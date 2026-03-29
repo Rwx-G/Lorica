@@ -16,4 +16,3 @@ Items identified during development that are deferred to future stories.
 
 | Source | Description | References |
 |--------|-------------|------------|
-| Epic 1.3 QA | Add doc comments (`///`) on public ConfigStore methods | Story 1.3, lorica-config/src/store.rs |

@@ -117,6 +117,7 @@ impl ConfigStore {
 
     // ---- Routes ----
 
+    /// Insert a new route into the database.
     pub fn create_route(&self, route: &Route) -> Result<()> {
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
@@ -139,6 +140,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Fetch a route by ID, or `None` if not found.
     pub fn get_route(&self, id: &str) -> Result<Option<Route>> {
         self.conn
             .query_row(
@@ -152,6 +154,7 @@ impl ConfigStore {
             .transpose()
     }
 
+    /// List all routes, ordered by hostname and path prefix.
     pub fn list_routes(&self) -> Result<Vec<Route>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, hostname, path_prefix, certificate_id, load_balancing,
@@ -166,6 +169,7 @@ impl ConfigStore {
         Ok(routes)
     }
 
+    /// Update an existing route. Returns `NotFound` if the ID does not exist.
     pub fn update_route(&self, route: &Route) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,
@@ -190,6 +194,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Delete a route by ID. Returns `NotFound` if the ID does not exist.
     pub fn delete_route(&self, id: &str) -> Result<()> {
         let changed = self
             .conn
@@ -202,6 +207,7 @@ impl ConfigStore {
 
     // ---- Backends ----
 
+    /// Insert a new backend into the database.
     pub fn create_backend(&self, backend: &Backend) -> Result<()> {
         self.conn.execute(
             "INSERT INTO backends (id, address, weight, health_status, health_check_enabled,
@@ -225,6 +231,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Fetch a backend by ID, or `None` if not found.
     pub fn get_backend(&self, id: &str) -> Result<Option<Backend>> {
         self.conn
             .query_row(
@@ -239,6 +246,7 @@ impl ConfigStore {
             .transpose()
     }
 
+    /// List all backends, ordered by address.
     pub fn list_backends(&self) -> Result<Vec<Backend>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, address, weight, health_status, health_check_enabled,
@@ -254,6 +262,7 @@ impl ConfigStore {
         Ok(backends)
     }
 
+    /// Update an existing backend. Returns `NotFound` if the ID does not exist.
     pub fn update_backend(&self, backend: &Backend) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE backends SET address=?2, weight=?3, health_status=?4,
@@ -278,6 +287,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Delete a backend by ID. Returns `NotFound` if the ID does not exist.
     pub fn delete_backend(&self, id: &str) -> Result<()> {
         let changed = self
             .conn
@@ -290,6 +300,7 @@ impl ConfigStore {
 
     // ---- Route-Backend associations ----
 
+    /// Associate a backend with a route. Idempotent (ignores duplicates).
     pub fn link_route_backend(&self, route_id: &str, backend_id: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO route_backends (route_id, backend_id) VALUES (?1, ?2)",
@@ -298,6 +309,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Remove an association between a route and a backend.
     pub fn unlink_route_backend(&self, route_id: &str, backend_id: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM route_backends WHERE route_id=?1 AND backend_id=?2",
@@ -306,6 +318,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// List backend IDs associated with a given route.
     pub fn list_backends_for_route(&self, route_id: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT backend_id FROM route_backends WHERE route_id=?1 ORDER BY backend_id",
@@ -318,6 +331,7 @@ impl ConfigStore {
         Ok(ids)
     }
 
+    /// List route IDs associated with a given backend.
     pub fn list_routes_for_backend(&self, backend_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -332,6 +346,7 @@ impl ConfigStore {
 
     // ---- Certificates ----
 
+    /// Insert a new certificate. The `key_pem` field is encrypted at rest if an encryption key is configured.
     pub fn create_certificate(&self, cert: &Certificate) -> Result<()> {
         let san_json = serde_json::to_string(&cert.san_domains)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
@@ -358,6 +373,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Fetch a certificate by ID, or `None` if not found. Decrypts `key_pem` transparently.
     pub fn get_certificate(&self, id: &str) -> Result<Option<Certificate>> {
         self.conn
             .query_row(
@@ -371,6 +387,7 @@ impl ConfigStore {
             .transpose()
     }
 
+    /// List all certificates, ordered by domain. Decrypts `key_pem` transparently.
     pub fn list_certificates(&self) -> Result<Vec<Certificate>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, domain, san_domains, fingerprint, cert_pem, key_pem,
@@ -385,6 +402,7 @@ impl ConfigStore {
         Ok(certs)
     }
 
+    /// Update an existing certificate. Re-encrypts `key_pem` at rest.
     pub fn update_certificate(&self, cert: &Certificate) -> Result<()> {
         let san_json = serde_json::to_string(&cert.san_domains)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
@@ -413,6 +431,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Delete a certificate by ID. Returns `NotFound` if the ID does not exist.
     pub fn delete_certificate(&self, id: &str) -> Result<()> {
         let changed = self
             .conn
@@ -425,6 +444,7 @@ impl ConfigStore {
 
     // ---- Notification Configs ----
 
+    /// Insert a new notification configuration.
     pub fn create_notification_config(&self, nc: &NotificationConfig) -> Result<()> {
         let alert_json = serde_json::to_string(&nc.alert_types)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
@@ -442,6 +462,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Fetch a notification config by ID, or `None` if not found.
     pub fn get_notification_config(&self, id: &str) -> Result<Option<NotificationConfig>> {
         self.conn
             .query_row(
@@ -454,6 +475,7 @@ impl ConfigStore {
             .transpose()
     }
 
+    /// List all notification configs, ordered by channel.
     pub fn list_notification_configs(&self) -> Result<Vec<NotificationConfig>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, channel, enabled, config, alert_types
@@ -467,6 +489,7 @@ impl ConfigStore {
         Ok(configs)
     }
 
+    /// Update an existing notification config. Returns `NotFound` if the ID does not exist.
     pub fn update_notification_config(&self, nc: &NotificationConfig) -> Result<()> {
         let alert_json = serde_json::to_string(&nc.alert_types)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
@@ -490,6 +513,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Delete a notification config by ID. Returns `NotFound` if the ID does not exist.
     pub fn delete_notification_config(&self, id: &str) -> Result<()> {
         let changed = self
             .conn
@@ -502,6 +526,7 @@ impl ConfigStore {
 
     // ---- User Preferences ----
 
+    /// Insert a new user preference.
     pub fn create_user_preference(&self, pref: &UserPreference) -> Result<()> {
         self.conn.execute(
             "INSERT INTO user_preferences (id, preference_key, value, created_at, updated_at)
@@ -517,6 +542,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Fetch a user preference by ID, or `None` if not found.
     pub fn get_user_preference(&self, id: &str) -> Result<Option<UserPreference>> {
         self.conn
             .query_row(
@@ -529,6 +555,7 @@ impl ConfigStore {
             .transpose()
     }
 
+    /// Fetch a user preference by its unique key, or `None` if not found.
     pub fn get_user_preference_by_key(&self, key: &str) -> Result<Option<UserPreference>> {
         self.conn
             .query_row(
@@ -541,6 +568,7 @@ impl ConfigStore {
             .transpose()
     }
 
+    /// List all user preferences, ordered by key.
     pub fn list_user_preferences(&self) -> Result<Vec<UserPreference>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, preference_key, value, created_at, updated_at
@@ -554,6 +582,7 @@ impl ConfigStore {
         Ok(prefs)
     }
 
+    /// Update an existing user preference. Returns `NotFound` if the ID does not exist.
     pub fn update_user_preference(&self, pref: &UserPreference) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE user_preferences SET preference_key=?2, value=?3, updated_at=?4
@@ -574,6 +603,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Delete a user preference by ID. Returns `NotFound` if the ID does not exist.
     pub fn delete_user_preference(&self, id: &str) -> Result<()> {
         let changed = self
             .conn
@@ -586,6 +616,7 @@ impl ConfigStore {
 
     // ---- Admin Users ----
 
+    /// Insert a new admin user.
     pub fn create_admin_user(&self, user: &AdminUser) -> Result<()> {
         self.conn.execute(
             "INSERT INTO admin_users (id, username, password_hash, must_change_password,
@@ -602,6 +633,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Fetch an admin user by ID, or `None` if not found.
     pub fn get_admin_user(&self, id: &str) -> Result<Option<AdminUser>> {
         self.conn
             .query_row(
@@ -614,6 +646,7 @@ impl ConfigStore {
             .transpose()
     }
 
+    /// Fetch an admin user by username, or `None` if not found.
     pub fn get_admin_user_by_username(&self, username: &str) -> Result<Option<AdminUser>> {
         self.conn
             .query_row(
@@ -626,6 +659,7 @@ impl ConfigStore {
             .transpose()
     }
 
+    /// List all admin users, ordered by username.
     pub fn list_admin_users(&self) -> Result<Vec<AdminUser>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, username, password_hash, must_change_password, created_at, last_login
@@ -639,6 +673,7 @@ impl ConfigStore {
         Ok(users)
     }
 
+    /// Update an existing admin user. Returns `NotFound` if the ID does not exist.
     pub fn update_admin_user(&self, user: &AdminUser) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE admin_users SET username=?2, password_hash=?3, must_change_password=?4,
@@ -657,6 +692,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Delete an admin user by ID. Returns `NotFound` if the ID does not exist.
     pub fn delete_admin_user(&self, id: &str) -> Result<()> {
         let changed = self
             .conn
@@ -669,6 +705,7 @@ impl ConfigStore {
 
     // ---- Global Settings ----
 
+    /// Read all global settings from the key-value table.
     pub fn get_global_settings(&self) -> Result<GlobalSettings> {
         let mut stmt = self
             .conn
@@ -698,6 +735,7 @@ impl ConfigStore {
         Ok(settings)
     }
 
+    /// Write all global settings to the key-value table (upsert).
     pub fn update_global_settings(&self, settings: &GlobalSettings) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('management_port', ?1)",
@@ -716,6 +754,7 @@ impl ConfigStore {
 
     // ---- Helpers for export/import ----
 
+    /// List all route-backend associations, ordered by route then backend ID.
     pub fn list_route_backends(&self) -> Result<Vec<RouteBackend>> {
         let mut stmt = self.conn.prepare(
             "SELECT route_id, backend_id FROM route_backends ORDER BY route_id, backend_id",
