@@ -1,0 +1,30 @@
+[package]
+name = "lorica-api"
+version = "0.1.0"
+authors = ["Romain G."]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "REST API for Lorica reverse proxy management"
+
+[dependencies]
+lorica-config = { version = "0.1.0", path = "../lorica-config" }
+axum = { version = "0.7", features = ["multipart"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+argon2 = "0.5"
+rand = "0.8"
+thiserror = "2"
+tracing = "0.1"
+http = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+hyper = { version = "1", features = ["full"] }
+tower = { version = "0.4", features = ["util"] }
+tempfile = "3"
