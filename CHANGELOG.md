@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-29
+
 ### Added
 
 - Project documentation: brief, PRD (5 epics, 25 stories), architecture (sharded), brainstorming results
