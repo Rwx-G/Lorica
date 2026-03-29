@@ -1,7 +1,7 @@
 # Story 1.1: Fork and Strip Pingora
 
 **Epic:** [Epic 1 - Foundation](../prd/epic-1-foundation.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Depends on:** None (first story)
 
