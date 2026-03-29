@@ -8,12 +8,20 @@
   }
 
   let { title, message, confirmLabel = 'Delete', onconfirm, oncancel }: Props = $props();
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      oncancel();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      onconfirm();
+    }
+  }
 </script>
 
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="overlay" onclick={oncancel}>
-  <div class="dialog" onclick={(e) => e.stopPropagation()}>
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+<div class="overlay" onclick={oncancel} onkeydown={handleKeydown} role="dialog" aria-modal="true" tabindex="-1">
+  <div class="dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
     <h3>{title}</h3>
     <p>{message}</p>
     <div class="actions">

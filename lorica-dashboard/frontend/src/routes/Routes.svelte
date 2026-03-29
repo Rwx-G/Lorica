@@ -103,6 +103,15 @@
     editingRoute = null;
   }
 
+  function handleFormKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      closeForm();
+    } else if (e.key === 'Enter' && !formSubmitting && (e.target as HTMLElement)?.tagName !== 'SELECT') {
+      e.preventDefault();
+      handleSubmit();
+    }
+  }
+
   async function handleSubmit() {
     if (!formHostname.trim()) {
       formError = 'Hostname is required';
@@ -258,10 +267,9 @@
 </div>
 
 {#if showForm}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="overlay" onclick={closeForm}>
-    <div class="modal" onclick={(e) => e.stopPropagation()}>
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div class="overlay" onclick={closeForm} onkeydown={handleFormKeydown} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
       <h2>{editingRoute ? 'Edit Route' : 'New Route'}</h2>
 
       {#if formError}
