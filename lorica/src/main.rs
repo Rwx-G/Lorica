@@ -149,6 +149,7 @@ async fn main() {
                 let key_path = tls_dir.join("server.key");
                 if std::fs::write(&cert_path, &cert.cert_pem).is_ok()
                     && std::fs::write(&key_path, &cert.key_pem).is_ok()
+                    && restrict_key_permissions(&key_path)
                 {
                     match lorica_core::listeners::tls::TlsSettings::intermediate(
                         cert_path.to_str().unwrap(),
@@ -223,6 +224,23 @@ async fn main() {
 
     // The proxy thread runs in its own process lifecycle via run_forever;
     // it handles signals internally. We just exit.
+}
+
+/// Restrict private key file permissions (owner-only read on Unix, best-effort on Windows).
+fn restrict_key_permissions(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            warn!(error = %e, path = %path.display(), "failed to restrict key file permissions");
+            return false;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    true
 }
 
 async fn shutdown_signal() {
