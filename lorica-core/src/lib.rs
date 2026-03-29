@@ -26,7 +26,7 @@
 //!
 //! # Features
 //! - Http 1.x and Http 2
-//! - Modern TLS with OpenSSL or BoringSSL (FIPS compatible)
+//! - Modern TLS with Rustls
 //! - Zero downtime upgrade
 //!
 //! # Usage
@@ -36,16 +36,13 @@
 //!
 //! # Optional features
 //!
-//! ## TLS backends (mutually exclusive)
-//! - `openssl`: Use OpenSSL as the TLS library (default if no TLS feature is specified)
-//! - `boringssl`: Use BoringSSL as the TLS library (FIPS compatible)
+//! ## TLS backend
 //! - `rustls`: Use Rustls as the TLS library
 //!
 //! ## Additional features
 //! - `connection_filter`: Enable early TCP connection filtering before TLS handshake.
 //!   This allows implementing custom logic to accept/reject connections based on peer address
 //!   with zero overhead when disabled.
-//! - `sentry`: Enable Sentry error reporting integration
 //! - `patched_http1`: Enable patched HTTP/1 parser
 //!
 //! # Connection Filtering
@@ -103,19 +100,7 @@ pub mod utils;
 
 pub use lorica_error::{ErrorType::*, *};
 
-// If both openssl and boringssl are enabled, prefer boringssl.
-// This is to make sure that boringssl can override the default openssl feature
-// when this crate is used indirectly by other crates.
-#[cfg(feature = "boringssl")]
-pub use lorica_tls as tls;
-
-#[cfg(feature = "openssl")]
-pub use lorica_tls as tls;
-
 #[cfg(feature = "rustls")]
-pub use lorica_tls as tls;
-
-#[cfg(feature = "s2n")]
 pub use lorica_tls as tls;
 
 #[cfg(not(feature = "any_tls"))]

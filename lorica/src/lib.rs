@@ -1,4 +1,5 @@
-// Copyright 2026 Cloudflare, Inc.
+// Copyright 2024 Cloudflare, Inc.
+// Copyright 2026 Romain G. (Lorica)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,42 +19,28 @@
 #![allow(clippy::match_wild_err_arm)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::upper_case_acronyms)]
-// This enables the feature that labels modules that are only available with
-// certain lorica features
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! # Lorica
 //!
-//! Lorica is a framework to build fast, reliable and programmable networked systems at Internet scale.
+//! A modern, secure, dashboard-first reverse proxy built in Rust.
+//! Forked from Cloudflare's Pingora.
 //!
 //! # Features
-//! - Http 1.x and Http 2
-//! - Modern TLS with OpenSSL or BoringSSL (FIPS compatible)
+//! - HTTP/1.x and HTTP/2
+//! - TLS termination with rustls (no OpenSSL)
 //! - Zero downtime upgrade
 //!
 //! # Usage
 //! This crate provides low level service and protocol implementation and abstraction.
 //!
 //! If looking to build a (reverse) proxy, see [`lorica-proxy`](https://docs.rs/lorica-proxy) crate.
-//!
-//! # Feature flags
-#![cfg_attr(
-    feature = "document-features",
-    cfg_attr(doc, doc = ::document_features::document_features!())
-)]
 
 pub use lorica_core::*;
 
 /// HTTP header objects that preserve http header cases
 pub mod http {
     pub use lorica_http::*;
-}
-
-#[cfg(feature = "cache")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cache")))]
-/// Caching services and tooling
-pub mod cache {
-    pub use lorica_cache::*;
 }
 
 #[cfg(feature = "lb")]
@@ -82,10 +69,6 @@ pub mod prelude {
     pub use lorica_core::prelude::*;
     pub use lorica_http::prelude::*;
     pub use lorica_timeout::*;
-
-    #[cfg(feature = "cache")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "cache")))]
-    pub use lorica_cache::prelude::*;
 
     #[cfg(feature = "lb")]
     #[cfg_attr(docsrs, doc(cfg(feature = "lb")))]

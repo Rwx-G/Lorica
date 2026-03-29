@@ -20,9 +20,6 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex as TokioMutex};
 
-#[cfg(feature = "sentry")]
-use sentry::ClientOptions;
-
 #[cfg(unix)]
 use crate::server::ListenFds;
 
@@ -59,22 +56,6 @@ pub struct Bootstrap {
 
     #[cfg(unix)]
     listen_fds: Option<ListenFds>,
-
-    #[cfg(feature = "sentry")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
-    /// The Sentry ClientOptions.
-    ///
-    /// Panics and other events sentry captures will be sent to this DSN **only
-    /// in release mode**
-    pub sentry: Option<ClientOptions>,
-
-    /// The Sentry [`ClientInitGuard`](sentry::ClientInitGuard) returned by
-    /// [`sentry::init`].
-    ///
-    /// This guard must be kept alive for the lifetime of the server, because
-    /// dropping it flushes and disables the Sentry client.
-    #[cfg(all(not(debug_assertions), feature = "sentry"))]
-    sentry_guard: Option<sentry::ClientInitGuard>,
 }
 
 impl Bootstrap {
@@ -98,37 +79,6 @@ impl Bootstrap {
             listen_fds: None,
             execution_phase_watch: execution_phase_watch.clone(),
             completed: false,
-            #[cfg(feature = "sentry")]
-            sentry: None,
-            #[cfg(all(not(debug_assertions), feature = "sentry"))]
-            sentry_guard: None,
-        }
-    }
-
-    #[cfg(feature = "sentry")]
-    pub fn set_sentry_config(&mut self, sentry_config: Option<ClientOptions>) {
-        self.sentry = sentry_config;
-    }
-
-    /// Initialize the Sentry client from the configured [`ClientOptions`] and
-    /// store the resulting guard.
-    ///
-    /// The [`ClientOptions`] are preserved (not consumed) so that sentry can be
-    /// re-initialized after daemonization, when the transport thread spawned by
-    /// the previous [`sentry::init`] call is lost due to `fork()`.
-    ///
-    /// The resulting [`sentry::ClientInitGuard`] is stored in `self` so that it
-    /// lives as long as the [`Bootstrap`] (and therefore the
-    /// [`Server`](super::Server)), keeping the Sentry client active for the
-    /// lifetime of the process.
-    ///
-    /// Sentry is only initialized in release builds; in debug builds this is a
-    /// no-op.
-    #[cfg(feature = "sentry")]
-    pub(super) fn start_sentry(&mut self) {
-        #[cfg(not(debug_assertions))]
-        {
-            self.sentry_guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
         }
     }
 
@@ -144,18 +94,6 @@ impl Bootstrap {
             .send(ExecutionPhase::Bootstrap)
             .ok();
 
-        // Temporarily initialize sentry if it isn't already active, so that
-        // errors during fd loading are captured. If sentry was already
-        // initialized with a persistent guard by `Server::run()` (as in
-        // the `bootstrap_as_a_service` path), we skip this to avoid
-        // clobbering the persistent guard.
-        #[cfg(all(not(debug_assertions), feature = "sentry"))]
-        let _guard = if self.sentry_guard.is_none() {
-            self.sentry.as_ref().map(|opts| sentry::init(opts.clone()))
-        } else {
-            None
-        };
-
         if self.test {
             info!("Server Test passed, exiting");
             std::process::exit(0);
@@ -168,10 +106,6 @@ impl Bootstrap {
                 info!("Bootstrap done");
             }
             Err(e) => {
-                // sentry log error on fd load failure
-                #[cfg(all(not(debug_assertions), feature = "sentry"))]
-                sentry::capture_error(&e);
-
                 error!("Bootstrap failed on error: {:?}, exiting.", e);
                 std::process::exit(1);
             }

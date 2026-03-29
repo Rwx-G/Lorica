@@ -12,36 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "openssl_derived")]
-mod boringssl_openssl;
-
-#[cfg(feature = "openssl_derived")]
-pub use boringssl_openssl::*;
-
-#[cfg(feature = "s2n")]
-mod s2n;
-
-#[cfg(feature = "s2n")]
-pub use s2n::*;
-
 #[cfg(feature = "rustls")]
 mod rustls;
 
 #[cfg(feature = "rustls")]
 pub use rustls::*;
 
-///    OpenSSL considers underscores in hostnames non-compliant.
+///    Some TLS libraries consider underscores in hostnames non-compliant.
 ///    We replace the underscore in the leftmost label as we must support these
-///    hostnames for wildcard matches and we have not patched OpenSSL.
-///
-///    https://github.com/openssl/openssl/issues/12566
+///    hostnames for wildcard matches.
 ///
 ///    > The labels must follow the rules for ARPANET host names. They must
 ///    > start with a letter, end with a letter or digit, and have as interior
 ///    > characters only letters, digits, and hyphen.  There are also some
 ///    > restrictions on the length.  Labels must be 63 characters or less.
 ///    - https://datatracker.ietf.org/doc/html/rfc1034#section-3.5
-#[cfg(any(feature = "openssl_derived", feature = "rustls"))]
+#[cfg(feature = "rustls")]
 pub fn replace_leftmost_underscore(sni: &str) -> Option<String> {
     // wildcard is only leftmost label
     if let Some((leftmost, rest)) = sni.split_once('.') {
@@ -56,7 +42,7 @@ pub fn replace_leftmost_underscore(sni: &str) -> Option<String> {
     None
 }
 
-#[cfg(any(feature = "openssl_derived", feature = "rustls"))]
+#[cfg(feature = "rustls")]
 #[cfg(test)]
 mod tests {
     use super::*;

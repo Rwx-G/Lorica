@@ -12,20 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "openssl_derived")]
-mod boringssl_openssl;
-
-#[cfg(feature = "openssl_derived")]
-pub use boringssl_openssl::*;
-
 #[cfg(feature = "rustls")]
 mod rustls;
 
 #[cfg(feature = "rustls")]
 pub use rustls::*;
-
-#[cfg(feature = "s2n")]
-mod s2n;
-
-#[cfg(feature = "s2n")]
-pub use s2n::*;

@@ -29,8 +29,6 @@ use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use lorica_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
 use lorica_timeout::fast_timeout;
-#[cfg(feature = "sentry")]
-use sentry::ClientOptions;
 use std::sync::Arc;
 use std::thread;
 use std::time::SystemTime;
@@ -282,9 +280,6 @@ impl Server {
                         }
                         Err(e) => {
                             error!("Unable to send listener sockets to new process: {e}");
-                            // sentry log error on fd send failure
-                            #[cfg(all(not(debug_assertions), feature = "sentry"))]
-                            sentry::capture_error(&e);
                         }
                     }
                     self.execution_phase_watch
@@ -347,15 +342,6 @@ impl Server {
                 ShutdownType::Quick
             }
         }
-    }
-
-    #[cfg(feature = "sentry")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
-    /// The Sentry ClientOptions.
-    ///
-    /// Panics and other events sentry captures will be sent to this DSN **only in release mode**
-    pub fn set_sentry_config(&mut self, sentry_config: ClientOptions) {
-        self.bootstrap.lock().set_sentry_config(Some(sentry_config));
     }
 
     /// Get the configured file descriptors for listening
@@ -633,15 +619,6 @@ impl Server {
             max_threads: conf.max_blocking_threads,
             thread_keep_alive: conf.blocking_threads_ttl_seconds.map(Duration::from_secs),
         };
-
-        // Initialize (or re-initialize) sentry and persist the guard for
-        // the lifetime of the server. When daemonizing, the transport
-        // thread spawned by any earlier `sentry::init` during
-        // `bootstrap()` is lost after `fork()`, so a fresh init in the
-        // child process is required. In non-daemon mode this is the
-        // authoritative initialization that keeps sentry active.
-        #[cfg(feature = "sentry")]
-        self.bootstrap.lock().start_sentry();
 
         // Holds tuples of runtimes and their service name.
         let mut runtimes: Vec<(Runtime, String)> = Vec::new();
