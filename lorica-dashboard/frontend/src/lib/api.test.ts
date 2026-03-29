@@ -177,3 +177,18 @@ describe('api.deleteCertificate conflict', () => {
     expect(res.error?.code).toBe('conflict');
   });
 });
+
+describe('api.generateSelfSigned', () => {
+  it('calls POST /api/v1/certificates/self-signed with domain', async () => {
+    mockFetch(mockCert);
+    const res = await api.generateSelfSigned({ domain: 'localhost' });
+    expect(res.data?.id).toBe('cert-1');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/certificates/self-signed',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ domain: 'localhost' }),
+      }),
+    );
+  });
+});

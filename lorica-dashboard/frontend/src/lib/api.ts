@@ -126,6 +126,10 @@ export interface UpdateCertificateRequest {
   key_pem?: string;
 }
 
+export interface GenerateSelfSignedRequest {
+  domain: string;
+}
+
 export const api = {
   login: (creds: LoginRequest) =>
     request<LoginResponse>('POST', '/auth/login', creds),
@@ -172,4 +176,7 @@ export const api = {
 
   deleteCertificate: (id: string) =>
     request<{ message: string }>('DELETE', `/certificates/${id}`),
+
+  generateSelfSigned: (body: GenerateSelfSignedRequest) =>
+    request<CertificateResponse>('POST', '/certificates/self-signed', body),
 };

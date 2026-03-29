@@ -7,6 +7,7 @@
     type RouteResponse,
     type CreateCertificateRequest,
     type UpdateCertificateRequest,
+    type GenerateSelfSignedRequest,
   } from '../lib/api';
   import CertExpiryBadge from '../components/CertExpiryBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
@@ -291,14 +292,10 @@
     selfSignedSubmitting = true;
     selfSignedError = '';
 
-    // Generate a placeholder self-signed cert via the API
-    // The API accepts PEM - we send a marker that the backend can interpret
-    const body: CreateCertificateRequest = {
+    const body: GenerateSelfSignedRequest = {
       domain: selfSignedDomain,
-      cert_pem: `-----BEGIN CERTIFICATE-----\nSELF_SIGNED_PLACEHOLDER\n-----END CERTIFICATE-----`,
-      key_pem: `-----BEGIN PRIVATE KEY-----\nSELF_SIGNED_PLACEHOLDER\n-----END PRIVATE KEY-----`,
     };
-    const res = await api.createCertificate(body);
+    const res = await api.generateSelfSigned(body);
     if (res.error) {
       selfSignedError = res.error.message;
       selfSignedSubmitting = false;
