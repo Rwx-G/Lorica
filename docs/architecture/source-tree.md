@@ -41,6 +41,11 @@ lorica/
   lorica-limits/                # Fork of pingora-limits
   lorica-header-serde/          # Fork of pingora-header-serde
 
+  lorica-cache/                 # Fork of pingora-cache (HTTP response caching)
+  lorica-memory-cache/          # Fork of pingora-memory-cache
+  lorica-lru/                   # Fork of pingora-lru
+  tinyufo/                      # Cache eviction algorithm (upstream)
+
   lorica-config/                # NEW - Config state & persistence
     Cargo.toml
     src/

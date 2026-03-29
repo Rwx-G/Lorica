@@ -154,7 +154,7 @@ Built as a fork of Cloudflare's Pingora (Apache-2.0), augmented with architectur
 - Cluster mode / multi-instance aggregation (long-term vision)
 - DNS-based service discovery (Phase 3+)
 - Rate limiting middleware (Phase 3+)
-- HTTP cache (Phase 3+)
+- HTTP response cache (inherited from Pingora, available from Phase 1)
 - Remote access to dashboard (out of scope - use Teleport/SSH/VPN)
 - Slack/Telegram/Discord notifications (out of scope - webhook covers these)
 - Static file serving / web server features (out of scope - never)
@@ -195,7 +195,7 @@ The MVP is successful when the author can fully replace Nginx on at least one pr
 - Docker Swarm and Kubernetes native integrations (API-driven discovery)
 - Auto-scaling triggers via webhook when load thresholds are crossed
 - Community-contributed notification plugins
-- HTTP cache (evaluate feasibility and performance impact)
+- HTTP response cache dashboard integration (cache stats, purge controls)
 
 ### Expansion Opportunities
 

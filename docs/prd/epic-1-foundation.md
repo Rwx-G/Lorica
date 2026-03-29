@@ -18,7 +18,7 @@ so that I have a minimal, focused foundation to build on.
 2. All crates renamed from `pingora-*` to `lorica-*`
 3. All internal `use pingora_*` references updated to `lorica_*`
 4. `pingora-openssl`, `pingora-boringssl`, `pingora-s2n` crates removed
-5. `pingora-cache`, `pingora-memory-cache`, `pingora-lru`, `tinyufo` crates removed
+5. `pingora-cache`, `pingora-memory-cache`, `pingora-lru`, `tinyufo` crates renamed and kept (HTTP response caching is useful for a reverse proxy)
 6. Conditional compilation for non-rustls TLS backends removed
 7. Cloudflare-specific code removed (sentry, cf-rustracing)
 8. NOTICE file created crediting Cloudflare Pingora as upstream (Apache-2.0)

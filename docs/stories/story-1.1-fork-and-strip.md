@@ -17,7 +17,7 @@ so that I have a minimal, focused foundation to build on.
 2. All crates renamed from `pingora-*` to `lorica-*`
 3. All internal `use pingora_*` references updated to `lorica_*`
 4. `pingora-openssl`, `pingora-boringssl`, `pingora-s2n` crates removed
-5. `pingora-cache`, `pingora-memory-cache`, `pingora-lru`, `tinyufo` crates removed
+5. `pingora-cache`, `pingora-memory-cache`, `pingora-lru`, `tinyufo` crates renamed and kept (HTTP response caching is useful for a reverse proxy)
 6. Conditional compilation for non-rustls TLS backends removed
 7. Cloudflare-specific code removed (sentry, cf-rustracing)
 8. NOTICE file created crediting Cloudflare Pingora as upstream (Apache-2.0)
@@ -39,7 +39,7 @@ so that I have a minimal, focused foundation to build on.
 - [x] Update all Cargo.toml package names and dependencies
 - [x] Update all `use pingora_*` imports to `lorica_*`
 - [x] Remove openssl, boringssl, s2n crates and their references
-- [ ] Remove cache, memory-cache, lru, tinyufo crates (kept temporarily - proxy depends on cache)
+- [x] Rename and keep cache, memory-cache, lru, tinyufo crates (HTTP caching useful for RP)
 - [x] Remove conditional TLS compilation (keep rustls only)
 - [x] Remove Cloudflare-specific code (sentry features removed, examples removed)
 - [x] Update deprecated deps (serde_yaml -> serde_yml)
@@ -47,11 +47,12 @@ so that I have a minimal, focused foundation to build on.
 - [x] Run `cargo test` - PASS (558 tests, 0 failures, 1 skipped env-dependent)
 - [x] Verify no references to removed crates remain (0 pingora mentions in code)
 
-## Deferred Items
+## Dev Notes (Post-Implementation)
 
-- nix 0.24 -> 0.29 migration deferred (API breaking changes require deeper refactoring)
-- Cache crate kept temporarily (proxy has deep coupling with cache - needs dedicated story to decouple)
-- cf-rustracing kept in cache crate only (Cloudflare tracing dependency, will be removed with cache decoupling)
+- Cache crate kept intentionally: HTTP response caching is a useful feature for a reverse proxy
+- cf-rustracing replaced with no-op stubs in cache crate (Cloudflare tracing removed)
+- nix upgraded from 0.24 to 0.29 (OwnedFd conversion, Backlog type changes)
+- All dead cfg branches (openssl, boringssl, s2n, sentry) removed - 0 code warnings
 
 ## Dev Notes
 
