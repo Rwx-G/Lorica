@@ -21,6 +21,7 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         system_cache: Arc::new(Mutex::new(SystemCache::new())),
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         started_at: Instant::now(),
+        config_reload_tx: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
@@ -1575,7 +1576,7 @@ async fn test_import_preview_with_changes() {
     assert_eq!(response.status(), StatusCode::CREATED);
 
     // Preview import with empty config - should show the backend as "removed"
-    let toml_content = "version = 1\n\n[global_settings]\nmanagement_port = 9443\nlog_level = \"info\"\ndefault_health_check_interval_s = 10\n";
+    let toml_content = "version = 1\n\n[global_settings]\nmanagement_port = 9443\nlog_level = \"info\"\ndefault_health_check_interval_s = 10\ncert_warning_days = 30\ncert_critical_days = 7\n";
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({ "toml_content": toml_content });
 

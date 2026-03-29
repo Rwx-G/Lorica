@@ -22,6 +22,8 @@ pub struct UpdateSettingsRequest {
     pub management_port: Option<u16>,
     pub log_level: Option<String>,
     pub default_health_check_interval_s: Option<i32>,
+    pub cert_warning_days: Option<i32>,
+    pub cert_critical_days: Option<i32>,
 }
 
 /// PUT /api/v1/settings
@@ -51,6 +53,22 @@ pub async fn update_settings(
             ));
         }
         settings.default_health_check_interval_s = interval;
+    }
+    if let Some(days) = body.cert_warning_days {
+        if days < 1 {
+            return Err(ApiError::BadRequest(
+                "cert_warning_days must be >= 1".into(),
+            ));
+        }
+        settings.cert_warning_days = days;
+    }
+    if let Some(days) = body.cert_critical_days {
+        if days < 1 {
+            return Err(ApiError::BadRequest(
+                "cert_critical_days must be >= 1".into(),
+            ));
+        }
+        settings.cert_critical_days = days;
     }
 
     store.update_global_settings(&settings)?;
@@ -86,6 +104,8 @@ pub async fn create_notification(
         .parse()
         .map_err(|e: String| ApiError::BadRequest(e))?;
 
+    validate_notification_config(&body.config)?;
+
     let nc = lorica_config::models::NotificationConfig {
         id: lorica_config::store::new_id(),
         channel,
@@ -99,6 +119,51 @@ pub async fn create_notification(
     Ok(json_data_with_status(StatusCode::CREATED, nc))
 }
 
+/// POST /api/v1/notifications/:id/test - validate notification config reachability
+pub async fn test_notification(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.store.lock().await;
+    let nc = store
+        .get_notification_config(&id)?
+        .ok_or_else(|| ApiError::NotFound(format!("notification_config {id}")))?;
+
+    let config_json: serde_json::Value = serde_json::from_str(&nc.config)
+        .map_err(|e| ApiError::BadRequest(format!("invalid config JSON: {e}")))?;
+
+    match nc.channel {
+        lorica_config::models::NotificationChannel::Email => {
+            if config_json.get("smtp_host").is_none() {
+                return Err(ApiError::BadRequest(
+                    "email config missing required field: smtp_host".into(),
+                ));
+            }
+        }
+        lorica_config::models::NotificationChannel::Webhook => {
+            if config_json.get("url").is_none() {
+                return Err(ApiError::BadRequest(
+                    "webhook config missing required field: url".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(json_data(serde_json::json!({
+        "message": "notification config is valid",
+        "channel": nc.channel.as_str(),
+    })))
+}
+
+fn validate_notification_config(config: &str) -> Result<(), ApiError> {
+    if config.is_empty() {
+        return Err(ApiError::BadRequest("config must not be empty".into()));
+    }
+    serde_json::from_str::<serde_json::Value>(config)
+        .map_err(|e| ApiError::BadRequest(format!("config must be valid JSON: {e}")))?;
+    Ok(())
+}
+
 /// PUT /api/v1/notifications/:id
 pub async fn update_notification(
     Extension(state): Extension<AppState>,
@@ -109,6 +174,8 @@ pub async fn update_notification(
         .channel
         .parse()
         .map_err(|e: String| ApiError::BadRequest(e))?;
+
+    validate_notification_config(&body.config)?;
 
     let nc = lorica_config::models::NotificationConfig {
         id,

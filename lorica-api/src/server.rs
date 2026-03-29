@@ -6,7 +6,7 @@ use std::time::Instant;
 use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tracing::info;
 
 use crate::logs::LogBuffer;
@@ -22,6 +22,19 @@ pub struct AppState {
     pub system_cache: Arc<Mutex<SystemCache>>,
     pub active_connections: Arc<AtomicU64>,
     pub started_at: Instant,
+    /// Sender that signals the proxy engine to reload its configuration.
+    /// Incremented on each mutation. `None` in tests or when no proxy is running.
+    pub config_reload_tx: Option<watch::Sender<u64>>,
+}
+
+impl AppState {
+    /// Signal the proxy engine to reload its configuration from the database.
+    pub fn notify_config_changed(&self) {
+        if let Some(tx) = &self.config_reload_tx {
+            let next = *tx.borrow() + 1;
+            let _ = tx.send(next);
+        }
+    }
 }
 
 /// Build the axum router with all API routes.
@@ -102,6 +115,10 @@ pub fn build_router(
         .route(
             "/api/v1/notifications/:id",
             delete(crate::settings::delete_notification),
+        )
+        .route(
+            "/api/v1/notifications/:id/test",
+            post(crate::settings::test_notification),
         )
         .route(
             "/api/v1/preferences",

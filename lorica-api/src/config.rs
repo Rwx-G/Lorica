@@ -39,17 +39,30 @@ pub async fn export_config(
     ))
 }
 
+/// Maximum TOML import size: 1 MB.
+const MAX_IMPORT_SIZE: usize = 1_048_576;
+
 /// POST /api/v1/config/import - direct import (replaces all data)
 pub async fn import_config(
     Extension(state): Extension<AppState>,
     Json(body): Json<ImportRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.toml_content.len() > MAX_IMPORT_SIZE {
+        return Err(ApiError::BadRequest(format!(
+            "TOML content too large: {} bytes (max {} bytes)",
+            body.toml_content.len(),
+            MAX_IMPORT_SIZE
+        )));
+    }
+
     let import_data = lorica_config::import::parse_toml(&body.toml_content)
         .map_err(|e| ApiError::BadRequest(format!("invalid TOML: {e}")))?;
 
     let store = state.store.lock().await;
     lorica_config::import::import_to_store(&store, &import_data)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    drop(store);
+    state.notify_config_changed();
 
     Ok(json_data(
         serde_json::json!({"message": "configuration imported successfully"}),
@@ -61,6 +74,14 @@ pub async fn import_preview(
     Extension(state): Extension<AppState>,
     Json(body): Json<ImportRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.toml_content.len() > MAX_IMPORT_SIZE {
+        return Err(ApiError::BadRequest(format!(
+            "TOML content too large: {} bytes (max {} bytes)",
+            body.toml_content.len(),
+            MAX_IMPORT_SIZE
+        )));
+    }
+
     let import_data = lorica_config::import::parse_toml(&body.toml_content)
         .map_err(|e| ApiError::BadRequest(format!("invalid TOML: {e}")))?;
 
