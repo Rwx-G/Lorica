@@ -23,8 +23,8 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::proxy::ProxyConfig;
-use crate::reload::reload_proxy_config;
+use lorica::proxy_wiring::ProxyConfig;
+use lorica::reload::reload_proxy_config;
 
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 

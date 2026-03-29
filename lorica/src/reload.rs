@@ -19,7 +19,7 @@ use lorica_config::ConfigStore;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::proxy::ProxyConfig;
+use crate::proxy_wiring::ProxyConfig;
 
 /// Load all routes, backends, certificates and route-backend links from the store
 /// and build a new ProxyConfig, then atomically swap it in.

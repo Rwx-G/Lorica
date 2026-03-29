@@ -13,8 +13,6 @@
 // limitations under the License.
 
 mod health;
-mod proxy;
-mod reload;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,8 +26,8 @@ use lorica_config::ConfigStore;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use proxy::{LoricaProxy, ProxyConfig};
-use reload::reload_proxy_config;
+use lorica::proxy_wiring::{LoricaProxy, ProxyConfig};
+use lorica::reload::reload_proxy_config;
 
 const DEFAULT_DATA_DIR: &str = if cfg!(unix) {
     "/var/lib/lorica"
@@ -39,6 +37,7 @@ const DEFAULT_DATA_DIR: &str = if cfg!(unix) {
 
 const DEFAULT_MANAGEMENT_PORT: u16 = 9443;
 const DEFAULT_HTTP_PORT: u16 = 8080;
+const DEFAULT_HTTPS_PORT: u16 = 8443;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -62,6 +61,10 @@ struct Cli {
     /// HTTP proxy listen port
     #[arg(long, default_value_t = DEFAULT_HTTP_PORT)]
     http_port: u16,
+
+    /// HTTPS proxy listen port
+    #[arg(long, default_value_t = DEFAULT_HTTPS_PORT)]
+    https_port: u16,
 }
 
 fn init_logging(log_level: &str) {
@@ -85,6 +88,7 @@ fn startup_banner(cli: &Cli) {
         data_dir = %cli.data_dir,
         management_port = cli.management_port,
         http_port = cli.http_port,
+        https_port = cli.https_port,
         "Lorica reverse proxy starting"
     );
 }
@@ -130,6 +134,43 @@ async fn main() {
     proxy_service.add_tcp(&format!("0.0.0.0:{}", cli.http_port));
 
     info!(port = cli.http_port, "HTTP proxy listener configured");
+
+    // Add TLS listener if any certificates are available
+    let tls_dir = data_dir.join("tls");
+    let https_port = cli.https_port;
+    {
+        let s = store.lock().await;
+        let certs = s.list_certificates().unwrap_or_default();
+        if let Some(cert) = certs.first() {
+            if let Err(e) = std::fs::create_dir_all(&tls_dir) {
+                warn!(error = %e, "failed to create TLS directory");
+            } else {
+                let cert_path = tls_dir.join("server.crt");
+                let key_path = tls_dir.join("server.key");
+                if std::fs::write(&cert_path, &cert.cert_pem).is_ok()
+                    && std::fs::write(&key_path, &cert.key_pem).is_ok()
+                {
+                    match lorica_core::listeners::tls::TlsSettings::intermediate(
+                        cert_path.to_str().unwrap(),
+                        key_path.to_str().unwrap(),
+                    ) {
+                        Ok(mut tls_settings) => {
+                            tls_settings.enable_h2();
+                            proxy_service.add_tls_with_settings(
+                                &format!("0.0.0.0:{https_port}"),
+                                None,
+                                tls_settings,
+                            );
+                            info!(port = https_port, domain = %cert.domain, "HTTPS proxy listener configured");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to create TLS settings");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Start API server (management plane)
     let api_store = Arc::clone(&store);

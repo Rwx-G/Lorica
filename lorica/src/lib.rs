@@ -36,6 +36,9 @@
 //!
 //! If looking to build a (reverse) proxy, see [`lorica-proxy`](https://docs.rs/lorica-proxy) crate.
 
+pub mod proxy_wiring;
+pub mod reload;
+
 pub use lorica_core::*;
 
 /// HTTP header objects that preserve http header cases

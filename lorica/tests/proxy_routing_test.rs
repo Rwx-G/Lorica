@@ -1,0 +1,246 @@
+// Copyright 2026 Romain G. (Lorica)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Tests for the reload module and proxy config construction from ConfigStore.
+
+use std::sync::Arc;
+
+use lorica_config::models::*;
+use lorica_config::ConfigStore;
+
+fn make_route(id: &str, hostname: &str, path_prefix: &str) -> Route {
+    Route {
+        id: id.to_string(),
+        hostname: hostname.to_string(),
+        path_prefix: path_prefix.to_string(),
+        certificate_id: None,
+        load_balancing: LoadBalancing::RoundRobin,
+        waf_enabled: false,
+        waf_mode: WafMode::Detection,
+        topology_type: TopologyType::SingleVm,
+        enabled: true,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn make_backend(id: &str, address: &str) -> Backend {
+    Backend {
+        id: id.to_string(),
+        address: address.to_string(),
+        weight: 1,
+        health_status: HealthStatus::Healthy,
+        health_check_enabled: true,
+        health_check_interval_s: 10,
+        lifecycle_state: LifecycleState::Normal,
+        active_connections: 0,
+        tls_upstream: false,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+/// Verify that reload_proxy_config loads routes and backends from the store
+/// into a correct ProxyConfig structure.
+#[tokio::test]
+async fn test_reload_builds_proxy_config() {
+    let store = ConfigStore::open_in_memory().unwrap();
+
+    // Create routes with backends
+    store.create_route(&make_route("r1", "example.com", "/")).unwrap();
+    store.create_route(&make_route("r2", "api.example.com", "/v1")).unwrap();
+    store.create_backend(&make_backend("b1", "10.0.0.1:80")).unwrap();
+    store.create_backend(&make_backend("b2", "10.0.0.2:80")).unwrap();
+    store.link_route_backend("r1", "b1").unwrap();
+    store.link_route_backend("r1", "b2").unwrap();
+    store.link_route_backend("r2", "b1").unwrap();
+
+    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let proxy_config = Arc::new(arc_swap::ArcSwap::from_pointee(
+        lorica::proxy_wiring::ProxyConfig::default(),
+    ));
+
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+
+    let config = proxy_config.load();
+    assert_eq!(config.routes_by_host.len(), 2);
+
+    let example_routes = config.routes_by_host.get("example.com").unwrap();
+    assert_eq!(example_routes.len(), 1);
+    assert_eq!(example_routes[0].backends.len(), 2);
+
+    let api_routes = config.routes_by_host.get("api.example.com").unwrap();
+    assert_eq!(api_routes.len(), 1);
+    assert_eq!(api_routes[0].backends.len(), 1);
+}
+
+/// Verify that longest path prefix is matched first.
+#[tokio::test]
+async fn test_longest_prefix_ordering() {
+    let store = ConfigStore::open_in_memory().unwrap();
+
+    store.create_route(&make_route("r1", "app.test", "/")).unwrap();
+    store.create_route(&make_route("r2", "app.test", "/api")).unwrap();
+    store.create_route(&make_route("r3", "app.test", "/api/v2")).unwrap();
+    store.create_backend(&make_backend("b1", "10.0.0.1:80")).unwrap();
+    store.link_route_backend("r1", "b1").unwrap();
+    store.link_route_backend("r2", "b1").unwrap();
+    store.link_route_backend("r3", "b1").unwrap();
+
+    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let proxy_config = Arc::new(arc_swap::ArcSwap::from_pointee(
+        lorica::proxy_wiring::ProxyConfig::default(),
+    ));
+
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+
+    let config = proxy_config.load();
+    let routes = config.routes_by_host.get("app.test").unwrap();
+    assert_eq!(routes.len(), 3);
+    // Longest prefix first
+    assert_eq!(routes[0].route.path_prefix, "/api/v2");
+    assert_eq!(routes[1].route.path_prefix, "/api");
+    assert_eq!(routes[2].route.path_prefix, "/");
+}
+
+/// Verify that disabled routes are excluded from the config.
+#[tokio::test]
+async fn test_disabled_routes_excluded() {
+    let store = ConfigStore::open_in_memory().unwrap();
+
+    let mut disabled = make_route("r1", "example.com", "/");
+    disabled.enabled = false;
+    store.create_route(&disabled).unwrap();
+    store.create_route(&make_route("r2", "example.com", "/api")).unwrap();
+    store.create_backend(&make_backend("b1", "10.0.0.1:80")).unwrap();
+    store.link_route_backend("r1", "b1").unwrap();
+    store.link_route_backend("r2", "b1").unwrap();
+
+    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let proxy_config = Arc::new(arc_swap::ArcSwap::from_pointee(
+        lorica::proxy_wiring::ProxyConfig::default(),
+    ));
+
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+
+    let config = proxy_config.load();
+    let routes = config.routes_by_host.get("example.com").unwrap();
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].route.path_prefix, "/api");
+}
+
+/// Verify that routes with no backends are still loaded (but will return 502).
+#[tokio::test]
+async fn test_route_with_no_backends() {
+    let store = ConfigStore::open_in_memory().unwrap();
+
+    store.create_route(&make_route("r1", "empty.test", "/")).unwrap();
+
+    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let proxy_config = Arc::new(arc_swap::ArcSwap::from_pointee(
+        lorica::proxy_wiring::ProxyConfig::default(),
+    ));
+
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+
+    let config = proxy_config.load();
+    let routes = config.routes_by_host.get("empty.test").unwrap();
+    assert_eq!(routes.len(), 1);
+    assert!(routes[0].backends.is_empty());
+}
+
+/// Verify config reload atomically swaps the config.
+#[tokio::test]
+async fn test_reload_atomic_swap() {
+    let store = ConfigStore::open_in_memory().unwrap();
+
+    store.create_route(&make_route("r1", "first.test", "/")).unwrap();
+    store.create_backend(&make_backend("b1", "10.0.0.1:80")).unwrap();
+    store.link_route_backend("r1", "b1").unwrap();
+
+    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let proxy_config = Arc::new(arc_swap::ArcSwap::from_pointee(
+        lorica::proxy_wiring::ProxyConfig::default(),
+    ));
+
+    // First load
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+
+    let config1 = proxy_config.load();
+    assert!(config1.routes_by_host.contains_key("first.test"));
+
+    // Add a new route and reload
+    {
+        let s = store.lock().await;
+        s.create_route(&make_route("r2", "second.test", "/")).unwrap();
+        s.link_route_backend("r2", "b1").unwrap();
+    }
+
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+
+    let config2 = proxy_config.load();
+    assert!(config2.routes_by_host.contains_key("first.test"));
+    assert!(config2.routes_by_host.contains_key("second.test"));
+}
+
+/// Verify that down backends are not counted in healthy list.
+#[tokio::test]
+async fn test_down_backends_filtered() {
+    let store = ConfigStore::open_in_memory().unwrap();
+
+    store.create_route(&make_route("r1", "app.test", "/")).unwrap();
+
+    let mut b1 = make_backend("b1", "10.0.0.1:80");
+    let mut b2 = make_backend("b2", "10.0.0.2:80");
+    b2.health_status = HealthStatus::Down;
+
+    store.create_backend(&b1).unwrap();
+    store.create_backend(&b2).unwrap();
+    store.link_route_backend("r1", "b1").unwrap();
+    store.link_route_backend("r1", "b2").unwrap();
+
+    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let proxy_config = Arc::new(arc_swap::ArcSwap::from_pointee(
+        lorica::proxy_wiring::ProxyConfig::default(),
+    ));
+
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+
+    let config = proxy_config.load();
+    let routes = config.routes_by_host.get("app.test").unwrap();
+    // Both backends are in the config (filtering happens in upstream_peer)
+    assert_eq!(routes[0].backends.len(), 2);
+    // One is healthy, one is down
+    let healthy: Vec<_> = routes[0]
+        .backends
+        .iter()
+        .filter(|b| b.health_status != HealthStatus::Down)
+        .collect();
+    assert_eq!(healthy.len(), 1);
+    assert_eq!(healthy[0].address, "10.0.0.1:80");
+}
