@@ -2,6 +2,7 @@
   import Nav from '../components/Nav.svelte';
   import Overview from './Overview.svelte';
   import Routes from './Routes.svelte';
+  import Certificates from './Certificates.svelte';
   import Placeholder from './Placeholder.svelte';
   import { currentPath } from '../lib/router';
 
@@ -21,7 +22,7 @@
   {:else if path === '/backends'}
     <Placeholder title="Backends" />
   {:else if path === '/certificates'}
-    <Placeholder title="Certificates" />
+    <Certificates />
   {:else if path === '/logs'}
     <Placeholder title="Logs" />
   {:else if path === '/system'}
