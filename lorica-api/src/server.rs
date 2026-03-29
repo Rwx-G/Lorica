@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,6 +20,7 @@ pub struct AppState {
     pub store: Arc<Mutex<lorica_config::ConfigStore>>,
     pub log_buffer: Arc<LogBuffer>,
     pub system_cache: Arc<Mutex<SystemCache>>,
+    pub active_connections: Arc<AtomicU64>,
     pub started_at: Instant,
 }
 

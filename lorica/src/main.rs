@@ -124,6 +124,9 @@ async fn main() {
     // Create shared log buffer for access log capture (10,000 entries)
     let log_buffer = Arc::new(LogBuffer::new(10_000));
 
+    // Live active connection counter shared between proxy and API
+    let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // Build initial proxy config from database
     let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
     if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
@@ -135,7 +138,7 @@ async fn main() {
     let lorica_proxy = LoricaProxy::new(
         Arc::clone(&proxy_config),
         Arc::clone(&log_buffer),
-        tokio::runtime::Handle::current(),
+        Arc::clone(&active_connections),
     );
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
@@ -184,12 +187,14 @@ async fn main() {
     // Start API server (management plane)
     let api_store = Arc::clone(&store);
     let api_log_buffer = Arc::clone(&log_buffer);
+    let api_active_connections = Arc::clone(&active_connections);
     let management_port = cli.management_port;
     let api_handle = tokio::spawn(async move {
         let state = AppState {
             store: api_store.clone(),
             log_buffer: api_log_buffer,
             system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
+            active_connections: api_active_connections,
             started_at: Instant::now(),
         };
         let session_store = SessionStore::new();

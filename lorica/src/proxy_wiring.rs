@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -133,20 +133,20 @@ pub struct LoricaProxy {
     pub config: Arc<ArcSwap<ProxyConfig>>,
     /// Shared log buffer for dashboard access log viewing.
     pub log_buffer: Arc<LogBuffer>,
-    /// Tokio runtime handle for spawning async tasks from sync context.
-    pub rt_handle: tokio::runtime::Handle,
+    /// Live counter of active proxy connections.
+    pub active_connections: Arc<AtomicU64>,
 }
 
 impl LoricaProxy {
     pub fn new(
         config: Arc<ArcSwap<ProxyConfig>>,
         log_buffer: Arc<LogBuffer>,
-        rt_handle: tokio::runtime::Handle,
+        active_connections: Arc<AtomicU64>,
     ) -> Self {
         Self {
             config,
             log_buffer,
-            rt_handle,
+            active_connections,
         }
     }
 }
@@ -229,6 +229,7 @@ impl ProxyHttp for LoricaProxy {
         let backend = healthy_backends[idx];
 
         ctx.backend_addr = Some(backend.address.clone());
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
 
         let peer = Box::new(HttpPeer::new(
             &*backend.address,
@@ -294,6 +295,8 @@ impl ProxyHttp for LoricaProxy {
             );
         }
 
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+
         // Push to the in-memory log buffer for dashboard viewing
         let entry = LogEntry {
             id: 0, // assigned by LogBuffer
@@ -306,10 +309,7 @@ impl ProxyHttp for LoricaProxy {
             backend: backend_addr.to_string(),
             error: error_str,
         };
-        let buf = Arc::clone(&self.log_buffer);
-        self.rt_handle.spawn(async move {
-            buf.push(entry).await;
-        });
+        self.log_buffer.push(entry).await;
     }
 
     async fn connected_to_upstream(

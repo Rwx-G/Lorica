@@ -116,11 +116,9 @@ pub async fn get_system(
 
     // Proxy info
     let uptime = state.started_at.elapsed().as_secs();
-    let active_connections = {
-        let store = state.store.lock().await;
-        let backends = store.list_backends().unwrap_or_default();
-        backends.iter().map(|b| b.active_connections as u64).sum()
-    };
+    let active_connections = state
+        .active_connections
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     let response = SystemResponse {
         host: HostMetrics {

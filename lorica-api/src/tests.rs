@@ -19,6 +19,7 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         store: Arc::new(Mutex::new(store)),
         log_buffer: Arc::new(LogBuffer::new(1000)),
         system_cache: Arc::new(Mutex::new(SystemCache::new())),
+        active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         started_at: Instant::now(),
     };
     let session_store = SessionStore::new();
