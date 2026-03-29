@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Story 1.5:** `lorica-dashboard` crate - embedded web dashboard
+- Svelte 5 frontend with TypeScript, compiled to ~59KB bundle via Vite
+- Login screen consuming `/api/v1/auth/login` with session cookie auth
+- First-run password change screen for forced password rotation
+- Navigation sidebar: Overview, Routes, Backends, Certificates, Logs, System, Settings
+- Overview screen with status cards (route count, backend health, certificate status)
+- Static assets embedded in binary via `rust-embed` (< 5MB total)
+- `build.rs` auto-compiles frontend during `cargo build` (npm install + build)
+- SPA fallback routing (hash-based client-side navigation)
+- Dashboard served on management port (9443) alongside REST API
+
 ## [0.2.0] - 2026-03-29
 
 ### Added
