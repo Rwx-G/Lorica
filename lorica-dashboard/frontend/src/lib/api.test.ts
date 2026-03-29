@@ -106,3 +106,74 @@ describe('api.listCertificates', () => {
     expect(fetch).toHaveBeenCalledWith('/api/v1/certificates', expect.objectContaining({ method: 'GET' }));
   });
 });
+
+const mockCert = {
+  id: 'cert-1',
+  domain: 'example.com',
+  san_domains: [],
+  fingerprint: 'AA:BB:CC',
+  issuer: 'Test CA',
+  not_before: '2026-01-01T00:00:00Z',
+  not_after: '2027-01-01T00:00:00Z',
+  is_acme: false,
+  acme_auto_renew: false,
+  created_at: '2026-01-01T00:00:00Z',
+};
+
+describe('api.getCertificate', () => {
+  it('calls GET /api/v1/certificates/:id and returns detail', async () => {
+    mockFetch({ ...mockCert, cert_pem: '---PEM---', associated_routes: ['r1'] });
+    const res = await api.getCertificate('cert-1');
+    expect(res.data?.domain).toBe('example.com');
+    expect(res.data?.cert_pem).toBe('---PEM---');
+    expect(res.data?.associated_routes).toEqual(['r1']);
+    expect(fetch).toHaveBeenCalledWith('/api/v1/certificates/cert-1', expect.objectContaining({ method: 'GET' }));
+  });
+});
+
+describe('api.createCertificate', () => {
+  it('calls POST /api/v1/certificates with body', async () => {
+    mockFetch(mockCert);
+    const res = await api.createCertificate({ domain: 'test.com', cert_pem: 'cert', key_pem: 'key' });
+    expect(res.data?.id).toBe('cert-1');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/certificates',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ domain: 'test.com', cert_pem: 'cert', key_pem: 'key' }),
+      }),
+    );
+  });
+});
+
+describe('api.updateCertificate', () => {
+  it('calls PUT /api/v1/certificates/:id with body', async () => {
+    mockFetch(mockCert);
+    const res = await api.updateCertificate('cert-1', { domain: 'new.com' });
+    expect(res.data?.id).toBe('cert-1');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/certificates/cert-1',
+      expect.objectContaining({ method: 'PUT' }),
+    );
+  });
+});
+
+describe('api.deleteCertificate', () => {
+  it('calls DELETE /api/v1/certificates/:id', async () => {
+    mockFetch({ message: 'certificate deleted' });
+    const res = await api.deleteCertificate('cert-1');
+    expect(res.data?.message).toBe('certificate deleted');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/certificates/cert-1',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+  });
+});
+
+describe('api.deleteCertificate conflict', () => {
+  it('returns error on 409 when routes reference the cert', async () => {
+    mockFetch({ code: 'conflict', message: 'certificate is referenced by routes: r1' }, false, 409);
+    const res = await api.deleteCertificate('cert-1');
+    expect(res.error?.code).toBe('conflict');
+  });
+});

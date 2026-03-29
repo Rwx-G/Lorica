@@ -109,6 +109,23 @@ export interface CertificateResponse {
   created_at: string;
 }
 
+export interface CertificateDetailResponse extends CertificateResponse {
+  cert_pem: string;
+  associated_routes: string[];
+}
+
+export interface CreateCertificateRequest {
+  domain: string;
+  cert_pem: string;
+  key_pem: string;
+}
+
+export interface UpdateCertificateRequest {
+  domain?: string;
+  cert_pem?: string;
+  key_pem?: string;
+}
+
 export const api = {
   login: (creds: LoginRequest) =>
     request<LoginResponse>('POST', '/auth/login', creds),
@@ -143,4 +160,16 @@ export const api = {
 
   listCertificates: () =>
     request<{ certificates: CertificateResponse[] }>('GET', '/certificates'),
+
+  getCertificate: (id: string) =>
+    request<CertificateDetailResponse>('GET', `/certificates/${id}`),
+
+  createCertificate: (body: CreateCertificateRequest) =>
+    request<CertificateResponse>('POST', '/certificates', body),
+
+  updateCertificate: (id: string, body: UpdateCertificateRequest) =>
+    request<CertificateResponse>('PUT', `/certificates/${id}`, body),
+
+  deleteCertificate: (id: string) =>
+    request<{ message: string }>('DELETE', `/certificates/${id}`),
 };
