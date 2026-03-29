@@ -167,11 +167,6 @@
     }
   }
 
-  function backendLabel(id: string): string {
-    const b = backends.find((b) => b.id === id);
-    return b ? b.address : id.slice(0, 8);
-  }
-
   function certLabel(id: string): string {
     const c = certificates.find((c) => c.id === id);
     return c ? c.domain : id.slice(0, 8);
