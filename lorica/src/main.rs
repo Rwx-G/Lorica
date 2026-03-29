@@ -24,6 +24,7 @@ use lorica_api::logs::LogBuffer;
 use lorica_api::middleware::auth::SessionStore;
 use lorica_api::middleware::rate_limit::RateLimiter;
 use lorica_api::server::AppState;
+use lorica_api::system::SystemCache;
 use lorica_config::ConfigStore;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -188,6 +189,7 @@ async fn main() {
         let state = AppState {
             store: api_store.clone(),
             log_buffer: api_log_buffer,
+            system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
             started_at: Instant::now(),
         };
         let session_store = SessionStore::new();

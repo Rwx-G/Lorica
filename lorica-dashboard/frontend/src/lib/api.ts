@@ -152,6 +152,8 @@ export interface LogsQuery {
   status?: number;
   status_min?: number;
   status_max?: number;
+  time_from?: string;
+  time_to?: string;
   search?: string;
   limit?: number;
   after_id?: number;
@@ -241,6 +243,8 @@ export const api = {
     if (params?.status !== undefined) query.set('status', String(params.status));
     if (params?.status_min !== undefined) query.set('status_min', String(params.status_min));
     if (params?.status_max !== undefined) query.set('status_max', String(params.status_max));
+    if (params?.time_from) query.set('time_from', params.time_from);
+    if (params?.time_to) query.set('time_to', params.time_to);
     if (params?.search) query.set('search', params.search);
     if (params?.limit !== undefined) query.set('limit', String(params.limit));
     if (params?.after_id !== undefined) query.set('after_id', String(params.after_id));

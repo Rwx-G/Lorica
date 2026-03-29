@@ -51,12 +51,36 @@ pub struct ProxyInfo {
     pub active_connections: u64,
 }
 
+/// Cached system info to avoid expensive re-creation on every request.
+pub struct SystemCache {
+    sys: System,
+}
+
+impl SystemCache {
+    pub fn new() -> Self {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        Self { sys }
+    }
+
+    /// Refresh only the metrics we need (CPU, memory, process).
+    pub fn refresh(&mut self) {
+        self.sys.refresh_cpu_all();
+        self.sys.refresh_memory();
+        self.sys.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(std::process::id())]),
+            true,
+        );
+    }
+}
+
 /// GET /api/v1/system
 pub async fn get_system(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    let mut sys_cache = state.system_cache.lock().await;
+    sys_cache.refresh();
+    let sys = &sys_cache.sys;
 
     // Host CPU
     let cpu_usage = sys.global_cpu_usage();

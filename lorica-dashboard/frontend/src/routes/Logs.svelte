@@ -11,6 +11,7 @@
   let searchText = $state('');
   let filterRoute = $state('');
   let filterStatusCategory = $state('');
+  let filterTimeRange = $state('');
   let autoRefresh = $state(true);
 
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
@@ -23,6 +24,17 @@
     else if (filterStatusCategory === '3xx') { params.status_min = 300; params.status_max = 399; }
     else if (filterStatusCategory === '4xx') { params.status_min = 400; params.status_max = 499; }
     else if (filterStatusCategory === '5xx') { params.status_min = 500; params.status_max = 599; }
+
+    if (filterTimeRange) {
+      const now = new Date();
+      let from: Date;
+      if (filterTimeRange === '5m') from = new Date(now.getTime() - 5 * 60 * 1000);
+      else if (filterTimeRange === '15m') from = new Date(now.getTime() - 15 * 60 * 1000);
+      else if (filterTimeRange === '1h') from = new Date(now.getTime() - 60 * 60 * 1000);
+      else if (filterTimeRange === '6h') from = new Date(now.getTime() - 6 * 60 * 60 * 1000);
+      else from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      params.time_from = from.toISOString();
+    }
 
     const res = await api.getLogs(params);
     if (res.error) {
@@ -99,6 +111,15 @@
     { value: '4xx', label: '4xx Client Error' },
     { value: '5xx', label: '5xx Server Error' },
   ];
+
+  const timeRanges = [
+    { value: '', label: 'All time' },
+    { value: '5m', label: 'Last 5 min' },
+    { value: '15m', label: 'Last 15 min' },
+    { value: '1h', label: 'Last 1 hour' },
+    { value: '6h', label: 'Last 6 hours' },
+    { value: '24h', label: 'Last 24 hours' },
+  ];
 </script>
 
 <div class="logs-page">
@@ -132,6 +153,11 @@
     <select class="filter-select" bind:value={filterStatusCategory} onchange={loadLogs}>
       {#each statusCategories as cat}
         <option value={cat.value}>{cat.label}</option>
+      {/each}
+    </select>
+    <select class="filter-select" bind:value={filterTimeRange} onchange={loadLogs}>
+      {#each timeRanges as tr}
+        <option value={tr.value}>{tr.label}</option>
       {/each}
     </select>
     <span class="entry-count">{total} entries</span>

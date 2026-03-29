@@ -36,6 +36,7 @@ struct LogBufferInner {
 
 impl LogBuffer {
     pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "LogBuffer capacity must be > 0");
         Self {
             entries: tokio::sync::RwLock::new(LogBufferInner {
                 buf: Vec::with_capacity(capacity),
@@ -102,6 +103,10 @@ pub struct LogsQuery {
     pub status_min: Option<u16>,
     /// Filter by maximum status code.
     pub status_max: Option<u16>,
+    /// Filter by start time (ISO 8601 / RFC 3339).
+    pub time_from: Option<String>,
+    /// Filter by end time (ISO 8601 / RFC 3339).
+    pub time_to: Option<String>,
     /// Search text across method, path, host, backend, error fields.
     pub search: Option<String>,
     /// Maximum number of entries to return (default 200).
@@ -149,6 +154,16 @@ pub async fn get_logs(
             }
             if let Some(max) = params.status_max {
                 if e.status > max {
+                    return false;
+                }
+            }
+            if let Some(ref time_from) = params.time_from {
+                if e.timestamp.as_str() < time_from.as_str() {
+                    return false;
+                }
+            }
+            if let Some(ref time_to) = params.time_to {
+                if e.timestamp.as_str() > time_to.as_str() {
                     return false;
                 }
             }

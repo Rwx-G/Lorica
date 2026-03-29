@@ -11,12 +11,14 @@ use crate::logs::LogBuffer;
 use crate::middleware::auth::SessionStore;
 use crate::middleware::rate_limit::RateLimiter;
 use crate::server::{build_router, AppState};
+use crate::system::SystemCache;
 
 fn test_state() -> (AppState, SessionStore, RateLimiter) {
     let store = lorica_config::ConfigStore::open_in_memory().unwrap();
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         log_buffer: Arc::new(LogBuffer::new(1000)),
+        system_cache: Arc::new(Mutex::new(SystemCache::new())),
         started_at: Instant::now(),
     };
     let session_store = SessionStore::new();
@@ -1065,6 +1067,156 @@ async fn test_clear_logs_endpoint() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["data"]["total"], 0);
+}
+
+#[tokio::test]
+async fn test_logs_endpoint_status_range() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    use crate::logs::LogEntry;
+    for (status, path) in [(200, "/ok"), (301, "/redir"), (404, "/miss"), (500, "/err")] {
+        state
+            .log_buffer
+            .push(LogEntry {
+                id: 0,
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                method: "GET".into(),
+                path: path.into(),
+                host: "test.com".into(),
+                status,
+                latency_ms: 5,
+                backend: "10.0.0.1:80".into(),
+                error: None,
+            })
+            .await;
+    }
+
+    // Filter 4xx-5xx
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs?status_min=400")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 2);
+}
+
+#[tokio::test]
+async fn test_logs_endpoint_time_range() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    use crate::logs::LogEntry;
+    state
+        .log_buffer
+        .push(LogEntry {
+            id: 0,
+            timestamp: "2026-01-01T10:00:00Z".into(),
+            method: "GET".into(),
+            path: "/old".into(),
+            host: "test.com".into(),
+            status: 200,
+            latency_ms: 5,
+            backend: "10.0.0.1:80".into(),
+            error: None,
+        })
+        .await;
+    state
+        .log_buffer
+        .push(LogEntry {
+            id: 0,
+            timestamp: "2026-01-01T15:00:00Z".into(),
+            method: "GET".into(),
+            path: "/new".into(),
+            host: "test.com".into(),
+            status: 200,
+            latency_ms: 5,
+            backend: "10.0.0.1:80".into(),
+            error: None,
+        })
+        .await;
+
+    // Filter: only entries from 12:00 onwards
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs?time_from=2026-01-01T12:00:00Z")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 1);
+    assert_eq!(json["data"]["entries"][0]["path"], "/new");
+}
+
+#[tokio::test]
+async fn test_logs_endpoint_limit_and_after_id() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    use crate::logs::LogEntry;
+    for i in 1..=10 {
+        state
+            .log_buffer
+            .push(LogEntry {
+                id: 0,
+                timestamp: format!("2026-01-01T00:00:{:02}Z", i),
+                method: "GET".into(),
+                path: format!("/p{i}"),
+                host: "test.com".into(),
+                status: 200,
+                latency_ms: 5,
+                backend: "10.0.0.1:80".into(),
+                error: None,
+            })
+            .await;
+    }
+
+    // Limit to 3
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs?limit=3")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 10);
+    assert_eq!(json["data"]["entries"].as_array().unwrap().len(), 3);
+
+    // after_id: only entries after ID 5
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs?after_id=5")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 5);
 }
 
 // ---- System Endpoint Tests ----

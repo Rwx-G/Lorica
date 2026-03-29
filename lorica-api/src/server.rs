@@ -11,12 +11,14 @@ use tracing::info;
 use crate::logs::LogBuffer;
 use crate::middleware::auth::{require_auth, SessionStore};
 use crate::middleware::rate_limit::RateLimiter;
+use crate::system::SystemCache;
 
 /// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Mutex<lorica_config::ConfigStore>>,
     pub log_buffer: Arc<LogBuffer>,
+    pub system_cache: Arc<Mutex<SystemCache>>,
     pub started_at: Instant,
 }
 
