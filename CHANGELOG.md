@@ -68,6 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Configurable expiration thresholds (default: 30 days warning, 7 days critical)
 - API client methods for certificates (get, create, update, delete)
 - Frontend tests: CertExpiryBadge (10), certificate API client (6) - 16 new tests (36 total)
+- **Story 1.8:** Proxy engine wiring - live HTTP/HTTPS proxying from dashboard config
+- `LoricaProxy` struct implementing `ProxyHttp` trait for config-driven routing
+- Host-based and path-prefix routing with longest-prefix-match semantics
+- Round-robin backend selection with health-aware filtering (down/closing excluded)
+- TLS termination using certificates loaded from ConfigStore into rustls
+- Configuration hot-reload via `arc-swap` (no binary restart needed)
+- TCP health check background service with configurable interval
+- Structured JSON access logging (method, path, host, status, latency_ms, backend)
+- HTTP proxy listener on port 8080, HTTPS on 8443 (configurable via CLI)
+- TLS private key file permissions restricted to 0600 on Unix
+- Rust tests: 13 new tests (config linking, routing logic, prefix ordering, health filtering)
 
 ### Changed
 
