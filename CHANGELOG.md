@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CRUD operations for all configuration entities with route-backend associations
 - Database migration system (version-tracked, auto-run on startup)
 - TOML export/import with referential integrity validation and version field
+- AES-256-GCM encryption for certificate private keys at rest (via ring)
 
 ### Changed
 
