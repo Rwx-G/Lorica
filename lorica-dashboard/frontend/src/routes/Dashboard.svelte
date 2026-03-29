@@ -3,6 +3,8 @@
   import Overview from './Overview.svelte';
   import Routes from './Routes.svelte';
   import Certificates from './Certificates.svelte';
+  import Logs from './Logs.svelte';
+  import SystemView from './System.svelte';
   import Placeholder from './Placeholder.svelte';
   import { currentPath } from '../lib/router';
 
@@ -24,9 +26,9 @@
   {:else if path === '/certificates'}
     <Certificates />
   {:else if path === '/logs'}
-    <Placeholder title="Logs" />
+    <Logs />
   {:else if path === '/system'}
-    <Placeholder title="System" />
+    <SystemView />
   {:else if path === '/settings'}
     <Placeholder title="Settings" />
   {:else}

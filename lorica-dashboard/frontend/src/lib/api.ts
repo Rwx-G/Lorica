@@ -130,6 +130,61 @@ export interface GenerateSelfSignedRequest {
   domain: string;
 }
 
+export interface LogEntry {
+  id: number;
+  timestamp: string;
+  method: string;
+  path: string;
+  host: string;
+  status: number;
+  latency_ms: number;
+  backend: string;
+  error: string | null;
+}
+
+export interface LogsResponse {
+  entries: LogEntry[];
+  total: number;
+}
+
+export interface LogsQuery {
+  route?: string;
+  status?: number;
+  status_min?: number;
+  status_max?: number;
+  search?: string;
+  limit?: number;
+  after_id?: number;
+}
+
+export interface HostMetrics {
+  cpu_usage_percent: number;
+  cpu_count: number;
+  memory_total_bytes: number;
+  memory_used_bytes: number;
+  memory_usage_percent: number;
+  disk_total_bytes: number;
+  disk_used_bytes: number;
+  disk_usage_percent: number;
+}
+
+export interface ProcessMetrics {
+  memory_bytes: number;
+  cpu_usage_percent: number;
+}
+
+export interface ProxyInfo {
+  version: string;
+  uptime_seconds: number;
+  active_connections: number;
+}
+
+export interface SystemResponse {
+  host: HostMetrics;
+  process: ProcessMetrics;
+  proxy: ProxyInfo;
+}
+
 export const api = {
   login: (creds: LoginRequest) =>
     request<LoginResponse>('POST', '/auth/login', creds),
@@ -179,4 +234,23 @@ export const api = {
 
   generateSelfSigned: (body: GenerateSelfSignedRequest) =>
     request<CertificateResponse>('POST', '/certificates/self-signed', body),
+
+  getLogs: (params?: LogsQuery) => {
+    const query = new URLSearchParams();
+    if (params?.route) query.set('route', params.route);
+    if (params?.status !== undefined) query.set('status', String(params.status));
+    if (params?.status_min !== undefined) query.set('status_min', String(params.status_min));
+    if (params?.status_max !== undefined) query.set('status_max', String(params.status_max));
+    if (params?.search) query.set('search', params.search);
+    if (params?.limit !== undefined) query.set('limit', String(params.limit));
+    if (params?.after_id !== undefined) query.set('after_id', String(params.after_id));
+    const qs = query.toString();
+    return request<LogsResponse>('GET', `/logs${qs ? `?${qs}` : ''}`);
+  },
+
+  clearLogs: () =>
+    request<{ message: string }>('DELETE', '/logs'),
+
+  getSystem: () =>
+    request<SystemResponse>('GET', '/system'),
 };
