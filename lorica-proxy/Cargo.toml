@@ -1,0 +1,67 @@
+[package]
+name = "lorica-proxy"
+version = "0.1.0"
+authors = ["Romain G."]
+# Original author: Yuchen Wu <yuchen@cloudflare.com> (Cloudflare Pingora)
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.84"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "http", "proxy", "lorica"]
+exclude = ["tests/*"]
+description = """
+Lorica HTTP proxy APIs and traits. Forked from Pingora.
+"""
+
+[lib]
+name = "lorica_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+lorica-error = { version = "0.1.0", path = "../lorica-error" }
+lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = false }
+lorica-cache = { version = "0.1.0", path = "../lorica-cache", default-features = false }
+tokio = { workspace = true, features = ["macros", "net"] }
+lorica-http = { version = "0.1.0", path = "../lorica-http" }
+http = { workspace = true }
+futures = "0.3"
+bytes = { workspace = true }
+async-trait = { workspace = true }
+log = { workspace = true }
+h2 = { workspace = true }
+once_cell = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+rand = "0.8"
+
+[dev-dependencies]
+reqwest = { version = "0.11", features = ["gzip", "rustls-tls"], default-features = false }
+httparse = { workspace = true }
+tokio-test = "0.4"
+env_logger = "0.11"
+hyper = "0.14"
+tokio-tungstenite = "0.20.1"
+lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
+lorica-lb = { version = "0.1.0", path = "../lorica-lb", default-features = false }
+prometheus = "0"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yml = "0.0.12"
+
+[target.'cfg(unix)'.dev-dependencies]
+hyperlocal = "0.8"
+
+[features]
+default = []
+rustls = ["lorica-core/rustls", "lorica-cache/rustls", "any_tls"]
+any_tls = []
+connection_filter = ["lorica-core/connection_filter"]
+prometheus = ["lorica-core/prometheus"]
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "doc_async_trait"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(doc_async_trait)'] }

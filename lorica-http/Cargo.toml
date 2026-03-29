@@ -1,0 +1,27 @@
+[package]
+name = "lorica-http"
+version = "0.1.0"
+authors = ["Romain G."]
+# Original author: Yuchen Wu <yuchen@cloudflare.com> (Cloudflare Pingora)
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["web-programming"]
+keywords = ["http", "lorica"]
+description = """
+HTTP request and response header types for Pingora.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lorica_http"
+path = "src/lib.rs"
+
+[dependencies]
+http = { workspace = true }
+bytes = { workspace = true }
+lorica-error = { version = "0.1.0", path = "../lorica-error" }
+
+[features]
+default = []
+patched_http1 = []

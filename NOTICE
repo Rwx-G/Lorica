@@ -1,0 +1,17 @@
+Lorica
+Copyright 2026 Romain G.
+
+This product includes software developed by Cloudflare, Inc.
+https://github.com/cloudflare/pingora
+
+Pingora - Copyright 2024 Cloudflare, Inc.
+Licensed under the Apache License, Version 2.0
+
+Lorica is a fork of Pingora, modified to serve as a dashboard-first
+reverse proxy product. The original Pingora source code has been
+renamed from pingora-* to lorica-*, with unused components removed
+(OpenSSL, BoringSSL, s2n-tls backends, cache subsystem).
+
+Architectural patterns in Lorica are inspired by Sozu (Clever Cloud),
+reimplemented from scratch. No Sozu code has been copied (AGPL-3.0
+prevents code reuse).

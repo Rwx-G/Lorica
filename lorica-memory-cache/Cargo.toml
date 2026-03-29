@@ -1,0 +1,30 @@
+[package]
+name = "lorica-memory-cache"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["algorithms", "caching"]
+keywords = ["async", "cache", "lorica"]
+description = """
+An async in-memory cache with cache stampede protection.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lorica_memory_cache"
+path = "src/lib.rs"
+
+[dependencies]
+TinyUFO = { version = "0.8.0", path = "../tinyufo" }
+ahash = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+async-trait = { workspace = true }
+lorica-error = { version = "0.1.0", path = "../lorica-error" }
+log = { workspace = true }
+parking_lot = "0"
+lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }
+
+[dev-dependencies]
+once_cell = { workspace = true }

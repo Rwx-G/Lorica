@@ -1,7 +1,7 @@
 # Story 1.1: Fork and Strip Pingora
 
 **Epic:** [Epic 1 - Foundation](../prd/epic-1-foundation.md)
-**Status:** Draft
+**Status:** Review
 **Priority:** P0
 **Depends on:** None (first story)
 
@@ -32,20 +32,26 @@ so that I have a minimal, focused foundation to build on.
 
 ## Tasks
 
-- [ ] Clone Pingora repository
-- [ ] Remove git history, initialize fresh repo
-- [ ] Create NOTICE file with Cloudflare attribution
-- [ ] Rename all crate directories (`pingora-*` -> `lorica-*`)
-- [ ] Update all Cargo.toml package names and dependencies
-- [ ] Update all `use pingora_*` imports to `lorica_*`
-- [ ] Remove openssl, boringssl, s2n crates and their references
-- [ ] Remove cache, memory-cache, lru, tinyufo crates
-- [ ] Remove conditional TLS compilation (keep rustls only)
-- [ ] Remove Cloudflare-specific code (sentry, cf-rustracing)
-- [ ] Update deprecated deps (serde_yaml -> serde_yml, nix 0.24 -> 0.29+)
-- [ ] Run `cargo check` - fix all compilation errors
-- [ ] Run `cargo test` - fix all test failures
-- [ ] Verify no references to removed crates remain
+- [x] Clone Pingora repository
+- [x] Remove git history, initialize fresh repo
+- [x] Create NOTICE file with Cloudflare attribution
+- [x] Rename all crate directories (`pingora-*` -> `lorica-*`)
+- [x] Update all Cargo.toml package names and dependencies
+- [x] Update all `use pingora_*` imports to `lorica_*`
+- [x] Remove openssl, boringssl, s2n crates and their references
+- [ ] Remove cache, memory-cache, lru, tinyufo crates (kept temporarily - proxy depends on cache)
+- [x] Remove conditional TLS compilation (keep rustls only)
+- [x] Remove Cloudflare-specific code (sentry features removed, examples removed)
+- [x] Update deprecated deps (serde_yaml -> serde_yml)
+- [x] Run `cargo check` - PASS (warnings only, no errors)
+- [x] Run `cargo test` - PASS (558 tests, 0 failures, 1 skipped env-dependent)
+- [x] Verify no references to removed crates remain (0 pingora mentions in code)
+
+## Deferred Items
+
+- nix 0.24 -> 0.29 migration deferred (API breaking changes require deeper refactoring)
+- Cache crate kept temporarily (proxy has deep coupling with cache - needs dedicated story to decouple)
+- cf-rustracing kept in cache crate only (Cloudflare tracing dependency, will be removed with cache decoupling)
 
 ## Dev Notes
 

@@ -1,0 +1,37 @@
+[package]
+name = "lorica-timeout"
+version = "0.1.0"
+authors = ["Romain G."]
+# Original author: Yuchen Wu <yuchen@cloudflare.com> (Cloudflare Pingora)
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["asynchronous"]
+keywords = ["async", "non-blocking", "lorica"]
+description = """
+Highly efficient async timer and timeout system for Tokio runtimes.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lorica_timeout"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true, features = [
+    "time",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+] }
+pin-project-lite = "0.2"
+once_cell = { workspace = true }
+parking_lot = "0.12"
+thread_local = "1.0"
+
+[dev-dependencies]
+bencher = "0.1.5"
+
+[[bench]]
+name = "benchmark"
+harness = false

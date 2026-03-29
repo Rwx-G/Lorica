@@ -1,0 +1,30 @@
+[package]
+name = "lorica-pool"
+version = "0.1.0"
+authors = ["Romain G."]
+# Original author: Yuchen Wu <yuchen@cloudflare.com> (Cloudflare Pingora)
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["network-programming"]
+keywords = ["async", "pooling", "lorica"]
+description = """
+A connection pool system for connection reuse.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lorica_pool"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["sync", "io-util"] }
+thread_local = "1.0"
+lru = { workspace = true }
+log = { workspace = true }
+parking_lot = "0.12"
+crossbeam-queue = "0.3"
+lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }
+
+[dev-dependencies]
+tokio-test = "0.4"

@@ -1,0 +1,26 @@
+[package]
+name = "lorica-tls"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "tls", "ssl", "lorica"]
+description = """
+RusTLS async APIs for Pingora.
+"""
+
+[lib]
+name = "lorica_tls"
+path = "src/lib.rs"
+
+[dependencies]
+log = "0.4.21"
+lorica-error = { version = "0.1.0", path = "../lorica-error"}
+ring = "0.17.12"
+rustls = "0.23.12"
+rustls-native-certs = "0.7.1"
+rustls-pemfile = "2.1.2"
+rustls-pki-types = "1.7.0"
+tokio-rustls = "0.26.0"
+no_debug = "3.1.0"

@@ -1,0 +1,18 @@
+[package]
+name = "lorica-error"
+version = "0.1.0"
+authors = ["Romain G."]
+# Original author: Yuchen Wu <yuchen@cloudflare.com> (Cloudflare Pingora)
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["rust-patterns"]
+keywords = ["error", "error-handling", "lorica"]
+description = """
+Error types and error handling APIs for Pingora.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lorica_error"
+path = "src/lib.rs"

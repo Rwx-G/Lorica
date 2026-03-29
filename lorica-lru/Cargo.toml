@@ -1,0 +1,34 @@
+[package]
+name = "lorica-lru"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["algorithms", "caching"]
+keywords = ["lru", "cache", "lorica"]
+description = """
+LRU cache that focuses on memory efficiency, concurrency and persistence.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lorica_lru"
+path = "src/lib.rs"
+
+[dependencies]
+hashbrown = "0"
+parking_lot = "0"
+arrayvec = "0"
+rand = "0.8"
+
+[dev-dependencies]
+lru = { workspace = true }
+
+[[bench]]
+name = "bench_linked_list"
+harness = false
+
+[[bench]]
+name = "bench_lru"
+harness = false

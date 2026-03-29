@@ -1,0 +1,32 @@
+[package]
+name = "lorica-limits"
+version = "0.1.0"
+authors = ["Romain G."]
+# Original author: Yuchen Wu <yuchen@cloudflare.com> (Cloudflare Pingora)
+license = "Apache-2.0"
+description = "A library for rate limiting and event frequency estimation"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["algorithms"]
+keywords = ["rate-limit", "lorica"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lorica_limits"
+path = "src/lib.rs"
+
+[dependencies]
+ahash = { workspace = true }
+
+[dev-dependencies]
+rand = "0.8"
+dashmap = "5"
+dhat = "0"
+float-cmp = "0.9.0"
+
+[[bench]]
+name = "benchmark"
+harness = false
+
+[features]
+dhat-heap = [] # for benchmark only

@@ -1,0 +1,56 @@
+[package]
+name = "lorica"
+version = "0.1.0"
+authors = ["Romain G."]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = """
+A modern, secure, dashboard-first reverse proxy built in Rust.
+"""
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "proxy", "http", "reverse-proxy", "lorica"]
+
+[lib]
+name = "lorica"
+path = "src/lib.rs"
+
+[dependencies]
+lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = false }
+lorica-http = { version = "0.1.0", path = "../lorica-http" }
+lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }
+lorica-lb = { version = "0.1.0", path = "../lorica-lb", optional = true, default-features = false }
+lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, default-features = false }
+
+[dev-dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+async-trait = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+once_cell = { workspace = true }
+bytes = { workspace = true }
+
+[features]
+default = ["rustls"]
+
+rustls = [
+    "lorica-core/rustls",
+    "lorica-proxy?/rustls",
+    "lorica-lb?/rustls",
+    "any_tls",
+]
+
+proxy = ["lorica-proxy"]
+lb = ["lorica-lb", "proxy"]
+
+time = []
+
+connection_filter = [
+    "lorica-core/connection_filter",
+    "lorica-proxy?/connection_filter",
+]
+
+any_tls = []
+patched_http1 = ["lorica-core/patched_http1"]
+prometheus = ["lorica-core/prometheus"]

@@ -1,0 +1,33 @@
+[package]
+name = "lorica-header-serde"
+version = "0.1.0"
+authors = ["Romain G."]
+# Original author: Yuchen Wu <yuchen@cloudflare.com> (Cloudflare Pingora)
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["compression"]
+keywords = ["http", "compression", "lorica"]
+exclude = ["samples/*"]
+description = """
+HTTP header (de)serialization and compression for Pingora.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lorica_header_serde"
+path = "src/lib.rs"
+
+[[bin]]
+name = "trainer"
+path = "src/trainer.rs"
+
+[dependencies]
+zstd = "0.13.1"
+zstd-safe = { version = "7.1.0", features = ["std"] }
+http = { workspace = true }
+bytes = { workspace = true }
+httparse = { workspace = true }
+lorica-error = { version = "0.1.0", path = "../lorica-error" }
+lorica-http = { version = "0.1.0", path = "../lorica-http" }
+thread_local = "1.0"

@@ -1,0 +1,41 @@
+[package]
+name = "lorica-lb"
+version = "0.1.0"
+authors = ["Romain G."]
+# Original author: Yuchen Wu <yuchen@cloudflare.com> (Cloudflare Pingora)
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+categories = ["network-programming"]
+keywords = ["proxy", "lorica"]
+description = """
+Common load balancing features for Lorica proxy. Forked from Pingora.
+"""
+
+[lib]
+name = "lorica_lb"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+lorica-http = { version = "0.1.0", path = "../lorica-http" }
+lorica-error = { version = "0.1.0", path = "../lorica-error" }
+lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = false }
+lorica-ketama = { version = "0.1.0", path = "../lorica-ketama" }
+lorica-runtime = { version = "0.1.0", path = "../lorica-runtime" }
+arc-swap = "1"
+fnv = "1"
+rand = "0.8"
+tokio = { workspace = true }
+futures = "0"
+log = { workspace = true }
+http = { workspace = true }
+derivative.workspace = true
+
+[dev-dependencies]
+
+[features]
+default = []
+rustls = ["lorica-core/rustls", "any_tls"]
+any_tls = []
+v2 = ["lorica-ketama/v2"]
