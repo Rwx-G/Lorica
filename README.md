@@ -1,6 +1,6 @@
 # Lorica
 
-![Version](https://img.shields.io/badge/version-0.2.0--dev-blue)
+![Version](https://img.shields.io/badge/version-0.3.0--dev-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Status](https://img.shields.io/badge/status-early%20development-orange)
 

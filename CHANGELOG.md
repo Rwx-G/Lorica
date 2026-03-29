@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-29
+
 ### Added
 
 - **Story 1.5:** `lorica-dashboard` crate - embedded web dashboard
