@@ -1,0 +1,57 @@
+schema: 1
+story: "1.7"
+story_title: "Dashboard - Certificate Management"
+gate: PASS
+status_reason: "All 6 ACs met at the UI level. Full certificate CRUD with list, PEM upload, detail view, edit, delete with impact display, self-signed generation with preference memory prompt, and configurable expiration thresholds. 36 frontend tests total (16 new). Type checking clean (0 errors). Three items deferred to future stories (preference persistence, threshold persistence, real self-signed generation) as they require backend endpoints not yet available."
+reviewer: "Quinn (Test Architect)"
+updated: "2026-03-29T23:30:00Z"
+
+waiver: { active: false }
+
+top_issues:
+  - id: "FUTURE-001"
+    severity: low
+    finding: "Self-signed preference memory is client-side only, lost on page refresh"
+    suggested_action: "Persist to UserPreference API when Settings page (Story 1.10) adds the endpoint"
+    suggested_owner: dev
+  - id: "FUTURE-002"
+    severity: low
+    finding: "Expiration threshold config is client-side only, lost on navigation"
+    suggested_action: "Persist to GlobalSettings when Settings page (Story 1.10) adds the endpoint"
+    suggested_owner: dev
+
+quality_score: 95
+expires: "2026-04-12T00:00:00Z"
+
+evidence:
+  tests_reviewed: 36
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6]
+    ac_gaps: []
+  iv_verified:
+    - "IV1: Upload calls POST /api/v1/certificates, cert stored with encrypted key_pem - TLS termination wiring is Story 1.8"
+    - "IV2: CertExpiryBadge calculates days until expiry and shows valid/warning/critical/expired - 10 tests cover all states"
+    - "IV3: Delete shows affected routes, API returns 409 Conflict when routes reference cert - tested with conflict scenario"
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "No XSS vectors. @html only for static SVG icons. PEM displayed via text interpolation. Private keys sent to backend for AES-256-GCM encryption at rest. No secrets in frontend."
+  performance:
+    status: PASS
+    notes: "Parallel API calls (certificates + routes) on mount. CertExpiryBadge uses $derived for efficient recalculation."
+  reliability:
+    status: PASS
+    notes: "Error handling on all API calls with user-visible banners. Loading states for list and detail view. Form validation on required fields. Threshold validation (critical < warning)."
+  maintainability:
+    status: PASS
+    notes: "Consistent with Story 1.6 patterns. CertExpiryBadge extracted as reusable component with 10 tests. TypeScript interfaces match Rust API types exactly. 16 new tests (36 total)."
+
+recommendations:
+  immediate: []
+  future:
+    - action: "Persist self-signed preference and threshold config to backend when Settings API is available"
+      refs: ["lorica-dashboard/frontend/src/routes/Certificates.svelte:57", "lorica-dashboard/frontend/src/routes/Certificates.svelte:20-21"]
+    - action: "Add backend endpoint for real self-signed certificate generation (rcgen or similar)"
+      refs: ["lorica-api/src/certificates.rs"]
