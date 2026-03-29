@@ -1,7 +1,7 @@
 # Story 1.6: Dashboard - Route Management
 
 **Epic:** [Epic 1 - Foundation](../prd/epic-1-foundation.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Depends on:** Story 1.5
 
@@ -64,6 +64,18 @@ so that I can manage my proxy configuration visually.
 - `lorica-dashboard/frontend/src/routes/Routes.svelte` - NEW - Route management page (list + CRUD)
 - `lorica-dashboard/frontend/src/routes/Dashboard.svelte` - Updated to use Routes instead of Placeholder
 
+## QA Results
+
+- **Gate:** PASS (score: 97/100)
+- **Reviewer:** Romain G.
+- **AC Coverage:** All 6 ACs met, all 3 IVs verified
+- **Issues Found:** 1 low-severity (dead code - `backendLabel` function) - fixed
+- **NFR:** Security PASS, Performance PASS, Reliability PASS, Maintainability PASS
+- **Future Recommendations:**
+  - Add Vitest + @testing-library/svelte for frontend component tests
+  - Consider keyboard navigation (Escape to close modal, Enter to submit)
+
 ## Change Log
 
 - 2026-03-29: Implementation complete, all tasks checked off, status set to Review
+- 2026-03-29: QA PASS (97/100), dead code fixed, status set to Done

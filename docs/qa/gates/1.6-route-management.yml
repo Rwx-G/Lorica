@@ -1,0 +1,50 @@
+schema: 1
+story: "1.6"
+story_title: "Dashboard - Route Management"
+gate: PASS
+status_reason: "All 6 ACs met. Full CRUD for routes via dashboard with data table, create/edit modal, delete confirmation, and health status indicators. All operations go through the REST API. Type checks clean, build passes, 5 Rust dashboard tests pass."
+reviewer: "Romain G."
+updated: "2026-03-29T22:00:00Z"
+
+waiver: { active: false }
+
+top_issues:
+  - severity: low
+    description: "Dead code (backendLabel function) found and removed during review"
+    resolution: "Fixed in commit fix(ui): remove unused backendLabel function"
+
+quality_score: 97
+expires: "2026-04-12T00:00:00Z"
+
+evidence:
+  tests_reviewed: 5
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6]
+    ac_gaps: []
+  iv_verified:
+    - "IV1: Route creation calls POST /api/v1/routes, then reloads list via GET"
+    - "IV2: Route deletion calls DELETE /api/v1/routes/:id, then reloads list"
+    - "IV3: onMount triggers loadData, all mutations followed by loadData refresh"
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "No XSS vectors - Svelte auto-escapes template output. @html only used for static SVG icon constants. API calls use same-origin credentials."
+  performance:
+    status: PASS
+    notes: "Bundle size unchanged at 64.73 KB. Parallel API fetching (routes + backends + certificates) on mount. No unnecessary re-renders."
+  reliability:
+    status: PASS
+    notes: "Error states handled for all API calls. Loading state prevents interaction during fetch. Form validation prevents empty hostname submission."
+  maintainability:
+    status: PASS
+    notes: "Consistent Svelte 5 patterns ($state, $props). Reusable StatusBadge and ConfirmDialog components. TypeScript interfaces match Rust API types."
+
+recommendations:
+  immediate: []
+  future:
+    - action: "Add Vitest + @testing-library/svelte for frontend component tests"
+      refs: ["lorica-dashboard/frontend/"]
+    - action: "Consider keyboard navigation (Escape to close modal, Enter to submit)"
+      refs: ["lorica-dashboard/frontend/src/routes/Routes.svelte"]
