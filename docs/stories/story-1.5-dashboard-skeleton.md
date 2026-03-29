@@ -1,7 +1,7 @@
 # Story 1.5: Dashboard - Embedded Frontend Skeleton
 
 **Epic:** [Epic 1 - Foundation](../prd/epic-1-foundation.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Depends on:** Story 1.4
 
