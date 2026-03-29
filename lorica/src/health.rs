@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use lorica_config::models::HealthStatus;
@@ -27,6 +27,30 @@ use lorica::proxy_wiring::ProxyConfig;
 use lorica::reload::reload_proxy_config;
 
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Latency threshold above which a backend is considered degraded (ms).
+const DEGRADED_THRESHOLD_MS: u128 = 2000;
+
+/// Result of a single TCP health check probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeResult {
+    /// Connection succeeded within the degraded threshold.
+    Healthy,
+    /// Connection succeeded but took longer than the degraded threshold.
+    Degraded,
+    /// Connection failed or timed out.
+    Down,
+}
+
+impl ProbeResult {
+    pub fn to_health_status(&self) -> HealthStatus {
+        match self {
+            ProbeResult::Healthy => HealthStatus::Healthy,
+            ProbeResult::Degraded => HealthStatus::Degraded,
+            ProbeResult::Down => HealthStatus::Down,
+        }
+    }
+}
 
 /// Run TCP health checks in a loop, updating backend health status in the database
 /// and triggering a config reload when status changes.
@@ -57,10 +81,8 @@ pub async fn health_check_loop(
                 continue;
             }
 
-            let new_status = match tcp_check(&backend.address).await {
-                true => HealthStatus::Healthy,
-                false => HealthStatus::Down,
-            };
+            let probe = tcp_probe(&backend.address).await;
+            let new_status = probe.to_health_status();
 
             if new_status != backend.health_status {
                 debug!(
@@ -94,17 +116,96 @@ pub async fn health_check_loop(
     }
 }
 
-/// Attempt a TCP connection to the given address. Returns true if successful.
-async fn tcp_check(address: &str) -> bool {
+/// Attempt a TCP connection and measure latency.
+/// Returns Healthy if connect < DEGRADED_THRESHOLD_MS, Degraded if slower, Down on failure.
+async fn tcp_probe(address: &str) -> ProbeResult {
+    let start = Instant::now();
     match timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(address)).await {
-        Ok(Ok(_)) => true,
+        Ok(Ok(_stream)) => {
+            let elapsed_ms = start.elapsed().as_millis();
+            if elapsed_ms > DEGRADED_THRESHOLD_MS {
+                debug!(
+                    address = %address,
+                    latency_ms = elapsed_ms as u64,
+                    threshold_ms = DEGRADED_THRESHOLD_MS as u64,
+                    "TCP health check slow - marking degraded"
+                );
+                ProbeResult::Degraded
+            } else {
+                ProbeResult::Healthy
+            }
+        }
         Ok(Err(e)) => {
             debug!(address = %address, error = %e, "TCP health check failed");
-            false
+            ProbeResult::Down
         }
         Err(_) => {
             debug!(address = %address, "TCP health check timed out");
-            false
+            ProbeResult::Down
         }
+    }
+}
+
+/// Determine probe result from a latency value (for testing).
+#[cfg(test)]
+fn classify_latency(connected: bool, latency_ms: u128) -> ProbeResult {
+    if !connected {
+        ProbeResult::Down
+    } else if latency_ms > DEGRADED_THRESHOLD_MS {
+        ProbeResult::Degraded
+    } else {
+        ProbeResult::Healthy
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_latency_healthy() {
+        assert_eq!(classify_latency(true, 50), ProbeResult::Healthy);
+        assert_eq!(classify_latency(true, 0), ProbeResult::Healthy);
+        assert_eq!(classify_latency(true, 1999), ProbeResult::Healthy);
+        assert_eq!(classify_latency(true, 2000), ProbeResult::Healthy);
+    }
+
+    #[test]
+    fn test_classify_latency_degraded() {
+        assert_eq!(classify_latency(true, 2001), ProbeResult::Degraded);
+        assert_eq!(classify_latency(true, 5000), ProbeResult::Degraded);
+    }
+
+    #[test]
+    fn test_classify_latency_down() {
+        assert_eq!(classify_latency(false, 0), ProbeResult::Down);
+        assert_eq!(classify_latency(false, 3000), ProbeResult::Down);
+    }
+
+    #[test]
+    fn test_probe_result_to_health_status() {
+        assert_eq!(ProbeResult::Healthy.to_health_status(), HealthStatus::Healthy);
+        assert_eq!(ProbeResult::Degraded.to_health_status(), HealthStatus::Degraded);
+        assert_eq!(ProbeResult::Down.to_health_status(), HealthStatus::Down);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_probe_unreachable_address() {
+        // Use a non-routable address to guarantee failure
+        let result = tcp_probe("192.0.2.1:1").await;
+        assert_eq!(result, ProbeResult::Down);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_probe_invalid_address() {
+        let result = tcp_probe("not-a-valid-address").await;
+        assert_eq!(result, ProbeResult::Down);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_probe_refused() {
+        // Localhost on a port nothing is listening on
+        let result = tcp_probe("127.0.0.1:1").await;
+        assert_eq!(result, ProbeResult::Down);
     }
 }
