@@ -11,17 +11,18 @@ Story 1.8 (Proxy Engine Wiring) has been successfully implemented and passed qua
 
 | Stack | Tests | Status |
 |-------|-------|--------|
-| Rust (cargo test -p lorica) | 13 | PASS |
+| Rust (cargo test -p lorica) | 20 | PASS |
 
 New tests added in Story 1.8:
 - 7 unit tests for ConfigStore route/backend linking and CRUD operations
 - 6 integration tests for proxy config construction, routing logic, prefix ordering, disabled route filtering, atomic config swap, and health status filtering
+- 7 health check unit tests for latency classification, probe-to-status mapping, and TCP probing (unreachable/invalid/refused)
 
 ## Story Status
 
 | Story | Title | Gate | Score | QA Iterations |
 |-------|-------|------|-------|---------------|
-| 1.8 | Proxy Engine Wiring | PASS | 95 | 1 |
+| 1.8 | Proxy Engine Wiring | PASS | 98 | 1 |
 
 ## PRD Acceptance Criteria Traceability
 
@@ -83,12 +84,9 @@ None - all critical requirements met.
 
 ### Future
 1. **API-triggered config reload** - Route/backend mutations via API should trigger `reload_proxy_config()` so changes are immediately visible without waiting for health check interval
-2. **Health check unit tests** - Add tests for `tcp_check()` and `health_check_loop` status change detection
-3. **TLS key cleanup on shutdown** - Delete temporary key files in the shutdown path
-4. **Degraded health status** - Support latency-based degraded detection (not just up/down)
 
 ## Epic Gate Decision
 
 **Gate: PASS**
-**Quality Score: 95/100**
-**Rationale:** All acceptance criteria are met with appropriate test coverage. One minor design trade-off (AC5 fixed ports vs dynamic ports) is well-documented and pragmatic. Security fix for key permissions was applied during review. No blocking issues.
+**Quality Score: 98/100**
+**Rationale:** All acceptance criteria are met with 20 tests. Latency-based degraded detection, TLS key cleanup on shutdown, and health check unit tests all addressed. One remaining item: API-triggered config reload (medium, backlog).

@@ -136,15 +136,16 @@ Solid implementation of the proxy engine wiring. The architecture cleanly separa
 
 - [x] Restrict TLS private key file permissions (security fix - applied)
 - [ ] Add API endpoint to trigger manual config reload (currently only health check triggers reload; API mutations should also trigger it)
-- [ ] Add Degraded health status support in health check (currently only Healthy/Down, no intermediate state)
-- [ ] Add tests for health check module (TCP check logic, status change detection)
+- [x] Add Degraded health status support in health check (latency-based, threshold 2000ms)
+- [x] Add tests for health check module (7 tests: latency classification, TCP probing)
+- [x] Clean up TLS key files on shutdown
 
 ### Security Review
 
 - **Fixed**: TLS private key file permissions now restricted to 0600 on Unix
 - **OK**: No secrets in code, proxy data plane binds 0.0.0.0, management API binds localhost only
 - **OK**: Error messages in 404/502 responses don't leak internal details beyond host/path
-- **Note**: TLS key is written to disk in plaintext from the encrypted-at-rest DB. This is necessary for rustls but the key file should be cleaned up on shutdown (future improvement)
+- **Fixed**: TLS key files cleaned up on graceful shutdown
 
 ### Performance Considerations
 
@@ -162,7 +163,7 @@ Solid implementation of the proxy engine wiring. The architecture cleanly separa
 ### Gate Status
 
 Gate: PASS - docs/qa/gates/1.8-proxy-wiring.yml
-Quality Score: 95/100
+Quality Score: 98/100
 
 ### Recommended Status
 

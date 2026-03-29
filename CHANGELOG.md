@@ -78,7 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Structured JSON access logging (method, path, host, status, latency_ms, backend)
 - HTTP proxy listener on port 8080, HTTPS on 8443 (configurable via CLI)
 - TLS private key file permissions restricted to 0600 on Unix
-- Rust tests: 13 new tests (config linking, routing logic, prefix ordering, health filtering)
+- Latency-based degraded health detection (backends marked Degraded when TCP connect > 2s)
+- TLS key file cleanup on graceful shutdown
+- Rust tests: 20 new tests (config linking, routing logic, prefix ordering, health filtering, TCP probing)
 
 ### Changed
 
