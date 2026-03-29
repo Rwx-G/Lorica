@@ -12,8 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod health;
+mod proxy;
+mod reload;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use clap::Parser;
-use tracing::{info, warn};
+use lorica_api::middleware::auth::SessionStore;
+use lorica_api::middleware::rate_limit::RateLimiter;
+use lorica_api::server::AppState;
+use lorica_config::ConfigStore;
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
+
+use proxy::{LoricaProxy, ProxyConfig};
+use reload::reload_proxy_config;
 
 const DEFAULT_DATA_DIR: &str = if cfg!(unix) {
     "/var/lib/lorica"
@@ -22,6 +38,7 @@ const DEFAULT_DATA_DIR: &str = if cfg!(unix) {
 };
 
 const DEFAULT_MANAGEMENT_PORT: u16 = 9443;
+const DEFAULT_HTTP_PORT: u16 = 8080;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,6 +58,10 @@ struct Cli {
     /// Management port (localhost only)
     #[arg(long, default_value_t = DEFAULT_MANAGEMENT_PORT)]
     management_port: u16,
+
+    /// HTTP proxy listen port
+    #[arg(long, default_value_t = DEFAULT_HTTP_PORT)]
+    http_port: u16,
 }
 
 fn init_logging(log_level: &str) {
@@ -63,6 +84,7 @@ fn startup_banner(cli: &Cli) {
         version = env!("CARGO_PKG_VERSION"),
         data_dir = %cli.data_dir,
         management_port = cli.management_port,
+        http_port = cli.http_port,
         "Lorica reverse proxy starting"
     );
 }
@@ -74,10 +96,92 @@ async fn main() {
     init_logging(&cli.log_level);
     startup_banner(&cli);
 
+    // Ensure data directory exists
+    let data_dir = PathBuf::from(&cli.data_dir);
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        error!(error = %e, path = %data_dir.display(), "failed to create data directory");
+        std::process::exit(1);
+    }
+
+    // Open the configuration database
+    let db_path = data_dir.join("lorica.db");
+    let store = match ConfigStore::open(&db_path, None) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "failed to open configuration database");
+            std::process::exit(1);
+        }
+    };
+
+    let store = Arc::new(Mutex::new(store));
+
+    // Build initial proxy config from database
+    let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+    if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
+        error!(error = %e, "failed to load initial proxy configuration");
+        std::process::exit(1);
+    }
+
+    // Start the HTTP proxy service using the lorica-core server framework
+    let lorica_proxy = LoricaProxy::new(Arc::clone(&proxy_config));
+    let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
+    let mut proxy_service =
+        lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
+    proxy_service.add_tcp(&format!("0.0.0.0:{}", cli.http_port));
+
+    info!(port = cli.http_port, "HTTP proxy listener configured");
+
+    // Start API server (management plane)
+    let api_store = Arc::clone(&store);
+    let management_port = cli.management_port;
+    let api_handle = tokio::spawn(async move {
+        let state = AppState {
+            store: api_store.clone(),
+        };
+        let session_store = SessionStore::new();
+        let rate_limiter = RateLimiter::new();
+
+        if let Err(e) =
+            lorica_api::server::start_server(management_port, state, session_store, rate_limiter)
+                .await
+        {
+            error!(error = %e, "API server exited with error");
+        }
+    });
+
+    // Start health check background task
+    let health_store = Arc::clone(&store);
+    let health_config = Arc::clone(&proxy_config);
+    let health_interval = {
+        let s = store.lock().await;
+        s.get_global_settings()
+            .map(|gs| gs.default_health_check_interval_s as u64)
+            .unwrap_or(10)
+    };
+    let health_handle = tokio::spawn(async move {
+        health::health_check_loop(health_store, health_config, health_interval).await;
+    });
+
+    // Run the proxy engine in a dedicated thread (it blocks via run_forever)
+    let _proxy_thread = std::thread::spawn(move || {
+        let mut server =
+            lorica_core::server::Server::new(None).expect("failed to create proxy server");
+        server.bootstrap();
+        server.add_service(proxy_service);
+        server.run_forever();
+    });
+
     // Wait for shutdown signal
     shutdown_signal().await;
 
     info!("Lorica shutting down gracefully");
+
+    // Abort background tasks
+    api_handle.abort();
+    health_handle.abort();
+
+    // The proxy thread runs in its own process lifecycle via run_forever;
+    // it handles signals internally. We just exit.
 }
 
 async fn shutdown_signal() {
