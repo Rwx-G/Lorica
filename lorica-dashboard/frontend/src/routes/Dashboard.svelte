@@ -5,6 +5,7 @@
   import Certificates from './Certificates.svelte';
   import Logs from './Logs.svelte';
   import SystemView from './System.svelte';
+  import Settings from './Settings.svelte';
   import Placeholder from './Placeholder.svelte';
   import { currentPath } from '../lib/router';
 
@@ -30,7 +31,7 @@
   {:else if path === '/system'}
     <SystemView />
   {:else if path === '/settings'}
-    <Placeholder title="Settings" />
+    <Settings />
   {:else}
     <Placeholder title="Not Found" />
   {/if}

@@ -187,6 +187,64 @@ export interface SystemResponse {
   proxy: ProxyInfo;
 }
 
+export interface GlobalSettingsResponse {
+  management_port: number;
+  log_level: string;
+  default_health_check_interval_s: number;
+}
+
+export interface UpdateSettingsRequest {
+  management_port?: number;
+  log_level?: string;
+  default_health_check_interval_s?: number;
+}
+
+export interface NotificationConfigResponse {
+  id: string;
+  channel: string;
+  enabled: boolean;
+  config: string;
+  alert_types: string[];
+}
+
+export interface CreateNotificationRequest {
+  channel: string;
+  enabled?: boolean;
+  config: string;
+  alert_types: string[];
+}
+
+export interface UserPreferenceResponse {
+  id: string;
+  preference_key: string;
+  value: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EntityDiff {
+  added: string[];
+  modified: string[];
+  removed: string[];
+}
+
+export interface SettingChange {
+  key: string;
+  old_value: string;
+  new_value: string;
+}
+
+export interface ImportDiffResponse {
+  routes: EntityDiff;
+  backends: EntityDiff;
+  certificates: EntityDiff;
+  route_backends: EntityDiff;
+  notification_configs: EntityDiff;
+  user_preferences: EntityDiff;
+  admin_users: EntityDiff;
+  global_settings: { changes: SettingChange[] };
+}
+
 export const api = {
   login: (creds: LoginRequest) =>
     request<LoginResponse>('POST', '/auth/login', creds),
@@ -257,4 +315,55 @@ export const api = {
 
   getSystem: () =>
     request<SystemResponse>('GET', '/system'),
+
+  // Settings
+  getSettings: () =>
+    request<GlobalSettingsResponse>('GET', '/settings'),
+
+  updateSettings: (body: UpdateSettingsRequest) =>
+    request<GlobalSettingsResponse>('PUT', '/settings', body),
+
+  // Notifications
+  listNotifications: () =>
+    request<{ notifications: NotificationConfigResponse[] }>('GET', '/notifications'),
+
+  createNotification: (body: CreateNotificationRequest) =>
+    request<NotificationConfigResponse>('POST', '/notifications', body),
+
+  updateNotification: (id: string, body: CreateNotificationRequest) =>
+    request<NotificationConfigResponse>('PUT', `/notifications/${id}`, body),
+
+  deleteNotification: (id: string) =>
+    request<{ message: string }>('DELETE', `/notifications/${id}`),
+
+  // Preferences
+  listPreferences: () =>
+    request<{ preferences: UserPreferenceResponse[] }>('GET', '/preferences'),
+
+  updatePreference: (id: string, value: string) =>
+    request<UserPreferenceResponse>('PUT', `/preferences/${id}`, { value }),
+
+  deletePreference: (id: string) =>
+    request<{ message: string }>('DELETE', `/preferences/${id}`),
+
+  // Config export/import
+  exportConfig: async (): Promise<ApiResponse<string>> => {
+    const res = await fetch(`${BASE}/config/export`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) {
+      const json = await res.json();
+      return { error: json.error ?? { code: 'unknown', message: res.statusText } };
+    }
+    const text = await res.text();
+    return { data: text };
+  },
+
+  importPreview: (toml_content: string) =>
+    request<ImportDiffResponse>('POST', '/config/import/preview', { toml_content }),
+
+  importConfig: (toml_content: string) =>
+    request<{ message: string }>('POST', '/config/import', { toml_content }),
 };
