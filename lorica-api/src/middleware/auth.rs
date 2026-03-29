@@ -24,7 +24,7 @@ pub struct Session {
 /// In-memory session store.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
+    pub(crate) sessions: Arc<Mutex<HashMap<String, Session>>>,
 }
 
 impl Default for SessionStore {
@@ -81,6 +81,29 @@ impl SessionStore {
             .await
             .get(session_id)
             .map(|s| s.expires_at)
+    }
+
+    /// Remove all expired sessions from memory.
+    pub async fn purge_expired(&self) -> usize {
+        let now = Utc::now();
+        let mut sessions = self.sessions.lock().await;
+        let before = sessions.len();
+        sessions.retain(|_, s| s.expires_at > now);
+        before - sessions.len()
+    }
+
+    /// Spawn a background task that purges expired sessions at a fixed interval.
+    pub fn spawn_gc(self, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let purged = self.purge_expired().await;
+                if purged > 0 {
+                    tracing::debug!(purged, "session GC: removed expired sessions");
+                }
+            }
+        })
     }
 }
 

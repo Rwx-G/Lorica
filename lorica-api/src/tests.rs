@@ -742,3 +742,96 @@ async fn test_logout() {
     let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ---- Certificate update test ----
+
+#[tokio::test]
+async fn test_certificate_update() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create certificate
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "domain": "example.com",
+        "cert_pem": "-----BEGIN CERTIFICATE-----\noriginal\n-----END CERTIFICATE-----",
+        "key_pem": "-----BEGIN PRIVATE KEY-----\noriginal\n-----END PRIVATE KEY-----"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let cert_id = json["data"]["id"].as_str().unwrap().to_string();
+    let original_fingerprint = json["data"]["fingerprint"].as_str().unwrap().to_string();
+
+    // Update certificate with new PEM
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "domain": "updated.com",
+        "cert_pem": "-----BEGIN CERTIFICATE-----\nupdated\n-----END CERTIFICATE-----"
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["domain"], "updated.com");
+    assert_ne!(
+        json["data"]["fingerprint"].as_str().unwrap(),
+        original_fingerprint
+    );
+}
+
+// ---- Session GC test ----
+
+#[tokio::test]
+async fn test_session_purge_expired() {
+    let store = SessionStore::new();
+
+    // Create a session
+    let sid = store.create("user1".into(), "admin".into()).await;
+
+    // Nothing expired yet
+    assert_eq!(store.purge_expired().await, 0);
+
+    // Manually insert an expired session
+    {
+        use crate::middleware::auth::Session;
+        let mut sessions = store.sessions.lock().await;
+        sessions.insert(
+            "expired-session".to_string(),
+            Session {
+                user_id: "user2".into(),
+                username: "old".into(),
+                created_at: chrono::Utc::now() - chrono::Duration::hours(2),
+                expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            },
+        );
+    }
+
+    // Should purge the expired one
+    assert_eq!(store.purge_expired().await, 1);
+    // Valid session still exists
+    assert!(store.get(&sid).await.is_some());
+}

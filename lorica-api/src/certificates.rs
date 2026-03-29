@@ -28,6 +28,13 @@ pub struct CreateCertificateRequest {
     pub key_pem: String,
 }
 
+#[derive(Deserialize)]
+pub struct UpdateCertificateRequest {
+    pub domain: Option<String>,
+    pub cert_pem: Option<String>,
+    pub key_pem: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct CertificateDetailResponse {
     pub id: String,
@@ -158,6 +165,32 @@ pub async fn get_certificate(
     };
 
     Ok(json_data(response))
+}
+
+/// PUT /api/v1/certificates/:id
+pub async fn update_certificate(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateCertificateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.store.lock().await;
+    let mut cert = store
+        .get_certificate(&id)?
+        .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
+
+    if let Some(domain) = body.domain {
+        cert.domain = domain;
+    }
+    if let Some(cert_pem) = body.cert_pem {
+        cert.fingerprint = compute_fingerprint(&cert_pem);
+        cert.cert_pem = cert_pem;
+    }
+    if let Some(key_pem) = body.key_pem {
+        cert.key_pem = key_pem;
+    }
+
+    store.update_certificate(&cert)?;
+    Ok(json_data(cert_to_response(&cert)))
 }
 
 /// DELETE /api/v1/certificates/:id

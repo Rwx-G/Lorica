@@ -57,6 +57,10 @@ pub fn build_router(
         )
         .route(
             "/api/v1/certificates/:id",
+            put(crate::certificates::update_certificate),
+        )
+        .route(
+            "/api/v1/certificates/:id",
             delete(crate::certificates::delete_certificate),
         )
         .route("/api/v1/status", get(crate::status::get_status))
