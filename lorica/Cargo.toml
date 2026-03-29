@@ -34,6 +34,7 @@ lorica-api = { version = "0.3.0", path = "../lorica-api" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
 arc-swap = "1"
 async-trait = { workspace = true }
+chrono = "0.4"
 serde_json = "1.0"
 
 [dev-dependencies]

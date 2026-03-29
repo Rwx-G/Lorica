@@ -22,6 +22,7 @@ argon2 = "0.5"
 rand = "0.8"
 rcgen = "0.13"
 ring = "0.17"
+sysinfo = "0.33"
 thiserror = "2"
 tracing = "0.1"
 http = { workspace = true }

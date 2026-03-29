@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::middleware;
 use axum::routing::{delete, get, post, put};
@@ -7,13 +8,16 @@ use axum::Router;
 use tokio::sync::Mutex;
 use tracing::info;
 
+use crate::logs::LogBuffer;
 use crate::middleware::auth::{require_auth, SessionStore};
 use crate::middleware::rate_limit::RateLimiter;
 
-/// Shared application state holding the config store.
+/// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Mutex<lorica_config::ConfigStore>>,
+    pub log_buffer: Arc<LogBuffer>,
+    pub started_at: Instant,
 }
 
 /// Build the axum router with all API routes.
@@ -68,6 +72,9 @@ pub fn build_router(
             delete(crate::certificates::delete_certificate),
         )
         .route("/api/v1/status", get(crate::status::get_status))
+        .route("/api/v1/logs", get(crate::logs::get_logs))
+        .route("/api/v1/logs", delete(crate::logs::clear_logs))
+        .route("/api/v1/system", get(crate::system::get_system))
         .route("/api/v1/config/export", post(crate::config::export_config))
         .route("/api/v1/config/import", post(crate::config::import_config))
         .layer(middleware::from_fn(require_auth));

@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use lorica_api::logs::{LogBuffer, LogEntry};
 use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route};
 use lorica_core::protocols::Digest;
 use lorica_core::upstreams::peer::HttpPeer;
@@ -128,11 +129,15 @@ pub struct RequestCtx {
 pub struct LoricaProxy {
     /// The current in-memory config, atomically swappable.
     pub config: Arc<ArcSwap<ProxyConfig>>,
+    /// Shared log buffer for dashboard access log viewing.
+    pub log_buffer: Arc<LogBuffer>,
+    /// Tokio runtime handle for spawning async tasks from sync context.
+    pub rt_handle: tokio::runtime::Handle,
 }
 
 impl LoricaProxy {
-    pub fn new(config: Arc<ArcSwap<ProxyConfig>>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<ArcSwap<ProxyConfig>>, log_buffer: Arc<LogBuffer>, rt_handle: tokio::runtime::Handle) -> Self {
+        Self { config, log_buffer, rt_handle }
     }
 }
 
@@ -262,13 +267,16 @@ impl ProxyHttp for LoricaProxy {
 
         let backend_addr = ctx.backend_addr.as_deref().unwrap_or("-");
 
-        if let Some(err) = e {
+        let error_str = e.map(|err| err.to_string());
+        let latency_ms = elapsed.as_millis() as u64;
+
+        if let Some(ref err) = error_str {
             warn!(
                 method = method,
                 path = path,
                 host = host,
                 status = status,
-                latency_ms = elapsed.as_millis() as u64,
+                latency_ms = latency_ms,
                 backend = backend_addr,
                 error = %err,
                 "request completed with error"
@@ -279,11 +287,28 @@ impl ProxyHttp for LoricaProxy {
                 path = path,
                 host = host,
                 status = status,
-                latency_ms = elapsed.as_millis() as u64,
+                latency_ms = latency_ms,
                 backend = backend_addr,
                 "request completed"
             );
         }
+
+        // Push to the in-memory log buffer for dashboard viewing
+        let entry = LogEntry {
+            id: 0, // assigned by LogBuffer
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: method.to_string(),
+            path: path.to_string(),
+            host: host.to_string(),
+            status,
+            latency_ms,
+            backend: backend_addr.to_string(),
+            error: error_str,
+        };
+        let buf = Arc::clone(&self.log_buffer);
+        self.rt_handle.spawn(async move {
+            buf.push(entry).await;
+        });
     }
 
     async fn connected_to_upstream(

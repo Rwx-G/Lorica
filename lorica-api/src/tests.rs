@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -6,6 +7,7 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 use crate::auth::{ensure_admin_user, hash_password};
+use crate::logs::LogBuffer;
 use crate::middleware::auth::SessionStore;
 use crate::middleware::rate_limit::RateLimiter;
 use crate::server::{build_router, AppState};
@@ -14,6 +16,8 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
     let store = lorica_config::ConfigStore::open_in_memory().unwrap();
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
+        log_buffer: Arc::new(LogBuffer::new(1000)),
+        started_at: Instant::now(),
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
