@@ -20,6 +20,7 @@ members = [
     "tinyufo",
     "lorica-config",
     "lorica-api",
+    "lorica-dashboard",
 ]
 
 [workspace.dependencies]

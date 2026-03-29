@@ -1,0 +1,19 @@
+[package]
+name = "lorica-dashboard"
+version = "0.2.0"
+authors = ["Romain G."]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/Rwx-G/Lorica"
+description = "Embedded web dashboard for Lorica reverse proxy"
+
+[dependencies]
+axum = "0.7"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+hyper = { version = "1", features = ["full"] }
+tower = { version = "0.4", features = ["util"] }
