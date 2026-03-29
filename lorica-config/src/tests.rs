@@ -310,6 +310,8 @@ mod tests {
             management_port: 8443,
             log_level: "debug".into(),
             default_health_check_interval_s: 30,
+            cert_warning_days: 14,
+            cert_critical_days: 3,
         };
         store.update_global_settings(&new_settings).unwrap();
         let fetched = store.get_global_settings().unwrap();
@@ -371,6 +373,8 @@ mod tests {
             management_port: 8443,
             log_level: "debug".into(),
             default_health_check_interval_s: 30,
+            cert_warning_days: 14,
+            cert_critical_days: 3,
         };
         store1.update_global_settings(&settings).unwrap();
 

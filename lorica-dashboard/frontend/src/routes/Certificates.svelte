@@ -56,14 +56,17 @@
   let selfSignedError = $state('');
   let selfSignedSubmitting = $state(false);
   let selfSignedPref: 'never' | 'always' | 'once' | null = $state(null);
+  let selfSignedPrefId: string | null = $state(null);
   let showSelfSignedPrefPrompt = $state(false);
 
   async function loadData() {
     loading = true;
     error = '';
-    const [certsRes, routesRes] = await Promise.all([
+    const [certsRes, routesRes, settingsRes, prefRes] = await Promise.all([
       api.listCertificates(),
       api.listRoutes(),
+      api.getSettings(),
+      api.listPreferences(),
     ]);
     if (certsRes.error) {
       error = certsRes.error.message;
@@ -72,6 +75,17 @@
     }
     if (routesRes.data) {
       routes = routesRes.data.routes;
+    }
+    if (settingsRes.data) {
+      warningDays = settingsRes.data.cert_warning_days;
+      criticalDays = settingsRes.data.cert_critical_days;
+    }
+    if (prefRes.data) {
+      const ssPref = prefRes.data.preferences.find((p) => p.preference_key === 'self_signed_cert');
+      if (ssPref) {
+        selfSignedPref = ssPref.value as 'never' | 'always' | 'once';
+        selfSignedPrefId = ssPref.id;
+      }
     }
     loading = false;
   }
@@ -267,9 +281,12 @@
     showSelfSigned = true;
   }
 
-  function handleSelfSignedPref(choice: 'never' | 'always' | 'once') {
+  async function handleSelfSignedPref(choice: 'never' | 'always' | 'once') {
     selfSignedPref = choice;
     showSelfSignedPrefPrompt = false;
+    if (selfSignedPrefId) {
+      await api.updatePreference(selfSignedPrefId, choice);
+    }
     if (choice === 'never') return;
     selfSignedDomain = '';
     selfSignedError = '';
@@ -325,12 +342,13 @@
     if (e.key === 'Escape') closeThresholdConfig();
   }
 
-  function saveThresholds() {
+  async function saveThresholds() {
     if (thresholdCritical >= thresholdWarning) {
       return;
     }
     warningDays = thresholdWarning;
     criticalDays = thresholdCritical;
+    await api.updateSettings({ cert_warning_days: warningDays, cert_critical_days: criticalDays });
     closeThresholdConfig();
   }
 </script>

@@ -729,6 +729,16 @@ impl ConfigStore {
                         ConfigError::Validation("invalid default_health_check_interval_s".into())
                     })?;
                 }
+                "cert_warning_days" => {
+                    settings.cert_warning_days = value
+                        .parse()
+                        .map_err(|_| ConfigError::Validation("invalid cert_warning_days".into()))?;
+                }
+                "cert_critical_days" => {
+                    settings.cert_critical_days = value.parse().map_err(|_| {
+                        ConfigError::Validation("invalid cert_critical_days".into())
+                    })?;
+                }
                 _ => {}
             }
         }
@@ -748,6 +758,14 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('default_health_check_interval_s', ?1)",
             params![settings.default_health_check_interval_s.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_warning_days', ?1)",
+            params![settings.cert_warning_days.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_critical_days', ?1)",
+            params![settings.cert_critical_days.to_string()],
         )?;
         Ok(())
     }

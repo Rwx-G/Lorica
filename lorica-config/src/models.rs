@@ -305,6 +305,18 @@ pub struct GlobalSettings {
     pub management_port: u16,
     pub log_level: String,
     pub default_health_check_interval_s: i32,
+    #[serde(default = "default_cert_warning_days")]
+    pub cert_warning_days: i32,
+    #[serde(default = "default_cert_critical_days")]
+    pub cert_critical_days: i32,
+}
+
+fn default_cert_warning_days() -> i32 {
+    30
+}
+
+fn default_cert_critical_days() -> i32 {
+    7
 }
 
 impl Default for GlobalSettings {
@@ -313,6 +325,8 @@ impl Default for GlobalSettings {
             management_port: 9443,
             log_level: "info".to_string(),
             default_health_check_interval_s: 10,
+            cert_warning_days: 30,
+            cert_critical_days: 7,
         }
     }
 }

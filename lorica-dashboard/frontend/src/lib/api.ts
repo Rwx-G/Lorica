@@ -191,12 +191,16 @@ export interface GlobalSettingsResponse {
   management_port: number;
   log_level: string;
   default_health_check_interval_s: number;
+  cert_warning_days: number;
+  cert_critical_days: number;
 }
 
 export interface UpdateSettingsRequest {
   management_port?: number;
   log_level?: string;
   default_health_check_interval_s?: number;
+  cert_warning_days?: number;
+  cert_critical_days?: number;
 }
 
 export interface NotificationConfigResponse {
@@ -335,6 +339,9 @@ export const api = {
 
   deleteNotification: (id: string) =>
     request<{ message: string }>('DELETE', `/notifications/${id}`),
+
+  testNotification: (id: string) =>
+    request<{ message: string; channel: string }>('POST', `/notifications/${id}/test`),
 
   // Preferences
   listPreferences: () =>

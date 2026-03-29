@@ -224,6 +224,20 @@ fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> Setting
             new_value: incoming.default_health_check_interval_s.to_string(),
         });
     }
+    if current.cert_warning_days != incoming.cert_warning_days {
+        changes.push(SettingChange {
+            key: "cert_warning_days".to_string(),
+            old_value: current.cert_warning_days.to_string(),
+            new_value: incoming.cert_warning_days.to_string(),
+        });
+    }
+    if current.cert_critical_days != incoming.cert_critical_days {
+        changes.push(SettingChange {
+            key: "cert_critical_days".to_string(),
+            old_value: current.cert_critical_days.to_string(),
+            new_value: incoming.cert_critical_days.to_string(),
+        });
+    }
     SettingsDiff { changes }
 }
 

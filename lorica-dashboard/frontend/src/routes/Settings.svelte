@@ -11,7 +11,7 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10 });
+  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7 });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -27,6 +27,8 @@
   let notifError = $state('');
   let notifSaving = $state(false);
   let deletingNotif: NotificationConfigResponse | null = $state(null);
+  let testingNotif = $state('');
+  let testNotifResult = $state('');
 
   // Preferences
   let preferences: UserPreferenceResponse[] = $state([]);
@@ -42,6 +44,9 @@
   let importPreviewing = $state(false);
   let importApplying = $state(false);
   let importSuccess = $state('');
+
+  // Theme
+  let theme = $state<'dark' | 'light'>('dark');
 
   let loading = $state(true);
   let error = $state('');
@@ -65,11 +70,32 @@
     }
     if (prefRes.data) {
       preferences = prefRes.data.preferences;
+      const themePref = prefRes.data.preferences.find((p) => p.preference_key === 'theme');
+      if (themePref && (themePref.value === 'always' || themePref.value === 'never')) {
+        theme = themePref.value === 'always' ? 'light' : 'dark';
+        applyTheme(theme);
+      }
     }
     loading = false;
   }
 
   onMount(loadAll);
+
+  // ---- Theme ----
+
+  function applyTheme(t: 'dark' | 'light') {
+    document.documentElement.setAttribute('data-theme', t);
+  }
+
+  async function toggleTheme() {
+    theme = theme === 'dark' ? 'light' : 'dark';
+    applyTheme(theme);
+    const themePref = preferences.find((p) => p.preference_key === 'theme');
+    if (themePref) {
+      await api.updatePreference(themePref.id, theme === 'light' ? 'always' : 'never');
+    }
+    await loadAll();
+  }
 
   // ---- Settings ----
 
@@ -134,6 +160,19 @@
     await api.deleteNotification(deletingNotif.id);
     deletingNotif = null;
     await loadAll();
+  }
+
+  async function handleTestNotif(id: string) {
+    testingNotif = id;
+    testNotifResult = '';
+    const res = await api.testNotification(id);
+    if (res.error) {
+      testNotifResult = `Error: ${res.error.message}`;
+    } else {
+      testNotifResult = `Valid (${res.data?.channel})`;
+    }
+    testingNotif = '';
+    setTimeout(() => testNotifResult = '', 3000);
   }
 
   // ---- Preferences ----
@@ -248,6 +287,17 @@
   {#if loading}
     <p class="loading">Loading...</p>
   {:else}
+    <!-- Theme -->
+    <section class="section">
+      <div class="section-header">
+        <h2>Appearance</h2>
+        <button class="btn btn-secondary" onclick={toggleTheme}>
+          {theme === 'dark' ? 'Switch to Light' : 'Switch to Dark'}
+        </button>
+      </div>
+      <p class="section-hint">Current theme: {theme}.</p>
+    </section>
+
     <!-- Global Settings -->
     <section class="section">
       <h2>Global Configuration</h2>
@@ -270,6 +320,14 @@
         <div class="form-row">
           <label for="hc-interval">Default Health Check Interval (s)</label>
           <input id="hc-interval" type="number" bind:value={settingsForm.default_health_check_interval_s} min="1" max="3600" />
+        </div>
+        <div class="form-row">
+          <label for="cert-warn">Certificate Warning Threshold (days)</label>
+          <input id="cert-warn" type="number" bind:value={settingsForm.cert_warning_days} min="1" max="365" />
+        </div>
+        <div class="form-row">
+          <label for="cert-crit">Certificate Critical Threshold (days)</label>
+          <input id="cert-crit" type="number" bind:value={settingsForm.cert_critical_days} min="1" max="365" />
         </div>
         {#if settingsError}
           <div class="form-error">{settingsError}</div>
@@ -316,6 +374,7 @@
                   </td>
                   <td>{nc.alert_types.join(', ') || '-'}</td>
                   <td class="actions-cell">
+                    <button class="btn-link" onclick={() => handleTestNotif(nc.id)} disabled={testingNotif === nc.id}>Test</button>
                     <button class="btn-link" onclick={() => openNotifEdit(nc)}>Edit</button>
                     <button class="btn-link danger" onclick={() => deletingNotif = nc}>Delete</button>
                   </td>
@@ -872,6 +931,15 @@
   }
 
   .btn-cancel:hover {
+    background: var(--color-bg-hover);
+  }
+
+  .btn-secondary {
+    background: var(--color-bg-input);
+    color: var(--color-text);
+  }
+
+  .btn-secondary:hover {
     background: var(--color-bg-hover);
   }
 
