@@ -10,7 +10,7 @@ waiver: { active: false }
 
 top_issues: []
 
-quality_score: 95
+quality_score: 100
 expires: "2026-04-12T00:00:00Z"
 
 evidence:
@@ -39,5 +39,3 @@ recommendations:
   future:
     - action: "Add Vitest + testing-library for frontend component tests"
       refs: ["lorica-dashboard/frontend/"]
-    - action: "Extract shared SVG shield icon to reduce duplication"
-      refs: ["Login.svelte", "PasswordChange.svelte", "Nav.svelte"]
