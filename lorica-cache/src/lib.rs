@@ -16,7 +16,7 @@
 
 #![allow(clippy::new_without_default)]
 
-use cf_rustracing::tag::Tag;
+use trace::Tag;
 use http::{method::Method, request::Parts as ReqHeader, response::Parts as RespHeader};
 use key::{CacheHashKey, CompactCacheKey, HashBinary};
 use lock::WritePermit;

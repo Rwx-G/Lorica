@@ -256,7 +256,8 @@ impl AsyncRead for RawStreamWrapper {
                         Ok(r) => {
                             if let Some(ControlMessageOwned::ScmTimestampsns(rtime)) = r
                                 .cmsgs()
-                                .find(|i| matches!(i, ControlMessageOwned::ScmTimestampsns(_)))
+                                .ok()
+                                .and_then(|mut c| c.find(|i| matches!(i, ControlMessageOwned::ScmTimestampsns(_))))
                             {
                                 // The returned timestamp is a real (i.e. not monotonic) timestamp
                                 // https://docs.kernel.org/networking/timestamping.html
@@ -430,11 +431,12 @@ impl Stream {
     #[cfg(target_os = "linux")]
     pub fn set_rx_timestamp(&mut self) -> Result<()> {
         use nix::sys::socket::{setsockopt, sockopt, TimestampingFlag};
+        use std::os::unix::io::AsFd;
 
         if let RawStream::Tcp(s) = &self.stream_mut().get_mut().stream {
             let timestamp_options = TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
                 | TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE;
-            setsockopt(s.as_raw_fd(), sockopt::Timestamping, &timestamp_options)
+            setsockopt(&s.as_fd(), sockopt::Timestamping, &timestamp_options)
                 .or_err(InternalError, "failed to set SOF_TIMESTAMPING_RX_SOFTWARE")?;
             self.stream_mut().get_mut().enable_rx_ts(true);
         }

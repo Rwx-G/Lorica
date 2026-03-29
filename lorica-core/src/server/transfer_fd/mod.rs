@@ -16,10 +16,14 @@
 use log::{debug, error, warn};
 use nix::errno::Errno;
 #[cfg(target_os = "linux")]
-use nix::sys::socket::{self, AddressFamily, RecvMsg, SockFlag, SockType, UnixAddr};
+use nix::sys::socket::{
+    self, AddressFamily, Backlog, SockFlag, SockType, SockaddrStorage, UnixAddr,
+};
 #[cfg(target_os = "linux")]
 use nix::sys::stat;
-use nix::{Error, NixPath};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+use nix::NixPath;
 use std::collections::HashMap;
 use std::io::Write;
 #[cfg(target_os = "linux")]
@@ -61,7 +65,7 @@ impl Fds {
         }
     }
 
-    pub fn send_to_sock<P>(&self, path: &P) -> Result<usize, Error>
+    pub fn send_to_sock<P>(&self, path: &P) -> Result<usize, Errno>
     where
         P: ?Sized + NixPath + std::fmt::Display,
     {
@@ -71,7 +75,7 @@ impl Fds {
         send_fds_to(vec_fds, &ser_buf[..ser_key_size], path, None)
     }
 
-    pub fn get_from_sock<P>(&mut self, path: &P) -> Result<(), Error>
+    pub fn get_from_sock<P>(&mut self, path: &P) -> Result<(), Errno>
     where
         P: ?Sized + NixPath + std::fmt::Display,
     {
@@ -91,8 +95,8 @@ fn serialize_vec_string(vec_string: &[String], mut buf: &mut [u8]) -> usize {
     buf.write(joined.as_bytes()).unwrap()
 }
 
-fn deserialize_vec_string(buf: &[u8]) -> Result<Vec<String>, Error> {
-    let joined = std::str::from_utf8(buf).map_err(|_| Error::EINVAL)?;
+fn deserialize_vec_string(buf: &[u8]) -> Result<Vec<String>, Errno> {
+    let joined = std::str::from_utf8(buf).map_err(|_| Errno::EINVAL)?;
     Ok(joined.split_ascii_whitespace().map(String::from).collect())
 }
 
@@ -101,7 +105,7 @@ pub fn get_fds_from<P>(
     path: &P,
     payload: &mut [u8],
     max_retry: Option<usize>,
-) -> Result<(Vec<RawFd>, usize), Error>
+) -> Result<(Vec<RawFd>, usize), Errno>
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
@@ -115,9 +119,10 @@ where
         None,
     )
     .unwrap();
+    let listen_raw_fd = listen_fd.as_raw_fd();
     let unix_addr = UnixAddr::new(path).unwrap();
     // clean up old sock
-    match nix::unistd::unlink(path) {
+    match std::fs::remove_file(path.to_string()) {
         Ok(()) => {
             debug!("unlink {} done", path);
         }
@@ -127,7 +132,7 @@ where
             // TODO: warn if exist but not able to unlink
         }
     };
-    socket::bind(listen_fd, &unix_addr).unwrap();
+    socket::bind(listen_raw_fd, &unix_addr).unwrap();
 
     /* sock is created before we change user, need to give permission */
     stat::fchmodat(
@@ -138,23 +143,22 @@ where
     )
     .unwrap();
 
-    socket::listen(listen_fd, 8).unwrap();
+    socket::listen(&listen_fd, Backlog::new(8).unwrap()).unwrap();
 
-    let fd = match accept_with_retry_timeout(listen_fd, max_retry) {
+    let fd = match accept_with_retry_timeout(listen_raw_fd, max_retry) {
         Ok(fd) => fd,
         Err(e) => {
             error!("Giving up reading socket from: {path}, error: {e:?}");
             //cleanup
-            if nix::unistd::close(listen_fd).is_ok() {
-                nix::unistd::unlink(path).unwrap();
-            }
+            drop(listen_fd);
+            let _ = std::fs::remove_file(path.to_string());
             return Err(e);
         }
     };
 
     let mut io_vec = [IoSliceMut::new(payload); 1];
     let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
-    let msg: RecvMsg<UnixAddr> = socket::recvmsg(
+    let msg = socket::recvmsg::<SockaddrStorage>(
         fd,
         &mut io_vec,
         Some(&mut cmsg_buf),
@@ -163,7 +167,7 @@ where
     .unwrap();
 
     let mut fds: Vec<RawFd> = Vec::new();
-    for cmsg in msg.cmsgs() {
+    for cmsg in msg.cmsgs().unwrap() {
         if let socket::ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
             fds.append(&mut vec_fds)
         } else {
@@ -172,9 +176,8 @@ where
     }
 
     //cleanup
-    if nix::unistd::close(listen_fd).is_ok() {
-        nix::unistd::unlink(path).unwrap();
-    }
+    drop(listen_fd);
+    let _ = std::fs::remove_file(path.to_string());
 
     Ok((fds, msg.bytes))
 }
@@ -184,7 +187,7 @@ pub fn get_fds_from<P>(
     _path: &P,
     _payload: &mut [u8],
     _max_retry: Option<usize>,
-) -> Result<(Vec<RawFd>, usize), Error>
+) -> Result<(Vec<RawFd>, usize), Errno>
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
@@ -198,7 +201,7 @@ const MAX_RETRY: usize = 5;
 const RETRY_INTERVAL: time::Duration = time::Duration::from_secs(1);
 
 #[cfg(target_os = "linux")]
-fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Error> {
+fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Errno> {
     let mut retried = 0;
     loop {
         match socket::accept(listen_fd) {
@@ -231,7 +234,7 @@ pub fn send_fds_to<P>(
     payload: &[u8],
     path: &P,
     max_retry: Option<usize>,
-) -> Result<usize, Error>
+) -> Result<usize, Errno>
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
@@ -245,12 +248,13 @@ where
         SockFlag::SOCK_NONBLOCK,
         None,
     )?;
+    let send_raw_fd = send_fd.as_raw_fd();
     let unix_addr = UnixAddr::new(path)?;
     let mut retried = 0;
     let mut nonblocking_polls = 0;
 
-    let conn_result: Result<usize, Error> = loop {
-        match socket::connect(send_fd, &unix_addr) {
+    let conn_result: Result<usize, Errno> = loop {
+        match socket::connect(send_raw_fd, &unix_addr) {
             Ok(_) => break Ok(0),
             Err(e) => match e {
                 /* If the new process hasn't created the upgrade sock we'll get an ENOENT.
@@ -295,7 +299,7 @@ where
             let cmsg = [scm; 1];
             loop {
                 match socket::sendmsg(
-                    send_fd,
+                    send_raw_fd,
                     &io_vec,
                     &cmsg,
                     socket::MsgFlags::empty(),
@@ -327,7 +331,7 @@ where
         Err(_) => conn_result,
     };
 
-    nix::unistd::close(send_fd).unwrap();
+    drop(send_fd);
     result
 }
 
@@ -337,7 +341,7 @@ pub fn send_fds_to<P>(
     _payload: &[u8],
     _path: &P,
     _max_retry: Option<usize>,
-) -> Result<usize, Error>
+) -> Result<usize, Errno>
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
@@ -348,6 +352,7 @@ where
 #[cfg(target_os = "linux")]
 mod tests {
     use super::*;
+    use std::os::unix::io::IntoRawFd;
     use log::{debug, error};
 
     fn init_log() {
@@ -401,7 +406,8 @@ mod tests {
             SockFlag::empty(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .into_raw_fd();
 
         // receiver need to start in another thread since it is blocking
         let child = thread::spawn(move || {
@@ -441,7 +447,8 @@ mod tests {
             SockFlag::empty(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .into_raw_fd();
         fds.add(key1.clone(), dumb_fd1);
         let key2 = "1.1.1.1:443".to_string();
         let dumb_fd2 = socket::socket(
@@ -450,7 +457,8 @@ mod tests {
             SockFlag::empty(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .into_raw_fd();
         fds.add(key2.clone(), dumb_fd2);
 
         let child = thread::spawn(move || {
@@ -476,7 +484,8 @@ mod tests {
             SockFlag::empty(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .into_raw_fd();
 
         let fds = vec![dumb_fd];
         let buf: [u8; 32] = [1; 32];

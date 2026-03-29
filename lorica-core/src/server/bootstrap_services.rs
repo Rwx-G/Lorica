@@ -185,7 +185,7 @@ impl Bootstrap {
     }
 
     #[cfg(unix)]
-    fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::Error> {
+    fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::errno::Errno> {
         let mut fds = Fds::new();
         if upgrade {
             debug!("Trying to receive socks");

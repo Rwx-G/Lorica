@@ -12,17 +12,88 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Distributed tracing helpers
+//! No-op distributed tracing stubs
+//!
+//! These types replace the former `cf-rustracing` / `cf-rustracing-jaeger`
+//! dependency with zero-cost no-op implementations that expose the same
+//! public API surface.
 
-use cf_rustracing_jaeger::span::SpanContextState;
 use std::time::SystemTime;
 
 use crate::{CacheMeta, CachePhase, HitStatus};
 
-pub use cf_rustracing::tag::Tag;
+/// A no-op tracing tag.
+#[derive(Debug, Clone)]
+pub struct Tag {
+    _private: (),
+}
 
-pub type Span = cf_rustracing::span::Span<SpanContextState>;
-pub type SpanHandle = cf_rustracing::span::SpanHandle<SpanContextState>;
+impl Tag {
+    /// Create a tag (does nothing).
+    pub fn new<V>(_key: &'static str, _value: V) -> Self {
+        Tag { _private: () }
+    }
+}
+
+/// A no-op span handle.
+#[derive(Debug, Clone)]
+pub struct SpanHandle {
+    _private: (),
+}
+
+/// A no-op tracing span.
+#[derive(Debug)]
+pub struct Span {
+    _private: (),
+}
+
+impl Span {
+    /// Return an inactive (no-op) span.
+    pub fn inactive() -> Self {
+        Span { _private: () }
+    }
+
+    /// Create a child span (no-op). The callback is accepted but never invoked
+    /// in the real cf-rustracing either when the span is inactive.
+    pub fn child<F>(&self, _name: &'static str, _f: F) -> Span
+    where
+        F: FnOnce(SpanBuilder) -> Span,
+    {
+        Span::inactive()
+    }
+
+    /// Return a handle to this span (no-op).
+    pub fn handle(&self) -> SpanHandle {
+        SpanHandle { _private: () }
+    }
+
+    /// Set a single tag via a closure (no-op).
+    pub fn set_tag<F: FnOnce() -> Tag>(&mut self, _f: F) {}
+
+    /// Set multiple tags via a closure (no-op).
+    pub fn set_tags<I, F>(&mut self, _f: F)
+    where
+        I: IntoIterator<Item = Tag>,
+        F: FnOnce() -> I,
+    {
+    }
+
+    /// Set a custom finish time (no-op).
+    pub fn set_finish_time<F: FnOnce() -> SystemTime>(&mut self, _f: F) {}
+}
+
+/// Placeholder so `Span::child` closure signature compiles.
+#[derive(Debug)]
+pub struct SpanBuilder {
+    _private: (),
+}
+
+impl SpanBuilder {
+    /// Start the span (no-op).
+    pub fn start(self) -> Span {
+        Span::inactive()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct CacheTraceCTX {
@@ -33,26 +104,8 @@ pub(crate) struct CacheTraceCTX {
     pub hit_span: Span,
 }
 
-pub fn tag_span_with_meta(span: &mut Span, meta: &CacheMeta) {
-    fn ts2epoch(ts: SystemTime) -> f64 {
-        ts.duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default() // should never overflow but be safe here
-            .as_secs_f64()
-    }
-    let internal = &meta.0.internal;
-    span.set_tags(|| {
-        [
-            Tag::new("created", ts2epoch(internal.created)),
-            Tag::new("fresh_until", ts2epoch(internal.fresh_until)),
-            Tag::new("updated", ts2epoch(internal.updated)),
-            Tag::new("stale_if_error_sec", internal.stale_if_error_sec as i64),
-            Tag::new(
-                "stale_while_revalidate_sec",
-                internal.stale_while_revalidate_sec as i64,
-            ),
-            Tag::new("variance", internal.variance.is_some()),
-        ]
-    });
+pub fn tag_span_with_meta(_span: &mut Span, _meta: &CacheMeta) {
+    // no-op
 }
 
 impl CacheTraceCTX {

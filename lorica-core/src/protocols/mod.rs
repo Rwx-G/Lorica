@@ -316,19 +316,27 @@ impl ConnSockReusable for SocketAddr {
 impl ConnFdReusable for Path {
     fn check_fd_match<V: AsRawFd>(&self, fd: V) -> bool {
         let fd = fd.as_raw_fd();
-        match getpeername::<UnixAddr>(fd) {
-            Ok(peer) => match UnixAddr::new(self) {
-                Ok(addr) => {
-                    if addr == peer {
-                        debug!("Unix FD to: {peer} is reusable");
-                        true
-                    } else {
-                        error!("Crit: unix FD mismatch: fd: {fd:?}, peer: {peer}, addr: {addr}",);
+        match getpeername::<SockaddrStorage>(fd) {
+            Ok(peer_storage) => match peer_storage.as_unix_addr() {
+                Some(peer) => match UnixAddr::new(self) {
+                    Ok(addr) => {
+                        if addr == *peer {
+                            debug!("Unix FD to: {peer} is reusable");
+                            true
+                        } else {
+                            error!(
+                                "Crit: unix FD mismatch: fd: {fd:?}, peer: {peer}, addr: {addr}",
+                            );
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        error!("Bad addr: {self:?}, error: {e:?}");
                         false
                     }
-                }
-                Err(e) => {
-                    error!("Bad addr: {self:?}, error: {e:?}");
+                },
+                None => {
+                    error!("Peer address is not a Unix address for fd: {fd:?}");
                     false
                 }
             },
@@ -344,7 +352,7 @@ impl ConnFdReusable for Path {
 impl ConnFdReusable for InetSocketAddr {
     fn check_fd_match<V: AsRawFd>(&self, fd: V) -> bool {
         let fd = fd.as_raw_fd();
-        match getpeername::<SockaddrStorage>(fd) {
+        match getpeername(fd) {
             Ok(peer) => {
                 const ZERO: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
                 if self.ip() == ZERO {

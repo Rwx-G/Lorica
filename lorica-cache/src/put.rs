@@ -239,7 +239,7 @@ impl<C: CachePut> CachePutCtx<C> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use cf_rustracing::span::Span;
+    use crate::trace::Span;
     use once_cell::sync::Lazy;
 
     struct TestCachePut();
