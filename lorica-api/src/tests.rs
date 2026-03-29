@@ -879,6 +879,225 @@ async fn test_generate_self_signed_certificate() {
     assert!(cert_pem.contains("-----END CERTIFICATE-----"));
 }
 
+// ---- Logs Endpoint Tests ----
+
+#[tokio::test]
+async fn test_logs_endpoint_empty() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 0);
+    assert!(json["data"]["entries"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_logs_endpoint_with_entries() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Push some log entries
+    use crate::logs::LogEntry;
+    for i in 1..=3 {
+        state
+            .log_buffer
+            .push(LogEntry {
+                id: 0,
+                timestamp: format!("2026-01-0{i}T00:00:00Z"),
+                method: "GET".into(),
+                path: format!("/path{i}"),
+                host: "example.com".into(),
+                status: 200,
+                latency_ms: 10,
+                backend: "10.0.0.1:8080".into(),
+                error: None,
+            })
+            .await;
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 3);
+    assert_eq!(json["data"]["entries"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn test_logs_endpoint_filtering() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    use crate::logs::LogEntry;
+    state
+        .log_buffer
+        .push(LogEntry {
+            id: 0,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            method: "GET".into(),
+            path: "/ok".into(),
+            host: "example.com".into(),
+            status: 200,
+            latency_ms: 10,
+            backend: "10.0.0.1:8080".into(),
+            error: None,
+        })
+        .await;
+    state
+        .log_buffer
+        .push(LogEntry {
+            id: 0,
+            timestamp: "2026-01-01T00:00:01Z".into(),
+            method: "POST".into(),
+            path: "/error".into(),
+            host: "other.com".into(),
+            status: 500,
+            latency_ms: 50,
+            backend: "10.0.0.2:8080".into(),
+            error: Some("internal error".into()),
+        })
+        .await;
+
+    // Filter by route
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs?route=other.com")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 1);
+
+    // Filter by search
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs?search=internal")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 1);
+    assert_eq!(json["data"]["entries"][0]["status"], 500);
+}
+
+#[tokio::test]
+async fn test_clear_logs_endpoint() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    use crate::logs::LogEntry;
+    state
+        .log_buffer
+        .push(LogEntry {
+            id: 0,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            method: "GET".into(),
+            path: "/".into(),
+            host: "example.com".into(),
+            status: 200,
+            latency_ms: 5,
+            backend: "10.0.0.1:8080".into(),
+            error: None,
+        })
+        .await;
+
+    // Clear logs
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/logs")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Verify empty
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/logs")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 0);
+}
+
+// ---- System Endpoint Tests ----
+
+#[tokio::test]
+async fn test_system_endpoint() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/system")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Verify structure
+    assert!(json["data"]["host"]["cpu_count"].as_u64().unwrap() > 0);
+    assert!(json["data"]["host"]["memory_total_bytes"].as_u64().unwrap() > 0);
+    assert!(json["data"]["proxy"]["version"].is_string());
+    assert!(json["data"]["proxy"]["uptime_seconds"].as_u64().is_some());
+    assert!(json["data"]["process"]["memory_bytes"].as_u64().is_some());
+}
+
 // ---- Session GC test ----
 
 #[tokio::test]

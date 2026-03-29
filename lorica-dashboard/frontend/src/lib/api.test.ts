@@ -192,3 +192,80 @@ describe('api.generateSelfSigned', () => {
     );
   });
 });
+
+// ---- Logs API Tests ----
+
+const mockLogEntry = {
+  id: 1,
+  timestamp: '2026-01-01T00:00:00Z',
+  method: 'GET',
+  path: '/api/test',
+  host: 'example.com',
+  status: 200,
+  latency_ms: 15,
+  backend: '10.0.0.1:8080',
+  error: null,
+};
+
+describe('api.getLogs', () => {
+  it('calls GET /api/v1/logs without params', async () => {
+    mockFetch({ entries: [mockLogEntry], total: 1 });
+    const res = await api.getLogs();
+    expect(res.data?.entries).toHaveLength(1);
+    expect(res.data?.total).toBe(1);
+    expect(fetch).toHaveBeenCalledWith('/api/v1/logs', expect.objectContaining({ method: 'GET' }));
+  });
+
+  it('passes query params for filtering', async () => {
+    mockFetch({ entries: [], total: 0 });
+    await api.getLogs({ route: 'example.com', status_min: 400, search: 'error' });
+    const url = (fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(url).toContain('route=example.com');
+    expect(url).toContain('status_min=400');
+    expect(url).toContain('search=error');
+  });
+});
+
+describe('api.clearLogs', () => {
+  it('calls DELETE /api/v1/logs', async () => {
+    mockFetch({ message: 'logs cleared' });
+    const res = await api.clearLogs();
+    expect(res.data?.message).toBe('logs cleared');
+    expect(fetch).toHaveBeenCalledWith('/api/v1/logs', expect.objectContaining({ method: 'DELETE' }));
+  });
+});
+
+// ---- System API Tests ----
+
+const mockSystem = {
+  host: {
+    cpu_usage_percent: 25.5,
+    cpu_count: 8,
+    memory_total_bytes: 16000000000,
+    memory_used_bytes: 8000000000,
+    memory_usage_percent: 50.0,
+    disk_total_bytes: 500000000000,
+    disk_used_bytes: 250000000000,
+    disk_usage_percent: 50.0,
+  },
+  process: {
+    memory_bytes: 50000000,
+    cpu_usage_percent: 2.3,
+  },
+  proxy: {
+    version: '0.3.0',
+    uptime_seconds: 3600,
+    active_connections: 42,
+  },
+};
+
+describe('api.getSystem', () => {
+  it('calls GET /api/v1/system and returns metrics', async () => {
+    mockFetch(mockSystem);
+    const res = await api.getSystem();
+    expect(res.data?.host.cpu_count).toBe(8);
+    expect(res.data?.proxy.version).toBe('0.3.0');
+    expect(res.data?.process.memory_bytes).toBe(50000000);
+    expect(fetch).toHaveBeenCalledWith('/api/v1/system', expect.objectContaining({ method: 'GET' }));
+  });
+});
