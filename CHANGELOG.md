@@ -63,7 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Certificate detail view: full chain display, SAN domains, fingerprint, associated routes
 - Certificate edit modal for domain and PEM replacement
 - Certificate deletion with impact display (affected routes warning, 409 conflict handling)
-- Self-signed certificate generation with preference memory prompt (never/always/once)
+- Self-signed certificate generation via `rcgen` with preference memory prompt (never/always/once)
+- `POST /api/v1/certificates/self-signed` endpoint for real self-signed cert generation
 - Configurable expiration thresholds (default: 30 days warning, 7 days critical)
 - API client methods for certificates (get, create, update, delete)
 - Frontend tests: CertExpiryBadge (10), certificate API client (6) - 16 new tests (36 total)
