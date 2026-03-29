@@ -59,63 +59,18 @@ fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateRespon
     }
 }
 
-/// Compute a simple hex fingerprint from PEM cert data (SHA-256).
+/// Compute a SHA-256 fingerprint from PEM cert data using ring.
 fn compute_fingerprint(cert_pem: &str) -> String {
     use std::fmt::Write;
-    // Simple hash of the PEM content for fingerprint
-    let mut hasher = Sha256::new();
-    hasher.update(cert_pem.as_bytes());
-    let result = hasher.finalize();
-    let mut hex = String::with_capacity(result.len() * 3);
-    for (i, byte) in result.iter().enumerate() {
+    let digest = ring::digest::digest(&ring::digest::SHA256, cert_pem.as_bytes());
+    let mut hex = String::with_capacity(digest.as_ref().len() * 3);
+    for (i, byte) in digest.as_ref().iter().enumerate() {
         if i > 0 {
             hex.push(':');
         }
         write!(hex, "{byte:02X}").unwrap();
     }
     hex
-}
-
-/// We use a minimal SHA-256 implementation to avoid adding a dependency.
-/// This computes SHA-256 of the PEM bytes for a basic fingerprint.
-struct Sha256 {
-    data: Vec<u8>,
-}
-
-impl Sha256 {
-    fn new() -> Self {
-        Self { data: Vec::new() }
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        self.data.extend_from_slice(bytes);
-    }
-
-    fn finalize(self) -> Vec<u8> {
-        // We already have ring as a transitive dep from lorica-config.
-        // Use a simple hash approach: XOR-fold for uniqueness.
-        // Actually, let's just use a deterministic hash.
-        // For a real fingerprint we'd parse the DER, but for now
-        // we produce a stable unique identifier from the PEM content.
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        self.data.hash(&mut hasher);
-        let h1 = hasher.finish();
-        // Produce a second hash for more bytes
-        h1.hash(&mut hasher);
-        let h2 = hasher.finish();
-        h2.hash(&mut hasher);
-        let h3 = hasher.finish();
-        h3.hash(&mut hasher);
-        let h4 = hasher.finish();
-        let mut result = Vec::with_capacity(32);
-        result.extend_from_slice(&h1.to_be_bytes());
-        result.extend_from_slice(&h2.to_be_bytes());
-        result.extend_from_slice(&h3.to_be_bytes());
-        result.extend_from_slice(&h4.to_be_bytes());
-        result
-    }
 }
 
 /// GET /api/v1/certificates

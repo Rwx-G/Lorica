@@ -98,12 +98,12 @@ fn extract_session_cookie(req: &Request) -> Option<String> {
 
 /// Build a Set-Cookie header value for the session.
 pub fn session_cookie(session_id: &str) -> String {
-    format!("{SESSION_COOKIE_NAME}={session_id}; HttpOnly; SameSite=Strict; Path=/api")
+    format!("{SESSION_COOKIE_NAME}={session_id}; HttpOnly; Secure; SameSite=Strict; Path=/api")
 }
 
 /// Build a Set-Cookie header to clear the session.
 pub fn clear_session_cookie() -> String {
-    format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0")
+    format!("{SESSION_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Strict; Path=/api; Max-Age=0")
 }
 
 /// Axum middleware that requires a valid session.
