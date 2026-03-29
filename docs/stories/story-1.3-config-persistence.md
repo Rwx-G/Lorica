@@ -58,26 +58,31 @@ Claude Opus 4.6
 
 ### File List
 - `Cargo.toml` (modified - added lorica-config to workspace members)
-- `lorica-config/Cargo.toml` (new)
-- `lorica-config/src/lib.rs` (new)
+- `lorica-config/Cargo.toml` (new - added ring dependency for encryption)
+- `lorica-config/src/lib.rs` (new - with #![deny(clippy::all)])
 - `lorica-config/src/error.rs` (new - ConfigError with thiserror)
 - `lorica-config/src/models.rs` (new - Route, Backend, Certificate, GlobalSettings, AdminUser, UserPreference, NotificationConfig, RouteBackend + enums)
-- `lorica-config/src/store.rs` (new - ConfigStore with CRUD, migrations, WAL mode)
+- `lorica-config/src/store.rs` (new - ConfigStore with CRUD, migrations, WAL mode, key_pem encryption)
+- `lorica-config/src/crypto.rs` (new - AES-256-GCM encryption for key_pem at rest)
 - `lorica-config/src/export.rs` (new - TOML export with version field)
 - `lorica-config/src/import.rs` (new - TOML import with validation)
 - `lorica-config/src/migrations/001_initial.sql` (new - initial schema)
-- `lorica-config/src/tests.rs` (new - 17 unit tests)
+- `lorica-config/src/tests.rs` (new - 26 unit tests)
+- `docs/backlog.md` (modified - removed fixed items)
 
 ### Change Log
 - feat(config): add lorica-config crate with SQLite persistence
+- fix(config): address QA findings for 1.3 - key_pem encryption at rest, #![deny(clippy::all)]
 
 ### Completion Notes
-- All 17 tests pass (CRUD for all 7 entities + route-backend links + global settings + migration + export/import round-trip + WAL crash safety + import validation + file export/import + clear all)
-- Clippy clean with `-D clippy::all`
+- All 26 tests pass (17 original + 6 crypto + 3 encrypted storage)
+- Clippy clean with `-D clippy::all` (now enforced in lib.rs)
 - Formatted with `cargo fmt`
 - All enums implement `std::str::FromStr` trait
 - serde_json used for JSON array columns (san_domains, alert_types)
 - ConfigStore is the sole database access point as required
+- Certificate key_pem encrypted at rest with AES-256-GCM via ring (Dev Notes requirement)
+- EncryptionKey::load_or_create manages key file lifecycle
 
 ## QA Results
 
