@@ -99,3 +99,83 @@ so that I can manage my reverse proxy from a browser without any additional tool
 - Implemented login, password change, navigation skeleton, and overview screens
 - Integrated dashboard into lorica-api router on management port
 - Added build.rs for automatic frontend compilation during cargo build
+
+## QA Results
+
+### Review Date: 2026-03-29
+
+### Reviewed By: Quinn (Test Architect)
+
+### Code Quality Assessment
+
+Solid implementation with clean architecture. The Rust side (lib.rs) is well-structured with proper cache headers, SPA fallback logic, and API route passthrough. The Svelte 5 frontend uses modern patterns ($state, $props) and TypeScript throughout. Total bundle at ~59KB is excellent for a full SPA with routing.
+
+### Refactoring Performed
+
+- **File**: `lorica-dashboard/frontend/src/lib/api.ts`
+    - **Change**: Fixed StatusResponse and LoginResponse interfaces to match actual API response fields
+    - **Why**: Frontend field names diverged from backend (e.g., `routes` vs `routes_count`, missing `session_expires_at`)
+    - **How**: Aligned all interface fields with the actual Rust struct serialization in `lorica-api/src/status.rs` and `lorica-api/src/auth.rs`
+
+- **File**: `lorica-dashboard/frontend/src/routes/Overview.svelte`
+    - **Change**: Updated template bindings to use correct field names; removed non-existent `certificates_valid`/`certificates_expired` cards
+    - **Why**: Overview screen would display undefined values at runtime
+    - **How**: Changed to `routes_count`, `backends_count`, `certificates_count`, `certificates_expiring_soon`
+
+### Compliance Check
+
+- Coding Standards: Pass - `#![deny(clippy::all)]`, `cargo clippy` clean, `cargo fmt` applied, `svelte-check` 0 errors
+- Project Structure: Pass - New crate follows `source-tree.md` layout exactly (lorica-dashboard/src/lib.rs, frontend/)
+- Testing Strategy: Pass - 5 Rust unit tests for asset serving; svelte-check for TypeScript correctness
+- All ACs Met: Pass - All 10 acceptance criteria verified (see traceability below)
+
+### AC Traceability
+
+| AC | Status | Evidence |
+|----|--------|----------|
+| 1. lorica-dashboard crate created | Pass | `lorica-dashboard/Cargo.toml` exists, added to workspace |
+| 2. Frontend framework selected | Pass | Svelte 5 chosen (dev notes document evaluation rationale) |
+| 3. Build integrated into Cargo | Pass | `build.rs` runs npm install + build automatically |
+| 4. Assets embedded via rust-embed | Pass | `#[derive(Embed)] #[folder = "frontend/dist"]` in lib.rs |
+| 5. Dashboard served on mgmt port | Pass | Dashboard router merged in `lorica-api/src/server.rs` |
+| 6. Login screen functional | Pass | `Login.svelte` consumes `/api/v1/auth/login` with proper error handling |
+| 7. Password change screen | Pass | `PasswordChange.svelte` with 12-char minimum validation |
+| 8. Navigation skeleton | Pass | 7 nav items in sidebar: Overview, Routes, Backends, Certificates, Logs, System, Settings |
+| 9. Overview with placeholder cards | Pass | Cards for route count, backend health (3 states), cert status |
+| 10. Asset size < 5MB | Pass | Total dist: ~59KB (index.html + CSS + JS + favicon) |
+
+### Improvements Checklist
+
+- [x] Fixed StatusResponse field names to match API (api.ts, Overview.svelte)
+- [x] Fixed LoginResponse interface to match API
+- [ ] Consider adding Vitest + testing-library for frontend component tests (future story)
+- [ ] Consider extracting SVG shield icon to a shared component (3 duplications)
+- [ ] Session cookie Path=/api means dashboard pages don't receive the cookie - verify this is intentional (it is: SPA makes fetch to /api/*)
+
+### Security Review
+
+- No XSS vulnerabilities: `{@html}` in Nav.svelte only renders hardcoded SVG icon map (no user input)
+- Login form uses `autocomplete` attributes correctly for password managers
+- Password change enforces 12-char minimum on frontend (stricter than API's 8-char)
+- Session cookie: HttpOnly, Secure, SameSite=Strict - properly configured
+- No secrets or credentials in committed code
+
+### Performance Considerations
+
+- Bundle size: ~59KB total (19KB gzipped JS) - excellent
+- Cache strategy: immutable caching for hashed assets, no-cache for index.html - correct pattern
+- rust-embed serves from compiled binary memory - zero disk I/O at runtime
+- No performance concerns identified
+
+### Files Modified During Review
+
+- `lorica-dashboard/frontend/src/lib/api.ts` - Fixed interface field names
+- `lorica-dashboard/frontend/src/routes/Overview.svelte` - Fixed template bindings
+
+### Gate Status
+
+Gate: PASS -> docs/qa/gates/1.5-dashboard-skeleton.yml
+
+### Recommended Status
+
+Ready for Done - all ACs met, API alignment issue fixed, tests passing
