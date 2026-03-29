@@ -1,6 +1,6 @@
 [package]
 name = "lorica-api"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Romain G."]
 license = "Apache-2.0"
 edition = "2021"
@@ -8,8 +8,8 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
-lorica-config = { version = "0.2.0", path = "../lorica-config" }
-lorica-dashboard = { version = "0.2.0", path = "../lorica-dashboard" }
+lorica-config = { version = "0.3.0", path = "../lorica-config" }
+lorica-dashboard = { version = "0.3.0", path = "../lorica-dashboard" }
 axum = { version = "0.7", features = ["multipart"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
