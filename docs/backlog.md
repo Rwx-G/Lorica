@@ -17,5 +17,4 @@ Items identified during development that are deferred to future stories.
 | Source | Description | References |
 |--------|-------------|------------|
 | Epic 1.5 QA | Add Vitest + @testing-library/svelte for frontend component tests | lorica-dashboard/frontend/, Story 1.6+ |
-| Epic 1.5 QA | Extract shared SVG shield icon to reusable Svelte component (3 duplications) | Login.svelte, PasswordChange.svelte, Nav.svelte |
 | Epic 1.5 QA | Add light theme toggle in dashboard Settings screen | Story 1.10 |
