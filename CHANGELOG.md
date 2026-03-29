@@ -56,6 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Keyboard navigation for modals (Escape to close, Enter to submit) with ARIA dialog roles
 - Vitest + @testing-library/svelte test framework for frontend component testing
 - Frontend tests: StatusBadge (6), ConfirmDialog (7), API client (7) - 20 tests total
+- **Story 1.7:** Dashboard certificate management - full CRUD for TLS certificates
+- Certificates list screen with domain, issuer, expiration date, and expiry status badges
+- CertExpiryBadge component with valid/warning/critical/expired states (configurable thresholds)
+- Certificate upload via PEM file input or textarea (cert + key)
+- Certificate detail view: full chain display, SAN domains, fingerprint, associated routes
+- Certificate edit modal for domain and PEM replacement
+- Certificate deletion with impact display (affected routes warning, 409 conflict handling)
+- Self-signed certificate generation with preference memory prompt (never/always/once)
+- Configurable expiration thresholds (default: 30 days warning, 7 days critical)
+- API client methods for certificates (get, create, update, delete)
+- Frontend tests: CertExpiryBadge (10), certificate API client (6) - 16 new tests (36 total)
 
 ### Changed
 
