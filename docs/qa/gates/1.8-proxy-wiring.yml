@@ -2,21 +2,16 @@ schema: 1
 story: "1.8"
 story_title: "Proxy Engine Wiring"
 gate: PASS
-status_reason: "All acceptance criteria met. ProxyHttp implementation correctly bridges config to proxy engine with host/path routing, round-robin LB, TLS termination, health checks with latency-based degraded detection, and structured logging. 20 tests passing. TLS key cleanup on shutdown."
+status_reason: "All acceptance criteria met. ProxyHttp implementation correctly bridges config to proxy engine with host/path routing, round-robin LB, TLS termination, health checks, and structured logging. API mutations now trigger automatic proxy config reload via tokio::watch channel."
 reviewer: "Quinn (Test Architect)"
-updated: "2026-03-29T12:00:00Z"
+updated: "2026-03-30T01:00:00Z"
 
 waiver: { active: false }
 
-top_issues:
-  - id: "FEAT-001"
-    severity: low
-    finding: "API mutations do not trigger config reload - only health check loop does"
-    suggested_action: "Add reload trigger when routes/backends are created/updated/deleted via API"
-    suggested_owner: dev
+top_issues: []
 
-quality_score: 98
-expires: "2026-04-12T12:00:00Z"
+quality_score: 100
+expires: "2026-04-13T00:00:00Z"
 
 evidence:
   tests_reviewed: 20
@@ -34,17 +29,21 @@ nfr_validation:
     notes: "Lock-free arc-swap on hot path. Atomic round-robin. No blocking in request pipeline."
   reliability:
     status: PASS
-    notes: "Graceful error handling for missing routes (404) and no backends (502). Health check auto-recovers."
+    notes: "Graceful error handling for missing routes (404) and no backends (502). Health check auto-recovers. Config reload on API mutations."
   maintainability:
     status: PASS
-    notes: "Clean separation of concerns. Well-documented dev notes. 13 tests provide regression safety."
+    notes: "Clean separation of concerns. Well-documented dev notes. 20 tests provide regression safety."
 
 recommendations:
   immediate: []
-  future:
-    - action: "Add API-triggered config reload on route/backend mutations"
-      refs: ["lorica-api/src/routes.rs", "lorica-api/src/backends.rs"]
-    - action: "Add health check unit tests"
-      refs: ["lorica/src/health.rs"]
-    - action: "Clean up TLS key files on shutdown"
-      refs: ["lorica/src/main.rs"]
+  future: []
+
+history:
+  - at: "2026-03-29T12:00:00Z"
+    gate: PASS
+    score: 98
+    note: "Initial review - one low-severity item (API mutations don't trigger config reload)"
+  - at: "2026-03-30T01:00:00Z"
+    gate: PASS
+    score: 100
+    note: "Config reload on mutations resolved via tokio::watch channel in backlog cleanup"
