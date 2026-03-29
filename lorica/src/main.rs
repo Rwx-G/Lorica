@@ -222,8 +222,25 @@ async fn main() {
     api_handle.abort();
     health_handle.abort();
 
+    // Clean up TLS key material from disk
+    cleanup_tls_files(&tls_dir);
+
     // The proxy thread runs in its own process lifecycle via run_forever;
     // it handles signals internally. We just exit.
+}
+
+/// Remove TLS key material from disk on shutdown.
+fn cleanup_tls_files(tls_dir: &std::path::Path) {
+    for name in &["server.key", "server.crt"] {
+        let path = tls_dir.join(name);
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!(error = %e, path = %path.display(), "failed to remove TLS file on shutdown");
+            } else {
+                info!(path = %path.display(), "removed TLS file on shutdown");
+            }
+        }
+    }
 }
 
 /// Restrict private key file permissions (owner-only read on Unix, best-effort on Windows).
