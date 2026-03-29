@@ -9,19 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Story 1.6:** Dashboard route management - full CRUD for proxy routes
-- Routes list screen with data table (hostname, path, backends, TLS, health, enabled)
-- Route creation form with backend multi-select, certificate dropdown, load balancing and topology selectors
-- Route edit modal with all route parameters
-- Route delete with confirmation dialog
-- StatusBadge component for health indicators (green/orange/red)
-- ConfirmDialog component for destructive action confirmation
-- API client methods for routes (list, create, update, delete), backends (list), certificates (list)
-
-## [0.1.0] - 2026-03-29
-
-### Added
-
 - Project documentation: brief, PRD (5 epics, 25 stories), architecture (sharded), brainstorming results
 - Initial repository setup with LICENSE, README, CHANGELOG
 - **Story 1.1:** Fork Pingora v0.8.0 and rename to Lorica (17 crates, 178 .rs files)
@@ -58,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `build.rs` auto-compiles frontend during `cargo build` (npm install + build)
 - SPA fallback routing (hash-based client-side navigation)
 - Dashboard served on management port (9443) alongside REST API
+- **Story 1.6:** Dashboard route management - full CRUD for proxy routes
+- Routes list screen with data table (hostname, path, backends, TLS, health, enabled)
+- Route creation form with backend multi-select, certificate dropdown, load balancing and topology selectors
+- Route edit modal with all route parameters
+- Route delete with confirmation dialog
+- StatusBadge component for health indicators (green/orange/red)
+- ConfirmDialog component for destructive action confirmation
+- API client methods for routes (list, create, update, delete), backends (list), certificates (list)
+- Keyboard navigation for modals (Escape to close, Enter to submit) with ARIA dialog roles
+- Vitest + @testing-library/svelte test framework for frontend component testing
+- Frontend tests: StatusBadge (6), ConfirmDialog (7), API client (7) - 20 tests total
 
 ### Changed
 
