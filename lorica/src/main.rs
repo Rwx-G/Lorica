@@ -72,8 +72,7 @@ struct Cli {
 fn init_logging(log_level: &str) {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
     tracing_subscriber::fmt()
         .json()
@@ -138,8 +137,7 @@ async fn main() {
         tokio::runtime::Handle::current(),
     );
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
-    let mut proxy_service =
-        lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
+    let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
     proxy_service.add_tcp(&format!("0.0.0.0:{}", cli.http_port));
 
     info!(port = cli.http_port, "HTTP proxy listener configured");
@@ -277,10 +275,9 @@ async fn shutdown_signal() {
     {
         use tokio::signal::unix::{signal, SignalKind};
 
-        let mut sigterm = signal(SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-        let mut sigint = signal(SignalKind::interrupt())
-            .expect("failed to install SIGINT handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
 
         tokio::select! {
             _ = sigterm.recv() => {

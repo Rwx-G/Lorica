@@ -58,8 +58,10 @@ impl ProxyConfig {
     ) -> Self {
         let backend_map: HashMap<String, Backend> =
             backends.into_iter().map(|b| (b.id.clone(), b)).collect();
-        let cert_map: HashMap<String, Certificate> =
-            certificates.into_iter().map(|c| (c.id.clone(), c)).collect();
+        let cert_map: HashMap<String, Certificate> = certificates
+            .into_iter()
+            .map(|c| (c.id.clone(), c))
+            .collect();
 
         // Build route_id -> backend_ids mapping
         let mut route_backends_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -136,8 +138,16 @@ pub struct LoricaProxy {
 }
 
 impl LoricaProxy {
-    pub fn new(config: Arc<ArcSwap<ProxyConfig>>, log_buffer: Arc<LogBuffer>, rt_handle: tokio::runtime::Handle) -> Self {
-        Self { config, log_buffer, rt_handle }
+    pub fn new(
+        config: Arc<ArcSwap<ProxyConfig>>,
+        log_buffer: Arc<LogBuffer>,
+        rt_handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            config,
+            log_buffer,
+            rt_handle,
+        }
     }
 }
 
@@ -176,14 +186,11 @@ impl ProxyHttp for LoricaProxy {
         let config = self.config.load();
 
         // Find matching route by hostname then longest path prefix
-        let route_entry = config
-            .routes_by_host
-            .get(host)
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|e| path.starts_with(&e.route.path_prefix))
-            });
+        let route_entry = config.routes_by_host.get(host).and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| path.starts_with(&e.route.path_prefix))
+        });
 
         let entry = match route_entry {
             Some(e) => e,
@@ -203,8 +210,7 @@ impl ProxyHttp for LoricaProxy {
             .backends
             .iter()
             .filter(|b| {
-                b.health_status != HealthStatus::Down
-                    && b.lifecycle_state == LifecycleState::Normal
+                b.health_status != HealthStatus::Down && b.lifecycle_state == LifecycleState::Normal
             })
             .collect();
 
@@ -229,12 +235,7 @@ impl ProxyHttp for LoricaProxy {
             backend.tls_upstream,
             if backend.tls_upstream {
                 // Use the backend address host as SNI
-                backend
-                    .address
-                    .split(':')
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
+                backend.address.split(':').next().unwrap_or("").to_string()
             } else {
                 String::new()
             },

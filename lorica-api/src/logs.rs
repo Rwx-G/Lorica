@@ -158,7 +158,9 @@ pub async fn get_logs(
                     || e.path.to_lowercase().contains(&s)
                     || e.host.to_lowercase().contains(&s)
                     || e.backend.to_lowercase().contains(&s)
-                    || e.error.as_ref().is_some_and(|err| err.to_lowercase().contains(&s));
+                    || e.error
+                        .as_ref()
+                        .is_some_and(|err| err.to_lowercase().contains(&s));
                 if !matches {
                     return false;
                 }

@@ -73,10 +73,9 @@ pub async fn get_system(
 
     // Disk (aggregate all disks)
     let disks = sysinfo::Disks::new_with_refreshed_list();
-    let (disk_total, disk_available) =
-        disks.iter().fold((0u64, 0u64), |(total, avail), d| {
-            (total + d.total_space(), avail + d.available_space())
-        });
+    let (disk_total, disk_available) = disks.iter().fold((0u64, 0u64), |(total, avail), d| {
+        (total + d.total_space(), avail + d.available_space())
+    });
     let disk_used = disk_total.saturating_sub(disk_available);
     let disk_percent = if disk_total > 0 {
         (disk_used as f64 / disk_total as f64) * 100.0

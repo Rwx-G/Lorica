@@ -184,8 +184,14 @@ mod tests {
 
     #[test]
     fn test_probe_result_to_health_status() {
-        assert_eq!(ProbeResult::Healthy.to_health_status(), HealthStatus::Healthy);
-        assert_eq!(ProbeResult::Degraded.to_health_status(), HealthStatus::Degraded);
+        assert_eq!(
+            ProbeResult::Healthy.to_health_status(),
+            HealthStatus::Healthy
+        );
+        assert_eq!(
+            ProbeResult::Degraded.to_health_status(),
+            HealthStatus::Degraded
+        );
         assert_eq!(ProbeResult::Down.to_health_status(), HealthStatus::Down);
     }
 

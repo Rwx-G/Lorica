@@ -58,10 +58,18 @@ async fn test_reload_builds_proxy_config() {
     let store = ConfigStore::open_in_memory().unwrap();
 
     // Create routes with backends
-    store.create_route(&make_route("r1", "example.com", "/")).unwrap();
-    store.create_route(&make_route("r2", "api.example.com", "/v1")).unwrap();
-    store.create_backend(&make_backend("b1", "10.0.0.1:80")).unwrap();
-    store.create_backend(&make_backend("b2", "10.0.0.2:80")).unwrap();
+    store
+        .create_route(&make_route("r1", "example.com", "/"))
+        .unwrap();
+    store
+        .create_route(&make_route("r2", "api.example.com", "/v1"))
+        .unwrap();
+    store
+        .create_backend(&make_backend("b1", "10.0.0.1:80"))
+        .unwrap();
+    store
+        .create_backend(&make_backend("b2", "10.0.0.2:80"))
+        .unwrap();
     store.link_route_backend("r1", "b1").unwrap();
     store.link_route_backend("r1", "b2").unwrap();
     store.link_route_backend("r2", "b1").unwrap();
@@ -92,10 +100,18 @@ async fn test_reload_builds_proxy_config() {
 async fn test_longest_prefix_ordering() {
     let store = ConfigStore::open_in_memory().unwrap();
 
-    store.create_route(&make_route("r1", "app.test", "/")).unwrap();
-    store.create_route(&make_route("r2", "app.test", "/api")).unwrap();
-    store.create_route(&make_route("r3", "app.test", "/api/v2")).unwrap();
-    store.create_backend(&make_backend("b1", "10.0.0.1:80")).unwrap();
+    store
+        .create_route(&make_route("r1", "app.test", "/"))
+        .unwrap();
+    store
+        .create_route(&make_route("r2", "app.test", "/api"))
+        .unwrap();
+    store
+        .create_route(&make_route("r3", "app.test", "/api/v2"))
+        .unwrap();
+    store
+        .create_backend(&make_backend("b1", "10.0.0.1:80"))
+        .unwrap();
     store.link_route_backend("r1", "b1").unwrap();
     store.link_route_backend("r2", "b1").unwrap();
     store.link_route_backend("r3", "b1").unwrap();
@@ -126,8 +142,12 @@ async fn test_disabled_routes_excluded() {
     let mut disabled = make_route("r1", "example.com", "/");
     disabled.enabled = false;
     store.create_route(&disabled).unwrap();
-    store.create_route(&make_route("r2", "example.com", "/api")).unwrap();
-    store.create_backend(&make_backend("b1", "10.0.0.1:80")).unwrap();
+    store
+        .create_route(&make_route("r2", "example.com", "/api"))
+        .unwrap();
+    store
+        .create_backend(&make_backend("b1", "10.0.0.1:80"))
+        .unwrap();
     store.link_route_backend("r1", "b1").unwrap();
     store.link_route_backend("r2", "b1").unwrap();
 
@@ -151,7 +171,9 @@ async fn test_disabled_routes_excluded() {
 async fn test_route_with_no_backends() {
     let store = ConfigStore::open_in_memory().unwrap();
 
-    store.create_route(&make_route("r1", "empty.test", "/")).unwrap();
+    store
+        .create_route(&make_route("r1", "empty.test", "/"))
+        .unwrap();
 
     let store = Arc::new(tokio::sync::Mutex::new(store));
     let proxy_config = Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -173,8 +195,12 @@ async fn test_route_with_no_backends() {
 async fn test_reload_atomic_swap() {
     let store = ConfigStore::open_in_memory().unwrap();
 
-    store.create_route(&make_route("r1", "first.test", "/")).unwrap();
-    store.create_backend(&make_backend("b1", "10.0.0.1:80")).unwrap();
+    store
+        .create_route(&make_route("r1", "first.test", "/"))
+        .unwrap();
+    store
+        .create_backend(&make_backend("b1", "10.0.0.1:80"))
+        .unwrap();
     store.link_route_backend("r1", "b1").unwrap();
 
     let store = Arc::new(tokio::sync::Mutex::new(store));
@@ -193,7 +219,8 @@ async fn test_reload_atomic_swap() {
     // Add a new route and reload
     {
         let s = store.lock().await;
-        s.create_route(&make_route("r2", "second.test", "/")).unwrap();
+        s.create_route(&make_route("r2", "second.test", "/"))
+            .unwrap();
         s.link_route_backend("r2", "b1").unwrap();
     }
 
@@ -211,7 +238,9 @@ async fn test_reload_atomic_swap() {
 async fn test_down_backends_filtered() {
     let store = ConfigStore::open_in_memory().unwrap();
 
-    store.create_route(&make_route("r1", "app.test", "/")).unwrap();
+    store
+        .create_route(&make_route("r1", "app.test", "/"))
+        .unwrap();
 
     let b1 = make_backend("b1", "10.0.0.1:80");
     let mut b2 = make_backend("b2", "10.0.0.2:80");

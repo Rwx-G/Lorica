@@ -81,6 +81,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Latency-based degraded health detection (backends marked Degraded when TCP connect > 2s)
 - TLS key file cleanup on graceful shutdown
 - Rust tests: 20 new tests (config linking, routing logic, prefix ordering, health filtering, TCP probing)
+- **Story 1.9:** Dashboard logs and system monitoring
+- In-memory ring buffer for access log capture (configurable, default 10,000 entries)
+- `GET /api/v1/logs` endpoint with filtering by route, status code range, and text search
+- `DELETE /api/v1/logs` endpoint for clearing log buffer
+- `GET /api/v1/system` endpoint with host metrics (CPU, RAM, disk), process metrics, and proxy info (version, uptime, connections)
+- `sysinfo` crate integration for cross-platform system metrics
+- Logs dashboard screen: scrollable table with filters (host, status category, search), auto-refresh (5s polling), clear action
+- System dashboard screen: CPU/RAM/disk gauge bars with color thresholds, process memory and CPU, proxy version/uptime/connections
+- Proxy access logging wired into shared LogBuffer for real-time dashboard viewing
+- Rust tests: 5 new integration tests (logs endpoint empty/populated/filtering/clear, system endpoint)
+- Frontend tests: 4 new API client tests (getLogs, getLogs with params, clearLogs, getSystem) - 40 total
 
 ### Changed
 
