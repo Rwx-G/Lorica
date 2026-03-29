@@ -1,6 +1,7 @@
 <script lang="ts">
   import Nav from '../components/Nav.svelte';
   import Overview from './Overview.svelte';
+  import Routes from './Routes.svelte';
   import Placeholder from './Placeholder.svelte';
   import { currentPath } from '../lib/router';
 
@@ -16,7 +17,7 @@
   {#if path === '/'}
     <Overview />
   {:else if path === '/routes'}
-    <Placeholder title="Routes" />
+    <Routes />
   {:else if path === '/backends'}
     <Placeholder title="Backends" />
   {:else if path === '/certificates'}
