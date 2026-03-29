@@ -106,6 +106,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - API client methods for settings, notifications, preferences, export, import, and import preview
 - Rust tests: 5 ConfigDiff tests, 8 API integration tests (settings, notifications, preferences, import preview)
 - Frontend tests: 12 new API client tests (settings, notifications, preferences, export/import) - 52 total
+- **Backlog cleanup:** Notification config JSON validation on create/update
+- **Backlog cleanup:** TOML import file size limit (1 MB max)
+- **Backlog cleanup:** `POST /api/v1/notifications/:id/test` endpoint for config validation
+- **Backlog cleanup:** Certificate expiration thresholds (`cert_warning_days`, `cert_critical_days`) persisted to GlobalSettings
+- **Backlog cleanup:** Self-signed certificate preference persisted to UserPreference API
+- **Backlog cleanup:** Light theme with toggle in Settings (Appearance section)
+- **Backlog cleanup:** API-triggered proxy config reload on route/backend/import mutations via `tokio::watch` channel
+
+### Fixed
+
+- Windows compilation for PoolNode test (ID type alias)
 
 ### Changed
 
