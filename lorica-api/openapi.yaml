@@ -1,0 +1,736 @@
+openapi: 3.0.3
+info:
+  title: Lorica API
+  description: REST API for Lorica reverse proxy management
+  version: 0.1.0
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:9443
+    description: Management port (localhost only)
+
+paths:
+  /api/v1/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Authenticate and create session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+      responses:
+        "200":
+          description: Login successful
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: Session cookie (HttpOnly, SameSite=Strict)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      must_change_password:
+                        type: boolean
+                      session_expires_at:
+                        type: string
+                        format: date-time
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Invalidate session and logout
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Logout successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+
+  /api/v1/auth/password:
+    put:
+      tags: [Authentication]
+      summary: Change admin password
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password:
+                  type: string
+                new_password:
+                  type: string
+                  minLength: 8
+      responses:
+        "200":
+          description: Password updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/routes:
+    get:
+      tags: [Routes]
+      summary: List all routes
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: List of routes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      routes:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/Route"
+    post:
+      tags: [Routes]
+      summary: Create a new route
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateRouteRequest"
+      responses:
+        "201":
+          description: Route created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Route"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/routes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [Routes]
+      summary: Get route by ID
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Route details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Route"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Routes]
+      summary: Update route
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRouteRequest"
+      responses:
+        "200":
+          description: Route updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Route"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Routes]
+      summary: Delete route
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Route deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/backends:
+    get:
+      tags: [Backends]
+      summary: List all backends
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: List of backends
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      backends:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/Backend"
+    post:
+      tags: [Backends]
+      summary: Add a new backend
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBackendRequest"
+      responses:
+        "201":
+          description: Backend created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Backend"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/backends/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [Backends]
+      summary: Get backend by ID
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Backend details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Backend"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Backends]
+      summary: Update backend
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateBackendRequest"
+      responses:
+        "200":
+          description: Backend updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Backend"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Backends]
+      summary: Delete backend
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Backend deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/certificates:
+    get:
+      tags: [Certificates]
+      summary: List all certificates
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: List of certificates
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      certificates:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/Certificate"
+    post:
+      tags: [Certificates]
+      summary: Upload a certificate
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCertificateRequest"
+      responses:
+        "201":
+          description: Certificate created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Certificate"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/certificates/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [Certificates]
+      summary: Get certificate details
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Certificate details with associated routes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CertificateDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Certificates]
+      summary: Delete certificate
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Certificate deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Certificate is referenced by routes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/status:
+    get:
+      tags: [Status]
+      summary: Proxy status overview
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Status overview
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Status"
+
+  /api/v1/config/export:
+    post:
+      tags: [Configuration]
+      summary: Export full configuration as TOML
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: TOML file download
+          content:
+            application/toml:
+              schema:
+                type: string
+
+  /api/v1/config/import:
+    post:
+      tags: [Configuration]
+      summary: Import configuration from TOML
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [toml_content]
+              properties:
+                toml_content:
+                  type: string
+                  description: Full TOML configuration content
+      responses:
+        "200":
+          description: Configuration imported
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: lorica_session
+
+  schemas:
+    Route:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        hostname:
+          type: string
+        path_prefix:
+          type: string
+        backends:
+          type: array
+          items:
+            type: string
+            format: uuid
+        certificate_id:
+          type: string
+          format: uuid
+          nullable: true
+        load_balancing:
+          type: string
+          enum: [round_robin, consistent_hash, random, peak_ewma]
+        waf_enabled:
+          type: boolean
+        topology_type:
+          type: string
+          enum: [single_vm, ha, docker_swarm, kubernetes, custom]
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateRouteRequest:
+      type: object
+      required: [hostname]
+      properties:
+        hostname:
+          type: string
+        path_prefix:
+          type: string
+          default: "/"
+        backend_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        certificate_id:
+          type: string
+          format: uuid
+        load_balancing:
+          type: string
+          enum: [round_robin, consistent_hash, random, peak_ewma]
+          default: round_robin
+        topology_type:
+          type: string
+          enum: [single_vm, ha, docker_swarm, kubernetes, custom]
+          default: single_vm
+
+    UpdateRouteRequest:
+      type: object
+      properties:
+        hostname:
+          type: string
+        path_prefix:
+          type: string
+        backend_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        certificate_id:
+          type: string
+          format: uuid
+        load_balancing:
+          type: string
+          enum: [round_robin, consistent_hash, random, peak_ewma]
+        topology_type:
+          type: string
+          enum: [single_vm, ha, docker_swarm, kubernetes, custom]
+        enabled:
+          type: boolean
+
+    Backend:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        address:
+          type: string
+        weight:
+          type: integer
+        health_status:
+          type: string
+          enum: [healthy, degraded, down]
+        health_check_enabled:
+          type: boolean
+        health_check_interval_s:
+          type: integer
+        tls_upstream:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateBackendRequest:
+      type: object
+      required: [address]
+      properties:
+        address:
+          type: string
+        weight:
+          type: integer
+          default: 100
+        health_check_enabled:
+          type: boolean
+          default: true
+        health_check_interval_s:
+          type: integer
+          default: 10
+        tls_upstream:
+          type: boolean
+          default: false
+
+    UpdateBackendRequest:
+      type: object
+      properties:
+        address:
+          type: string
+        weight:
+          type: integer
+        health_check_enabled:
+          type: boolean
+        health_check_interval_s:
+          type: integer
+        tls_upstream:
+          type: boolean
+
+    Certificate:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        domain:
+          type: string
+        san_domains:
+          type: array
+          items:
+            type: string
+        fingerprint:
+          type: string
+        issuer:
+          type: string
+        not_before:
+          type: string
+          format: date-time
+        not_after:
+          type: string
+          format: date-time
+        is_acme:
+          type: boolean
+        acme_auto_renew:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    CertificateDetail:
+      allOf:
+        - $ref: "#/components/schemas/Certificate"
+        - type: object
+          properties:
+            cert_pem:
+              type: string
+            associated_routes:
+              type: array
+              items:
+                type: string
+                format: uuid
+
+    CreateCertificateRequest:
+      type: object
+      required: [domain, cert_pem, key_pem]
+      properties:
+        domain:
+          type: string
+        cert_pem:
+          type: string
+        key_pem:
+          type: string
+
+    Status:
+      type: object
+      properties:
+        routes_count:
+          type: integer
+        backends_count:
+          type: integer
+        backends_healthy:
+          type: integer
+        backends_degraded:
+          type: integer
+        backends_down:
+          type: integer
+        certificates_count:
+          type: integer
+        certificates_expiring_soon:
+          type: integer
+
+    MessageResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            message:
+              type: string
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    RateLimited:
+      description: Too many requests
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
