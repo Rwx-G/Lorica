@@ -1,0 +1,55 @@
+schema: 1
+story: "1.8"
+story_title: "Proxy Engine Wiring"
+gate: PASS
+status_reason: "All acceptance criteria met. ProxyHttp implementation correctly bridges config to proxy engine with host/path routing, round-robin LB, TLS termination, health checks, and structured logging. 13 tests passing. Security fix applied for TLS key permissions."
+reviewer: "Quinn (Test Architect)"
+updated: "2026-03-29T12:00:00Z"
+
+waiver: { active: false }
+
+top_issues:
+  - id: "FEAT-001"
+    severity: low
+    finding: "API mutations do not trigger config reload - only health check loop does"
+    suggested_action: "Add reload trigger when routes/backends are created/updated/deleted via API"
+    suggested_owner: dev
+  - id: "FEAT-002"
+    severity: low
+    finding: "Health check only supports Healthy/Down states, no Degraded"
+    suggested_action: "Consider adding latency-based degraded detection in future iteration"
+    suggested_owner: dev
+
+quality_score: 95
+expires: "2026-04-12T12:00:00Z"
+
+evidence:
+  tests_reviewed: 13
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7, 8]
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "TLS key permissions restricted. No secrets in code. Management API localhost-only."
+  performance:
+    status: PASS
+    notes: "Lock-free arc-swap on hot path. Atomic round-robin. No blocking in request pipeline."
+  reliability:
+    status: PASS
+    notes: "Graceful error handling for missing routes (404) and no backends (502). Health check auto-recovers."
+  maintainability:
+    status: PASS
+    notes: "Clean separation of concerns. Well-documented dev notes. 13 tests provide regression safety."
+
+recommendations:
+  immediate: []
+  future:
+    - action: "Add API-triggered config reload on route/backend mutations"
+      refs: ["lorica-api/src/routes.rs", "lorica-api/src/backends.rs"]
+    - action: "Add health check unit tests"
+      refs: ["lorica/src/health.rs"]
+    - action: "Clean up TLS key files on shutdown"
+      refs: ["lorica/src/main.rs"]
