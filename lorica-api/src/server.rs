@@ -68,9 +68,13 @@ pub fn build_router(
         .route("/api/v1/config/import", post(crate::config::import_config))
         .layer(middleware::from_fn(require_auth));
 
+    // Dashboard routes serve embedded frontend assets (SPA with fallback)
+    let dashboard_routes = lorica_dashboard::router();
+
     Router::new()
         .merge(auth_routes)
         .merge(protected_routes)
+        .merge(dashboard_routes)
         .layer(axum::Extension(state))
         .layer(axum::Extension(session_store))
         .layer(axum::Extension(rate_limiter))

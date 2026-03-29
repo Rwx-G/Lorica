@@ -9,6 +9,7 @@ description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
 lorica-config = { version = "0.2.0", path = "../lorica-config" }
+lorica-dashboard = { version = "0.2.0", path = "../lorica-dashboard" }
 axum = { version = "0.7", features = ["multipart"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
