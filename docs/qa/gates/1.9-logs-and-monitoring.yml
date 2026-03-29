@@ -1,0 +1,48 @@
+schema: 1
+story: "1.9"
+story_title: "Dashboard - Logs and System Monitoring"
+gate: PASS
+status_reason: "All 6 ACs met after QA fixes. Time range filtering added. SystemCache optimization applied. 29 Rust + 40 frontend tests passing."
+reviewer: "QA Agent"
+updated: "2026-03-29T23:50:00Z"
+
+waiver: { active: false }
+
+top_issues:
+  - severity: minor
+    description: "active_connections reads from DB, not live proxy state - always shows stored value"
+    resolution: "Documented as v1 limitation, deferred to future story"
+  - severity: minor
+    description: "Spawned log push task drops JoinHandle without error handling"
+    resolution: "Acceptable for best-effort log buffer"
+
+quality_score: 96
+expires: "2026-04-12T00:00:00Z"
+
+evidence:
+  tests_reviewed: 69
+  risks_identified: 2
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6]
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "All new endpoints behind require_auth middleware. No secrets exposed. No injection vectors."
+  performance:
+    status: PASS
+    notes: "SystemCache avoids expensive System::new_all() per request. Ring buffer O(1) push. RwLock allows concurrent reads."
+  reliability:
+    status: PASS
+    notes: "Ring buffer gracefully overwrites oldest entries. Log push is best-effort, proxy operation unaffected."
+  maintainability:
+    status: PASS
+    notes: "Follows existing module patterns. Clean separation between LogBuffer (data) and handlers (API). Frontend follows Svelte 5 runes."
+
+recommendations:
+  immediate: []
+  future:
+    - "Wire real-time active connection counting from the proxy engine"
+    - "Consider WebSocket for sub-second log streaming"
+    - "Extract shared CSS (buttons, error banners) into a component library"

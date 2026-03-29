@@ -1,7 +1,7 @@
 # Story 1.9: Dashboard - Logs and System Monitoring
 
 **Epic:** [Epic 1 - Foundation](../prd/epic-1-foundation.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P1
 **Depends on:** Stories 1.5, 1.8
 
