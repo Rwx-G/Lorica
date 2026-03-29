@@ -1,10 +1,16 @@
-# Lorica
+<p align="center">
+  <h1 align="center">Lorica</h1>
+  <p align="center">A modern reverse proxy you manage from your browser. Single binary, built-in dashboard, no config files. Powered by Rust and <a href="https://github.com/cloudflare/pingora">Pingora</a>.</p>
+</p>
 
-![Version](https://img.shields.io/badge/version-0.1.0--dev-blue)
-![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Status](https://img.shields.io/badge/status-early%20development-orange)
-
-**A modern reverse proxy you manage from your browser.** Single binary, built-in dashboard, no config files. Powered by Rust and [Pingora](https://github.com/cloudflare/pingora).
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
+  <img src="https://img.shields.io/badge/Svelte-5-FF3E00.svg" alt="Svelte">
+  <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
+  <img src="https://img.shields.io/badge/Status-0.1.0--dev-yellow.svg" alt="Status">
+  <img src="https://img.shields.io/badge/Tests-119%20passing-brightgreen.svg" alt="Tests">
+</p>
 
 ---
 
