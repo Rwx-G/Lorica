@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 
 pub mod crypto;
+pub mod diff;
 pub mod error;
 pub mod export;
 pub mod import;

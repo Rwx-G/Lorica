@@ -81,6 +81,40 @@ pub fn build_router(
         .route("/api/v1/system", get(crate::system::get_system))
         .route("/api/v1/config/export", post(crate::config::export_config))
         .route("/api/v1/config/import", post(crate::config::import_config))
+        .route(
+            "/api/v1/config/import/preview",
+            post(crate::config::import_preview),
+        )
+        .route("/api/v1/settings", get(crate::settings::get_settings))
+        .route("/api/v1/settings", put(crate::settings::update_settings))
+        .route(
+            "/api/v1/notifications",
+            get(crate::settings::list_notifications),
+        )
+        .route(
+            "/api/v1/notifications",
+            post(crate::settings::create_notification),
+        )
+        .route(
+            "/api/v1/notifications/:id",
+            put(crate::settings::update_notification),
+        )
+        .route(
+            "/api/v1/notifications/:id",
+            delete(crate::settings::delete_notification),
+        )
+        .route(
+            "/api/v1/preferences",
+            get(crate::settings::list_preferences),
+        )
+        .route(
+            "/api/v1/preferences/:id",
+            put(crate::settings::update_preference),
+        )
+        .route(
+            "/api/v1/preferences/:id",
+            delete(crate::settings::delete_preference),
+        )
         .layer(middleware::from_fn(require_auth));
 
     // Dashboard routes serve embedded frontend assets (SPA with fallback)

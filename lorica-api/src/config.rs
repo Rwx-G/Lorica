@@ -39,7 +39,7 @@ pub async fn export_config(
     ))
 }
 
-/// POST /api/v1/config/import
+/// POST /api/v1/config/import - direct import (replaces all data)
 pub async fn import_config(
     Extension(state): Extension<AppState>,
     Json(body): Json<ImportRequest>,
@@ -54,4 +54,19 @@ pub async fn import_config(
     Ok(json_data(
         serde_json::json!({"message": "configuration imported successfully"}),
     ))
+}
+
+/// POST /api/v1/config/import/preview - parse TOML and return diff without applying
+pub async fn import_preview(
+    Extension(state): Extension<AppState>,
+    Json(body): Json<ImportRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let import_data = lorica_config::import::parse_toml(&body.toml_content)
+        .map_err(|e| ApiError::BadRequest(format!("invalid TOML: {e}")))?;
+
+    let store = state.store.lock().await;
+    let diff = lorica_config::diff::compute_diff(&store, &import_data)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(json_data(diff))
 }
