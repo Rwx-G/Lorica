@@ -332,10 +332,10 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
         {
-            let _store = ConfigStore::open(path).unwrap();
+            let _store = ConfigStore::open(path, None).unwrap();
         }
         {
-            let store = ConfigStore::open(path).unwrap();
+            let store = ConfigStore::open(path, None).unwrap();
             assert_eq!(store.schema_version().unwrap(), 1);
         }
     }
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn test_wal_mode_enabled() {
         let tmp = NamedTempFile::new().unwrap();
-        let store = ConfigStore::open(tmp.path()).unwrap();
+        let store = ConfigStore::open(tmp.path(), None).unwrap();
 
         // Verify WAL mode by writing and reading back
         let route = make_route();
@@ -428,7 +428,7 @@ mod tests {
 
         // Data survives re-open (simulates crash recovery)
         drop(store);
-        let store2 = ConfigStore::open(tmp.path()).unwrap();
+        let store2 = ConfigStore::open(tmp.path(), None).unwrap();
         let fetched = store2.get_route(&route.id).unwrap().unwrap();
         assert_eq!(fetched.hostname, "example.com");
     }
@@ -515,5 +515,84 @@ backend_id = "also-nonexistent"
         assert!(store.list_routes().unwrap().is_empty());
         assert!(store.list_backends().unwrap().is_empty());
         assert!(store.list_certificates().unwrap().is_empty());
+    }
+
+    // ---- Encryption at rest ----
+
+    #[test]
+    fn test_key_pem_encrypted_at_rest() {
+        use crate::crypto::EncryptionKey;
+
+        let key = EncryptionKey::generate().unwrap();
+        let store = ConfigStore::open_in_memory_with_key(key).unwrap();
+        let cert = make_certificate();
+        let original_key_pem = cert.key_pem.clone();
+
+        store.create_certificate(&cert).unwrap();
+
+        // Verify we can read back the decrypted key_pem
+        let fetched = store.get_certificate(&cert.id).unwrap().unwrap();
+        assert_eq!(fetched.key_pem, original_key_pem);
+
+        // Verify it's stored encrypted in the DB (raw query)
+        let raw: Vec<u8> = store
+            .conn
+            .query_row(
+                "SELECT key_pem FROM certificates WHERE id=?1",
+                rusqlite::params![cert.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Encrypted data should differ from plaintext
+        assert_ne!(raw, original_key_pem.as_bytes());
+        // Encrypted data should be larger (nonce + tag overhead)
+        assert!(raw.len() > original_key_pem.len());
+    }
+
+    #[test]
+    fn test_key_pem_round_trip_with_encryption() {
+        use crate::crypto::EncryptionKey;
+
+        let key = EncryptionKey::generate().unwrap();
+        let store = ConfigStore::open_in_memory_with_key(key).unwrap();
+
+        let cert = make_certificate();
+        store.create_certificate(&cert).unwrap();
+
+        // List also decrypts
+        let certs = store.list_certificates().unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].key_pem, cert.key_pem);
+
+        // Update also encrypts
+        let mut updated = cert.clone();
+        updated.key_pem = "-----BEGIN PRIVATE KEY-----\nnew key\n-----END PRIVATE KEY-----".into();
+        store.update_certificate(&updated).unwrap();
+
+        let fetched = store.get_certificate(&updated.id).unwrap().unwrap();
+        assert_eq!(fetched.key_pem, updated.key_pem);
+    }
+
+    #[test]
+    fn test_export_import_with_encryption() {
+        use crate::crypto::EncryptionKey;
+
+        let key = EncryptionKey::generate().unwrap();
+        let store1 = ConfigStore::open_in_memory_with_key(key.clone()).unwrap();
+
+        let cert = make_certificate();
+        store1.create_certificate(&cert).unwrap();
+
+        // Export produces decrypted key_pem in TOML
+        let toml_str = export_to_toml(&store1).unwrap();
+        assert!(toml_str.contains(&cert.key_pem));
+
+        // Import into another encrypted store works
+        let store2 = ConfigStore::open_in_memory_with_key(key).unwrap();
+        let data = parse_toml(&toml_str).unwrap();
+        import_to_store(&store2, &data).unwrap();
+
+        let fetched = store2.get_certificate(&cert.id).unwrap().unwrap();
+        assert_eq!(fetched.key_pem, cert.key_pem);
     }
 }

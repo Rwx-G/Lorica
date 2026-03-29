@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json;
 use uuid::Uuid;
 
+use crate::crypto::EncryptionKey;
 use crate::error::{ConfigError, Result};
 use crate::models::*;
 
@@ -13,17 +14,22 @@ const MIGRATION_V1: &str = include_str!("migrations/001_initial.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
-    conn: Connection,
+    pub(crate) conn: Connection,
+    encryption_key: Option<EncryptionKey>,
 }
 
 impl ConfigStore {
     /// Open (or create) the configuration database at the given path.
     /// Enables WAL mode and runs pending migrations automatically.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// If `encryption_key` is provided, certificate private keys are encrypted at rest.
+    pub fn open(path: &Path, encryption_key: Option<EncryptionKey>) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            encryption_key,
+        };
         store.run_migrations()?;
         Ok(store)
     }
@@ -32,9 +38,44 @@ impl ConfigStore {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            encryption_key: None,
+        };
         store.run_migrations()?;
         Ok(store)
+    }
+
+    /// Open an in-memory database with an encryption key (for testing encryption).
+    pub fn open_in_memory_with_key(encryption_key: EncryptionKey) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let store = Self {
+            conn,
+            encryption_key: Some(encryption_key),
+        };
+        store.run_migrations()?;
+        Ok(store)
+    }
+
+    fn encrypt_key_pem(&self, key_pem: &str) -> Result<Vec<u8>> {
+        match &self.encryption_key {
+            Some(key) => key.encrypt(key_pem.as_bytes()),
+            None => Ok(key_pem.as_bytes().to_vec()),
+        }
+    }
+
+    fn decrypt_key_pem(&self, data: &[u8]) -> Result<String> {
+        match &self.encryption_key {
+            Some(key) => {
+                let plaintext = key.decrypt(data)?;
+                String::from_utf8(plaintext).map_err(|e| {
+                    ConfigError::Validation(format!("decrypted key_pem is not valid UTF-8: {e}"))
+                })
+            }
+            None => String::from_utf8(data.to_vec())
+                .map_err(|e| ConfigError::Validation(format!("key_pem is not valid UTF-8: {e}"))),
+        }
     }
 
     fn run_migrations(&self) -> Result<()> {
@@ -294,6 +335,7 @@ impl ConfigStore {
     pub fn create_certificate(&self, cert: &Certificate) -> Result<()> {
         let san_json = serde_json::to_string(&cert.san_domains)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        let encrypted_key = self.encrypt_key_pem(&cert.key_pem)?;
         self.conn.execute(
             "INSERT INTO certificates (id, domain, san_domains, fingerprint, cert_pem, key_pem,
              issuer, not_before, not_after, is_acme, acme_auto_renew, created_at)
@@ -304,7 +346,7 @@ impl ConfigStore {
                 san_json,
                 cert.fingerprint,
                 cert.cert_pem,
-                cert.key_pem,
+                encrypted_key,
                 cert.issuer,
                 cert.not_before.to_rfc3339(),
                 cert.not_after.to_rfc3339(),
@@ -323,7 +365,7 @@ impl ConfigStore {
                  issuer, not_before, not_after, is_acme, acme_auto_renew, created_at
                  FROM certificates WHERE id = ?1",
                 params![id],
-                |row| Ok(row_to_certificate(row)),
+                |row| Ok(self.row_to_certificate(row)),
             )
             .optional()?
             .transpose()
@@ -335,7 +377,7 @@ impl ConfigStore {
              issuer, not_before, not_after, is_acme, acme_auto_renew, created_at
              FROM certificates ORDER BY domain",
         )?;
-        let rows = stmt.query_map([], |row| Ok(row_to_certificate(row)))?;
+        let rows = stmt.query_map([], |row| Ok(self.row_to_certificate(row)))?;
         let mut certs = Vec::new();
         for r in rows {
             certs.push(r??);
@@ -346,6 +388,7 @@ impl ConfigStore {
     pub fn update_certificate(&self, cert: &Certificate) -> Result<()> {
         let san_json = serde_json::to_string(&cert.san_domains)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        let encrypted_key = self.encrypt_key_pem(&cert.key_pem)?;
         let changed = self.conn.execute(
             "UPDATE certificates SET domain=?2, san_domains=?3, fingerprint=?4,
              cert_pem=?5, key_pem=?6, issuer=?7, not_before=?8, not_after=?9,
@@ -356,7 +399,7 @@ impl ConfigStore {
                 san_json,
                 cert.fingerprint,
                 cert.cert_pem,
-                cert.key_pem,
+                encrypted_key,
                 cert.issuer,
                 cert.not_before.to_rfc3339(),
                 cert.not_after.to_rfc3339(),
@@ -704,6 +747,28 @@ impl ConfigStore {
         )?;
         Ok(())
     }
+
+    fn row_to_certificate(&self, row: &rusqlite::Row<'_>) -> Result<Certificate> {
+        let san_json: String = row.get(2)?;
+        let san_domains: Vec<String> = serde_json::from_str(&san_json)
+            .map_err(|e| ConfigError::Validation(format!("invalid san_domains JSON: {e}")))?;
+        let key_pem_raw: Vec<u8> = row.get(5)?;
+        let key_pem = self.decrypt_key_pem(&key_pem_raw)?;
+        Ok(Certificate {
+            id: row.get(0)?,
+            domain: row.get(1)?,
+            san_domains,
+            fingerprint: row.get(3)?,
+            cert_pem: row.get(4)?,
+            key_pem,
+            issuer: row.get(6)?,
+            not_before: parse_datetime(&row.get::<_, String>(7)?)?,
+            not_after: parse_datetime(&row.get::<_, String>(8)?)?,
+            is_acme: row.get(9)?,
+            acme_auto_renew: row.get(10)?,
+            created_at: parse_datetime(&row.get::<_, String>(11)?)?,
+        })
+    }
 }
 
 // ---- Row mapping helpers ----
@@ -754,26 +819,6 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
         tls_upstream: row.get(8)?,
         created_at: parse_datetime(&row.get::<_, String>(9)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
-    })
-}
-
-fn row_to_certificate(row: &rusqlite::Row<'_>) -> Result<Certificate> {
-    let san_json: String = row.get(2)?;
-    let san_domains: Vec<String> = serde_json::from_str(&san_json)
-        .map_err(|e| ConfigError::Validation(format!("invalid san_domains JSON: {e}")))?;
-    Ok(Certificate {
-        id: row.get(0)?,
-        domain: row.get(1)?,
-        san_domains,
-        fingerprint: row.get(3)?,
-        cert_pem: row.get(4)?,
-        key_pem: row.get(5)?,
-        issuer: row.get(6)?,
-        not_before: parse_datetime(&row.get::<_, String>(7)?)?,
-        not_after: parse_datetime(&row.get::<_, String>(8)?)?,
-        is_acme: row.get(9)?,
-        acme_auto_renew: row.get(10)?,
-        created_at: parse_datetime(&row.get::<_, String>(11)?)?,
     })
 }
 
