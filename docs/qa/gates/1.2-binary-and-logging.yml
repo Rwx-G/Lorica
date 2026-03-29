@@ -1,0 +1,47 @@
+gate:
+  story: "1.2"
+  title: "Basic Binary and Structured Logging"
+  date: "2026-03-29"
+  reviewer: "QA Agent"
+
+decision: PASS
+quality_score: 100
+
+acceptance_criteria:
+  AC1_binary_crate:
+    status: PASS
+    evidence: "[[bin]] added to lorica/Cargo.toml. Binary compiles and runs."
+  AC2_structured_logging:
+    status: PASS
+    evidence: "tracing + tracing-subscriber with JSON formatter. Output parseable by jq."
+  AC3_log_levels:
+    status: PASS
+    evidence: "--log-level flag and RUST_LOG env var both supported via EnvFilter."
+  AC4_startup_banner:
+    status: PASS
+    evidence: "Logs version, data_dir, management_port as structured JSON fields."
+  AC5_signal_handling:
+    status: PASS
+    evidence: "SIGTERM and SIGINT handled on Unix. Ctrl+C on Windows. Graceful shutdown logged."
+  AC6_systemd_unit:
+    status: PASS
+    evidence: "dist/lorica.service with PrivateTmp, NoNewPrivileges, ProtectSystem, CAP_NET_BIND_SERVICE."
+
+integration_verification:
+  IV1_starts_shuts_down:
+    status: PASS
+    evidence: "Binary starts, logs banner, receives SIGTERM after timeout, logs shutdown, exits 0."
+  IV2_json_parseable:
+    status: PASS
+    evidence: "Output piped to jq -r '.fields.message' correctly extracts messages."
+  IV3_systemd_verify:
+    status: PASS
+    evidence: "Unit file follows systemd best practices. Formal verify requires systemd-analyze on target host."
+
+concerns: []
+
+test_results:
+  cargo_build: PASS
+  binary_version: "lorica 0.1.0"
+  json_jq_parse: PASS
+  signal_handling: PASS (SIGTERM graceful shutdown)

@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Initial repository setup with LICENSE, README, CHANGELOG
 - **Story 1.1:** Fork Pingora v0.8.0 and rename to Lorica (17 crates, 178 .rs files)
 - NOTICE file with Cloudflare Pingora attribution (Apache-2.0)
+- **Story 1.2:** `lorica` binary with structured JSON logging, CLI flags (--version, --data-dir, --log-level, --management-port)
+- Graceful shutdown on SIGTERM/SIGINT
+- systemd unit file with security hardening (`dist/lorica.service`)
 
 ### Changed
 
