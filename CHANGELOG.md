@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Story 1.2:** `lorica` binary with structured JSON logging, CLI flags (--version, --data-dir, --log-level, --management-port)
 - Graceful shutdown on SIGTERM/SIGINT
 - systemd unit file with security hardening (`dist/lorica.service`)
+- **Story 1.3:** `lorica-config` crate for configuration state and persistence
+- Data models: Route, Backend, Certificate, GlobalSettings, AdminUser, UserPreference, NotificationConfig
+- Embedded SQLite database with WAL mode for crash safety
+- CRUD operations for all configuration entities with route-backend associations
+- Database migration system (version-tracked, auto-run on startup)
+- TOML export/import with referential integrity validation and version field
 
 ### Changed
 
