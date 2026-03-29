@@ -630,8 +630,8 @@ mod tests {
         // into the connections HashMap, and verify is_empty drains both.
         let node: PoolNode<String> = PoolNode::new();
 
-        for i in 0..(HOT_QUEUE_SIZE as i32 + 4) {
-            node.insert(i, format!("v{i}"));
+        for i in 0..(HOT_QUEUE_SIZE + 4) {
+            node.insert(i as ID, format!("v{i}"));
         }
         assert!(!node.is_empty());
 
