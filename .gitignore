@@ -1,0 +1,35 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Frontend
+node_modules/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Environment
+.env
+.env.*
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# BMAD core (framework, not project content)
+.bmad-core/
+
+# Claude
+.claude/
