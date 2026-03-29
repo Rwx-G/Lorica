@@ -803,6 +803,78 @@ async fn test_certificate_update() {
     );
 }
 
+// ---- Self-signed certificate generation test ----
+
+#[tokio::test]
+async fn test_generate_self_signed_certificate() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "domain": "localhost"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates/self-signed")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["domain"], "localhost");
+    assert_eq!(json["data"]["issuer"], "Self-signed");
+    assert!(!json["data"]["fingerprint"].as_str().unwrap().is_empty());
+
+    // Verify it's in the list
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/certificates")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["certificates"].as_array().unwrap().len(), 1);
+
+    // Verify detail contains valid PEM
+    let cert_id = json["data"]["certificates"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let cert_pem = json["data"]["cert_pem"].as_str().unwrap();
+    assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+    assert!(cert_pem.contains("-----END CERTIFICATE-----"));
+}
+
 // ---- Session GC test ----
 
 #[tokio::test]

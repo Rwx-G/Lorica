@@ -52,6 +52,10 @@ pub fn build_router(
             post(crate::certificates::create_certificate),
         )
         .route(
+            "/api/v1/certificates/self-signed",
+            post(crate::certificates::generate_self_signed),
+        )
+        .route(
             "/api/v1/certificates/:id",
             get(crate::certificates::get_certificate),
         )

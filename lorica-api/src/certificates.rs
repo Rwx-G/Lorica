@@ -29,6 +29,11 @@ pub struct CreateCertificateRequest {
 }
 
 #[derive(Deserialize)]
+pub struct GenerateSelfSignedRequest {
+    pub domain: String,
+}
+
+#[derive(Deserialize)]
 pub struct UpdateCertificateRequest {
     pub domain: Option<String>,
     pub cert_pem: Option<String>,
@@ -218,5 +223,55 @@ pub async fn delete_certificate(
     store.delete_certificate(&id)?;
     Ok(json_data(
         serde_json::json!({"message": "certificate deleted"}),
+    ))
+}
+
+/// POST /api/v1/certificates/self-signed
+pub async fn generate_self_signed(
+    Extension(state): Extension<AppState>,
+    Json(body): Json<GenerateSelfSignedRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    if body.domain.is_empty() {
+        return Err(ApiError::BadRequest("domain is required".into()));
+    }
+
+    let mut params = rcgen::CertificateParams::new(vec![body.domain.clone()])
+        .map_err(|e| ApiError::Internal(format!("failed to create cert params: {e}")))?;
+    params.is_ca = rcgen::IsCa::NoCa;
+
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| ApiError::Internal(format!("failed to generate key pair: {e}")))?;
+
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| ApiError::Internal(format!("failed to generate self-signed cert: {e}")))?;
+
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+
+    let fingerprint = compute_fingerprint(&cert_pem);
+    let now = Utc::now();
+
+    let certificate = lorica_config::models::Certificate {
+        id: uuid::Uuid::new_v4().to_string(),
+        domain: body.domain,
+        san_domains: Vec::new(),
+        fingerprint,
+        cert_pem: cert_pem.clone(),
+        key_pem,
+        issuer: "Self-signed".to_string(),
+        not_before: now,
+        not_after: now + chrono::Duration::days(365),
+        is_acme: false,
+        acme_auto_renew: false,
+        created_at: now,
+    };
+
+    let store = state.store.lock().await;
+    store.create_certificate(&certificate)?;
+
+    Ok(json_data_with_status(
+        StatusCode::CREATED,
+        cert_to_response(&certificate),
     ))
 }
