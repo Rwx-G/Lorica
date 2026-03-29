@@ -7,22 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-03-29
-
 ### Added
 
-- **Story 1.5:** `lorica-dashboard` crate - embedded web dashboard
-- Svelte 5 frontend with TypeScript, compiled to ~59KB bundle via Vite
-- Login screen consuming `/api/v1/auth/login` with session cookie auth
-- First-run password change screen for forced password rotation
-- Navigation sidebar: Overview, Routes, Backends, Certificates, Logs, System, Settings
-- Overview screen with status cards (route count, backend health, certificate status)
-- Static assets embedded in binary via `rust-embed` (< 5MB total)
-- `build.rs` auto-compiles frontend during `cargo build` (npm install + build)
-- SPA fallback routing (hash-based client-side navigation)
-- Dashboard served on management port (9443) alongside REST API
+- **Story 1.6:** Dashboard route management - full CRUD for proxy routes
+- Routes list screen with data table (hostname, path, backends, TLS, health, enabled)
+- Route creation form with backend multi-select, certificate dropdown, load balancing and topology selectors
+- Route edit modal with all route parameters
+- Route delete with confirmation dialog
+- StatusBadge component for health indicators (green/orange/red)
+- ConfirmDialog component for destructive action confirmation
+- API client methods for routes (list, create, update, delete), backends (list), certificates (list)
 
-## [0.2.0] - 2026-03-29
+## [0.1.0] - 2026-03-29
 
 ### Added
 
@@ -52,6 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Consistent JSON error envelope: `{"error": {"code": "...", "message": "..."}}`
 - Localhost-only binding for management port (127.0.0.1:9443)
 - OpenAPI 3.0 specification for all API endpoints
+- **Story 1.5:** `lorica-dashboard` crate - embedded web dashboard
+- Svelte 5 frontend with TypeScript, compiled to ~59KB bundle via Vite
+- Login screen consuming `/api/v1/auth/login` with session cookie auth
+- First-run password change screen for forced password rotation
+- Navigation sidebar: Overview, Routes, Backends, Certificates, Logs, System, Settings
+- Overview screen with status cards (route count, backend health, certificate status)
+- Static assets embedded in binary via `rust-embed` (< 5MB total)
+- `build.rs` auto-compiles frontend during `cargo build` (npm install + build)
+- SPA fallback routing (hash-based client-side navigation)
+- Dashboard served on management port (9443) alongside REST API
 
 ### Changed
 
