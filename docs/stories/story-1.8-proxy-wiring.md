@@ -1,7 +1,7 @@
 # Story 1.8: Proxy Engine Wiring
 
 **Epic:** [Epic 1 - Foundation](../prd/epic-1-foundation.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Depends on:** Stories 1.3, 1.4
 
