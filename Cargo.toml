@@ -18,6 +18,7 @@ members = [
     "lorica-memory-cache",
     "lorica-lru",
     "tinyufo",
+    "lorica-config",
 ]
 
 [workspace.dependencies]
