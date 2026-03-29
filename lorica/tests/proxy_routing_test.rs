@@ -213,7 +213,7 @@ async fn test_down_backends_filtered() {
 
     store.create_route(&make_route("r1", "app.test", "/")).unwrap();
 
-    let mut b1 = make_backend("b1", "10.0.0.1:80");
+    let b1 = make_backend("b1", "10.0.0.1:80");
     let mut b2 = make_backend("b2", "10.0.0.2:80");
     b2.health_status = HealthStatus::Down;
 
