@@ -88,6 +88,8 @@ pub async fn create_backend(
 
     let store = state.store.lock().await;
     store.create_backend(&backend)?;
+    drop(store);
+    state.notify_config_changed();
 
     Ok(json_data_with_status(
         StatusCode::CREATED,
@@ -136,6 +138,8 @@ pub async fn update_backend(
     backend.updated_at = Utc::now();
 
     store.update_backend(&backend)?;
+    drop(store);
+    state.notify_config_changed();
     Ok(json_data(backend_to_response(&backend)))
 }
 
@@ -146,5 +150,7 @@ pub async fn delete_backend(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     store.delete_backend(&id)?;
+    drop(store);
+    state.notify_config_changed();
     Ok(json_data(serde_json::json!({"message": "backend deleted"})))
 }

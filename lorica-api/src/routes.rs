@@ -123,6 +123,7 @@ pub async fn create_route(
     }
 
     let response = route_to_response(&route, backend_ids);
+    state.notify_config_changed();
     Ok(json_data_with_status(StatusCode::CREATED, response))
 }
 
@@ -188,6 +189,7 @@ pub async fn update_route(
     }
 
     let backend_ids = store.list_backends_for_route(&id)?;
+    state.notify_config_changed();
     Ok(json_data(route_to_response(&route, backend_ids)))
 }
 
@@ -198,5 +200,7 @@ pub async fn delete_route(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     store.delete_route(&id)?;
+    drop(store);
+    state.notify_config_changed();
     Ok(json_data(serde_json::json!({"message": "route deleted"})))
 }

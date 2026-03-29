@@ -184,6 +184,9 @@ async fn main() {
         }
     }
 
+    // Create config reload channel so API mutations can trigger proxy reload
+    let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
+
     // Start API server (management plane)
     let api_store = Arc::clone(&store);
     let api_log_buffer = Arc::clone(&log_buffer);
@@ -196,6 +199,7 @@ async fn main() {
             system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
             active_connections: api_active_connections,
             started_at: Instant::now(),
+            config_reload_tx: Some(config_reload_tx),
         };
         let session_store = SessionStore::new();
         let rate_limiter = RateLimiter::new();
@@ -205,6 +209,17 @@ async fn main() {
                 .await
         {
             error!(error = %e, "API server exited with error");
+        }
+    });
+
+    // Background task: reload proxy config when API signals a change
+    let reload_store = Arc::clone(&store);
+    let reload_config = Arc::clone(&proxy_config);
+    let _reload_handle = tokio::spawn(async move {
+        while config_reload_rx.changed().await.is_ok() {
+            if let Err(e) = reload_proxy_config(&reload_store, &reload_config).await {
+                tracing::error!(error = %e, "failed to reload proxy configuration");
+            }
         }
     });
 
