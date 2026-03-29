@@ -26,12 +26,12 @@
   {:else}
     <h2>Routes</h2>
     <div class="card-grid">
-      <Card title="Total Routes" value={status.routes} />
+      <Card title="Total Routes" value={status.routes_count} />
     </div>
 
     <h2>Backends</h2>
     <div class="card-grid">
-      <Card title="Total" value={status.backends} />
+      <Card title="Total" value={status.backends_count} />
       <Card title="Healthy" value={status.backends_healthy} color="green" />
       <Card title="Degraded" value={status.backends_degraded} color="orange" />
       <Card title="Down" value={status.backends_down} color="red" />
@@ -39,10 +39,8 @@
 
     <h2>Certificates</h2>
     <div class="card-grid">
-      <Card title="Total" value={status.certificates} />
-      <Card title="Valid" value={status.certificates_valid} color="green" />
-      <Card title="Expiring" value={status.certificates_expiring} color="orange" />
-      <Card title="Expired" value={status.certificates_expired} color="red" />
+      <Card title="Total" value={status.certificates_count} />
+      <Card title="Expiring Soon" value={status.certificates_expiring_soon} color="orange" />
     </div>
   {/if}
 </div>

@@ -37,20 +37,18 @@ export interface LoginRequest {
 }
 
 export interface LoginResponse {
-  message: string;
   must_change_password: boolean;
+  session_expires_at: string;
 }
 
 export interface StatusResponse {
-  routes: number;
-  backends: number;
-  certificates: number;
+  routes_count: number;
+  backends_count: number;
   backends_healthy: number;
   backends_degraded: number;
   backends_down: number;
-  certificates_valid: number;
-  certificates_expiring: number;
-  certificates_expired: number;
+  certificates_count: number;
+  certificates_expiring_soon: number;
 }
 
 export const api = {
