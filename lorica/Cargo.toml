@@ -15,7 +15,15 @@ keywords = ["async", "proxy", "http", "reverse-proxy", "lorica"]
 name = "lorica"
 path = "src/lib.rs"
 
+[[bin]]
+name = "lorica"
+path = "src/main.rs"
+
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
 lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = false }
 lorica-http = { version = "0.1.0", path = "../lorica-http" }
 lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }

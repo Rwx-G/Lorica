@@ -5,7 +5,7 @@ Cargo.lock
 
 # Frontend
 node_modules/
-dist/
+**/frontend/dist/
 
 # IDE
 .idea/
