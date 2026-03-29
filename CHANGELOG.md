@@ -92,6 +92,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Proxy access logging wired into shared LogBuffer for real-time dashboard viewing
 - Rust tests: 5 new integration tests (logs endpoint empty/populated/filtering/clear, system endpoint)
 - Frontend tests: 4 new API client tests (getLogs, getLogs with params, clearLogs, getSystem) - 40 total
+- **Story 1.10:** Configuration export/import and settings dashboard
+- Settings dashboard screen: global configuration (management port, log level, health check interval)
+- Export button: downloads full configuration as TOML file with version field
+- Import function: upload TOML file, preview diff (added/modified/removed), apply with confirmation
+- ConfigDiff module in `lorica-config` for computing import preview diffs
+- `POST /api/v1/config/import/preview` endpoint returning diff without applying
+- `GET/PUT /api/v1/settings` endpoints for global settings management
+- `GET/POST/PUT/DELETE /api/v1/notifications` endpoints for notification channel CRUD
+- `GET/PUT/DELETE /api/v1/preferences` endpoints for user preference management
+- Notification preferences UI: email SMTP and webhook HTTP channel configuration
+- Preference memory management UI: view, change (never/always/once), and delete stored preferences
+- API client methods for settings, notifications, preferences, export, import, and import preview
+- Rust tests: 5 ConfigDiff tests, 8 API integration tests (settings, notifications, preferences, import preview)
+- Frontend tests: 12 new API client tests (settings, notifications, preferences, export/import) - 52 total
 
 ### Changed
 

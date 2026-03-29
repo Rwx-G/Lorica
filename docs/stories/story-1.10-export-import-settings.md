@@ -1,7 +1,7 @@
 # Story 1.10: Configuration Export/Import and Settings
 
 **Epic:** [Epic 1 - Foundation](../prd/epic-1-foundation.md)
-**Status:** Draft
+**Status:** Review
 **Priority:** P1
 **Depends on:** Stories 1.5, 1.3
 
@@ -28,15 +28,15 @@ so that I can backup, share, and restore my proxy setup.
 
 ## Tasks
 
-- [ ] Build settings screen with global config display
-- [ ] Implement export button (calls `POST /api/v1/config/export`, downloads file)
-- [ ] Implement import UI (file upload, calls `POST /api/v1/config/import`)
-- [ ] Build import diff preview screen (added/modified/removed)
-- [ ] Implement import confirmation flow (`POST /api/v1/config/import/confirm`)
-- [ ] Build notification preferences section (email SMTP config, webhook URL)
-- [ ] Build preference memory management UI
-- [ ] Test round-trip: export from instance A, import to instance B
-- [ ] Test import diff preview accuracy
+- [x] Build settings screen with global config display
+- [x] Implement export button (calls `POST /api/v1/config/export`, downloads file)
+- [x] Implement import UI (file upload, calls `POST /api/v1/config/import`)
+- [x] Build import diff preview screen (added/modified/removed)
+- [x] Implement import confirmation flow (`POST /api/v1/config/import/confirm`)
+- [x] Build notification preferences section (email SMTP config, webhook URL)
+- [x] Build preference memory management UI
+- [x] Test round-trip: export from instance A, import to instance B
+- [x] Test import diff preview accuracy
 
 ## Dev Notes
 
@@ -45,3 +45,33 @@ so that I can backup, share, and restore my proxy setup.
 - Settings that require restart should display a warning (though most should be hot-reloadable)
 - Notification preferences stored in NotificationConfig table
 - User preferences stored in UserPreference table
+
+## Dev Agent Record
+
+- ConfigDiff module added to lorica-config for computing import diffs
+- Import preview endpoint added: POST /api/v1/config/import/preview
+- Settings CRUD endpoints: GET/PUT /api/v1/settings
+- Notification config CRUD: GET/POST/PUT/DELETE /api/v1/notifications
+- Preference management: GET/PUT/DELETE /api/v1/preferences
+- Settings.svelte page with 4 sections: Global Config, Notifications, Preferences, Export/Import
+- Management port shown as read-only (requires restart)
+- Import flow: upload file -> preview diff -> confirm/cancel
+
+## File List
+
+- `lorica-config/src/diff.rs` - ConfigDiff computation (new)
+- `lorica-config/src/lib.rs` - Module registration
+- `lorica-config/src/tests.rs` - 5 new diff tests
+- `lorica-api/src/settings.rs` - Settings, notifications, preferences endpoints (new)
+- `lorica-api/src/config.rs` - Import preview endpoint added
+- `lorica-api/src/lib.rs` - Module registration
+- `lorica-api/src/server.rs` - Route registration
+- `lorica-api/src/tests.rs` - 8 new integration tests
+- `lorica-dashboard/frontend/src/lib/api.ts` - 12 new API client methods and interfaces
+- `lorica-dashboard/frontend/src/lib/api.test.ts` - 12 new tests
+- `lorica-dashboard/frontend/src/routes/Settings.svelte` - Settings page (new)
+- `lorica-dashboard/frontend/src/routes/Dashboard.svelte` - Settings route wiring
+
+## Change Log
+
+- 2026-03-30: Implementation complete - all tasks done, all tests passing
