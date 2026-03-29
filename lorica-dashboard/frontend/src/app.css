@@ -1,4 +1,5 @@
-:root {
+:root,
+:root[data-theme="dark"] {
   --color-bg: #0f172a;
   --color-bg-card: #1e293b;
   --color-bg-input: #334155;
@@ -14,6 +15,24 @@
   --color-orange: #f59e0b;
   --color-red: #ef4444;
   --color-error: #ef4444;
+}
+
+:root[data-theme="light"] {
+  --color-bg: #f1f5f9;
+  --color-bg-card: #ffffff;
+  --color-bg-input: #e2e8f0;
+  --color-bg-nav: #ffffff;
+  --color-bg-hover: #e2e8f0;
+  --color-text: #1e293b;
+  --color-text-muted: #64748b;
+  --color-text-heading: #0f172a;
+  --color-primary: #2563eb;
+  --color-primary-hover: #1d4ed8;
+  --color-border: #cbd5e1;
+  --color-green: #16a34a;
+  --color-orange: #d97706;
+  --color-red: #dc2626;
+  --color-error: #dc2626;
 
   --sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, 'Cascadia Code', Consolas, monospace;
