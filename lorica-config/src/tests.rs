@@ -573,6 +573,95 @@ backend_id = "also-nonexistent"
         assert_eq!(fetched.key_pem, updated.key_pem);
     }
 
+    // ---- ConfigDiff tests ----
+
+    #[test]
+    fn test_diff_empty_to_empty() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let toml_str = export_to_toml(&store).unwrap();
+        let import_data = parse_toml(&toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn test_diff_detects_added_route() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+
+        // Build import data with one route, current store is empty
+        let toml_str = {
+            let temp = ConfigStore::open_in_memory().unwrap();
+            temp.create_route(&route).unwrap();
+            export_to_toml(&temp).unwrap()
+        };
+        let import_data = parse_toml(&toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+
+        assert_eq!(diff.routes.added.len(), 1);
+        assert!(diff.routes.removed.is_empty());
+        assert!(diff.routes.modified.is_empty());
+    }
+
+    #[test]
+    fn test_diff_detects_removed_backend() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let backend = make_backend();
+        store.create_backend(&backend).unwrap();
+
+        // Import data with no backends
+        let toml_str = {
+            let temp = ConfigStore::open_in_memory().unwrap();
+            export_to_toml(&temp).unwrap()
+        };
+        let import_data = parse_toml(&toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+
+        assert!(diff.backends.added.is_empty());
+        assert_eq!(diff.backends.removed.len(), 1);
+    }
+
+    #[test]
+    fn test_diff_detects_modified_route() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+
+        // Modify hostname in import data
+        let mut modified = route.clone();
+        modified.hostname = "modified.com".into();
+        let toml_str = {
+            let temp = ConfigStore::open_in_memory().unwrap();
+            temp.create_route(&modified).unwrap();
+            export_to_toml(&temp).unwrap()
+        };
+        let import_data = parse_toml(&toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+
+        assert!(diff.routes.added.is_empty());
+        assert!(diff.routes.removed.is_empty());
+        assert_eq!(diff.routes.modified.len(), 1);
+    }
+
+    #[test]
+    fn test_diff_detects_settings_change() {
+        let store = ConfigStore::open_in_memory().unwrap();
+
+        let toml_str = r#"
+version = 1
+
+[global_settings]
+management_port = 9443
+log_level = "debug"
+default_health_check_interval_s = 30
+"#;
+        let import_data = parse_toml(toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+
+        assert_eq!(diff.global_settings.changes.len(), 2);
+        assert!(!diff.is_empty());
+    }
+
     #[test]
     fn test_export_import_with_encryption() {
         use crate::crypto::EncryptionKey;

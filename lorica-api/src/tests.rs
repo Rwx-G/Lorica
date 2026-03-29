@@ -1251,6 +1251,352 @@ async fn test_system_endpoint() {
     assert!(json["data"]["process"]["memory_bytes"].as_u64().is_some());
 }
 
+// ---- Settings Endpoint Tests ----
+
+#[tokio::test]
+async fn test_get_settings_defaults() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["management_port"], 9443);
+    assert_eq!(json["data"]["log_level"], "info");
+    assert_eq!(json["data"]["default_health_check_interval_s"], 10);
+}
+
+#[tokio::test]
+async fn test_update_settings() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "log_level": "debug",
+        "default_health_check_interval_s": 30
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["log_level"], "debug");
+    assert_eq!(json["data"]["default_health_check_interval_s"], 30);
+    assert_eq!(json["data"]["management_port"], 9443);
+}
+
+#[tokio::test]
+async fn test_update_settings_invalid_log_level() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "log_level": "invalid" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---- Notification Endpoint Tests ----
+
+#[tokio::test]
+async fn test_notification_crud() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "channel": "email",
+        "config": "{\"smtp_host\": \"mail.example.com\"}",
+        "alert_types": ["backend_down", "cert_expiring"]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/notifications")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let notif_id = json["data"]["id"].as_str().unwrap().to_string();
+    assert_eq!(json["data"]["channel"], "email");
+    assert_eq!(json["data"]["enabled"], true);
+
+    // List
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/notifications")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["notifications"].as_array().unwrap().len(), 1);
+
+    // Update
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "channel": "webhook",
+        "enabled": false,
+        "config": "{\"url\": \"https://hooks.example.com\"}",
+        "alert_types": ["health_change"]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(&format!("/api/v1/notifications/{notif_id}"))
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["channel"], "webhook");
+    assert_eq!(json["data"]["enabled"], false);
+
+    // Delete
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(&format!("/api/v1/notifications/{notif_id}"))
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Verify empty
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/notifications")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["data"]["notifications"].as_array().unwrap().is_empty());
+}
+
+// ---- Preference Endpoint Tests ----
+
+#[tokio::test]
+async fn test_preference_list_update_delete() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create preference directly via store
+    {
+        let store = state.store.lock().await;
+        store
+            .create_user_preference(&lorica_config::models::UserPreference {
+                id: "pref-1".into(),
+                preference_key: "self_signed_cert".into(),
+                value: lorica_config::models::PreferenceValue::Once,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+    }
+
+    // List
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/preferences")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["preferences"].as_array().unwrap().len(), 1);
+
+    // Update
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "value": "always" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/preferences/pref-1")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["value"], "always");
+
+    // Delete
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/preferences/pref-1")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ---- Import Preview Tests ----
+
+#[tokio::test]
+async fn test_import_preview_empty_diff() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Export current state
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/config/export")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    let toml_content = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    // Preview with same content - should be empty diff
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "toml_content": toml_content });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/config/import/preview")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["data"]["routes"]["added"].as_array().unwrap().is_empty());
+    assert!(json["data"]["routes"]["removed"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_import_preview_with_changes() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create a backend
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "address": "10.0.0.1:8080" });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/backends")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Preview import with empty config - should show the backend as "removed"
+    let toml_content = "version = 1\n\n[global_settings]\nmanagement_port = 9443\nlog_level = \"info\"\ndefault_health_check_interval_s = 10\n";
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "toml_content": toml_content });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/config/import/preview")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["backends"]["removed"].as_array().unwrap().len(), 1);
+}
+
 // ---- Session GC test ----
 
 #[tokio::test]

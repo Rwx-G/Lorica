@@ -67,7 +67,7 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         &store.list_routes()?,
         &incoming.routes,
         |r| r.id.clone(),
-        |a, b| route_eq(a, b),
+        route_eq,
         |r| format!("{} ({})", r.hostname, r.id),
     );
 
@@ -75,7 +75,7 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         &store.list_backends()?,
         &incoming.backends,
         |b| b.id.clone(),
-        |a, b| backend_eq(a, b),
+        backend_eq,
         |b| format!("{} ({})", b.address, b.id),
     );
 
@@ -83,7 +83,7 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         &store.list_certificates()?,
         &incoming.certificates,
         |c| c.id.clone(),
-        |a, b| cert_eq(a, b),
+        cert_eq,
         |c| format!("{} ({})", c.domain, c.id),
     );
 
@@ -96,7 +96,7 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         &store.list_notification_configs()?,
         &incoming.notification_configs,
         |n| n.id.clone(),
-        |a, b| notif_eq(a, b),
+        notif_eq,
         |n| format!("{} ({})", n.channel.as_str(), n.id),
     );
 
@@ -104,7 +104,7 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         &store.list_user_preferences()?,
         &incoming.user_preferences,
         |p| p.id.clone(),
-        |a, b| pref_eq(a, b),
+        pref_eq,
         |p| format!("{} ({})", p.preference_key, p.id),
     );
 
@@ -112,7 +112,7 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         &store.list_admin_users()?,
         &incoming.admin_users,
         |u| u.id.clone(),
-        |a, b| admin_eq(a, b),
+        admin_eq,
         |u| format!("{} ({})", u.username, u.id),
     );
 

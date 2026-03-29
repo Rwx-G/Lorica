@@ -269,3 +269,193 @@ describe('api.getSystem', () => {
     expect(fetch).toHaveBeenCalledWith('/api/v1/system', expect.objectContaining({ method: 'GET' }));
   });
 });
+
+// ---- Settings API Tests ----
+
+const mockSettings = {
+  management_port: 9443,
+  log_level: 'info',
+  default_health_check_interval_s: 10,
+};
+
+describe('api.getSettings', () => {
+  it('calls GET /api/v1/settings', async () => {
+    mockFetch(mockSettings);
+    const res = await api.getSettings();
+    expect(res.data?.management_port).toBe(9443);
+    expect(res.data?.log_level).toBe('info');
+    expect(fetch).toHaveBeenCalledWith('/api/v1/settings', expect.objectContaining({ method: 'GET' }));
+  });
+});
+
+describe('api.updateSettings', () => {
+  it('calls PUT /api/v1/settings with body', async () => {
+    mockFetch({ ...mockSettings, log_level: 'debug' });
+    const res = await api.updateSettings({ log_level: 'debug' });
+    expect(res.data?.log_level).toBe('debug');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/settings',
+      expect.objectContaining({ method: 'PUT' }),
+    );
+  });
+});
+
+// ---- Notifications API Tests ----
+
+const mockNotification = {
+  id: 'notif-1',
+  channel: 'email',
+  enabled: true,
+  config: '{"smtp_host": "mail.example.com"}',
+  alert_types: ['backend_down'],
+};
+
+describe('api.listNotifications', () => {
+  it('calls GET /api/v1/notifications', async () => {
+    mockFetch({ notifications: [mockNotification] });
+    const res = await api.listNotifications();
+    expect(res.data?.notifications).toHaveLength(1);
+    expect(res.data?.notifications[0].channel).toBe('email');
+    expect(fetch).toHaveBeenCalledWith('/api/v1/notifications', expect.objectContaining({ method: 'GET' }));
+  });
+});
+
+describe('api.createNotification', () => {
+  it('calls POST /api/v1/notifications with body', async () => {
+    mockFetch(mockNotification);
+    const res = await api.createNotification({
+      channel: 'email',
+      config: '{}',
+      alert_types: ['backend_down'],
+    });
+    expect(res.data?.id).toBe('notif-1');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/notifications',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+});
+
+describe('api.updateNotification', () => {
+  it('calls PUT /api/v1/notifications/:id', async () => {
+    mockFetch({ ...mockNotification, enabled: false });
+    const res = await api.updateNotification('notif-1', {
+      channel: 'email',
+      enabled: false,
+      config: '{}',
+      alert_types: [],
+    });
+    expect(res.data?.enabled).toBe(false);
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/notifications/notif-1',
+      expect.objectContaining({ method: 'PUT' }),
+    );
+  });
+});
+
+describe('api.deleteNotification', () => {
+  it('calls DELETE /api/v1/notifications/:id', async () => {
+    mockFetch({ message: 'notification config deleted' });
+    const res = await api.deleteNotification('notif-1');
+    expect(res.data?.message).toBe('notification config deleted');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/notifications/notif-1',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+  });
+});
+
+// ---- Preferences API Tests ----
+
+describe('api.listPreferences', () => {
+  it('calls GET /api/v1/preferences', async () => {
+    mockFetch({ preferences: [] });
+    const res = await api.listPreferences();
+    expect(res.data?.preferences).toHaveLength(0);
+    expect(fetch).toHaveBeenCalledWith('/api/v1/preferences', expect.objectContaining({ method: 'GET' }));
+  });
+});
+
+describe('api.updatePreference', () => {
+  it('calls PUT /api/v1/preferences/:id with value', async () => {
+    mockFetch({ id: 'p1', preference_key: 'self_signed', value: 'always', created_at: '', updated_at: '' });
+    const res = await api.updatePreference('p1', 'always');
+    expect(res.data?.value).toBe('always');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/preferences/p1',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({ value: 'always' }),
+      }),
+    );
+  });
+});
+
+describe('api.deletePreference', () => {
+  it('calls DELETE /api/v1/preferences/:id', async () => {
+    mockFetch({ message: 'preference deleted' });
+    const res = await api.deletePreference('p1');
+    expect(res.data?.message).toBe('preference deleted');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/preferences/p1',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+  });
+});
+
+// ---- Config Export/Import API Tests ----
+
+describe('api.exportConfig', () => {
+  it('calls POST /api/v1/config/export and returns TOML text', async () => {
+    const tomlContent = 'version = 1\n[global_settings]\nmanagement_port = 9443\n';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        text: () => Promise.resolve(tomlContent),
+      }),
+    );
+    const res = await api.exportConfig();
+    expect(res.data).toContain('version = 1');
+    expect(fetch).toHaveBeenCalledWith('/api/v1/config/export', expect.objectContaining({ method: 'POST' }));
+  });
+});
+
+describe('api.importPreview', () => {
+  it('calls POST /api/v1/config/import/preview and returns diff', async () => {
+    const diff = {
+      routes: { added: ['new-route (r1)'], modified: [], removed: [] },
+      backends: { added: [], modified: [], removed: [] },
+      certificates: { added: [], modified: [], removed: [] },
+      route_backends: { added: [], modified: [], removed: [] },
+      notification_configs: { added: [], modified: [], removed: [] },
+      user_preferences: { added: [], modified: [], removed: [] },
+      admin_users: { added: [], modified: [], removed: [] },
+      global_settings: { changes: [] },
+    };
+    mockFetch(diff);
+    const res = await api.importPreview('version = 1\n');
+    expect(res.data?.routes.added).toHaveLength(1);
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/config/import/preview',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+});
+
+describe('api.importConfig', () => {
+  it('calls POST /api/v1/config/import with toml_content', async () => {
+    mockFetch({ message: 'configuration imported successfully' });
+    const res = await api.importConfig('version = 1\n');
+    expect(res.data?.message).toBe('configuration imported successfully');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/config/import',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ toml_content: 'version = 1\n' }),
+      }),
+    );
+  });
+});
