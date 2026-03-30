@@ -1,0 +1,7 @@
+target/
+.git/
+docs/
+dist/
+*.md
+!README.md
+lorica-dashboard/frontend/node_modules/

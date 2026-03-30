@@ -1,0 +1,26 @@
+services:
+  lorica:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    ports:
+      - "9443:9443"   # Management dashboard
+      - "8080:8080"   # HTTP proxy
+    volumes:
+      - lorica-data:/var/lib/lorica
+    depends_on:
+      - app1
+      - app2
+
+  app1:
+    image: nginx:alpine
+    volumes:
+      - ./app1/index.html:/usr/share/nginx/html/index.html:ro
+
+  app2:
+    image: nginx:alpine
+    volumes:
+      - ./app2/index.html:/usr/share/nginx/html/index.html:ro
+
+volumes:
+  lorica-data:
