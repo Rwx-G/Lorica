@@ -17,6 +17,8 @@
 
 #![warn(clippy::all)]
 
+pub mod cert_resolver;
+
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -26,6 +28,7 @@ pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use lorica_error::{Error, ErrorType, OrErr, Result};
 
 pub use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+pub use rustls::server::ResolvesServerCert;
 pub use rustls::server::{ClientCertVerifierBuilder, WebPkiClientVerifier};
 pub use rustls::{
     client::WebPkiServerVerifier, version, CertificateError, ClientConfig, DigitallySignedStruct,
