@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Command channel** (`lorica-command`) - Protobuf-based command channel between supervisor and worker processes. 8-byte LE size-prefix framing over Unix socketpair. Supervisor dispatches ConfigReload commands to workers when API configuration changes. Workers apply changes inline by reloading from database without pausing traffic. Three-state response protocol (Ok, Error, Processing). Heartbeat health monitoring every 5 seconds with timeout detection.
 - **Worker isolation** (`lorica-worker`) - Process-based worker isolation using fork+exec. Supervisor creates TCP listening sockets, forks N worker processes, and passes socket FDs via SCM_RIGHTS. Each worker runs the proxy engine independently. Configurable worker count via `--workers N` (default 0 = single-process mode, N = multi-worker). Supervisor monitors workers and automatically restarts crashed workers with structured logging. Unix-only (Linux/macOS).
 
 ### Fixed
 
 - **Database migrations** - Made migration tracking insert idempotent (`INSERT OR IGNORE`) to prevent race conditions when multiple worker processes open the database concurrently.
+- **Database concurrency** - Added `PRAGMA busy_timeout=5000` to prevent "database is locked" errors during concurrent worker startup.
 
 ### Added
 
