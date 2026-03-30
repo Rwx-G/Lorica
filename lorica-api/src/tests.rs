@@ -23,6 +23,8 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         started_at: Instant::now(),
         config_reload_tx: None,
         worker_metrics: None,
+        waf_event_buffer: None,
+        waf_rule_count: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();

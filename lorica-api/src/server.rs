@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -28,6 +29,10 @@ pub struct AppState {
     pub config_reload_tx: Option<watch::Sender<u64>>,
     /// Per-worker heartbeat metrics. `None` in single-process mode.
     pub worker_metrics: Option<Arc<WorkerMetrics>>,
+    /// WAF event ring buffer. `None` if WAF engine not initialized.
+    pub waf_event_buffer: Option<Arc<std::sync::Mutex<VecDeque<lorica_waf::WafEvent>>>>,
+    /// Number of loaded WAF rules.
+    pub waf_rule_count: Option<usize>,
 }
 
 impl AppState {
@@ -137,6 +142,9 @@ pub fn build_router(
             "/api/v1/preferences/:id",
             delete(crate::settings::delete_preference),
         )
+        .route("/api/v1/waf/events", get(crate::waf::get_waf_events))
+        .route("/api/v1/waf/events", delete(crate::waf::clear_waf_events))
+        .route("/api/v1/waf/stats", get(crate::waf::get_waf_stats))
         .layer(middleware::from_fn(require_auth));
 
     // Dashboard routes serve embedded frontend assets (SPA with fallback)
