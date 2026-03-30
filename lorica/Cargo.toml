@@ -32,6 +32,7 @@ lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, d
 lorica-config = { version = "0.3.0", path = "../lorica-config" }
 lorica-api = { version = "0.3.0", path = "../lorica-api" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
+lorica-worker = { version = "0.3.0", path = "../lorica-worker" }
 arc-swap = "1"
 async-trait = { workspace = true }
 chrono = "0.4"

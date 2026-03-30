@@ -97,7 +97,7 @@ impl ConfigStore {
             tracing::info!("applying migration 001_initial");
             self.conn.execute_batch(MIGRATION_V1)?;
             self.conn.execute(
-                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![1],
             )?;
         }
