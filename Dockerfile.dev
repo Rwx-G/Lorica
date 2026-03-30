@@ -1,4 +1,11 @@
-# Stage 1: Build frontend
+# Development Dockerfile for building and testing on Linux.
+# Usage:
+#   docker build -f Dockerfile.dev -t lorica-dev .
+#   docker run --rm lorica-dev cargo test --workspace
+#   docker run --rm lorica-dev cargo test -p lorica-worker
+#   docker run --rm lorica-dev cargo clippy --workspace -- -D warnings
+
+# Stage 1: Build frontend (needed by lorica-dashboard)
 FROM node:22-slim AS frontend
 WORKDIR /app/lorica-dashboard/frontend
 COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/package-lock.json* ./
@@ -6,10 +13,12 @@ RUN npm ci
 COPY lorica-dashboard/frontend/ ./
 RUN npm run build
 
-# Stage 2: Build Rust binary
-FROM rust:1.88-bookworm AS builder
+# Stage 2: Rust development environment
+FROM rust:1.88-bookworm
 RUN apt-get update && apt-get install -y cmake pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+
+# Copy workspace
 COPY Cargo.toml Cargo.lock ./
 COPY lorica/ lorica/
 COPY lorica-api/ lorica-api/
@@ -33,23 +42,9 @@ COPY lorica-tls/ lorica-tls/
 COPY lorica-worker/ lorica-worker/
 COPY tinyufo/ tinyufo/
 
-# Copy pre-built frontend into the dashboard crate
+# Copy pre-built frontend
 COPY --from=frontend /app/lorica-dashboard/frontend/dist/ lorica-dashboard/frontend/dist/
-
-# Build with SKIP_FRONTEND_BUILD since we already built it
 ENV SKIP_FRONTEND_BUILD=1
-RUN cargo build --release -p lorica
 
-# Stage 3: Runtime
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates socat && rm -rf /var/lib/apt/lists/*
-RUN useradd -r -s /bin/false lorica
-RUN mkdir -p /var/lib/lorica && chown lorica:lorica /var/lib/lorica
-
-COPY --from=builder /app/target/release/lorica /usr/local/bin/lorica
-COPY tests-e2e-docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-EXPOSE 9443 8080 8443
-
-ENTRYPOINT ["/entrypoint.sh"]
+# Default: build everything
+CMD ["cargo", "build", "--workspace"]
