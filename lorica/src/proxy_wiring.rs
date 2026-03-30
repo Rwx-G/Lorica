@@ -115,6 +115,55 @@ impl ProxyConfig {
     }
 }
 
+/// Per-backend active connection counter.
+///
+/// Thread-safe counters keyed by backend address. Used to track how many
+/// active connections each backend has, enabling graceful drain on removal.
+#[derive(Debug, Default)]
+pub struct BackendConnections {
+    counts: std::sync::RwLock<HashMap<String, Arc<AtomicU64>>>,
+}
+
+impl BackendConnections {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Increment the connection count for a backend, returning the counter.
+    pub fn increment(&self, addr: &str) -> Arc<AtomicU64> {
+        let counts = self.counts.read().unwrap();
+        if let Some(counter) = counts.get(addr) {
+            counter.fetch_add(1, Ordering::Relaxed);
+            return Arc::clone(counter);
+        }
+        drop(counts);
+
+        let mut counts = self.counts.write().unwrap();
+        let counter = counts
+            .entry(addr.to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+        counter.fetch_add(1, Ordering::Relaxed);
+        Arc::clone(counter)
+    }
+
+    /// Decrement the connection count for a backend.
+    pub fn decrement(&self, addr: &str) {
+        let counts = self.counts.read().unwrap();
+        if let Some(counter) = counts.get(addr) {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Get the current connection count for a backend.
+    pub fn get(&self, addr: &str) -> u64 {
+        let counts = self.counts.read().unwrap();
+        counts
+            .get(addr)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+}
+
 /// Per-request context carried through the proxy pipeline.
 pub struct RequestCtx {
     /// When the request started processing.
@@ -133,8 +182,10 @@ pub struct LoricaProxy {
     pub config: Arc<ArcSwap<ProxyConfig>>,
     /// Shared log buffer for dashboard access log viewing.
     pub log_buffer: Arc<LogBuffer>,
-    /// Live counter of active proxy connections.
+    /// Live counter of active proxy connections (global).
     pub active_connections: Arc<AtomicU64>,
+    /// Per-backend connection counters for graceful drain.
+    pub backend_connections: Arc<BackendConnections>,
 }
 
 impl LoricaProxy {
@@ -147,6 +198,7 @@ impl LoricaProxy {
             config,
             log_buffer,
             active_connections,
+            backend_connections: Arc::new(BackendConnections::new()),
         }
     }
 }
@@ -230,6 +282,7 @@ impl ProxyHttp for LoricaProxy {
 
         ctx.backend_addr = Some(backend.address.clone());
         self.active_connections.fetch_add(1, Ordering::Relaxed);
+        self.backend_connections.increment(&backend.address);
 
         let peer = Box::new(HttpPeer::new(
             &*backend.address,
@@ -296,8 +349,9 @@ impl ProxyHttp for LoricaProxy {
         }
 
         // Only decrement if upstream_peer() actually incremented the counter
-        if ctx.backend_addr.is_some() {
+        if let Some(ref addr) = ctx.backend_addr {
             self.active_connections.fetch_sub(1, Ordering::Relaxed);
+            self.backend_connections.decrement(addr);
         }
 
         // Push to the in-memory log buffer for dashboard viewing
@@ -513,5 +567,34 @@ mod tests {
     fn test_proxy_config_default_is_empty() {
         let config = ProxyConfig::default();
         assert!(config.routes_by_host.is_empty());
+    }
+
+    // ---- BackendConnections ----
+
+    #[test]
+    fn test_backend_connections_increment_decrement() {
+        let bc = BackendConnections::new();
+        bc.increment("10.0.0.1:8080");
+        bc.increment("10.0.0.1:8080");
+        assert_eq!(bc.get("10.0.0.1:8080"), 2);
+
+        bc.decrement("10.0.0.1:8080");
+        assert_eq!(bc.get("10.0.0.1:8080"), 1);
+    }
+
+    #[test]
+    fn test_backend_connections_unknown_backend() {
+        let bc = BackendConnections::new();
+        assert_eq!(bc.get("nonexistent:8080"), 0);
+    }
+
+    #[test]
+    fn test_backend_connections_multiple_backends() {
+        let bc = BackendConnections::new();
+        bc.increment("10.0.0.1:8080");
+        bc.increment("10.0.0.2:8080");
+        bc.increment("10.0.0.2:8080");
+        assert_eq!(bc.get("10.0.0.1:8080"), 1);
+        assert_eq!(bc.get("10.0.0.2:8080"), 2);
     }
 }
