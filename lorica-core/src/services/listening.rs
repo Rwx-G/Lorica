@@ -31,6 +31,9 @@ use crate::server::ListenFds;
 use crate::server::ShutdownWatch;
 use crate::services::Service as ServiceTrait;
 
+#[cfg(unix)]
+use std::fs::Permissions;
+
 use async_trait::async_trait;
 use log::{debug, error, info};
 use lorica_error::Result;

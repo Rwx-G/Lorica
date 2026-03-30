@@ -28,6 +28,8 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 use std::time::Duration;
+#[cfg(unix)]
+use std::fs::Permissions;
 use std::sync::Arc;
 use tokio::net::TcpSocket;
 

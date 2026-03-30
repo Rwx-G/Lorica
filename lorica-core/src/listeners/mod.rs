@@ -79,6 +79,9 @@ use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
 #[cfg(unix)]
 use crate::server::ListenFds;
 
+#[cfg(unix)]
+use std::fs::Permissions;
+
 use async_trait::async_trait;
 use lorica_error::Result;
 use std::{any::Any, sync::Arc};

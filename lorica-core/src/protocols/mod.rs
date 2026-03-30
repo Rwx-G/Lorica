@@ -281,6 +281,8 @@ pub(crate) trait ConnSockReusable {
 use l4::socket::SocketAddr;
 use log::{debug, error};
 #[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
 use nix::sys::socket::{getpeername, SockaddrStorage, UnixAddr};
 #[cfg(unix)]
 use std::os::unix::prelude::AsRawFd;

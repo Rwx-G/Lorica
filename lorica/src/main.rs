@@ -119,6 +119,25 @@ async fn main() {
         }
     };
 
+    // Ensure an admin user exists (first-run password generation)
+    match lorica_api::auth::ensure_admin_user(&store) {
+        Ok(Some(password)) => {
+            println!();
+            println!("  ===================================================");
+            println!("  Initial admin password: {password}");
+            println!("  Login at http://localhost:{}/", cli.management_port);
+            println!("  You will be asked to change it on first login.");
+            println!("  ===================================================");
+            println!();
+            info!("admin user created (first run)");
+        }
+        Ok(None) => {}
+        Err(e) => {
+            error!(error = %e, "failed to ensure admin user");
+            std::process::exit(1);
+        }
+    }
+
     let store = Arc::new(Mutex::new(store));
 
     // Create shared log buffer for access log capture (10,000 entries)

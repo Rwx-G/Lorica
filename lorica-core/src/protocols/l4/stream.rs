@@ -39,6 +39,8 @@ use tokio::net::UnixStream;
 use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
 use crate::protocols::l4::virt;
 use crate::protocols::raw_connect::ProxyDigest;
+#[cfg(unix)]
+use crate::protocols::UniqueIDType;
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
     TimingDigest, UniqueID,

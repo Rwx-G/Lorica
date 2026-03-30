@@ -25,6 +25,8 @@ use async_trait::async_trait;
 #[cfg(unix)]
 use daemon::daemonize;
 use daggy::NodeIndex;
+#[cfg(unix)]
+use lorica_timeout::fast_timeout;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use lorica_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
@@ -35,6 +37,10 @@ use std::time::SystemTime;
 use tokio::signal::unix;
 use tokio::sync::{broadcast, watch};
 use tokio::time::Duration;
+#[cfg(unix)]
+use tokio::sync::Mutex as TokioMutex;
+#[cfg(unix)]
+use tokio::time::sleep;
 
 use crate::prelude::background_service;
 use crate::server::bootstrap_services::{Bootstrap, BootstrapService};

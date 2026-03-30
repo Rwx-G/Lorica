@@ -16,6 +16,8 @@
 
 use crate::{Error, OrErr};
 #[cfg(unix)]
+use log::warn;
+#[cfg(unix)]
 use nix::sys::socket::{getpeername, getsockname, SockaddrStorage};
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};

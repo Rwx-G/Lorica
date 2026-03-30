@@ -295,7 +295,10 @@ impl ProxyHttp for LoricaProxy {
             );
         }
 
-        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        // Only decrement if upstream_peer() actually incremented the counter
+        if ctx.backend_addr.is_some() {
+            self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
 
         // Push to the in-memory log buffer for dashboard viewing
         let entry = LogEntry {

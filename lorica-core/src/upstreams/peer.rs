@@ -23,6 +23,10 @@ use crate::protocols::TcpKeepalive;
 use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
 use derivative::Derivative;
+#[cfg(unix)]
+use lorica_error::ErrorType::{InternalError, SocketError};
+#[cfg(unix)]
+use lorica_error::OrErr;
 use lorica_error::Result;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
