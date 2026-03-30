@@ -677,6 +677,7 @@ fn run_single_process(cli: Cli) {
             Arc::clone(&log_buffer),
             Arc::clone(&active_connections),
         );
+        let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
         proxy_service.add_tcp(&format!("0.0.0.0:{}", cli.http_port));
@@ -746,7 +747,7 @@ fn run_single_process(cli: Cli) {
                 .unwrap_or(10)
         };
         let health_handle = tokio::spawn(async move {
-            health::health_check_loop(health_store, health_config, health_interval).await;
+            health::health_check_loop(health_store, health_config, health_interval, Some(backend_conns)).await;
         });
 
         // Run the proxy engine in a dedicated thread

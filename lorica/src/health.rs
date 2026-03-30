@@ -12,21 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use lorica_config::models::HealthStatus;
+use lorica_config::models::{HealthStatus, LifecycleState};
 use lorica_config::ConfigStore;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use lorica::proxy_wiring::ProxyConfig;
+use lorica::proxy_wiring::{BackendConnections, ProxyConfig};
 use lorica::reload::reload_proxy_config;
 
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default drain timeout before force-closing a Closing backend.
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Latency threshold above which a backend is considered degraded (ms).
 const DEGRADED_THRESHOLD_MS: u128 = 2000;
@@ -52,14 +56,20 @@ impl ProbeResult {
     }
 }
 
-/// Run TCP health checks in a loop, updating backend health status in the database
-/// and triggering a config reload when status changes.
+/// Run TCP health checks and backend drain monitoring in a loop.
+///
+/// - Health checks: probe each backend, update status (Healthy/Degraded/Down)
+/// - Drain checks: transition Closing backends to Closed when connections reach 0 or timeout expires
 pub async fn health_check_loop(
     store: Arc<Mutex<ConfigStore>>,
     proxy_config: Arc<ArcSwap<ProxyConfig>>,
     default_interval_s: u64,
+    backend_connections: Option<Arc<BackendConnections>>,
 ) {
     let interval = Duration::from_secs(default_interval_s.max(5));
+    // Track when each backend entered Closing state for drain timeout
+    let mut drain_start: HashMap<String, Instant> = HashMap::new();
+
     loop {
         tokio::time::sleep(interval).await;
 
@@ -77,6 +87,55 @@ pub async fn health_check_loop(
         let mut changed = false;
 
         for backend in &backends {
+            // --- Drain monitoring for Closing backends ---
+            if backend.lifecycle_state == LifecycleState::Closing {
+                let start = drain_start
+                    .entry(backend.id.clone())
+                    .or_insert_with(Instant::now);
+
+                let active = backend_connections
+                    .as_ref()
+                    .map(|bc| bc.get(&backend.address))
+                    .unwrap_or(0);
+
+                let timed_out = start.elapsed() >= DEFAULT_DRAIN_TIMEOUT;
+
+                if active == 0 || timed_out {
+                    let reason = if active == 0 {
+                        "all connections drained"
+                    } else {
+                        "drain timeout expired"
+                    };
+                    info!(
+                        backend = %backend.address,
+                        active_connections = active,
+                        reason = reason,
+                        "transitioning backend to Closed"
+                    );
+
+                    let mut updated = backend.clone();
+                    updated.lifecycle_state = LifecycleState::Closed;
+                    updated.updated_at = chrono::Utc::now();
+
+                    let store = store.lock().await;
+                    if let Err(e) = store.update_backend(&updated) {
+                        warn!(
+                            backend = %backend.address,
+                            error = %e,
+                            "failed to transition backend to Closed"
+                        );
+                    } else {
+                        changed = true;
+                        drain_start.remove(&backend.id);
+                    }
+                }
+                continue;
+            }
+
+            // Clean up drain tracking for non-Closing backends
+            drain_start.remove(&backend.id);
+
+            // --- Health checks for Normal backends ---
             if !backend.health_check_enabled {
                 continue;
             }
