@@ -32,11 +32,7 @@ use tracing::{error, info, warn};
 use lorica::proxy_wiring::{LoricaProxy, ProxyConfig};
 use lorica::reload::reload_proxy_config;
 
-const DEFAULT_DATA_DIR: &str = if cfg!(unix) {
-    "/var/lib/lorica"
-} else {
-    "./data"
-};
+const DEFAULT_DATA_DIR: &str = "/var/lib/lorica";
 
 const DEFAULT_MANAGEMENT_PORT: u16 = 9443;
 const DEFAULT_HTTP_PORT: u16 = 8080;
@@ -129,7 +125,6 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        #[cfg(unix)]
         Some(Commands::Worker {
             id,
             cmd_fd,
@@ -139,16 +134,10 @@ fn main() {
             init_logging(&log_level);
             run_worker(id, cmd_fd, &data_dir);
         }
-        #[cfg(not(unix))]
-        Some(Commands::Worker { .. }) => {
-            eprintln!("Worker mode is only supported on Unix");
-            std::process::exit(1);
-        }
         None => {
             init_logging(&cli.log_level);
             startup_banner(&cli);
 
-            #[cfg(unix)]
             if cli.workers > 0 {
                 run_supervisor(cli);
                 return;
@@ -164,7 +153,6 @@ fn main() {
 // Supervisor mode (Unix only): forks workers, runs API server, monitors workers
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
 fn run_supervisor(cli: Cli) {
     use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_worker::manager::{WorkerConfig, WorkerEvent, WorkerManager};
@@ -451,7 +439,6 @@ fn run_supervisor(cli: Cli) {
 // Worker mode (Unix only): receives FDs from supervisor, runs proxy engine
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
 fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
     use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_core::server::Fds;
@@ -781,61 +768,28 @@ fn run_single_process(cli: Cli) {
     });
 }
 
-/// Remove TLS key material from disk on shutdown.
-fn cleanup_tls_files(tls_dir: &std::path::Path) {
-    for name in &["server.key", "server.crt"] {
-        let path = tls_dir.join(name);
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(&path) {
-                warn!(error = %e, path = %path.display(), "failed to remove TLS file on shutdown");
-            } else {
-                info!(path = %path.display(), "removed TLS file on shutdown");
-            }
-        }
-    }
-}
-
-/// Restrict private key file permissions (owner-only read on Unix).
+/// Restrict private key file permissions to owner-only read.
 fn restrict_key_permissions(path: &std::path::Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-            warn!(error = %e, path = %path.display(), "failed to restrict key file permissions");
-            return false;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        warn!(error = %e, path = %path.display(), "failed to restrict key file permissions");
+        return false;
     }
     true
 }
 
 async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{signal, SignalKind};
 
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-        let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
 
-        tokio::select! {
-            _ = sigterm.recv() => {
-                warn!("Received SIGTERM");
-            }
-            _ = sigint.recv() => {
-                warn!("Received SIGINT");
-            }
+    tokio::select! {
+        _ = sigterm.recv() => {
+            warn!("Received SIGTERM");
         }
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-        warn!("Received Ctrl+C");
+        _ = sigint.recv() => {
+            warn!("Received SIGINT");
+        }
     }
 }

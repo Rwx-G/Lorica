@@ -45,7 +45,7 @@ so that a crash or compromise in one worker does not affect others.
 - Worker binary mode: `lorica worker --id <id> --cmd-fd <fd> --data-dir <dir> --log-level <level>`
 - Main process creates unix socket pairs before fork for command channel
 - SCM_RIGHTS allows passing file descriptors between processes
-- This is Unix-only (fork+exec) - Windows falls back to single-process mode (--workers 0)
+- This is Linux-only (fork+exec) - project does not support Windows
 
 ## Dev Agent Record
 
