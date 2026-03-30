@@ -374,8 +374,7 @@ impl ProxyHttp for LoricaProxy {
         _session: &mut Session,
         _reused: bool,
         _peer: &HttpPeer,
-        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
-        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        _fd: std::os::unix::io::RawFd,
         _digest: Option<&Digest>,
         _ctx: &mut Self::CTX,
     ) -> Result<()>

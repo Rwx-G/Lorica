@@ -23,7 +23,6 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use super::{ServiceReadyNotifier, ServiceWithDependents};
-#[cfg(unix)]
 use crate::server::ListenFds;
 use crate::server::ShutdownWatch;
 
@@ -93,7 +92,7 @@ where
 
     async fn start_service(
         &mut self,
-        #[cfg(unix)] _fds: Option<ListenFds>,
+        _fds: Option<ListenFds>,
         shutdown: ShutdownWatch,
         _listeners_per_fd: usize,
         ready: ServiceReadyNotifier,

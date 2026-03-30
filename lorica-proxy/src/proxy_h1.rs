@@ -145,9 +145,6 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        #[cfg(windows)]
-        let raw = client_session.id() as std::os::windows::io::RawSocket;
-        #[cfg(unix)]
         let raw = client_session.id();
 
         let initial_write_pending = client_session.stream().get_write_pending_time();

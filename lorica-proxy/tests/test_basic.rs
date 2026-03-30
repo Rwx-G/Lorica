@@ -306,7 +306,7 @@ async fn test_h2_head() {
 async fn test_simple_proxy_uds() {
     init();
     let url = Uri::new("/tmp/lorica_proxy.sock", "/").into();
-    let client = Client::unix();
+    let client = hyper::Client::unix();
 
     let res = client.get(url).await.unwrap();
 

@@ -21,14 +21,9 @@ use lorica_error::{
 };
 use std::io::ErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs};
-#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
-#[cfg(unix)]
 use std::os::unix::net::UnixListener as StdUnixListener;
-#[cfg(windows)]
-use std::os::windows::io::AsRawSocket;
 use std::time::Duration;
-#[cfg(unix)]
 use std::fs::Permissions;
 use std::sync::Arc;
 use tokio::net::TcpSocket;
@@ -44,7 +39,6 @@ pub use crate::protocols::l4::stream::Stream;
 #[cfg(feature = "connection_filter")]
 use crate::protocols::GetSocketDigest;
 use crate::protocols::TcpKeepalive;
-#[cfg(unix)]
 use crate::server::ListenFds;
 
 const TCP_LISTENER_MAX_TRY: usize = 30;
@@ -56,7 +50,6 @@ const LISTENER_BACKLOG: u32 = 65535;
 #[derive(Clone, Debug)]
 pub enum ServerAddress {
     Tcp(String, Option<TcpSocketOptions>),
-    #[cfg(unix)]
     Uds(String, Option<Permissions>),
 }
 
@@ -64,7 +57,6 @@ impl AsRef<str> for ServerAddress {
     fn as_ref(&self) -> &str {
         match &self {
             Self::Tcp(l, _) => l,
-            #[cfg(unix)]
             Self::Uds(l, _) => l,
         }
     }
@@ -74,7 +66,6 @@ impl ServerAddress {
     fn tcp_sock_opts(&self) -> Option<&TcpSocketOptions> {
         match &self {
             Self::Tcp(_, op) => op.into(),
-            #[cfg(unix)]
             Self::Uds(_, _) => None,
         }
     }
@@ -111,7 +102,6 @@ pub struct TcpSocketOptions {
     // TODO: allow configuring reuseaddr, backlog, etc. from here?
 }
 
-#[cfg(unix)]
 mod uds {
     use super::{OrErr, Result};
     use crate::protocols::l4::listener::Listener;
@@ -182,17 +172,13 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
             .or_err(BindError, "failed to set IPV6_V6ONLY")?;
     }
 
-    #[cfg(unix)]
     if let Some(reuseport) = opt.so_reuseport {
         socket_ref
             .set_reuse_port(reuseport)
             .or_err(BindError, "failed to set SO_REUSEPORT")?;
     }
 
-    #[cfg(unix)]
     let raw = sock.as_raw_fd();
-    #[cfg(windows)]
-    let raw = sock.as_raw_socket();
 
     if let Some(backlog) = opt.tcp_fastopen {
         set_tcp_fastopen_backlog(raw, backlog)?;
@@ -204,10 +190,8 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
     Ok(())
 }
 
-#[cfg(unix)]
 fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
     match address {
-        #[cfg(unix)]
         ServerAddress::Uds(addr, perm) => {
             let std_listener = unsafe { StdUnixListener::from_raw_fd(fd) };
             // set permissions just in case
@@ -215,10 +199,7 @@ fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
             Ok(uds::set_backlog(std_listener, LISTENER_BACKLOG)?.into())
         }
         ServerAddress::Tcp(_, _) => {
-            #[cfg(unix)]
             let std_listener_socket = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-            #[cfg(windows)]
-            let std_listener_socket = unsafe { std::net::TcpStream::from_raw_socket(fd as u64) };
             let listener_socket = TcpSocket::from_std_stream(std_listener_socket);
             // Note that we call listen on an already listening socket
             // POSIX undefined but on Linux it will update the backlog size
@@ -280,7 +261,6 @@ async fn bind_tcp(addr: &str, opt: Option<TcpSocketOptions>) -> Result<Listener>
 
 async fn bind(addr: &ServerAddress) -> Result<Listener> {
     match addr {
-        #[cfg(unix)]
         ServerAddress::Uds(l, perm) => uds::bind(l, perm.clone()),
         ServerAddress::Tcp(l, opt) => bind_tcp(l, opt.clone()).await,
     }
@@ -321,7 +301,6 @@ impl ListenerEndpointBuilder {
         self
     }
 
-    #[cfg(unix)]
     pub async fn listen(self, fds: Option<ListenFds>) -> Result<ListenerEndpoint> {
         let listen_addr = self
             .listen_addr
@@ -359,26 +338,6 @@ impl ListenerEndpointBuilder {
         })
     }
 
-    #[cfg(windows)]
-    pub async fn listen(self) -> Result<ListenerEndpoint> {
-        let listen_addr = self
-            .listen_addr
-            .expect("Tried to listen with no addr specified");
-
-        let listener = bind(&listen_addr).await?;
-
-        #[cfg(feature = "connection_filter")]
-        let connection_filter = self
-            .connection_filter
-            .unwrap_or_else(|| Arc::new(AcceptAllFilter));
-
-        Ok(ListenerEndpoint {
-            listen_addr,
-            listener: Arc::new(listener),
-            #[cfg(feature = "connection_filter")]
-            connection_filter,
-        })
-    }
 }
 
 impl ListenerEndpoint {
@@ -400,22 +359,13 @@ impl ListenerEndpoint {
             stream.set_keepalive(ka)?;
         }
         if let Some(dscp) = op.dscp {
-            #[cfg(unix)]
             set_dscp(stream.as_raw_fd(), dscp)?;
-            #[cfg(windows)]
-            set_dscp(stream.as_raw_socket(), dscp)?;
         }
         if let Some(snd_buf) = op.tcp_snd_buf {
-            #[cfg(unix)]
             set_snd_buf(stream.as_raw_fd(), snd_buf)?;
-            #[cfg(windows)]
-            set_snd_buf(stream.as_raw_socket(), snd_buf)?;
         }
         if let Some(recv_buf) = op.tcp_recv_buf {
-            #[cfg(unix)]
             set_recv_buf(stream.as_raw_fd(), recv_buf)?;
-            #[cfg(windows)]
-            set_recv_buf(stream.as_raw_socket(), recv_buf)?;
         }
         Ok(())
     }
@@ -480,11 +430,7 @@ mod test {
 
         builder.listen_addr(ServerAddress::Tcp(addr.into(), None));
 
-        #[cfg(unix)]
         let listener = builder.listen(None).await.unwrap();
-
-        #[cfg(windows)]
-        let listener = builder.listen().await.unwrap();
 
         tokio::spawn(async move {
             // just try to accept once
@@ -506,11 +452,7 @@ mod test {
 
         builder.listen_addr(ServerAddress::Tcp("[::]:7111".into(), sock_opt));
 
-        #[cfg(unix)]
         let listener = builder.listen(None).await.unwrap();
-
-        #[cfg(windows)]
-        let listener = builder.listen().await.unwrap();
 
         tokio::spawn(async move {
             // just try to accept twice
@@ -525,7 +467,6 @@ mod test {
             .expect("can connect to v6 addr");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn test_listen_uds() {
         let addr = "/tmp/test_listen_uds";
@@ -545,7 +486,6 @@ mod test {
             .expect("can connect to UDS listener");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn test_tcp_so_reuseport() {
         let addr = "127.0.0.1:7201";
@@ -570,7 +510,6 @@ mod test {
         assert_eq!(listener2.as_str(), addr);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn test_tcp_so_reuseport_false() {
         let addr = "127.0.0.1:7202";
@@ -646,10 +585,7 @@ mod test {
             .listen_addr(ServerAddress::Tcp(addr.into(), None))
             .connection_filter(filter);
 
-        #[cfg(unix)]
         let listener = builder.listen(None).await.unwrap();
-        #[cfg(windows)]
-        let listener = builder.listen().await.unwrap();
 
         let listener_clone = listener.clone();
         tokio::spawn(async move {
@@ -699,10 +635,7 @@ mod test {
                 reject_count: reject_count.clone(),
             }));
 
-        #[cfg(unix)]
         let listener = builder.listen(None).await.unwrap();
-        #[cfg(windows)]
-        let listener = builder.listen().await.unwrap();
 
         let listener_clone = listener.clone();
         let _accept_handle = tokio::spawn(async move {

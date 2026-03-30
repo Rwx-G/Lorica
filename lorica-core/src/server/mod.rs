@@ -16,16 +16,12 @@
 
 mod bootstrap_services;
 pub mod configuration;
-#[cfg(unix)]
 mod daemon;
-#[cfg(unix)]
 pub(crate) mod transfer_fd;
 
 use async_trait::async_trait;
-#[cfg(unix)]
 use daemon::daemonize;
 use daggy::NodeIndex;
-#[cfg(unix)]
 use lorica_timeout::fast_timeout;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
@@ -33,13 +29,10 @@ use lorica_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
 use std::sync::Arc;
 use std::thread;
 use std::time::SystemTime;
-#[cfg(unix)]
 use tokio::signal::unix;
 use tokio::sync::{broadcast, watch};
 use tokio::time::Duration;
-#[cfg(unix)]
 use tokio::sync::Mutex as TokioMutex;
-#[cfg(unix)]
 use tokio::time::sleep;
 
 use crate::prelude::background_service;
@@ -49,7 +42,6 @@ use crate::services::{
 };
 use configuration::{Opt, ServerConf};
 use std::collections::HashMap;
-#[cfg(unix)]
 pub use transfer_fd::Fds;
 
 use lorica_error::{Error, ErrorType, Result};
@@ -120,7 +112,6 @@ pub enum ExecutionPhase {
 /// The receiver for server's shutdown event. The value will turn to true once the server starts
 /// to shutdown
 pub type ShutdownWatch = watch::Receiver<bool>;
-#[cfg(unix)]
 pub type ListenFds = Arc<TokioMutex<Fds>>;
 
 /// The type of shutdown process that has been requested.
@@ -149,10 +140,8 @@ pub trait ShutdownSignalWatch {
 /// - `SIGQUIT`: graceful upgrade
 /// - `SIGTERM`: graceful terminate
 /// - `SIGINT`: fast shutdown
-#[cfg(unix)]
 pub struct UnixShutdownSignalWatch;
 
-#[cfg(unix)]
 #[async_trait]
 impl ShutdownSignalWatch for UnixShutdownSignalWatch {
     async fn recv(&self) -> ShutdownSignal {
@@ -177,21 +166,14 @@ impl ShutdownSignalWatch for UnixShutdownSignalWatch {
 /// Arguments to configure running of the lorica server.
 pub struct RunArgs {
     /// Signal for initating shutdown
-    #[cfg(unix)]
     pub shutdown_signal: Box<dyn ShutdownSignalWatch>,
 }
 
 impl Default for RunArgs {
-    #[cfg(unix)]
     fn default() -> Self {
         Self {
             shutdown_signal: Box::new(UnixShutdownSignalWatch),
         }
-    }
-
-    #[cfg(windows)]
-    fn default() -> Self {
-        Self {}
     }
 }
 
@@ -233,7 +215,6 @@ impl Server {
         self.execution_phase_watch.subscribe()
     }
 
-    #[cfg(unix)]
     async fn main_loop(&self, run_args: RunArgs) -> ShutdownType {
         // waiting for exit signal
 
@@ -314,44 +295,7 @@ impl Server {
         }
     }
 
-    #[cfg(windows)]
-    async fn main_loop(&self, _run_args: RunArgs) -> ShutdownType {
-        // waiting for exit signal
-
-        self.execution_phase_watch
-            .send(ExecutionPhase::Running)
-            .ok();
-
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                info!("Ctrl+C received, gracefully exiting");
-                // graceful shutdown if there are listening sockets
-                info!("Broadcasting graceful shutdown");
-                match self.shutdown_watch.send(true) {
-                    Ok(_) => {
-                        info!("Graceful shutdown started!");
-                    }
-                    Err(e) => {
-                        error!("Graceful shutdown broadcast failed: {e}");
-                    }
-                }
-                info!("Broadcast graceful shutdown complete");
-
-                self.execution_phase_watch
-                    .send(ExecutionPhase::GracefulTerminate)
-                    .ok();
-
-                ShutdownType::Graceful
-            }
-            Err(e) => {
-                error!("Unable to listen for shutdown signal: {}", e);
-                ShutdownType::Quick
-            }
-        }
-    }
-
-    /// Get the configured file descriptors for listening
-    #[cfg(unix)]
+        /// Get the configured file descriptors for listening
     fn listen_fds(&self) -> Option<ListenFds> {
         self.bootstrap.lock().get_fds()
     }
@@ -359,7 +303,7 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     fn run_service(
         mut service: Box<dyn ServiceWithDependents>,
-        #[cfg(unix)] fds: Option<ListenFds>,
+        fds: Option<ListenFds>,
         shutdown: ShutdownWatch,
         threads: usize,
         work_stealing: bool,
@@ -397,7 +341,6 @@ impl Server {
             // Start the actual service, passing the ready notifier
             service
                 .start_service(
-                    #[cfg(unix)]
                     fds,
                     shutdown,
                     listeners_per_fd,
@@ -565,7 +508,6 @@ impl Server {
     ///
     /// This is used by worker processes that receive listening socket FDs via SCM_RIGHTS.
     /// Call this instead of [`bootstrap()`] when running in worker mode.
-    #[cfg(unix)]
     pub fn set_listen_fds(&mut self, fds: crate::server::bootstrap_services::Fds) {
         self.bootstrap.lock().set_fds(fds);
     }
@@ -617,17 +559,11 @@ impl Server {
 
         let conf = self.configuration.as_ref();
 
-        #[cfg(unix)]
         if conf.daemon {
             info!("Daemonizing the server");
             fast_timeout::pause_for_fork();
             daemonize(&self.configuration);
             fast_timeout::unpause();
-        }
-
-        #[cfg(windows)]
-        if conf.daemon {
-            panic!("Daemonizing under windows is not supported");
         }
 
         let blocking_opts = BlockingPoolOpts {
@@ -700,7 +636,6 @@ impl Server {
 
             let runtime = Server::run_service(
                 wrapper.service,
-                #[cfg(unix)]
                 self.listen_fds(),
                 self.shutdown_recv.clone(),
                 threads,
@@ -716,11 +651,6 @@ impl Server {
         // blocked on main loop so that it runs forever
         // Only work steal runtime can use block_on()
         let server_runtime = Server::create_runtime("Server", 1, true, BlockingPoolOpts::default());
-        #[cfg(unix)]
-        let shutdown_type = server_runtime
-            .get_handle()
-            .block_on(self.main_loop(run_args));
-        #[cfg(windows)]
         let shutdown_type = server_runtime
             .get_handle()
             .block_on(self.main_loop(run_args));

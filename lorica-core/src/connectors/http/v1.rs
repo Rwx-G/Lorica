@@ -101,9 +101,9 @@ mod tests {
         assert!(reused);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn test_reuse_rejects_fd_mismatch() {
+        use std::fmt::{Display, Formatter, Result as FmtResult};
         use std::os::unix::prelude::AsRawFd;
 
         #[derive(Clone)]

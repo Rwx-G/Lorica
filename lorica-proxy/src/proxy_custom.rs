@@ -44,9 +44,6 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        #[cfg(windows)]
-        let raw = client_session.fd() as std::os::windows::io::RawSocket;
-        #[cfg(unix)]
         let raw = client_session.fd();
 
         if let Err(e) = self

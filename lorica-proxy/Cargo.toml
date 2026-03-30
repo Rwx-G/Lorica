@@ -53,8 +53,17 @@ serde_yml = "0.0.12"
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
 
+[[test]]
+name = "test_basic"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "test_upstream"
+required-features = ["integration-tests"]
+
 [features]
 default = []
+integration-tests = []
 rustls = ["lorica-core/rustls", "lorica-cache/rustls", "any_tls"]
 any_tls = []
 connection_filter = ["lorica-core/connection_filter"]

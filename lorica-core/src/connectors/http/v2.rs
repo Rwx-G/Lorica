@@ -376,22 +376,8 @@ impl Connector {
             .filter(|c| !c.is_closed())
             .or_else(|| self.idle_pool.get(&reuse_hash));
         if let Some(conn) = maybe_conn {
-            #[cfg(unix)]
             if !peer.matches_fd(conn.id()) {
                 return Ok(None);
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::{AsRawSocket, RawSocket};
-                struct WrappedRawSocket(RawSocket);
-                impl AsRawSocket for WrappedRawSocket {
-                    fn as_raw_socket(&self) -> RawSocket {
-                        self.0
-                    }
-                }
-                if !peer.matches_sock(WrappedRawSocket(conn.id() as RawSocket)) {
-                    return Ok(None);
-                }
             }
             let h2_stream = conn.spawn_stream().await?;
             if conn.more_streams_allowed() {

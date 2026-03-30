@@ -32,7 +32,6 @@ use std::sync::Weak;
 use std::time::Duration;
 use tokio::sync::watch;
 
-#[cfg(unix)]
 use crate::server::ListenFds;
 use crate::server::ShutdownWatch;
 
@@ -303,7 +302,7 @@ pub trait ServiceWithDependents: Send + Sync {
     ///   dependents should call `ready_notifier.notify_ready()` once they are fully initialized.
     async fn start_service(
         &mut self,
-        #[cfg(unix)] fds: Option<ListenFds>,
+        fds: Option<ListenFds>,
         shutdown: ShutdownWatch,
         listeners_per_fd: usize,
         ready_notifier: ServiceReadyNotifier,
@@ -345,7 +344,7 @@ where
 {
     async fn start_service(
         &mut self,
-        #[cfg(unix)] fds: Option<ListenFds>,
+        fds: Option<ListenFds>,
         shutdown: ShutdownWatch,
         listeners_per_fd: usize,
         ready_notifier: ServiceReadyNotifier,
@@ -355,7 +354,6 @@ where
 
         S::start_service(
             self,
-            #[cfg(unix)]
             fds,
             shutdown,
             listeners_per_fd,
@@ -393,7 +391,7 @@ pub trait Service: Sync + Send {
     /// - `listeners_per_fd`: number of listener tasks to spawn per file descriptor.
     async fn start_service(
         &mut self,
-        #[cfg(unix)] _fds: Option<ListenFds>,
+        _fds: Option<ListenFds>,
         _shutdown: ShutdownWatch,
         _listeners_per_fd: usize,
     ) {

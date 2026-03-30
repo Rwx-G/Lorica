@@ -12,19 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(unix)]
 pub use super::transfer_fd::Fds;
 use async_trait::async_trait;
-#[cfg(unix)]
-use log::{debug, error};
-use log::info;
+use log::{debug, error, info};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-#[cfg(unix)]
 use tokio::sync::Mutex as TokioMutex;
 
-#[cfg(unix)]
 use crate::server::ListenFds;
 
 use crate::{
@@ -58,7 +53,6 @@ pub struct Bootstrap {
 
     execution_phase_watch: broadcast::Sender<ExecutionPhase>,
 
-    #[cfg(unix)]
     listen_fds: Option<ListenFds>,
 }
 
@@ -79,7 +73,6 @@ impl Bootstrap {
             test,
             _upgrade: upgrade,
             _upgrade_sock: upgrade_sock,
-            #[cfg(unix)]
             listen_fds: None,
             execution_phase_watch: execution_phase_watch.clone(),
             completed: false,
@@ -104,7 +97,6 @@ impl Bootstrap {
         }
 
         // load fds
-        #[cfg(unix)]
         match self.load_fds(self._upgrade) {
             Ok(_) => {
                 info!("Bootstrap done");
@@ -122,7 +114,6 @@ impl Bootstrap {
             .ok();
     }
 
-    #[cfg(unix)]
     fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::errno::Errno> {
         let mut fds = Fds::new();
         if upgrade {
@@ -133,7 +124,6 @@ impl Bootstrap {
         Ok(())
     }
 
-    #[cfg(unix)]
     pub fn get_fds(&self) -> Option<ListenFds> {
         self.listen_fds.clone()
     }
@@ -142,7 +132,6 @@ impl Bootstrap {
     ///
     /// This skips the normal bootstrap FD-loading and marks bootstrap as completed.
     /// Used by worker processes that receive listening FDs via SCM_RIGHTS.
-    #[cfg(unix)]
     pub fn set_fds(&mut self, fds: Fds) {
         self.listen_fds = Some(Arc::new(TokioMutex::new(fds)));
         self.completed = true;

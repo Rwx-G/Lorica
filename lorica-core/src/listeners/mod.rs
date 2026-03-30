@@ -76,10 +76,8 @@ pub use crate::tls::listeners as tls;
 
 use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
 
-#[cfg(unix)]
 use crate::server::ListenFds;
 
-#[cfg(unix)]
 use std::fs::Permissions;
 
 use async_trait::async_trait;
@@ -131,7 +129,7 @@ struct TransportStackBuilder {
 impl TransportStackBuilder {
     pub async fn build(
         &mut self,
-        #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
+        upgrade_listeners: Option<ListenFds>,
     ) -> Result<TransportStack> {
         let mut builder = ListenerEndpoint::builder();
 
@@ -142,11 +140,7 @@ impl TransportStackBuilder {
             builder.connection_filter(filter.clone());
         }
 
-        #[cfg(unix)]
         let l4 = builder.listen(upgrade_listeners).await?;
-
-        #[cfg(windows)]
-        let l4 = builder.listen().await?;
 
         Ok(TransportStack {
             l4,
@@ -227,7 +221,6 @@ impl Listeners {
     }
 
     /// Create a new [`Listeners`] with a Unix domain socket endpoint from the given string.
-    #[cfg(unix)]
     pub fn uds(addr: &str, perm: Option<Permissions>) -> Self {
         let mut listeners = Self::new();
         listeners.add_uds(addr, perm);
@@ -255,7 +248,6 @@ impl Listeners {
     }
 
     /// Add a Unix domain socket endpoint to `self`.
-    #[cfg(unix)]
     pub fn add_uds(&mut self, addr: &str, perm: Option<Permissions>) {
         self.add_address(ServerAddress::Uds(addr.into(), perm));
     }
@@ -309,16 +301,13 @@ impl Listeners {
 
     pub(crate) async fn build(
         &mut self,
-        #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
+        upgrade_listeners: Option<ListenFds>,
     ) -> Result<Vec<TransportStack>> {
         let mut stacks = Vec::with_capacity(self.stacks.len());
 
         for b in self.stacks.iter_mut() {
             let new_stack = b
-                .build(
-                    #[cfg(unix)]
-                    upgrade_listeners.clone(),
-                )
+                .build(upgrade_listeners.clone())
                 .await?;
 
             stacks.push(new_stack);
@@ -350,10 +339,7 @@ mod test {
         listeners.add_tcp(addr2);
 
         let listeners = listeners
-            .build(
-                #[cfg(unix)]
-                None,
-            )
+            .build(None)
             .await
             .unwrap();
 
@@ -383,10 +369,7 @@ mod test {
         let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
         let mut listeners = Listeners::tls(addr, &cert_path, &key_path).unwrap();
         let listener = listeners
-            .build(
-                #[cfg(unix)]
-                None,
-            )
+            .build(None)
             .await
             .unwrap()
             .pop()

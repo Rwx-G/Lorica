@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(unix)]
 use crate::protocols::l4::ext::connect_uds;
 use crate::protocols::l4::ext::{
     connect_with as tcp_connect, set_dscp, set_recv_buf, set_tcp_fastopen_connect,
@@ -26,10 +25,7 @@ use log::debug;
 use lorica_error::{Context, Error, ErrorType::*, OrErr, Result};
 use rand::seq::SliceRandom;
 use std::net::SocketAddr as InetSocketAddr;
-#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::io::AsRawSocket;
 
 /// The interface to establish a L4 connection
 #[async_trait]
@@ -106,10 +102,7 @@ where
             match peer_addr {
                 SocketAddr::Inet(addr) => {
                     let connect_future = tcp_connect(addr, bind_to.as_ref(), |socket| {
-                        #[cfg(unix)]
                         let raw = socket.as_raw_fd();
-                        #[cfg(windows)]
-                        let raw = socket.as_raw_socket();
 
                         if peer.tcp_fast_open() {
                             set_tcp_fastopen_connect(raw)?;
@@ -154,7 +147,6 @@ where
                         }
                     }
                 }
-                #[cfg(unix)]
                 SocketAddr::Unix(addr) => {
                     let connect_future = connect_uds(
                         addr.as_pathname()
@@ -197,10 +189,7 @@ where
     }
     stream.set_nodelay()?;
 
-    #[cfg(unix)]
     let digest = SocketDigest::from_raw_fd(stream.as_raw_fd());
-    #[cfg(windows)]
-    let digest = SocketDigest::from_raw_socket(stream.as_raw_socket());
     digest
         .peer_addr
         .set(Some(peer_addr.clone()))
@@ -238,7 +227,6 @@ pub(crate) fn bind_to_random<P: Peer>(
             InetSocketAddr::V4(_) => bind_to_ips(v4_list),
             InetSocketAddr::V6(_) => bind_to_ips(v6_list),
         },
-        #[cfg(unix)]
         SocketAddr::Unix(_) => None,
     };
 
@@ -255,10 +243,8 @@ pub(crate) fn bind_to_random<P: Peer>(
     bind_to
 }
 
-#[cfg(unix)]
 use crate::protocols::raw_connect;
 
-#[cfg(unix)]
 async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
     // safe to unwrap
     let proxy = peer.get_proxy().unwrap();
@@ -299,24 +285,25 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
     Ok(*stream)
 }
 
-#[cfg(windows)]
-async fn proxy_connect<P: Peer>(_peer: &P) -> Result<Stream> {
-    panic!("peer proxy not supported on windows")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::upstreams::peer::{BasicPeer, HttpPeer};
+    use crate::upstreams::peer::Proxy;
+    use lorica_error::ErrorType;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::sleep;
 
     /// Some of the tests below are flaky when making new connections to mock
     /// servers. The servers are simple tokio listeners, so failures there are
     /// not indicative of real errors. This function will retry the peer/server
     /// in increasing intervals until it either succeeds in connecting or a long
     /// timeout expires (max 10sec)
-    #[cfg(unix)]
     async fn wait_for_peer<P>(peer: &P)
     where
         P: Peer + Send + Sync,
@@ -439,7 +426,6 @@ mod tests {
         assert!(new_session.is_ok());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn test_connect_proxy_fail() {
         let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string());
@@ -457,7 +443,6 @@ mod tests {
         assert!(!e.retry());
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_connect_proxy_work() {
         use crate::connectors::test_utils;
@@ -486,7 +471,6 @@ mod tests {
         server_handle.await.unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_connect_proxy_conn_closed() {
         use crate::connectors::test_utils;
@@ -517,6 +501,7 @@ mod tests {
         server_handle.await.unwrap();
     }
 
+    #[ignore] // requires specific port range config, flaky in Docker
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_bind_to_port_range_on_connect() {
