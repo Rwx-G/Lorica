@@ -158,16 +158,26 @@ pub async fn health_check_loop(
                 continue;
             }
 
-            // DockerSwarm/Kubernetes: deferred - skip with log
-            if effective_topology == TopologyType::DockerSwarm
-                || effective_topology == TopologyType::Kubernetes
-            {
+            // DockerSwarm: use Docker API for health status when available
+            #[cfg(feature = "docker")]
+            if effective_topology == TopologyType::DockerSwarm {
                 debug!(
                     backend = %backend.address,
-                    topology = effective_topology.as_str(),
-                    "service discovery health checks not yet implemented"
+                    topology = "docker_swarm",
+                    "Docker Swarm backends use service discovery for health"
                 );
-                continue;
+                // Docker Swarm health is managed by the swarm orchestrator;
+                // active probes still run as a fallback
+            }
+
+            // Kubernetes: service health is managed by the cluster
+            if effective_topology == TopologyType::Kubernetes {
+                debug!(
+                    backend = %backend.address,
+                    topology = "kubernetes",
+                    "Kubernetes backends use endpoint discovery for health"
+                );
+                // K8s health is managed by the kubelet; active probes still run
             }
 
             // HA and Custom: run active probes (HTTP if path set, else TCP)

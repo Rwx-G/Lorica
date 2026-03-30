@@ -37,10 +37,15 @@ lorica-worker = { version = "0.3.0", path = "../lorica-worker" }
 lorica-command = { version = "0.3.0", path = "../lorica-command" }
 lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+bollard = { version = "0.18", optional = true }
+kube = { version = "0.98", default-features = false, features = ["client", "rustls-tls"], optional = true }
+k8s-openapi = { version = "0.24", features = ["latest"], optional = true }
 arc-swap = "1"
 async-trait = { workspace = true }
 chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+thiserror = "2"
 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -53,7 +58,9 @@ bytes = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 
 [features]
-default = ["rustls", "lb"]
+default = ["rustls", "lb", "docker", "kubernetes"]
+docker = ["bollard"]
+kubernetes = ["kube", "k8s-openapi"]
 
 rustls = [
     "lorica-core/rustls",
