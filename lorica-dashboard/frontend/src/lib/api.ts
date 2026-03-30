@@ -373,4 +373,15 @@ export const api = {
 
   importConfig: (toml_content: string) =>
     request<{ message: string }>('POST', '/config/import', { toml_content }),
+
+  getWorkers: () =>
+    request<{ workers: WorkerStatus[]; total: number }>('GET', '/workers'),
 };
+
+export interface WorkerStatus {
+  worker_id: number;
+  pid: number;
+  last_heartbeat_ms: number;
+  last_heartbeat_ago_s: number;
+  healthy: boolean;
+}

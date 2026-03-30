@@ -238,6 +238,7 @@ fn run_supervisor(cli: Cli) {
         let store = Arc::new(Mutex::new(store));
         let log_buffer = Arc::new(LogBuffer::new(10_000));
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_metrics = Arc::new(lorica_api::workers::WorkerMetrics::new());
 
         // Broadcast channel: API config changes fan out to all per-worker tasks
         let (reload_bc_tx, _) = broadcast::channel::<u64>(16);
@@ -267,6 +268,7 @@ fn run_supervisor(cli: Cli) {
             };
             let mut reload_rx = reload_bc_tx.subscribe();
             let hb_seq = Arc::clone(&sequence);
+            let hb_metrics = Arc::clone(&worker_metrics);
 
             tokio::spawn(async move {
                 let heartbeat_interval = Duration::from_secs(5);
@@ -310,6 +312,7 @@ fn run_supervisor(cli: Cli) {
                             match channel.recv::<Response>().await {
                                 Ok(_) => {
                                     let latency_ms = start.elapsed().as_millis() as u64;
+                                    hb_metrics.record_heartbeat(worker_id, 0, latency_ms).await;
                                     info!(worker_id, latency_ms, "heartbeat ok");
                                 }
                                 Err(e) => {
@@ -335,6 +338,7 @@ fn run_supervisor(cli: Cli) {
                 active_connections: api_active_connections,
                 started_at: Instant::now(),
                 config_reload_tx: Some(config_reload_tx),
+                worker_metrics: Some(Arc::clone(&worker_metrics)),
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
@@ -714,6 +718,7 @@ fn run_single_process(cli: Cli) {
                 active_connections: api_active_connections,
                 started_at: Instant::now(),
                 config_reload_tx: Some(config_reload_tx),
+                worker_metrics: None,
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();

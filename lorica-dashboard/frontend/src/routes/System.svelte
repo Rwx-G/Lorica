@@ -1,21 +1,28 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { api, type SystemResponse } from '../lib/api';
+  import { api, type SystemResponse, type WorkerStatus } from '../lib/api';
   import Card from '../components/Card.svelte';
 
   let system: SystemResponse | null = $state(null);
+  let workers: WorkerStatus[] = $state([]);
   let error = $state('');
   let loading = $state(true);
   let autoRefresh = $state(true);
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
 
   async function loadSystem() {
-    const res = await api.getSystem();
-    if (res.error) {
-      error = res.error.message;
-    } else if (res.data) {
-      system = res.data;
+    const [sysRes, workersRes] = await Promise.all([
+      api.getSystem(),
+      api.getWorkers(),
+    ]);
+    if (sysRes.error) {
+      error = sysRes.error.message;
+    } else if (sysRes.data) {
+      system = sysRes.data;
       error = '';
+    }
+    if (workersRes.data) {
+      workers = workersRes.data.workers;
     }
     loading = false;
   }
@@ -102,6 +109,37 @@
       <Card title="Uptime" value={formatUptime(system.proxy.uptime_seconds)} />
       <Card title="Active Connections" value={system.proxy.active_connections} />
     </div>
+
+    {#if workers.length > 0}
+    <h2>Workers</h2>
+    <div class="workers-table">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>PID</th>
+            <th>Status</th>
+            <th>Heartbeat Latency</th>
+            <th>Last Seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each workers as w}
+          <tr>
+            <td>#{w.worker_id}</td>
+            <td>{w.pid}</td>
+            <td>
+              <span class="status-dot" style="background: {w.healthy ? 'var(--color-green)' : 'var(--color-red)'}"></span>
+              {w.healthy ? 'Healthy' : 'Unresponsive'}
+            </td>
+            <td>{w.last_heartbeat_ms}ms</td>
+            <td>{w.last_heartbeat_ago_s}s ago</td>
+          </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+    {/if}
 
     <h2>Host Resources</h2>
     <div class="gauges-grid">
@@ -281,5 +319,37 @@
 
   .btn-secondary:hover {
     background: var(--color-bg-hover);
+  }
+
+  .workers-table {
+    overflow-x: auto;
+    margin-bottom: 1.5rem;
+  }
+
+  .workers-table table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+  }
+
+  .workers-table th,
+  .workers-table td {
+    padding: 0.5rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .workers-table th {
+    color: var(--color-text-muted);
+    font-weight: 500;
+  }
+
+  .status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
   }
 </style>
