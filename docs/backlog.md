@@ -11,8 +11,6 @@ Items identified during development that are deferred to future stories.
 
 | Source | Description | References |
 |--------|-------------|------------|
-| Epic 1 QA | WebSocket for real-time log streaming (currently polling) | lorica-api, lorica-dashboard |
-| Epic 2 QA | Metrics dashboard for command channel heartbeat latency | lorica-command, lorica-dashboard |
 
 ## Low Priority
 
