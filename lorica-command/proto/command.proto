@@ -1,0 +1,34 @@
+// Command channel protocol between Lorica supervisor and worker processes.
+// This file documents the wire format. The actual Rust types are defined
+// using prost derive macros (no protoc compilation needed).
+
+syntax = "proto3";
+package lorica.command;
+
+// Commands sent from supervisor to worker
+message Command {
+  CommandType command_type = 1;
+  uint64 sequence = 2;          // Monotonic sequence for request-response matching
+  uint64 timestamp_ms = 3;      // Unix timestamp in milliseconds
+}
+
+enum CommandType {
+  COMMAND_TYPE_UNSPECIFIED = 0;
+  CONFIG_RELOAD = 1;            // Worker should reload config from database
+  HEARTBEAT = 2;                // Keepalive ping
+  SHUTDOWN = 3;                 // Graceful shutdown requested
+}
+
+// Responses sent from worker to supervisor
+message Response {
+  ResponseStatus status = 1;
+  uint64 sequence = 2;          // Matches the command sequence
+  string message = 3;           // Human-readable detail (empty on success)
+}
+
+enum ResponseStatus {
+  RESPONSE_STATUS_UNSPECIFIED = 0;
+  OK = 1;
+  ERROR = 2;
+  PROCESSING = 3;               // Long operation in progress (e.g., connection draining)
+}

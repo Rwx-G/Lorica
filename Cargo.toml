@@ -22,6 +22,7 @@ members = [
     "lorica-api",
     "lorica-dashboard",
     "lorica-worker",
+    "lorica-command",
 ]
 
 [workspace.dependencies]
