@@ -1,0 +1,40 @@
+schema: 1
+story: "3.1"
+story_title: "WAF Engine with OWASP CRS"
+gate: PASS
+status_reason: "All 8 ACs met. WAF crate with 18 CRS-inspired rules, detection/blocking modes, per-route toggle, configurable rule sets, security dashboard, sub-0.5ms latency."
+reviewer: "Romain G."
+updated: "2026-03-30T21:30:00Z"
+
+top_issues: []
+waiver:
+  active: false
+
+quality_score: 98
+expires: "2026-04-13T21:30:00Z"
+
+evidence:
+  tests_reviewed: 41
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7, 8]
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "OWASP Top 10 coverage - SQLi, XSS, path traversal, command injection, protocol violations"
+  performance:
+    status: PASS
+    notes: "Sub-500us per evaluation (benchmarked). Zero overhead when WAF disabled."
+  reliability:
+    status: PASS
+    notes: "Event ring buffer (500) prevents unbounded memory. Disabled rules skip via RwLock."
+  maintainability:
+    status: PASS
+    notes: "Separate lorica-waf crate. Per-rule enable/disable via API."
+
+recommendations:
+  immediate: []
+  future:
+    - "Add custom user-defined regex rules via API"

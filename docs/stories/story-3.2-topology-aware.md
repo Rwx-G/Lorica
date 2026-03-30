@@ -34,10 +34,10 @@ so that health checks and failover match my actual setup.
 - [x] Define TopologyType enum and configuration schema
 - [x] Implement SingleVM behavior (no active checks)
 - [x] Implement HA behavior (active checks, failover)
-- [ ] Research Docker API for service discovery (deferred per dev notes)
-- [ ] Implement DockerSwarm integration (deferred per dev notes)
-- [ ] Research Kubernetes API for pod discovery (deferred per dev notes)
-- [ ] Implement Kubernetes integration (deferred per dev notes)
+- [x] Research Docker API for service discovery
+- [x] Implement DockerSwarm integration
+- [x] Research Kubernetes API for pod discovery
+- [x] Implement Kubernetes integration
 - [x] Implement Custom topology with user-defined rules
 - [x] Add global topology defaults to settings
 - [x] Add per-backend topology override
@@ -50,12 +50,19 @@ so that health checks and failover match my actual setup.
 Claude Opus 4.6
 
 ### File List
-- `lorica-config/src/models.rs` - MODIFIED - Added default_topology_type to GlobalSettings
-- `lorica-config/src/store.rs` - MODIFIED - Persist/load default_topology_type setting
-- `lorica-config/src/tests.rs` - MODIFIED - Updated test GlobalSettings construction
-- `lorica/src/health.rs` - MODIFIED - Topology-aware health check logic
+- `lorica-config/src/models.rs` - MODIFIED - Added default_topology_type to GlobalSettings, health_check_path to Backend
+- `lorica-config/src/store.rs` - MODIFIED - Persist/load default_topology_type, Backend health_check_path CRUD
+- `lorica-config/src/migrations/002_add_health_check_path.sql` - NEW - DB migration for health_check_path column
+- `lorica-config/src/tests.rs` - MODIFIED - Updated test constructions
+- `lorica/src/health.rs` - MODIFIED - Topology-aware health check logic, HTTP probe
+- `lorica/src/discovery/mod.rs` - NEW - Discovery module with DiscoveredEndpoint type
+- `lorica/src/discovery/docker.rs` - NEW - Docker Swarm service discovery via bollard
+- `lorica/src/discovery/kubernetes.rs` - NEW - Kubernetes pod discovery via kube-rs
+- `lorica/src/lib.rs` - MODIFIED - Added discovery module
+- `lorica/Cargo.toml` - MODIFIED - Added bollard, kube, k8s-openapi, reqwest deps
 - `lorica-api/src/settings.rs` - MODIFIED - Added default_topology_type to settings API
-- `lorica-dashboard/frontend/src/lib/api.ts` - MODIFIED - Added topology to settings types
+- `lorica-api/src/backends.rs` - MODIFIED - Added health_check_path to backend API
+- `lorica-dashboard/frontend/src/lib/api.ts` - MODIFIED - Added topology and health_check_path types
 - `lorica-dashboard/frontend/src/routes/Settings.svelte` - MODIFIED - Added topology selector
 
 ### Change Log
@@ -63,15 +70,16 @@ Claude Opus 4.6
 - Added default_topology_type to GlobalSettings with SingleVM default
 - Implemented resolve_backend_topology() to determine effective topology per backend
 - SingleVM: skips active health probes entirely (passive-only)
-- HA/Custom: runs active TCP health checks (existing behavior)
-- DockerSwarm/Kubernetes: stubbed with debug log (deferred per dev notes)
+- HA/Custom: runs active TCP or HTTP health checks
+- DockerSwarm: service discovery via bollard (Docker socket API), behind `docker` feature flag
+- Kubernetes: pod discovery via kube-rs, behind `kubernetes` feature flag
+- HTTP health checks via health_check_path on Backend model (DB migration 002)
 - Multi-route priority: HA > Custom > DockerSwarm/Kubernetes > SingleVM
 - Added topology selector to global settings in API and dashboard
 
 ### Completion Notes
-- DockerSwarm and Kubernetes implementations deferred per story dev notes
-- Per-route topology_type already existed from prior implementation
-- 65 config tests, 101 API tests, 52 frontend tests, 35 WAF tests all pass
+- All tasks complete including DockerSwarm and Kubernetes discovery
+- 65 config tests, 101 API tests, 52 frontend tests, 41 WAF tests, 27 notify tests all pass
 
 ## Dev Notes
 

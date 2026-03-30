@@ -1,0 +1,40 @@
+schema: 1
+story: "3.3"
+story_title: "Notification Channels"
+gate: PASS
+status_reason: "All 8 ACs met. lorica-notify crate with stdout, email (lettre), webhook (reqwest) channels. Per-channel rate limiting. Event history ring buffer. Notification CRUD and test UI already existed."
+reviewer: "Romain G."
+updated: "2026-03-30T21:30:00Z"
+
+top_issues: []
+waiver:
+  active: false
+
+quality_score: 98
+expires: "2026-04-13T21:30:00Z"
+
+evidence:
+  tests_reviewed: 27
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7, 8]
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "SMTP credentials in config JSON (not hardcoded). Webhook auth header optional."
+  performance:
+    status: PASS
+    notes: "Async send. Rate limiter prevents alert storms (10/60s default)."
+  reliability:
+    status: PASS
+    notes: "Send failures logged but don't crash. Stdout always on as fallback. History ring buffer (100)."
+  maintainability:
+    status: PASS
+    notes: "Separate lorica-notify crate. Clean channel abstraction. Config validation helpers."
+
+recommendations:
+  immediate: []
+  future:
+    - "Add Slack/Discord notification channels"
