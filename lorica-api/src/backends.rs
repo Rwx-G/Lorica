@@ -17,6 +17,7 @@ pub struct BackendResponse {
     pub active_connections: i32,
     pub health_check_enabled: bool,
     pub health_check_interval_s: i32,
+    pub health_check_path: Option<String>,
     pub tls_upstream: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -28,6 +29,7 @@ pub struct CreateBackendRequest {
     pub weight: Option<i32>,
     pub health_check_enabled: Option<bool>,
     pub health_check_interval_s: Option<i32>,
+    pub health_check_path: Option<String>,
     pub tls_upstream: Option<bool>,
 }
 
@@ -37,6 +39,7 @@ pub struct UpdateBackendRequest {
     pub weight: Option<i32>,
     pub health_check_enabled: Option<bool>,
     pub health_check_interval_s: Option<i32>,
+    pub health_check_path: Option<String>,
     pub tls_upstream: Option<bool>,
 }
 
@@ -50,6 +53,7 @@ fn backend_to_response(b: &lorica_config::models::Backend) -> BackendResponse {
         active_connections: b.active_connections,
         health_check_enabled: b.health_check_enabled,
         health_check_interval_s: b.health_check_interval_s,
+        health_check_path: b.health_check_path.clone(),
         tls_upstream: b.tls_upstream,
         created_at: b.created_at.to_rfc3339(),
         updated_at: b.updated_at.to_rfc3339(),
@@ -83,6 +87,7 @@ pub async fn create_backend(
         health_status: lorica_config::models::HealthStatus::Healthy,
         health_check_enabled: body.health_check_enabled.unwrap_or(true),
         health_check_interval_s: body.health_check_interval_s.unwrap_or(10),
+        health_check_path: body.health_check_path.clone(),
         lifecycle_state: lorica_config::models::LifecycleState::Normal,
         active_connections: 0,
         tls_upstream: body.tls_upstream.unwrap_or(false),
@@ -135,6 +140,9 @@ pub async fn update_backend(
     }
     if let Some(interval) = body.health_check_interval_s {
         backend.health_check_interval_s = interval;
+    }
+    if let Some(path) = body.health_check_path {
+        backend.health_check_path = Some(path);
     }
     if let Some(tls) = body.tls_upstream {
         backend.tls_upstream = tls;

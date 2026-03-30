@@ -36,6 +36,7 @@ lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 lorica-worker = { version = "0.3.0", path = "../lorica-worker" }
 lorica-command = { version = "0.3.0", path = "../lorica-command" }
 lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 arc-swap = "1"
 async-trait = { workspace = true }
 chrono = "0.4"

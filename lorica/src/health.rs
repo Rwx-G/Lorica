@@ -170,8 +170,14 @@ pub async fn health_check_loop(
                 continue;
             }
 
-            // HA and Custom: run active TCP probes
-            let probe = tcp_probe(&backend.address).await;
+            // HA and Custom: run active probes (HTTP if path set, else TCP)
+            let probe = if let Some(ref path) = backend.health_check_path {
+                let scheme = if backend.tls_upstream { "https" } else { "http" };
+                let url = format!("{scheme}://{}{path}", backend.address);
+                http_probe(&url).await
+            } else {
+                tcp_probe(&backend.address).await
+            };
             let new_status = probe.to_health_status();
 
             if new_status != backend.health_status {
@@ -283,6 +289,52 @@ async fn tcp_probe(address: &str) -> ProbeResult {
     }
 }
 
+/// Attempt an HTTP GET and check for a 2xx response.
+/// Returns Healthy if response is 2xx within the degraded threshold, Degraded if slow, Down on failure.
+async fn http_probe(url: &str) -> ProbeResult {
+    let start = Instant::now();
+
+    let client = match reqwest::Client::builder()
+        .timeout(TCP_CONNECT_TIMEOUT)
+        .danger_accept_invalid_certs(true)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(url = %url, error = %e, "HTTP health check client build failed");
+            return ProbeResult::Down;
+        }
+    };
+
+    match client.get(url).send().await {
+        Ok(resp) => {
+            let elapsed_ms = start.elapsed().as_millis();
+            if !resp.status().is_success() {
+                debug!(
+                    url = %url,
+                    status = resp.status().as_u16(),
+                    "HTTP health check non-2xx response"
+                );
+                return ProbeResult::Down;
+            }
+            if elapsed_ms > DEGRADED_THRESHOLD_MS {
+                debug!(
+                    url = %url,
+                    latency_ms = elapsed_ms as u64,
+                    "HTTP health check slow - marking degraded"
+                );
+                ProbeResult::Degraded
+            } else {
+                ProbeResult::Healthy
+            }
+        }
+        Err(e) => {
+            debug!(url = %url, error = %e, "HTTP health check failed");
+            ProbeResult::Down
+        }
+    }
+}
+
 /// Determine probe result from a latency value (for testing).
 #[cfg(test)]
 fn classify_latency(connected: bool, latency_ms: u128) -> ProbeResult {
@@ -377,6 +429,20 @@ mod tests {
     async fn test_tcp_probe_refused() {
         // Localhost on a port nothing is listening on
         let result = tcp_probe("127.0.0.1:1").await;
+        assert_eq!(result, ProbeResult::Down);
+    }
+
+    // ---- HTTP probe ----
+
+    #[tokio::test]
+    async fn test_http_probe_unreachable() {
+        let result = http_probe("http://192.0.2.1:1/healthz").await;
+        assert_eq!(result, ProbeResult::Down);
+    }
+
+    #[tokio::test]
+    async fn test_http_probe_invalid_url() {
+        let result = http_probe("not-a-url").await;
         assert_eq!(result, ProbeResult::Down);
     }
 }

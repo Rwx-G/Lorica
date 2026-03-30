@@ -243,6 +243,10 @@ pub struct Backend {
     pub health_status: HealthStatus,
     pub health_check_enabled: bool,
     pub health_check_interval_s: i32,
+    /// Optional HTTP health check path (e.g. "/healthz"). When set, HTTP GET
+    /// is used instead of TCP connect for health checks.
+    #[serde(default)]
+    pub health_check_path: Option<String>,
     pub lifecycle_state: LifecycleState,
     pub active_connections: i32,
     pub tls_upstream: bool,

@@ -11,6 +11,7 @@ use crate::error::{ConfigError, Result};
 use crate::models::*;
 
 const MIGRATION_V1: &str = include_str!("migrations/001_initial.sql");
+const MIGRATION_V2: &str = include_str!("migrations/002_add_health_check_path.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -100,6 +101,15 @@ impl ConfigStore {
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![1],
+            )?;
+        }
+
+        if current_version < 2 {
+            tracing::info!("applying migration 002_add_health_check_path");
+            self.conn.execute_batch(MIGRATION_V2)?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![2],
             )?;
         }
 
@@ -212,9 +222,9 @@ impl ConfigStore {
     pub fn create_backend(&self, backend: &Backend) -> Result<()> {
         self.conn.execute(
             "INSERT INTO backends (id, address, weight, health_status, health_check_enabled,
-             health_check_interval_s, lifecycle_state, active_connections, tls_upstream,
-             created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             health_check_interval_s, health_check_path, lifecycle_state, active_connections,
+             tls_upstream, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 backend.id,
                 backend.address,
@@ -222,6 +232,7 @@ impl ConfigStore {
                 backend.health_status.as_str(),
                 backend.health_check_enabled,
                 backend.health_check_interval_s,
+                backend.health_check_path,
                 backend.lifecycle_state.as_str(),
                 backend.active_connections,
                 backend.tls_upstream,
@@ -237,8 +248,8 @@ impl ConfigStore {
         self.conn
             .query_row(
                 "SELECT id, address, weight, health_status, health_check_enabled,
-                 health_check_interval_s, lifecycle_state, active_connections, tls_upstream,
-                 created_at, updated_at
+                 health_check_interval_s, health_check_path, lifecycle_state, active_connections,
+                 tls_upstream, created_at, updated_at
                  FROM backends WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_backend(row)),
@@ -251,8 +262,8 @@ impl ConfigStore {
     pub fn list_backends(&self) -> Result<Vec<Backend>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, address, weight, health_status, health_check_enabled,
-             health_check_interval_s, lifecycle_state, active_connections, tls_upstream,
-             created_at, updated_at
+             health_check_interval_s, health_check_path, lifecycle_state, active_connections,
+             tls_upstream, created_at, updated_at
              FROM backends ORDER BY address",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_backend(row)))?;
@@ -267,8 +278,9 @@ impl ConfigStore {
     pub fn update_backend(&self, backend: &Backend) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE backends SET address=?2, weight=?3, health_status=?4,
-             health_check_enabled=?5, health_check_interval_s=?6, lifecycle_state=?7,
-             active_connections=?8, tls_upstream=?9, updated_at=?10 WHERE id=?1",
+             health_check_enabled=?5, health_check_interval_s=?6, health_check_path=?7,
+             lifecycle_state=?8, active_connections=?9, tls_upstream=?10,
+             updated_at=?11 WHERE id=?1",
             params![
                 backend.id,
                 backend.address,
@@ -276,6 +288,7 @@ impl ConfigStore {
                 backend.health_status.as_str(),
                 backend.health_check_enabled,
                 backend.health_check_interval_s,
+                backend.health_check_path,
                 backend.lifecycle_state.as_str(),
                 backend.active_connections,
                 backend.tls_upstream,
@@ -880,12 +893,13 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
             .map_err(ConfigError::Validation)?,
         health_check_enabled: row.get(4)?,
         health_check_interval_s: row.get(5)?,
-        lifecycle_state: LifecycleState::from_str(&row.get::<_, String>(6)?)
+        health_check_path: row.get(6)?,
+        lifecycle_state: LifecycleState::from_str(&row.get::<_, String>(7)?)
             .map_err(ConfigError::Validation)?,
-        active_connections: row.get(7)?,
-        tls_upstream: row.get(8)?,
-        created_at: parse_datetime(&row.get::<_, String>(9)?)?,
-        updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
+        active_connections: row.get(8)?,
+        tls_upstream: row.get(9)?,
+        created_at: parse_datetime(&row.get::<_, String>(10)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(11)?)?,
     })
 }
 

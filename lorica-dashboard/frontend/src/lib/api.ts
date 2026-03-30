@@ -96,6 +96,7 @@ export interface BackendResponse {
   health_status: string;
   health_check_enabled: boolean;
   health_check_interval_s: number;
+  health_check_path: string | null;
   tls_upstream: boolean;
   created_at: string;
   updated_at: string;

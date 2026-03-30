@@ -49,6 +49,7 @@ fn make_backend(id: &str, address: &str, healthy: bool) -> Backend {
         },
         health_check_enabled: true,
         health_check_interval_s: 10,
+        health_check_path: None,
         lifecycle_state: LifecycleState::Normal,
         active_connections: 0,
         tls_upstream: false,

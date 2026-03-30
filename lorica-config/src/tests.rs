@@ -34,6 +34,7 @@ mod tests {
             health_status: HealthStatus::Healthy,
             health_check_enabled: true,
             health_check_interval_s: 10,
+            health_check_path: None,
             lifecycle_state: LifecycleState::Normal,
             active_connections: 0,
             tls_upstream: false,
@@ -326,7 +327,7 @@ mod tests {
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
     }
 
     #[test]
@@ -339,7 +340,7 @@ mod tests {
         }
         {
             let store = ConfigStore::open(path, None).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 1);
+            assert_eq!(store.schema_version().unwrap(), 2);
         }
     }
 
