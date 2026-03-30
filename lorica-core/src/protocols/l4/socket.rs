@@ -15,7 +15,6 @@
 //! Generic socket type
 
 use crate::{Error, OrErr};
-use log::warn;
 #[cfg(unix)]
 use nix::sys::socket::{getpeername, getsockname, SockaddrStorage};
 use std::cmp::Ordering;
@@ -38,10 +37,18 @@ pub enum SocketAddr {
 impl SocketAddr {
     /// Get a reference to the IP socket if it is one
     pub fn as_inet(&self) -> Option<&StdSockAddr> {
-        if let SocketAddr::Inet(addr) = self {
+        #[cfg(unix)]
+        {
+            if let SocketAddr::Inet(addr) = self {
+                Some(addr)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let SocketAddr::Inet(addr) = self;
             Some(addr)
-        } else {
-            None
         }
     }
 
@@ -57,8 +64,14 @@ impl SocketAddr {
 
     /// Set the port if the address is an IP socket.
     pub fn set_port(&mut self, port: u16) {
+        #[cfg(unix)]
         if let SocketAddr::Inet(addr) = self {
-            addr.set_port(port)
+            addr.set_port(port);
+        }
+        #[cfg(not(unix))]
+        {
+            let SocketAddr::Inet(addr) = self;
+            addr.set_port(port);
         }
     }
 

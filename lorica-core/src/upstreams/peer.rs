@@ -23,10 +23,7 @@ use crate::protocols::TcpKeepalive;
 use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
 use derivative::Derivative;
-use lorica_error::{
-    ErrorType::{InternalError, SocketError},
-    OrErr, Result,
-};
+use lorica_error::Result;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
@@ -640,7 +637,7 @@ impl Peer for HttpPeer {
     fn matches_sock<V: AsRawSocket>(&self, sock: V) -> bool {
         use crate::protocols::ConnSockReusable;
 
-        if let Some(proxy) = self.get_proxy() {
+        if let Some(_proxy) = self.get_proxy() {
             panic!("windows do not support peers with proxy")
         } else {
             self.address().check_sock_match(sock)

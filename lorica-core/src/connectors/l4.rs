@@ -255,6 +255,7 @@ pub(crate) fn bind_to_random<P: Peer>(
     bind_to
 }
 
+#[cfg(unix)]
 use crate::protocols::raw_connect;
 
 #[cfg(unix)]
@@ -299,22 +300,16 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
 }
 
 #[cfg(windows)]
-async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
+async fn proxy_connect<P: Peer>(_peer: &P) -> Result<Stream> {
     panic!("peer proxy not supported on windows")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upstreams::peer::{BasicPeer, HttpPeer, Proxy};
-    use lorica_error::ErrorType;
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use crate::upstreams::peer::{BasicPeer, HttpPeer};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
-    use tokio::io::AsyncWriteExt;
-    use tokio::time::sleep;
 
     /// Some of the tests below are flaky when making new connections to mock
     /// servers. The servers are simple tokio listeners, so failures there are

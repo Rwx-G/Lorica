@@ -666,6 +666,343 @@ default_health_check_interval_s = 30
         assert!(!diff.is_empty());
     }
 
+    // ---- Import validation edge cases ----
+
+    #[test]
+    fn test_import_version_zero_rejected() {
+        let toml_str = r#"
+version = 0
+
+[global_settings]
+management_port = 9443
+log_level = "info"
+default_health_check_interval_s = 10
+"#;
+        let result = parse_toml(toml_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("version must be >= 1"));
+    }
+
+    #[test]
+    fn test_import_empty_string_fails() {
+        let result = parse_toml("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_import_malformed_toml_syntax_fails() {
+        let result = parse_toml("this is {{ not valid toml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_import_missing_global_settings_fails() {
+        let toml_str = r#"
+version = 1
+"#;
+        let result = parse_toml(toml_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_import_route_backend_unknown_route_ref() {
+        let toml_str = r#"
+version = 1
+
+[global_settings]
+management_port = 9443
+log_level = "info"
+default_health_check_interval_s = 10
+
+[[backends]]
+id = "b1"
+address = "10.0.0.1:8080"
+weight = 100
+health_status = "healthy"
+health_check_enabled = true
+health_check_interval_s = 10
+lifecycle_state = "normal"
+active_connections = 0
+tls_upstream = false
+created_at = "2026-01-01T00:00:00Z"
+updated_at = "2026-01-01T00:00:00Z"
+
+[[route_backends]]
+route_id = "nonexistent-route"
+backend_id = "b1"
+"#;
+        let result = parse_toml(toml_str);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown route_id"));
+    }
+
+    #[test]
+    fn test_import_route_backend_unknown_backend_ref() {
+        let toml_str = r#"
+version = 1
+
+[global_settings]
+management_port = 9443
+log_level = "info"
+default_health_check_interval_s = 10
+
+[[routes]]
+id = "r1"
+hostname = "test.com"
+path_prefix = "/"
+load_balancing = "round_robin"
+waf_enabled = false
+waf_mode = "detection"
+topology_type = "single_vm"
+enabled = true
+created_at = "2026-01-01T00:00:00Z"
+updated_at = "2026-01-01T00:00:00Z"
+
+[[route_backends]]
+route_id = "r1"
+backend_id = "nonexistent-backend"
+"#;
+        let result = parse_toml(toml_str);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown backend_id")
+        );
+    }
+
+    #[test]
+    fn test_import_valid_minimal() {
+        let toml_str = r#"
+version = 1
+
+[global_settings]
+management_port = 9443
+log_level = "info"
+default_health_check_interval_s = 10
+"#;
+        let data = parse_toml(toml_str).unwrap();
+        assert_eq!(data.version, 1);
+        assert!(data.routes.is_empty());
+        assert!(data.backends.is_empty());
+    }
+
+    #[test]
+    fn test_import_replaces_all_data() {
+        let store = ConfigStore::open_in_memory().unwrap();
+
+        // Pre-populate
+        store.create_route(&make_route()).unwrap();
+        store.create_backend(&make_backend()).unwrap();
+        assert_eq!(store.list_routes().unwrap().len(), 1);
+        assert_eq!(store.list_backends().unwrap().len(), 1);
+
+        // Import empty config
+        let toml_str = r#"
+version = 1
+
+[global_settings]
+management_port = 9443
+log_level = "info"
+default_health_check_interval_s = 10
+"#;
+        let data = parse_toml(toml_str).unwrap();
+        import_to_store(&store, &data).unwrap();
+
+        // Everything should be cleared
+        assert!(store.list_routes().unwrap().is_empty());
+        assert!(store.list_backends().unwrap().is_empty());
+    }
+
+    // ---- ConfigDiff edge cases ----
+
+    #[test]
+    fn test_diff_route_backends_added_and_removed() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        let backend1 = make_backend();
+        store.create_route(&route).unwrap();
+        store.create_backend(&backend1).unwrap();
+        store
+            .link_route_backend(&route.id, &backend1.id)
+            .unwrap();
+
+        // Import data with a different backend link
+        let mut backend2 = make_backend();
+        backend2.id = "backend-new".into();
+        let temp = ConfigStore::open_in_memory().unwrap();
+        temp.create_route(&route).unwrap();
+        temp.create_backend(&backend2).unwrap();
+        temp.link_route_backend(&route.id, &backend2.id).unwrap();
+        let toml_str = export_to_toml(&temp).unwrap();
+
+        let import_data = parse_toml(&toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+
+        assert!(!diff.route_backends.added.is_empty());
+        assert!(!diff.route_backends.removed.is_empty());
+    }
+
+    #[test]
+    fn test_diff_notification_config_changes() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let nc = make_notification_config();
+        store.create_notification_config(&nc).unwrap();
+
+        // Import with modified notification
+        let mut modified = nc.clone();
+        modified.enabled = false;
+        let temp = ConfigStore::open_in_memory().unwrap();
+        temp.create_notification_config(&modified).unwrap();
+        let toml_str = export_to_toml(&temp).unwrap();
+
+        let import_data = parse_toml(&toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+
+        assert_eq!(diff.notification_configs.modified.len(), 1);
+    }
+
+    #[test]
+    fn test_diff_admin_user_changes() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let user = make_admin_user();
+        store.create_admin_user(&user).unwrap();
+
+        // Import with modified username
+        let mut modified = user.clone();
+        modified.username = "superadmin".into();
+        let temp = ConfigStore::open_in_memory().unwrap();
+        temp.create_admin_user(&modified).unwrap();
+        let toml_str = export_to_toml(&temp).unwrap();
+
+        let import_data = parse_toml(&toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+
+        assert_eq!(diff.admin_users.modified.len(), 1);
+    }
+
+    #[test]
+    fn test_diff_user_preference_changes() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let pref = make_user_preference();
+        store.create_user_preference(&pref).unwrap();
+
+        let mut modified = pref.clone();
+        modified.value = PreferenceValue::Always;
+        let temp = ConfigStore::open_in_memory().unwrap();
+        temp.create_user_preference(&modified).unwrap();
+        let toml_str = export_to_toml(&temp).unwrap();
+
+        let import_data = parse_toml(&toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+
+        assert_eq!(diff.user_preferences.modified.len(), 1);
+    }
+
+    #[test]
+    fn test_diff_all_settings_fields() {
+        let store = ConfigStore::open_in_memory().unwrap();
+
+        let toml_str = r#"
+version = 1
+
+[global_settings]
+management_port = 8443
+log_level = "debug"
+default_health_check_interval_s = 30
+cert_warning_days = 14
+cert_critical_days = 3
+"#;
+        let import_data = parse_toml(toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+
+        // All 5 settings should differ from defaults
+        assert_eq!(diff.global_settings.changes.len(), 5);
+    }
+
+    #[test]
+    fn test_diff_certificate_changes() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let cert = make_certificate();
+        store.create_certificate(&cert).unwrap();
+
+        let mut modified = cert.clone();
+        modified.domain = "new-domain.com".into();
+        let temp = ConfigStore::open_in_memory().unwrap();
+        temp.create_certificate(&modified).unwrap();
+        let toml_str = export_to_toml(&temp).unwrap();
+
+        let import_data = parse_toml(&toml_str).unwrap();
+        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+
+        assert_eq!(diff.certificates.modified.len(), 1);
+    }
+
+    // ---- Export tests ----
+
+    #[test]
+    fn test_export_empty_store_produces_valid_toml() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let toml_str = export_to_toml(&store).unwrap();
+        assert!(toml_str.contains("version = 1"));
+        assert!(toml_str.contains("[global_settings]"));
+        // Should be re-importable
+        let data = parse_toml(&toml_str).unwrap();
+        assert_eq!(data.version, 1);
+    }
+
+    #[test]
+    fn test_export_preserves_all_entity_types() {
+        let store = ConfigStore::open_in_memory().unwrap();
+
+        let cert = make_certificate();
+        store.create_certificate(&cert).unwrap();
+
+        let mut route = make_route();
+        route.certificate_id = Some(cert.id.clone());
+        store.create_route(&route).unwrap();
+
+        let backend = make_backend();
+        store.create_backend(&backend).unwrap();
+        store.link_route_backend(&route.id, &backend.id).unwrap();
+
+        let nc = make_notification_config();
+        store.create_notification_config(&nc).unwrap();
+
+        let pref = make_user_preference();
+        store.create_user_preference(&pref).unwrap();
+
+        let user = make_admin_user();
+        store.create_admin_user(&user).unwrap();
+
+        let toml_str = export_to_toml(&store).unwrap();
+
+        // All sections should appear
+        assert!(toml_str.contains("[[routes]]"));
+        assert!(toml_str.contains("[[backends]]"));
+        assert!(toml_str.contains("[[certificates]]"));
+        assert!(toml_str.contains("[[route_backends]]"));
+        assert!(toml_str.contains("[[notification_configs]]"));
+        assert!(toml_str.contains("[[user_preferences]]"));
+        assert!(toml_str.contains("[[admin_users]]"));
+    }
+
+    // ---- Error type tests ----
+
+    #[test]
+    fn test_config_error_display() {
+        let err = crate::error::ConfigError::NotFound("route 1".into());
+        assert_eq!(err.to_string(), "not found: route 1");
+
+        let err = crate::error::ConfigError::Validation("bad ref".into());
+        assert_eq!(err.to_string(), "validation error: bad ref");
+
+        let err = crate::error::ConfigError::Serialization("toml fail".into());
+        assert_eq!(err.to_string(), "serialization error: toml fail");
+    }
+
     #[test]
     fn test_export_import_with_encryption() {
         use crate::crypto::EncryptionKey;

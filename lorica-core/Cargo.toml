@@ -85,6 +85,9 @@ rustls = "0.23"
 hyperlocal = "0.8"
 jemallocator = "0.5"
 
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("openssl", "s2n"))'] }
+
 [features]
 default = []
 rustls = ["lorica-tls", "any_tls", "dep:x509-parser", "ouroboros"]

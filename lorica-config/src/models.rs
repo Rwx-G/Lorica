@@ -330,3 +330,171 @@ impl Default for GlobalSettings {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- LoadBalancing ----
+
+    #[test]
+    fn test_load_balancing_round_trip() {
+        for (s, variant) in [
+            ("round_robin", LoadBalancing::RoundRobin),
+            ("consistent_hash", LoadBalancing::ConsistentHash),
+            ("random", LoadBalancing::Random),
+            ("peak_ewma", LoadBalancing::PeakEwma),
+        ] {
+            assert_eq!(s.parse::<LoadBalancing>().unwrap(), variant);
+            assert_eq!(variant.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn test_load_balancing_unknown() {
+        assert!("unknown".parse::<LoadBalancing>().is_err());
+    }
+
+    // ---- WafMode ----
+
+    #[test]
+    fn test_waf_mode_round_trip() {
+        for (s, variant) in [
+            ("detection", WafMode::Detection),
+            ("blocking", WafMode::Blocking),
+        ] {
+            assert_eq!(s.parse::<WafMode>().unwrap(), variant);
+            assert_eq!(variant.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn test_waf_mode_unknown() {
+        assert!("permissive".parse::<WafMode>().is_err());
+    }
+
+    // ---- TopologyType ----
+
+    #[test]
+    fn test_topology_type_round_trip() {
+        for (s, variant) in [
+            ("single_vm", TopologyType::SingleVm),
+            ("ha", TopologyType::Ha),
+            ("docker_swarm", TopologyType::DockerSwarm),
+            ("kubernetes", TopologyType::Kubernetes),
+            ("custom", TopologyType::Custom),
+        ] {
+            assert_eq!(s.parse::<TopologyType>().unwrap(), variant);
+            assert_eq!(variant.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn test_topology_type_unknown() {
+        assert!("bare_metal".parse::<TopologyType>().is_err());
+    }
+
+    // ---- HealthStatus ----
+
+    #[test]
+    fn test_health_status_round_trip() {
+        for (s, variant) in [
+            ("healthy", HealthStatus::Healthy),
+            ("degraded", HealthStatus::Degraded),
+            ("down", HealthStatus::Down),
+        ] {
+            assert_eq!(s.parse::<HealthStatus>().unwrap(), variant);
+            assert_eq!(variant.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn test_health_status_unknown() {
+        assert!("unknown".parse::<HealthStatus>().is_err());
+    }
+
+    // ---- LifecycleState ----
+
+    #[test]
+    fn test_lifecycle_state_round_trip() {
+        for (s, variant) in [
+            ("normal", LifecycleState::Normal),
+            ("closing", LifecycleState::Closing),
+            ("closed", LifecycleState::Closed),
+        ] {
+            assert_eq!(s.parse::<LifecycleState>().unwrap(), variant);
+            assert_eq!(variant.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_state_unknown() {
+        assert!("draining".parse::<LifecycleState>().is_err());
+    }
+
+    // ---- NotificationChannel ----
+
+    #[test]
+    fn test_notification_channel_round_trip() {
+        for (s, variant) in [
+            ("email", NotificationChannel::Email),
+            ("webhook", NotificationChannel::Webhook),
+        ] {
+            assert_eq!(s.parse::<NotificationChannel>().unwrap(), variant);
+            assert_eq!(variant.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn test_notification_channel_unknown() {
+        assert!("slack".parse::<NotificationChannel>().is_err());
+    }
+
+    // ---- PreferenceValue ----
+
+    #[test]
+    fn test_preference_value_round_trip() {
+        for (s, variant) in [
+            ("never", PreferenceValue::Never),
+            ("always", PreferenceValue::Always),
+            ("once", PreferenceValue::Once),
+        ] {
+            assert_eq!(s.parse::<PreferenceValue>().unwrap(), variant);
+            assert_eq!(variant.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn test_preference_value_unknown() {
+        assert!("sometimes".parse::<PreferenceValue>().is_err());
+    }
+
+    // ---- GlobalSettings ----
+
+    #[test]
+    fn test_global_settings_defaults() {
+        let settings = GlobalSettings::default();
+        assert_eq!(settings.management_port, 9443);
+        assert_eq!(settings.log_level, "info");
+        assert_eq!(settings.default_health_check_interval_s, 10);
+        assert_eq!(settings.cert_warning_days, 30);
+        assert_eq!(settings.cert_critical_days, 7);
+    }
+
+    #[test]
+    fn test_global_settings_serde_round_trip() {
+        let settings = GlobalSettings::default();
+        let json = serde_json::to_string(&settings).unwrap();
+        let deserialized: GlobalSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.management_port, settings.management_port);
+        assert_eq!(deserialized.log_level, settings.log_level);
+    }
+
+    #[test]
+    fn test_global_settings_cert_day_defaults_on_missing() {
+        let json = r#"{"management_port":9443,"log_level":"info","default_health_check_interval_s":10}"#;
+        let settings: GlobalSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.cert_warning_days, 30);
+        assert_eq!(settings.cert_critical_days, 7);
+    }
+}

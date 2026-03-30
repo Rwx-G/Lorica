@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// These tests require openresty (Linux/macOS only)
+#![cfg(unix)]
+
 mod utils;
 
 use utils::server_utils::init;

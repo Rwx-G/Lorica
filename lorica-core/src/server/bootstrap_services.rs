@@ -15,10 +15,14 @@
 #[cfg(unix)]
 pub use super::transfer_fd::Fds;
 use async_trait::async_trait;
-use log::{debug, error, info};
+#[cfg(unix)]
+use log::{debug, error};
+use log::info;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex as TokioMutex};
+use tokio::sync::broadcast;
+#[cfg(unix)]
+use tokio::sync::Mutex as TokioMutex;
 
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -48,9 +52,9 @@ pub struct Bootstrap {
     completed: bool,
 
     test: bool,
-    upgrade: bool,
+    _upgrade: bool,
 
-    upgrade_sock: String,
+    _upgrade_sock: String,
 
     execution_phase_watch: broadcast::Sender<ExecutionPhase>,
 
@@ -73,8 +77,8 @@ impl Bootstrap {
 
         Bootstrap {
             test,
-            upgrade,
-            upgrade_sock,
+            _upgrade: upgrade,
+            _upgrade_sock: upgrade_sock,
             #[cfg(unix)]
             listen_fds: None,
             execution_phase_watch: execution_phase_watch.clone(),
@@ -101,7 +105,7 @@ impl Bootstrap {
 
         // load fds
         #[cfg(unix)]
-        match self.load_fds(self.upgrade) {
+        match self.load_fds(self._upgrade) {
             Ok(_) => {
                 info!("Bootstrap done");
             }
@@ -123,7 +127,7 @@ impl Bootstrap {
         let mut fds = Fds::new();
         if upgrade {
             debug!("Trying to receive socks");
-            fds.get_from_sock(self.upgrade_sock.as_str())?
+            fds.get_from_sock(self._upgrade_sock.as_str())?
         }
         self.listen_fds = Some(Arc::new(TokioMutex::new(fds)));
         Ok(())

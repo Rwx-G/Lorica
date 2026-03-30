@@ -26,9 +26,9 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener as StdUnixListener;
 #[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, FromRawSocket};
+use std::os::windows::io::AsRawSocket;
 use std::time::Duration;
-use std::{fs::Permissions, sync::Arc};
+use std::sync::Arc;
 use tokio::net::TcpSocket;
 
 #[cfg(feature = "connection_filter")]
@@ -72,7 +72,8 @@ impl ServerAddress {
     fn tcp_sock_opts(&self) -> Option<&TcpSocketOptions> {
         match &self {
             Self::Tcp(_, op) => op.into(),
-            _ => None,
+            #[cfg(unix)]
+            Self::Uds(_, _) => None,
         }
     }
 }
@@ -201,6 +202,7 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
     Ok(())
 }
 
+#[cfg(unix)]
 fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
     match address {
         #[cfg(unix)]
@@ -470,7 +472,7 @@ mod test {
 
     #[tokio::test]
     async fn test_listen_tcp() {
-        let addr = "127.0.0.1:7100";
+        let addr = "127.0.0.1:7110";
 
         let mut builder = ListenerEndpoint::builder();
 
@@ -500,7 +502,7 @@ mod test {
 
         let mut builder = ListenerEndpoint::builder();
 
-        builder.listen_addr(ServerAddress::Tcp("[::]:7101".into(), sock_opt));
+        builder.listen_addr(ServerAddress::Tcp("[::]:7111".into(), sock_opt));
 
         #[cfg(unix)]
         let listener = builder.listen(None).await.unwrap();
@@ -513,10 +515,10 @@ mod test {
             listener.accept().await.unwrap();
             listener.accept().await.unwrap();
         });
-        tokio::net::TcpStream::connect("127.0.0.1:7101")
+        tokio::net::TcpStream::connect("127.0.0.1:7111")
             .await
             .expect_err("cannot connect to v4 addr");
-        tokio::net::TcpStream::connect("[::1]:7101")
+        tokio::net::TcpStream::connect("[::1]:7111")
             .await
             .expect("can connect to v6 addr");
     }
@@ -566,6 +568,7 @@ mod test {
         assert_eq!(listener2.as_str(), addr);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_tcp_so_reuseport_false() {
         let addr = "127.0.0.1:7202";

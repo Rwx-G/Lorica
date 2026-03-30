@@ -43,6 +43,7 @@ impl BackendSelection for KetamaHashing {
             .iter()
             .filter_map(|b| {
                 // FIXME: ketama only supports Inet addr, UDS addrs are ignored here
+                #[allow(irrefutable_let_patterns)]
                 if let SocketAddr::Inet(addr) = b.addr {
                     Some(Bucket::new(addr, b.weight as u32))
                 } else {

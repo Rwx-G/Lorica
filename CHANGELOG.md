@@ -21,5 +21,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - **Settings** - Global configuration, notification channel management (email/webhook), preference memory UI, configuration export/import with diff preview, light/dark theme toggle
 - **Health checks** - Background TCP health check service with configurable interval. Backends marked as degraded (>2s latency) or down (unreachable) and excluded from rotation.
 - **Binary** (`lorica`) - CLI with `--version`, `--data-dir`, `--log-level`, `--management-port`, `--http-port`, `--https-port`. Graceful shutdown on SIGTERM/SIGINT. systemd unit file with security hardening.
-- **Tests** - 119 tests total: 31 config store unit tests, 36 API integration tests, 52 frontend tests (Vitest + @testing-library/svelte).
+- **Tests** - 829 Rust tests + 52 frontend tests (881 total). Unit tests for API error handling, middleware (session store, rate limiter), config models (all enum round-trips), import validation edge cases, diff computation, export round-trips, proxy config building, and load balancing algorithms. Integration tests for all API error scenarios (validation, 404, malformed import, expired sessions, rate limiting).
 - NOTICE file crediting Cloudflare Pingora as upstream (Apache-2.0)

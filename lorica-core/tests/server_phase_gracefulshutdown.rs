@@ -15,10 +15,12 @@
 // NOTE: This test sends a shutdown signal to itself,
 // so it needs to be in an isolated test to prevent concurrency.
 
+#[cfg(unix)]
 use lorica_core::server::{configuration::ServerConf, ExecutionPhase, RunArgs, Server};
 
 // Ensure that execution phases are reported correctly.
 #[test]
+#[cfg(unix)]
 fn test_server_execution_phase_monitor_graceful_shutdown() {
     let conf = ServerConf {
         // Use small timeouts to speed up the test.

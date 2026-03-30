@@ -67,9 +67,7 @@ mod tests {
     use super::*;
     use crate::protocols::l4::socket::SocketAddr;
     use crate::upstreams::peer::HttpPeer;
-    use crate::upstreams::peer::Peer;
     use lorica_http::RequestHeader;
-    use std::fmt::{Display, Formatter, Result as FmtResult};
 
     async fn get_http(http: &mut HttpSession, expected_status: u16) {
         let mut req = Box::new(RequestHeader::build("GET", b"/", None).unwrap());

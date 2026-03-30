@@ -28,14 +28,13 @@ use daggy::NodeIndex;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use lorica_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
-use lorica_timeout::fast_timeout;
 use std::sync::Arc;
 use std::thread;
 use std::time::SystemTime;
 #[cfg(unix)]
 use tokio::signal::unix;
-use tokio::sync::{broadcast, watch, Mutex as TokioMutex};
-use tokio::time::{sleep, Duration};
+use tokio::sync::{broadcast, watch};
+use tokio::time::Duration;
 
 use crate::prelude::background_service;
 use crate::server::bootstrap_services::{Bootstrap, BootstrapService};
@@ -54,6 +53,7 @@ This is the graceful period for all existing sessions to finish */
 const EXIT_TIMEOUT: u64 = 60 * 5;
 /* Time to wait before shutting down listening sockets.
 This is the graceful period for the new service to get ready */
+#[allow(dead_code)]
 const CLOSE_TIMEOUT: u64 = 5;
 
 enum ShutdownType {

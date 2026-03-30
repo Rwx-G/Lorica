@@ -328,3 +328,187 @@ impl ProxyHttp for LoricaProxy {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use lorica_config::models::*;
+
+    fn make_route(id: &str, hostname: &str, path: &str, enabled: bool) -> Route {
+        let now = Utc::now();
+        Route {
+            id: id.into(),
+            hostname: hostname.into(),
+            path_prefix: path.into(),
+            certificate_id: None,
+            load_balancing: LoadBalancing::RoundRobin,
+            waf_enabled: false,
+            waf_mode: WafMode::Detection,
+            topology_type: TopologyType::SingleVm,
+            enabled,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn make_backend(id: &str, addr: &str) -> Backend {
+        let now = Utc::now();
+        Backend {
+            id: id.into(),
+            address: addr.into(),
+            weight: 100,
+            health_status: HealthStatus::Healthy,
+            health_check_enabled: true,
+            health_check_interval_s: 10,
+            lifecycle_state: LifecycleState::Normal,
+            active_connections: 0,
+            tls_upstream: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn make_certificate(id: &str, domain: &str) -> Certificate {
+        let now = Utc::now();
+        Certificate {
+            id: id.into(),
+            domain: domain.into(),
+            san_domains: vec![],
+            fingerprint: "sha256:test".into(),
+            cert_pem: "cert".into(),
+            key_pem: "key".into(),
+            issuer: "test".into(),
+            not_before: now,
+            not_after: now,
+            is_acme: false,
+            acme_auto_renew: false,
+            created_at: now,
+        }
+    }
+
+    #[test]
+    fn test_from_store_empty() {
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![]);
+        assert!(config.routes_by_host.is_empty());
+    }
+
+    #[test]
+    fn test_from_store_single_route_with_backend() {
+        let route = make_route("r1", "example.com", "/", true);
+        let backend = make_backend("b1", "10.0.0.1:8080");
+        let links = vec![("r1".into(), "b1".into())];
+
+        let config = ProxyConfig::from_store(vec![route], vec![backend], vec![], links);
+        let entries = config.routes_by_host.get("example.com").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].backends.len(), 1);
+        assert_eq!(entries[0].backends[0].address, "10.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_from_store_disabled_routes_excluded() {
+        let r1 = make_route("r1", "example.com", "/", true);
+        let r2 = make_route("r2", "disabled.com", "/", false);
+
+        let config = ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![]);
+        assert!(config.routes_by_host.contains_key("example.com"));
+        assert!(!config.routes_by_host.contains_key("disabled.com"));
+    }
+
+    #[test]
+    fn test_from_store_longest_path_prefix_first() {
+        let r1 = make_route("r1", "example.com", "/", true);
+        let r2 = make_route("r2", "example.com", "/api", true);
+        let r3 = make_route("r3", "example.com", "/api/v1", true);
+
+        let config = ProxyConfig::from_store(vec![r1, r2, r3], vec![], vec![], vec![]);
+        let entries = config.routes_by_host.get("example.com").unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].route.path_prefix, "/api/v1");
+        assert_eq!(entries[1].route.path_prefix, "/api");
+        assert_eq!(entries[2].route.path_prefix, "/");
+    }
+
+    #[test]
+    fn test_from_store_route_without_backends() {
+        let route = make_route("r1", "example.com", "/", true);
+
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![]);
+        let entries = config.routes_by_host.get("example.com").unwrap();
+        assert!(entries[0].backends.is_empty());
+    }
+
+    #[test]
+    fn test_from_store_certificate_association() {
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.certificate_id = Some("c1".into());
+        let cert = make_certificate("c1", "example.com");
+
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![cert], vec![]);
+        let entries = config.routes_by_host.get("example.com").unwrap();
+        assert!(entries[0].certificate.is_some());
+        assert_eq!(entries[0].certificate.as_ref().unwrap().domain, "example.com");
+    }
+
+    #[test]
+    fn test_from_store_missing_certificate_is_none() {
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.certificate_id = Some("nonexistent".into());
+
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![]);
+        let entries = config.routes_by_host.get("example.com").unwrap();
+        assert!(entries[0].certificate.is_none());
+    }
+
+    #[test]
+    fn test_from_store_multiple_backends_per_route() {
+        let route = make_route("r1", "example.com", "/", true);
+        let b1 = make_backend("b1", "10.0.0.1:8080");
+        let b2 = make_backend("b2", "10.0.0.2:8080");
+        let links = vec![
+            ("r1".into(), "b1".into()),
+            ("r1".into(), "b2".into()),
+        ];
+
+        let config = ProxyConfig::from_store(vec![route], vec![b1, b2], vec![], links);
+        let entries = config.routes_by_host.get("example.com").unwrap();
+        assert_eq!(entries[0].backends.len(), 2);
+    }
+
+    #[test]
+    fn test_from_store_multiple_hosts() {
+        let r1 = make_route("r1", "foo.com", "/", true);
+        let r2 = make_route("r2", "bar.com", "/", true);
+
+        let config = ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![]);
+        assert_eq!(config.routes_by_host.len(), 2);
+        assert!(config.routes_by_host.contains_key("foo.com"));
+        assert!(config.routes_by_host.contains_key("bar.com"));
+    }
+
+    #[test]
+    fn test_from_store_dangling_backend_link_ignored() {
+        let route = make_route("r1", "example.com", "/", true);
+        let links = vec![("r1".into(), "nonexistent-backend".into())];
+
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], links);
+        let entries = config.routes_by_host.get("example.com").unwrap();
+        assert!(entries[0].backends.is_empty());
+    }
+
+    #[test]
+    fn test_from_store_rr_counter_starts_at_zero() {
+        let route = make_route("r1", "example.com", "/", true);
+
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![]);
+        let entries = config.routes_by_host.get("example.com").unwrap();
+        assert_eq!(entries[0].rr_counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_proxy_config_default_is_empty() {
+        let config = ProxyConfig::default();
+        assert!(config.routes_by_host.is_empty());
+    }
+}

@@ -36,7 +36,6 @@ use log::{debug, error, info};
 use lorica_error::Result;
 use lorica_runtime::current_handle;
 use lorica_timeout::timeout;
-use std::fs::Permissions;
 use std::sync::Arc;
 use std::time::Duration;
 

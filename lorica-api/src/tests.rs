@@ -1630,3 +1630,1046 @@ async fn test_session_purge_expired() {
     // Valid session still exists
     assert!(store.get(&sid).await.is_some());
 }
+
+// ---- Validation Error Scenario Tests ----
+
+#[tokio::test]
+async fn test_create_route_empty_hostname_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "hostname": "",
+        "path_prefix": "/"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/routes")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn test_create_route_invalid_load_balancing_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "hostname": "example.com",
+        "load_balancing": "invalid_algo"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/routes")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_create_route_invalid_topology_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "hostname": "example.com",
+        "topology_type": "nonexistent"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/routes")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_update_route_nonexistent_returns_404() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "hostname": "new.com" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/routes/nonexistent-id")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_delete_route_nonexistent_returns_error() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/routes/nonexistent-id")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    // ConfigStore::delete_route returns NotFound for unknown IDs
+    assert!(
+        response.status() == StatusCode::NOT_FOUND
+            || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn test_create_backend_empty_address_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "address": "" });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/backends")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_get_backend_nonexistent_returns_404() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/backends/nonexistent")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_update_backend_nonexistent_returns_404() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "address": "10.0.0.1:80" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/backends/nonexistent")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_create_certificate_empty_domain_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "domain": "",
+        "cert_pem": "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
+        "key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_create_certificate_empty_pem_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "domain": "example.com",
+        "cert_pem": "",
+        "key_pem": ""
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_get_certificate_nonexistent_returns_404() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/certificates/nonexistent")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_update_certificate_nonexistent_returns_404() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "domain": "new.com" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/certificates/nonexistent")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_self_signed_empty_domain_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "domain": "" });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates/self-signed")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_change_password_too_short_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let known_password = "test_password_123";
+
+    // Create admin and set known password
+    {
+        let store = state.store.lock().await;
+        ensure_admin_user(&store).unwrap();
+        let mut user = store.get_admin_user_by_username("admin").unwrap().unwrap();
+        user.password_hash = hash_password(known_password).unwrap();
+        store.update_admin_user(&user).unwrap();
+    }
+
+    // Login
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let login_body = serde_json::json!({
+        "username": "admin",
+        "password": known_password
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&login_body).unwrap()))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    let cookie = format!(
+        "lorica_session={}",
+        extract_session_cookie(&response).unwrap()
+    );
+
+    // Try change password with too-short new password
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "current_password": known_password,
+        "new_password": "short"
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/auth/password")
+        .header("Content-Type", "application/json")
+        .header("Cookie", cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_change_password_wrong_current_returns_401() {
+    let (state, session_store, rate_limiter) = test_state();
+    let known_password = "test_password_123";
+
+    {
+        let store = state.store.lock().await;
+        ensure_admin_user(&store).unwrap();
+        let mut user = store.get_admin_user_by_username("admin").unwrap().unwrap();
+        user.password_hash = hash_password(known_password).unwrap();
+        store.update_admin_user(&user).unwrap();
+    }
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let login_body = serde_json::json!({
+        "username": "admin",
+        "password": known_password
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&login_body).unwrap()))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    let cookie = format!(
+        "lorica_session={}",
+        extract_session_cookie(&response).unwrap()
+    );
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "current_password": "wrong_password",
+        "new_password": "new_secure_password_456"
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/auth/password")
+        .header("Content-Type", "application/json")
+        .header("Cookie", cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_login_nonexistent_user_returns_401() {
+    let (state, session_store, rate_limiter) = test_state();
+    {
+        let store = state.store.lock().await;
+        ensure_admin_user(&store).unwrap();
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "username": "nonexistent_user",
+        "password": "whatever"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---- Import Error Scenarios ----
+
+#[tokio::test]
+async fn test_import_malformed_toml_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "toml_content": "this is {{ not valid toml !@#$"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/config/import")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_import_too_large_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Generate content larger than 1MB
+    let large_content = "x".repeat(1_048_577);
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "toml_content": large_content
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/config/import")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["error"]["message"].as_str().unwrap().contains("too large"));
+}
+
+#[tokio::test]
+async fn test_import_preview_malformed_toml_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "toml_content": "not valid { toml"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/config/import/preview")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_import_invalid_references_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let toml_content = r#"version = 1
+
+[global_settings]
+management_port = 9443
+log_level = "info"
+default_health_check_interval_s = 10
+
+[[routes]]
+id = "r1"
+hostname = "test.com"
+path_prefix = "/"
+certificate_id = "nonexistent-cert"
+load_balancing = "round_robin"
+waf_enabled = false
+waf_mode = "detection"
+topology_type = "single_vm"
+enabled = true
+created_at = "2026-01-01T00:00:00Z"
+updated_at = "2026-01-01T00:00:00Z"
+"#;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "toml_content": toml_content });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/config/import")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---- Settings Validation Error Tests ----
+
+#[tokio::test]
+async fn test_settings_invalid_log_level_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "log_level": "verbose" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_settings_invalid_health_check_interval_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "default_health_check_interval_s": 0 });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_settings_invalid_cert_warning_days_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "cert_warning_days": 0 });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_settings_invalid_cert_critical_days_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "cert_critical_days": -1 });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---- Notification Validation Tests ----
+
+#[tokio::test]
+async fn test_create_notification_invalid_channel_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "channel": "sms",
+        "config": "{}",
+        "alert_types": ["cert_expiry"]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/notifications")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_create_notification_empty_config_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "channel": "email",
+        "config": "",
+        "alert_types": ["cert_expiry"]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/notifications")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_create_notification_invalid_json_config_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "channel": "email",
+        "config": "not json at all",
+        "alert_types": ["cert_expiry"]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/notifications")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_test_notification_nonexistent_returns_404() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/notifications/nonexistent/test")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_test_notification_email_missing_smtp_host_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create a notification without smtp_host
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "channel": "email",
+        "config": r#"{"recipient":"test@test.com"}"#,
+        "alert_types": ["cert_expiry"]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/notifications")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    let notif_id = json["data"]["id"].as_str().unwrap().to_string();
+
+    // Test it - should fail
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("POST")
+        .uri(&format!("/api/v1/notifications/{notif_id}/test"))
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_test_notification_webhook_missing_url_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "channel": "webhook",
+        "config": r#"{"method":"POST"}"#,
+        "alert_types": ["backend_down"]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/notifications")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    let notif_id = json["data"]["id"].as_str().unwrap().to_string();
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("POST")
+        .uri(&format!("/api/v1/notifications/{notif_id}/test"))
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---- Preference Validation Tests ----
+
+#[tokio::test]
+async fn test_update_preference_nonexistent_returns_404() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "value": "always" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/preferences/nonexistent")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_update_preference_invalid_value_returns_400() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create a preference first
+    {
+        let store = state.store.lock().await;
+        let pref = lorica_config::models::UserPreference {
+            id: "pref-1".into(),
+            preference_key: "test_key".into(),
+            value: lorica_config::models::PreferenceValue::Never,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        store.create_user_preference(&pref).unwrap();
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "value": "invalid_value" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/preferences/pref-1")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---- Expired session test ----
+
+#[tokio::test]
+async fn test_expired_session_returns_401() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Manually expire all sessions
+    {
+        let mut sessions = session_store.sessions.lock().await;
+        for session in sessions.values_mut() {
+            session.expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        }
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/routes")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---- System endpoint test ----
+
+#[tokio::test]
+async fn test_system_endpoint_returns_all_fields() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/system")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["data"]["host"]["cpu_count"].as_u64().unwrap() > 0);
+    assert!(json["data"]["host"]["memory_total_bytes"].as_u64().unwrap() > 0);
+    assert!(json["data"]["process"].is_object());
+    assert!(json["data"]["proxy"]["version"].is_string());
+    assert!(json["data"]["proxy"]["uptime_seconds"].is_number());
+}
+
+// ---- Route-backend association tests ----
+
+#[tokio::test]
+async fn test_create_route_with_backend_ids() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create a backend first
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "address": "10.0.0.1:8080" });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/backends")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    let backend_id = json["data"]["id"].as_str().unwrap().to_string();
+
+    // Create route with backend_ids
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "hostname": "example.com",
+        "backend_ids": [backend_id]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/routes")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    assert_eq!(json["data"]["backends"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_update_route_backend_associations() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create two backends
+    let mut backend_ids = Vec::new();
+    for addr in ["10.0.0.1:8080", "10.0.0.2:8080"] {
+        let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+        let body = serde_json::json!({ "address": addr });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/backends")
+            .header("Content-Type", "application/json")
+            .header("Cookie", &cookie)
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let response = router.oneshot(req).await.unwrap();
+        let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        backend_ids.push(json["data"]["id"].as_str().unwrap().to_string());
+    }
+
+    // Create route with first backend
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "hostname": "example.com",
+        "backend_ids": [&backend_ids[0]]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/routes")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    let route_id = json["data"]["id"].as_str().unwrap().to_string();
+
+    // Update route to use second backend only
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "backend_ids": [&backend_ids[1]]
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri(&format!("/api/v1/routes/{route_id}"))
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    let backends = json["data"]["backends"].as_array().unwrap();
+    assert_eq!(backends.len(), 1);
+    assert_eq!(backends[0].as_str().unwrap(), backend_ids[1]);
+}
+
+// ---- Status with data test ----
+
+#[tokio::test]
+async fn test_status_counts_with_data() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create route + backend + certificate
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "hostname": "example.com" });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/routes")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    router.oneshot(req).await.unwrap();
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "address": "10.0.0.1:8080" });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/backends")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    router.oneshot(req).await.unwrap();
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "domain": "example.com",
+        "cert_pem": "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
+        "key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    router.oneshot(req).await.unwrap();
+
+    // Check status
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/status")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["routes_count"], 1);
+    assert_eq!(json["data"]["backends_count"], 1);
+    assert_eq!(json["data"]["backends_healthy"], 1);
+    assert_eq!(json["data"]["certificates_count"], 1);
+}

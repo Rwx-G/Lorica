@@ -64,4 +64,4 @@ prometheus = ["lorica-core/prometheus"]
 rustdoc-args = ["--cfg", "doc_async_trait"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(doc_async_trait)'] }
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(doc_async_trait)', 'cfg(feature, values("s2n", "openssl_derived"))'] }

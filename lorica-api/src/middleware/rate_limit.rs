@@ -51,3 +51,61 @@ impl RateLimiter {
         bucket.attempts <= MAX_ATTEMPTS
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_allows_up_to_max_attempts() {
+        let limiter = RateLimiter::new();
+        for _ in 0..MAX_ATTEMPTS {
+            assert!(limiter.check("key1").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blocks_after_max_attempts() {
+        let limiter = RateLimiter::new();
+        for _ in 0..MAX_ATTEMPTS {
+            limiter.check("key1").await;
+        }
+        assert!(!limiter.check("key1").await);
+    }
+
+    #[tokio::test]
+    async fn test_independent_keys() {
+        let limiter = RateLimiter::new();
+        for _ in 0..MAX_ATTEMPTS {
+            limiter.check("key1").await;
+        }
+        // key2 should still be allowed
+        assert!(limiter.check("key2").await);
+    }
+
+    #[tokio::test]
+    async fn test_window_resets_after_expiry() {
+        let limiter = RateLimiter::new();
+        // Exhaust the limit
+        for _ in 0..=MAX_ATTEMPTS {
+            limiter.check("key1").await;
+        }
+        assert!(!limiter.check("key1").await);
+
+        // Manually expire the window
+        {
+            let mut buckets = limiter.buckets.lock().await;
+            let bucket = buckets.get_mut("key1").unwrap();
+            bucket.window_start = Utc::now() - Duration::seconds(WINDOW_SECONDS + 1);
+        }
+
+        // Should be allowed again
+        assert!(limiter.check("key1").await);
+    }
+
+    #[test]
+    fn test_default_impl() {
+        let limiter = RateLimiter::default();
+        assert!(limiter.buckets.try_lock().is_ok());
+    }
+}

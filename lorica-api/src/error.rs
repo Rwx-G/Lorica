@@ -99,3 +99,85 @@ pub fn json_data_with_status<T: Serialize>(
 ) -> (StatusCode, axum::Json<serde_json::Value>) {
     (status, axum::Json(serde_json::json!({ "data": data })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn test_status_codes() {
+        assert_eq!(ApiError::NotFound("x".into()).status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(ApiError::BadRequest("x".into()).status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(ApiError::Unauthorized("x".into()).status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(ApiError::Forbidden("x".into()).status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(ApiError::Conflict("x".into()).status_code(), StatusCode::CONFLICT);
+        assert_eq!(ApiError::RateLimited.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(ApiError::Internal("x".into()).status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_error_codes() {
+        assert_eq!(ApiError::NotFound("x".into()).code(), "not_found");
+        assert_eq!(ApiError::BadRequest("x".into()).code(), "bad_request");
+        assert_eq!(ApiError::Unauthorized("x".into()).code(), "unauthorized");
+        assert_eq!(ApiError::Forbidden("x".into()).code(), "forbidden");
+        assert_eq!(ApiError::Conflict("x".into()).code(), "conflict");
+        assert_eq!(ApiError::RateLimited.code(), "rate_limited");
+        assert_eq!(ApiError::Internal("x".into()).code(), "internal_error");
+    }
+
+    #[test]
+    fn test_display_messages() {
+        assert_eq!(ApiError::NotFound("item".into()).to_string(), "not found: item");
+        assert_eq!(ApiError::BadRequest("bad".into()).to_string(), "bad request: bad");
+        assert_eq!(ApiError::RateLimited.to_string(), "rate limited");
+    }
+
+    #[tokio::test]
+    async fn test_into_response_status_and_body() {
+        let err = ApiError::NotFound("route 42".into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "not_found");
+        assert_eq!(json["error"]["message"], "not found: route 42");
+    }
+
+    #[test]
+    fn test_config_error_not_found_converts() {
+        let err: ApiError = lorica_config::ConfigError::NotFound("cert 1".into()).into();
+        assert_eq!(err.status_code(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_config_error_validation_converts() {
+        let err: ApiError = lorica_config::ConfigError::Validation("bad ref".into()).into();
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_config_error_other_converts_to_internal() {
+        let err: ApiError =
+            lorica_config::ConfigError::Serialization("toml fail".into()).into();
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_json_data_envelope() {
+        let result = json_data("hello");
+        let val = result.0;
+        assert_eq!(val["data"], "hello");
+    }
+
+    #[test]
+    fn test_json_data_with_status_envelope() {
+        let (status, json) = json_data_with_status(StatusCode::CREATED, "item");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json.0["data"], "item");
+    }
+}

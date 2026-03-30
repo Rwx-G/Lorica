@@ -81,7 +81,7 @@ use crate::server::ListenFds;
 
 use async_trait::async_trait;
 use lorica_error::Result;
-use std::{any::Any, fs::Permissions, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};

@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// These tests require openresty (Linux/macOS only)
+#![cfg(unix)]
+
 mod utils;
 
 use bytes::Bytes;
 use h2::client;
 use http::Request;
-use hyper::{body::HttpBody, header::HeaderValue, Body, Client};
+use hyper::{body::HttpBody, header::HeaderValue, Body};
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};

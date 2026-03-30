@@ -149,3 +149,150 @@ pub async fn require_auth(req: Request, next: Next) -> Result<Response, ApiError
     req.extensions_mut().insert(session);
     Ok(next.run(req).await)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_session_store_create_and_get() {
+        let store = SessionStore::new();
+        let sid = store.create("user-1".into(), "admin".into()).await;
+        let session = store.get(&sid).await.unwrap();
+        assert_eq!(session.user_id, "user-1");
+        assert_eq!(session.username, "admin");
+    }
+
+    #[tokio::test]
+    async fn test_session_store_get_nonexistent() {
+        let store = SessionStore::new();
+        assert!(store.get("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_store_remove() {
+        let store = SessionStore::new();
+        let sid = store.create("user-1".into(), "admin".into()).await;
+        store.remove(&sid).await;
+        assert!(store.get(&sid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_store_expires_at() {
+        let store = SessionStore::new();
+        let sid = store.create("user-1".into(), "admin".into()).await;
+        let expires = store.expires_at(&sid).await;
+        assert!(expires.is_some());
+        assert!(expires.unwrap() > Utc::now());
+    }
+
+    #[tokio::test]
+    async fn test_session_store_expires_at_nonexistent() {
+        let store = SessionStore::new();
+        assert!(store.expires_at("nope").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_store_expired_session_returns_none() {
+        let store = SessionStore::new();
+        let sid = Uuid::new_v4().to_string();
+        let expired = Session {
+            user_id: "user-1".into(),
+            username: "admin".into(),
+            created_at: Utc::now() - Duration::minutes(60),
+            expires_at: Utc::now() - Duration::minutes(1),
+        };
+        store.sessions.lock().await.insert(sid.clone(), expired);
+        assert!(store.get(&sid).await.is_none());
+        // Verify the expired session was removed from the map
+        assert!(store.sessions.lock().await.get(&sid).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_purge_expired_removes_stale_sessions() {
+        let store = SessionStore::new();
+
+        // Insert a valid session
+        let valid_sid = store.create("user-1".into(), "admin".into()).await;
+
+        // Insert an expired session
+        let expired_sid = Uuid::new_v4().to_string();
+        let expired = Session {
+            user_id: "user-2".into(),
+            username: "old".into(),
+            created_at: Utc::now() - Duration::minutes(60),
+            expires_at: Utc::now() - Duration::minutes(1),
+        };
+        store
+            .sessions
+            .lock()
+            .await
+            .insert(expired_sid.clone(), expired);
+
+        let purged = store.purge_expired().await;
+        assert_eq!(purged, 1);
+
+        // Valid session still exists
+        assert!(store.get(&valid_sid).await.is_some());
+        // Expired session gone
+        assert!(store.sessions.lock().await.get(&expired_sid).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_purge_expired_returns_zero_when_none_expired() {
+        let store = SessionStore::new();
+        store.create("user-1".into(), "admin".into()).await;
+        assert_eq!(store.purge_expired().await, 0);
+    }
+
+    #[test]
+    fn test_session_cookie_format() {
+        let cookie = session_cookie("abc-123");
+        assert!(cookie.contains("lorica_session=abc-123"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("Secure"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Path=/api"));
+    }
+
+    #[test]
+    fn test_clear_session_cookie_format() {
+        let cookie = clear_session_cookie();
+        assert!(cookie.contains("lorica_session="));
+        assert!(cookie.contains("Max-Age=0"));
+        assert!(cookie.contains("HttpOnly"));
+    }
+
+    #[test]
+    fn test_extract_session_cookie_from_request() {
+        let req = Request::builder()
+            .header(http::header::COOKIE, "lorica_session=test-sid-123; other=val")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let result = extract_session_cookie(&req);
+        assert_eq!(result.unwrap(), "test-sid-123");
+    }
+
+    #[test]
+    fn test_extract_session_cookie_missing() {
+        let req = Request::builder()
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(extract_session_cookie(&req).is_none());
+    }
+
+    #[test]
+    fn test_extract_session_cookie_wrong_name() {
+        let req = Request::builder()
+            .header(http::header::COOKIE, "other_cookie=val")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(extract_session_cookie(&req).is_none());
+    }
+
+    #[test]
+    fn test_session_store_default() {
+        let store = SessionStore::default();
+        assert!(store.sessions.try_lock().is_ok());
+    }
+}

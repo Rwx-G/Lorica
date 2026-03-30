@@ -188,6 +188,7 @@ fn ip_bind_addr_no_port(_fd: RawFd, _val: bool) -> io::Result<()> {
 /// IP_LOCAL_PORT_RANGE is only supported on Linux 6.3 and higher,
 /// ip_local_port_range() is a no-op on unsupported versions.
 /// See the [man page](https://man7.org/linux/man-pages/man7/ip.7.html) for more details.
+#[allow(dead_code)]
 #[cfg(target_os = "linux")]
 fn ip_local_port_range(fd: RawFd, low: u16, high: u16) -> io::Result<()> {
     const IP_LOCAL_PORT_RANGE: i32 = 51;
@@ -200,11 +201,13 @@ fn ip_local_port_range(fd: RawFd, low: u16, high: u16) -> io::Result<()> {
     }
 }
 
+#[allow(dead_code)]
 #[cfg(all(unix, not(target_os = "linux")))]
 fn ip_local_port_range(_fd: RawFd, _low: u16, _high: u16) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 #[cfg(windows)]
 fn ip_local_port_range(_fd: RawSocket, _low: u16, _high: u16) -> io::Result<()> {
     Ok(())

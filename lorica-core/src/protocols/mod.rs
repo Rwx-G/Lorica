@@ -286,7 +286,7 @@ use nix::sys::socket::{getpeername, SockaddrStorage, UnixAddr};
 use std::os::unix::prelude::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
-use std::{net::SocketAddr as InetSocketAddr, path::Path};
+use std::net::SocketAddr as InetSocketAddr;
 
 use crate::protocols::tls::TlsRef;
 

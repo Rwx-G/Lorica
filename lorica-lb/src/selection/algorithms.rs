@@ -59,3 +59,58 @@ impl SelectionAlgorithm for Random {
         rng.gen()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+
+    #[test]
+    fn test_round_robin_increments() {
+        let rr = RoundRobin::new();
+        assert_eq!(rr.next(b""), 0);
+        assert_eq!(rr.next(b""), 1);
+        assert_eq!(rr.next(b""), 2);
+    }
+
+    #[test]
+    fn test_round_robin_ignores_key() {
+        let rr = RoundRobin::new();
+        assert_eq!(rr.next(b"a"), 0);
+        assert_eq!(rr.next(b"b"), 1);
+        assert_eq!(rr.next(b"c"), 2);
+    }
+
+    #[test]
+    fn test_hasher_deterministic() {
+        let h = <DefaultHasher as SelectionAlgorithm>::new();
+        let v1 = h.next(b"test-key");
+        let v2 = h.next(b"test-key");
+        assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn test_hasher_different_keys_differ() {
+        let h = <DefaultHasher as SelectionAlgorithm>::new();
+        let v1 = h.next(b"key-a");
+        let v2 = h.next(b"key-b");
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn test_random_produces_values() {
+        let r = Random::new();
+        let v1 = r.next(b"");
+        let v2 = r.next(b"");
+        // Very unlikely to be equal, but we just check they don't panic
+        let _ = (v1, v2);
+    }
+
+    #[test]
+    fn test_round_robin_high_count() {
+        let rr = RoundRobin::new();
+        for i in 0..1000u64 {
+            assert_eq!(rr.next(b""), i);
+        }
+    }
+}

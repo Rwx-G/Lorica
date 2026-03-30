@@ -41,7 +41,7 @@ use crate::protocols::l4::virt;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
-    TimingDigest, UniqueID, UniqueIDType,
+    TimingDigest, UniqueID,
 };
 use crate::upstreams::peer::Tracer;
 
@@ -407,6 +407,7 @@ impl Stream {
                 s.set_socket_option(virt::VirtualSockOpt::NoDelay)
                     .or_err(ConnectError, "failed to set_nodelay on virtual socket")?;
             }
+            #[cfg(unix)]
             _ => (),
         }
         Ok(())
@@ -423,6 +424,7 @@ impl Stream {
                 s.set_socket_option(virt::VirtualSockOpt::KeepAlive(ka.clone()))
                     .or_err(ConnectError, "failed to set_keepalive on virtual socket")?;
             }
+            #[cfg(unix)]
             _ => (),
         }
         Ok(())
