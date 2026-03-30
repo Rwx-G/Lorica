@@ -65,11 +65,28 @@ pub enum WorkerEvent {
 }
 
 /// Handle to a running worker process.
-struct WorkerHandle {
+pub struct WorkerHandle {
     id: u32,
     pid: Pid,
-    /// Supervisor end of the socketpair (kept alive for potential future commands).
-    _cmd_fd: OwnedFd,
+    /// Supervisor end of the command channel socketpair.
+    cmd_fd: OwnedFd,
+}
+
+impl WorkerHandle {
+    /// Get the worker ID.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Get the worker PID.
+    pub fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    /// Get the raw FD for the command channel (supervisor end).
+    pub fn cmd_fd(&self) -> RawFd {
+        self.cmd_fd.as_raw_fd()
+    }
 }
 
 /// Manages a pool of worker processes.
@@ -150,7 +167,7 @@ impl WorkerManager {
                 self.workers.push(WorkerHandle {
                     id,
                     pid: child,
-                    _cmd_fd: supervisor_fd,
+                    cmd_fd: supervisor_fd,
                 });
 
                 Ok(())
@@ -270,6 +287,17 @@ impl WorkerManager {
     /// PIDs of all currently tracked workers.
     pub fn worker_pids(&self) -> Vec<(u32, Pid)> {
         self.workers.iter().map(|w| (w.id, w.pid)).collect()
+    }
+
+    /// Take ownership of the worker handles (for passing to async tasks).
+    /// After this call, the manager no longer tracks workers.
+    pub fn take_workers(&mut self) -> Vec<WorkerHandle> {
+        std::mem::take(&mut self.workers)
+    }
+
+    /// Get a reference to the worker handles.
+    pub fn workers(&self) -> &[WorkerHandle] {
+        &self.workers
     }
 }
 

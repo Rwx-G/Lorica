@@ -166,7 +166,9 @@ fn main() {
 
 #[cfg(unix)]
 fn run_supervisor(cli: Cli) {
+    use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_worker::manager::{WorkerConfig, WorkerEvent, WorkerManager};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     let worker_count = if cli.workers == 0 {
         WorkerConfig::default_worker_count()
@@ -214,7 +216,7 @@ fn run_supervisor(cli: Cli) {
             }
         };
 
-        // Ensure an admin user exists (first-run password generation)
+        // Ensure an admin user exists
         match lorica_api::auth::ensure_admin_user(&store) {
             Ok(Some(password)) => {
                 println!();
@@ -237,8 +239,114 @@ fn run_supervisor(cli: Cli) {
         let log_buffer = Arc::new(LogBuffer::new(10_000));
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        // No config_reload_tx in supervisor mode - workers read config independently
-        // (command channel in Story 2.2 will replace this)
+        // Create config reload channel - API mutations trigger config dispatch to workers
+        let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
+
+        // Build command channels from worker socketpair FDs
+        let cmd_channels: Vec<(u32, CommandChannel)> = manager
+            .workers()
+            .iter()
+            .filter_map(|w| {
+                let fd = w.cmd_fd();
+                // Duplicate the FD so we don't take ownership from the WorkerHandle
+                let dup_fd = nix::unistd::dup(fd).ok()?;
+                let ch = unsafe { CommandChannel::from_raw_fd(dup_fd).ok()? };
+                Some((w.id(), ch))
+            })
+            .collect();
+
+        let cmd_channels = Arc::new(tokio::sync::Mutex::new(cmd_channels));
+        let sequence = Arc::new(AtomicU64::new(1));
+
+        // Background task: dispatch config reload to workers when API signals a change
+        let dispatch_channels = Arc::clone(&cmd_channels);
+        let dispatch_seq = Arc::clone(&sequence);
+        let _dispatch_handle = tokio::spawn(async move {
+            while config_reload_rx.changed().await.is_ok() {
+                let seq = dispatch_seq.fetch_add(1, Ordering::Relaxed);
+                let cmd = Command::new(CommandType::ConfigReload, seq);
+
+                let mut channels = dispatch_channels.lock().await;
+                for (worker_id, ch) in channels.iter_mut() {
+                    if let Err(e) = ch.send(&cmd).await {
+                        warn!(
+                            worker_id = *worker_id,
+                            error = %e,
+                            "failed to send ConfigReload to worker"
+                        );
+                        continue;
+                    }
+
+                    match ch.recv::<Response>().await {
+                        Ok(resp) => {
+                            let status = resp.typed_status();
+                            match status {
+                                lorica_command::ResponseStatus::Ok => {
+                                    info!(worker_id = *worker_id, "worker applied config reload");
+                                }
+                                lorica_command::ResponseStatus::Error => {
+                                    error!(
+                                        worker_id = *worker_id,
+                                        message = %resp.message,
+                                        "worker failed to apply config reload"
+                                    );
+                                }
+                                lorica_command::ResponseStatus::Processing => {
+                                    info!(
+                                        worker_id = *worker_id,
+                                        message = %resp.message,
+                                        "worker processing config reload"
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                worker_id = *worker_id,
+                                error = %e,
+                                "failed to receive response from worker"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        // Background task: heartbeat health monitoring
+        let heartbeat_channels = Arc::clone(&cmd_channels);
+        let heartbeat_seq = Arc::clone(&sequence);
+        let _heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                let seq = heartbeat_seq.fetch_add(1, Ordering::Relaxed);
+                let cmd = Command::new(CommandType::Heartbeat, seq);
+
+                let mut channels = heartbeat_channels.lock().await;
+                for (worker_id, ch) in channels.iter_mut() {
+                    if let Err(e) = ch.send(&cmd).await {
+                        warn!(
+                            worker_id = *worker_id,
+                            error = %e,
+                            "heartbeat failed - worker may be unresponsive"
+                        );
+                        continue;
+                    }
+
+                    match ch.recv::<Response>().await {
+                        Ok(_) => {} // Worker is alive
+                        Err(e) => {
+                            warn!(
+                                worker_id = *worker_id,
+                                error = %e,
+                                "heartbeat response failed - worker may be unresponsive"
+                            );
+                        }
+                    }
+                }
+            }
+        });
 
         // Start API server
         let api_store = Arc::clone(&store);
@@ -252,7 +360,7 @@ fn run_supervisor(cli: Cli) {
                 system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
                 active_connections: api_active_connections,
                 started_at: Instant::now(),
-                config_reload_tx: None,
+                config_reload_tx: Some(config_reload_tx),
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
@@ -265,12 +373,15 @@ fn run_supervisor(cli: Cli) {
             }
         });
 
-        // Worker monitoring loop
+        // Worker monitoring loop (crash detection and restart)
+        let manager = Arc::new(std::sync::Mutex::new(manager));
+        let monitor_mgr = Arc::clone(&manager);
         let monitor_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                let events = manager.check_workers();
+                let mut mgr = monitor_mgr.lock().unwrap();
+                let events = mgr.check_workers();
                 for event in events {
                     match event {
                         WorkerEvent::Exited { id, pid, status } => {
@@ -280,12 +391,8 @@ fn run_supervisor(cli: Cli) {
                                 status = status,
                                 "worker exited, restarting"
                             );
-                            if let Err(e) = manager.restart_worker(id) {
-                                error!(
-                                    worker_id = id,
-                                    error = %e,
-                                    "failed to restart worker"
-                                );
+                            if let Err(e) = mgr.restart_worker(id) {
+                                error!(worker_id = id, error = %e, "failed to restart worker");
                             }
                         }
                         WorkerEvent::Crashed { id, pid, signal } => {
@@ -295,12 +402,8 @@ fn run_supervisor(cli: Cli) {
                                 signal = %signal,
                                 "worker crashed, restarting"
                             );
-                            if let Err(e) = manager.restart_worker(id) {
-                                error!(
-                                    worker_id = id,
-                                    error = %e,
-                                    "failed to restart crashed worker"
-                                );
+                            if let Err(e) = mgr.restart_worker(id) {
+                                error!(worker_id = id, error = %e, "failed to restart crashed worker");
                             }
                         }
                     }
@@ -311,8 +414,8 @@ fn run_supervisor(cli: Cli) {
         // Wait for shutdown signal
         shutdown_signal().await;
 
-        info!("supervisor shutting down, sending SIGTERM to workers");
-        // manager is moved into the monitor task; we'll just abort tasks
+        info!("supervisor shutting down");
+        manager.lock().unwrap().shutdown_all();
         api_handle.abort();
         monitor_handle.abort();
     });
@@ -324,6 +427,7 @@ fn run_supervisor(cli: Cli) {
 
 #[cfg(unix)]
 fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
+    use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_core::server::Fds;
     use lorica_worker::fd_passing;
 
@@ -337,9 +441,6 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
             std::process::exit(1);
         }
     };
-
-    // Close the command FD - no longer needed (command channel comes in Story 2.2)
-    unsafe { fd_passing::close_fd(cmd_fd) };
 
     info!(
         worker_id = id,
@@ -381,6 +482,79 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
         }
     });
 
+    // Start the command channel listener in a background thread
+    // (the proxy server's run_forever blocks the main thread)
+    let cmd_store = Arc::clone(&store);
+    let cmd_config = Arc::clone(&proxy_config);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create command channel runtime");
+        rt.block_on(async move {
+            // Create the command channel from the socketpair FD
+            let mut channel = match unsafe { CommandChannel::from_raw_fd(cmd_fd) } {
+                Ok(ch) => ch,
+                Err(e) => {
+                    error!(error = %e, "worker failed to create command channel");
+                    return;
+                }
+            };
+            // Worker recv timeout must be longer than supervisor heartbeat interval
+            channel.set_timeout(std::time::Duration::from_secs(30));
+
+            info!(worker_id = id, "command channel listener started");
+
+            loop {
+                let cmd: Command = match channel.recv().await {
+                    Ok(cmd) => cmd,
+                    Err(e) => {
+                        warn!(worker_id = id, error = %e, "command channel recv error");
+                        // Channel closed - supervisor probably shut down
+                        break;
+                    }
+                };
+
+                match cmd.typed_command() {
+                    CommandType::ConfigReload => {
+                        info!(worker_id = id, seq = cmd.sequence, "applying config reload");
+                        match reload_proxy_config(&cmd_store, &cmd_config).await {
+                            Ok(()) => {
+                                let resp = Response::ok(cmd.sequence);
+                                if let Err(e) = channel.send(&resp).await {
+                                    warn!(error = %e, "failed to send response");
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    worker_id = id,
+                                    error = %e,
+                                    "config reload failed"
+                                );
+                                let resp = Response::error(cmd.sequence, e.to_string());
+                                if let Err(e) = channel.send(&resp).await {
+                                    warn!(error = %e, "failed to send error response");
+                                }
+                            }
+                        }
+                    }
+                    CommandType::Heartbeat => {
+                        let resp = Response::ok(cmd.sequence);
+                        if let Err(e) = channel.send(&resp).await {
+                            warn!(error = %e, "failed to send heartbeat response");
+                        }
+                    }
+                    CommandType::Shutdown => {
+                        info!(worker_id = id, "received shutdown command");
+                        let resp = Response::ok(cmd.sequence);
+                        let _ = channel.send(&resp).await;
+                        std::process::exit(0);
+                    }
+                    CommandType::Unspecified => {
+                        warn!(worker_id = id, "received unspecified command");
+                    }
+                }
+            }
+        });
+    });
+
     // Build the proxy service
     let lorica_proxy = LoricaProxy::new(
         Arc::clone(&proxy_config),
@@ -391,15 +565,12 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
 
-    // Register the received listener addresses
-    // The lorica-core framework will look up the FDs from the Fds table
     for addr in &listener_addrs {
         proxy_service.add_tcp(addr);
     }
 
     info!(worker_id = id, "starting proxy engine");
 
-    // Create the server and inject pre-received FDs
     let mut server =
         lorica_core::server::Server::new(None).expect("failed to create proxy server");
     server.set_listen_fds(fds);
