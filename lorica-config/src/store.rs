@@ -740,6 +740,11 @@ impl ConfigStore {
                         ConfigError::Validation("invalid cert_critical_days".into())
                     })?;
                 }
+                "default_topology_type" => {
+                    settings.default_topology_type = value.parse().map_err(|_| {
+                        ConfigError::Validation("invalid default_topology_type".into())
+                    })?;
+                }
                 _ => {}
             }
         }
@@ -767,6 +772,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_critical_days', ?1)",
             params![settings.cert_critical_days.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('default_topology_type', ?1)",
+            params![settings.default_topology_type.as_str()],
         )?;
         Ok(())
     }

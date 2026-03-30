@@ -198,6 +198,7 @@ export interface GlobalSettingsResponse {
   default_health_check_interval_s: number;
   cert_warning_days: number;
   cert_critical_days: number;
+  default_topology_type: string;
 }
 
 export interface UpdateSettingsRequest {
@@ -206,6 +207,7 @@ export interface UpdateSettingsRequest {
   default_health_check_interval_s?: number;
   cert_warning_days?: number;
   cert_critical_days?: number;
+  default_topology_type?: string;
 }
 
 export interface NotificationConfigResponse {

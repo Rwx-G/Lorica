@@ -24,6 +24,7 @@ pub struct UpdateSettingsRequest {
     pub default_health_check_interval_s: Option<i32>,
     pub cert_warning_days: Option<i32>,
     pub cert_critical_days: Option<i32>,
+    pub default_topology_type: Option<String>,
 }
 
 /// PUT /api/v1/settings
@@ -69,6 +70,11 @@ pub async fn update_settings(
             ));
         }
         settings.cert_critical_days = days;
+    }
+    if let Some(ref topo) = body.default_topology_type {
+        settings.default_topology_type = topo
+            .parse::<lorica_config::models::TopologyType>()
+            .map_err(ApiError::BadRequest)?;
     }
 
     store.update_global_settings(&settings)?;

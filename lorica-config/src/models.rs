@@ -309,6 +309,8 @@ pub struct GlobalSettings {
     pub cert_warning_days: i32,
     #[serde(default = "default_cert_critical_days")]
     pub cert_critical_days: i32,
+    #[serde(default = "default_topology_type")]
+    pub default_topology_type: TopologyType,
 }
 
 fn default_cert_warning_days() -> i32 {
@@ -319,6 +321,10 @@ fn default_cert_critical_days() -> i32 {
     7
 }
 
+fn default_topology_type() -> TopologyType {
+    TopologyType::SingleVm
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
@@ -327,6 +333,7 @@ impl Default for GlobalSettings {
             default_health_check_interval_s: 10,
             cert_warning_days: 30,
             cert_critical_days: 7,
+            default_topology_type: TopologyType::SingleVm,
         }
     }
 }

@@ -11,7 +11,7 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7 });
+  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, default_topology_type: 'single_vm' });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -328,6 +328,16 @@
         <div class="form-row">
           <label for="cert-crit">Certificate Critical Threshold (days)</label>
           <input id="cert-crit" type="number" bind:value={settingsForm.cert_critical_days} min="1" max="365" />
+        </div>
+        <div class="form-row">
+          <label for="default-topo">Default Topology Type</label>
+          <select id="default-topo" bind:value={settingsForm.default_topology_type}>
+            <option value="single_vm">Single VM (passive only)</option>
+            <option value="ha">High Availability (active probes)</option>
+            <option value="docker_swarm">Docker Swarm</option>
+            <option value="kubernetes">Kubernetes</option>
+            <option value="custom">Custom</option>
+          </select>
         </div>
         {#if settingsError}
           <div class="form-error">{settingsError}</div>
