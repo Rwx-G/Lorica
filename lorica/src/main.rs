@@ -657,6 +657,33 @@ fn run_single_process(cli: Cli) {
             std::process::exit(1);
         }
 
+        // Build the CertResolver for SNI-based certificate selection
+        let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
+        {
+            let s = store.lock().await;
+            let db_certs = s.list_certificates().unwrap_or_default();
+            if !db_certs.is_empty() {
+                let cert_data: Vec<lorica_tls::cert_resolver::CertData> = db_certs
+                    .iter()
+                    .map(|c| lorica_tls::cert_resolver::CertData {
+                        domain: c.domain.clone(),
+                        san_domains: c.san_domains.clone(),
+                        cert_pem: c.cert_pem.clone(),
+                        key_pem: c.key_pem.clone(),
+                        not_after_epoch: c.not_after.timestamp(),
+                    })
+                    .collect();
+                if let Err(e) = cert_resolver.reload(cert_data) {
+                    warn!(error = %e, "failed to load certificates into resolver");
+                } else {
+                    info!(
+                        domains = cert_resolver.domain_count(),
+                        "loaded certificates into SNI resolver"
+                    );
+                }
+            }
+        }
+
         // Start the HTTP proxy service
         let lorica_proxy = LoricaProxy::new(
             Arc::clone(&proxy_config),
@@ -669,42 +696,18 @@ fn run_single_process(cli: Cli) {
 
         info!(port = cli.http_port, "HTTP proxy listener configured");
 
-        // Add TLS listener if any certificates are available
-        let tls_dir = data_dir.join("tls");
+        // Add TLS listener with SNI-based cert resolver (no cert files on disk)
         let https_port = cli.https_port;
-        {
-            let s = store.lock().await;
-            let certs = s.list_certificates().unwrap_or_default();
-            if let Some(cert) = certs.first() {
-                if let Err(e) = std::fs::create_dir_all(&tls_dir) {
-                    warn!(error = %e, "failed to create TLS directory");
-                } else {
-                    let cert_path = tls_dir.join("server.crt");
-                    let key_path = tls_dir.join("server.key");
-                    if std::fs::write(&cert_path, &cert.cert_pem).is_ok()
-                        && std::fs::write(&key_path, &cert.key_pem).is_ok()
-                        && restrict_key_permissions(&key_path)
-                    {
-                        match lorica_core::listeners::tls::TlsSettings::intermediate(
-                            cert_path.to_str().unwrap(),
-                            key_path.to_str().unwrap(),
-                        ) {
-                            Ok(mut tls_settings) => {
-                                tls_settings.enable_h2();
-                                proxy_service.add_tls_with_settings(
-                                    &format!("0.0.0.0:{https_port}"),
-                                    None,
-                                    tls_settings,
-                                );
-                                info!(port = https_port, domain = %cert.domain, "HTTPS proxy listener configured");
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "failed to create TLS settings");
-                            }
-                        }
-                    }
-                }
-            }
+        if cert_resolver.domain_count() > 0 {
+            let mut tls_settings =
+                lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
+            tls_settings.enable_h2();
+            proxy_service.add_tls_with_settings(
+                &format!("0.0.0.0:{https_port}"),
+                None,
+                tls_settings,
+            );
+            info!(port = https_port, "HTTPS proxy listener configured with SNI resolver");
         }
 
         // Create config reload channel so API mutations can trigger proxy reload
@@ -775,9 +778,6 @@ fn run_single_process(cli: Cli) {
 
         api_handle.abort();
         health_handle.abort();
-
-        // Clean up TLS key material from disk
-        cleanup_tls_files(&tls_dir);
     });
 }
 
