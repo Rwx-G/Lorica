@@ -60,7 +60,12 @@ pub fn send_listener_fds(
     fds: &[RawFd],
     addrs: &[String],
 ) -> Result<(), WorkerError> {
-    assert_eq!(fds.len(), addrs.len(), "FD and address count mismatch");
+    if fds.len() != addrs.len() {
+        return Err(WorkerError::FdAddrMismatch {
+            fds: fds.len(),
+            addrs: addrs.len(),
+        });
+    }
 
     let payload = addrs.join(" ");
     let iov = [IoSlice::new(payload.as_bytes())];
