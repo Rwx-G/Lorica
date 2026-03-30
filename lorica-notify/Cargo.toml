@@ -1,0 +1,15 @@
+[package]
+name = "lorica-notify"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+tracing = "0.1"
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+thiserror = "2"
