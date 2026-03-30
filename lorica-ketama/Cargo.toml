@@ -2,7 +2,7 @@
 name = "lorica-ketama"
 version = "0.1.0"
 description = "Rust port of the nginx consistent hash function"
-authors = ["Romain G."]
+authors = ["Rwx-G"]
 # Original author: Pingora Team <pingora@cloudflare.com> (Cloudflare Pingora)
 license = "Apache-2.0"
 edition = "2021"

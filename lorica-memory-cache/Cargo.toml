@@ -1,7 +1,7 @@
 [package]
 name = "lorica-memory-cache"
 version = "0.1.0"
-authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
 repository = "https://github.com/Rwx-G/Lorica"
