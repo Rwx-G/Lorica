@@ -168,7 +168,10 @@ fn main() {
 fn run_supervisor(cli: Cli) {
     use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_worker::manager::{WorkerConfig, WorkerEvent, WorkerManager};
+    use std::os::fd::{IntoRawFd, RawFd};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    use tokio::sync::broadcast;
 
     let worker_count = if cli.workers == 0 {
         WorkerConfig::default_worker_count()
@@ -196,17 +199,27 @@ fn run_supervisor(cli: Cli) {
         "all workers spawned, starting supervisor services"
     );
 
+    // Extract raw FDs from worker handles before entering the tokio runtime.
+    // CommandChannel::from_raw_fd requires a tokio runtime, so we take the raw FDs
+    // here and create channels inside block_on.
+    let worker_fds: Vec<(u32, RawFd)> = manager
+        .workers_mut()
+        .iter_mut()
+        .filter_map(|w| {
+            let fd = w.take_cmd_fd()?;
+            Some((w.id(), fd.into_raw_fd()))
+        })
+        .collect();
+
     // Now start the async runtime for API server + worker monitoring
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async move {
-        // Ensure data directory exists
         let data_dir = PathBuf::from(&cli.data_dir);
         if let Err(e) = std::fs::create_dir_all(&data_dir) {
             error!(error = %e, path = %data_dir.display(), "failed to create data directory");
             std::process::exit(1);
         }
 
-        // Open the configuration database
         let db_path = data_dir.join("lorica.db");
         let store = match ConfigStore::open(&db_path, None) {
             Ok(s) => s,
@@ -216,7 +229,6 @@ fn run_supervisor(cli: Cli) {
             }
         };
 
-        // Ensure an admin user exists
         match lorica_api::auth::ensure_admin_user(&store) {
             Ok(Some(password)) => {
                 println!();
@@ -239,114 +251,88 @@ fn run_supervisor(cli: Cli) {
         let log_buffer = Arc::new(LogBuffer::new(10_000));
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        // Create config reload channel - API mutations trigger config dispatch to workers
+        // Broadcast channel: API config changes fan out to all per-worker tasks
+        let (reload_bc_tx, _) = broadcast::channel::<u64>(16);
+        // Clone for the API's watch-based reload signal
+        let reload_bc_tx_clone = reload_bc_tx.clone();
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
 
-        // Build command channels from worker socketpair FDs
-        let cmd_channels: Vec<(u32, CommandChannel)> = manager
-            .workers()
-            .iter()
-            .filter_map(|w| {
-                let fd = w.cmd_fd();
-                // Duplicate the FD so we don't take ownership from the WorkerHandle
-                let dup_fd = nix::unistd::dup(fd).ok()?;
-                let ch = unsafe { CommandChannel::from_raw_fd(dup_fd).ok()? };
-                Some((w.id(), ch))
-            })
-            .collect();
-
-        let cmd_channels = Arc::new(tokio::sync::Mutex::new(cmd_channels));
+        // Bridge: watch channel (from API) -> broadcast (to per-worker tasks)
         let sequence = Arc::new(AtomicU64::new(1));
-
-        // Background task: dispatch config reload to workers when API signals a change
-        let dispatch_channels = Arc::clone(&cmd_channels);
-        let dispatch_seq = Arc::clone(&sequence);
-        let _dispatch_handle = tokio::spawn(async move {
+        let bridge_seq = Arc::clone(&sequence);
+        tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
-                let seq = dispatch_seq.fetch_add(1, Ordering::Relaxed);
-                let cmd = Command::new(CommandType::ConfigReload, seq);
+                let seq = bridge_seq.fetch_add(1, Ordering::Relaxed);
+                let _ = reload_bc_tx_clone.send(seq);
+            }
+        });
 
-                let mut channels = dispatch_channels.lock().await;
-                for (worker_id, ch) in channels.iter_mut() {
-                    if let Err(e) = ch.send(&cmd).await {
-                        warn!(
-                            worker_id = *worker_id,
-                            error = %e,
-                            "failed to send ConfigReload to worker"
-                        );
-                        continue;
-                    }
+        // Spawn a per-worker task that handles both config reload and heartbeat
+        // No shared Mutex - each worker has its own channel and task
+        for (worker_id, raw_fd) in worker_fds {
+            let mut channel = match unsafe { CommandChannel::from_raw_fd(raw_fd) } {
+                Ok(ch) => ch,
+                Err(e) => {
+                    error!(worker_id, error = %e, "failed to create command channel");
+                    continue;
+                }
+            };
+            let mut reload_rx = reload_bc_tx.subscribe();
+            let hb_seq = Arc::clone(&sequence);
 
-                    match ch.recv::<Response>().await {
-                        Ok(resp) => {
-                            let status = resp.typed_status();
-                            match status {
-                                lorica_command::ResponseStatus::Ok => {
-                                    info!(worker_id = *worker_id, "worker applied config reload");
-                                }
-                                lorica_command::ResponseStatus::Error => {
-                                    error!(
-                                        worker_id = *worker_id,
-                                        message = %resp.message,
-                                        "worker failed to apply config reload"
-                                    );
-                                }
-                                lorica_command::ResponseStatus::Processing => {
-                                    info!(
-                                        worker_id = *worker_id,
-                                        message = %resp.message,
-                                        "worker processing config reload"
-                                    );
-                                }
-                                _ => {}
+            tokio::spawn(async move {
+                let heartbeat_interval = Duration::from_secs(5);
+                let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
+                heartbeat_timer.tick().await; // skip first immediate tick
+
+                loop {
+                    tokio::select! {
+                        // Config reload triggered by API
+                        Ok(seq) = reload_rx.recv() => {
+                            let cmd = Command::new(CommandType::ConfigReload, seq);
+                            if let Err(e) = channel.send(&cmd).await {
+                                warn!(worker_id, error = %e, "config reload send failed");
+                                continue;
+                            }
+                            match channel.recv::<Response>().await {
+                                Ok(resp) => match resp.typed_status() {
+                                    lorica_command::ResponseStatus::Ok => {
+                                        info!(worker_id, seq, "worker applied config reload");
+                                    }
+                                    lorica_command::ResponseStatus::Error => {
+                                        error!(worker_id, message = %resp.message, "worker config reload failed");
+                                    }
+                                    lorica_command::ResponseStatus::Processing => {
+                                        info!(worker_id, message = %resp.message, "worker processing config reload");
+                                    }
+                                    _ => {}
+                                },
+                                Err(e) => warn!(worker_id, error = %e, "config reload response failed"),
                             }
                         }
-                        Err(e) => {
-                            warn!(
-                                worker_id = *worker_id,
-                                error = %e,
-                                "failed to receive response from worker"
-                            );
+                        // Periodic heartbeat
+                        _ = heartbeat_timer.tick() => {
+                            let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                            let cmd = Command::new(CommandType::Heartbeat, seq);
+                            let start = Instant::now();
+                            if let Err(e) = channel.send(&cmd).await {
+                                warn!(worker_id, error = %e, "heartbeat send failed");
+                                continue;
+                            }
+                            match channel.recv::<Response>().await {
+                                Ok(_) => {
+                                    let latency_ms = start.elapsed().as_millis() as u64;
+                                    info!(worker_id, latency_ms, "heartbeat ok");
+                                }
+                                Err(e) => {
+                                    warn!(worker_id, error = %e, "heartbeat response failed - worker may be unresponsive");
+                                }
+                            }
                         }
                     }
                 }
-            }
-        });
-
-        // Background task: heartbeat health monitoring
-        let heartbeat_channels = Arc::clone(&cmd_channels);
-        let heartbeat_seq = Arc::clone(&sequence);
-        let _heartbeat_handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-                let seq = heartbeat_seq.fetch_add(1, Ordering::Relaxed);
-                let cmd = Command::new(CommandType::Heartbeat, seq);
-
-                let mut channels = heartbeat_channels.lock().await;
-                for (worker_id, ch) in channels.iter_mut() {
-                    if let Err(e) = ch.send(&cmd).await {
-                        warn!(
-                            worker_id = *worker_id,
-                            error = %e,
-                            "heartbeat failed - worker may be unresponsive"
-                        );
-                        continue;
-                    }
-
-                    match ch.recv::<Response>().await {
-                        Ok(_) => {} // Worker is alive
-                        Err(e) => {
-                            warn!(
-                                worker_id = *worker_id,
-                                error = %e,
-                                "heartbeat response failed - worker may be unresponsive"
-                            );
-                        }
-                    }
-                }
-            }
-        });
+            });
+        }
 
         // Start API server
         let api_store = Arc::clone(&store);
@@ -373,38 +359,77 @@ fn run_supervisor(cli: Cli) {
             }
         });
 
-        // Worker monitoring loop (crash detection and restart)
+        // Worker monitoring loop (crash detection and restart with backoff)
         let manager = Arc::new(std::sync::Mutex::new(manager));
         let monitor_mgr = Arc::clone(&manager);
+        let monitor_reload_tx = reload_bc_tx.clone();
+        let monitor_seq = Arc::clone(&sequence);
         let monitor_handle = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
 
                 let mut mgr = monitor_mgr.lock().unwrap();
                 let events = mgr.check_workers();
                 for event in events {
-                    match event {
+                    let (id, log_msg) = match event {
                         WorkerEvent::Exited { id, pid, status } => {
-                            warn!(
-                                worker_id = id,
-                                pid = pid.as_raw(),
-                                status = status,
-                                "worker exited, restarting"
-                            );
-                            if let Err(e) = mgr.restart_worker(id) {
-                                error!(worker_id = id, error = %e, "failed to restart worker");
-                            }
+                            warn!(worker_id = id, pid = pid.as_raw(), status, "worker exited");
+                            (id, "exited")
                         }
                         WorkerEvent::Crashed { id, pid, signal } => {
-                            error!(
-                                worker_id = id,
-                                pid = pid.as_raw(),
-                                signal = %signal,
-                                "worker crashed, restarting"
-                            );
-                            if let Err(e) = mgr.restart_worker(id) {
-                                error!(worker_id = id, error = %e, "failed to restart crashed worker");
+                            error!(worker_id = id, pid = pid.as_raw(), signal = %signal, "worker crashed");
+                            (id, "crashed")
+                        }
+                    };
+
+                    match mgr.restart_worker(id) {
+                        Ok(Some(new_fd)) => {
+                            // Spawn a new per-worker channel task for the restarted worker
+                            info!(worker_id = id, reason = log_msg, "worker restarted, reconnecting channel");
+                            match unsafe { CommandChannel::from_raw_fd(new_fd.into_raw_fd()) } {
+                                Ok(mut channel) => {
+                                    let mut rx = monitor_reload_tx.subscribe();
+                                    let seq = Arc::clone(&monitor_seq);
+                                    tokio::spawn(async move {
+                                        let mut timer = tokio::time::interval(Duration::from_secs(5));
+                                        timer.tick().await;
+                                        loop {
+                                            tokio::select! {
+                                                Ok(s) = rx.recv() => {
+                                                    let cmd = Command::new(CommandType::ConfigReload, s);
+                                                    if channel.send(&cmd).await.is_ok() {
+                                                        if let Ok(r) = channel.recv::<Response>().await {
+                                                            match r.typed_status() {
+                                                                lorica_command::ResponseStatus::Ok => info!(worker_id = id, "restarted worker applied config reload"),
+                                                                lorica_command::ResponseStatus::Error => error!(worker_id = id, message = %r.message, "restarted worker config reload failed"),
+                                                                _ => {}
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                _ = timer.tick() => {
+                                                    let s = seq.fetch_add(1, Ordering::Relaxed);
+                                                    let cmd = Command::new(CommandType::Heartbeat, s);
+                                                    let start = Instant::now();
+                                                    if channel.send(&cmd).await.is_ok() {
+                                                        match channel.recv::<Response>().await {
+                                                            Ok(_) => info!(worker_id = id, latency_ms = start.elapsed().as_millis() as u64, "heartbeat ok"),
+                                                            Err(e) => warn!(worker_id = id, error = %e, "heartbeat failed"),
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(e) => error!(worker_id = id, error = %e, "failed to create channel for restarted worker"),
                             }
+                        }
+                        Ok(None) => {
+                            warn!(worker_id = id, "restarted worker has no command channel");
+                        }
+                        Err(e) => {
+                            error!(worker_id = id, error = %e, "failed to restart worker");
                         }
                     }
                 }
@@ -415,6 +440,7 @@ fn run_supervisor(cli: Cli) {
         shutdown_signal().await;
 
         info!("supervisor shutting down");
+        // Explicit SIGTERM to all workers before exiting
         manager.lock().unwrap().shutdown_all();
         api_handle.abort();
         monitor_handle.abort();

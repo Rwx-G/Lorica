@@ -22,6 +22,7 @@
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::time::{Duration, Instant};
 
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -30,6 +31,12 @@ use tracing::{info, warn};
 
 use crate::fd_passing;
 use crate::WorkerError;
+
+/// Maximum backoff delay between restarts.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// If a worker runs longer than this, its restart counter resets.
+const STABLE_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// Configuration for the worker pool.
 #[derive(Debug, Clone)]
@@ -69,7 +76,12 @@ pub struct WorkerHandle {
     id: u32,
     pid: Pid,
     /// Supervisor end of the command channel socketpair.
-    cmd_fd: OwnedFd,
+    /// `None` after the FD has been taken via [`take_cmd_fd`].
+    cmd_fd: Option<OwnedFd>,
+    /// When this worker was last spawned (for backoff calculation).
+    spawned_at: Instant,
+    /// Consecutive restart count (resets after stable run).
+    restart_count: u32,
 }
 
 impl WorkerHandle {
@@ -83,9 +95,10 @@ impl WorkerHandle {
         self.pid
     }
 
-    /// Get the raw FD for the command channel (supervisor end).
-    pub fn cmd_fd(&self) -> RawFd {
-        self.cmd_fd.as_raw_fd()
+    /// Take ownership of the command channel FD.
+    /// Returns `None` if already taken.
+    pub fn take_cmd_fd(&mut self) -> Option<OwnedFd> {
+        self.cmd_fd.take()
     }
 }
 
@@ -124,7 +137,7 @@ impl WorkerManager {
         );
 
         for id in 0..self.config.worker_count {
-            self.spawn_worker(id as u32)?;
+            self.spawn_worker(id as u32, 0)?;
         }
 
         Ok(())
@@ -148,7 +161,7 @@ impl WorkerManager {
     }
 
     /// Fork+exec a single worker process and send it the listening FDs.
-    fn spawn_worker(&mut self, id: u32) -> Result<(), WorkerError> {
+    fn spawn_worker(&mut self, id: u32, restart_count: u32) -> Result<(), WorkerError> {
         let (supervisor_fd, worker_fd) = fd_passing::create_socketpair()?;
 
         match unsafe { fork() }.map_err(WorkerError::Fork)? {
@@ -167,7 +180,9 @@ impl WorkerManager {
                 self.workers.push(WorkerHandle {
                     id,
                     pid: child,
-                    cmd_fd: supervisor_fd,
+                    cmd_fd: Some(supervisor_fd),
+                    spawned_at: Instant::now(),
+                    restart_count,
                 });
 
                 Ok(())
@@ -180,7 +195,7 @@ impl WorkerManager {
                 let cmd_fd_raw = worker_fd.into_raw_fd();
                 fd_passing::clear_cloexec(cmd_fd_raw)?;
 
-                // Build exec arguments: lorica worker --id N --cmd-fd F --data-dir D --log-level L
+                // Build exec arguments
                 let exe = std::env::current_exe().map_err(WorkerError::CurrentExe)?;
                 let exe_str = exe.to_string_lossy().to_string();
 
@@ -206,16 +221,12 @@ impl WorkerManager {
                 let exe_cstr = CString::new(exe_str).expect("CString conversion failed");
                 execv(&exe_cstr, &c_arg_refs).map_err(WorkerError::Exec)?;
 
-                // execv never returns on success
                 unreachable!()
             }
         }
     }
 
     /// Non-blocking check for worker process status changes.
-    ///
-    /// Returns a list of events for workers that have exited or crashed.
-    /// Does not remove workers from the internal list - call [`restart_worker`] for that.
     pub fn check_workers(&self) -> Vec<WorkerEvent> {
         let mut events = Vec::new();
 
@@ -237,7 +248,6 @@ impl WorkerManager {
                 }
                 Ok(WaitStatus::StillAlive) | Ok(_) => {}
                 Err(nix::Error::ECHILD) => {
-                    // Process already reaped
                     events.push(WorkerEvent::Exited {
                         id: handle.id,
                         pid: handle.pid,
@@ -258,23 +268,77 @@ impl WorkerManager {
         events
     }
 
-    /// Restart a worker by removing the old handle and spawning a new process.
-    pub fn restart_worker(&mut self, id: u32) -> Result<(), WorkerError> {
+    /// Restart a worker with exponential backoff.
+    ///
+    /// If the worker ran for less than [`STABLE_THRESHOLD`], the restart counter
+    /// increments and a delay of `min(2^count, 30)` seconds is applied.
+    /// If it ran long enough, the counter resets.
+    ///
+    /// Returns the new worker's command channel FD (for re-registering in the
+    /// supervisor's channel map).
+    pub fn restart_worker(&mut self, id: u32) -> Result<Option<OwnedFd>, WorkerError> {
+        // Retrieve the old handle's backoff state
+        let (prev_restart_count, prev_spawned_at) = self
+            .workers
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| (w.restart_count, w.spawned_at))
+            .unwrap_or((0, Instant::now()));
+
         self.workers.retain(|w| w.id != id);
-        info!(worker_id = id, "restarting worker");
-        self.spawn_worker(id)
+
+        // Reset counter if the worker was stable, otherwise increment
+        let next_count = if prev_spawned_at.elapsed() >= STABLE_THRESHOLD {
+            0
+        } else {
+            prev_restart_count + 1
+        };
+
+        // Apply exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s, ...
+        if next_count > 0 {
+            let delay_secs = (1u64 << (next_count - 1).min(5)).min(MAX_BACKOFF.as_secs());
+            let delay = Duration::from_secs(delay_secs);
+            warn!(
+                worker_id = id,
+                restart_count = next_count,
+                backoff_secs = delay_secs,
+                "applying restart backoff"
+            );
+            std::thread::sleep(delay);
+        }
+
+        info!(worker_id = id, restart_count = next_count, "restarting worker");
+        self.spawn_worker(id, next_count)?;
+
+        // Return the cmd_fd of the newly spawned worker
+        let fd = self
+            .workers
+            .iter_mut()
+            .find(|w| w.id == id)
+            .and_then(|w| w.take_cmd_fd());
+        Ok(fd)
     }
 
     /// Send SIGTERM to all workers for graceful shutdown.
     pub fn shutdown_all(&self) {
+        info!("sending SIGTERM to all workers");
         for handle in &self.workers {
-            if let Err(e) = signal::kill(handle.pid, Signal::SIGTERM) {
-                warn!(
-                    worker_id = handle.id,
-                    pid = handle.pid.as_raw(),
-                    error = %e,
-                    "failed to send SIGTERM to worker"
-                );
+            match signal::kill(handle.pid, Signal::SIGTERM) {
+                Ok(()) => {
+                    info!(
+                        worker_id = handle.id,
+                        pid = handle.pid.as_raw(),
+                        "sent SIGTERM to worker"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        worker_id = handle.id,
+                        pid = handle.pid.as_raw(),
+                        error = %e,
+                        "failed to send SIGTERM to worker"
+                    );
+                }
             }
         }
     }
@@ -290,7 +354,6 @@ impl WorkerManager {
     }
 
     /// Take ownership of the worker handles (for passing to async tasks).
-    /// After this call, the manager no longer tracks workers.
     pub fn take_workers(&mut self) -> Vec<WorkerHandle> {
         std::mem::take(&mut self.workers)
     }
@@ -299,11 +362,15 @@ impl WorkerManager {
     pub fn workers(&self) -> &[WorkerHandle] {
         &self.workers
     }
+
+    /// Get mutable access to worker handles (e.g. to take cmd_fds).
+    pub fn workers_mut(&mut self) -> &mut [WorkerHandle] {
+        &mut self.workers
+    }
 }
 
 impl Drop for WorkerManager {
     fn drop(&mut self) {
-        // Clean up listening socket FDs owned by the supervisor
         for &fd in &self.listen_fds {
             unsafe { fd_passing::close_fd(fd) };
         }
@@ -376,5 +443,18 @@ mod tests {
         let mgr = WorkerManager::new(config);
         let events = mgr.check_workers();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_backoff_calculation() {
+        // Verify that the backoff formula produces correct delays
+        // 2^0=1, 2^1=2, 2^2=4, 2^3=8, 2^4=16, 2^5=32->capped to 30
+        assert_eq!((1u64 << 0u32.min(5)).min(30), 1);
+        assert_eq!((1u64 << 1u32.min(5)).min(30), 2);
+        assert_eq!((1u64 << 2u32.min(5)).min(30), 4);
+        assert_eq!((1u64 << 3u32.min(5)).min(30), 8);
+        assert_eq!((1u64 << 4u32.min(5)).min(30), 16);
+        assert_eq!((1u64 << 5u32.min(5)).min(30), 30);
+        assert_eq!((1u64 << 6u32.min(5)).min(30), 30);
     }
 }
