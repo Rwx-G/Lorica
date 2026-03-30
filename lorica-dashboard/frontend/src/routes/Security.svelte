@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type WafEvent, type WafCategoryCount } from '../lib/api';
+  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary } from '../lib/api';
 
   let events: WafEvent[] = $state([]);
   let stats: { total_events: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
@@ -8,16 +8,20 @@
     rule_count: 0,
     by_category: [],
   });
+  let rules: WafRuleSummary[] = $state([]);
+  let rulesEnabled = $state(0);
   let loading = $state(true);
   let error = $state('');
   let filterCategory = $state('');
+  let activeTab: 'events' | 'rules' = $state('events');
 
   async function loadData() {
     loading = true;
     error = '';
-    const [eventsRes, statsRes] = await Promise.all([
+    const [eventsRes, statsRes, rulesRes] = await Promise.all([
       api.getWafEvents({ limit: 100, category: filterCategory || undefined }),
       api.getWafStats(),
+      api.getWafRules(),
     ]);
 
     if (eventsRes.error) {
@@ -28,6 +32,11 @@
 
     if (statsRes.data) {
       stats = statsRes.data;
+    }
+
+    if (rulesRes.data) {
+      rules = rulesRes.data.rules;
+      rulesEnabled = rulesRes.data.enabled;
     }
 
     loading = false;
@@ -42,6 +51,11 @@
 
   function handleFilterChange() {
     loadData();
+  }
+
+  async function toggleRule(ruleId: number, enabled: boolean) {
+    await api.toggleWafRule(ruleId, enabled);
+    await loadData();
   }
 
   function severityClass(s: number): string {
@@ -77,7 +91,7 @@
     <h1>Security</h1>
     <div class="header-actions">
       <button class="btn btn-secondary" onclick={loadData}>Refresh</button>
-      {#if events.length > 0}
+      {#if activeTab === 'events' && events.length > 0}
         <button class="btn btn-danger" onclick={handleClear}>Clear Events</button>
       {/if}
     </div>
@@ -90,8 +104,8 @@
   <!-- Stats cards -->
   <div class="stats-grid">
     <div class="stat-card">
-      <div class="stat-value">{stats.rule_count}</div>
-      <div class="stat-label">Active Rules</div>
+      <div class="stat-value">{rulesEnabled}/{stats.rule_count}</div>
+      <div class="stat-label">Rules Enabled</div>
     </div>
     <div class="stat-card">
       <div class="stat-value">{stats.total_events}</div>
@@ -105,56 +119,99 @@
     {/each}
   </div>
 
-  <!-- Filter -->
-  <div class="filter-bar">
-    <label for="cat-filter">Filter by category:</label>
-    <select id="cat-filter" bind:value={filterCategory} onchange={handleFilterChange}>
-      <option value="">All categories</option>
-      <option value="sql_injection">SQL Injection</option>
-      <option value="xss">XSS</option>
-      <option value="path_traversal">Path Traversal</option>
-      <option value="command_injection">Command Injection</option>
-      <option value="protocol_violation">Protocol Violation</option>
-    </select>
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab" class:active={activeTab === 'events'} onclick={() => activeTab = 'events'}>Events</button>
+    <button class="tab" class:active={activeTab === 'rules'} onclick={() => activeTab = 'rules'}>Rules</button>
   </div>
 
-  <!-- Events table -->
-  {#if loading}
-    <p class="loading">Loading...</p>
-  {:else if events.length === 0}
-    <div class="empty-state">
-      <p>No WAF events recorded.</p>
-      <p class="text-muted">Enable WAF on a route to start monitoring for attacks.</p>
+  {#if activeTab === 'events'}
+    <!-- Filter -->
+    <div class="filter-bar">
+      <label for="cat-filter">Filter by category:</label>
+      <select id="cat-filter" bind:value={filterCategory} onchange={handleFilterChange}>
+        <option value="">All categories</option>
+        <option value="sql_injection">SQL Injection</option>
+        <option value="xss">XSS</option>
+        <option value="path_traversal">Path Traversal</option>
+        <option value="command_injection">Command Injection</option>
+        <option value="protocol_violation">Protocol Violation</option>
+      </select>
     </div>
-  {:else}
-    <div class="table-wrapper">
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Rule</th>
-            <th>Category</th>
-            <th>Severity</th>
-            <th>Field</th>
-            <th>Matched</th>
-            <th>Description</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each events as event}
+
+    <!-- Events table -->
+    {#if loading}
+      <p class="loading">Loading...</p>
+    {:else if events.length === 0}
+      <div class="empty-state">
+        <p>No WAF events recorded.</p>
+        <p class="text-muted">Enable WAF on a route to start monitoring for attacks.</p>
+      </div>
+    {:else}
+      <div class="table-wrapper">
+        <table>
+          <thead>
             <tr>
-              <td class="mono">{formatTime(event.timestamp)}</td>
-              <td class="mono">{event.rule_id}</td>
-              <td><span class="category-badge">{categoryLabel(event.category)}</span></td>
-              <td><span class={severityClass(event.severity)}>{event.severity}/5</span></td>
-              <td class="mono">{event.matched_field}</td>
-              <td class="mono matched-value" title={event.matched_value}>{event.matched_value}</td>
-              <td>{event.description}</td>
+              <th>Time</th>
+              <th>Rule</th>
+              <th>Category</th>
+              <th>Severity</th>
+              <th>Field</th>
+              <th>Matched</th>
+              <th>Description</th>
             </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody>
+            {#each events as event}
+              <tr>
+                <td class="mono">{formatTime(event.timestamp)}</td>
+                <td class="mono">{event.rule_id}</td>
+                <td><span class="category-badge">{categoryLabel(event.category)}</span></td>
+                <td><span class={severityClass(event.severity)}>{event.severity}/5</span></td>
+                <td class="mono">{event.matched_field}</td>
+                <td class="mono matched-value" title={event.matched_value}>{event.matched_value}</td>
+                <td>{event.description}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  {:else}
+    <!-- Rules table -->
+    {#if loading}
+      <p class="loading">Loading...</p>
+    {:else}
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Category</th>
+              <th>Severity</th>
+              <th>Description</th>
+              <th>Enabled</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each rules as rule}
+              <tr class:disabled-rule={!rule.enabled}>
+                <td class="mono">{rule.id}</td>
+                <td><span class="category-badge">{categoryLabel(rule.category)}</span></td>
+                <td><span class={severityClass(rule.severity)}>{rule.severity}/5</span></td>
+                <td>{rule.description}</td>
+                <td>
+                  <label class="toggle">
+                    <input type="checkbox" checked={rule.enabled} onchange={() => toggleRule(rule.id, !rule.enabled)} />
+                    <span class="toggle-slider"></span>
+                  </label>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -213,6 +270,34 @@
     font-size: 0.75rem;
     color: var(--color-text-muted);
     margin-top: 0.25rem;
+  }
+
+  .tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .tab {
+    padding: 0.5rem 1.25rem;
+    border: none;
+    background: none;
+    color: var(--color-text-muted);
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+  }
+
+  .tab.active {
+    color: var(--color-text-heading);
+    border-bottom-color: var(--color-primary, #3b82f6);
+  }
+
+  .tab:hover {
+    color: var(--color-text);
   }
 
   .filter-bar {
@@ -284,6 +369,10 @@
     background: rgba(255, 255, 255, 0.02);
   }
 
+  .disabled-rule td {
+    opacity: 0.5;
+  }
+
   .mono {
     font-family: var(--mono);
     font-size: 0.75rem;
@@ -322,6 +411,51 @@
 
   .severity-low {
     color: var(--color-text-muted);
+  }
+
+  .toggle {
+    position: relative;
+    display: inline-block;
+    width: 36px;
+    height: 20px;
+    cursor: pointer;
+  }
+
+  .toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+
+  .toggle-slider {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: var(--color-border);
+    border-radius: 20px;
+    transition: background 0.2s;
+  }
+
+  .toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    left: 2px;
+    bottom: 2px;
+    background: white;
+    border-radius: 50%;
+    transition: transform 0.2s;
+  }
+
+  .toggle input:checked + .toggle-slider {
+    background: var(--color-green, #22c55e);
+  }
+
+  .toggle input:checked + .toggle-slider::before {
+    transform: translateX(16px);
   }
 
   .btn {

@@ -398,6 +398,12 @@ export const api = {
 
   clearWafEvents: () =>
     request<{ cleared: boolean }>('DELETE', '/waf/events'),
+
+  getWafRules: () =>
+    request<WafRulesResponse>('GET', '/waf/rules'),
+
+  toggleWafRule: (ruleId: number, enabled: boolean) =>
+    request<{ rule_id: number; enabled: boolean }>('PUT', `/waf/rules/${ruleId}`, { enabled }),
 };
 
 export interface WafEvent {
@@ -425,6 +431,20 @@ export interface WafStatsResponse {
   total_events: number;
   rule_count: number;
   by_category: WafCategoryCount[];
+}
+
+export interface WafRuleSummary {
+  id: number;
+  description: string;
+  category: string;
+  severity: number;
+  enabled: boolean;
+}
+
+export interface WafRulesResponse {
+  rules: WafRuleSummary[];
+  total: number;
+  enabled: number;
 }
 
 export interface WorkerStatus {

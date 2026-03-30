@@ -24,6 +24,7 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         config_reload_tx: None,
         worker_metrics: None,
         waf_event_buffer: None,
+        waf_engine: None,
         waf_rule_count: None,
     };
     let session_store = SessionStore::new();

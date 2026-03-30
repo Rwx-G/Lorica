@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -51,9 +51,20 @@ pub enum WafMode {
     Blocking,
 }
 
+/// Summary of a WAF rule for API exposure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleSummary {
+    pub id: u32,
+    pub description: String,
+    pub category: RuleCategory,
+    pub severity: u8,
+    pub enabled: bool,
+}
+
 /// WAF engine with precompiled rules and an event ring buffer.
 pub struct WafEngine {
     ruleset: RuleSet,
+    disabled_rules: RwLock<HashSet<u32>>,
     event_buffer: Arc<Mutex<VecDeque<WafEvent>>>,
     max_events: usize,
 }
@@ -63,6 +74,7 @@ impl WafEngine {
     pub fn new() -> Self {
         Self {
             ruleset: RuleSet::default_crs(),
+            disabled_rules: RwLock::new(HashSet::new()),
             event_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(500))),
             max_events: 500,
         }
@@ -73,9 +85,62 @@ impl WafEngine {
         Arc::clone(&self.event_buffer)
     }
 
-    /// Return the number of loaded rules.
+    /// Return the total number of rules in the ruleset.
     pub fn rule_count(&self) -> usize {
         self.ruleset.len()
+    }
+
+    /// Return the number of currently enabled rules.
+    pub fn enabled_rule_count(&self) -> usize {
+        let disabled = self.disabled_rules.read().unwrap();
+        self.ruleset.len() - disabled.len()
+    }
+
+    /// List all rules with their enabled/disabled status.
+    pub fn list_rules(&self) -> Vec<RuleSummary> {
+        let disabled = self.disabled_rules.read().unwrap();
+        self.ruleset
+            .rules()
+            .iter()
+            .map(|r| RuleSummary {
+                id: r.id,
+                description: r.description.to_string(),
+                category: r.category.clone(),
+                severity: r.severity,
+                enabled: !disabled.contains(&r.id),
+            })
+            .collect()
+    }
+
+    /// Disable a specific rule by ID. Returns false if rule ID not found.
+    pub fn disable_rule(&self, rule_id: u32) -> bool {
+        if self.ruleset.rules().iter().any(|r| r.id == rule_id) {
+            self.disabled_rules.write().unwrap().insert(rule_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Enable a previously disabled rule by ID. Returns false if rule ID not found.
+    pub fn enable_rule(&self, rule_id: u32) -> bool {
+        if self.ruleset.rules().iter().any(|r| r.id == rule_id) {
+            self.disabled_rules.write().unwrap().remove(&rule_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Bulk-set which rules are disabled.
+    pub fn set_disabled_rules(&self, rule_ids: &[u32]) {
+        let mut disabled = self.disabled_rules.write().unwrap();
+        disabled.clear();
+        for &id in rule_ids {
+            if self.ruleset.rules().iter().any(|r| r.id == id) {
+                disabled.insert(id);
+            }
+        }
     }
 
     /// Evaluate a request against the WAF ruleset.
@@ -161,9 +226,13 @@ impl WafEngine {
         }
     }
 
-    /// Scan a single field against all rules.
+    /// Scan a single field against all enabled rules.
     fn scan_field(&self, field: &str, value: &str, timestamp: &str, events: &mut Vec<WafEvent>) {
+        let disabled = self.disabled_rules.read().unwrap();
         for rule in self.ruleset.rules() {
+            if disabled.contains(&rule.id) {
+                continue;
+            }
             if rule.pattern.is_match(value) {
                 // Extract the matched substring (first match only)
                 let matched_value = rule
@@ -538,5 +607,82 @@ mod tests {
             per_request_us < 500,
             "WAF evaluation too slow: {per_request_us}us per request"
         );
+    }
+
+    // --- Rule configuration ---
+
+    #[test]
+    fn test_list_rules() {
+        let e = engine();
+        let rules = e.list_rules();
+        assert!(rules.len() >= 15);
+        assert!(rules.iter().all(|r| r.enabled));
+    }
+
+    #[test]
+    fn test_disable_rule() {
+        let e = engine();
+        assert!(e.disable_rule(942100));
+        let rules = e.list_rules();
+        let sqli_union = rules.iter().find(|r| r.id == 942100).unwrap();
+        assert!(!sqli_union.enabled);
+        assert_eq!(e.enabled_rule_count(), e.rule_count() - 1);
+    }
+
+    #[test]
+    fn test_disable_unknown_rule_returns_false() {
+        let e = engine();
+        assert!(!e.disable_rule(999999));
+    }
+
+    #[test]
+    fn test_enable_rule() {
+        let e = engine();
+        e.disable_rule(942100);
+        assert!(e.enable_rule(942100));
+        let rules = e.list_rules();
+        let sqli_union = rules.iter().find(|r| r.id == 942100).unwrap();
+        assert!(sqli_union.enabled);
+    }
+
+    #[test]
+    fn test_disabled_rule_skipped_during_evaluation() {
+        let e = engine();
+        // Disable the UNION SELECT rule (942100)
+        e.disable_rule(942100);
+
+        let verdict = e.evaluate(
+            WafMode::Blocking,
+            "/search",
+            Some("q=1 UNION SELECT * FROM users"),
+            &[],
+            "example.com",
+        );
+
+        // Should still be blocked by the stacked queries rule (942150)
+        // or pass if only 942100 matches this payload
+        match &verdict {
+            WafVerdict::Pass => {} // Rule was disabled, no other match
+            WafVerdict::Blocked(events) => {
+                // If it matched, it should NOT be via rule 942100
+                assert!(!events.iter().any(|e| e.rule_id == 942100));
+            }
+            WafVerdict::Detected(_) => panic!("unexpected detection mode"),
+        }
+    }
+
+    #[test]
+    fn test_set_disabled_rules_bulk() {
+        let e = engine();
+        e.set_disabled_rules(&[942100, 941100, 930100]);
+        let rules = e.list_rules();
+        assert!(!rules.iter().find(|r| r.id == 942100).unwrap().enabled);
+        assert!(!rules.iter().find(|r| r.id == 941100).unwrap().enabled);
+        assert!(!rules.iter().find(|r| r.id == 930100).unwrap().enabled);
+        assert_eq!(e.enabled_rule_count(), e.rule_count() - 3);
+
+        // Re-enable all
+        e.set_disabled_rules(&[]);
+        assert_eq!(e.enabled_rule_count(), e.rule_count());
     }
 }

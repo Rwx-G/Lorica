@@ -340,6 +340,7 @@ fn run_supervisor(cli: Cli) {
                 config_reload_tx: Some(config_reload_tx),
                 worker_metrics: Some(Arc::clone(&worker_metrics)),
                 waf_event_buffer: None,
+                waf_engine: None,
                 waf_rule_count: None,
             };
             let session_store = SessionStore::new();
@@ -722,6 +723,7 @@ fn run_single_process(cli: Cli) {
                 config_reload_tx: Some(config_reload_tx),
                 worker_metrics: None,
                 waf_event_buffer: None,
+                waf_engine: None,
                 waf_rule_count: None,
             };
             let session_store = SessionStore::new();

@@ -120,6 +120,56 @@ pub async fn get_waf_stats(
     }))
 }
 
+/// GET /api/v1/waf/rules - list all WAF rules with enabled/disabled status
+pub async fn get_waf_rules(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let rules = if let Some(ref engine) = state.waf_engine {
+        engine.list_rules()
+    } else {
+        vec![]
+    };
+    let total = rules.len();
+    let enabled = rules.iter().filter(|r| r.enabled).count();
+    Ok(json_data(serde_json::json!({
+        "rules": rules,
+        "total": total,
+        "enabled": enabled,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RuleToggleRequest {
+    pub enabled: bool,
+}
+
+/// PUT /api/v1/waf/rules/:id - enable or disable a specific rule
+pub async fn toggle_waf_rule(
+    Extension(state): Extension<AppState>,
+    axum::extract::Path(rule_id): axum::extract::Path<u32>,
+    Json(body): Json<RuleToggleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = state
+        .waf_engine
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("WAF engine not initialized".into()))?;
+
+    let found = if body.enabled {
+        engine.enable_rule(rule_id)
+    } else {
+        engine.disable_rule(rule_id)
+    };
+
+    if !found {
+        return Err(ApiError::NotFound(format!("rule {rule_id} not found")));
+    }
+
+    Ok(json_data(serde_json::json!({
+        "rule_id": rule_id,
+        "enabled": body.enabled,
+    })))
+}
+
 /// DELETE /api/v1/waf/events - clear WAF event buffer
 pub async fn clear_waf_events(
     Extension(state): Extension<AppState>,

@@ -31,6 +31,8 @@ pub struct AppState {
     pub worker_metrics: Option<Arc<WorkerMetrics>>,
     /// WAF event ring buffer. `None` if WAF engine not initialized.
     pub waf_event_buffer: Option<Arc<std::sync::Mutex<VecDeque<lorica_waf::WafEvent>>>>,
+    /// WAF engine reference for rule management. `None` if not initialized.
+    pub waf_engine: Option<Arc<lorica_waf::WafEngine>>,
     /// Number of loaded WAF rules.
     pub waf_rule_count: Option<usize>,
 }
@@ -145,6 +147,11 @@ pub fn build_router(
         .route("/api/v1/waf/events", get(crate::waf::get_waf_events))
         .route("/api/v1/waf/events", delete(crate::waf::clear_waf_events))
         .route("/api/v1/waf/stats", get(crate::waf::get_waf_stats))
+        .route("/api/v1/waf/rules", get(crate::waf::get_waf_rules))
+        .route(
+            "/api/v1/waf/rules/:id",
+            put(crate::waf::toggle_waf_rule),
+        )
         .layer(middleware::from_fn(require_auth));
 
     // Dashboard routes serve embedded frontend assets (SPA with fallback)
