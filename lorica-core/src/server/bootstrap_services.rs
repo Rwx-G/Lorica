@@ -137,6 +137,16 @@ impl Bootstrap {
     pub fn get_fds(&self) -> Option<ListenFds> {
         self.listen_fds.clone()
     }
+
+    /// Inject pre-existing file descriptors (received from a supervisor process).
+    ///
+    /// This skips the normal bootstrap FD-loading and marks bootstrap as completed.
+    /// Used by worker processes that receive listening FDs via SCM_RIGHTS.
+    #[cfg(unix)]
+    pub fn set_fds(&mut self, fds: Fds) {
+        self.listen_fds = Some(Arc::new(TokioMutex::new(fds)));
+        self.completed = true;
+    }
 }
 
 #[async_trait]

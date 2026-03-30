@@ -561,6 +561,15 @@ impl Server {
             .collect()
     }
 
+    /// Inject pre-existing listening FDs received from a supervisor process.
+    ///
+    /// This is used by worker processes that receive listening socket FDs via SCM_RIGHTS.
+    /// Call this instead of [`bootstrap()`] when running in worker mode.
+    #[cfg(unix)]
+    pub fn set_listen_fds(&mut self, fds: crate::server::bootstrap_services::Fds) {
+        self.bootstrap.lock().set_fds(fds);
+    }
+
     /// Prepare the server to start
     ///
     /// When trying to zero downtime upgrade from an older version of the server which is already
