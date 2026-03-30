@@ -16,6 +16,7 @@ pub struct RouteResponse {
     pub certificate_id: Option<String>,
     pub load_balancing: String,
     pub waf_enabled: bool,
+    pub waf_mode: String,
     pub topology_type: String,
     pub enabled: bool,
     pub created_at: String,
@@ -30,6 +31,8 @@ pub struct CreateRouteRequest {
     pub certificate_id: Option<String>,
     pub load_balancing: Option<String>,
     pub topology_type: Option<String>,
+    pub waf_enabled: Option<bool>,
+    pub waf_mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +43,8 @@ pub struct UpdateRouteRequest {
     pub certificate_id: Option<String>,
     pub load_balancing: Option<String>,
     pub topology_type: Option<String>,
+    pub waf_enabled: Option<bool>,
+    pub waf_mode: Option<String>,
     pub enabled: Option<bool>,
 }
 
@@ -55,6 +60,7 @@ fn route_to_response(
         certificate_id: route.certificate_id.clone(),
         load_balancing: route.load_balancing.as_str().to_string(),
         waf_enabled: route.waf_enabled,
+        waf_mode: route.waf_mode.as_str().to_string(),
         topology_type: route.topology_type.as_str().to_string(),
         enabled: route.enabled,
         created_at: route.created_at.to_rfc3339(),
@@ -99,6 +105,13 @@ pub async fn create_route(
         .parse::<lorica_config::models::TopologyType>()
         .map_err(ApiError::BadRequest)?;
 
+    let waf_mode = body
+        .waf_mode
+        .as_deref()
+        .unwrap_or("detection")
+        .parse::<lorica_config::models::WafMode>()
+        .map_err(ApiError::BadRequest)?;
+
     let now = Utc::now();
     let route = lorica_config::models::Route {
         id: uuid::Uuid::new_v4().to_string(),
@@ -106,8 +119,8 @@ pub async fn create_route(
         path_prefix: body.path_prefix.unwrap_or_else(|| "/".to_string()),
         certificate_id: body.certificate_id,
         load_balancing: lb,
-        waf_enabled: false,
-        waf_mode: lorica_config::models::WafMode::Detection,
+        waf_enabled: body.waf_enabled.unwrap_or(false),
+        waf_mode,
         topology_type: topo,
         enabled: true,
         created_at: now,
@@ -168,6 +181,14 @@ pub async fn update_route(
     if let Some(topo) = body.topology_type {
         route.topology_type = topo
             .parse::<lorica_config::models::TopologyType>()
+            .map_err(ApiError::BadRequest)?;
+    }
+    if let Some(waf_enabled) = body.waf_enabled {
+        route.waf_enabled = waf_enabled;
+    }
+    if let Some(waf_mode) = body.waf_mode {
+        route.waf_mode = waf_mode
+            .parse::<lorica_config::models::WafMode>()
             .map_err(ApiError::BadRequest)?;
     }
     if let Some(enabled) = body.enabled {

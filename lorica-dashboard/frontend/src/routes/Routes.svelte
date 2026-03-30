@@ -26,6 +26,8 @@
   let formCertificateId = $state('');
   let formLoadBalancing = $state('round_robin');
   let formTopologyType = $state('single_vm');
+  let formWafEnabled = $state(false);
+  let formWafMode = $state('detection');
   let formEnabled = $state(true);
   let formError = $state('');
   let formSubmitting = $state(false);
@@ -80,6 +82,8 @@
     formCertificateId = '';
     formLoadBalancing = 'round_robin';
     formTopologyType = 'single_vm';
+    formWafEnabled = false;
+    formWafMode = 'detection';
     formEnabled = true;
     formError = '';
     showForm = true;
@@ -93,6 +97,8 @@
     formCertificateId = route.certificate_id ?? '';
     formLoadBalancing = route.load_balancing;
     formTopologyType = route.topology_type;
+    formWafEnabled = route.waf_enabled;
+    formWafMode = route.waf_mode ?? 'detection';
     formEnabled = route.enabled;
     formError = '';
     showForm = true;
@@ -128,6 +134,8 @@
         certificate_id: formCertificateId || undefined,
         load_balancing: formLoadBalancing,
         topology_type: formTopologyType,
+        waf_enabled: formWafEnabled,
+        waf_mode: formWafMode,
         enabled: formEnabled,
       };
       const res = await api.updateRoute(editingRoute.id, body);
@@ -144,6 +152,8 @@
         certificate_id: formCertificateId || undefined,
         load_balancing: formLoadBalancing,
         topology_type: formTopologyType,
+        waf_enabled: formWafEnabled,
+        waf_mode: formWafMode,
       };
       const res = await api.createRoute(body);
       if (res.error) {
@@ -220,6 +230,7 @@
             <th>Path</th>
             <th>Backends</th>
             <th>TLS</th>
+            <th>WAF</th>
             <th>Health</th>
             <th>Enabled</th>
             <th>Actions</th>
@@ -242,6 +253,13 @@
                   <span class="tls-on" title={certLabel(route.certificate_id)}>TLS</span>
                 {:else}
                   <span class="tls-off">-</span>
+                {/if}
+              </td>
+              <td>
+                {#if route.waf_enabled}
+                  <span class="waf-on" title={route.waf_mode === 'blocking' ? 'Blocking' : 'Detection'}>{route.waf_mode === 'blocking' ? 'Block' : 'Detect'}</span>
+                {:else}
+                  <span class="waf-off">-</span>
                 {/if}
               </td>
               <td><StatusBadge status={resolveHealthStatus(route)} /></td>
@@ -332,6 +350,23 @@
           </select>
         </div>
       </div>
+
+      <div class="form-group">
+        <label class="checkbox-item">
+          <input type="checkbox" bind:checked={formWafEnabled} />
+          <span>Enable WAF</span>
+        </label>
+      </div>
+
+      {#if formWafEnabled}
+        <div class="form-group">
+          <label for="waf-mode">WAF Mode</label>
+          <select id="waf-mode" bind:value={formWafMode}>
+            <option value="detection">Detection (log only)</option>
+            <option value="blocking">Blocking (reject 403)</option>
+          </select>
+        </div>
+      {/if}
 
       {#if editingRoute}
         <div class="form-group">
@@ -467,6 +502,20 @@
   }
 
   .tls-off {
+    color: var(--color-text-muted);
+  }
+
+  .waf-on {
+    display: inline-block;
+    padding: 0.125rem 0.5rem;
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    background: rgba(251, 146, 60, 0.1);
+    color: var(--color-orange, #fb923c);
+  }
+
+  .waf-off {
     color: var(--color-text-muted);
   }
 

@@ -3,6 +3,7 @@
   import Overview from './Overview.svelte';
   import Routes from './Routes.svelte';
   import Certificates from './Certificates.svelte';
+  import Security from './Security.svelte';
   import Logs from './Logs.svelte';
   import SystemView from './System.svelte';
   import Settings from './Settings.svelte';
@@ -26,6 +27,8 @@
     <Placeholder title="Backends" />
   {:else if path === '/certificates'}
     <Certificates />
+  {:else if path === '/security'}
+    <Security />
   {:else if path === '/logs'}
     <Logs />
   {:else if path === '/system'}

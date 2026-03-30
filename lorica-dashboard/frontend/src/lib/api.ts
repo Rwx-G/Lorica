@@ -59,6 +59,7 @@ export interface RouteResponse {
   certificate_id: string | null;
   load_balancing: string;
   waf_enabled: boolean;
+  waf_mode: string;
   topology_type: string;
   enabled: boolean;
   created_at: string;
@@ -72,6 +73,8 @@ export interface CreateRouteRequest {
   certificate_id?: string;
   load_balancing?: string;
   topology_type?: string;
+  waf_enabled?: boolean;
+  waf_mode?: string;
 }
 
 export interface UpdateRouteRequest {
@@ -81,6 +84,8 @@ export interface UpdateRouteRequest {
   certificate_id?: string;
   load_balancing?: string;
   topology_type?: string;
+  waf_enabled?: boolean;
+  waf_mode?: string;
   enabled?: boolean;
 }
 
@@ -376,7 +381,49 @@ export const api = {
 
   getWorkers: () =>
     request<{ workers: WorkerStatus[]; total: number }>('GET', '/workers'),
+
+  // WAF
+  getWafEvents: (params?: { limit?: number; category?: string }) => {
+    const query = new URLSearchParams();
+    if (params?.limit !== undefined) query.set('limit', String(params.limit));
+    if (params?.category) query.set('category', params.category);
+    const qs = query.toString();
+    return request<WafEventsResponse>('GET', `/waf/events${qs ? `?${qs}` : ''}`);
+  },
+
+  getWafStats: () =>
+    request<WafStatsResponse>('GET', '/waf/stats'),
+
+  clearWafEvents: () =>
+    request<{ cleared: boolean }>('DELETE', '/waf/events'),
 };
+
+export interface WafEvent {
+  rule_id: number;
+  description: string;
+  category: string;
+  severity: number;
+  matched_field: string;
+  matched_value: string;
+  timestamp: string;
+}
+
+export interface WafEventsResponse {
+  events: WafEvent[];
+  total: number;
+  rule_count: number;
+}
+
+export interface WafCategoryCount {
+  category: string;
+  count: number;
+}
+
+export interface WafStatsResponse {
+  total_events: number;
+  rule_count: number;
+  by_category: WafCategoryCount[];
+}
 
 export interface WorkerStatus {
   worker_id: number;
