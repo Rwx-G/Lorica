@@ -30,6 +30,7 @@ COPY lorica-proxy/ lorica-proxy/
 COPY lorica-runtime/ lorica-runtime/
 COPY lorica-timeout/ lorica-timeout/
 COPY lorica-tls/ lorica-tls/
+COPY lorica-command/ lorica-command/
 COPY lorica-worker/ lorica-worker/
 COPY tinyufo/ tinyufo/
 

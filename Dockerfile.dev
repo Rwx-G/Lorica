@@ -40,6 +40,7 @@ COPY lorica-runtime/ lorica-runtime/
 COPY lorica-timeout/ lorica-timeout/
 COPY lorica-tls/ lorica-tls/
 COPY lorica-worker/ lorica-worker/
+COPY lorica-command/ lorica-command/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend
