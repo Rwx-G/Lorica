@@ -15,6 +15,63 @@
   let autoRefresh = $state(true);
 
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
+  let ws: WebSocket | null = null;
+  let wsConnected = $state(false);
+
+  function connectWebSocket() {
+    if (ws) return;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/api/v1/logs/ws`);
+
+    ws.onopen = () => {
+      wsConnected = true;
+      stopAutoRefresh(); // No need to poll when WS is active
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const entry: LogEntry = JSON.parse(event.data);
+        // Apply client-side filters before adding
+        if (matchesFilters(entry)) {
+          entries = [...entries.slice(-499), entry];
+          total = entries.length;
+        }
+      } catch { /* ignore malformed messages */ }
+    };
+
+    ws.onclose = () => {
+      wsConnected = false;
+      ws = null;
+      // Fall back to polling if WS disconnects
+      if (autoRefresh) startAutoRefresh();
+    };
+
+    ws.onerror = () => {
+      ws?.close();
+    };
+  }
+
+  function disconnectWebSocket() {
+    ws?.close();
+    ws = null;
+    wsConnected = false;
+  }
+
+  function matchesFilters(e: LogEntry): boolean {
+    if (filterStatusCategory === '2xx' && (e.status < 200 || e.status > 299)) return false;
+    if (filterStatusCategory === '3xx' && (e.status < 300 || e.status > 399)) return false;
+    if (filterStatusCategory === '4xx' && (e.status < 400 || e.status > 499)) return false;
+    if (filterStatusCategory === '5xx' && (e.status < 500 || e.status > 599)) return false;
+    if (searchText.trim()) {
+      const s = searchText.trim().toLowerCase();
+      if (!e.method.toLowerCase().includes(s)
+        && !e.path.toLowerCase().includes(s)
+        && !e.host.toLowerCase().includes(s)
+        && !e.backend.toLowerCase().includes(s)) return false;
+    }
+    if (filterRoute.trim() && !e.host.includes(filterRoute.trim())) return false;
+    return true;
+  }
 
   async function loadLogs() {
     const params: LogsQuery = { limit: 500 };
@@ -89,11 +146,14 @@
   }
 
   onMount(() => {
-    loadLogs();
-    startAutoRefresh();
+    loadLogs();          // Initial load via REST
+    connectWebSocket();  // Then switch to real-time WS
   });
 
-  onDestroy(stopAutoRefresh);
+  onDestroy(() => {
+    stopAutoRefresh();
+    disconnectWebSocket();
+  });
 
   // Restart auto-refresh when toggle changes
   $effect(() => {
@@ -128,7 +188,8 @@
     <div class="header-actions">
       <label class="auto-refresh">
         <input type="checkbox" bind:checked={autoRefresh} />
-        <span>Auto-refresh (5s)</span>
+        <span>{wsConnected ? 'Live (WebSocket)' : 'Auto-refresh (5s)'}</span>
+        {#if wsConnected}<span class="ws-dot" title="WebSocket connected"></span>{/if}
       </label>
       <button class="btn btn-secondary" onclick={loadLogs}>Refresh</button>
       <button class="btn btn-danger" onclick={handleClearLogs}>Clear</button>
@@ -447,5 +508,21 @@
 
   .btn-danger:hover {
     background: rgba(239, 68, 68, 0.2);
+  }
+
+  .ws-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--color-green);
+    margin-left: 6px;
+    vertical-align: middle;
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
   }
 </style>

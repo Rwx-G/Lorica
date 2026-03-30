@@ -1,6 +1,10 @@
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, Query};
+use axum::response::IntoResponse;
 use axum::Json;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
@@ -19,9 +23,11 @@ pub struct LogEntry {
     pub error: Option<String>,
 }
 
-/// Thread-safe in-memory ring buffer for access logs.
+/// Thread-safe in-memory ring buffer for access logs with real-time broadcast.
 pub struct LogBuffer {
     entries: tokio::sync::RwLock<LogBufferInner>,
+    /// Broadcast channel for real-time WebSocket subscribers.
+    tx: broadcast::Sender<LogEntry>,
 }
 
 struct LogBufferInner {
@@ -37,6 +43,7 @@ struct LogBufferInner {
 impl LogBuffer {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "LogBuffer capacity must be > 0");
+        let (tx, _) = broadcast::channel(256);
         Self {
             entries: tokio::sync::RwLock::new(LogBufferInner {
                 buf: Vec::with_capacity(capacity),
@@ -45,14 +52,17 @@ impl LogBuffer {
                 write_pos: 0,
                 len: 0,
             }),
+            tx,
         }
     }
 
-    /// Push a new log entry into the ring buffer.
+    /// Push a new log entry into the ring buffer and broadcast to WebSocket subscribers.
     pub async fn push(&self, mut entry: LogEntry) {
         let mut inner = self.entries.write().await;
         entry.id = inner.next_id;
         inner.next_id += 1;
+
+        let entry_clone = entry.clone();
 
         if inner.buf.len() < inner.capacity {
             inner.buf.push(entry);
@@ -64,6 +74,14 @@ impl LogBuffer {
         if inner.len < inner.capacity {
             inner.len += 1;
         }
+
+        // Broadcast to WebSocket subscribers (ignore if no receivers)
+        let _ = self.tx.send(entry_clone);
+    }
+
+    /// Subscribe to real-time log entries.
+    pub fn subscribe(&self) -> broadcast::Receiver<LogEntry> {
+        self.tx.subscribe()
     }
 
     /// Return all entries in chronological order (oldest first).
@@ -201,6 +219,49 @@ pub async fn clear_logs(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.log_buffer.clear().await;
     Ok(json_data(serde_json::json!({ "message": "logs cleared" })))
+}
+
+/// GET /api/v1/logs/ws - WebSocket endpoint for real-time log streaming.
+///
+/// Each new log entry is broadcast to all connected WebSocket clients as JSON.
+/// No authentication required on the WebSocket upgrade itself (the session
+/// cookie is validated by the middleware layer before reaching this handler).
+pub async fn logs_ws(
+    ws: WebSocketUpgrade,
+    Extension(state): Extension<AppState>,
+) -> impl IntoResponse {
+    let rx = state.log_buffer.subscribe();
+    ws.on_upgrade(move |socket| handle_log_stream(socket, rx))
+}
+
+async fn handle_log_stream(socket: WebSocket, mut rx: broadcast::Receiver<LogEntry>) {
+    let (mut sender, mut receiver) = socket.split();
+
+    // Forward broadcast entries to the WebSocket client
+    let send_task = tokio::spawn(async move {
+        while let Ok(entry) = rx.recv().await {
+            if let Ok(json) = serde_json::to_string(&entry) {
+                if sender.send(Message::Text(json.into())).await.is_err() {
+                    break; // Client disconnected
+                }
+            }
+        }
+    });
+
+    // Consume incoming messages (ping/pong, close) but don't process them
+    let recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+        }
+    });
+
+    // Wait for either task to finish
+    tokio::select! {
+        _ = send_task => {}
+        _ = recv_task => {}
+    }
 }
 
 #[cfg(test)]

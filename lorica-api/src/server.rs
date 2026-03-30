@@ -13,6 +13,7 @@ use crate::logs::LogBuffer;
 use crate::middleware::auth::{require_auth, SessionStore};
 use crate::middleware::rate_limit::RateLimiter;
 use crate::system::SystemCache;
+use crate::workers::WorkerMetrics;
 
 /// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]
@@ -25,6 +26,8 @@ pub struct AppState {
     /// Sender that signals the proxy engine to reload its configuration.
     /// Incremented on each mutation. `None` in tests or when no proxy is running.
     pub config_reload_tx: Option<watch::Sender<u64>>,
+    /// Per-worker heartbeat metrics. `None` in single-process mode.
+    pub worker_metrics: Option<Arc<WorkerMetrics>>,
 }
 
 impl AppState {
@@ -91,7 +94,9 @@ pub fn build_router(
         .route("/api/v1/status", get(crate::status::get_status))
         .route("/api/v1/logs", get(crate::logs::get_logs))
         .route("/api/v1/logs", delete(crate::logs::clear_logs))
+        .route("/api/v1/logs/ws", get(crate::logs::logs_ws))
         .route("/api/v1/system", get(crate::system::get_system))
+        .route("/api/v1/workers", get(crate::workers::get_workers))
         .route("/api/v1/config/export", post(crate::config::export_config))
         .route("/api/v1/config/import", post(crate::config::import_config))
         .route(

@@ -22,6 +22,7 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         started_at: Instant::now(),
         config_reload_tx: None,
+        worker_metrics: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();

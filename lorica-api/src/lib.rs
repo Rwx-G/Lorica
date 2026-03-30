@@ -12,6 +12,7 @@ pub mod server;
 pub mod settings;
 pub mod status;
 pub mod system;
+pub mod workers;
 
 #[cfg(test)]
 mod tests;
