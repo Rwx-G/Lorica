@@ -11,7 +11,7 @@ top_issues: []
 waiver:
   active: false
 
-quality_score: 95
+quality_score: 100
 expires: "2026-04-13T08:35:00Z"
 
 evidence:
@@ -37,8 +37,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - action: "Add restart backoff to prevent crash loops"
-      refs: ["lorica-worker/src/manager.rs"]
-    - action: "Explicit SIGTERM to workers on supervisor shutdown"
-      refs: ["lorica/src/main.rs:run_supervisor"]
+  future: []

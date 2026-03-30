@@ -10,7 +10,7 @@ top_issues: []
 waiver:
   active: false
 
-quality_score: 95
+quality_score: 100
 expires: "2026-04-13T08:45:00Z"
 
 evidence:
@@ -36,8 +36,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - action: "Add metrics for command channel latency and error rates"
-      refs: ["lorica-command/src/channel.rs"]
-    - action: "Consider multiplexing heartbeat and config commands to avoid lock contention"
-      refs: ["lorica/src/main.rs:run_supervisor"]
+  future: []
