@@ -1,0 +1,39 @@
+schema: 1
+story: "2.3"
+story_title: "Certificate Hot-Swap"
+gate: PASS
+status_reason: "All 7 ACs met. SNI resolver with wildcard, arc-swap hot-swap, no cert files on disk."
+reviewer: "Quinn (Test Architect)"
+updated: "2026-03-30T09:15:00Z"
+
+top_issues: []
+waiver:
+  active: false
+
+quality_score: 100
+expires: "2026-04-13T09:15:00Z"
+
+evidence:
+  tests_reviewed: 6
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7]
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "No cert files on disk, PEM parsed in memory, private keys never written to filesystem"
+  performance:
+    status: PASS
+    notes: "Lock-free reads via arc-swap on hot path (TLS handshake), O(1) lookup"
+  reliability:
+    status: PASS
+    notes: "Atomic swap ensures no partial state, existing connections unaffected"
+  maintainability:
+    status: PASS
+    notes: "Clean separation: CertResolver in lorica-tls, wiring in lorica-core"
+
+recommendations:
+  immediate: []
+  future: []

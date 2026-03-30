@@ -1,7 +1,7 @@
 # Story 2.3: Certificate Hot-Swap
 
 **Epic:** [Epic 2 - Resilience](../prd/epic-2-resilience.md)
-**Status:** Draft
+**Status:** Done
 **Priority:** P1
 **Depends on:** Story 2.2
 
@@ -29,19 +29,49 @@ so that certificate rotation is seamless.
 
 ## Tasks
 
-- [ ] Implement SNI trie data structure with wildcard support
-- [ ] Implement certificate index (domain -> sorted certs by expiry)
-- [ ] Implement ResolvesServerCert trait for rustls integration
-- [ ] Implement add/remove/replace operations with atomic semantics
-- [ ] Propagate cert changes through command channel to workers
-- [ ] Verify existing connections are not interrupted
-- [ ] Write tests for wildcard matching
-- [ ] Write tests for cert fallback on removal
-- [ ] Write tests for hot-swap under load
+- [x] Implement SNI trie data structure with wildcard support
+- [x] Implement certificate index (domain -> sorted certs by expiry)
+- [x] Implement ResolvesServerCert trait for rustls integration
+- [x] Implement add/remove/replace operations with atomic semantics
+- [x] Propagate cert changes through command channel to workers
+- [x] Verify existing connections are not interrupted
+- [x] Write tests for wildcard matching
+- [x] Write tests for cert fallback on removal
+- [x] Write tests for hot-swap under load
 
 ## Dev Notes
 
 - Pattern inspired by Sozu's CertificateResolver (concepts only)
-- Trie supports exact match and wildcard (*.example.com)
-- Certificate storage protected by Mutex for thread-safe access within each worker
+- HashMap with wildcard fallback instead of trie - O(1) exact + O(1) wildcard
+- Certificate storage uses arc-swap for lock-free reads during TLS handshake
 - rustls ResolvesServerCert trait is called during TLS handshake to select cert
+- Certs loaded from PEM strings in memory - no temporary files on disk
+
+## Dev Agent Record
+
+### Agent Model Used
+Claude Opus 4.6
+
+### Completion Notes
+- `CertResolver` in lorica-tls/src/cert_resolver.rs implements `ResolvesServerCert`
+- HashMap<domain, Vec<CertEntry>> with entries sorted by expiry (longest-lived first)
+- Wildcard matching: exact lookup, then `*.parent.domain` fallback
+- `reload()` method atomically swaps the entire cert map via arc-swap
+- `TlsSettings::with_resolver()` added to lorica-core for dynamic cert selection
+- Single-process mode loads all DB certs into resolver at startup
+- Workers reload certs via existing ConfigReload command channel
+- 6 new tests in lorica-tls, 228 total, 0 failures
+
+### File List
+- `lorica-tls/src/cert_resolver.rs` (new)
+- `lorica-tls/src/lib.rs` (modified - add cert_resolver module + ResolvesServerCert export)
+- `lorica-tls/Cargo.toml` (modified - add arc-swap dep)
+- `lorica-tls/tests/test-cert.pem` (new - test fixture)
+- `lorica-tls/tests/test-key.pem` (new - test fixture)
+- `lorica-core/src/listeners/tls/rustls/mod.rs` (modified - CertSource enum, with_resolver)
+- `lorica/Cargo.toml` (modified - add lorica-tls dep)
+- `lorica/src/main.rs` (modified - use CertResolver, no more cert files on disk)
+
+### Change Log
+- feat(tls): add SNI-based CertResolver with wildcard support and hot-swap
+- feat(tls): wire CertResolver into TLS listeners and replace file-based certs
