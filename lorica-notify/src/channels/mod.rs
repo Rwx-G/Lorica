@@ -16,8 +16,9 @@ pub mod email;
 pub mod stdout;
 pub mod webhook;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::events::AlertEvent;
 use tracing::{info, warn};
@@ -64,11 +65,34 @@ enum ChannelType {
     Webhook(WebhookConfig),
 }
 
+/// Rate limiter configuration.
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    /// Maximum number of notifications per channel within the window.
+    pub max_per_window: usize,
+    /// Sliding window duration.
+    pub window: Duration,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_per_window: 10,
+            window: Duration::from_secs(60),
+        }
+    }
+}
+
 /// Dispatches alert events to all configured notification channels.
 pub struct NotifyDispatcher {
     channels: Vec<RegisteredChannel>,
     history: Arc<Mutex<VecDeque<AlertEvent>>>,
     max_history: usize,
+    rate_limit: RateLimitConfig,
+    /// Per-channel send timestamps for rate limiting.
+    send_times: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// Counter of rate-limited (suppressed) notifications.
+    suppressed_count: Mutex<usize>,
 }
 
 impl NotifyDispatcher {
@@ -77,7 +101,23 @@ impl NotifyDispatcher {
             channels: Vec::new(),
             history: Arc::new(Mutex::new(VecDeque::with_capacity(100))),
             max_history: 100,
+            rate_limit: RateLimitConfig::default(),
+            send_times: Mutex::new(HashMap::new()),
+            suppressed_count: Mutex::new(0),
         }
+    }
+
+    /// Create a dispatcher with custom rate limiting.
+    pub fn with_rate_limit(rate_limit: RateLimitConfig) -> Self {
+        Self {
+            rate_limit,
+            ..Self::new()
+        }
+    }
+
+    /// Return the number of suppressed notifications.
+    pub fn suppressed_count(&self) -> usize {
+        *self.suppressed_count.lock().unwrap()
     }
 
     /// Return a reference to the event history buffer.
@@ -153,6 +193,17 @@ impl NotifyDispatcher {
                 continue;
             }
 
+            // Rate limiting check
+            if self.is_rate_limited(&ch.id) {
+                warn!(
+                    channel_id = %ch.id,
+                    alert_type = alert_str,
+                    "notification suppressed by rate limiter"
+                );
+                *self.suppressed_count.lock().unwrap() += 1;
+                continue;
+            }
+
             match &ch.channel_type {
                 ChannelType::Email(config) => {
                     if let Err(e) = email::send(config, event).await {
@@ -162,6 +213,7 @@ impl NotifyDispatcher {
                             "failed to send email notification"
                         );
                     } else {
+                        self.record_send(&ch.id);
                         info!(
                             channel_id = %ch.id,
                             alert_type = alert_str,
@@ -177,6 +229,7 @@ impl NotifyDispatcher {
                             "failed to send webhook notification"
                         );
                     } else {
+                        self.record_send(&ch.id);
                         info!(
                             channel_id = %ch.id,
                             alert_type = alert_str,
@@ -202,6 +255,27 @@ impl NotifyDispatcher {
     /// Return the total number of events in history.
     pub fn history_count(&self) -> usize {
         self.history.lock().unwrap().len()
+    }
+
+    /// Check if a channel has exceeded its rate limit.
+    fn is_rate_limited(&self, channel_id: &str) -> bool {
+        let now = Instant::now();
+        let mut times = self.send_times.lock().unwrap();
+        let entry = times.entry(channel_id.to_string()).or_default();
+
+        // Evict expired entries
+        while entry.front().map_or(false, |t| now.duration_since(*t) > self.rate_limit.window) {
+            entry.pop_front();
+        }
+
+        entry.len() >= self.rate_limit.max_per_window
+    }
+
+    /// Record a successful send for rate limiting.
+    fn record_send(&self, channel_id: &str) {
+        let mut times = self.send_times.lock().unwrap();
+        let entry = times.entry(channel_id.to_string()).or_default();
+        entry.push_back(Instant::now());
     }
 }
 
@@ -344,5 +418,61 @@ mod tests {
         let recent = d.recent_history(10);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].alert_type, AlertType::BackendDown);
+    }
+
+    // ---- Rate limiting ----
+
+    #[test]
+    fn test_rate_limit_config_default() {
+        let cfg = RateLimitConfig::default();
+        assert_eq!(cfg.max_per_window, 10);
+        assert_eq!(cfg.window, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_is_rate_limited_under_threshold() {
+        let d = NotifyDispatcher::new();
+        // Record 5 sends (under default of 10)
+        for _ in 0..5 {
+            d.record_send("ch1");
+        }
+        assert!(!d.is_rate_limited("ch1"));
+    }
+
+    #[test]
+    fn test_is_rate_limited_at_threshold() {
+        let d = NotifyDispatcher::new();
+        for _ in 0..10 {
+            d.record_send("ch1");
+        }
+        assert!(d.is_rate_limited("ch1"));
+    }
+
+    #[test]
+    fn test_rate_limit_per_channel_isolation() {
+        let d = NotifyDispatcher::new();
+        for _ in 0..10 {
+            d.record_send("ch1");
+        }
+        assert!(d.is_rate_limited("ch1"));
+        assert!(!d.is_rate_limited("ch2"));
+    }
+
+    #[test]
+    fn test_rate_limit_custom_config() {
+        let d = NotifyDispatcher::with_rate_limit(RateLimitConfig {
+            max_per_window: 2,
+            window: Duration::from_secs(60),
+        });
+        d.record_send("ch1");
+        assert!(!d.is_rate_limited("ch1"));
+        d.record_send("ch1");
+        assert!(d.is_rate_limited("ch1"));
+    }
+
+    #[test]
+    fn test_suppressed_count_starts_at_zero() {
+        let d = NotifyDispatcher::new();
+        assert_eq!(d.suppressed_count(), 0);
     }
 }

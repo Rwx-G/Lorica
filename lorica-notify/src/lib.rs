@@ -19,5 +19,5 @@
 pub mod channels;
 pub mod events;
 
-pub use channels::{NotifyDispatcher, NotifyError};
+pub use channels::{NotifyDispatcher, NotifyError, RateLimitConfig};
 pub use events::AlertEvent;
