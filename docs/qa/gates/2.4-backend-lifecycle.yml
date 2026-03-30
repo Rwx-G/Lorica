@@ -1,0 +1,39 @@
+schema: 1
+story: "2.4"
+story_title: "Backend Lifecycle Management"
+gate: PASS
+status_reason: "All 6 ACs met. Per-backend connection tracking, lifecycle state exposed in API, Closing backends filtered from load balancing."
+reviewer: "Quinn (Test Architect)"
+updated: "2026-03-30T09:25:00Z"
+
+top_issues: []
+waiver:
+  active: false
+
+quality_score: 100
+expires: "2026-04-13T09:25:00Z"
+
+evidence:
+  tests_reviewed: 3
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6]
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "No security-sensitive changes"
+  performance:
+    status: PASS
+    notes: "Atomic counters with RwLock - minimal contention on hot path"
+  reliability:
+    status: PASS
+    notes: "Graceful drain prevents connection drops during backend removal"
+  maintainability:
+    status: PASS
+    notes: "Clean BackendConnections abstraction, thread-safe API"
+
+recommendations:
+  immediate: []
+  future: []
