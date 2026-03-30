@@ -20,11 +20,12 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use lorica_api::logs::{LogBuffer, LogEntry};
-use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route};
+use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route, WafMode};
 use lorica_core::protocols::Digest;
 use lorica_core::upstreams::peer::HttpPeer;
 use lorica_error::{Error, ErrorType, Result};
 use lorica_proxy::{ProxyHttp, Session};
+use lorica_waf::WafEngine;
 use tracing::{info, warn};
 
 /// In-memory snapshot of a route and its backends for fast lookup.
@@ -174,6 +175,8 @@ pub struct RequestCtx {
     pub matched_host: Option<String>,
     /// The matched route path prefix (for logging).
     pub matched_path: Option<String>,
+    /// Whether WAF blocked this request.
+    pub waf_blocked: bool,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -186,6 +189,8 @@ pub struct LoricaProxy {
     pub active_connections: Arc<AtomicU64>,
     /// Per-backend connection counters for graceful drain.
     pub backend_connections: Arc<BackendConnections>,
+    /// WAF engine for request inspection.
+    pub waf_engine: Arc<WafEngine>,
 }
 
 impl LoricaProxy {
@@ -199,7 +204,13 @@ impl LoricaProxy {
             log_buffer,
             active_connections,
             backend_connections: Arc::new(BackendConnections::new()),
+            waf_engine: Arc::new(WafEngine::new()),
         }
+    }
+
+    /// Return a reference to the WAF engine for API access.
+    pub fn waf_engine(&self) -> &Arc<WafEngine> {
+        &self.waf_engine
     }
 }
 
@@ -213,6 +224,86 @@ impl ProxyHttp for LoricaProxy {
             backend_addr: None,
             matched_host: None,
             matched_path: None,
+            waf_blocked: false,
+        }
+    }
+
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let req = session.req_header();
+
+        let host = req
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(|h| h.split(':').next().unwrap_or(h))
+            .unwrap_or("");
+
+        let path = req.uri.path();
+        let query = req.uri.query();
+        let config = self.config.load();
+
+        // Find matching route to check WAF settings
+        let route_entry = config.routes_by_host.get(host).and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| path.starts_with(&e.route.path_prefix))
+        });
+
+        let entry = match route_entry {
+            Some(e) => e,
+            None => return Ok(false), // No route = let upstream_peer handle 404
+        };
+
+        // Skip WAF evaluation entirely if not enabled (zero overhead)
+        if !entry.route.waf_enabled {
+            return Ok(false);
+        }
+
+        // Collect headers for inspection
+        let headers: Vec<(&str, &str)> = req
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                let name_str = name.as_str();
+                // Only inspect relevant headers (skip large/binary ones)
+                match name_str {
+                    "user-agent" | "referer" | "cookie" | "x-forwarded-for"
+                    | "content-type" | "authorization" | "origin" => {
+                        value.to_str().ok().map(|v| (name_str, v))
+                    }
+                    n if n.starts_with("x-") => {
+                        value.to_str().ok().map(|v| (name_str, v))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let waf_mode = match entry.route.waf_mode {
+            WafMode::Detection => lorica_waf::WafMode::Detection,
+            WafMode::Blocking => lorica_waf::WafMode::Blocking,
+        };
+
+        let verdict = self.waf_engine.evaluate(waf_mode, path, query, &headers, host);
+
+        match verdict {
+            lorica_waf::WafVerdict::Blocked(_) => {
+                ctx.waf_blocked = true;
+                ctx.matched_host = Some(host.to_string());
+                ctx.matched_path = Some(path.to_string());
+
+                let header = lorica_http::ResponseHeader::build(403, None)?;
+                session.write_response_header(Box::new(header), true).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 
