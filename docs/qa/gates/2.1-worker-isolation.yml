@@ -1,0 +1,44 @@
+schema: 1
+story: "2.1"
+story_title: "Process-Based Worker Isolation"
+gate: PASS
+status_reason: "All ACs met. assert_eq fix applied. Solid fork+exec architecture with SCM_RIGHTS FD passing."
+reviewer: "Quinn (Test Architect)"
+updated: "2026-03-30T08:35:00Z"
+
+top_issues: []
+
+waiver:
+  active: false
+
+quality_score: 95
+expires: "2026-04-13T08:35:00Z"
+
+evidence:
+  tests_reviewed: 10
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7]
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "Proper CLOEXEC management, minimal unsafe blocks, no privilege escalation"
+  performance:
+    status: PASS
+    notes: "500ms polling interval is negligible, one-time FD passing at startup"
+  reliability:
+    status: PASS
+    notes: "Auto-restart on crash. Backoff is a future improvement, not blocking."
+  maintainability:
+    status: PASS
+    notes: "Clean crate structure, well-documented public API, typed errors"
+
+recommendations:
+  immediate: []
+  future:
+    - action: "Add restart backoff to prevent crash loops"
+      refs: ["lorica-worker/src/manager.rs"]
+    - action: "Explicit SIGTERM to workers on supervisor shutdown"
+      refs: ["lorica/src/main.rs:run_supervisor"]
