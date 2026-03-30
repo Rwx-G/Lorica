@@ -1,7 +1,7 @@
 # Story 3.3: Notification Channels
 
 **Epic:** [Epic 3 - Intelligence](../prd/epic-3-intelligence.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P2
 **Depends on:** Epic 1 complete
 

@@ -1,7 +1,7 @@
 # Story 3.1: WAF Engine with OWASP CRS
 
 **Epic:** [Epic 3 - Intelligence](../prd/epic-3-intelligence.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P2
 **Depends on:** Epic 2 complete
 
