@@ -13,11 +13,33 @@
     state = v;
   });
 
+  function applyTheme(t: 'dark' | 'light') {
+    document.documentElement.setAttribute('data-theme', t);
+  }
+
+  async function loadTheme() {
+    const res = await api.listPreferences();
+    if (res.data) {
+      const themePref = res.data.preferences.find(
+        (p) => p.preference_key === 'theme',
+      );
+      if (themePref) {
+        const t = themePref.value === 'always' ? 'light' : 'dark';
+        applyTheme(t);
+        return;
+      }
+    }
+    // No preference saved yet - ensure light is explicit
+    applyTheme('light');
+  }
+
   onMount(async () => {
     // Check if we already have a valid session cookie (survives F5)
     const res = await api.getStatus();
     if (res.data) {
       auth.set({ status: 'authenticated' });
+      // Load theme preference immediately after confirming session
+      await loadTheme();
     }
     checking = false;
   });
