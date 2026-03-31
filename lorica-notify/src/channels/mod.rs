@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod email;
+pub mod slack;
 pub mod stdout;
 pub mod webhook;
 
@@ -63,6 +64,7 @@ struct RegisteredChannel {
 enum ChannelType {
     Email(EmailConfig),
     Webhook(WebhookConfig),
+    Slack(WebhookConfig),
 }
 
 /// Rate limiter configuration.
@@ -157,6 +159,22 @@ impl NotifyDispatcher {
         });
     }
 
+    /// Register a Slack (or Discord) webhook channel.
+    pub fn add_slack_channel(
+        &mut self,
+        id: String,
+        config: WebhookConfig,
+        alert_types: Vec<String>,
+        enabled: bool,
+    ) {
+        self.channels.push(RegisteredChannel {
+            id,
+            channel_type: ChannelType::Slack(config),
+            alert_types,
+            enabled,
+        });
+    }
+
     /// Clear all registered channels (for reconfiguration).
     pub fn clear_channels(&mut self) {
         self.channels.clear();
@@ -237,6 +255,22 @@ impl NotifyDispatcher {
                         );
                     }
                 }
+                ChannelType::Slack(config) => {
+                    if let Err(e) = slack::send(config, event).await {
+                        warn!(
+                            channel_id = %ch.id,
+                            error = %e,
+                            "failed to send Slack notification"
+                        );
+                    } else {
+                        self.record_send(&ch.id);
+                        info!(
+                            channel_id = %ch.id,
+                            alert_type = alert_str,
+                            "Slack notification sent"
+                        );
+                    }
+                }
             }
         }
     }
@@ -264,7 +298,7 @@ impl NotifyDispatcher {
         let entry = times.entry(channel_id.to_string()).or_default();
 
         // Evict expired entries
-        while entry.front().map_or(false, |t| now.duration_since(*t) > self.rate_limit.window) {
+        while entry.front().is_some_and(|t| now.duration_since(*t) > self.rate_limit.window) {
             entry.pop_front();
         }
 
