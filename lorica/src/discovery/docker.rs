@@ -16,6 +16,15 @@ use tracing::{debug, warn};
 
 use super::{DiscoveredEndpoint, DiscoveryError};
 
+/// A Docker Swarm service lifecycle event.
+#[derive(Debug, Clone)]
+pub struct ServiceEvent {
+    /// The action: "create", "update", "remove".
+    pub action: String,
+    /// The affected service name.
+    pub service_name: String,
+}
+
 /// Docker Swarm service discovery client.
 pub struct DockerDiscovery {
     client: Docker,
@@ -159,6 +168,50 @@ impl DockerDiscovery {
         );
 
         Ok(endpoints)
+    }
+
+    /// Watch Docker events for service changes in real-time.
+    ///
+    /// Returns a stream of `DiscoveryEvent` for service create/update/remove.
+    /// The caller should re-run `discover_service()` when relevant events arrive.
+    pub fn watch_service_events(
+        &self,
+    ) -> impl futures_util::Stream<Item = Result<ServiceEvent, DiscoveryError>> + '_ {
+        use bollard::system::EventsOptions;
+        use futures_util::StreamExt;
+
+        let mut filters = HashMap::new();
+        filters.insert("type".to_string(), vec!["service".to_string()]);
+
+        let options = EventsOptions {
+            since: None,
+            until: None,
+            filters,
+        };
+
+        self.client.events(Some(options)).map(|result| {
+            result
+                .map(|event| {
+                    let action = event.action.unwrap_or_default();
+                    let service_name = event
+                        .actor
+                        .and_then(|a| a.attributes)
+                        .and_then(|attrs| attrs.get("name").cloned())
+                        .unwrap_or_default();
+
+                    debug!(
+                        action = %action,
+                        service = %service_name,
+                        "Docker Swarm service event"
+                    );
+
+                    ServiceEvent {
+                        action,
+                        service_name,
+                    }
+                })
+                .map_err(|e| DiscoveryError::Docker(format!("event stream error: {e}")))
+        })
     }
 
     /// Ping the Docker daemon to verify connectivity.
