@@ -48,15 +48,25 @@ pub struct ProxyConfig {
     /// Routes indexed by hostname for fast matching.
     /// Each hostname maps to a list of routes sorted by path_prefix length (longest first).
     pub routes_by_host: HashMap<String, Vec<RouteEntry>>,
+    /// Wildcard routes (*.example.com) checked when exact lookup fails.
+    pub wildcard_routes: Vec<(String, Vec<RouteEntry>)>,
+    /// Merged security header presets (builtin + custom).
+    /// Custom presets override builtins when names collide.
+    pub security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
 }
 
 impl ProxyConfig {
     /// Build from config store data.
+    ///
+    /// `custom_security_presets` are merged with the builtins. A custom preset
+    /// whose name matches a builtin replaces it, allowing operators to override
+    /// the default "strict" / "moderate" definitions.
     pub fn from_store(
         routes: Vec<Route>,
         backends: Vec<Backend>,
         certificates: Vec<Certificate>,
         route_backend_links: Vec<(String, String)>,
+        custom_security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
     ) -> Self {
         let backend_map: HashMap<String, Backend> =
             backends.into_iter().map(|b| (b.id.clone(), b)).collect();
@@ -116,12 +126,65 @@ impl ProxyConfig {
             }
         }
 
+        // Separate wildcard hostnames (*.example.com) from exact ones
+        let mut wildcard_routes: Vec<(String, Vec<RouteEntry>)> = Vec::new();
+        let wildcard_keys: Vec<String> = routes_by_host
+            .keys()
+            .filter(|k| k.starts_with("*."))
+            .cloned()
+            .collect();
+        for key in wildcard_keys {
+            if let Some(entries) = routes_by_host.remove(&key) {
+                wildcard_routes.push((key, entries));
+            }
+        }
+
         // Sort each host's routes by path_prefix length descending (longest prefix match first)
         for entries in routes_by_host.values_mut() {
             entries.sort_by(|a, b| b.route.path_prefix.len().cmp(&a.route.path_prefix.len()));
         }
+        for (_, entries) in &mut wildcard_routes {
+            entries.sort_by(|a, b| b.route.path_prefix.len().cmp(&a.route.path_prefix.len()));
+        }
 
-        ProxyConfig { routes_by_host }
+        // Merge security presets: start with builtins, let custom override by name
+        let mut presets = lorica_config::models::builtin_security_presets();
+        for custom in custom_security_presets {
+            if let Some(existing) = presets.iter_mut().find(|p| p.name == custom.name) {
+                *existing = custom;
+            } else {
+                presets.push(custom);
+            }
+        }
+
+        ProxyConfig {
+            routes_by_host,
+            wildcard_routes,
+            security_presets: presets,
+        }
+    }
+
+    /// Find a matching route entry for a given host and path.
+    /// Exact hostname match takes precedence over wildcard.
+    pub fn find_route<'a>(&'a self, host: &str, path: &str) -> Option<&'a RouteEntry> {
+        // 1. Exact hostname match (O(1))
+        if let Some(entries) = self.routes_by_host.get(host) {
+            if let Some(entry) = entries.iter().find(|e| path.starts_with(&e.route.path_prefix)) {
+                return Some(entry);
+            }
+        }
+
+        // 2. Wildcard match (*.example.com matches foo.example.com)
+        for (pattern, entries) in &self.wildcard_routes {
+            let suffix = &pattern[1..]; // "*.example.com" -> ".example.com"
+            if host.ends_with(suffix) && host.len() > suffix.len() {
+                if let Some(entry) = entries.iter().find(|e| path.starts_with(&e.route.path_prefix)) {
+                    return Some(entry);
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -370,14 +433,8 @@ impl ProxyHttp for LoricaProxy {
         let query = req.uri.query();
         let config = self.config.load();
 
-        // Find matching route to check WAF settings
-        let route_entry = config.routes_by_host.get(host).and_then(|entries| {
-            entries
-                .iter()
-                .find(|e| path.starts_with(&e.route.path_prefix))
-        });
-
-        let entry = match route_entry {
+        // Find matching route (exact hostname first, then wildcard)
+        let entry = match config.find_route(host, path) {
             Some(e) => e,
             None => return Ok(false), // No route = let upstream_peer handle 404
         };
@@ -550,14 +607,8 @@ impl ProxyHttp for LoricaProxy {
         let path = req.uri.path();
         let config = self.config.load();
 
-        // Find matching route by hostname then longest path prefix
-        let route_entry = config.routes_by_host.get(host).and_then(|entries| {
-            entries
-                .iter()
-                .find(|e| path.starts_with(&e.route.path_prefix))
-        });
-
-        let entry = match route_entry {
+        // Find matching route (exact hostname first, then wildcard)
+        let entry = match config.find_route(host, path) {
             Some(e) => e,
             None => {
                 return Error::e_explain(
@@ -748,46 +799,16 @@ impl ProxyHttp for LoricaProxy {
             upstream_response.remove_header(name.as_str());
         }
 
-        // Security headers based on preset level
-        match route.security_headers.as_str() {
-            "strict" => {
-                let _ = upstream_response
-                    .insert_header("X-Content-Type-Options", "nosniff");
-                let _ = upstream_response
-                    .insert_header("X-Frame-Options", "DENY");
-                let _ = upstream_response
-                    .insert_header("X-XSS-Protection", "1; mode=block");
-                let _ = upstream_response.insert_header(
-                    "Strict-Transport-Security",
-                    "max-age=63072000; includeSubDomains; preload",
-                );
-                let _ = upstream_response.insert_header(
-                    "Content-Security-Policy",
-                    "default-src 'self'",
-                );
-                let _ = upstream_response
-                    .insert_header("Referrer-Policy", "no-referrer");
-                let _ = upstream_response.insert_header(
-                    "Permissions-Policy",
-                    "geolocation=(), camera=(), microphone=()",
-                );
+        // Security headers based on preset name (looked up in merged presets)
+        let config = self.config.load();
+        if let Some(preset) = config
+            .security_presets
+            .iter()
+            .find(|p| p.name == route.security_headers)
+        {
+            for (name, value) in &preset.headers {
+                let _ = upstream_response.insert_header(name.as_str(), value.as_str());
             }
-            "moderate" => {
-                let _ = upstream_response
-                    .insert_header("X-Content-Type-Options", "nosniff");
-                let _ = upstream_response
-                    .insert_header("X-Frame-Options", "SAMEORIGIN");
-                let _ = upstream_response
-                    .insert_header("X-XSS-Protection", "1; mode=block");
-                let _ = upstream_response.insert_header(
-                    "Strict-Transport-Security",
-                    "max-age=31536000; includeSubDomains",
-                );
-                let _ = upstream_response
-                    .insert_header("Referrer-Policy", "strict-origin-when-cross-origin");
-            }
-            // "none" or anything else - skip security headers
-            _ => {}
         }
 
         Ok(())
@@ -983,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_from_store_empty() {
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![]);
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![]);
         assert!(config.routes_by_host.is_empty());
     }
 
@@ -993,7 +1014,7 @@ mod tests {
         let backend = make_backend("b1", "10.0.0.1:8080");
         let links = vec![("r1".into(), "b1".into())];
 
-        let config = ProxyConfig::from_store(vec![route], vec![backend], vec![], links);
+        let config = ProxyConfig::from_store(vec![route], vec![backend], vec![], links, vec![]);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].backends.len(), 1);
@@ -1005,7 +1026,7 @@ mod tests {
         let r1 = make_route("r1", "example.com", "/", true);
         let r2 = make_route("r2", "disabled.com", "/", false);
 
-        let config = ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![]);
+        let config = ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![]);
         assert!(config.routes_by_host.contains_key("example.com"));
         assert!(!config.routes_by_host.contains_key("disabled.com"));
     }
@@ -1016,7 +1037,7 @@ mod tests {
         let r2 = make_route("r2", "example.com", "/api", true);
         let r3 = make_route("r3", "example.com", "/api/v1", true);
 
-        let config = ProxyConfig::from_store(vec![r1, r2, r3], vec![], vec![], vec![]);
+        let config = ProxyConfig::from_store(vec![r1, r2, r3], vec![], vec![], vec![], vec![]);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].route.path_prefix, "/api/v1");
@@ -1028,7 +1049,7 @@ mod tests {
     fn test_from_store_route_without_backends() {
         let route = make_route("r1", "example.com", "/", true);
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![]);
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![]);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].backends.is_empty());
     }
@@ -1039,7 +1060,7 @@ mod tests {
         route.certificate_id = Some("c1".into());
         let cert = make_certificate("c1", "example.com");
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![cert], vec![]);
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![cert], vec![], vec![]);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].certificate.is_some());
         assert_eq!(entries[0].certificate.as_ref().unwrap().domain, "example.com");
@@ -1050,7 +1071,7 @@ mod tests {
         let mut route = make_route("r1", "example.com", "/", true);
         route.certificate_id = Some("nonexistent".into());
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![]);
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![]);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].certificate.is_none());
     }
@@ -1065,7 +1086,7 @@ mod tests {
             ("r1".into(), "b2".into()),
         ];
 
-        let config = ProxyConfig::from_store(vec![route], vec![b1, b2], vec![], links);
+        let config = ProxyConfig::from_store(vec![route], vec![b1, b2], vec![], links, vec![]);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries[0].backends.len(), 2);
     }
@@ -1075,7 +1096,7 @@ mod tests {
         let r1 = make_route("r1", "foo.com", "/", true);
         let r2 = make_route("r2", "bar.com", "/", true);
 
-        let config = ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![]);
+        let config = ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![]);
         assert_eq!(config.routes_by_host.len(), 2);
         assert!(config.routes_by_host.contains_key("foo.com"));
         assert!(config.routes_by_host.contains_key("bar.com"));
@@ -1086,7 +1107,7 @@ mod tests {
         let route = make_route("r1", "example.com", "/", true);
         let links = vec![("r1".into(), "nonexistent-backend".into())];
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], links);
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], links, vec![]);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].backends.is_empty());
     }
@@ -1095,7 +1116,7 @@ mod tests {
     fn test_from_store_rr_counter_starts_at_zero() {
         let route = make_route("r1", "example.com", "/", true);
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![]);
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![]);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries[0].rr_counter.load(Ordering::Relaxed), 0);
     }
@@ -1218,7 +1239,7 @@ mod tests {
         let mut route = make_route("r1", "example.com", "/", true);
         route.hostname_aliases = vec!["www.example.com".into(), "alias.example.com".into()];
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![]);
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![]);
         assert!(config.routes_by_host.contains_key("example.com"));
         assert!(config.routes_by_host.contains_key("www.example.com"));
         assert!(config.routes_by_host.contains_key("alias.example.com"));
@@ -1241,5 +1262,54 @@ mod tests {
     fn test_ip_matches_cidr_prefix() {
         assert!(ip_matches("192.168.1.100", "192.168.1/24"));
         assert!(!ip_matches("10.0.0.1", "192.168.1/24"));
+    }
+
+    // ---- Security Presets in ProxyConfig ----
+
+    #[test]
+    fn test_proxy_config_has_builtin_presets_by_default() {
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![]);
+        let names: Vec<&str> = config
+            .security_presets
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(names.contains(&"strict"));
+        assert!(names.contains(&"moderate"));
+        assert!(names.contains(&"none"));
+    }
+
+    #[test]
+    fn test_proxy_config_custom_preset_added() {
+        let custom = lorica_config::models::SecurityHeaderPreset {
+            name: "api-only".to_string(),
+            headers: std::collections::HashMap::from([
+                ("X-Custom-Header".to_string(), "yes".to_string()),
+            ]),
+        };
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![custom]);
+        let found = config.security_presets.iter().find(|p| p.name == "api-only");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().headers["X-Custom-Header"], "yes");
+    }
+
+    #[test]
+    fn test_proxy_config_custom_preset_overrides_builtin() {
+        let custom_strict = lorica_config::models::SecurityHeaderPreset {
+            name: "strict".to_string(),
+            headers: std::collections::HashMap::from([
+                ("X-Frame-Options".to_string(), "SAMEORIGIN".to_string()),
+            ]),
+        };
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![custom_strict]);
+        let strict = config
+            .security_presets
+            .iter()
+            .find(|p| p.name == "strict")
+            .unwrap();
+        // The custom override should have replaced the builtin
+        assert_eq!(strict.headers["X-Frame-Options"], "SAMEORIGIN");
+        // And should NOT have the builtin headers that were not in the override
+        assert!(!strict.headers.contains_key("Content-Security-Policy"));
     }
 }

@@ -251,7 +251,9 @@ pub async fn delete_custom_rule(
         .ok_or_else(|| ApiError::BadRequest("WAF engine not initialized".into()))?;
 
     if engine.remove_custom_rule(rule_id) {
-        Ok(json_data(serde_json::json!({"deleted": true, "id": rule_id})))
+        Ok(json_data(
+            serde_json::json!({"deleted": true, "id": rule_id}),
+        ))
     } else {
         Err(ApiError::NotFound(format!("custom rule {rule_id}")))
     }
@@ -302,9 +304,7 @@ pub async fn toggle_blocklist(
 
 /// Fetch and load the blocklist from the remote URL.
 /// Shared between the manual reload endpoint and the background task.
-async fn fetch_and_load_blocklist(
-    blocklist: &lorica_waf::IpBlocklist,
-) -> Result<usize, String> {
+async fn fetch_and_load_blocklist(blocklist: &lorica_waf::IpBlocklist) -> Result<usize, String> {
     let url = lorica_waf::ip_blocklist::DEFAULT_BLOCKLIST_URL;
 
     let client = reqwest::Client::builder()
@@ -369,10 +369,7 @@ pub fn spawn_blocklist_refresh(
 
             match fetch_and_load_blocklist(engine.ip_blocklist()).await {
                 Ok(count) => {
-                    tracing::info!(
-                        count = count,
-                        "IP blocklist refreshed from remote"
-                    );
+                    tracing::info!(count = count, "IP blocklist refreshed from remote");
                 }
                 Err(e) => {
                     tracing::warn!(

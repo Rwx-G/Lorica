@@ -348,6 +348,36 @@ mod tests {
         assert_eq!(fetched.default_health_check_interval_s, 30);
     }
 
+    #[test]
+    fn test_global_settings_custom_security_presets_round_trip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+
+        // Initially empty
+        let settings = store.get_global_settings().unwrap();
+        assert!(settings.custom_security_presets.is_empty());
+
+        // Store custom presets
+        let custom = SecurityHeaderPreset {
+            name: "api-only".to_string(),
+            headers: std::collections::HashMap::from([
+                ("X-API-Version".to_string(), "2".to_string()),
+                ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+            ]),
+        };
+        let mut updated = settings;
+        updated.custom_security_presets = vec![custom];
+        store.update_global_settings(&updated).unwrap();
+
+        // Read back
+        let fetched = store.get_global_settings().unwrap();
+        assert_eq!(fetched.custom_security_presets.len(), 1);
+        assert_eq!(fetched.custom_security_presets[0].name, "api-only");
+        assert_eq!(
+            fetched.custom_security_presets[0].headers["X-API-Version"],
+            "2"
+        );
+    }
+
     // ---- Migration ----
 
     #[test]

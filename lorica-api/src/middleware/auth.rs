@@ -266,7 +266,10 @@ mod tests {
     #[test]
     fn test_extract_session_cookie_from_request() {
         let req = Request::builder()
-            .header(http::header::COOKIE, "lorica_session=test-sid-123; other=val")
+            .header(
+                http::header::COOKIE,
+                "lorica_session=test-sid-123; other=val",
+            )
             .body(axum::body::Body::empty())
             .unwrap();
         let result = extract_session_cookie(&req);
@@ -275,9 +278,7 @@ mod tests {
 
     #[test]
     fn test_extract_session_cookie_missing() {
-        let req = Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
+        let req = Request::builder().body(axum::body::Body::empty()).unwrap();
         assert!(extract_session_cookie(&req).is_none());
     }
 

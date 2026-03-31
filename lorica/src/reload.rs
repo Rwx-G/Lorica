@@ -33,13 +33,18 @@ pub async fn reload_proxy_config(
     let backends = store.list_backends()?;
     let certificates = store.list_certificates()?;
     let route_backends = store.list_route_backends()?;
+    let custom_presets = store
+        .get_global_settings()
+        .map(|s| s.custom_security_presets)
+        .unwrap_or_default();
 
     let links: Vec<(String, String)> = route_backends
         .into_iter()
         .map(|rb| (rb.route_id, rb.backend_id))
         .collect();
 
-    let new_config = ProxyConfig::from_store(routes, backends, certificates, links);
+    let new_config =
+        ProxyConfig::from_store(routes, backends, certificates, links, custom_presets);
 
     let route_count: usize = new_config.routes_by_host.values().map(|v| v.len()).sum();
     info!(routes = route_count, "proxy configuration reloaded");

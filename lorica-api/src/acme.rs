@@ -44,7 +44,10 @@ impl AcmeChallengeStore {
     }
 
     pub async fn set(&self, token: String, key_authorization: String) {
-        self.challenges.write().await.insert(token, key_authorization);
+        self.challenges
+            .write()
+            .await
+            .insert(token, key_authorization);
     }
 
     pub async fn get(&self, token: &str) -> Option<String> {
@@ -181,15 +184,11 @@ async fn provision_with_acme(
     domain: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
-        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder,
-        OrderStatus,
+        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
     };
 
     // Create or load ACME account
-    let contact = config
-        .contact_email
-        .as_ref()
-        .map(|e| format!("mailto:{e}"));
+    let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
     let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
 
     let (account, _) = Account::create(
@@ -260,8 +259,9 @@ async fn provision_with_acme(
                     return Err("challenge validation failed (invalid)".into());
                 }
                 _ => {
-                    return Err(format!("unexpected authorization status: {:?}", auth.status)
-                        .into());
+                    return Err(
+                        format!("unexpected authorization status: {:?}", auth.status).into(),
+                    );
                 }
             }
         }
@@ -442,9 +442,7 @@ impl DnsChallengeConfig {
         if self.api_token.is_empty() {
             return Err("api_token is required".into());
         }
-        if self.provider == "route53"
-            && self.api_secret.as_ref().is_none_or(|s| s.is_empty())
-        {
+        if self.provider == "route53" && self.api_secret.as_ref().is_none_or(|s| s.is_empty()) {
             return Err("api_secret is required for route53 provider".into());
         }
         Ok(())
@@ -536,9 +534,7 @@ impl DnsChallenger for CloudflareDnsChallenger {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "Cloudflare API returned {status}: {body}"
-            ));
+            return Err(format!("Cloudflare API returned {status}: {body}"));
         }
 
         info!(domain = %domain, record = %record_name, "Cloudflare DNS TXT record created");
@@ -568,9 +564,7 @@ impl DnsChallenger for CloudflareDnsChallenger {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "Cloudflare API delete returned {status}: {body}"
-            ));
+            return Err(format!("Cloudflare API delete returned {status}: {body}"));
         }
 
         info!(domain = %domain, record = %record_name, "Cloudflare DNS TXT record deleted");
@@ -642,10 +636,7 @@ impl Route53DnsChallenger {
         let body_hash_hex = hex_encode(body_hash.as_ref());
 
         // Build canonical request components for AWS SigV4
-        let canonical_uri = format!(
-            "/2013-04-01/hostedzone/{}/rrset",
-            self.hosted_zone_id
-        );
+        let canonical_uri = format!("/2013-04-01/hostedzone/{}/rrset", self.hosted_zone_id);
         let canonical_headers = format!(
             "content-type:application/xml\nhost:route53.amazonaws.com\nx-amz-date:{date}\n"
         );
@@ -659,9 +650,8 @@ impl Route53DnsChallenger {
             hex_encode(digest::digest(&digest::SHA256, canonical_request.as_bytes()).as_ref());
 
         let credential_scope = format!("{date_short}/us-east-1/route53/aws4_request");
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{date}\n{credential_scope}\n{canonical_request_hash}"
-        );
+        let string_to_sign =
+            format!("AWS4-HMAC-SHA256\n{date}\n{credential_scope}\n{canonical_request_hash}");
 
         // Derive signing key
         let k_date = hmac_sha256(
@@ -733,9 +723,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Build a `DnsChallenger` from a `DnsChallengeConfig`.
-pub fn build_dns_challenger(
-    config: &DnsChallengeConfig,
-) -> Result<Box<dyn DnsChallenger>, String> {
+pub fn build_dns_challenger(config: &DnsChallengeConfig) -> Result<Box<dyn DnsChallenger>, String> {
     config.validate()?;
     match config.provider.as_str() {
         "cloudflare" => Ok(Box::new(CloudflareDnsChallenger::new(
@@ -798,8 +786,7 @@ pub async fn provision_certificate_dns(
         "starting ACME DNS-01 certificate provisioning"
     );
 
-    let result =
-        provision_with_acme_dns(&state, &config, &body.domain, challenger.as_ref()).await;
+    let result = provision_with_acme_dns(&state, &config, &body.domain, challenger.as_ref()).await;
 
     match result {
         Ok(cert_id) => {
@@ -828,15 +815,11 @@ async fn provision_with_acme_dns(
     challenger: &dyn DnsChallenger,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
-        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder,
-        OrderStatus,
+        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
     };
 
     // Create or load ACME account
-    let contact = config
-        .contact_email
-        .as_ref()
-        .map(|e| format!("mailto:{e}"));
+    let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
     let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
 
     let (account, _) = Account::create(
@@ -879,10 +862,8 @@ async fn provision_with_acme_dns(
         // of the key authorization.
         use base64::Engine;
         use ring::digest;
-        let digest =
-            digest::digest(&digest::SHA256, key_authorization.as_str().as_bytes());
-        let txt_value = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(digest.as_ref());
+        let digest = digest::digest(&digest::SHA256, key_authorization.as_str().as_bytes());
+        let txt_value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref());
 
         // Create TXT record via DNS provider
         challenger
@@ -920,11 +901,9 @@ async fn provision_with_acme_dns(
                 }
                 _ => {
                     let _ = challenger.delete_txt_record(domain).await;
-                    return Err(format!(
-                        "unexpected authorization status: {:?}",
-                        auth.status
-                    )
-                    .into());
+                    return Err(
+                        format!("unexpected authorization status: {:?}", auth.status).into(),
+                    );
                 }
             }
         }
@@ -1154,11 +1133,7 @@ mod tests {
 
     #[test]
     fn test_route53_change_xml_structure() {
-        let xml = Route53DnsChallenger::build_change_xml(
-            "UPSERT",
-            "example.com",
-            "test-value-123",
-        );
+        let xml = Route53DnsChallenger::build_change_xml("UPSERT", "example.com", "test-value-123");
         assert!(xml.contains("_acme-challenge.example.com."));
         assert!(xml.contains("UPSERT"));
         assert!(xml.contains("TXT"));

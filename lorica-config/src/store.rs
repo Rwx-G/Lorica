@@ -1024,6 +1024,14 @@ impl ConfigStore {
                         ConfigError::Validation("invalid default_topology_type".into())
                     })?;
                 }
+                "custom_security_presets" => {
+                    settings.custom_security_presets =
+                        serde_json::from_str(&value).map_err(|e| {
+                            ConfigError::Validation(format!(
+                                "invalid custom_security_presets JSON: {e}"
+                            ))
+                        })?;
+                }
                 _ => {}
             }
         }
@@ -1055,6 +1063,14 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('default_topology_type', ?1)",
             params![settings.default_topology_type.as_str()],
+        )?;
+        let presets_json =
+            serde_json::to_string(&settings.custom_security_presets).map_err(|e| {
+                ConfigError::Validation(format!("failed to serialize custom_security_presets: {e}"))
+            })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('custom_security_presets', ?1)",
+            params![presets_json],
         )?;
         Ok(())
     }

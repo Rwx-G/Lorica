@@ -87,10 +87,8 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         |c| format!("{} ({})", c.domain, c.id),
     );
 
-    let route_backends = diff_route_backends(
-        &store.list_route_backends()?,
-        &incoming.route_backends,
-    );
+    let route_backends =
+        diff_route_backends(&store.list_route_backends()?, &incoming.route_backends);
 
     let notification_configs = diff_by_id(
         &store.list_notification_configs()?,
@@ -116,10 +114,7 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         |u| format!("{} ({})", u.username, u.id),
     );
 
-    let global_settings = diff_settings(
-        &store.get_global_settings()?,
-        &incoming.global_settings,
-    );
+    let global_settings = diff_settings(&store.get_global_settings()?, &incoming.global_settings);
 
     Ok(ConfigDiff {
         routes,

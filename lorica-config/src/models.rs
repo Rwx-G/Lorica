@@ -219,6 +219,81 @@ impl FromStr for PreferenceValue {
     }
 }
 
+// --- Security Header Presets ---
+
+/// A named collection of HTTP security headers that can be applied to routes.
+///
+/// Routes reference a preset by name via `security_headers`. The proxy engine
+/// resolves the name against builtin presets first, then custom presets from
+/// `GlobalSettings`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityHeaderPreset {
+    pub name: String,
+    pub headers: HashMap<String, String>,
+}
+
+/// Return the three builtin security header presets: "strict", "moderate", and "none".
+///
+/// These match the original hardcoded header sets that were previously inlined
+/// in the proxy `response_filter`.
+pub fn builtin_security_presets() -> Vec<SecurityHeaderPreset> {
+    vec![
+        SecurityHeaderPreset {
+            name: "strict".to_string(),
+            headers: HashMap::from([
+                (
+                    "Strict-Transport-Security".to_string(),
+                    "max-age=63072000; includeSubDomains; preload".to_string(),
+                ),
+                ("X-Frame-Options".to_string(), "DENY".to_string()),
+                ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+                ("Referrer-Policy".to_string(), "no-referrer".to_string()),
+                (
+                    "Content-Security-Policy".to_string(),
+                    "default-src 'self'".to_string(),
+                ),
+                (
+                    "Permissions-Policy".to_string(),
+                    "geolocation=(), camera=(), microphone=()".to_string(),
+                ),
+                ("X-XSS-Protection".to_string(), "1; mode=block".to_string()),
+            ]),
+        },
+        SecurityHeaderPreset {
+            name: "moderate".to_string(),
+            headers: HashMap::from([
+                ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+                ("X-Frame-Options".to_string(), "SAMEORIGIN".to_string()),
+                ("X-XSS-Protection".to_string(), "1; mode=block".to_string()),
+                (
+                    "Strict-Transport-Security".to_string(),
+                    "max-age=31536000; includeSubDomains".to_string(),
+                ),
+                (
+                    "Referrer-Policy".to_string(),
+                    "strict-origin-when-cross-origin".to_string(),
+                ),
+            ]),
+        },
+        SecurityHeaderPreset {
+            name: "none".to_string(),
+            headers: HashMap::new(),
+        },
+    ]
+}
+
+/// Resolve a preset name against the given presets list.
+///
+/// Searches builtin presets first, then custom presets. Returns `None` when the
+/// name does not match any known preset (the caller should skip header injection
+/// in that case, matching the previous "none or anything else" fallback).
+pub fn resolve_security_preset<'a>(
+    name: &str,
+    custom_presets: &'a [SecurityHeaderPreset],
+) -> Option<&'a SecurityHeaderPreset> {
+    custom_presets.iter().find(|p| p.name == name)
+}
+
 // --- Data Models ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +449,11 @@ pub struct GlobalSettings {
     pub loadtest_max_duration_s: i32,
     #[serde(default = "default_loadtest_max_rps")]
     pub loadtest_max_rps: i32,
+    /// User-defined security header presets, stored as JSON.
+    /// These extend the builtin presets ("strict", "moderate", "none").
+    /// If a custom preset shares a name with a builtin, the custom one wins.
+    #[serde(default)]
+    pub custom_security_presets: Vec<SecurityHeaderPreset>,
 }
 
 fn default_security_headers() -> String {
@@ -445,6 +525,7 @@ impl Default for GlobalSettings {
             loadtest_max_concurrency: 100,
             loadtest_max_duration_s: 60,
             loadtest_max_rps: 1000,
+            custom_security_presets: Vec::new(),
         }
     }
 }
@@ -774,5 +855,81 @@ mod tests {
         let settings: GlobalSettings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.cert_warning_days, 30);
         assert_eq!(settings.cert_critical_days, 7);
+    }
+
+    #[test]
+    fn test_global_settings_custom_presets_default_empty() {
+        let settings = GlobalSettings::default();
+        assert!(settings.custom_security_presets.is_empty());
+    }
+
+    #[test]
+    fn test_global_settings_custom_presets_deserialized_on_missing() {
+        let json =
+            r#"{"management_port":9443,"log_level":"info","default_health_check_interval_s":10}"#;
+        let settings: GlobalSettings = serde_json::from_str(json).unwrap();
+        assert!(settings.custom_security_presets.is_empty());
+    }
+
+    // ---- SecurityHeaderPreset ----
+
+    #[test]
+    fn test_builtin_security_presets_names() {
+        let presets = builtin_security_presets();
+        let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["strict", "moderate", "none"]);
+    }
+
+    #[test]
+    fn test_builtin_strict_preset_has_expected_headers() {
+        let presets = builtin_security_presets();
+        let strict = presets.iter().find(|p| p.name == "strict").unwrap();
+        assert!(strict.headers.contains_key("Strict-Transport-Security"));
+        assert!(strict.headers.contains_key("X-Frame-Options"));
+        assert!(strict.headers.contains_key("Content-Security-Policy"));
+        assert!(strict.headers.contains_key("Permissions-Policy"));
+        assert_eq!(strict.headers["X-Frame-Options"], "DENY");
+    }
+
+    #[test]
+    fn test_builtin_moderate_preset_has_expected_headers() {
+        let presets = builtin_security_presets();
+        let moderate = presets.iter().find(|p| p.name == "moderate").unwrap();
+        assert!(moderate.headers.contains_key("X-Content-Type-Options"));
+        assert!(moderate.headers.contains_key("Strict-Transport-Security"));
+        assert_eq!(moderate.headers["X-Frame-Options"], "SAMEORIGIN");
+    }
+
+    #[test]
+    fn test_builtin_none_preset_is_empty() {
+        let presets = builtin_security_presets();
+        let none = presets.iter().find(|p| p.name == "none").unwrap();
+        assert!(none.headers.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_security_preset_finds_by_name() {
+        let presets = builtin_security_presets();
+        let found = resolve_security_preset("strict", &presets);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "strict");
+    }
+
+    #[test]
+    fn test_resolve_security_preset_returns_none_for_unknown() {
+        let presets = builtin_security_presets();
+        assert!(resolve_security_preset("nonexistent", &presets).is_none());
+    }
+
+    #[test]
+    fn test_security_header_preset_serde_round_trip() {
+        let preset = SecurityHeaderPreset {
+            name: "custom".to_string(),
+            headers: HashMap::from([("X-Custom".to_string(), "value".to_string())]),
+        };
+        let json = serde_json::to_string(&preset).unwrap();
+        let deserialized: SecurityHeaderPreset = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "custom");
+        assert_eq!(deserialized.headers["X-Custom"], "value");
     }
 }

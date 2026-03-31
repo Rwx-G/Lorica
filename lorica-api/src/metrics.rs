@@ -22,8 +22,7 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Registry,
-    TextEncoder,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Registry, TextEncoder,
 };
 
 use crate::server::AppState;
@@ -136,8 +135,7 @@ pub fn set_ewma_score(address: &str, score_us: f64) {
 /// System CPU usage gauge (0-100).
 static SYSTEM_CPU_PERCENT: Lazy<prometheus::Gauge> = Lazy::new(|| {
     let gauge =
-        prometheus::Gauge::new("lorica_system_cpu_percent", "System CPU usage percentage")
-            .unwrap();
+        prometheus::Gauge::new("lorica_system_cpu_percent", "System CPU usage percentage").unwrap();
     REGISTRY.register(Box::new(gauge.clone())).ok();
     gauge
 });
@@ -177,9 +175,7 @@ pub fn set_backend_health(backend_id: &str, address: &str, health: f64) {
 
 /// Update certificate expiry metric.
 pub fn set_cert_expiry_days(domain: &str, days: f64) {
-    CERT_EXPIRY_DAYS
-        .with_label_values(&[domain])
-        .set(days);
+    CERT_EXPIRY_DAYS.with_label_values(&[domain]).set(days);
 }
 
 /// Record a WAF event.
@@ -199,9 +195,7 @@ pub fn set_system_metrics(cpu_percent: f64, memory_used_bytes: i64) {
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,
 /// system resources) from AppState before encoding.
-pub async fn get_metrics(
-    Extension(state): Extension<AppState>,
-) -> impl IntoResponse {
+pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResponse {
     // Refresh active connections
     set_active_connections(
         state
@@ -250,10 +244,7 @@ pub async fn get_metrics(
         );
     }
 
-    (
-        [(header::CONTENT_TYPE, content_type)],
-        buffer,
-    )
+    ([(header::CONTENT_TYPE, content_type)], buffer)
 }
 
 #[cfg(test)]

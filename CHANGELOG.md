@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Configurable security header presets** - Security header presets ("strict", "moderate", "none") are no longer hardcoded in the proxy engine. Builtin presets are defined as data in `builtin_security_presets()` and can be extended or overridden via `custom_security_presets` in GlobalSettings. Operators can define new named presets (e.g. "api-only") and reference them in route `security_headers` field. Custom presets with the same name as a builtin replace it.
+
 ### Added
 
 - **Route configuration** (Epic 6) - 25 per-route production proxy settings: force HTTPS redirect (301), hostname redirect, hostname aliases, configurable proxy headers (set/remove), response headers (set/remove), security headers presets (strict/moderate/none with HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy), per-route timeouts (connect/read/send), path rewriting (strip/add prefix), access log toggle, max request body size, WebSocket toggle, per-route rate limiting (RPS + burst), IP allowlist/denylist, CORS configuration (origins, methods, max-age), gzip compression toggle, retry attempts. Dashboard Routes form with collapsible Advanced Configuration section.

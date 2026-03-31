@@ -107,13 +107,34 @@ mod tests {
 
     #[test]
     fn test_status_codes() {
-        assert_eq!(ApiError::NotFound("x".into()).status_code(), StatusCode::NOT_FOUND);
-        assert_eq!(ApiError::BadRequest("x".into()).status_code(), StatusCode::BAD_REQUEST);
-        assert_eq!(ApiError::Unauthorized("x".into()).status_code(), StatusCode::UNAUTHORIZED);
-        assert_eq!(ApiError::Forbidden("x".into()).status_code(), StatusCode::FORBIDDEN);
-        assert_eq!(ApiError::Conflict("x".into()).status_code(), StatusCode::CONFLICT);
-        assert_eq!(ApiError::RateLimited.status_code(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(ApiError::Internal("x".into()).status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            ApiError::NotFound("x".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            ApiError::BadRequest("x".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ApiError::Unauthorized("x".into()).status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            ApiError::Forbidden("x".into()).status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ApiError::Conflict("x".into()).status_code(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ApiError::RateLimited.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            ApiError::Internal("x".into()).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
@@ -129,8 +150,14 @@ mod tests {
 
     #[test]
     fn test_display_messages() {
-        assert_eq!(ApiError::NotFound("item".into()).to_string(), "not found: item");
-        assert_eq!(ApiError::BadRequest("bad".into()).to_string(), "bad request: bad");
+        assert_eq!(
+            ApiError::NotFound("item".into()).to_string(),
+            "not found: item"
+        );
+        assert_eq!(
+            ApiError::BadRequest("bad".into()).to_string(),
+            "bad request: bad"
+        );
         assert_eq!(ApiError::RateLimited.to_string(), "rate limited");
     }
 
@@ -162,8 +189,7 @@ mod tests {
 
     #[test]
     fn test_config_error_other_converts_to_internal() {
-        let err: ApiError =
-            lorica_config::ConfigError::Serialization("toml fail".into()).into();
+        let err: ApiError = lorica_config::ConfigError::Serialization("toml fail".into()).into();
         assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 

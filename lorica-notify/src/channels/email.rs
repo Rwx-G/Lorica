@@ -58,8 +58,7 @@ pub async fn send(config: &EmailConfig, event: &AlertEvent) -> Result<(), Notify
             .map_err(|e| NotifyError::Email(format!("SMTP relay error: {e}")))?
             .port(port);
 
-    if let (Some(ref username), Some(ref password)) =
-        (&config.smtp_username, &config.smtp_password)
+    if let (Some(ref username), Some(ref password)) = (&config.smtp_username, &config.smtp_password)
     {
         transport_builder =
             transport_builder.credentials(Credentials::new(username.clone(), password.clone()));

@@ -298,7 +298,10 @@ impl NotifyDispatcher {
         let entry = times.entry(channel_id.to_string()).or_default();
 
         // Evict expired entries
-        while entry.front().is_some_and(|t| now.duration_since(*t) > self.rate_limit.window) {
+        while entry
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > self.rate_limit.window)
+        {
             entry.pop_front();
         }
 
