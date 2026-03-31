@@ -405,6 +405,96 @@ export const api = {
 
   toggleWafRule: (ruleId: number, enabled: boolean) =>
     request<{ rule_id: number; enabled: boolean }>('PUT', `/waf/rules/${ruleId}`, { enabled }),
+
+  // Backends CRUD
+  getBackend: (id: string) =>
+    request<BackendResponse>('GET', `/backends/${id}`),
+
+  createBackend: (body: CreateBackendRequest) =>
+    request<BackendResponse>('POST', '/backends', body),
+
+  updateBackend: (id: string, body: UpdateBackendRequest) =>
+    request<BackendResponse>('PUT', `/backends/${id}`, body),
+
+  deleteBackend: (id: string) =>
+    request<{ message: string }>('DELETE', `/backends/${id}`),
+
+  // SLA
+  getSlaOverview: () =>
+    request<SlaSummary[]>('GET', '/sla/overview'),
+
+  getRouteSla: (routeId: string) =>
+    request<SlaSummary[]>('GET', `/sla/routes/${routeId}`),
+
+  getRouteSlaActive: (routeId: string) =>
+    request<SlaSummary[]>('GET', `/sla/routes/${routeId}/active`),
+
+  getRouteSlaBuckets: (routeId: string, params?: { from?: string; to?: string; source?: string }) => {
+    const query = new URLSearchParams();
+    if (params?.from) query.set('from', params.from);
+    if (params?.to) query.set('to', params.to);
+    if (params?.source) query.set('source', params.source);
+    const qs = query.toString();
+    return request<SlaBucket[]>('GET', `/sla/routes/${routeId}/buckets${qs ? `?${qs}` : ''}`);
+  },
+
+  getSlaConfig: (routeId: string) =>
+    request<SlaConfigResponse>('GET', `/sla/routes/${routeId}/config`),
+
+  updateSlaConfig: (routeId: string, body: UpdateSlaConfigRequest) =>
+    request<SlaConfigResponse>('PUT', `/sla/routes/${routeId}/config`, body),
+
+  exportSla: (routeId: string, format: 'json' | 'csv' = 'json') => {
+    const url = `${BASE}/sla/routes/${routeId}/export?format=${format}`;
+    return fetch(url, { credentials: 'same-origin' });
+  },
+
+  // Probes
+  listProbes: () =>
+    request<ProbeConfigResponse[]>('GET', '/probes'),
+
+  listProbesForRoute: (routeId: string) =>
+    request<ProbeConfigResponse[]>('GET', `/probes/route/${routeId}`),
+
+  createProbe: (body: CreateProbeRequest) =>
+    request<ProbeConfigResponse>('POST', '/probes', body),
+
+  updateProbe: (id: string, body: UpdateProbeRequest) =>
+    request<ProbeConfigResponse>('PUT', `/probes/${id}`, body),
+
+  deleteProbe: (id: string) =>
+    request<{ deleted: string }>('DELETE', `/probes/${id}`),
+
+  // Load Testing
+  listLoadTestConfigs: () =>
+    request<LoadTestConfigResponse[]>('GET', '/loadtest/configs'),
+
+  createLoadTestConfig: (body: CreateLoadTestRequest) =>
+    request<LoadTestConfigResponse>('POST', '/loadtest/configs', body),
+
+  deleteLoadTestConfig: (id: string) =>
+    request<{ deleted: string }>('DELETE', `/loadtest/configs/${id}`),
+
+  cloneLoadTestConfig: (id: string, name?: string) =>
+    request<LoadTestConfigResponse>('POST', `/loadtest/configs/${id}/clone`, { name }),
+
+  startLoadTest: (configId: string) =>
+    request<{ status: string; warnings?: string[] }>('POST', `/loadtest/start/${configId}`),
+
+  startLoadTestConfirmed: (configId: string) =>
+    request<{ status: string }>('POST', `/loadtest/start/${configId}/confirm`),
+
+  getLoadTestStatus: () =>
+    request<LoadTestProgress>('GET', '/loadtest/status'),
+
+  abortLoadTest: () =>
+    request<{ status: string }>('POST', '/loadtest/abort'),
+
+  getLoadTestResults: (configId: string) =>
+    request<LoadTestResultResponse[]>('GET', `/loadtest/results/${configId}`),
+
+  compareLoadTestResults: (configId: string) =>
+    request<LoadTestComparison>('GET', `/loadtest/results/${configId}/compare`),
 };
 
 export interface WafEvent {
@@ -454,4 +544,181 @@ export interface WorkerStatus {
   last_heartbeat_ms: number;
   last_heartbeat_ago_s: number;
   healthy: boolean;
+}
+
+// --- SLA ---
+
+export interface SlaSummary {
+  route_id: string;
+  window: string;
+  total_requests: number;
+  successful_requests: number;
+  sla_pct: number;
+  avg_latency_ms: number;
+  p50_latency_ms: number;
+  p95_latency_ms: number;
+  p99_latency_ms: number;
+  target_pct: number;
+  meets_target: boolean;
+}
+
+export interface SlaBucket {
+  id: number;
+  route_id: string;
+  bucket_start: string;
+  request_count: number;
+  success_count: number;
+  error_count: number;
+  latency_sum_ms: number;
+  latency_min_ms: number;
+  latency_max_ms: number;
+  latency_p50_ms: number;
+  latency_p95_ms: number;
+  latency_p99_ms: number;
+  source: string;
+  cfg_max_latency_ms: number;
+  cfg_status_min: number;
+  cfg_status_max: number;
+  cfg_target_pct: number;
+}
+
+export interface SlaConfigResponse {
+  route_id: string;
+  target_pct: number;
+  max_latency_ms: number;
+  success_status_min: number;
+  success_status_max: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UpdateSlaConfigRequest {
+  target_pct?: number;
+  max_latency_ms?: number;
+  success_status_min?: number;
+  success_status_max?: number;
+}
+
+// --- Probes ---
+
+export interface ProbeConfigResponse {
+  id: string;
+  route_id: string;
+  method: string;
+  path: string;
+  expected_status: number;
+  interval_s: number;
+  timeout_ms: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateProbeRequest {
+  route_id: string;
+  method?: string;
+  path?: string;
+  expected_status?: number;
+  interval_s?: number;
+  timeout_ms?: number;
+}
+
+export interface UpdateProbeRequest {
+  method?: string;
+  path?: string;
+  expected_status?: number;
+  interval_s?: number;
+  timeout_ms?: number;
+  enabled?: boolean;
+}
+
+// --- Load Testing ---
+
+export interface LoadTestConfigResponse {
+  id: string;
+  name: string;
+  target_url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: string | null;
+  concurrency: number;
+  requests_per_second: number;
+  duration_s: number;
+  error_threshold_pct: number;
+  schedule_cron: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateLoadTestRequest {
+  name: string;
+  target_url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  concurrency?: number;
+  requests_per_second?: number;
+  duration_s?: number;
+  error_threshold_pct?: number;
+  schedule_cron?: string;
+}
+
+export interface LoadTestResultResponse {
+  id: string;
+  config_id: string;
+  started_at: string;
+  finished_at: string;
+  total_requests: number;
+  successful_requests: number;
+  failed_requests: number;
+  avg_latency_ms: number;
+  p50_latency_ms: number;
+  p95_latency_ms: number;
+  p99_latency_ms: number;
+  min_latency_ms: number;
+  max_latency_ms: number;
+  throughput_rps: number;
+  aborted: boolean;
+  abort_reason: string | null;
+}
+
+export interface LoadTestProgress {
+  total_requests: number;
+  successful_requests: number;
+  failed_requests: number;
+  current_rps: number;
+  avg_latency_ms: number;
+  error_rate_pct: number;
+  elapsed_s: number;
+  active: boolean;
+  aborted: boolean;
+  abort_reason: string | null;
+}
+
+export interface LoadTestComparison {
+  current: LoadTestResultResponse;
+  previous: LoadTestResultResponse | null;
+  latency_delta_pct: number | null;
+  throughput_delta_pct: number | null;
+}
+
+// --- Backend Management ---
+
+export interface CreateBackendRequest {
+  address: string;
+  weight?: number;
+  health_check_enabled?: boolean;
+  health_check_interval_s?: number;
+  health_check_path?: string;
+  tls_upstream?: boolean;
+}
+
+export interface UpdateBackendRequest {
+  address?: string;
+  weight?: number;
+  health_check_enabled?: boolean;
+  health_check_interval_s?: number;
+  health_check_path?: string;
+  tls_upstream?: boolean;
 }
