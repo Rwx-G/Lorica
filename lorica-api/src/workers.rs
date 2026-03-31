@@ -15,7 +15,6 @@
 //! Worker process metrics for the management API.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::Extension;
@@ -47,6 +46,12 @@ struct WorkerMetricEntry {
     pid: i32,
     last_heartbeat_latency_ms: u64,
     last_heartbeat_at: Instant,
+}
+
+impl Default for WorkerMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkerMetrics {

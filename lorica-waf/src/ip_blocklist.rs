@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::RwLock;
 
-use tracing::{info, warn};
+use tracing::info;
 
 /// Default blocklist URL (Data-Shield IPv4 Blocklist - updated every 6 hours).
 pub const DEFAULT_BLOCKLIST_URL: &str =

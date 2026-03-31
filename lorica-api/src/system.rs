@@ -56,6 +56,12 @@ pub struct SystemCache {
     sys: System,
 }
 
+impl Default for SystemCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SystemCache {
     pub fn new() -> Self {
         let mut sys = System::new_all();

@@ -241,7 +241,7 @@ async fn handle_log_stream(socket: WebSocket, mut rx: broadcast::Receiver<LogEnt
     let send_task = tokio::spawn(async move {
         while let Ok(entry) = rx.recv().await {
             if let Ok(json) = serde_json::to_string(&entry) {
-                if sender.send(Message::Text(json.into())).await.is_err() {
+                if sender.send(Message::Text(json)).await.is_err() {
                     break; // Client disconnected
                 }
             }
