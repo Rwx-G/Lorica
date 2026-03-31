@@ -105,8 +105,17 @@ impl ConfigStore {
         }
 
         if current_version < 2 {
-            tracing::info!("applying migration 002_add_health_check_path");
-            self.conn.execute_batch(MIGRATION_V2)?;
+            // Check if column already exists (another process may have added it)
+            let has_column: bool = self
+                .conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('backends') WHERE name='health_check_path'")?
+                .query_row([], |row| row.get::<_, i64>(0))
+                .map(|c| c > 0)?;
+
+            if !has_column {
+                tracing::info!("applying migration 002_add_health_check_path");
+                self.conn.execute_batch(MIGRATION_V2)?;
+            }
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![2],

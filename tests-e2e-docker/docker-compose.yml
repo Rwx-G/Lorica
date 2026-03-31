@@ -6,9 +6,24 @@ services:
     ports:
       - "9443:9443"   # Management dashboard
       - "8080:8080"   # HTTP proxy
+      - "8443:8443"   # HTTPS proxy
     volumes:
       - lorica-data:/var/lib/lorica
       - shared:/shared
+    depends_on:
+      - backend1
+      - backend2
+    networks:
+      - e2e
+
+  lorica-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-workers.sh"]
+    volumes:
+      - lorica-workers-data:/var/lib/lorica
+      - shared-workers:/shared
     depends_on:
       - backend1
       - backend2
@@ -43,6 +58,23 @@ services:
     environment:
       - LORICA_API=http://lorica:9443
       - LORICA_PROXY=http://lorica:8080
+      - LORICA_PROXY_HTTPS=https://lorica:8443
+      - BACKEND1_ADDR=backend1:80
+      - BACKEND2_ADDR=backend2:80
+    networks:
+      - e2e
+
+  test-runner-workers:
+    build:
+      context: ./test-runner
+    entrypoint: ["bash", "run-tests-workers.sh"]
+    depends_on:
+      - lorica-workers
+    volumes:
+      - shared-workers:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-workers:9443
+      - LORICA_PROXY=http://lorica-workers:8080
       - BACKEND1_ADDR=backend1:80
       - BACKEND2_ADDR=backend2:80
     networks:
@@ -50,7 +82,9 @@ services:
 
 volumes:
   lorica-data:
+  lorica-workers-data:
   shared:
+  shared-workers:
 
 networks:
   e2e:

@@ -51,7 +51,8 @@ RUN mkdir -p /var/lib/lorica && chown lorica:lorica /var/lib/lorica
 
 COPY --from=builder /app/target/release/lorica /usr/local/bin/lorica
 COPY tests-e2e-docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY tests-e2e-docker/entrypoint-workers.sh /entrypoint-workers.sh
+RUN chmod +x /entrypoint.sh /entrypoint-workers.sh
 
 EXPOSE 9443 8080 8443
 
