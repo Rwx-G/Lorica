@@ -348,6 +348,7 @@ fn run_supervisor(cli: Cli) {
                 waf_event_buffer: None,
                 waf_engine: None,
                 waf_rule_count: None,
+                acme_challenge_store: None,
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
@@ -737,6 +738,7 @@ fn run_single_process(cli: Cli) {
                 waf_event_buffer: Some(waf_event_buffer),
                 waf_engine: Some(waf_engine),
                 waf_rule_count: Some(waf_rule_count),
+                acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::new()),
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();

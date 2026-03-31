@@ -1,5 +1,6 @@
 #![deny(clippy::all)]
 
+pub mod acme;
 pub mod auth;
 pub mod backends;
 pub mod certificates;

@@ -35,6 +35,8 @@ pub struct AppState {
     pub waf_engine: Option<Arc<lorica_waf::WafEngine>>,
     /// Number of loaded WAF rules.
     pub waf_rule_count: Option<usize>,
+    /// ACME HTTP-01 challenge store.
+    pub acme_challenge_store: Option<crate::acme::AcmeChallengeStore>,
 }
 
 impl AppState {
@@ -58,9 +60,13 @@ pub fn build_router(
         .route("/api/v1/auth/login", post(crate::auth::login))
         .route("/api/v1/auth/logout", post(crate::auth::logout));
 
-    // Metrics endpoint (no auth - Prometheus convention)
+    // Metrics and ACME challenge endpoints (no auth)
     let metrics_routes = Router::new()
-        .route("/metrics", get(crate::metrics::get_metrics));
+        .route("/metrics", get(crate::metrics::get_metrics))
+        .route(
+            "/.well-known/acme-challenge/:token",
+            get(crate::acme::serve_challenge),
+        );
 
     // Protected routes (auth required)
     let protected_routes = Router::new()
@@ -151,6 +157,10 @@ pub fn build_router(
         .route("/api/v1/waf/events", get(crate::waf::get_waf_events))
         .route("/api/v1/waf/events", delete(crate::waf::clear_waf_events))
         .route("/api/v1/waf/stats", get(crate::waf::get_waf_stats))
+        .route(
+            "/api/v1/acme/provision",
+            post(crate::acme::provision_certificate),
+        )
         .route("/api/v1/waf/rules", get(crate::waf::get_waf_rules))
         .route(
             "/api/v1/waf/rules/:id",

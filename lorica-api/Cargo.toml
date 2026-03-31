@@ -26,6 +26,7 @@ rcgen = "0.13"
 ring = "0.17"
 sysinfo = "0.33"
 thiserror = "2"
+instant-acme = "0.7"
 tracing = "0.1"
 prometheus = "0.14"
 once_cell = { workspace = true }
