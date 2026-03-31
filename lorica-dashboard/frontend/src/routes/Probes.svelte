@@ -273,44 +273,8 @@
 
 <style>
   .probes-page { max-width: 1100px; }
-  .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.5rem; }
-  .page-header h1 { margin: 0; }
-  .error-banner { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--color-red); border-radius: 0.5rem; color: var(--color-red); padding: 0.75rem 1rem; margin-bottom: 1rem; }
-  .loading { color: var(--color-text-muted); }
-  .text-muted { color: var(--color-text-muted); }
-  .small { font-size: 0.8125rem; }
-  .empty-state { display: flex; flex-direction: column; align-items: center; gap: 0.5rem; padding: 3rem 0; color: var(--color-text-muted); }
-  .table-wrapper { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; padding: 0.75rem 1rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted); border-bottom: 1px solid var(--color-border); }
-  td { padding: 0.75rem 1rem; border-bottom: 1px solid var(--color-border); font-size: 0.875rem; vertical-align: middle; }
-  tr:hover td { background: rgba(255, 255, 255, 0.02); }
-  .mono { font-family: var(--mono); font-size: 0.8125rem; }
   .route-label { font-weight: 600; color: var(--color-text-heading); }
   .method-badge { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; background: rgba(59, 130, 246, 0.1); color: var(--color-primary); font-family: var(--mono); }
   .status-on { color: var(--color-green); font-weight: 500; }
   .status-off { color: var(--color-text-muted); }
-  .actions { display: flex; gap: 0.25rem; }
-  .btn-icon { display: flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; border: none; border-radius: 0.375rem; background: none; color: var(--color-text-muted); transition: background-color 0.15s, color 0.15s; cursor: pointer; }
-  .btn-icon:hover { background: var(--color-bg-hover); color: var(--color-text); }
-  .btn-icon-danger:hover { background: rgba(239, 68, 68, 0.1); color: var(--color-red); }
-  .overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 100; }
-  .modal { background: var(--color-bg-card); border: 1px solid var(--color-border); border-radius: 0.75rem; padding: 1.5rem; width: 90%; max-width: 480px; max-height: 90vh; overflow-y: auto; }
-  .modal h2 { margin: 0 0 1.25rem; }
-  .form-error { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--color-red); border-radius: 0.375rem; color: var(--color-red); padding: 0.5rem 0.75rem; font-size: 0.8125rem; margin-bottom: 1rem; }
-  .form-group { margin-bottom: 1rem; }
-  .form-group label { display: block; font-size: 0.8125rem; font-weight: 500; color: var(--color-text-muted); margin-bottom: 0.375rem; }
-  .required { color: var(--color-red); }
-  .form-group input[type="text"], .form-group input[type="number"], .form-group select { width: 100%; padding: 0.5rem 0.75rem; border: 1px solid var(--color-border); border-radius: 0.375rem; background: var(--color-bg-input); color: var(--color-text); font-size: 0.875rem; }
-  .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--color-primary); }
-  .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-  .checkbox-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8125rem; cursor: pointer; }
-  .checkbox-item input[type="checkbox"] { accent-color: var(--color-primary); }
-  .form-actions { display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 1.5rem; }
-  .btn { padding: 0.5rem 1rem; border-radius: 0.375rem; font-weight: 500; border: none; font-size: 0.875rem; cursor: pointer; }
-  .btn-primary { background: var(--color-primary); color: white; }
-  .btn-primary:hover { background: var(--color-primary-hover); }
-  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn-cancel { background: var(--color-bg-input); color: var(--color-text); }
-  .btn-cancel:hover { background: var(--color-bg-hover); }
 </style>
