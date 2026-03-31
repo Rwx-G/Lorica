@@ -35,8 +35,8 @@ so that I can detect outages even when there is no user traffic.
 - [x] Track probe results separately from real traffic metrics
 - [x] Calculate active SLA from probe results
 - [x] Add probe config to route/backend API endpoints
-- [ ] Build dashboard probe configuration UI
-- [ ] Build side-by-side passive/active SLA display
+- [x] Build dashboard probe configuration UI
+- [x] Build side-by-side passive/active SLA display
 - [x] Integrate probe failure alerts with lorica-notify
 - [x] Write tests for probe scheduling accuracy
 - [x] Write test for outage detection during zero-traffic window

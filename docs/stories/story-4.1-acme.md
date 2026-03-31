@@ -29,15 +29,15 @@ so that I don't have to manage certificates manually.
 
 ## Tasks
 
-- [ ] Research Rust ACME crates (instant-acme, acme-lib)
-- [ ] Implement ACME client with HTTP-01 challenge
-- [ ] Integrate challenge response into proxy engine (/.well-known/acme-challenge/)
+- [x] Research Rust ACME crates (instant-acme, acme-lib)
+- [x] Implement ACME client with HTTP-01 challenge
+- [x] Integrate challenge response into proxy engine (/.well-known/acme-challenge/)
 - [ ] Implement consent-driven opt-in per route
-- [ ] Implement auto-renewal with configurable threshold
-- [ ] Implement failure fallback with admin notification
-- [ ] Store ACME certs in database with is_acme flag
-- [ ] Update dashboard to show ACME vs manual certs
-- [ ] Test against Let's Encrypt staging environment
+- [x] Implement auto-renewal with configurable threshold
+- [x] Implement failure fallback with admin notification
+- [x] Store ACME certs in database with is_acme flag
+- [x] Update dashboard to show ACME vs manual certs
+- [x] Test against Let's Encrypt staging environment
 - [ ] Write tests for renewal flow
 - [ ] Write tests for failure fallback
 

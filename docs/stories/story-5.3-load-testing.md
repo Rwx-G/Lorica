@@ -38,16 +38,16 @@ so that I can verify my infrastructure handles the expected traffic without need
 - [x] Implement load test engine (tokio tasks generating HTTP requests via reqwest)
 - [x] Implement configurable safe limits with threshold detection
 - [x] Implement auto-abort on error rate threshold
-- [ ] Implement real-time result streaming (WebSocket or SSE to dashboard)
+- [x] Implement real-time result streaming (WebSocket or SSE to dashboard)
 - [x] Add load test API endpoints (POST /api/v1/loadtest/start, GET /api/v1/loadtest/status, POST /api/v1/loadtest/abort)
-- [ ] Build dashboard load test UI with sliders and confirmation popup
-- [ ] Build real-time results display (live charts)
-- [ ] Build historical results comparison view
+- [x] Build dashboard load test UI with sliders and confirmation popup
+- [x] Build real-time results display (live charts)
+- [x] Build historical results comparison view
 - [x] Implement test scheduler (cron-like recurring execution - schema ready)
 - [x] Implement historical trend detection (delta between runs)
 - [x] Write tests for safe limit enforcement
 - [x] Write tests for auto-abort behavior
-- [ ] Write tests for scheduled execution
+- [x] Write tests for scheduled execution
 
 ## Dev Notes
 

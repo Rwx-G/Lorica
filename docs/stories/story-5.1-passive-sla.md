@@ -35,7 +35,7 @@ so that I have an accurate picture of what my users actually experience.
 - [x] Implement SLA percentage calculation with configurable success criteria
 - [x] Persist aggregated metrics to SQLite (not per-request - aggregated buckets)
 - [x] Add SLA API endpoints (`GET /api/v1/sla/routes/:id`)
-- [ ] Build dashboard SLA view with charts (latency trends, error rate, uptime %)
+- [x] Build dashboard SLA view with charts (latency trends, error rate, uptime %)
 - [x] Implement SLA threshold alerts (integrate with lorica-notify)
 - [x] Implement SLA data export (CSV or JSON)
 - [x] Write tests for SLA calculation accuracy

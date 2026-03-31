@@ -29,14 +29,14 @@ so that deployment is simple and follows standard Linux conventions.
 
 ## Tasks
 
-- [ ] Set up GitHub Actions CI (cargo test, clippy, fmt)
-- [ ] Set up release build pipeline (cross-compilation: x86_64, aarch64)
-- [ ] Create debian packaging files (control, postinst, prerm, postrm)
-- [ ] Implement post-install script (create user, set permissions, enable service)
-- [ ] Implement post-install credential display
-- [ ] Implement upgrade-safe packaging (conffiles, data dir preservation)
+- [x] Set up GitHub Actions CI (cargo test, clippy, fmt)
+- [x] Set up release build pipeline (cross-compilation: x86_64, aarch64)
+- [x] Create debian packaging files (control, postinst, prerm, postrm)
+- [x] Implement post-install script (create user, set permissions, enable service)
+- [x] Implement post-install credential display
+- [x] Implement upgrade-safe packaging (conffiles, data dir preservation)
 - [ ] Set up apt repository with package signing
-- [ ] Create GitHub release workflow (binary + .deb artifacts)
+- [x] Create GitHub release workflow (binary + .deb artifacts)
 - [ ] Test fresh install on Debian/Ubuntu
 - [ ] Test upgrade preserves data
 - [ ] Test remove/purge behavior

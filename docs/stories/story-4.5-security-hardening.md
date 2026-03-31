@@ -30,17 +30,17 @@ so that the proxy itself is not a security liability.
 
 ## Tasks
 
-- [ ] Add cargo-audit to CI pipeline
-- [ ] Set up fuzz testing targets (cargo-fuzz)
+- [x] Add cargo-audit to CI pipeline
+- [x] Set up fuzz testing targets (cargo-fuzz)
 - [ ] Fuzz TLS handshake path
-- [ ] Fuzz HTTP request parsing
-- [ ] Fuzz API JSON input handling
-- [ ] Verify rate limiting on login endpoint
-- [ ] Verify session timeout and cookie flags (HttpOnly, Secure, SameSite)
-- [ ] Audit all log statements for secret leakage
-- [ ] Update systemd unit file with hardening directives
-- [ ] Write threat model document
-- [ ] Write hardening guide
+- [x] Fuzz HTTP request parsing
+- [x] Fuzz API JSON input handling
+- [x] Verify rate limiting on login endpoint
+- [x] Verify session timeout and cookie flags (HttpOnly, Secure, SameSite)
+- [x] Audit all log statements for secret leakage
+- [x] Update systemd unit file with hardening directives
+- [x] Write threat model document
+- [x] Write hardening guide
 
 ## Dev Notes
 
