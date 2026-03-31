@@ -1,0 +1,169 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus"
+    }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "id": null,
+  "title": "Lorica Reverse Proxy",
+  "uid": "lorica",
+  "version": 1,
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "panels": [
+    {
+      "title": "Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(lorica_lorica_http_requests_total[5m])) by (route_id)",
+          "legendFormat": "{{ route_id }}",
+          "datasource": "${DS_PROMETHEUS}"
+        }
+      ]
+    },
+    {
+      "title": "Request Latency (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(lorica_lorica_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50",
+          "datasource": "${DS_PROMETHEUS}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(lorica_lorica_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95",
+          "datasource": "${DS_PROMETHEUS}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(lorica_lorica_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99",
+          "datasource": "${DS_PROMETHEUS}"
+        }
+      ]
+    },
+    {
+      "title": "Active Connections",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "lorica_active_connections",
+          "datasource": "${DS_PROMETHEUS}"
+        }
+      ]
+    },
+    {
+      "title": "Backend Health",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 8, "x": 4, "y": 8 },
+      "targets": [
+        {
+          "expr": "lorica_lorica_backend_health",
+          "format": "table",
+          "instant": true,
+          "datasource": "${DS_PROMETHEUS}"
+        }
+      ]
+    },
+    {
+      "title": "Certificate Expiry (days)",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "lorica_lorica_certificate_expiry_days",
+          "legendFormat": "{{ domain }}",
+          "datasource": "${DS_PROMETHEUS}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "orange", "value": 7 },
+              { "color": "yellow", "value": 14 },
+              { "color": "green", "value": 30 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "WAF Events Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(rate(lorica_lorica_waf_events_total[5m])) by (category, action)",
+          "legendFormat": "{{ category }} ({{ action }})",
+          "datasource": "${DS_PROMETHEUS}"
+        }
+      ]
+    },
+    {
+      "title": "EWMA Scores",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "lorica_lorica_ewma_score_us",
+          "legendFormat": "{{ backend_address }}",
+          "datasource": "${DS_PROMETHEUS}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "us" }
+      }
+    },
+    {
+      "title": "System CPU %",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "lorica_system_cpu_percent",
+          "datasource": "${DS_PROMETHEUS}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "max": 100, "unit": "percent" }
+      }
+    },
+    {
+      "title": "System Memory",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 24 },
+      "targets": [
+        {
+          "expr": "lorica_system_memory_used_bytes",
+          "datasource": "${DS_PROMETHEUS}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" }
+      }
+    },
+    {
+      "title": "Error Rate (4xx + 5xx)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum(rate(lorica_lorica_http_requests_total{status_code=~\"4..|5..\"}[5m])) by (status_code)",
+          "legendFormat": "HTTP {{ status_code }}",
+          "datasource": "${DS_PROMETHEUS}"
+        }
+      ]
+    }
+  ]
+}
