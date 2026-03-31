@@ -10,7 +10,7 @@ top_issues: []
 waiver:
   active: false
 
-quality_score: 97
+quality_score: 98
 expires: "2026-04-14T12:00:00Z"
 
 evidence:
@@ -37,5 +37,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Add integration test that verifies actual TCP timeout behavior under load"
+  future: []

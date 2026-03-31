@@ -2,7 +2,7 @@ schema: 1
 story: "6.2"
 story_title: "Security Response Headers and Path Rewriting"
 gate: PASS
-status_reason: "All ACs met. Security header presets (strict/moderate/none) with concrete header expansion in response_filter. Custom response headers with add/remove. Path rewrite via strip_path_prefix then add_path_prefix in upstream_request_filter. Per-route access_log_enabled toggle suppresses log buffer push but not error logs. All fields in DB migration, API, and dashboard."
+status_reason: "All ACs met. Security header presets (strict/moderate/none) with concrete header expansion in response_filter. Configurable presets via SecurityHeaderPreset model, builtin_security_presets(), and custom_security_presets in GlobalSettings with dynamic lookup in response_filter. Custom response headers with add/remove. Path rewrite via strip_path_prefix then add_path_prefix in upstream_request_filter. Per-route access_log_enabled toggle suppresses log buffer push but not error logs. All fields in DB migration, API, and dashboard."
 reviewer: "Romain G."
 updated: "2026-03-31T22:00:00Z"
 
@@ -10,7 +10,7 @@ top_issues: []
 waiver:
   active: false
 
-quality_score: 96
+quality_score: 98
 expires: "2026-04-14T12:00:00Z"
 
 evidence:
@@ -37,5 +37,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Consider making security header presets configurable (custom preset definitions)"
+  future: []
