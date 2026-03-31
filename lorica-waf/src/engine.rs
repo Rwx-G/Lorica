@@ -62,10 +62,22 @@ pub struct RuleSummary {
     pub enabled: bool,
 }
 
+/// A user-defined custom WAF rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomRule {
+    pub id: u32,
+    pub description: String,
+    pub category: RuleCategory,
+    pub pattern: String,
+    pub severity: u8,
+    pub enabled: bool,
+}
+
 /// WAF engine with precompiled rules, IP blocklist, and event ring buffer.
 pub struct WafEngine {
     ruleset: RuleSet,
     disabled_rules: RwLock<HashSet<u32>>,
+    custom_rules: RwLock<Vec<(CustomRule, regex::Regex)>>,
     event_buffer: Arc<Mutex<VecDeque<WafEvent>>>,
     max_events: usize,
     /// IP address blocklist (e.g. Data-Shield IPv4 Blocklist).
@@ -78,6 +90,7 @@ impl WafEngine {
         Self {
             ruleset: RuleSet::default_crs(),
             disabled_rules: RwLock::new(HashSet::new()),
+            custom_rules: RwLock::new(Vec::new()),
             event_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(500))),
             max_events: 500,
             ip_blocklist: IpBlocklist::new(),
@@ -150,6 +163,46 @@ impl WafEngine {
                 disabled.insert(id);
             }
         }
+    }
+
+    /// Add a custom user-defined WAF rule. Returns Err if the regex is invalid.
+    pub fn add_custom_rule(
+        &self,
+        id: u32,
+        description: String,
+        category: RuleCategory,
+        pattern: &str,
+        severity: u8,
+    ) -> Result<(), String> {
+        let regex = regex::Regex::new(pattern).map_err(|e| format!("invalid regex: {e}"))?;
+        let rule = CustomRule {
+            id,
+            description,
+            category,
+            pattern: pattern.to_string(),
+            severity,
+            enabled: true,
+        };
+        self.custom_rules.write().unwrap().push((rule, regex));
+        Ok(())
+    }
+
+    /// Remove a custom rule by ID.
+    pub fn remove_custom_rule(&self, id: u32) -> bool {
+        let mut rules = self.custom_rules.write().unwrap();
+        let before = rules.len();
+        rules.retain(|(r, _)| r.id != id);
+        rules.len() < before
+    }
+
+    /// List all custom rules.
+    pub fn list_custom_rules(&self) -> Vec<CustomRule> {
+        self.custom_rules
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(r, _)| r.clone())
+            .collect()
     }
 
     /// Evaluate a request against the WAF ruleset.
@@ -253,6 +306,29 @@ impl WafEngine {
                 events.push(WafEvent {
                     rule_id: rule.id,
                     description: rule.description.to_string(),
+                    category: rule.category.clone(),
+                    severity: rule.severity,
+                    matched_field: field.to_string(),
+                    matched_value,
+                    timestamp: timestamp.to_string(),
+                });
+            }
+        }
+
+        // Also check custom rules
+        let custom = self.custom_rules.read().unwrap();
+        for (rule, regex) in custom.iter() {
+            if !rule.enabled {
+                continue;
+            }
+            if regex.is_match(value) {
+                let matched_value = regex
+                    .find(value)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+                events.push(WafEvent {
+                    rule_id: rule.id,
+                    description: rule.description.clone(),
                     category: rule.category.clone(),
                     severity: rule.severity,
                     matched_field: field.to_string(),

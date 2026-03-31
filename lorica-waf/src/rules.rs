@@ -38,6 +38,20 @@ impl RuleCategory {
     }
 }
 
+impl std::str::FromStr for RuleCategory {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "sql_injection" => Ok(Self::SqlInjection),
+            "xss" => Ok(Self::Xss),
+            "path_traversal" => Ok(Self::PathTraversal),
+            "command_injection" => Ok(Self::CommandInjection),
+            "protocol_violation" => Ok(Self::ProtocolViolation),
+            other => Err(format!("unknown rule category: {other}")),
+        }
+    }
+}
+
 /// A single WAF rule with a precompiled regex pattern.
 pub struct WafRule {
     /// Unique rule ID (CRS-style numbering).

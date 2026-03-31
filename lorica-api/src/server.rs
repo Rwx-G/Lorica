@@ -173,7 +173,23 @@ pub fn build_router(
             "/api/v1/acme/provision",
             post(crate::acme::provision_certificate),
         )
+        .route(
+            "/api/v1/acme/provision-dns",
+            post(crate::acme::provision_certificate_dns),
+        )
         .route("/api/v1/waf/rules", get(crate::waf::get_waf_rules))
+        .route(
+            "/api/v1/waf/rules/custom",
+            get(crate::waf::list_custom_rules),
+        )
+        .route(
+            "/api/v1/waf/rules/custom",
+            post(crate::waf::create_custom_rule),
+        )
+        .route(
+            "/api/v1/waf/rules/custom/:id",
+            delete(crate::waf::delete_custom_rule),
+        )
         .route(
             "/api/v1/waf/rules/:id",
             put(crate::waf::toggle_waf_rule),

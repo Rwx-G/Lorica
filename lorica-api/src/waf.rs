@@ -181,6 +181,82 @@ pub async fn clear_waf_events(
     Ok(json_data(serde_json::json!({"cleared": true})))
 }
 
+// ---- Custom WAF rules ----
+
+#[derive(Debug, Deserialize)]
+pub struct CreateCustomRuleRequest {
+    pub id: u32,
+    pub description: String,
+    pub category: String,
+    pub pattern: String,
+    pub severity: Option<u8>,
+}
+
+/// POST /api/v1/waf/rules/custom - create a user-defined WAF rule
+pub async fn create_custom_rule(
+    Extension(state): Extension<AppState>,
+    Json(body): Json<CreateCustomRuleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = state
+        .waf_engine
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("WAF engine not initialized".into()))?;
+
+    let category = body
+        .category
+        .parse::<lorica_waf::RuleCategory>()
+        .map_err(|e| ApiError::BadRequest(format!("invalid category: {e}")))?;
+
+    engine
+        .add_custom_rule(
+            body.id,
+            body.description.clone(),
+            category,
+            &body.pattern,
+            body.severity.unwrap_or(3),
+        )
+        .map_err(ApiError::BadRequest)?;
+
+    Ok(json_data(serde_json::json!({
+        "id": body.id,
+        "description": body.description,
+        "created": true,
+    })))
+}
+
+/// GET /api/v1/waf/rules/custom - list user-defined WAF rules
+pub async fn list_custom_rules(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let rules = if let Some(ref engine) = state.waf_engine {
+        engine.list_custom_rules()
+    } else {
+        vec![]
+    };
+    let total = rules.len();
+    Ok(json_data(serde_json::json!({
+        "rules": rules,
+        "total": total,
+    })))
+}
+
+/// DELETE /api/v1/waf/rules/custom/:id - delete a user-defined WAF rule
+pub async fn delete_custom_rule(
+    Extension(state): Extension<AppState>,
+    axum::extract::Path(rule_id): axum::extract::Path<u32>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = state
+        .waf_engine
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("WAF engine not initialized".into()))?;
+
+    if engine.remove_custom_rule(rule_id) {
+        Ok(json_data(serde_json::json!({"deleted": true, "id": rule_id})))
+    } else {
+        Err(ApiError::NotFound(format!("custom rule {rule_id}")))
+    }
+}
+
 // ---- IP Blocklist endpoints ----
 
 /// GET /api/v1/waf/blocklist - get IP blocklist status
@@ -224,6 +300,36 @@ pub async fn toggle_blocklist(
     })))
 }
 
+/// Fetch and load the blocklist from the remote URL.
+/// Shared between the manual reload endpoint and the background task.
+async fn fetch_and_load_blocklist(
+    blocklist: &lorica_waf::IpBlocklist,
+) -> Result<usize, String> {
+    let url = lorica_waf::ip_blocklist::DEFAULT_BLOCKLIST_URL;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("failed to fetch blocklist: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("blocklist fetch returned {}", response.status()));
+    }
+
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("failed to read blocklist body: {e}"))?;
+
+    Ok(blocklist.load_from_text(&text))
+}
+
 /// POST /api/v1/waf/blocklist/reload - reload the IP blocklist from the remote URL
 pub async fn reload_blocklist(
     Extension(state): Extension<AppState>,
@@ -233,36 +339,48 @@ pub async fn reload_blocklist(
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("WAF engine not initialized".into()))?;
 
-    let url = lorica_waf::ip_blocklist::DEFAULT_BLOCKLIST_URL;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| ApiError::Internal(format!("HTTP client error: {e}")))?;
-
-    let response = client
-        .get(url)
-        .send()
+    let count = fetch_and_load_blocklist(engine.ip_blocklist())
         .await
-        .map_err(|e| ApiError::Internal(format!("failed to fetch blocklist: {e}")))?;
-
-    if !response.status().is_success() {
-        return Err(ApiError::Internal(format!(
-            "blocklist fetch returned {}",
-            response.status()
-        )));
-    }
-
-    let text = response
-        .text()
-        .await
-        .map_err(|e| ApiError::Internal(format!("failed to read blocklist body: {e}")))?;
-
-    let count = engine.ip_blocklist().load_from_text(&text);
+        .map_err(ApiError::Internal)?;
 
     Ok(json_data(serde_json::json!({
         "reloaded": true,
         "ip_count": count,
-        "source": url,
+        "source": lorica_waf::ip_blocklist::DEFAULT_BLOCKLIST_URL,
     })))
+}
+
+/// Spawn a background task that refreshes the IP blocklist periodically.
+///
+/// Default interval: 6 hours (matching the Data-Shield update frequency).
+/// Only fetches if the blocklist is enabled. Failures are logged, never fatal.
+pub fn spawn_blocklist_refresh(
+    engine: std::sync::Arc<lorica_waf::WafEngine>,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+
+            if !engine.ip_blocklist().is_enabled() {
+                tracing::debug!("IP blocklist disabled, skipping refresh");
+                continue;
+            }
+
+            match fetch_and_load_blocklist(engine.ip_blocklist()).await {
+                Ok(count) => {
+                    tracing::info!(
+                        count = count,
+                        "IP blocklist refreshed from remote"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "IP blocklist refresh failed, keeping previous list"
+                    );
+                }
+            }
+        }
+    })
 }
