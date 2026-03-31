@@ -18,7 +18,9 @@
 //! precompiled regex patterns. Supports detection-only and blocking modes.
 
 pub mod engine;
+pub mod ip_blocklist;
 pub mod rules;
 
 pub use engine::{RuleSummary, WafEngine, WafEvent, WafMode, WafVerdict};
+pub use ip_blocklist::IpBlocklist;
 pub use rules::{RuleCategory, RuleSet, WafRule};

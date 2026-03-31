@@ -158,6 +158,18 @@ pub fn build_router(
         .route("/api/v1/waf/events", delete(crate::waf::clear_waf_events))
         .route("/api/v1/waf/stats", get(crate::waf::get_waf_stats))
         .route(
+            "/api/v1/waf/blocklist",
+            get(crate::waf::get_blocklist_status),
+        )
+        .route(
+            "/api/v1/waf/blocklist",
+            put(crate::waf::toggle_blocklist),
+        )
+        .route(
+            "/api/v1/waf/blocklist/reload",
+            post(crate::waf::reload_blocklist),
+        )
+        .route(
             "/api/v1/acme/provision",
             post(crate::acme::provision_certificate),
         )

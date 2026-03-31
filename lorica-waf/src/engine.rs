@@ -19,6 +19,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::ip_blocklist::IpBlocklist;
 use crate::rules::{RuleCategory, RuleSet};
 
 /// WAF evaluation verdict.
@@ -61,12 +62,14 @@ pub struct RuleSummary {
     pub enabled: bool,
 }
 
-/// WAF engine with precompiled rules and an event ring buffer.
+/// WAF engine with precompiled rules, IP blocklist, and event ring buffer.
 pub struct WafEngine {
     ruleset: RuleSet,
     disabled_rules: RwLock<HashSet<u32>>,
     event_buffer: Arc<Mutex<VecDeque<WafEvent>>>,
     max_events: usize,
+    /// IP address blocklist (e.g. Data-Shield IPv4 Blocklist).
+    ip_blocklist: IpBlocklist,
 }
 
 impl WafEngine {
@@ -77,7 +80,13 @@ impl WafEngine {
             disabled_rules: RwLock::new(HashSet::new()),
             event_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(500))),
             max_events: 500,
+            ip_blocklist: IpBlocklist::new(),
         }
+    }
+
+    /// Return a reference to the IP blocklist.
+    pub fn ip_blocklist(&self) -> &IpBlocklist {
+        &self.ip_blocklist
     }
 
     /// Return a reference to the event buffer for dashboard consumption.

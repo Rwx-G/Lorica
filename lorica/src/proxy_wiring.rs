@@ -302,7 +302,32 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // IP blocklist check (before any other processing)
+        let client_ip = session
+            .as_downstream()
+            .client_addr()
+            .map(|addr| addr.ip().to_string());
+
+        // Prefer X-Forwarded-For if present (client behind another proxy)
         let req = session.req_header();
+        let check_ip = req
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .map(|xff| xff.split(',').next().unwrap_or(xff).trim().to_string())
+            .or(client_ip);
+
+        if let Some(ref ip) = check_ip {
+            if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
+                warn!(
+                    ip = %ip,
+                    "request blocked by IP blocklist"
+                );
+                let header = lorica_http::ResponseHeader::build(403, None)?;
+                session.write_response_header(Box::new(header), true).await?;
+                return Ok(true);
+            }
+        }
 
         let host = req
             .headers

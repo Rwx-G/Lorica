@@ -180,3 +180,89 @@ pub async fn clear_waf_events(
     }
     Ok(json_data(serde_json::json!({"cleared": true})))
 }
+
+// ---- IP Blocklist endpoints ----
+
+/// GET /api/v1/waf/blocklist - get IP blocklist status
+pub async fn get_blocklist_status(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (enabled, count) = if let Some(ref engine) = state.waf_engine {
+        let bl = engine.ip_blocklist();
+        (bl.is_enabled(), bl.len())
+    } else {
+        (false, 0)
+    };
+    Ok(json_data(serde_json::json!({
+        "enabled": enabled,
+        "ip_count": count,
+        "source": lorica_waf::ip_blocklist::DEFAULT_BLOCKLIST_URL,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlocklistToggleRequest {
+    pub enabled: bool,
+}
+
+/// PUT /api/v1/waf/blocklist - enable or disable the IP blocklist
+pub async fn toggle_blocklist(
+    Extension(state): Extension<AppState>,
+    Json(body): Json<BlocklistToggleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = state
+        .waf_engine
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("WAF engine not initialized".into()))?;
+
+    engine.ip_blocklist().set_enabled(body.enabled);
+    let count = engine.ip_blocklist().len();
+
+    Ok(json_data(serde_json::json!({
+        "enabled": body.enabled,
+        "ip_count": count,
+    })))
+}
+
+/// POST /api/v1/waf/blocklist/reload - reload the IP blocklist from the remote URL
+pub async fn reload_blocklist(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = state
+        .waf_engine
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("WAF engine not initialized".into()))?;
+
+    let url = lorica_waf::ip_blocklist::DEFAULT_BLOCKLIST_URL;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| ApiError::Internal(format!("HTTP client error: {e}")))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to fetch blocklist: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(ApiError::Internal(format!(
+            "blocklist fetch returned {}",
+            response.status()
+        )));
+    }
+
+    let text = response
+        .text()
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to read blocklist body: {e}")))?;
+
+    let count = engine.ip_blocklist().load_from_text(&text);
+
+    Ok(json_data(serde_json::json!({
+        "reloaded": true,
+        "ip_count": count,
+        "source": url,
+    })))
+}
