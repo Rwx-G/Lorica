@@ -409,6 +409,22 @@ pub struct SlaSummary {
     pub meets_target: bool,
 }
 
+// --- Probe Models ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeConfig {
+    pub id: String,
+    pub route_id: String,
+    pub method: String,
+    pub path: String,
+    pub expected_status: i32,
+    pub interval_s: i32,
+    pub timeout_ms: i32,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

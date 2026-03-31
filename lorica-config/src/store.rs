@@ -13,6 +13,7 @@ use crate::models::*;
 const MIGRATION_V1: &str = include_str!("migrations/001_initial.sql");
 const MIGRATION_V2: &str = include_str!("migrations/002_add_health_check_path.sql");
 const MIGRATION_V3: &str = include_str!("migrations/003_sla_metrics.sql");
+const MIGRATION_V4: &str = include_str!("migrations/004_probe_configs.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -129,6 +130,15 @@ impl ConfigStore {
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![3],
+            )?;
+        }
+
+        if current_version < 4 {
+            tracing::info!("applying migration 004_probe_configs");
+            self.conn.execute_batch(MIGRATION_V4)?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![4],
             )?;
         }
 
@@ -1126,6 +1136,126 @@ impl ConfigStore {
             "buckets": buckets,
         }))
     }
+
+    // ---- Probe Configuration ----
+
+    /// Create a new probe configuration.
+    pub fn create_probe_config(&self, probe: &ProbeConfig) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO probe_configs (id, route_id, method, path, expected_status,
+             interval_s, timeout_ms, enabled, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                probe.id,
+                probe.route_id,
+                probe.method,
+                probe.path,
+                probe.expected_status,
+                probe.interval_s,
+                probe.timeout_ms,
+                probe.enabled,
+                probe.created_at.to_rfc3339(),
+                probe.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all probe configurations.
+    pub fn list_probe_configs(&self) -> Result<Vec<ProbeConfig>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, route_id, method, path, expected_status, interval_s,
+             timeout_ms, enabled, created_at, updated_at FROM probe_configs",
+        )?;
+        let rows = stmt.query_map([], row_to_probe_config)?;
+        let mut probes = Vec::new();
+        for row in rows {
+            probes.push(row??);
+        }
+        Ok(probes)
+    }
+
+    /// List probe configurations for a specific route.
+    pub fn list_probes_for_route(&self, route_id: &str) -> Result<Vec<ProbeConfig>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, route_id, method, path, expected_status, interval_s,
+             timeout_ms, enabled, created_at, updated_at
+             FROM probe_configs WHERE route_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![route_id], row_to_probe_config)?;
+        let mut probes = Vec::new();
+        for row in rows {
+            probes.push(row??);
+        }
+        Ok(probes)
+    }
+
+    /// Get a single probe configuration by ID.
+    pub fn get_probe_config(&self, id: &str) -> Result<Option<ProbeConfig>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT id, route_id, method, path, expected_status, interval_s,
+                 timeout_ms, enabled, created_at, updated_at
+                 FROM probe_configs WHERE id = ?1",
+                params![id],
+                row_to_probe_config,
+            )
+            .optional()?;
+        match result {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Update a probe configuration.
+    pub fn update_probe_config(&self, probe: &ProbeConfig) -> Result<()> {
+        let affected = self.conn.execute(
+            "UPDATE probe_configs SET method = ?1, path = ?2, expected_status = ?3,
+             interval_s = ?4, timeout_ms = ?5, enabled = ?6, updated_at = ?7
+             WHERE id = ?8",
+            params![
+                probe.method,
+                probe.path,
+                probe.expected_status,
+                probe.interval_s,
+                probe.timeout_ms,
+                probe.enabled,
+                probe.updated_at.to_rfc3339(),
+                probe.id,
+            ],
+        )?;
+        if affected == 0 {
+            return Err(ConfigError::NotFound(format!("probe config {}", probe.id)));
+        }
+        Ok(())
+    }
+
+    /// Delete a probe configuration.
+    pub fn delete_probe_config(&self, id: &str) -> Result<()> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM probe_configs WHERE id = ?1", params![id])?;
+        if affected == 0 {
+            return Err(ConfigError::NotFound(format!("probe config {id}")));
+        }
+        Ok(())
+    }
+
+    /// List all enabled probes (for the scheduler).
+    pub fn list_enabled_probes(&self) -> Result<Vec<ProbeConfig>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, route_id, method, path, expected_status, interval_s,
+             timeout_ms, enabled, created_at, updated_at
+             FROM probe_configs WHERE enabled = 1",
+        )?;
+        let rows = stmt.query_map([], row_to_probe_config)?;
+        let mut probes = Vec::new();
+        for row in rows {
+            probes.push(row??);
+        }
+        Ok(probes)
+    }
 }
 
 // ---- Row mapping helpers ----
@@ -1214,6 +1344,27 @@ fn row_to_admin_user(row: &rusqlite::Row<'_>) -> Result<AdminUser> {
         created_at: parse_datetime(&row.get::<_, String>(4)?)?,
         last_login: parse_optional_datetime(row.get(5)?)?,
     })
+}
+
+fn row_to_probe_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ProbeConfig>> {
+    Ok(Ok(ProbeConfig {
+        id: row.get(0)?,
+        route_id: row.get(1)?,
+        method: row.get(2)?,
+        path: row.get(3)?,
+        expected_status: row.get(4)?,
+        interval_s: row.get(5)?,
+        timeout_ms: row.get(6)?,
+        enabled: row.get(7)?,
+        created_at: match parse_datetime(&row.get::<_, String>(8)?) {
+            Ok(dt) => dt,
+            Err(e) => return Ok(Err(e)),
+        },
+        updated_at: match parse_datetime(&row.get::<_, String>(9)?) {
+            Ok(dt) => dt,
+            Err(e) => return Ok(Err(e)),
+        },
+    }))
 }
 
 fn row_to_sla_bucket(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<SlaBucket>> {
