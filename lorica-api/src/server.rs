@@ -243,6 +243,10 @@ pub fn build_router(
             post(crate::loadtest::start_test_confirmed),
         )
         .route("/api/v1/loadtest/status", get(crate::loadtest::get_status))
+        .route(
+            "/api/v1/loadtest/stream",
+            get(crate::loadtest::stream_status),
+        )
         .route("/api/v1/loadtest/abort", post(crate::loadtest::abort_test))
         .route(
             "/api/v1/loadtest/results/:config_id",

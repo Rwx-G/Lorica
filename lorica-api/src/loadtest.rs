@@ -16,13 +16,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::Path;
+use axum::response::sse::{Event, Sse};
 use axum::Extension;
 use axum::Json;
 use chrono::Utc;
+use futures_util::stream;
 use lorica_bench::load_test;
 use lorica_config::models::LoadTestConfig;
 use lorica_config::store::new_id;
 use serde::Deserialize;
+use std::convert::Infallible;
+use std::time::Duration;
 
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
@@ -250,4 +254,38 @@ pub async fn compare_results(
     let comparison = load_test::compare_results(current, previous);
 
     Ok(json_data(comparison))
+}
+
+/// GET /api/v1/loadtest/stream
+/// Server-Sent Events stream of load test progress (1 event/second).
+pub async fn stream_status(
+    Extension(state): Extension<AppState>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let engine = state.load_test_engine.clone();
+
+    let stream = stream::unfold((), move |()| {
+        let engine = engine.clone();
+        async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            let event = match &engine {
+                Some(e) => match e.progress().await {
+                    Some(progress) => {
+                        let json = serde_json::to_string(&progress).unwrap_or_default();
+                        Event::default().data(json).event("progress")
+                    }
+                    None => Event::default().data(r#"{"active":false}"#).event("idle"),
+                },
+                None => Event::default().data(r#"{"active":false}"#).event("idle"),
+            };
+
+            Some((Ok(event), ()))
+        }
+    });
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
