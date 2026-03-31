@@ -10,6 +10,7 @@
   } from '../lib/api';
   import StatusBadge from '../components/StatusBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import { showToast } from '../lib/toast';
 
   let routes: RouteResponse[] = $state([]);
   let backends: BackendResponse[] = $state([]);
@@ -341,6 +342,7 @@
         formSubmitting = false;
         return;
       }
+      showToast('Route updated', 'success');
     } else {
       const body: CreateRouteRequest = {
         hostname: formHostname,
@@ -359,6 +361,7 @@
         formSubmitting = false;
         return;
       }
+      showToast('Route created', 'success');
     }
 
     formSubmitting = false;
@@ -371,6 +374,8 @@
     const res = await api.deleteRoute(deletingRoute.id);
     if (res.error) {
       error = res.error.message;
+    } else {
+      showToast('Route deleted', 'success');
     }
     deletingRoute = null;
     await loadData();

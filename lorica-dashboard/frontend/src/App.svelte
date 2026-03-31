@@ -5,6 +5,7 @@
   import Login from './routes/Login.svelte';
   import PasswordChange from './routes/PasswordChange.svelte';
   import Dashboard from './routes/Dashboard.svelte';
+  import Toast from './components/Toast.svelte';
 
   let state: AuthState = $state({ status: 'unauthenticated' });
   let checking = $state(true);
@@ -54,6 +55,8 @@
 {:else}
   <Dashboard />
 {/if}
+
+<Toast />
 
 <style>
   .boot-check {

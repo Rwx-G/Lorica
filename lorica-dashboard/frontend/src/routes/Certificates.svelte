@@ -487,6 +487,7 @@
             <th>Domain</th>
             <th>Issuer</th>
             <th>Expires</th>
+            <th>Days Left</th>
             <th>Status</th>
             <th>Routes</th>
             <th>Actions</th>
@@ -503,6 +504,12 @@
               </td>
               <td class="issuer">{cert.issuer}</td>
               <td>{formatDate(cert.not_after)}</td>
+              <td>
+                {@const daysLeft = Math.ceil((new Date(cert.not_after).getTime() - Date.now()) / (1000 * 60 * 60 * 24))}
+                <span class="days-left" style="color: {daysLeft < 7 ? 'var(--color-red)' : daysLeft <= 30 ? 'var(--color-orange, #fb923c)' : 'var(--color-green)'}; font-weight: 700; font-size: 1rem;">
+                  {daysLeft}
+                </span>
+              </td>
               <td><CertExpiryBadge notAfter={cert.not_after} {warningDays} {criticalDays} /></td>
               <td>
                 {#if getRoutesForCert(cert.id).length === 0}

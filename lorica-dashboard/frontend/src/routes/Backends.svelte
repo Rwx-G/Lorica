@@ -8,6 +8,7 @@
   } from '../lib/api';
   import StatusBadge from '../components/StatusBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import { showToast } from '../lib/toast';
 
   let backends: BackendResponse[] = $state([]);
   let error = $state('');
@@ -164,6 +165,7 @@
         formSubmitting = false;
         return;
       }
+      showToast('Backend updated', 'success');
     } else {
       const body: CreateBackendRequest = {
         address: formAddress,
@@ -181,6 +183,7 @@
         formSubmitting = false;
         return;
       }
+      showToast('Backend created', 'success');
     }
 
     formSubmitting = false;
@@ -193,6 +196,8 @@
     const res = await api.deleteBackend(deletingBackend.id);
     if (res.error) {
       error = res.error.message;
+    } else {
+      showToast('Backend deleted', 'success');
     }
     deletingBackend = null;
     await loadData();

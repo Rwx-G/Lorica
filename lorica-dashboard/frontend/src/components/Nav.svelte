@@ -4,20 +4,22 @@
   import { auth } from '../lib/auth';
   import ShieldIcon from './ShieldIcon.svelte';
 
-  const navItems = [
+  type NavItem = { path: string; label: string; icon: string } | { section: string };
+
+  const navItems: NavItem[] = [
     { path: '/', label: 'Overview', icon: 'grid' },
-    // Infrastructure
+    { section: 'Infrastructure' },
     { path: '/backends', label: 'Backends', icon: 'server' },
     { path: '/routes', label: 'Routes', icon: 'route' },
     { path: '/certificates', label: 'Certificates', icon: 'lock' },
-    // Security
+    { section: 'Security' },
     { path: '/security', label: 'Security', icon: 'shield' },
     { path: '/probes', label: 'Probes', icon: 'radio' },
-    // Monitoring
+    { section: 'Monitoring' },
     { path: '/sla', label: 'SLA', icon: 'activity' },
     { path: '/logs', label: 'Logs', icon: 'list' },
     { path: '/loadtest', label: 'Load Test', icon: 'zap' },
-    // System
+    { section: 'System' },
     { path: '/system', label: 'System', icon: 'cpu' },
     { path: '/settings', label: 'Settings', icon: 'settings' },
   ];
@@ -42,16 +44,20 @@
 
   <ul class="nav-list">
     {#each navItems as item}
-      <li>
-        <button
-          class="nav-item"
-          class:active={path === item.path}
-          onclick={() => navigate(item.path)}
-        >
-          <span class="nav-icon">{@html getIcon(item.icon)}</span>
-          <span>{item.label}</span>
-        </button>
-      </li>
+      {#if 'section' in item}
+        <li class="nav-section">{item.section}</li>
+      {:else}
+        <li>
+          <button
+            class="nav-item"
+            class:active={path === item.path}
+            onclick={() => navigate(item.path)}
+          >
+            <span class="nav-icon">{@html getIcon(item.icon)}</span>
+            <span>{item.label}</span>
+          </button>
+        </li>
+      {/if}
     {/each}
   </ul>
 
@@ -117,6 +123,16 @@
     display: flex;
     flex-direction: column;
     gap: 1px;
+  }
+
+  .nav-section {
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-text-muted);
+    padding: var(--space-4) var(--space-4) var(--space-1);
+    margin-top: var(--space-2);
+    list-style: none;
   }
 
   .nav-item {

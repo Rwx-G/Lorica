@@ -9,6 +9,7 @@
     type CreateLoadTestRequest,
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import { showToast } from '../lib/toast';
 
   let configs: LoadTestConfigResponse[] = $state([]);
   let error = $state('');
@@ -128,6 +129,7 @@
     const res = await api.createLoadTestConfig(body);
     formSubmitting = false;
     if (res.error) { formError = res.error.message; return; }
+    showToast('Test config created', 'success');
     showForm = false;
     await loadData();
   }
@@ -139,6 +141,8 @@
       pendingStartId = configId;
       startWarnings = res.data.warnings ?? [];
       showConfirmStart = true;
+    } else {
+      showToast('Load test started', 'success');
     }
   }
 
@@ -151,16 +155,19 @@
 
   async function handleAbort() {
     await api.abortLoadTest();
+    showToast('Load test aborted', 'success');
   }
 
   async function handleClone(id: string, name: string) {
     await api.cloneLoadTestConfig(id, `${name} (copy)`);
+    showToast('Test config cloned', 'success');
     await loadData();
   }
 
   async function handleDelete() {
     if (!deletingConfig) return;
     await api.deleteLoadTestConfig(deletingConfig.id);
+    showToast('Test config deleted', 'success');
     deletingConfig = null;
     if (selectedConfigId === deletingConfig?.id) {
       selectedConfigId = '';

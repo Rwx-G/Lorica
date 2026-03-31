@@ -8,6 +8,7 @@
     type UpdateProbeRequest,
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import { showToast } from '../lib/toast';
 
   let probes: ProbeConfigResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
@@ -104,6 +105,7 @@
       };
       const res = await api.updateProbe(editingProbe.id, body);
       if (res.error) { formError = res.error.message; formSubmitting = false; return; }
+      showToast('Probe updated', 'success');
     } else {
       const body: CreateProbeRequest = {
         route_id: formRouteId,
@@ -115,6 +117,7 @@
       };
       const res = await api.createProbe(body);
       if (res.error) { formError = res.error.message; formSubmitting = false; return; }
+      showToast('Probe created', 'success');
     }
 
     formSubmitting = false;
@@ -125,6 +128,7 @@
   async function handleDelete() {
     if (!deletingProbe) return;
     await api.deleteProbe(deletingProbe.id);
+    showToast('Probe deleted', 'success');
     deletingProbe = null;
     await loadData();
   }

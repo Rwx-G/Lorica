@@ -1,11 +1,13 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { api, type LogEntry, type LogsQuery } from '../lib/api';
+  import ConfirmDialog from '../components/ConfirmDialog.svelte';
 
   let entries: LogEntry[] = $state([]);
   let total = $state(0);
   let error = $state('');
   let loading = $state(true);
+  let showClearConfirm = $state(false);
 
   // Filters
   let searchText = $state('');
@@ -192,7 +194,7 @@
         {#if wsConnected}<span class="ws-dot" title="WebSocket connected"></span>{/if}
       </label>
       <button class="btn btn-secondary" onclick={loadLogs}>Refresh</button>
-      <button class="btn btn-danger" onclick={handleClearLogs}>Clear</button>
+      <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
     </div>
   </div>
 
@@ -277,6 +279,16 @@
         </tbody>
       </table>
     </div>
+  {/if}
+
+  {#if showClearConfirm}
+    <ConfirmDialog
+      title="Clear Logs"
+      message="This will permanently delete all log entries. This action cannot be undone."
+      confirmLabel="Clear"
+      onconfirm={() => { showClearConfirm = false; handleClearLogs(); }}
+      oncancel={() => (showClearConfirm = false)}
+    />
   {/if}
 </div>
 

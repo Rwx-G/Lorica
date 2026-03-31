@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import { showToast } from '../lib/toast';
 
   let events: WafEvent[] = $state([]);
   let stats: { total_events: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
@@ -18,6 +19,7 @@
   let error = $state('');
   let filterCategory = $state('');
   let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' = $state('events');
+  let showClearConfirm = $state(false);
 
   // Custom rule form
   let showCustomForm = $state(false);
@@ -88,6 +90,7 @@
     const res = await api.toggleBlocklist(newState);
     if (res.data) {
       blocklist = { ...blocklist, enabled: res.data.enabled, ip_count: res.data.ip_count };
+      showToast(`Blocklist ${newState ? 'enabled' : 'disabled'}`, 'success');
       // Auto-refresh on enable to load the IP list immediately
       if (newState) {
         await reloadBlocklist();
@@ -123,6 +126,7 @@
     if (res.error) {
       crError = res.error.message;
     } else {
+      showToast('Custom rule created', 'success');
       showCustomForm = false;
       await loadData();
     }
@@ -131,6 +135,7 @@
   async function handleDeleteCustomRule() {
     if (!deletingCustomRule) return;
     await api.deleteCustomRule(deletingCustomRule.id);
+    showToast('Custom rule deleted', 'success');
     deletingCustomRule = null;
     await loadData();
   }
@@ -141,6 +146,7 @@
     blocklistLoading = false;
     if (res.data) {
       blocklist = { ...blocklist, ip_count: res.data.ip_count };
+      showToast('Blocklist reloaded', 'success');
     } else if (res.error) {
       error = res.error.message;
     }
@@ -180,7 +186,7 @@
     <div class="header-actions">
       <button class="btn btn-secondary" onclick={loadData}>Refresh</button>
       {#if activeTab === 'events' && events.length > 0}
-        <button class="btn btn-danger" onclick={handleClear}>Clear Events</button>
+        <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear Events</button>
       {/if}
     </div>
   </div>
@@ -456,6 +462,16 @@
         </div>
       </div>
     </div>
+  {/if}
+
+  {#if showClearConfirm}
+    <ConfirmDialog
+      title="Clear Events"
+      message="This will permanently delete all security events. This action cannot be undone."
+      confirmLabel="Clear"
+      onconfirm={() => { showClearConfirm = false; handleClear(); }}
+      oncancel={() => (showClearConfirm = false)}
+    />
   {/if}
 </div>
 
