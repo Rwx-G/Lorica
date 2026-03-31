@@ -9,6 +9,7 @@ pub mod error;
 pub mod logs;
 pub mod metrics;
 pub mod middleware;
+pub mod probes;
 pub mod routes;
 pub mod server;
 pub mod settings;

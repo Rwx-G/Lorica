@@ -208,6 +208,18 @@ pub fn build_router(
             "/api/v1/sla/routes/:id/export",
             get(crate::sla::export_sla_data),
         )
+        .route(
+            "/api/v1/sla/routes/:id/active",
+            get(crate::probes::get_active_sla),
+        )
+        .route("/api/v1/probes", get(crate::probes::list_probes))
+        .route("/api/v1/probes", post(crate::probes::create_probe))
+        .route(
+            "/api/v1/probes/route/:route_id",
+            get(crate::probes::list_probes_for_route),
+        )
+        .route("/api/v1/probes/:id", put(crate::probes::update_probe))
+        .route("/api/v1/probes/:id", delete(crate::probes::delete_probe))
         .layer(middleware::from_fn(require_auth));
 
     // Dashboard routes serve embedded frontend assets (SPA with fallback)
