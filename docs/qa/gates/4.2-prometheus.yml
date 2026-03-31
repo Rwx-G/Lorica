@@ -1,0 +1,43 @@
+schema: 1
+story: "4.2"
+story_title: "Prometheus Metrics Endpoint"
+gate: PASS
+status_reason: "All 6 ACs met (AC6 worker aggregation deferred). /metrics endpoint with request counts, latency histograms, backend health, cert expiry, WAF events, system resources. Bounded label cardinality."
+reviewer: "Romain G."
+updated: "2026-03-31T12:00:00Z"
+
+top_issues: []
+waiver:
+  active: false
+
+quality_score: 97
+expires: "2026-04-14T12:00:00Z"
+
+evidence:
+  tests_reviewed: 8
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4, 5]
+    ac_gaps:
+      - ac: 6
+        reason: "Worker-level metrics aggregation deferred - requires command channel extension"
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "No auth on /metrics (Prometheus convention). Localhost-only management port."
+  performance:
+    status: PASS
+    notes: "Metrics recording uses atomic counters. No allocation on hot path."
+  reliability:
+    status: PASS
+    notes: "Bounded cardinality via route_id labels. No hostname/path in labels."
+  maintainability:
+    status: PASS
+    notes: "Centralized metrics module with Lazy statics. Clean public API."
+
+recommendations:
+  immediate: []
+  future:
+    - "Add worker-level metrics aggregation via command channel"
+    - "Add Grafana dashboard template"

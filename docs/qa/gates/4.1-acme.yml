@@ -1,0 +1,41 @@
+schema: 1
+story: "4.1"
+story_title: "ACME / Let's Encrypt Integration"
+gate: PASS
+status_reason: "All 7 ACs met. ACME client via instant-acme, HTTP-01 challenge, consent-driven opt-in, certs stored with is_acme flag. HTTP-01 NAT limitation documented."
+reviewer: "Romain G."
+updated: "2026-03-31T12:00:00Z"
+
+top_issues: []
+waiver:
+  active: false
+
+quality_score: 95
+expires: "2026-04-14T12:00:00Z"
+
+evidence:
+  tests_reviewed: 4
+  risks_identified: 1
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7]
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "ACME account keys handled by instant-acme. Private keys stored encrypted in DB."
+  performance:
+    status: PASS
+    notes: "Provisioning is async, does not block proxy traffic."
+  reliability:
+    status: PASS
+    notes: "ACME failure does not disrupt existing TLS. Fallback documented."
+  maintainability:
+    status: PASS
+    notes: "Clean separation in acme.rs module. Challenge store is thread-safe."
+
+recommendations:
+  immediate: []
+  future:
+    - "Add DNS-01 challenge support for NAT/internal deployments"
+    - "Add auto-renewal background task (currently manual trigger)"
