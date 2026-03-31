@@ -34,6 +34,7 @@ COPY lorica-tls/ lorica-tls/
 COPY lorica-command/ lorica-command/
 COPY lorica-waf/ lorica-waf/
 COPY lorica-worker/ lorica-worker/
+COPY lorica-bench/ lorica-bench/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend into the dashboard crate
