@@ -1,0 +1,41 @@
+schema: 1
+story: "6.3"
+story_title: "Hostname Aliases and Redirects"
+gate: PASS
+status_reason: "All ACs met. Hostname aliases indexed in routes_by_host map (same RouteEntry referenced by primary + all aliases). redirect_to_hostname triggers 301 before proxying, preserving scheme/path/query. Dashboard route form includes alias list (CSV) and redirect hostname input. Alias matching tested via unit test. Persistence via SQLite JSON array column."
+reviewer: "Romain G."
+updated: "2026-03-31T22:00:00Z"
+
+top_issues: []
+waiver:
+  active: false
+
+quality_score: 96
+expires: "2026-04-14T12:00:00Z"
+
+evidence:
+  tests_reviewed: 31
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4]
+    ac_gaps: []
+    ac_gap_reason: ""
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "Hostname redirect uses 301 status code. Redirect preserves original scheme unless force_https overrides. No open redirect - target is admin-configured."
+  performance:
+    status: PASS
+    notes: "Aliases are pre-indexed in routes_by_host HashMap during config reload. O(1) lookup per request regardless of alias count."
+  reliability:
+    status: PASS
+    notes: "Aliases stored as JSON array in SQLite, deserialized on load. Config reload atomically swaps the entire proxy config via arc-swap."
+  maintainability:
+    status: PASS
+    notes: "Alias indexing happens in ProxyConfig::from_store - single location. Redirect logic is 20 lines in request_filter, easy to audit."
+
+recommendations:
+  immediate: []
+  future:
+    - "Add unique alias constraint enforcement across routes (currently only documented, not enforced at DB level)"
