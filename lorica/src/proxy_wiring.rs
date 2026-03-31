@@ -771,11 +771,11 @@ impl ProxyHttp for LoricaProxy {
             .collect();
         let remove_headers: Vec<String> = route.proxy_headers_remove.clone();
 
-        for (name, value) in &custom_headers {
-            let _ = upstream_request.insert_header(name.as_str(), value.as_str());
+        for (name, value) in custom_headers {
+            let _ = upstream_request.insert_header(name, value);
         }
-        for name in &remove_headers {
-            upstream_request.remove_header(name.as_str());
+        for name in remove_headers {
+            upstream_request.remove_header(&name);
         }
 
         Ok(())
