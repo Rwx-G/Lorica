@@ -266,11 +266,11 @@
         <div class="form-row">
           <div class="form-group">
             <label>Name</label>
-            <input type="text" bind:value={formName} placeholder="serverK8S1" />
+            <input type="text" bind:value={formName} placeholder="e.g. web-server-01, wazuh-node" />
           </div>
           <div class="form-group">
             <label>Group</label>
-            <input type="text" bind:value={formGroupName} placeholder="K8S" />
+            <input type="text" bind:value={formGroupName} placeholder="e.g. kubernetes, production, dmz" />
           </div>
         </div>
 

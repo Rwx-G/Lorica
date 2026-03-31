@@ -148,14 +148,14 @@ pub async fn health_check_loop(
                 resolve_backend_topology(&store, &backend.id)
             };
 
-            // SingleVM: no active health checks - passive detection only
+            // SingleVM: still run health checks to detect unreachable backends.
+            // The topology type affects service discovery, not health monitoring.
             if effective_topology == TopologyType::SingleVm {
                 debug!(
                     backend = %backend.address,
                     topology = "single_vm",
-                    "skipping active health check (SingleVM topology)"
+                    "running health check (all topologies with health_check_enabled)"
                 );
-                continue;
             }
 
             // DockerSwarm: use Docker API for health status when available
