@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Svelte-5-FF3E00.svg" alt="Svelte">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Status-0.3.0--dev-yellow.svg" alt="Status">
-  <img src="https://img.shields.io/badge/Tests-375%20passing-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/Tests-414%20passing-brightgreen.svg" alt="Tests">
 </p>
 
 ---
@@ -22,7 +22,7 @@ One `apt install`, one binary, one management port on localhost. That's the enti
 
 ## What it does today
 
-Epics 1-3 are complete. Lorica is a fully functional reverse proxy with security and intelligence features:
+Epics 1-4 are complete. Lorica is a production-ready reverse proxy with security, intelligence, and automation:
 
 - **HTTP/HTTPS proxying** with host-based and path-prefix routing, round-robin load balancing, TLS termination via rustls
 - **Web dashboard** (Svelte 5, ~59KB) with route, backend, certificate management, access logs, security panel, system monitoring, and settings
@@ -33,6 +33,10 @@ Epics 1-3 are complete. Lorica is a fully functional reverse proxy with security
 - **Configuration persistence** in embedded SQLite (WAL mode), with TOML export/import and diff preview
 - **Worker isolation** with fork+exec, protobuf command channel, and zero-downtime config reload
 - **Certificate hot-swap** with SNI support and wildcard domains, no downtime during rotation
+- **ACME / Let's Encrypt** automatic TLS provisioning via HTTP-01 challenge
+- **Prometheus metrics** endpoint with request counts, latency histograms, backend health, WAF events
+- **Peak EWMA** latency-based load balancing alongside Round Robin, Consistent Hash, Random
+- **CI/CD** with GitHub Actions, `.deb` packaging, release automation
 
 ## Where it's going
 
@@ -41,7 +45,7 @@ Epics 1-3 are complete. Lorica is a fully functional reverse proxy with security
 | 1. Foundation | Proxy engine, API, dashboard, config management | Done |
 | 2. Resilience | Worker process isolation, command channel, zero-downtime reload | Done |
 | 3. Intelligence | WAF (OWASP CRS), topology awareness, notifications | Done |
-| 4. Production | ACME/Let's Encrypt, Prometheus metrics, deb/rpm packaging | Planned |
+| 4. Production | ACME/Let's Encrypt, Prometheus metrics, Peak EWMA, packaging, security | Done |
 | 5. Observability | SLA monitoring (passive + active probes), built-in load testing | Planned |
 
 ## Quick look
@@ -63,7 +67,7 @@ cd lorica-dashboard/frontend && npx vitest run
 cd tests-e2e-docker && ./run.sh --build
 ```
 
-312 unit tests + 63 Docker e2e tests = 375 total.
+324 unit tests + 90 Docker e2e tests = 414 total.
 
 ## Tech stack
 
