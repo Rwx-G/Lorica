@@ -45,7 +45,7 @@ RUN cargo build --release -p lorica
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates socat && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates socat curl && rm -rf /var/lib/apt/lists/*
 RUN useradd -r -s /bin/false lorica
 RUN mkdir -p /var/lib/lorica && chown lorica:lorica /var/lib/lorica
 

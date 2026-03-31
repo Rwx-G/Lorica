@@ -2,6 +2,10 @@
 # E2E test entrypoint: socat forwards external 0.0.0.0:9443 to Lorica's
 # localhost-only management API. The admin password is captured from Lorica's
 # first-run output and written to /shared/admin_password for the test runner.
+#
+# FRAGILE: password extraction parses "Initial admin password: ..." from
+# stdout. If the message format changes, tests will fail silently at the
+# login step. A future --init-password-file flag would be more robust.
 
 mkdir -p /shared
 
