@@ -13,50 +13,63 @@
   };
 </script>
 
-<span class="badge" class:healthy={status === 'healthy'} class:degraded={status === 'degraded'} class:down={status === 'down'} class:unknown={status === 'unknown'}>
+<span class="status-badge" class:healthy={status === 'healthy'} class:degraded={status === 'degraded'} class:down={status === 'down'} class:unknown={status === 'unknown'}>
   <span class="dot"></span>
   {labels[status] ?? 'Unknown'}
 </span>
 
 <style>
-  .badge {
+  .status-badge {
     display: inline-flex;
     align-items: center;
-    gap: 0.375rem;
-    padding: 0.125rem 0.5rem;
-    border-radius: 9999px;
-    font-size: 0.75rem;
+    gap: var(--space-2);
+    padding: 0.125rem 0.625rem;
+    border-radius: var(--radius-full);
+    font-size: var(--text-sm);
     font-weight: 500;
     white-space: nowrap;
   }
 
   .dot {
-    width: 0.5rem;
-    height: 0.5rem;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
+    flex-shrink: 0;
   }
 
   .healthy {
-    background: rgba(34, 197, 94, 0.1);
+    background: var(--color-green-subtle);
     color: var(--color-green);
   }
-  .healthy .dot { background: var(--color-green); }
+  .healthy .dot {
+    background: var(--color-green);
+    box-shadow: 0 0 0 3px var(--color-green-subtle);
+  }
 
   .degraded {
-    background: rgba(245, 158, 11, 0.1);
+    background: var(--color-orange-subtle);
     color: var(--color-orange);
   }
-  .degraded .dot { background: var(--color-orange); }
+  .degraded .dot {
+    background: var(--color-orange);
+    box-shadow: 0 0 0 3px var(--color-orange-subtle);
+  }
 
   .down {
-    background: rgba(239, 68, 68, 0.1);
+    background: var(--color-red-subtle);
     color: var(--color-red);
   }
-  .down .dot { background: var(--color-red); }
+  .down .dot {
+    background: var(--color-red);
+    box-shadow: 0 0 0 3px var(--color-red-subtle);
+  }
 
   .unknown {
-    background: rgba(148, 163, 184, 0.1);
+    background: rgba(100, 116, 139, 0.1);
     color: var(--color-text-muted);
   }
-  .unknown .dot { background: var(--color-text-muted); }
+  .unknown .dot {
+    background: var(--color-text-muted);
+    box-shadow: 0 0 0 3px rgba(100, 116, 139, 0.15);
+  }
 </style>

@@ -46,8 +46,24 @@
   font-family: var(--sans);
   font-size: 15px;
   line-height: 1.5;
+  font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* Disable transitions during theme toggle (Tailscale technique) */
+.theme-transitioning,
+.theme-transitioning * {
+  transition: none !important;
+}
+
+/* Respect reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* --- Color Themes --- */
@@ -68,13 +84,13 @@
   --color-primary-subtle: rgba(59, 130, 246, 0.1);
   --color-border: #1e293b;
   --color-border-subtle: rgba(255, 255, 255, 0.06);
-  --color-green: #22c55e;
-  --color-green-subtle: rgba(34, 197, 94, 0.1);
-  --color-orange: #f59e0b;
-  --color-orange-subtle: rgba(245, 158, 11, 0.1);
-  --color-red: #ef4444;
-  --color-red-subtle: rgba(239, 68, 68, 0.1);
-  --color-error: #ef4444;
+  --color-green: #34d399;
+  --color-green-subtle: rgba(52, 211, 153, 0.1);
+  --color-orange: #fbbf24;
+  --color-orange-subtle: rgba(251, 191, 36, 0.1);
+  --color-red: #f87171;
+  --color-red-subtle: rgba(248, 113, 113, 0.1);
+  --color-error: #f87171;
 
   color-scheme: dark;
   color: var(--color-text);
@@ -508,4 +524,66 @@ tbody tr:hover td {
   font-size: var(--text-sm);
   color: var(--color-text-muted);
   margin-top: var(--space-1);
+}
+
+/* Numeric alignment in tables */
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--mono);
+}
+
+/* Status dot with glow */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-dot-green {
+  background: var(--color-green);
+  box-shadow: 0 0 0 3px var(--color-green-subtle);
+}
+
+.status-dot-orange {
+  background: var(--color-orange);
+  box-shadow: 0 0 0 3px var(--color-orange-subtle);
+}
+
+.status-dot-red {
+  background: var(--color-red);
+  box-shadow: 0 0 0 3px var(--color-red-subtle);
+}
+
+.status-dot-gray {
+  background: var(--color-text-muted);
+  box-shadow: 0 0 0 3px rgba(100, 116, 139, 0.15);
+}
+
+/* Truncate with ellipsis */
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Scrollbar styling (Webkit) */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: var(--radius-full);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
 }
