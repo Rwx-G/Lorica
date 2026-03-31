@@ -58,6 +58,10 @@ pub fn build_router(
         .route("/api/v1/auth/login", post(crate::auth::login))
         .route("/api/v1/auth/logout", post(crate::auth::logout));
 
+    // Metrics endpoint (no auth - Prometheus convention)
+    let metrics_routes = Router::new()
+        .route("/metrics", get(crate::metrics::get_metrics));
+
     // Protected routes (auth required)
     let protected_routes = Router::new()
         .route("/api/v1/auth/password", put(crate::auth::change_password))
@@ -159,6 +163,7 @@ pub fn build_router(
 
     Router::new()
         .merge(auth_routes)
+        .merge(metrics_routes)
         .merge(protected_routes)
         .merge(dashboard_routes)
         .layer(axum::Extension(state))

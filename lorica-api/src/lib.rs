@@ -6,6 +6,7 @@ pub mod certificates;
 pub mod config;
 pub mod error;
 pub mod logs;
+pub mod metrics;
 pub mod middleware;
 pub mod routes;
 pub mod server;

@@ -63,6 +63,16 @@ impl SystemCache {
         Self { sys }
     }
 
+    /// Get CPU usage percentage after refresh.
+    pub fn cpu_usage_percent(&self) -> f32 {
+        self.sys.global_cpu_usage()
+    }
+
+    /// Get used memory in bytes after refresh.
+    pub fn memory_used_bytes(&self) -> u64 {
+        self.sys.used_memory()
+    }
+
     /// Refresh only the metrics we need (CPU, memory, process).
     pub fn refresh(&mut self) {
         self.sys.refresh_cpu_all();

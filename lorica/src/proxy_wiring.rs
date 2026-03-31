@@ -175,6 +175,8 @@ pub struct RequestCtx {
     pub matched_host: Option<String>,
     /// The matched route path prefix (for logging).
     pub matched_path: Option<String>,
+    /// The matched route ID (for metrics - bounded cardinality).
+    pub route_id: Option<String>,
     /// Whether WAF blocked this request.
     pub waf_blocked: bool,
 }
@@ -224,6 +226,7 @@ impl ProxyHttp for LoricaProxy {
             backend_addr: None,
             matched_host: None,
             matched_path: None,
+            route_id: None,
             waf_blocked: false,
         }
     }
@@ -294,7 +297,10 @@ impl ProxyHttp for LoricaProxy {
         let verdict = self.waf_engine.evaluate(waf_mode, path, query, &headers, host);
 
         match verdict {
-            lorica_waf::WafVerdict::Blocked(_) => {
+            lorica_waf::WafVerdict::Blocked(ref events) => {
+                for ev in events {
+                    lorica_api::metrics::record_waf_event(ev.category.as_str(), "blocked");
+                }
                 ctx.waf_blocked = true;
                 ctx.matched_host = Some(host.to_string());
                 ctx.matched_path = Some(path.to_string());
@@ -303,7 +309,13 @@ impl ProxyHttp for LoricaProxy {
                 session.write_response_header(Box::new(header), true).await?;
                 Ok(true)
             }
-            _ => Ok(false),
+            lorica_waf::WafVerdict::Detected(ref events) => {
+                for ev in events {
+                    lorica_api::metrics::record_waf_event(ev.category.as_str(), "detected");
+                }
+                Ok(false)
+            }
+            lorica_waf::WafVerdict::Pass => Ok(false),
         }
     }
 
@@ -347,6 +359,7 @@ impl ProxyHttp for LoricaProxy {
 
         ctx.matched_host = Some(entry.route.hostname.clone());
         ctx.matched_path = Some(entry.route.path_prefix.clone());
+        ctx.route_id = Some(entry.route.id.clone());
 
         // Filter healthy backends
         let healthy_backends: Vec<&Backend> = entry
@@ -458,6 +471,10 @@ impl ProxyHttp for LoricaProxy {
             error: error_str,
         };
         self.log_buffer.push(entry).await;
+
+        // Record Prometheus metrics (bounded labels: route_id, not hostname)
+        let route_label = ctx.route_id.as_deref().unwrap_or("_unknown");
+        lorica_api::metrics::record_request(route_label, status, elapsed.as_secs_f64());
     }
 
     async fn connected_to_upstream(
