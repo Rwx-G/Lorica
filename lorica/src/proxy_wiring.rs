@@ -823,12 +823,12 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Apply all collected headers
-        for (name, value) in &headers_to_set {
-            let _ = upstream_response.insert_header(name.as_str(), value.as_str());
+        // Apply removals first, then additions
+        for name in headers_to_remove {
+            upstream_response.remove_header(&name);
         }
-        for name in &headers_to_remove {
-            upstream_response.remove_header(name.as_str());
+        for (name, value) in headers_to_set {
+            let _ = upstream_response.insert_header(name, value);
         }
 
         Ok(())
