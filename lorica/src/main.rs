@@ -690,6 +690,12 @@ fn run_single_process(cli: Cli) {
         let waf_event_buffer = waf_engine.event_buffer();
         let waf_rule_count = waf_engine.rule_count();
 
+        // Spawn IP blocklist auto-refresh (every 6 hours, matching Data-Shield update frequency)
+        let _blocklist_refresh = lorica_api::waf::spawn_blocklist_refresh(
+            Arc::clone(&waf_engine),
+            std::time::Duration::from_secs(6 * 3600),
+        );
+
         // Start the HTTP proxy service
         let mut lorica_proxy = LoricaProxy::new(
             Arc::clone(&proxy_config),
