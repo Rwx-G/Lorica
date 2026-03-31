@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -165,6 +165,66 @@ impl BackendConnections {
     }
 }
 
+/// Peak EWMA latency tracker for load balancing.
+///
+/// Tracks exponentially weighted moving average of latency per backend.
+/// The decay factor ensures recent measurements count more than old ones.
+#[derive(Debug, Default)]
+pub struct EwmaTracker {
+    /// EWMA score per backend address (microseconds).
+    scores: RwLock<HashMap<String, f64>>,
+}
+
+/// Decay factor for EWMA (tau = 10 seconds).
+const EWMA_DECAY_NS: f64 = 10_000_000_000.0;
+
+impl EwmaTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update the EWMA score for a backend with a new latency sample.
+    pub fn record(&self, addr: &str, latency_us: f64) {
+        let mut scores = self.scores.write().unwrap();
+        let current = scores.get(addr).copied().unwrap_or(0.0);
+        // Exponential decay: new_score = alpha * sample + (1-alpha) * old_score
+        // With alpha ~0.3 for responsive adaptation
+        let alpha = 0.3;
+        let new_score = alpha * latency_us + (1.0 - alpha) * current;
+        scores.insert(addr.to_string(), new_score);
+    }
+
+    /// Select the backend with the lowest EWMA score.
+    /// Returns the index into the provided backends slice.
+    pub fn select_best(&self, backends: &[&Backend]) -> usize {
+        if backends.is_empty() {
+            return 0;
+        }
+        let scores = self.scores.read().unwrap();
+        let mut best_idx = 0;
+        let mut best_score = f64::MAX;
+        for (i, b) in backends.iter().enumerate() {
+            let score = scores.get(&b.address).copied().unwrap_or(0.0);
+            // Tie-break: unscored backends get priority (explore)
+            if score < best_score {
+                best_score = score;
+                best_idx = i;
+            }
+        }
+        best_idx
+    }
+
+    /// Get the EWMA score for a backend (for dashboard display).
+    pub fn get_score(&self, addr: &str) -> f64 {
+        self.scores
+            .read()
+            .unwrap()
+            .get(addr)
+            .copied()
+            .unwrap_or(0.0)
+    }
+}
+
 /// Per-request context carried through the proxy pipeline.
 pub struct RequestCtx {
     /// When the request started processing.
@@ -191,6 +251,8 @@ pub struct LoricaProxy {
     pub active_connections: Arc<AtomicU64>,
     /// Per-backend connection counters for graceful drain.
     pub backend_connections: Arc<BackendConnections>,
+    /// Peak EWMA latency tracker for load balancing.
+    pub ewma_tracker: Arc<EwmaTracker>,
     /// WAF engine for request inspection.
     pub waf_engine: Arc<WafEngine>,
 }
@@ -206,6 +268,7 @@ impl LoricaProxy {
             log_buffer,
             active_connections,
             backend_connections: Arc::new(BackendConnections::new()),
+            ewma_tracker: Arc::new(EwmaTracker::new()),
             waf_engine: Arc::new(WafEngine::new()),
         }
     }
@@ -380,8 +443,24 @@ impl ProxyHttp for LoricaProxy {
             );
         }
 
-        // Round-robin selection
-        let idx = entry.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_backends.len();
+        // Backend selection based on load balancing algorithm
+        use lorica_config::models::LoadBalancing;
+        let idx = match entry.route.load_balancing {
+            LoadBalancing::PeakEwma => {
+                self.ewma_tracker.select_best(&healthy_backends)
+            }
+            LoadBalancing::Random => {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                ctx.start_time.hash(&mut hasher);
+                (hasher.finish() as usize) % healthy_backends.len()
+            }
+            _ => {
+                // Round-robin (default for RoundRobin and ConsistentHash)
+                entry.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_backends.len()
+            }
+        };
         let backend = healthy_backends[idx];
 
         ctx.backend_addr = Some(backend.address.clone());
@@ -475,6 +554,11 @@ impl ProxyHttp for LoricaProxy {
         // Record Prometheus metrics (bounded labels: route_id, not hostname)
         let route_label = ctx.route_id.as_deref().unwrap_or("_unknown");
         lorica_api::metrics::record_request(route_label, status, elapsed.as_secs_f64());
+
+        // Update EWMA latency tracker for Peak EWMA load balancing
+        if let Some(ref addr) = ctx.backend_addr {
+            self.ewma_tracker.record(addr, latency_ms as f64 * 1000.0);
+        }
     }
 
     async fn connected_to_upstream(
@@ -704,5 +788,81 @@ mod tests {
         bc.increment("10.0.0.2:8080");
         assert_eq!(bc.get("10.0.0.1:8080"), 1);
         assert_eq!(bc.get("10.0.0.2:8080"), 2);
+    }
+
+    // ---- EWMA Tracker ----
+
+    #[test]
+    fn test_ewma_tracker_default_score() {
+        let tracker = EwmaTracker::new();
+        assert_eq!(tracker.get_score("10.0.0.1:8080"), 0.0);
+    }
+
+    #[test]
+    fn test_ewma_tracker_record_updates_score() {
+        let tracker = EwmaTracker::new();
+        tracker.record("10.0.0.1:8080", 100.0);
+        assert!(tracker.get_score("10.0.0.1:8080") > 0.0);
+    }
+
+    #[test]
+    fn test_ewma_tracker_selects_lowest_score() {
+        let tracker = EwmaTracker::new();
+        // Backend 1: high latency
+        for _ in 0..10 {
+            tracker.record("10.0.0.1:8080", 5000.0);
+        }
+        // Backend 2: low latency
+        for _ in 0..10 {
+            tracker.record("10.0.0.2:8080", 100.0);
+        }
+
+        let b1 = make_backend("b1", "10.0.0.1:8080");
+        let b2 = make_backend("b2", "10.0.0.2:8080");
+        let backends = vec![&b1, &b2];
+
+        let selected = tracker.select_best(&backends);
+        assert_eq!(selected, 1, "Should select the faster backend (index 1)");
+    }
+
+    #[test]
+    fn test_ewma_tracker_prefers_unscored() {
+        let tracker = EwmaTracker::new();
+        // Only score backend 1 (high latency)
+        tracker.record("10.0.0.1:8080", 5000.0);
+        // Backend 2 is unscored (score = 0.0, exploration priority)
+
+        let b1 = make_backend("b1", "10.0.0.1:8080");
+        let b2 = make_backend("b2", "10.0.0.2:8080");
+        let backends = vec![&b1, &b2];
+
+        let selected = tracker.select_best(&backends);
+        assert_eq!(selected, 1, "Should prefer unscored backend for exploration");
+    }
+
+    #[test]
+    fn test_ewma_tracker_decay() {
+        let tracker = EwmaTracker::new();
+        // Record very high latency
+        tracker.record("10.0.0.1:8080", 10000.0);
+        let score_after_high = tracker.get_score("10.0.0.1:8080");
+
+        // Record many low latency samples (should decay the high score)
+        for _ in 0..20 {
+            tracker.record("10.0.0.1:8080", 50.0);
+        }
+        let score_after_low = tracker.get_score("10.0.0.1:8080");
+
+        assert!(
+            score_after_low < score_after_high,
+            "Score should decrease after low-latency samples ({score_after_low} < {score_after_high})"
+        );
+    }
+
+    #[test]
+    fn test_ewma_tracker_empty_backends() {
+        let tracker = EwmaTracker::new();
+        let backends: Vec<&Backend> = vec![];
+        assert_eq!(tracker.select_best(&backends), 0);
     }
 }
