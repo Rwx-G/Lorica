@@ -211,6 +211,7 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
                     lorica_config::models::HealthStatus::Healthy => 1.0,
                     lorica_config::models::HealthStatus::Degraded => 0.5,
                     lorica_config::models::HealthStatus::Down => 0.0,
+                    lorica_config::models::HealthStatus::Unknown => -1.0,
                 };
                 set_backend_health(&b.id, &b.address, health_val);
             }
