@@ -1,7 +1,7 @@
 # Story 5.2: Active SLA Monitoring (Internal/Engineering)
 
 **Epic:** [Epic 5 - Observability](../prd/epic-5-observability.md)
-**Status:** Draft
+**Status:** Review
 **Priority:** P2
 **Depends on:** Story 5.1
 
@@ -29,17 +29,17 @@ so that I can detect outages even when there is no user traffic.
 
 ## Tasks
 
-- [ ] Design probe configuration model (method, path, expected status, interval, timeout)
-- [ ] Implement probe scheduler (tokio interval task per probe)
-- [ ] Implement probe execution (HTTP request to backend via lorica-core connector)
-- [ ] Track probe results separately from real traffic metrics
-- [ ] Calculate active SLA from probe results
-- [ ] Add probe config to route/backend API endpoints
+- [x] Design probe configuration model (method, path, expected status, interval, timeout)
+- [x] Implement probe scheduler (tokio interval task per probe)
+- [x] Implement probe execution (HTTP request to backend via reqwest)
+- [x] Track probe results separately from real traffic metrics
+- [x] Calculate active SLA from probe results
+- [x] Add probe config to route/backend API endpoints
 - [ ] Build dashboard probe configuration UI
 - [ ] Build side-by-side passive/active SLA display
-- [ ] Integrate probe failure alerts with lorica-notify
-- [ ] Write tests for probe scheduling accuracy
-- [ ] Write test for outage detection during zero-traffic window
+- [x] Integrate probe failure alerts with lorica-notify
+- [x] Write tests for probe scheduling accuracy
+- [x] Write test for outage detection during zero-traffic window
 
 ## Dev Notes
 
