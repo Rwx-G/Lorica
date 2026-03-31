@@ -52,7 +52,7 @@ impl DockerDiscovery {
             .client
             .list_services(Some(ListServicesOptions {
                 filters,
-                ..Default::default()
+                status: true,
             }))
             .await
             .map_err(|e| DiscoveryError::Docker(format!("failed to list services: {e}")))?;
@@ -67,6 +67,29 @@ impl DockerDiscovery {
                 .and_then(|s| s.name.as_deref())
                 .unwrap_or(service_name);
 
+            // Derive health from running vs desired task counts.
+            // A service with zero running tasks is unhealthy even if it has a VIP.
+            let (running, desired) = svc
+                .service_status
+                .as_ref()
+                .map(|s| {
+                    (
+                        s.running_tasks.unwrap_or(0),
+                        s.desired_tasks.unwrap_or(0),
+                    )
+                })
+                .unwrap_or((0, 0));
+
+            let healthy = running > 0 && running >= desired;
+
+            if running == 0 && desired > 0 {
+                warn!(
+                    service = svc_name,
+                    desired = desired,
+                    "Docker Swarm service has zero running tasks - marking unhealthy"
+                );
+            }
+
             // Extract virtual IPs from endpoint
             if let Some(ref endpoint) = svc.endpoint {
                 if let Some(ref vips) = endpoint.virtual_ips {
@@ -80,6 +103,8 @@ impl DockerDiscovery {
                             labels.insert("source".to_string(), "docker_swarm".to_string());
                             labels.insert("service_id".to_string(), svc_id.to_string());
                             labels.insert("service_name".to_string(), svc_name.to_string());
+                            labels.insert("running_tasks".to_string(), running.to_string());
+                            labels.insert("desired_tasks".to_string(), desired.to_string());
                             if let Some(ref net_id) = vip.network_id {
                                 labels.insert("network_id".to_string(), net_id.clone());
                             }
@@ -87,12 +112,15 @@ impl DockerDiscovery {
                             debug!(
                                 service = svc_name,
                                 address = %address,
+                                running = running,
+                                desired = desired,
+                                healthy = healthy,
                                 "discovered Docker Swarm service VIP"
                             );
 
                             endpoints.push(DiscoveredEndpoint {
                                 address,
-                                healthy: true,
+                                healthy,
                                 labels,
                             });
                         }
