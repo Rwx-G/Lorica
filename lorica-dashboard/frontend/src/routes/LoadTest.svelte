@@ -1,0 +1,529 @@
+<script lang="ts">
+  import { onMount, onDestroy } from 'svelte';
+  import {
+    api,
+    type LoadTestConfigResponse,
+    type LoadTestResultResponse,
+    type LoadTestProgress,
+    type LoadTestComparison,
+    type CreateLoadTestRequest,
+  } from '../lib/api';
+  import ConfirmDialog from '../components/ConfirmDialog.svelte';
+
+  let configs: LoadTestConfigResponse[] = $state([]);
+  let error = $state('');
+  let loading = $state(true);
+
+  // Live test state
+  let progress: LoadTestProgress | null = $state(null);
+  let sseSource: EventSource | null = $state(null);
+
+  // Results
+  let selectedConfigId = $state('');
+  let results: LoadTestResultResponse[] = $state([]);
+  let comparison: LoadTestComparison | null = $state(null);
+  let resultsLoading = $state(false);
+
+  // Form
+  let showForm = $state(false);
+  let formName = $state('');
+  let formTargetUrl = $state('');
+  let formMethod = $state('GET');
+  let formConcurrency = $state(10);
+  let formRps = $state(100);
+  let formDuration = $state(30);
+  let formErrorThreshold = $state(10.0);
+  let formCron = $state('');
+  let formError = $state('');
+  let formSubmitting = $state(false);
+
+  // Confirm
+  let pendingStartId = $state('');
+  let startWarnings: string[] = $state([]);
+  let showConfirmStart = $state(false);
+  let deletingConfig: LoadTestConfigResponse | null = $state(null);
+
+  async function loadData() {
+    loading = true;
+    error = '';
+    const res = await api.listLoadTestConfigs();
+    if (res.data) configs = res.data;
+    if (res.error) error = res.error.message;
+    loading = false;
+  }
+
+  onMount(() => {
+    loadData();
+    connectSSE();
+  });
+
+  onDestroy(() => {
+    if (sseSource) sseSource.close();
+  });
+
+  function connectSSE() {
+    const es = new EventSource('/api/v1/loadtest/stream');
+    es.addEventListener('progress', (e) => {
+      try { progress = JSON.parse(e.data); } catch {}
+    });
+    es.addEventListener('idle', () => {
+      if (progress?.active) {
+        progress = null;
+        // Reload results when test finishes
+        if (selectedConfigId) loadResults(selectedConfigId);
+      } else {
+        progress = null;
+      }
+    });
+    es.onerror = () => {
+      progress = null;
+    };
+    sseSource = es;
+  }
+
+  function openCreateForm() {
+    formName = '';
+    formTargetUrl = '';
+    formMethod = 'GET';
+    formConcurrency = 10;
+    formRps = 100;
+    formDuration = 30;
+    formErrorThreshold = 10.0;
+    formCron = '';
+    formError = '';
+    showForm = true;
+  }
+
+  async function handleCreate() {
+    if (!formName.trim() || !formTargetUrl.trim()) {
+      formError = 'Name and target URL are required';
+      return;
+    }
+    formSubmitting = true;
+    formError = '';
+    const body: CreateLoadTestRequest = {
+      name: formName,
+      target_url: formTargetUrl,
+      method: formMethod,
+      concurrency: formConcurrency,
+      requests_per_second: formRps,
+      duration_s: formDuration,
+      error_threshold_pct: formErrorThreshold,
+      schedule_cron: formCron || undefined,
+    };
+    const res = await api.createLoadTestConfig(body);
+    formSubmitting = false;
+    if (res.error) { formError = res.error.message; return; }
+    showForm = false;
+    await loadData();
+  }
+
+  async function handleStart(configId: string) {
+    const res = await api.startLoadTest(configId);
+    if (res.error) { error = res.error.message; return; }
+    if (res.data?.status === 'requires_confirmation') {
+      pendingStartId = configId;
+      startWarnings = res.data.warnings ?? [];
+      showConfirmStart = true;
+    }
+  }
+
+  async function handleConfirmedStart() {
+    showConfirmStart = false;
+    const res = await api.startLoadTestConfirmed(pendingStartId);
+    if (res.error) error = res.error.message;
+    pendingStartId = '';
+  }
+
+  async function handleAbort() {
+    await api.abortLoadTest();
+  }
+
+  async function handleClone(id: string, name: string) {
+    await api.cloneLoadTestConfig(id, `${name} (copy)`);
+    await loadData();
+  }
+
+  async function handleDelete() {
+    if (!deletingConfig) return;
+    await api.deleteLoadTestConfig(deletingConfig.id);
+    deletingConfig = null;
+    if (selectedConfigId === deletingConfig?.id) {
+      selectedConfigId = '';
+      results = [];
+      comparison = null;
+    }
+    await loadData();
+  }
+
+  async function loadResults(configId: string) {
+    selectedConfigId = configId;
+    resultsLoading = true;
+    const [resResults, resCompare] = await Promise.all([
+      api.getLoadTestResults(configId),
+      api.compareLoadTestResults(configId),
+    ]);
+    if (resResults.data) results = resResults.data;
+    if (resCompare.data) comparison = resCompare.data;
+    resultsLoading = false;
+  }
+
+  function formatDelta(val: number | null): string {
+    if (val === null) return '-';
+    const sign = val >= 0 ? '+' : '';
+    return `${sign}${val.toFixed(1)}%`;
+  }
+
+  function deltaColor(val: number | null, invertGood: boolean = false): string {
+    if (val === null) return 'var(--color-text-muted)';
+    const good = invertGood ? val > 0 : val < 0;
+    if (Math.abs(val) < 2) return 'var(--color-text-muted)';
+    return good ? 'var(--color-green)' : 'var(--color-red)';
+  }
+</script>
+
+<div class="loadtest-page">
+  <div class="page-header">
+    <h1>Load Testing</h1>
+    <button class="btn btn-primary" onclick={openCreateForm}>New Test Config</button>
+  </div>
+
+  {#if error}
+    <div class="error-banner">{error}</div>
+  {/if}
+
+  <!-- Live progress panel -->
+  {#if progress?.active}
+    <div class="live-panel">
+      <div class="live-header">
+        <span class="live-dot"></span>
+        <span class="live-title">Test Running</span>
+        <button class="btn btn-danger-small" onclick={handleAbort}>Abort</button>
+      </div>
+      <div class="live-stats">
+        <div class="live-stat">
+          <span class="live-label">Requests</span>
+          <span class="live-value">{progress.total_requests.toLocaleString()}</span>
+        </div>
+        <div class="live-stat">
+          <span class="live-label">RPS</span>
+          <span class="live-value">{progress.current_rps.toFixed(0)}</span>
+        </div>
+        <div class="live-stat">
+          <span class="live-label">Avg Latency</span>
+          <span class="live-value">{progress.avg_latency_ms.toFixed(0)}ms</span>
+        </div>
+        <div class="live-stat">
+          <span class="live-label">Error Rate</span>
+          <span class="live-value" style="color: {progress.error_rate_pct > 5 ? 'var(--color-red)' : 'var(--color-green)'}">
+            {progress.error_rate_pct.toFixed(1)}%
+          </span>
+        </div>
+        <div class="live-stat">
+          <span class="live-label">Elapsed</span>
+          <span class="live-value">{progress.elapsed_s.toFixed(0)}s</span>
+        </div>
+      </div>
+      {#if progress.aborted}
+        <div class="abort-reason">Aborted: {progress.abort_reason}</div>
+      {/if}
+    </div>
+  {/if}
+
+  {#if loading}
+    <p class="loading">Loading test configurations...</p>
+  {:else if configs.length === 0}
+    <div class="empty-state">
+      <p>No load test configurations yet.</p>
+      <button class="btn btn-primary" onclick={openCreateForm}>Create your first test</button>
+    </div>
+  {:else}
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Target</th>
+            <th>Concurrency</th>
+            <th>RPS</th>
+            <th>Duration</th>
+            <th>Schedule</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each configs as c}
+            <tr class:selected={selectedConfigId === c.id}>
+              <td>
+                <button class="link-btn" onclick={() => loadResults(c.id)}>{c.name}</button>
+              </td>
+              <td class="mono small">{c.target_url}</td>
+              <td>{c.concurrency}</td>
+              <td>{c.requests_per_second}</td>
+              <td>{c.duration_s}s</td>
+              <td class="mono small">{c.schedule_cron ?? '-'}</td>
+              <td class="actions">
+                <button class="btn btn-small btn-run" onclick={() => handleStart(c.id)} disabled={!!progress?.active} title="Run">
+                  Run
+                </button>
+                <button class="btn-icon" onclick={() => handleClone(c.id, c.name)} title="Clone">
+                  {@html cloneIcon}
+                </button>
+                <button class="btn-icon btn-icon-danger" onclick={() => (deletingConfig = c)} title="Delete">
+                  {@html trashIcon}
+                </button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  {/if}
+
+  <!-- Results panel -->
+  {#if selectedConfigId}
+    <div class="results-section">
+      <h2>Results</h2>
+      {#if resultsLoading}
+        <p class="loading">Loading results...</p>
+      {:else if results.length === 0}
+        <p class="text-muted">No test runs yet for this configuration.</p>
+      {:else}
+        <!-- Comparison card -->
+        {#if comparison}
+          <div class="comparison-card">
+            <h3>Latest vs Previous</h3>
+            <div class="comparison-grid">
+              <div class="comp-item">
+                <span class="comp-label">Avg Latency</span>
+                <span class="comp-value">{comparison.current.avg_latency_ms.toFixed(1)}ms</span>
+                <span class="comp-delta" style="color: {deltaColor(comparison.latency_delta_pct)}">
+                  {formatDelta(comparison.latency_delta_pct)}
+                </span>
+              </div>
+              <div class="comp-item">
+                <span class="comp-label">Throughput</span>
+                <span class="comp-value">{comparison.current.throughput_rps.toFixed(0)} rps</span>
+                <span class="comp-delta" style="color: {deltaColor(comparison.throughput_delta_pct, true)}">
+                  {formatDelta(comparison.throughput_delta_pct)}
+                </span>
+              </div>
+              <div class="comp-item">
+                <span class="comp-label">p99</span>
+                <span class="comp-value">{comparison.current.p99_latency_ms}ms</span>
+              </div>
+              <div class="comp-item">
+                <span class="comp-label">Errors</span>
+                <span class="comp-value">{comparison.current.failed_requests}</span>
+              </div>
+            </div>
+          </div>
+        {/if}
+
+        <!-- History table -->
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Requests</th>
+                <th>Success</th>
+                <th>Failed</th>
+                <th>Avg Latency</th>
+                <th>p95</th>
+                <th>p99</th>
+                <th>RPS</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each results as r}
+                <tr>
+                  <td class="mono small">{new Date(r.started_at).toLocaleString()}</td>
+                  <td>{r.total_requests.toLocaleString()}</td>
+                  <td style="color: var(--color-green)">{r.successful_requests.toLocaleString()}</td>
+                  <td style="color: {r.failed_requests > 0 ? 'var(--color-red)' : 'var(--color-text-muted)'}">{r.failed_requests}</td>
+                  <td class="mono">{r.avg_latency_ms.toFixed(1)}ms</td>
+                  <td class="mono">{r.p95_latency_ms}ms</td>
+                  <td class="mono">{r.p99_latency_ms}ms</td>
+                  <td>{r.throughput_rps.toFixed(0)}</td>
+                  <td>
+                    {#if r.aborted}
+                      <span class="status-aborted" title={r.abort_reason ?? ''}>Aborted</span>
+                    {:else}
+                      <span class="status-done">Done</span>
+                    {/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    </div>
+  {/if}
+
+  {#if deletingConfig}
+    <ConfirmDialog
+      title="Delete Test Config"
+      message="Delete '{deletingConfig.name}'? All associated results will be lost."
+      confirmLabel="Delete"
+      onconfirm={handleDelete}
+      oncancel={() => (deletingConfig = null)}
+    />
+  {/if}
+
+  {#if showConfirmStart}
+    <ConfirmDialog
+      title="Exceeds Safe Limits"
+      message="This test exceeds configured safe limits: {startWarnings.join(', ')}. Proceed anyway?"
+      confirmLabel="Start Anyway"
+      onconfirm={handleConfirmedStart}
+      oncancel={() => (showConfirmStart = false)}
+    />
+  {/if}
+
+  {#if showForm}
+    <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showForm = false; }}>
+      <div class="modal">
+        <h2>New Load Test</h2>
+        {#if formError}
+          <div class="form-error">{formError}</div>
+        {/if}
+
+        <div class="form-group">
+          <label>Name <span class="required">*</span></label>
+          <input type="text" bind:value={formName} placeholder="Weekly backend stress test" />
+        </div>
+
+        <div class="form-group">
+          <label>Target URL <span class="required">*</span></label>
+          <input type="text" bind:value={formTargetUrl} placeholder="http://10.0.0.1:8080/api/health" />
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label>Method</label>
+            <select bind:value={formMethod}>
+              <option>GET</option><option>POST</option><option>PUT</option><option>HEAD</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Duration (s)</label>
+            <input type="number" bind:value={formDuration} min="5" max="3600" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label>Concurrency</label>
+            <input type="number" bind:value={formConcurrency} min="1" max="10000" />
+          </div>
+          <div class="form-group">
+            <label>Requests/sec</label>
+            <input type="number" bind:value={formRps} min="1" max="100000" />
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Error Abort Threshold (%)</label>
+          <input type="number" bind:value={formErrorThreshold} min="1" max="100" step="0.5" />
+        </div>
+
+        <div class="form-group">
+          <label>Schedule (cron, optional)</label>
+          <input type="text" bind:value={formCron} placeholder="0 3 * * 1 (Mon 03:00)" />
+          <span class="hint">5-field cron: min hour dom month dow</span>
+        </div>
+
+        <div class="form-actions">
+          <button class="btn btn-cancel" onclick={() => (showForm = false)}>Cancel</button>
+          <button class="btn btn-primary" onclick={handleCreate} disabled={formSubmitting}>
+            {formSubmitting ? 'Creating...' : 'Create'}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+</div>
+
+<script lang="ts" module>
+  const cloneIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+</script>
+
+<style>
+  .loadtest-page { max-width: 1200px; }
+  .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.5rem; }
+  .page-header h1 { margin: 0; }
+  .error-banner { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--color-red); border-radius: 0.5rem; color: var(--color-red); padding: 0.75rem 1rem; margin-bottom: 1rem; }
+  .loading { color: var(--color-text-muted); }
+  .text-muted { color: var(--color-text-muted); }
+  .empty-state { display: flex; flex-direction: column; align-items: center; gap: 1rem; padding: 3rem 0; color: var(--color-text-muted); }
+
+  /* Live panel */
+  .live-panel { background: var(--color-bg-card); border: 2px solid var(--color-primary); border-radius: 0.75rem; padding: 1rem 1.25rem; margin-bottom: 1.5rem; }
+  .live-header { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
+  .live-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--color-green); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .live-title { font-weight: 600; flex: 1; }
+  .btn-danger-small { padding: 0.25rem 0.75rem; border-radius: 0.375rem; font-size: 0.8125rem; font-weight: 500; border: none; background: var(--color-red); color: white; cursor: pointer; }
+  .live-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1rem; }
+  .live-stat { text-align: center; }
+  .live-label { display: block; font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted); margin-bottom: 0.25rem; }
+  .live-value { font-size: 1.25rem; font-weight: 700; font-family: var(--mono); }
+  .abort-reason { margin-top: 0.75rem; padding: 0.5rem 0.75rem; background: rgba(239, 68, 68, 0.1); border-radius: 0.375rem; color: var(--color-red); font-size: 0.8125rem; }
+
+  /* Configs table */
+  .table-wrapper { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; padding: 0.75rem 1rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted); border-bottom: 1px solid var(--color-border); }
+  td { padding: 0.75rem 1rem; border-bottom: 1px solid var(--color-border); font-size: 0.875rem; vertical-align: middle; }
+  tr:hover td { background: rgba(255, 255, 255, 0.02); }
+  tr.selected td { background: rgba(59, 130, 246, 0.05); }
+  .mono { font-family: var(--mono); font-size: 0.8125rem; }
+  .small { font-size: 0.8125rem; }
+  .link-btn { background: none; border: none; color: var(--color-primary); font-weight: 600; cursor: pointer; font-size: 0.875rem; padding: 0; text-align: left; }
+  .link-btn:hover { text-decoration: underline; }
+  .actions { display: flex; gap: 0.25rem; align-items: center; }
+  .btn-icon { display: flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; border: none; border-radius: 0.375rem; background: none; color: var(--color-text-muted); transition: background-color 0.15s, color 0.15s; cursor: pointer; }
+  .btn-icon:hover { background: var(--color-bg-hover); color: var(--color-text); }
+  .btn-icon-danger:hover { background: rgba(239, 68, 68, 0.1); color: var(--color-red); }
+  .btn-small { padding: 0.25rem 0.625rem; border-radius: 0.375rem; font-size: 0.8125rem; font-weight: 500; border: 1px solid var(--color-border); background: var(--color-bg-card); color: var(--color-text); cursor: pointer; }
+  .btn-run { border-color: var(--color-green); color: var(--color-green); }
+  .btn-run:hover { background: rgba(34, 197, 94, 0.1); }
+  .btn-run:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Results */
+  .results-section { margin-top: 2rem; }
+  .results-section h2 { margin: 0 0 1rem; }
+  .comparison-card { background: var(--color-bg-card); border: 1px solid var(--color-border); border-radius: 0.75rem; padding: 1rem 1.25rem; margin-bottom: 1.5rem; }
+  .comparison-card h3 { margin: 0 0 0.75rem; font-size: 0.875rem; }
+  .comparison-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; }
+  .comp-item { text-align: center; }
+  .comp-label { display: block; font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted); margin-bottom: 0.25rem; }
+  .comp-value { display: block; font-size: 1.125rem; font-weight: 700; font-family: var(--mono); }
+  .comp-delta { display: block; font-size: 0.8125rem; font-weight: 600; margin-top: 0.125rem; }
+  .status-done { color: var(--color-green); font-weight: 500; }
+  .status-aborted { color: var(--color-red); font-weight: 500; cursor: help; }
+
+  /* Form */
+  .overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; z-index: 100; }
+  .modal { background: var(--color-bg-card); border: 1px solid var(--color-border); border-radius: 0.75rem; padding: 1.5rem; width: 90%; max-width: 520px; max-height: 90vh; overflow-y: auto; }
+  .modal h2 { margin: 0 0 1.25rem; }
+  .form-error { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--color-red); border-radius: 0.375rem; color: var(--color-red); padding: 0.5rem 0.75rem; font-size: 0.8125rem; margin-bottom: 1rem; }
+  .form-group { margin-bottom: 1rem; }
+  .form-group label { display: block; font-size: 0.8125rem; font-weight: 500; color: var(--color-text-muted); margin-bottom: 0.375rem; }
+  .required { color: var(--color-red); }
+  .hint { display: block; font-size: 0.75rem; color: var(--color-text-muted); margin-top: 0.25rem; }
+  .form-group input[type="text"], .form-group input[type="number"], .form-group select { width: 100%; padding: 0.5rem 0.75rem; border: 1px solid var(--color-border); border-radius: 0.375rem; background: var(--color-bg-input); color: var(--color-text); font-size: 0.875rem; }
+  .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--color-primary); }
+  .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  .form-actions { display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 1.5rem; }
+  .btn { padding: 0.5rem 1rem; border-radius: 0.375rem; font-weight: 500; border: none; font-size: 0.875rem; cursor: pointer; }
+  .btn-primary { background: var(--color-primary); color: white; }
+  .btn-primary:hover { background: var(--color-primary-hover); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-cancel { background: var(--color-bg-input); color: var(--color-text); }
+  .btn-cancel:hover { background: var(--color-bg-hover); }
+</style>
