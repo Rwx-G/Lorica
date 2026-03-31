@@ -4,7 +4,7 @@ story_title: "Topology-Aware Backend Management"
 gate: PASS
 status_reason: "All 9 ACs met. SingleVM passive-only, HA/Custom active TCP+HTTP probes, DockerSwarm via bollard, Kubernetes via kube-rs, global defaults, per-route override, dashboard display."
 reviewer: "Romain G."
-updated: "2026-03-30T21:30:00Z"
+updated: "2026-03-31T18:00:00Z"
 
 top_issues: []
 waiver:
@@ -36,6 +36,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Add Docker Swarm event watching for real-time task changes"
-    - "Add Kubernetes watch API for endpoint change streaming"
+  future: []

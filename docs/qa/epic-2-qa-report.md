@@ -124,18 +124,14 @@ No open risks. All items identified during QA reviews have been resolved:
 
 ## Recommendations
 
-### Immediate
+All original recommendations have been resolved:
 
-None - all findings resolved.
-
-### Future
-
-| Item | Priority | Reference |
-|------|----------|-----------|
-| WebSocket for real-time log streaming | Medium | Epic 3+ |
-| ACME/Let's Encrypt integration | Medium | Story 4.1 |
-| Connection draining background task for Closing backends | Low | Story 2.4 enhancement |
-| Metrics dashboard for command channel latency | Low | lorica-command |
+| Item | Status | Resolution |
+|------|--------|-----------|
+| WebSocket for real-time log streaming | Done | GET /api/v1/logs/ws |
+| ACME/Let's Encrypt integration | Done | Epic 4 Story 4.1 (HTTP-01 + DNS-01) |
+| Connection draining background task | Done | Health check loop monitors Closing backends |
+| Metrics dashboard for command channel latency | Done | Prometheus /metrics + Grafana template |
 
 ## Epic Gate Decision
 

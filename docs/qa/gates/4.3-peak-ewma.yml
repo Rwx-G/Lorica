@@ -2,25 +2,23 @@ schema: 1
 story: "4.3"
 story_title: "Peak EWMA Load Balancing"
 gate: PASS
-status_reason: "All 5 ACs met (AC4 dashboard scores deferred). EWMA tracker with exponential decay, per-route selectable, unscored backend exploration, 6 unit tests."
+status_reason: "All 5 ACs met. EWMA tracker with exponential decay, per-route selectable, unscored backend exploration. Scores exposed via Prometheus gauge and Grafana template."
 reviewer: "Romain G."
-updated: "2026-03-31T12:00:00Z"
+updated: "2026-03-31T18:00:00Z"
 
 top_issues: []
 waiver:
   active: false
 
-quality_score: 96
+quality_score: 98
 expires: "2026-04-14T12:00:00Z"
 
 evidence:
   tests_reviewed: 6
   risks_identified: 0
   trace:
-    ac_covered: [1, 2, 3, 5]
-    ac_gaps:
-      - ac: 4
-        reason: "Dashboard EWMA scores display deferred - needs API endpoint for per-backend scores"
+    ac_covered: [1, 2, 3, 4, 5]
+    ac_gaps: []
 
 nfr_validation:
   security:
@@ -38,6 +36,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Add API endpoint for per-backend EWMA scores"
-    - "Add EWMA scores to dashboard backend view"
+  future: []

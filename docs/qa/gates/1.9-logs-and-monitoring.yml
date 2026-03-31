@@ -4,7 +4,7 @@ story_title: "Dashboard - Logs and System Monitoring"
 gate: PASS
 status_reason: "All 6 ACs met. All QA findings resolved. 29 Rust + 40 frontend tests passing."
 reviewer: "QA Agent"
-updated: "2026-03-30T00:00:00Z"
+updated: "2026-03-31T18:00:00Z"
 
 waiver: { active: false }
 
@@ -36,6 +36,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Consider WebSocket for sub-second log streaming"
-    - "Extract shared CSS (buttons, error banners) into a component library"
+  future: []

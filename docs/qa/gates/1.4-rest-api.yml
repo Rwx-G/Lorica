@@ -4,7 +4,7 @@ story_title: "REST API Foundation"
 gate: PASS
 status_reason: "All findings from initial review addressed. Certificate fingerprint now uses ring::digest::SHA256, session cookie includes Secure flag. 15 tests pass, clippy clean, all 8 ACs met."
 reviewer: "Quinn (Test Architect)"
-updated: "2026-03-29T15:00:00Z"
+updated: "2026-03-31T18:00:00Z"
 
 waiver: { active: false }
 
@@ -36,8 +36,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - action: "Add session GC to clean expired sessions from memory"
-      refs: ["lorica-api/src/middleware/auth.rs"]
-    - action: "Add PUT endpoint for certificates (present in API design doc)"
-      refs: ["docs/architecture/api-design-and-integration.md"]
+  future: []

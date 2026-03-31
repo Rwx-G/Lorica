@@ -65,9 +65,9 @@ No open risks. All items identified during QA reviews have been resolved:
 
 ## Recommendations
 
-No immediate recommendations. Future epics may consider:
-- WebSocket for real-time log streaming (currently polling)
-- ACME/Let's Encrypt integration for automatic certificate management
+All original recommendations have been resolved:
+- WebSocket log streaming: implemented (GET /api/v1/logs/ws)
+- ACME/Let's Encrypt: implemented in Epic 4 (HTTP-01 + DNS-01)
 
 ## Epic Gate Decision
 

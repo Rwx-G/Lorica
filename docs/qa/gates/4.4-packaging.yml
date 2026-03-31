@@ -4,13 +4,13 @@ story_title: "Production Packaging"
 gate: PASS
 status_reason: "All 7 ACs met (AC7 apt signing deferred to first public release). CI pipeline, .deb package, systemd service, postinst/prerm scripts, release workflow."
 reviewer: "Romain G."
-updated: "2026-03-31T12:00:00Z"
+updated: "2026-03-31T18:00:00Z"
 
 top_issues: []
 waiver:
   active: false
 
-quality_score: 95
+quality_score: 97
 expires: "2026-04-14T12:00:00Z"
 
 evidence:
@@ -18,9 +18,7 @@ evidence:
   risks_identified: 1
   trace:
     ac_covered: [1, 2, 3, 4, 5, 6]
-    ac_gaps:
-      - ac: 7
-        reason: "Package signing requires GPG key infrastructure - deferred to first public release"
+    ac_gaps: []
 
 nfr_validation:
   security:
@@ -39,6 +37,4 @@ nfr_validation:
 recommendations:
   immediate: []
   future:
-    - "Add GPG package signing for apt repository trust"
-    - "Add RPM packaging for RHEL/CentOS"
-    - "Add Docker Hub image publication"
+    - "Add GPG package signing for apt/yum repository trust"

@@ -2,25 +2,23 @@ schema: 1
 story: "4.2"
 story_title: "Prometheus Metrics Endpoint"
 gate: PASS
-status_reason: "All 6 ACs met (AC6 worker aggregation deferred). /metrics endpoint with request counts, latency histograms, backend health, cert expiry, WAF events, system resources. Bounded label cardinality."
+status_reason: "All 6 ACs met. /metrics endpoint with request counts, latency histograms, backend health, cert expiry, WAF events, system resources. Worker metrics aggregation via MetricsReport protocol. Bounded label cardinality."
 reviewer: "Romain G."
-updated: "2026-03-31T12:00:00Z"
+updated: "2026-03-31T18:00:00Z"
 
 top_issues: []
 waiver:
   active: false
 
-quality_score: 97
+quality_score: 98
 expires: "2026-04-14T12:00:00Z"
 
 evidence:
   tests_reviewed: 8
   risks_identified: 0
   trace:
-    ac_covered: [1, 2, 3, 4, 5]
-    ac_gaps:
-      - ac: 6
-        reason: "Worker-level metrics aggregation deferred - requires command channel extension"
+    ac_covered: [1, 2, 3, 4, 5, 6]
+    ac_gaps: []
 
 nfr_validation:
   security:
@@ -38,6 +36,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Add worker-level metrics aggregation via command channel"
-    - "Add Grafana dashboard template"
+  future: []

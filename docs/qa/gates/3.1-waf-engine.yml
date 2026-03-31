@@ -4,7 +4,7 @@ story_title: "WAF Engine with OWASP CRS"
 gate: PASS
 status_reason: "All 8 ACs met. WAF crate with 18 CRS-inspired rules, detection/blocking modes, per-route toggle, configurable rule sets, security dashboard, sub-0.5ms latency."
 reviewer: "Romain G."
-updated: "2026-03-30T21:30:00Z"
+updated: "2026-03-31T18:00:00Z"
 
 top_issues: []
 waiver:
@@ -36,5 +36,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Add custom user-defined regex rules via API"
+  future: []

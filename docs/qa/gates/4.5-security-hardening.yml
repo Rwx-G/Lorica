@@ -2,13 +2,11 @@ schema: 1
 story: "4.5"
 story_title: "Security Hardening"
 gate: PASS
-status_reason: "All 7 ACs met. cargo audit clean (serde_yml documented), fuzz targets set up, rate limiting verified, secure cookies verified, secret masking verified, systemd hardened, security docs written."
+status_reason: "All 7 ACs met. cargo audit clean (serde_yml replaced by serde_yaml_ng), fuzz targets in weekly CI, rate limiting verified, secure cookies verified, secret masking verified, systemd hardened, security docs written."
 reviewer: "Romain G."
-updated: "2026-03-31T12:00:00Z"
+updated: "2026-03-31T18:00:00Z"
 
-top_issues:
-  - severity: low
-    description: "serde_yml RUSTSEC-2025-0068 - inherited from Pingora, only used for internal config parsing"
+top_issues: []
 
 waiver:
   active: false
@@ -39,7 +37,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Migrate serde_yml to serde_yaml_ng when Pingora upstream updates"
-    - "Run fuzz testing in CI as a scheduled job (weekly)"
-    - "Add SBOM generation to release pipeline"
+  future: []

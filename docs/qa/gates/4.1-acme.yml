@@ -4,7 +4,7 @@ story_title: "ACME / Let's Encrypt Integration"
 gate: PASS
 status_reason: "All 7 ACs met. ACME client via instant-acme, HTTP-01 challenge, consent-driven opt-in, certs stored with is_acme flag. HTTP-01 NAT limitation documented."
 reviewer: "Romain G."
-updated: "2026-03-31T12:00:00Z"
+updated: "2026-03-31T18:00:00Z"
 
 top_issues: []
 waiver:
@@ -36,6 +36,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Add DNS-01 challenge support for NAT/internal deployments"
-    - "Add auto-renewal background task (currently manual trigger)"
+  future: []
