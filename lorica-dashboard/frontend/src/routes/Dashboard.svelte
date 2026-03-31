@@ -2,8 +2,12 @@
   import Nav from '../components/Nav.svelte';
   import Overview from './Overview.svelte';
   import Routes from './Routes.svelte';
+  import Backends from './Backends.svelte';
   import Certificates from './Certificates.svelte';
   import Security from './Security.svelte';
+  import Sla from './Sla.svelte';
+  import Probes from './Probes.svelte';
+  import LoadTest from './LoadTest.svelte';
   import Logs from './Logs.svelte';
   import SystemView from './System.svelte';
   import Settings from './Settings.svelte';
@@ -24,11 +28,17 @@
   {:else if path === '/routes'}
     <Routes />
   {:else if path === '/backends'}
-    <Placeholder title="Backends" />
+    <Backends />
   {:else if path === '/certificates'}
     <Certificates />
   {:else if path === '/security'}
     <Security />
+  {:else if path === '/sla'}
+    <Sla />
+  {:else if path === '/probes'}
+    <Probes />
+  {:else if path === '/loadtest'}
+    <LoadTest />
   {:else if path === '/logs'}
     <Logs />
   {:else if path === '/system'}
