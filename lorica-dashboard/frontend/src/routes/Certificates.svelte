@@ -214,17 +214,22 @@
     else formKeyPem = text;
   }
 
+  const DOMAIN_PATTERN = /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
+
+  function validateUploadForm(): string {
+    if (!formDomain.trim()) return 'Domain is required';
+    if (!DOMAIN_PATTERN.test(formDomain.trim())) return 'Invalid domain pattern';
+    if (!formCertPem.trim()) return 'Certificate PEM is required';
+    if (!formCertPem.trim().startsWith('-----BEGIN CERTIFICATE-----')) return 'Certificate PEM must start with -----BEGIN CERTIFICATE-----';
+    if (!formKeyPem.trim()) return 'Private key PEM is required';
+    if (!formKeyPem.trim().startsWith('-----BEGIN')) return 'Key PEM must start with -----BEGIN (RSA/EC/PRIVATE KEY)';
+    return '';
+  }
+
   async function handleUploadSubmit() {
-    if (!formDomain.trim()) {
-      formError = 'Domain is required';
-      return;
-    }
-    if (!formCertPem.trim()) {
-      formError = 'Certificate PEM is required';
-      return;
-    }
-    if (!formKeyPem.trim()) {
-      formError = 'Private key PEM is required';
+    const err = validateUploadForm();
+    if (err) {
+      formError = err;
       return;
     }
     formSubmitting = true;
@@ -266,8 +271,24 @@
     if (e.key === 'Escape') closeEditForm();
   }
 
+  function validateEditForm(): string {
+    if (editDomain.trim() && !DOMAIN_PATTERN.test(editDomain.trim())) return 'Invalid domain pattern';
+    if (editCertPem.trim() && !editCertPem.trim().startsWith('-----BEGIN CERTIFICATE-----')) {
+      return 'Certificate PEM must start with -----BEGIN CERTIFICATE-----';
+    }
+    if (editKeyPem.trim() && !editKeyPem.trim().startsWith('-----BEGIN')) {
+      return 'Key PEM must start with -----BEGIN (RSA/EC/PRIVATE KEY)';
+    }
+    return '';
+  }
+
   async function handleEditSubmit() {
     if (!editingCert) return;
+    const valErr = validateEditForm();
+    if (valErr) {
+      editError = valErr;
+      return;
+    }
     editSubmitting = true;
     editError = '';
 

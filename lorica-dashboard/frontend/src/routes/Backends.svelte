@@ -26,7 +26,31 @@
   let formError = $state('');
   let formSubmitting = $state(false);
 
+  let addressError = $state('');
+
   let deletingBackend: BackendResponse | null = $state(null);
+
+  const ADDRESS_PATTERN = /^[a-zA-Z0-9._-]+:\d{1,5}$/;
+
+  function validateAddress(value: string): string {
+    if (!value.trim()) return 'Address is required (e.g. 10.0.0.1:8080)';
+    if (!ADDRESS_PATTERN.test(value.trim())) return 'Address must be in host:port format';
+    const port = parseInt(value.split(':').pop()!, 10);
+    if (port < 1 || port > 65535) return 'Port must be between 1 and 65535';
+    return '';
+  }
+
+  function validate(): string {
+    const addrErr = validateAddress(formAddress);
+    if (addrErr) return addrErr;
+    if (formWeight < 1 || formWeight > 1000) return 'Weight must be between 1 and 1000';
+    if (formHealthCheckInterval < 5 || formHealthCheckInterval > 3600) return 'Health check interval must be between 5 and 3600 seconds';
+    return '';
+  }
+
+  function handleAddressBlur() {
+    addressError = validateAddress(formAddress);
+  }
 
   async function loadData() {
     loading = true;
@@ -53,6 +77,7 @@
     formHealthCheckPath = '';
     formTlsUpstream = false;
     formError = '';
+    addressError = '';
     showForm = true;
   }
 
@@ -67,12 +92,14 @@
     formHealthCheckPath = b.health_check_path ?? '';
     formTlsUpstream = b.tls_upstream;
     formError = '';
+    addressError = '';
     showForm = true;
   }
 
   async function handleSubmit() {
-    if (!formAddress.trim()) {
-      formError = 'Address is required (e.g. 10.0.0.1:8080)';
+    const err = validate();
+    if (err) {
+      formError = err;
       return;
     }
     formSubmitting = true;
@@ -230,7 +257,10 @@
 
         <div class="form-group">
           <label>Address <span class="required">*</span></label>
-          <input type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" />
+          <input type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" pattern="^[a-zA-Z0-9._-]+:\d{1,5}$" onblur={handleAddressBlur} />
+          {#if addressError}
+            <span class="field-error">{addressError}</span>
+          {/if}
         </div>
 
         <div class="form-row">
@@ -251,7 +281,7 @@
           </div>
           <div class="form-group">
             <label>Health Check Interval (s)</label>
-            <input type="number" bind:value={formHealthCheckInterval} min="5" max="300" />
+            <input type="number" bind:value={formHealthCheckInterval} min="5" max="3600" />
           </div>
         </div>
 
@@ -294,4 +324,5 @@
 <style>
   .backends-page { max-width: none; }
   .badge-on { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; background: rgba(34, 197, 94, 0.1); color: var(--color-green); }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 </style>

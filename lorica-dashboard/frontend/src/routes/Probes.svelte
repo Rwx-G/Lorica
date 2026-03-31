@@ -76,7 +76,20 @@
     showForm = true;
   }
 
+  function validate(): string {
+    if (!formPath.startsWith('/')) return 'Path must start with /';
+    if (formInterval < 5 || formInterval > 3600) return 'Interval must be between 5 and 3600 seconds';
+    if (formTimeout < 1000 || formTimeout > 60000) return 'Timeout must be between 1000 and 60000 ms';
+    if (formExpectedStatus < 100 || formExpectedStatus > 599) return 'Expected status must be between 100 and 599';
+    return '';
+  }
+
   async function handleSubmit() {
+    const err = validate();
+    if (err) {
+      formError = err;
+      return;
+    }
     formSubmitting = true;
     formError = '';
 
@@ -242,7 +255,7 @@
           </div>
           <div class="form-group">
             <label>Timeout (ms)</label>
-            <input type="number" bind:value={formTimeout} min="1000" max="30000" />
+            <input type="number" bind:value={formTimeout} min="1000" max="60000" />
           </div>
         </div>
 

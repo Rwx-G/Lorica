@@ -60,6 +60,9 @@
   let formCompressionEnabled = $state(false);
   let formRetryAttempts = $state('');
 
+  // Inline field errors
+  let hostnameError = $state('');
+
   // Delete state
   let deletingRoute: RouteResponse | null = $state(null);
 
@@ -114,6 +117,7 @@
     formWafMode = 'detection';
     formEnabled = true;
     formError = '';
+    hostnameError = '';
     showAdvanced = false;
     formForceHttps = false;
     formRedirectHostname = '';
@@ -180,6 +184,7 @@
     formWafMode = route.waf_mode ?? 'detection';
     formEnabled = route.enabled;
     formError = '';
+    hostnameError = '';
     showAdvanced = false;
     formForceHttps = route.force_https;
     formRedirectHostname = route.redirect_hostname ?? '';
@@ -223,9 +228,53 @@
     }
   }
 
+  const HOSTNAME_PATTERN = /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
+
+  function validateHostname(value: string): string {
+    if (!value.trim()) return 'Hostname is required';
+    if (!HOSTNAME_PATTERN.test(value.trim())) return 'Invalid hostname';
+    return '';
+  }
+
+  function handleHostnameBlur() {
+    hostnameError = validateHostname(formHostname);
+  }
+
+  function validateIpList(text: string): string {
+    const lines = text.split('\n').map((s) => s.trim()).filter((s) => s.length > 0);
+    for (const line of lines) {
+      if (!line.includes('.') && !line.includes(':')) {
+        return `Invalid IP or CIDR: "${line}"`;
+      }
+    }
+    return '';
+  }
+
+  function validateRouteForm(): string {
+    const hostErr = validateHostname(formHostname);
+    if (hostErr) return hostErr;
+    if (formPathPrefix && !formPathPrefix.startsWith('/')) return 'Path prefix must start with /';
+    if (formConnectTimeout < 1 || formConnectTimeout > 3600) return 'Connect timeout must be between 1 and 3600';
+    if (formReadTimeout < 1 || formReadTimeout > 3600) return 'Read timeout must be between 1 and 3600';
+    if (formSendTimeout < 1 || formSendTimeout > 3600) return 'Send timeout must be between 1 and 3600';
+    if (formMaxBodyMb && Number(formMaxBodyMb) <= 0) return 'Max body size must be greater than 0';
+    if (formRateLimitRps && Number(formRateLimitRps) <= 0) return 'Rate limit RPS must be greater than 0';
+    if (formRateLimitBurst && Number(formRateLimitBurst) <= 0) return 'Rate limit burst must be greater than 0';
+    if (formRateLimitRps && formRateLimitBurst && Number(formRateLimitBurst) < Number(formRateLimitRps)) {
+      return 'Rate limit burst must be >= RPS';
+    }
+    if (formCorsMaxAge && Number(formCorsMaxAge) <= 0) return 'CORS max age must be greater than 0';
+    const allowErr = validateIpList(formIpAllowlist);
+    if (allowErr) return `IP allowlist: ${allowErr}`;
+    const denyErr = validateIpList(formIpDenylist);
+    if (denyErr) return `IP denylist: ${denyErr}`;
+    return '';
+  }
+
   async function handleSubmit() {
-    if (!formHostname.trim()) {
-      formError = 'Hostname is required';
+    const err = validateRouteForm();
+    if (err) {
+      formError = err;
       return;
     }
     formSubmitting = true;
@@ -431,7 +480,10 @@
 
       <div class="form-group">
         <label for="hostname">Hostname <span class="required">*</span></label>
-        <input id="hostname" type="text" bind:value={formHostname} placeholder="example.com" />
+        <input id="hostname" type="text" bind:value={formHostname} placeholder="example.com" onblur={handleHostnameBlur} />
+        {#if hostnameError}
+          <span class="field-error">{hostnameError}</span>
+        {/if}
       </div>
 
       <div class="form-group">
@@ -553,15 +605,15 @@
           <div class="form-row form-row-3">
             <div class="form-group">
               <label for="connect-timeout">Connect (s)</label>
-              <input id="connect-timeout" type="number" min="1" bind:value={formConnectTimeout} />
+              <input id="connect-timeout" type="number" min="1" max="3600" bind:value={formConnectTimeout} />
             </div>
             <div class="form-group">
               <label for="read-timeout">Read (s)</label>
-              <input id="read-timeout" type="number" min="1" bind:value={formReadTimeout} />
+              <input id="read-timeout" type="number" min="1" max="3600" bind:value={formReadTimeout} />
             </div>
             <div class="form-group">
               <label for="send-timeout">Send (s)</label>
-              <input id="send-timeout" type="number" min="1" bind:value={formSendTimeout} />
+              <input id="send-timeout" type="number" min="1" max="3600" bind:value={formSendTimeout} />
             </div>
           </div>
 
@@ -690,6 +742,8 @@
   .routes-page {
     max-width: none;
   }
+
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 
   .page-header {
     display: flex;

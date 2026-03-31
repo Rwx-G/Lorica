@@ -94,9 +94,23 @@
     showForm = true;
   }
 
+  function validate(): string {
+    if (!formName.trim()) return 'Name is required';
+    if (!formTargetUrl.trim()) return 'Target URL is required';
+    if (!formTargetUrl.trim().startsWith('http://') && !formTargetUrl.trim().startsWith('https://')) {
+      return 'Target URL must start with http:// or https://';
+    }
+    if (formConcurrency < 1 || formConcurrency > 10000) return 'Concurrency must be between 1 and 10000';
+    if (formRps < 1 || formRps > 100000) return 'Requests/sec must be between 1 and 100000';
+    if (formDuration < 5 || formDuration > 3600) return 'Duration must be between 5 and 3600 seconds';
+    if (formErrorThreshold < 1 || formErrorThreshold > 100) return 'Error threshold must be between 1 and 100%';
+    return '';
+  }
+
   async function handleCreate() {
-    if (!formName.trim() || !formTargetUrl.trim()) {
-      formError = 'Name and target URL are required';
+    const err = validate();
+    if (err) {
+      formError = err;
       return;
     }
     formSubmitting = true;
