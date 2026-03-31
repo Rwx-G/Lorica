@@ -13,6 +13,7 @@ services:
     depends_on:
       - backend1
       - backend2
+      - backend-tls
     networks:
       - e2e
 
@@ -48,6 +49,16 @@ services:
     networks:
       - e2e
 
+  backend-tls:
+    build:
+      context: ./backend
+    environment:
+      - BACKEND_ID=backend-tls
+      - LISTEN_PORT=443
+      - TLS_ENABLED=1
+    networks:
+      - e2e
+
   test-runner:
     build:
       context: ./test-runner
@@ -61,6 +72,7 @@ services:
       - LORICA_PROXY_HTTPS=https://lorica:8443
       - BACKEND1_ADDR=backend1:80
       - BACKEND2_ADDR=backend2:80
+      - BACKEND_TLS_ADDR=backend-tls:443
     networks:
       - e2e
 
