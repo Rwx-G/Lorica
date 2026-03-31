@@ -1,0 +1,32 @@
+name: Fuzz Testing
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'  # Weekly Sunday at 3 AM UTC
+  workflow_dispatch:       # Manual trigger
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [fuzz_waf_evaluate, fuzz_api_input]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Run fuzz target (${{ matrix.target }})
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
+        timeout-minutes: 15
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/
