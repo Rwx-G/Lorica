@@ -1,7 +1,7 @@
 # Story 4.5: Security Hardening
 
 **Epic:** [Epic 4 - Production](../prd/epic-4-production.md)
-**Status:** Draft
+**Status:** Done
 **Priority:** P2
 **Depends on:** Epic 1 complete
 
