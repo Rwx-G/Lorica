@@ -1,7 +1,7 @@
 # Story 4.1: ACME / Let's Encrypt Integration
 
 **Epic:** [Epic 4 - Production](../prd/epic-4-production.md)
-**Status:** Draft
+**Status:** Done
 **Priority:** P2
 **Depends on:** Story 2.3
 
