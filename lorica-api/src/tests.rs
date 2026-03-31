@@ -28,6 +28,7 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         waf_engine: None,
         waf_rule_count: None,
         acme_challenge_store: None,
+        sla_collector: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
@@ -1557,8 +1558,14 @@ async fn test_import_preview_empty_diff() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["data"]["routes"]["added"].as_array().unwrap().is_empty());
-    assert!(json["data"]["routes"]["removed"].as_array().unwrap().is_empty());
+    assert!(json["data"]["routes"]["added"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(json["data"]["routes"]["removed"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1601,7 +1608,13 @@ async fn test_import_preview_with_changes() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["data"]["backends"]["removed"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        json["data"]["backends"]["removed"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 // ---- Session GC test ----
@@ -1660,7 +1673,9 @@ async fn test_create_route_empty_hostname_returns_400() {
 
     let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"]["code"], "bad_request");
 }
@@ -2084,9 +2099,14 @@ async fn test_import_too_large_returns_400() {
 
     let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["error"]["message"].as_str().unwrap().contains("too large"));
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("too large"));
 }
 
 #[tokio::test]
@@ -2348,7 +2368,9 @@ async fn test_test_notification_email_missing_smtp_host_returns_400() {
 
     let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
     let notif_id = json["data"]["id"].as_str().unwrap().to_string();
 
@@ -2387,7 +2409,9 @@ async fn test_test_notification_webhook_missing_url_returns_400() {
 
     let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
     let notif_id = json["data"]["id"].as_str().unwrap().to_string();
 
@@ -2503,7 +2527,9 @@ async fn test_system_endpoint_returns_all_fields() {
     let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["data"]["host"]["cpu_count"].as_u64().unwrap() > 0);
     assert!(json["data"]["host"]["memory_total_bytes"].as_u64().unwrap() > 0);
@@ -2530,7 +2556,9 @@ async fn test_create_route_with_backend_ids() {
         .body(Body::from(serde_json::to_string(&body).unwrap()))
         .unwrap();
     let response = router.oneshot(req).await.unwrap();
-    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
     let backend_id = json["data"]["id"].as_str().unwrap().to_string();
 
@@ -2549,7 +2577,9 @@ async fn test_create_route_with_backend_ids() {
         .unwrap();
     let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
     assert_eq!(json["data"]["backends"].as_array().unwrap().len(), 1);
 }
@@ -2572,7 +2602,9 @@ async fn test_update_route_backend_associations() {
             .body(Body::from(serde_json::to_string(&body).unwrap()))
             .unwrap();
         let response = router.oneshot(req).await.unwrap();
-        let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
         backend_ids.push(json["data"]["id"].as_str().unwrap().to_string());
     }
@@ -2591,7 +2623,9 @@ async fn test_update_route_backend_associations() {
         .body(Body::from(serde_json::to_string(&body).unwrap()))
         .unwrap();
     let response = router.oneshot(req).await.unwrap();
-    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
     let route_id = json["data"]["id"].as_str().unwrap().to_string();
 
@@ -2609,7 +2643,9 @@ async fn test_update_route_backend_associations() {
         .unwrap();
     let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
     let backends = json["data"]["backends"].as_array().unwrap();
     assert_eq!(backends.len(), 1);
@@ -2672,7 +2708,9 @@ async fn test_status_counts_with_data() {
 
     let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["data"]["routes_count"], 1);
     assert_eq!(json["data"]["backends_count"], 1);
@@ -2699,6 +2737,7 @@ fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         waf_engine: Some(engine),
         waf_rule_count: Some(rule_count),
         acme_challenge_store: None,
+        sla_collector: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
@@ -2719,6 +2758,7 @@ fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         waf_engine: None,
         waf_rule_count: None,
         acme_challenge_store: None,
+        sla_collector: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();

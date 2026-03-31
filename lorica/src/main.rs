@@ -349,6 +349,7 @@ fn run_supervisor(cli: Cli) {
                 waf_engine: None,
                 waf_rule_count: None,
                 acme_challenge_store: None,
+                sla_collector: None,
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
@@ -583,10 +584,12 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
     });
 
     // Build the proxy service
+    let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
     let lorica_proxy = LoricaProxy::new(
         Arc::clone(&proxy_config),
         Arc::clone(&log_buffer),
         Arc::clone(&active_connections),
+        Arc::clone(&sla_collector),
     );
 
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
@@ -696,11 +699,20 @@ fn run_single_process(cli: Cli) {
             std::time::Duration::from_secs(6 * 3600),
         );
 
+        // Create SLA collector and start background flush task
+        let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
+        {
+            let s = store.lock().await;
+            sla_collector.load_configs(&s);
+        }
+        sla_collector.start_flush_task(Arc::clone(&store), None);
+
         // Start the HTTP proxy service
         let mut lorica_proxy = LoricaProxy::new(
             Arc::clone(&proxy_config),
             Arc::clone(&log_buffer),
             Arc::clone(&active_connections),
+            Arc::clone(&sla_collector),
         );
         lorica_proxy.waf_engine = Arc::clone(&waf_engine);
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
@@ -745,6 +757,7 @@ fn run_single_process(cli: Cli) {
                 waf_engine: Some(waf_engine),
                 waf_rule_count: Some(waf_rule_count),
                 acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::new()),
+                sla_collector: Some(Arc::clone(&sla_collector)),
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();

@@ -37,6 +37,8 @@ pub struct AppState {
     pub waf_rule_count: Option<usize>,
     /// ACME HTTP-01 challenge store.
     pub acme_challenge_store: Option<crate::acme::AcmeChallengeStore>,
+    /// Passive SLA metrics collector.
+    pub sla_collector: Option<Arc<lorica_bench::SlaCollector>>,
 }
 
 impl AppState {
@@ -161,10 +163,7 @@ pub fn build_router(
             "/api/v1/waf/blocklist",
             get(crate::waf::get_blocklist_status),
         )
-        .route(
-            "/api/v1/waf/blocklist",
-            put(crate::waf::toggle_blocklist),
-        )
+        .route("/api/v1/waf/blocklist", put(crate::waf::toggle_blocklist))
         .route(
             "/api/v1/waf/blocklist/reload",
             post(crate::waf::reload_blocklist),
@@ -190,9 +189,24 @@ pub fn build_router(
             "/api/v1/waf/rules/custom/:id",
             delete(crate::waf::delete_custom_rule),
         )
+        .route("/api/v1/waf/rules/:id", put(crate::waf::toggle_waf_rule))
+        .route("/api/v1/sla/overview", get(crate::sla::get_sla_overview))
+        .route("/api/v1/sla/routes/:id", get(crate::sla::get_route_sla))
         .route(
-            "/api/v1/waf/rules/:id",
-            put(crate::waf::toggle_waf_rule),
+            "/api/v1/sla/routes/:id/buckets",
+            get(crate::sla::get_route_sla_buckets),
+        )
+        .route(
+            "/api/v1/sla/routes/:id/config",
+            get(crate::sla::get_sla_config),
+        )
+        .route(
+            "/api/v1/sla/routes/:id/config",
+            put(crate::sla::update_sla_config),
+        )
+        .route(
+            "/api/v1/sla/routes/:id/export",
+            get(crate::sla::export_sla_data),
         )
         .layer(middleware::from_fn(require_auth));
 

@@ -20,6 +20,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use lorica_api::logs::{LogBuffer, LogEntry};
+use lorica_bench::SlaCollector;
 use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route, WafMode};
 use lorica_core::protocols::Digest;
 use lorica_core::upstreams::peer::HttpPeer;
@@ -255,6 +256,8 @@ pub struct LoricaProxy {
     pub ewma_tracker: Arc<EwmaTracker>,
     /// WAF engine for request inspection.
     pub waf_engine: Arc<WafEngine>,
+    /// Passive SLA metrics collector.
+    pub sla_collector: Arc<SlaCollector>,
 }
 
 impl LoricaProxy {
@@ -262,6 +265,7 @@ impl LoricaProxy {
         config: Arc<ArcSwap<ProxyConfig>>,
         log_buffer: Arc<LogBuffer>,
         active_connections: Arc<AtomicU64>,
+        sla_collector: Arc<SlaCollector>,
     ) -> Self {
         Self {
             config,
@@ -270,6 +274,7 @@ impl LoricaProxy {
             backend_connections: Arc::new(BackendConnections::new()),
             ewma_tracker: Arc::new(EwmaTracker::new()),
             waf_engine: Arc::new(WafEngine::new()),
+            sla_collector,
         }
     }
 
@@ -579,6 +584,11 @@ impl ProxyHttp for LoricaProxy {
         // Record Prometheus metrics (bounded labels: route_id, not hostname)
         let route_label = ctx.route_id.as_deref().unwrap_or("_unknown");
         lorica_api::metrics::record_request(route_label, status, elapsed.as_secs_f64());
+
+        // Record SLA metrics for passive monitoring
+        if let Some(ref route_id) = ctx.route_id {
+            self.sla_collector.record(route_id, status, latency_ms);
+        }
 
         // Update EWMA latency tracker for Peak EWMA load balancing
         if let Some(ref addr) = ctx.backend_addr {

@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod routes;
 pub mod server;
 pub mod settings;
+pub mod sla;
 pub mod status;
 pub mod system;
 pub mod waf;
