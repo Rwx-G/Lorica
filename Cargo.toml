@@ -25,6 +25,7 @@ members = [
     "lorica-command",
     "lorica-waf",
     "lorica-notify",
+    "lorica-bench",
 ]
 
 [workspace.dependencies]
