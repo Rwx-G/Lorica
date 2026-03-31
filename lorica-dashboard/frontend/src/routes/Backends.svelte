@@ -16,6 +16,8 @@
   let showForm = $state(false);
   let editingBackend: BackendResponse | null = $state(null);
   let formAddress = $state('');
+  let formName = $state('');
+  let formGroupName = $state('');
   let formWeight = $state(100);
   let formHealthCheckEnabled = $state(true);
   let formHealthCheckInterval = $state(10);
@@ -43,6 +45,8 @@
   function openCreateForm() {
     editingBackend = null;
     formAddress = '';
+    formName = '';
+    formGroupName = '';
     formWeight = 100;
     formHealthCheckEnabled = true;
     formHealthCheckInterval = 10;
@@ -55,6 +59,8 @@
   function openEditForm(b: BackendResponse) {
     editingBackend = b;
     formAddress = b.address;
+    formName = b.name ?? '';
+    formGroupName = b.group_name ?? '';
     formWeight = b.weight;
     formHealthCheckEnabled = b.health_check_enabled;
     formHealthCheckInterval = b.health_check_interval_s;
@@ -75,6 +81,8 @@
     if (editingBackend) {
       const body: UpdateBackendRequest = {
         address: formAddress,
+        name: formName || undefined,
+        group_name: formGroupName || undefined,
         weight: formWeight,
         health_check_enabled: formHealthCheckEnabled,
         health_check_interval_s: formHealthCheckInterval,
@@ -90,6 +98,8 @@
     } else {
       const body: CreateBackendRequest = {
         address: formAddress,
+        name: formName || undefined,
+        group_name: formGroupName || undefined,
         weight: formWeight,
         health_check_enabled: formHealthCheckEnabled,
         health_check_interval_s: formHealthCheckInterval,
@@ -149,6 +159,8 @@
       <table>
         <thead>
           <tr>
+            <th>Name</th>
+            <th>Group</th>
             <th>Address</th>
             <th>Health</th>
             <th>Weight</th>
@@ -161,6 +173,8 @@
         <tbody>
           {#each backends as b}
             <tr>
+              <td>{b.name || '-'}</td>
+              <td>{b.group_name || '-'}</td>
               <td class="mono">{b.address}</td>
               <td><StatusBadge status={b.health_status} /></td>
               <td>{b.weight}</td>
@@ -221,6 +235,17 @@
 
         <div class="form-row">
           <div class="form-group">
+            <label>Name</label>
+            <input type="text" bind:value={formName} placeholder="serverK8S1" />
+          </div>
+          <div class="form-group">
+            <label>Group</label>
+            <input type="text" bind:value={formGroupName} placeholder="K8S" />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
             <label>Weight</label>
             <input type="number" bind:value={formWeight} min="1" max="1000" />
           </div>
@@ -267,6 +292,6 @@
 </script>
 
 <style>
-  .backends-page { max-width: 1100px; }
+  .backends-page { max-width: none; }
   .badge-on { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; background: rgba(34, 197, 94, 0.1); color: var(--color-green); }
 </style>

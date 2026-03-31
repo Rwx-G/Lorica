@@ -167,6 +167,8 @@ export interface UpdateRouteRequest {
 export interface BackendResponse {
   id: string;
   address: string;
+  name: string;
+  group_name: string;
   weight: number;
   health_status: string;
   health_check_enabled: boolean;
@@ -856,6 +858,8 @@ export interface LoadTestComparison {
 
 export interface CreateBackendRequest {
   address: string;
+  name?: string;
+  group_name?: string;
   weight?: number;
   health_check_enabled?: boolean;
   health_check_interval_s?: number;
@@ -865,6 +869,8 @@ export interface CreateBackendRequest {
 
 export interface UpdateBackendRequest {
   address?: string;
+  name?: string;
+  group_name?: string;
   weight?: number;
   health_check_enabled?: boolean;
   health_check_interval_s?: number;

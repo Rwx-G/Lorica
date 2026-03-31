@@ -108,6 +108,7 @@ pub enum HealthStatus {
     Healthy,
     Degraded,
     Down,
+    Unknown,
 }
 
 impl HealthStatus {
@@ -116,6 +117,7 @@ impl HealthStatus {
             Self::Healthy => "healthy",
             Self::Degraded => "degraded",
             Self::Down => "down",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -127,6 +129,7 @@ impl FromStr for HealthStatus {
             "healthy" => Ok(Self::Healthy),
             "degraded" => Ok(Self::Degraded),
             "down" => Ok(Self::Down),
+            "unknown" => Ok(Self::Unknown),
             other => Err(format!("unknown health status: {other}")),
         }
     }
@@ -365,6 +368,10 @@ pub struct Route {
 pub struct Backend {
     pub id: String,
     pub address: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub group_name: String,
     pub weight: i32,
     pub health_status: HealthStatus,
     pub health_check_enabled: bool,
@@ -760,6 +767,7 @@ mod tests {
             ("healthy", HealthStatus::Healthy),
             ("degraded", HealthStatus::Degraded),
             ("down", HealthStatus::Down),
+            ("unknown", HealthStatus::Unknown),
         ] {
             assert_eq!(s.parse::<HealthStatus>().unwrap(), variant);
             assert_eq!(variant.as_str(), s);
@@ -768,7 +776,11 @@ mod tests {
 
     #[test]
     fn test_health_status_unknown() {
-        assert!("unknown".parse::<HealthStatus>().is_err());
+        assert_eq!(
+            "unknown".parse::<HealthStatus>().unwrap(),
+            HealthStatus::Unknown
+        );
+        assert!("invalid_status".parse::<HealthStatus>().is_err());
     }
 
     // ---- LifecycleState ----

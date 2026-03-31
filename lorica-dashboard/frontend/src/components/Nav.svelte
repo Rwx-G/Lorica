@@ -6,14 +6,18 @@
 
   const navItems = [
     { path: '/', label: 'Overview', icon: 'grid' },
-    { path: '/routes', label: 'Routes', icon: 'route' },
+    // Infrastructure
     { path: '/backends', label: 'Backends', icon: 'server' },
+    { path: '/routes', label: 'Routes', icon: 'route' },
     { path: '/certificates', label: 'Certificates', icon: 'lock' },
+    // Security
     { path: '/security', label: 'Security', icon: 'shield' },
-    { path: '/sla', label: 'SLA', icon: 'activity' },
     { path: '/probes', label: 'Probes', icon: 'radio' },
-    { path: '/loadtest', label: 'Load Test', icon: 'zap' },
+    // Monitoring
+    { path: '/sla', label: 'SLA', icon: 'activity' },
     { path: '/logs', label: 'Logs', icon: 'list' },
+    { path: '/loadtest', label: 'Load Test', icon: 'zap' },
+    // System
     { path: '/system', label: 'System', icon: 'cpu' },
     { path: '/settings', label: 'Settings', icon: 'settings' },
   ];

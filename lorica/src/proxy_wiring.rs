@@ -991,6 +991,8 @@ mod tests {
         Backend {
             id: id.into(),
             address: addr.into(),
+            name: String::new(),
+            group_name: String::new(),
             weight: 100,
             health_status: HealthStatus::Healthy,
             health_check_enabled: true,

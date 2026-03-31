@@ -55,6 +55,8 @@ mod tests {
         Backend {
             id: new_id(),
             address: "192.168.1.10:8080".into(),
+            name: String::new(),
+            group_name: String::new(),
             weight: 100,
             health_status: HealthStatus::Healthy,
             health_check_enabled: true,
@@ -383,7 +385,7 @@ mod tests {
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), 8);
     }
 
     #[test]
@@ -396,7 +398,7 @@ mod tests {
         }
         {
             let store = ConfigStore::open(path, None).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 7);
+            assert_eq!(store.schema_version().unwrap(), 8);
         }
     }
 

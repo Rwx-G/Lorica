@@ -837,7 +837,7 @@
 
 <style>
   .certs-page {
-    max-width: 1100px;
+    max-width: none;
   }
 
   .page-header {

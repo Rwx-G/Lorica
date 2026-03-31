@@ -17,6 +17,7 @@ const MIGRATION_V4: &str = include_str!("migrations/004_probe_configs.sql");
 const MIGRATION_V5: &str = include_str!("migrations/005_load_tests.sql");
 const MIGRATION_V6: &str = include_str!("migrations/006_sla_bucket_config_snapshot.sql");
 const MIGRATION_V7: &str = include_str!("migrations/007_route_config.sql");
+const MIGRATION_V8: &str = include_str!("migrations/008_backend_name_group.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -187,6 +188,23 @@ impl ConfigStore {
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![7],
+            )?;
+        }
+
+        if current_version < 8 {
+            let has_column: bool = self
+                .conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('backends') WHERE name='name'")?
+                .query_row([], |row| row.get::<_, i64>(0))
+                .map(|c| c > 0)?;
+
+            if !has_column {
+                tracing::info!("applying migration 008_backend_name_group");
+                self.conn.execute_batch(MIGRATION_V8)?;
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![8],
             )?;
         }
 
@@ -484,16 +502,35 @@ impl ConfigStore {
 
     // ---- Backends ----
 
+    /// Validate that a backend address contains a port (ip:port format).
+    fn validate_backend_address(address: &str) -> Result<()> {
+        if !address.contains(':') || address.ends_with(':') {
+            return Err(ConfigError::Validation(format!(
+                "backend address must be in ip:port format (got '{address}')"
+            )));
+        }
+        let port_str = address.rsplit(':').next().unwrap_or("");
+        if port_str.parse::<u16>().is_err() {
+            return Err(ConfigError::Validation(format!(
+                "backend address has invalid port (got '{address}')"
+            )));
+        }
+        Ok(())
+    }
+
     /// Insert a new backend into the database.
     pub fn create_backend(&self, backend: &Backend) -> Result<()> {
+        Self::validate_backend_address(&backend.address)?;
         self.conn.execute(
-            "INSERT INTO backends (id, address, weight, health_status, health_check_enabled,
-             health_check_interval_s, health_check_path, lifecycle_state, active_connections,
-             tls_upstream, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO backends (id, address, name, group_name, weight, health_status,
+             health_check_enabled, health_check_interval_s, health_check_path,
+             lifecycle_state, active_connections, tls_upstream, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 backend.id,
                 backend.address,
+                backend.name,
+                backend.group_name,
                 backend.weight,
                 backend.health_status.as_str(),
                 backend.health_check_enabled,
@@ -513,9 +550,9 @@ impl ConfigStore {
     pub fn get_backend(&self, id: &str) -> Result<Option<Backend>> {
         self.conn
             .query_row(
-                "SELECT id, address, weight, health_status, health_check_enabled,
-                 health_check_interval_s, health_check_path, lifecycle_state, active_connections,
-                 tls_upstream, created_at, updated_at
+                "SELECT id, address, name, group_name, weight, health_status,
+                 health_check_enabled, health_check_interval_s, health_check_path,
+                 lifecycle_state, active_connections, tls_upstream, created_at, updated_at
                  FROM backends WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_backend(row)),
@@ -527,9 +564,9 @@ impl ConfigStore {
     /// List all backends, ordered by address.
     pub fn list_backends(&self) -> Result<Vec<Backend>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, address, weight, health_status, health_check_enabled,
-             health_check_interval_s, health_check_path, lifecycle_state, active_connections,
-             tls_upstream, created_at, updated_at
+            "SELECT id, address, name, group_name, weight, health_status,
+             health_check_enabled, health_check_interval_s, health_check_path,
+             lifecycle_state, active_connections, tls_upstream, created_at, updated_at
              FROM backends ORDER BY address",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_backend(row)))?;
@@ -542,14 +579,17 @@ impl ConfigStore {
 
     /// Update an existing backend. Returns `NotFound` if the ID does not exist.
     pub fn update_backend(&self, backend: &Backend) -> Result<()> {
+        Self::validate_backend_address(&backend.address)?;
         let changed = self.conn.execute(
-            "UPDATE backends SET address=?2, weight=?3, health_status=?4,
-             health_check_enabled=?5, health_check_interval_s=?6, health_check_path=?7,
-             lifecycle_state=?8, active_connections=?9, tls_upstream=?10,
-             updated_at=?11 WHERE id=?1",
+            "UPDATE backends SET address=?2, name=?3, group_name=?4, weight=?5,
+             health_status=?6, health_check_enabled=?7, health_check_interval_s=?8,
+             health_check_path=?9, lifecycle_state=?10, active_connections=?11,
+             tls_upstream=?12, updated_at=?13 WHERE id=?1",
             params![
                 backend.id,
                 backend.address,
+                backend.name,
+                backend.group_name,
                 backend.weight,
                 backend.health_status.as_str(),
                 backend.health_check_enabled,
@@ -1836,18 +1876,20 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
     Ok(Backend {
         id: row.get(0)?,
         address: row.get(1)?,
-        weight: row.get(2)?,
-        health_status: HealthStatus::from_str(&row.get::<_, String>(3)?)
+        name: row.get(2)?,
+        group_name: row.get(3)?,
+        weight: row.get(4)?,
+        health_status: HealthStatus::from_str(&row.get::<_, String>(5)?)
             .map_err(ConfigError::Validation)?,
-        health_check_enabled: row.get(4)?,
-        health_check_interval_s: row.get(5)?,
-        health_check_path: row.get(6)?,
-        lifecycle_state: LifecycleState::from_str(&row.get::<_, String>(7)?)
+        health_check_enabled: row.get(6)?,
+        health_check_interval_s: row.get(7)?,
+        health_check_path: row.get(8)?,
+        lifecycle_state: LifecycleState::from_str(&row.get::<_, String>(9)?)
             .map_err(ConfigError::Validation)?,
-        active_connections: row.get(8)?,
-        tls_upstream: row.get(9)?,
-        created_at: parse_datetime(&row.get::<_, String>(10)?)?,
-        updated_at: parse_datetime(&row.get::<_, String>(11)?)?,
+        active_connections: row.get(10)?,
+        tls_upstream: row.get(11)?,
+        created_at: parse_datetime(&row.get::<_, String>(12)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(13)?)?,
     })
 }
 

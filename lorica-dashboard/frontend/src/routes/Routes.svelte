@@ -688,7 +688,7 @@
 
 <style>
   .routes-page {
-    max-width: 1100px;
+    max-width: none;
   }
 
   .page-header {

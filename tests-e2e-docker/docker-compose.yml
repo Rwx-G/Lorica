@@ -5,8 +5,11 @@ services:
       dockerfile: tests-e2e-docker/Dockerfile
     ports:
       - "9443:9443"   # Management dashboard
-      - "8080:8080"   # HTTP proxy
+      - "80:8080"     # HTTP proxy (host port 80 -> container 8080)
+      - "8080:8080"   # HTTP proxy (alternative)
       - "8443:8443"   # HTTPS proxy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - lorica-data:/var/lib/lorica
       - shared:/shared

@@ -64,6 +64,8 @@ fn make_backend(id: &str, address: &str) -> Backend {
     Backend {
         id: id.to_string(),
         address: address.to_string(),
+        name: String::new(),
+        group_name: String::new(),
         weight: 1,
         health_status: HealthStatus::Healthy,
         health_check_enabled: true,

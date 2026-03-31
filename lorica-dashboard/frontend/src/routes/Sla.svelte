@@ -290,7 +290,7 @@
 </div>
 
 <style>
-  .sla-page { max-width: 1200px; }
+  .sla-page { max-width: none; }
 
   .overview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: var(--space-4); margin-bottom: var(--space-8); }
   .sla-card { background: var(--color-bg-card); border: 1px solid var(--color-border); border-radius: var(--radius-xl); padding: var(--space-4); text-align: left; cursor: pointer; box-shadow: var(--shadow-sm); transition: border-color var(--transition-fast), box-shadow var(--transition-base), transform var(--transition-fast); }

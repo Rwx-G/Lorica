@@ -11,6 +11,8 @@ use crate::server::AppState;
 pub struct BackendResponse {
     pub id: String,
     pub address: String,
+    pub name: String,
+    pub group_name: String,
     pub weight: i32,
     pub health_status: String,
     pub lifecycle_state: String,
@@ -26,6 +28,8 @@ pub struct BackendResponse {
 #[derive(Deserialize)]
 pub struct CreateBackendRequest {
     pub address: String,
+    pub name: Option<String>,
+    pub group_name: Option<String>,
     pub weight: Option<i32>,
     pub health_check_enabled: Option<bool>,
     pub health_check_interval_s: Option<i32>,
@@ -36,6 +40,8 @@ pub struct CreateBackendRequest {
 #[derive(Deserialize)]
 pub struct UpdateBackendRequest {
     pub address: Option<String>,
+    pub name: Option<String>,
+    pub group_name: Option<String>,
     pub weight: Option<i32>,
     pub health_check_enabled: Option<bool>,
     pub health_check_interval_s: Option<i32>,
@@ -47,6 +53,8 @@ fn backend_to_response(b: &lorica_config::models::Backend) -> BackendResponse {
     BackendResponse {
         id: b.id.clone(),
         address: b.address.clone(),
+        name: b.name.clone(),
+        group_name: b.group_name.clone(),
         weight: b.weight,
         health_status: b.health_status.as_str().to_string(),
         lifecycle_state: b.lifecycle_state.as_str().to_string(),
@@ -83,8 +91,10 @@ pub async fn create_backend(
     let backend = lorica_config::models::Backend {
         id: uuid::Uuid::new_v4().to_string(),
         address: body.address,
+        name: body.name.unwrap_or_default(),
+        group_name: body.group_name.unwrap_or_default(),
         weight: body.weight.unwrap_or(100),
-        health_status: lorica_config::models::HealthStatus::Healthy,
+        health_status: lorica_config::models::HealthStatus::Unknown,
         health_check_enabled: body.health_check_enabled.unwrap_or(true),
         health_check_interval_s: body.health_check_interval_s.unwrap_or(10),
         health_check_path: body.health_check_path.clone(),
@@ -131,6 +141,12 @@ pub async fn update_backend(
 
     if let Some(address) = body.address {
         backend.address = address;
+    }
+    if let Some(name) = body.name {
+        backend.name = name;
+    }
+    if let Some(group_name) = body.group_name {
+        backend.group_name = group_name;
     }
     if let Some(weight) = body.weight {
         backend.weight = weight;

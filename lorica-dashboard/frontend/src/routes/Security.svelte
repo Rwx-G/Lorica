@@ -84,9 +84,14 @@
   }
 
   async function toggleBlocklist() {
-    const res = await api.toggleBlocklist(!blocklist.enabled);
+    const newState = !blocklist.enabled;
+    const res = await api.toggleBlocklist(newState);
     if (res.data) {
       blocklist = { ...blocklist, enabled: res.data.enabled, ip_count: res.data.ip_count };
+      // Auto-refresh on enable to load the IP list immediately
+      if (newState) {
+        await reloadBlocklist();
+      }
     }
   }
 
@@ -441,7 +446,7 @@
 
         <div class="blocklist-source">
           <span class="source-label">Source:</span>
-          <span class="mono">{blocklist.source}</span>
+          <a href={blocklist.source} target="_blank" rel="noopener noreferrer" class="mono">{blocklist.source}</a>
         </div>
 
         <div class="blocklist-actions">
@@ -460,7 +465,7 @@
 
 <style>
   .security-page {
-    max-width: 1200px;
+    max-width: none;
   }
 
   .page-header {

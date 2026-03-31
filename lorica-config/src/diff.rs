@@ -249,6 +249,8 @@ fn route_eq(a: &Route, b: &Route) -> bool {
 
 fn backend_eq(a: &Backend, b: &Backend) -> bool {
     a.address == b.address
+        && a.name == b.name
+        && a.group_name == b.group_name
         && a.weight == b.weight
         && a.health_check_enabled == b.health_check_enabled
         && a.health_check_interval_s == b.health_check_interval_s

@@ -453,7 +453,7 @@
 </script>
 
 <style>
-  .loadtest-page { max-width: 1200px; }
+  .loadtest-page { max-width: none; }
 
   /* Live progress panel */
   .live-panel { background: var(--color-bg-card); border: 2px solid var(--color-primary); border-radius: var(--radius-xl); padding: var(--space-4) var(--space-5); margin-bottom: var(--space-6); box-shadow: var(--shadow-md); }

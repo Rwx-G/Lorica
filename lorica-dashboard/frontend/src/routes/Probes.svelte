@@ -272,7 +272,7 @@
 </script>
 
 <style>
-  .probes-page { max-width: 1100px; }
+  .probes-page { max-width: none; }
   .route-label { font-weight: 600; color: var(--color-text-heading); }
   .method-badge { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; background: rgba(59, 130, 246, 0.1); color: var(--color-primary); font-family: var(--mono); }
   .status-on { color: var(--color-green); font-weight: 500; }
