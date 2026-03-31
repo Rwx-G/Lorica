@@ -763,12 +763,18 @@ impl ProxyHttp for LoricaProxy {
         let _ = upstream_request.insert_header("Host", &host_val);
 
         // Custom proxy headers from route config (override defaults)
-        for (name, value) in &route.proxy_headers {
+        // Clone to avoid borrow checker issues with the route snapshot lifetime
+        let custom_headers: Vec<(String, String)> = route
+            .proxy_headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let remove_headers: Vec<String> = route.proxy_headers_remove.clone();
+
+        for (name, value) in &custom_headers {
             let _ = upstream_request.insert_header(name.as_str(), value.as_str());
         }
-
-        // Remove headers listed in proxy_headers_remove
-        for name in &route.proxy_headers_remove {
+        for name in &remove_headers {
             upstream_request.remove_header(name.as_str());
         }
 
@@ -789,26 +795,40 @@ impl ProxyHttp for LoricaProxy {
             None => return Ok(()),
         };
 
-        // Inject custom response headers
+        // Collect all headers to inject (clone to satisfy borrow checker)
+        let mut headers_to_set: Vec<(String, String)> = Vec::new();
+        let mut headers_to_remove: Vec<String> = Vec::new();
+
+        // Custom response headers from route config
         for (name, value) in &route.response_headers {
+            headers_to_set.push((name.clone(), value.clone()));
+        }
+
+        // Headers to remove
+        for name in &route.response_headers_remove {
+            headers_to_remove.push(name.clone());
+        }
+
+        // Security headers based on preset name
+        {
+            let config = self.config.load();
+            if let Some(preset) = config
+                .security_presets
+                .iter()
+                .find(|p| p.name == route.security_headers)
+            {
+                for (name, value) in &preset.headers {
+                    headers_to_set.push((name.clone(), value.clone()));
+                }
+            }
+        }
+
+        // Apply all collected headers
+        for (name, value) in &headers_to_set {
             let _ = upstream_response.insert_header(name.as_str(), value.as_str());
         }
-
-        // Remove headers listed in response_headers_remove
-        for name in &route.response_headers_remove {
+        for name in &headers_to_remove {
             upstream_response.remove_header(name.as_str());
-        }
-
-        // Security headers based on preset name (looked up in merged presets)
-        let config = self.config.load();
-        if let Some(preset) = config
-            .security_presets
-            .iter()
-            .find(|p| p.name == route.security_headers)
-        {
-            for (name, value) in &preset.headers {
-                let _ = upstream_response.insert_header(name.as_str(), value.as_str());
-            }
         }
 
         Ok(())
