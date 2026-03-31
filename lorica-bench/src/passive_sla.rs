@@ -124,7 +124,7 @@ impl RouteBucket {
 }
 
 /// Compute p50, p95, p99 from a mutable sample vec (sorts in place).
-fn compute_percentiles(samples: &mut [u64]) -> (i64, i64, i64) {
+pub fn compute_percentiles(samples: &mut [u64]) -> (i64, i64, i64) {
     if samples.is_empty() {
         return (0, 0, 0);
     }

@@ -1,8 +1,10 @@
 #![deny(clippy::all)]
 
 pub mod active_probes;
+pub mod load_test;
 pub mod passive_sla;
 pub mod results;
 
 pub use active_probes::ProbeScheduler;
+pub use load_test::LoadTestEngine;
 pub use passive_sla::SlaCollector;
