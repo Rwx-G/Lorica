@@ -15,6 +15,7 @@ const MIGRATION_V2: &str = include_str!("migrations/002_add_health_check_path.sq
 const MIGRATION_V3: &str = include_str!("migrations/003_sla_metrics.sql");
 const MIGRATION_V4: &str = include_str!("migrations/004_probe_configs.sql");
 const MIGRATION_V5: &str = include_str!("migrations/005_load_tests.sql");
+const MIGRATION_V6: &str = include_str!("migrations/006_sla_bucket_config_snapshot.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -149,6 +150,23 @@ impl ConfigStore {
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![5],
+            )?;
+        }
+
+        if current_version < 6 {
+            let has_column: bool = self
+                .conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('sla_buckets') WHERE name='cfg_max_latency_ms'")?
+                .query_row([], |row| row.get::<_, i64>(0))
+                .map(|c| c > 0)?;
+
+            if !has_column {
+                tracing::info!("applying migration 006_sla_bucket_config_snapshot");
+                self.conn.execute_batch(MIGRATION_V6)?;
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![6],
             )?;
         }
 
@@ -1002,8 +1020,9 @@ impl ConfigStore {
             "INSERT OR REPLACE INTO sla_buckets
              (route_id, bucket_start, request_count, success_count, error_count,
               latency_sum_ms, latency_min_ms, latency_max_ms,
-              latency_p50_ms, latency_p95_ms, latency_p99_ms, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              latency_p50_ms, latency_p95_ms, latency_p99_ms, source,
+              cfg_max_latency_ms, cfg_status_min, cfg_status_max, cfg_target_pct)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 bucket.route_id,
                 bucket.bucket_start.to_rfc3339(),
@@ -1017,6 +1036,10 @@ impl ConfigStore {
                 bucket.latency_p95_ms,
                 bucket.latency_p99_ms,
                 bucket.source,
+                bucket.cfg_max_latency_ms,
+                bucket.cfg_status_min,
+                bucket.cfg_status_max,
+                bucket.cfg_target_pct,
             ],
         )?;
         Ok(())
@@ -1033,7 +1056,8 @@ impl ConfigStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, route_id, bucket_start, request_count, success_count, error_count,
              latency_sum_ms, latency_min_ms, latency_max_ms,
-             latency_p50_ms, latency_p95_ms, latency_p99_ms, source
+             latency_p50_ms, latency_p95_ms, latency_p99_ms, source,
+             cfg_max_latency_ms, cfg_status_min, cfg_status_max, cfg_target_pct
              FROM sla_buckets
              WHERE route_id = ?1 AND bucket_start >= ?2 AND bucket_start < ?3 AND source = ?4
              ORDER BY bucket_start ASC",
@@ -1103,7 +1127,23 @@ impl ConfigStore {
             0.0
         };
 
-        let config = self.get_sla_config(route_id)?;
+        // Use the snapshot target_pct from the most recent bucket in the window,
+        // so historical queries reflect the config active at recording time.
+        // Fall back to live config if no buckets exist yet.
+        let snapshot_target: f64 = self
+            .conn
+            .query_row(
+                "SELECT cfg_target_pct FROM sla_buckets
+                 WHERE route_id = ?1 AND bucket_start >= ?2 AND bucket_start < ?3 AND source = ?4
+                 ORDER BY bucket_start DESC LIMIT 1",
+                params![route_id, from.to_rfc3339(), to.to_rfc3339(), source],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| {
+                self.get_sla_config(route_id)
+                    .map(|c| c.target_pct)
+                    .unwrap_or(99.9)
+            });
 
         Ok(SlaSummary {
             route_id: route_id.to_string(),
@@ -1115,8 +1155,8 @@ impl ConfigStore {
             p50_latency_ms: percentiles.0,
             p95_latency_ms: percentiles.1,
             p99_latency_ms: percentiles.2,
-            target_pct: config.target_pct,
-            meets_target: sla_pct >= config.target_pct,
+            target_pct: snapshot_target,
+            meets_target: sla_pct >= snapshot_target,
         })
     }
 
@@ -1636,6 +1676,10 @@ fn row_to_sla_bucket(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<SlaBuck
         latency_p95_ms: row.get(10)?,
         latency_p99_ms: row.get(11)?,
         source: row.get(12)?,
+        cfg_max_latency_ms: row.get(13)?,
+        cfg_status_min: row.get(14)?,
+        cfg_status_max: row.get(15)?,
+        cfg_target_pct: row.get(16)?,
     }))
 }
 

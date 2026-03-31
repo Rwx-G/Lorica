@@ -140,6 +140,10 @@ impl ProbeScheduler {
                     latency_p95_ms: result.latency_ms as i64,
                     latency_p99_ms: result.latency_ms as i64,
                     source: "active".to_string(),
+                    cfg_max_latency_ms: probe.timeout_ms as i64,
+                    cfg_status_min: probe.expected_status,
+                    cfg_status_max: probe.expected_status,
+                    cfg_target_pct: 99.9,
                 };
 
                 {

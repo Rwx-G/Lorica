@@ -119,6 +119,10 @@ impl RouteBucket {
             latency_p95_ms: p95,
             latency_p99_ms: p99,
             source: "passive".to_string(),
+            cfg_max_latency_ms: 500,
+            cfg_status_min: 200,
+            cfg_status_max: 399,
+            cfg_target_pct: 99.9,
         }
     }
 }
@@ -249,6 +253,16 @@ impl SlaCollector {
 
             if sla_bucket.request_count == 0 {
                 continue;
+            }
+
+            // Stamp the config snapshot so historical reporting is consistent
+            if let Ok(configs) = self.sla_configs.lock() {
+                if let Some(config) = configs.get(route_id) {
+                    sla_bucket.cfg_max_latency_ms = config.max_latency_ms;
+                    sla_bucket.cfg_status_min = config.success_status_min;
+                    sla_bucket.cfg_status_max = config.success_status_max;
+                    sla_bucket.cfg_target_pct = config.target_pct;
+                }
             }
 
             if let Err(e) = store.insert_sla_bucket(&sla_bucket) {
@@ -509,6 +523,10 @@ mod tests {
             latency_p95_ms: 150,
             latency_p99_ms: 190,
             source: "passive".to_string(),
+            cfg_max_latency_ms: 500,
+            cfg_status_min: 200,
+            cfg_status_max: 399,
+            cfg_target_pct: 99.9,
         };
         store.insert_sla_bucket(&bucket).unwrap();
 
@@ -558,6 +576,10 @@ mod tests {
                 latency_p95_ms: 150,
                 latency_p99_ms: 190,
                 source: "passive".to_string(),
+                cfg_max_latency_ms: 500,
+                cfg_status_min: 200,
+                cfg_status_max: 399,
+                cfg_target_pct: 99.9,
             };
             store.insert_sla_bucket(&bucket).unwrap();
         }
@@ -624,6 +646,10 @@ mod tests {
                 latency_p95_ms: 18,
                 latency_p99_ms: 19,
                 source: format!("passive_{suffix}"),
+                cfg_max_latency_ms: 500,
+                cfg_status_min: 200,
+                cfg_status_max: 399,
+                cfg_target_pct: 99.9,
             };
             // Use different source to avoid UNIQUE constraint
             store.insert_sla_bucket(&bucket).unwrap();
@@ -703,6 +729,10 @@ mod tests {
             latency_p95_ms: 150,
             latency_p99_ms: 190,
             source: "passive".to_string(),
+            cfg_max_latency_ms: 500,
+            cfg_status_min: 200,
+            cfg_status_max: 399,
+            cfg_target_pct: 99.9,
         };
         store.insert_sla_bucket(&bucket).unwrap();
 

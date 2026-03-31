@@ -392,6 +392,29 @@ pub struct SlaBucket {
     pub latency_p95_ms: i64,
     pub latency_p99_ms: i64,
     pub source: String,
+    /// Snapshot of SLA config active when this bucket was recorded.
+    /// Ensures historical reporting stays consistent after config changes.
+    #[serde(default = "default_cfg_max_latency")]
+    pub cfg_max_latency_ms: i64,
+    #[serde(default = "default_cfg_status_min")]
+    pub cfg_status_min: i32,
+    #[serde(default = "default_cfg_status_max")]
+    pub cfg_status_max: i32,
+    #[serde(default = "default_cfg_target_pct")]
+    pub cfg_target_pct: f64,
+}
+
+fn default_cfg_max_latency() -> i64 {
+    500
+}
+fn default_cfg_status_min() -> i32 {
+    200
+}
+fn default_cfg_status_max() -> i32 {
+    399
+}
+fn default_cfg_target_pct() -> f64 {
+    99.9
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
