@@ -576,6 +576,12 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
                         let _ = channel.send(&resp).await;
                         std::process::exit(0);
                     }
+                    CommandType::MetricsRequest => {
+                        let resp = Response::ok(cmd.sequence);
+                        if let Err(e) = channel.send(&resp).await {
+                            warn!(error = %e, "failed to send metrics response");
+                        }
+                    }
                     CommandType::Unspecified => {
                         warn!(worker_id = id, "received unspecified command");
                     }
