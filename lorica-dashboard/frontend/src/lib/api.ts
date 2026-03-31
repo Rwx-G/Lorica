@@ -406,6 +406,16 @@ export const api = {
   toggleWafRule: (ruleId: number, enabled: boolean) =>
     request<{ rule_id: number; enabled: boolean }>('PUT', `/waf/rules/${ruleId}`, { enabled }),
 
+  // IP Blocklist
+  getBlocklistStatus: () =>
+    request<BlocklistStatus>('GET', '/waf/blocklist'),
+
+  toggleBlocklist: (enabled: boolean) =>
+    request<{ enabled: boolean; ip_count: number }>('PUT', '/waf/blocklist', { enabled }),
+
+  reloadBlocklist: () =>
+    request<{ reloaded: boolean; ip_count: number; source: string }>('POST', '/waf/blocklist/reload'),
+
   // Backends CRUD
   getBackend: (id: string) =>
     request<BackendResponse>('GET', `/backends/${id}`),
@@ -536,6 +546,12 @@ export interface WafRulesResponse {
   rules: WafRuleSummary[];
   total: number;
   enabled: number;
+}
+
+export interface BlocklistStatus {
+  enabled: boolean;
+  ip_count: number;
+  source: string;
 }
 
 export interface WorkerStatus {

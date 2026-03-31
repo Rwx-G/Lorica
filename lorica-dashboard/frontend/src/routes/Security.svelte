@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary } from '../lib/api';
+  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus } from '../lib/api';
 
   let events: WafEvent[] = $state([]);
   let stats: { total_events: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
@@ -10,18 +10,21 @@
   });
   let rules: WafRuleSummary[] = $state([]);
   let rulesEnabled = $state(0);
+  let blocklist: BlocklistStatus = $state({ enabled: false, ip_count: 0, source: '' });
+  let blocklistLoading = $state(false);
   let loading = $state(true);
   let error = $state('');
   let filterCategory = $state('');
-  let activeTab: 'events' | 'rules' = $state('events');
+  let activeTab: 'events' | 'rules' | 'blocklist' = $state('events');
 
   async function loadData() {
     loading = true;
     error = '';
-    const [eventsRes, statsRes, rulesRes] = await Promise.all([
+    const [eventsRes, statsRes, rulesRes, blRes] = await Promise.all([
       api.getWafEvents({ limit: 100, category: filterCategory || undefined }),
       api.getWafStats(),
       api.getWafRules(),
+      api.getBlocklistStatus(),
     ]);
 
     if (eventsRes.error) {
@@ -37,6 +40,10 @@
     if (rulesRes.data) {
       rules = rulesRes.data.rules;
       rulesEnabled = rulesRes.data.enabled;
+    }
+
+    if (blRes.data) {
+      blocklist = blRes.data;
     }
 
     loading = false;
@@ -56,6 +63,24 @@
   async function toggleRule(ruleId: number, enabled: boolean) {
     await api.toggleWafRule(ruleId, enabled);
     await loadData();
+  }
+
+  async function toggleBlocklist() {
+    const res = await api.toggleBlocklist(!blocklist.enabled);
+    if (res.data) {
+      blocklist = { ...blocklist, enabled: res.data.enabled, ip_count: res.data.ip_count };
+    }
+  }
+
+  async function reloadBlocklist() {
+    blocklistLoading = true;
+    const res = await api.reloadBlocklist();
+    blocklistLoading = false;
+    if (res.data) {
+      blocklist = { ...blocklist, ip_count: res.data.ip_count };
+    } else if (res.error) {
+      error = res.error.message;
+    }
   }
 
   function severityClass(s: number): string {
@@ -123,6 +148,14 @@
   <div class="tabs">
     <button class="tab" class:active={activeTab === 'events'} onclick={() => activeTab = 'events'}>Events</button>
     <button class="tab" class:active={activeTab === 'rules'} onclick={() => activeTab = 'rules'}>Rules</button>
+    <button class="tab" class:active={activeTab === 'blocklist'} onclick={() => activeTab = 'blocklist'}>
+      IP Blocklist
+      {#if blocklist.enabled}
+        <span class="tab-badge-on">ON</span>
+      {:else}
+        <span class="tab-badge-off">OFF</span>
+      {/if}
+    </button>
   </div>
 
   {#if activeTab === 'events'}
@@ -212,6 +245,43 @@
         </table>
       </div>
     {/if}
+  {:else if activeTab === 'blocklist'}
+    <div class="blocklist-section">
+      <div class="blocklist-card">
+        <div class="blocklist-header">
+          <div>
+            <h3>IPv4 Blocklist</h3>
+            <p class="text-muted">Blocks known malicious IP addresses from accessing the proxy. Sourced from Data-Shield and refreshed every 6 hours.</p>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" checked={blocklist.enabled} onchange={toggleBlocklist} />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="blocklist-stats">
+          <div class="blocklist-stat">
+            <span class="blocklist-stat-value">{blocklist.ip_count.toLocaleString()}</span>
+            <span class="blocklist-stat-label">Blocked IPs</span>
+          </div>
+          <div class="blocklist-stat">
+            <span class="blocklist-stat-value">{blocklist.enabled ? 'Active' : 'Disabled'}</span>
+            <span class="blocklist-stat-label">Status</span>
+          </div>
+        </div>
+
+        <div class="blocklist-source">
+          <span class="source-label">Source:</span>
+          <span class="mono">{blocklist.source}</span>
+        </div>
+
+        <div class="blocklist-actions">
+          <button class="btn btn-secondary" onclick={reloadBlocklist} disabled={blocklistLoading || !blocklist.enabled}>
+            {blocklistLoading ? 'Reloading...' : 'Reload Now'}
+          </button>
+        </div>
+      </div>
+    </div>
   {/if}
 </div>
 
@@ -484,5 +554,105 @@
 
   .btn-danger:hover {
     background: rgba(239, 68, 68, 0.2);
+  }
+
+  /* Tab badges */
+  .tab-badge-on {
+    display: inline-block;
+    padding: 0.0625rem 0.375rem;
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    background: var(--color-green-subtle);
+    color: var(--color-green);
+    margin-left: 0.375rem;
+  }
+
+  .tab-badge-off {
+    display: inline-block;
+    padding: 0.0625rem 0.375rem;
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    background: rgba(100, 116, 139, 0.1);
+    color: var(--color-text-muted);
+    margin-left: 0.375rem;
+  }
+
+  /* Blocklist */
+  .blocklist-section {
+    padding-top: var(--space-4);
+  }
+
+  .blocklist-card {
+    background: var(--color-bg-card);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
+    padding: var(--space-6);
+    box-shadow: var(--shadow-sm);
+    max-width: 600px;
+  }
+
+  .blocklist-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: var(--space-4);
+    margin-bottom: var(--space-6);
+  }
+
+  .blocklist-header h3 {
+    margin: 0 0 var(--space-1);
+  }
+
+  .blocklist-header p {
+    margin: 0;
+    font-size: var(--text-base);
+    line-height: 1.5;
+  }
+
+  .blocklist-stats {
+    display: flex;
+    gap: var(--space-8);
+    margin-bottom: var(--space-5);
+    padding: var(--space-4);
+    background: var(--color-bg-hover);
+    border-radius: var(--radius-lg);
+  }
+
+  .blocklist-stat {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .blocklist-stat-value {
+    font-size: var(--text-lg);
+    font-weight: 700;
+    font-family: var(--mono);
+    color: var(--color-text-heading);
+  }
+
+  .blocklist-stat-label {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+  }
+
+  .blocklist-source {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-bottom: var(--space-5);
+    font-size: var(--text-base);
+  }
+
+  .source-label {
+    color: var(--color-text-muted);
+    font-weight: 500;
+  }
+
+  .blocklist-actions {
+    display: flex;
+    gap: var(--space-3);
   }
 </style>
