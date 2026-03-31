@@ -1,7 +1,7 @@
 # Story 5.3: Built-in Load Testing
 
 **Epic:** [Epic 5 - Observability](../prd/epic-5-observability.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P2
 **Depends on:** Story 5.1
 

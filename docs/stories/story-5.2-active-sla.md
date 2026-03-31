@@ -1,7 +1,7 @@
 # Story 5.2: Active SLA Monitoring (Internal/Engineering)
 
 **Epic:** [Epic 5 - Observability](../prd/epic-5-observability.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P2
 **Depends on:** Story 5.1
 

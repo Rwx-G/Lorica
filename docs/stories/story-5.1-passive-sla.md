@@ -1,7 +1,7 @@
 # Story 5.1: Passive SLA Monitoring (Public/Contractual)
 
 **Epic:** [Epic 5 - Observability](../prd/epic-5-observability.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P2
 **Depends on:** Story 1.8 (proxy engine wiring)
 
