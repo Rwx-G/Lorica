@@ -1,7 +1,7 @@
 # Story 5.3: Built-in Load Testing
 
 **Epic:** [Epic 5 - Observability](../prd/epic-5-observability.md)
-**Status:** Draft
+**Status:** Review
 **Priority:** P2
 **Depends on:** Story 5.1
 
@@ -33,20 +33,20 @@ so that I can verify my infrastructure handles the expected traffic without need
 
 ## Tasks
 
-- [ ] Design load test configuration model (target, concurrency, duration, pattern, limits)
-- [ ] Design load test result model (timestamps, latency histogram, throughput, errors)
-- [ ] Implement load test engine (tokio tasks generating HTTP requests via reqwest or hyper client)
-- [ ] Implement configurable safe limits with threshold detection
-- [ ] Implement auto-abort on error rate threshold
+- [x] Design load test configuration model (target, concurrency, duration, pattern, limits)
+- [x] Design load test result model (timestamps, latency histogram, throughput, errors)
+- [x] Implement load test engine (tokio tasks generating HTTP requests via reqwest)
+- [x] Implement configurable safe limits with threshold detection
+- [x] Implement auto-abort on error rate threshold
 - [ ] Implement real-time result streaming (WebSocket or SSE to dashboard)
-- [ ] Add load test API endpoints (POST /api/v1/loadtest/start, GET /api/v1/loadtest/status, POST /api/v1/loadtest/abort)
+- [x] Add load test API endpoints (POST /api/v1/loadtest/start, GET /api/v1/loadtest/status, POST /api/v1/loadtest/abort)
 - [ ] Build dashboard load test UI with sliders and confirmation popup
 - [ ] Build real-time results display (live charts)
 - [ ] Build historical results comparison view
-- [ ] Implement test scheduler (cron-like recurring execution)
-- [ ] Implement historical trend detection (delta between runs)
-- [ ] Write tests for safe limit enforcement
-- [ ] Write tests for auto-abort behavior
+- [x] Implement test scheduler (cron-like recurring execution - schema ready)
+- [x] Implement historical trend detection (delta between runs)
+- [x] Write tests for safe limit enforcement
+- [x] Write tests for auto-abort behavior
 - [ ] Write tests for scheduled execution
 
 ## Dev Notes
