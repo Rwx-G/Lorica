@@ -1,7 +1,7 @@
 # Story 5.1: Passive SLA Monitoring (Public/Contractual)
 
 **Epic:** [Epic 5 - Observability](../prd/epic-5-observability.md)
-**Status:** Draft
+**Status:** Review
 **Priority:** P2
 **Depends on:** Story 1.8 (proxy engine wiring)
 
@@ -29,16 +29,16 @@ so that I have an accurate picture of what my users actually experience.
 
 ## Tasks
 
-- [ ] Design SLA metrics data model (time-bucketed aggregates)
-- [ ] Implement metrics collector in ProxyHttp logging() callback
-- [ ] Implement time-windowed aggregation (24h, 7d, 30d rolling windows)
-- [ ] Implement SLA percentage calculation with configurable success criteria
-- [ ] Persist aggregated metrics to SQLite (not per-request - aggregated buckets)
-- [ ] Add SLA API endpoints (`GET /api/v1/routes/:id/sla`)
+- [x] Design SLA metrics data model (time-bucketed aggregates)
+- [x] Implement metrics collector in ProxyHttp logging() callback
+- [x] Implement time-windowed aggregation (24h, 7d, 30d rolling windows)
+- [x] Implement SLA percentage calculation with configurable success criteria
+- [x] Persist aggregated metrics to SQLite (not per-request - aggregated buckets)
+- [x] Add SLA API endpoints (`GET /api/v1/sla/routes/:id`)
 - [ ] Build dashboard SLA view with charts (latency trends, error rate, uptime %)
-- [ ] Implement SLA threshold alerts (integrate with lorica-notify)
-- [ ] Implement SLA data export (CSV or JSON)
-- [ ] Write tests for SLA calculation accuracy
+- [x] Implement SLA threshold alerts (integrate with lorica-notify)
+- [x] Implement SLA data export (CSV or JSON)
+- [x] Write tests for SLA calculation accuracy
 
 ## Dev Notes
 
