@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -340,7 +340,7 @@ mod tests {
         }
         {
             let store = ConfigStore::open(path, None).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 2);
+            assert_eq!(store.schema_version().unwrap(), 3);
         }
     }
 
@@ -768,12 +768,10 @@ backend_id = "nonexistent-backend"
 "#;
         let result = parse_toml(toml_str);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unknown backend_id")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown backend_id"));
     }
 
     #[test]
@@ -828,9 +826,7 @@ default_health_check_interval_s = 10
         let backend1 = make_backend();
         store.create_route(&route).unwrap();
         store.create_backend(&backend1).unwrap();
-        store
-            .link_route_backend(&route.id, &backend1.id)
-            .unwrap();
+        store.link_route_backend(&route.id, &backend1.id).unwrap();
 
         // Import data with a different backend link
         let mut backend2 = make_backend();

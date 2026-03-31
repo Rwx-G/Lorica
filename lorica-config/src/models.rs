@@ -342,6 +342,73 @@ impl Default for GlobalSettings {
     }
 }
 
+// --- SLA Models ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlaConfig {
+    pub route_id: String,
+    pub target_pct: f64,
+    pub max_latency_ms: i64,
+    pub success_status_min: i32,
+    pub success_status_max: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SlaConfig {
+    pub fn default_for_route(route_id: &str) -> Self {
+        let now = Utc::now();
+        Self {
+            route_id: route_id.to_string(),
+            target_pct: 99.9,
+            max_latency_ms: 500,
+            success_status_min: 200,
+            success_status_max: 399,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn is_success(&self, status: u16, latency_ms: u64) -> bool {
+        let status_ok = (status as i32) >= self.success_status_min
+            && (status as i32) <= self.success_status_max;
+        let latency_ok = (latency_ms as i64) <= self.max_latency_ms;
+        status_ok && latency_ok
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlaBucket {
+    pub id: Option<i64>,
+    pub route_id: String,
+    pub bucket_start: DateTime<Utc>,
+    pub request_count: i64,
+    pub success_count: i64,
+    pub error_count: i64,
+    pub latency_sum_ms: i64,
+    pub latency_min_ms: i64,
+    pub latency_max_ms: i64,
+    pub latency_p50_ms: i64,
+    pub latency_p95_ms: i64,
+    pub latency_p99_ms: i64,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlaSummary {
+    pub route_id: String,
+    pub window: String,
+    pub total_requests: i64,
+    pub successful_requests: i64,
+    pub sla_pct: f64,
+    pub avg_latency_ms: f64,
+    pub p50_latency_ms: i64,
+    pub p95_latency_ms: i64,
+    pub p99_latency_ms: i64,
+    pub target_pct: f64,
+    pub meets_target: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,7 +570,8 @@ mod tests {
 
     #[test]
     fn test_global_settings_cert_day_defaults_on_missing() {
-        let json = r#"{"management_port":9443,"log_level":"info","default_health_check_interval_s":10}"#;
+        let json =
+            r#"{"management_port":9443,"log_level":"info","default_health_check_interval_s":10}"#;
         let settings: GlobalSettings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.cert_warning_days, 30);
         assert_eq!(settings.cert_critical_days, 7);
