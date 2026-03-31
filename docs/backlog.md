@@ -17,4 +17,3 @@ Items identified during development that are deferred to future stories.
 
 | Source | Description | References |
 |--------|-------------|------------|
-| Epic 5 QA | Dashboard SLA charts and comparison views | Story 5.1, 5.2, frontend epic |
