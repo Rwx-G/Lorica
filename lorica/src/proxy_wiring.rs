@@ -311,6 +311,7 @@ impl ProxyHttp for LoricaProxy {
         let client_ip = session
             .as_downstream()
             .client_addr()
+            .and_then(|addr| addr.as_inet())
             .map(|addr| addr.ip().to_string());
 
         // Prefer X-Forwarded-For if present (client behind another proxy)
