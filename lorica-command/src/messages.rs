@@ -27,6 +27,7 @@ pub enum CommandType {
     ConfigReload = 1,
     Heartbeat = 2,
     Shutdown = 3,
+    MetricsRequest = 4,
 }
 
 impl CommandType {
@@ -35,6 +36,7 @@ impl CommandType {
             1 => Self::ConfigReload,
             2 => Self::Heartbeat,
             3 => Self::Shutdown,
+            4 => Self::MetricsRequest,
             _ => Self::Unspecified,
         }
     }
@@ -134,6 +136,41 @@ impl Response {
     /// Get the typed response status.
     pub fn typed_status(&self) -> ResponseStatus {
         ResponseStatus::from_i32(self.status)
+    }
+}
+
+/// Metrics data sent from worker to supervisor for aggregation.
+///
+/// Workers periodically report their Prometheus counter values.
+/// The supervisor aggregates them into the global /metrics endpoint.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct MetricsReport {
+    /// Worker ID.
+    #[prost(uint32, tag = "1")]
+    pub worker_id: u32,
+    /// Total requests processed by this worker.
+    #[prost(uint64, tag = "2")]
+    pub total_requests: u64,
+    /// Active connections on this worker.
+    #[prost(uint64, tag = "3")]
+    pub active_connections: u64,
+    /// Timestamp of the report.
+    #[prost(uint64, tag = "4")]
+    pub timestamp_ms: u64,
+}
+
+impl MetricsReport {
+    pub fn new(worker_id: u32, total_requests: u64, active_connections: u64) -> Self {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            worker_id,
+            total_requests,
+            active_connections,
+            timestamp_ms,
+        }
     }
 }
 
