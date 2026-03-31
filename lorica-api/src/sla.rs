@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use axum::extract::Path;
+use axum::response::IntoResponse;
 use axum::Extension;
 use axum::Json;
 use chrono::{Duration, Utc};
@@ -162,25 +163,16 @@ pub async fn update_sla_config(
     Ok(json_data(config))
 }
 
-/// POST /api/v1/sla/routes/:id/export
+/// GET /api/v1/sla/routes/:id/export?format=json|csv&from=...&to=...
 /// Export SLA data for reporting.
 #[derive(Deserialize)]
 pub struct ExportQuery {
     pub from: Option<String>,
     pub to: Option<String>,
+    pub format: Option<String>,
 }
 
-pub async fn export_sla_data(
-    Extension(state): Extension<AppState>,
-    Path(route_id): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<ExportQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-
-    store
-        .get_route(&route_id)?
-        .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
-
+fn parse_export_range(query: &ExportQuery) -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
     let now = Utc::now();
     let from = query
         .from
@@ -194,12 +186,74 @@ pub async fn export_sla_data(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or(now);
+    (from, to)
+}
 
-    let export = store
-        .export_sla_data(&route_id, &from, &to)
+pub async fn export_sla_data(
+    Extension(state): Extension<AppState>,
+    Path(route_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ExportQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let store = state.store.lock().await;
+
+    store
+        .get_route(&route_id)?
+        .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
+
+    let (from, to) = parse_export_range(&query);
+
+    let buckets = store
+        .query_sla_buckets(&route_id, &from, &to, "passive")
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "data": export })))
+    let is_csv = query
+        .format
+        .as_deref()
+        .map(|f| f.eq_ignore_ascii_case("csv"))
+        .unwrap_or(false);
+
+    if is_csv {
+        let mut csv = String::from(
+            "bucket_start,request_count,success_count,error_count,\
+             latency_sum_ms,latency_min_ms,latency_max_ms,\
+             latency_p50_ms,latency_p95_ms,latency_p99_ms\n",
+        );
+        for b in &buckets {
+            csv.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{}\n",
+                b.bucket_start.to_rfc3339(),
+                b.request_count,
+                b.success_count,
+                b.error_count,
+                b.latency_sum_ms,
+                b.latency_min_ms,
+                b.latency_max_ms,
+                b.latency_p50_ms,
+                b.latency_p95_ms,
+                b.latency_p99_ms,
+            ));
+        }
+        Ok(axum::response::Response::builder()
+            .header("Content-Type", "text/csv")
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"sla-{route_id}.csv\""),
+            )
+            .body(axum::body::Body::from(csv))
+            .unwrap())
+    } else {
+        let config = store
+            .get_sla_config(&route_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let export = serde_json::json!({
+            "route_id": route_id,
+            "from": from.to_rfc3339(),
+            "to": to.to_rfc3339(),
+            "config": config,
+            "buckets": buckets,
+        });
+        Ok(Json(serde_json::json!({ "data": export })).into_response())
+    }
 }
 
 /// GET /api/v1/sla/overview
