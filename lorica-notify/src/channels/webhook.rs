@@ -73,4 +73,38 @@ mod tests {
         assert_eq!(json["alert_type"], "config_changed");
         assert_eq!(json["details"]["changed_by"], "admin");
     }
+
+    #[tokio::test]
+    async fn test_send_with_auth_header_fails_gracefully() {
+        let config = WebhookConfig {
+            url: "http://192.0.2.1:1/hook".into(),
+            auth_header: Some("Bearer test-token".into()),
+        };
+        let event = AlertEvent::new(AlertType::WafAlert, "test");
+        let result = send(&config, &event).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_with_empty_url_fails() {
+        let config = WebhookConfig {
+            url: "".into(),
+            auth_header: None,
+        };
+        let event = AlertEvent::new(AlertType::BackendDown, "test");
+        let result = send(&config, &event).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_webhook_config_serialization() {
+        let config = WebhookConfig {
+            url: "https://hooks.example.com/alert".into(),
+            auth_header: Some("Bearer secret".into()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: WebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.url, config.url);
+        assert_eq!(parsed.auth_header, config.auth_header);
+    }
 }

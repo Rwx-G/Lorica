@@ -475,4 +475,111 @@ mod tests {
         let d = NotifyDispatcher::new();
         assert_eq!(d.suppressed_count(), 0);
     }
+
+    #[tokio::test]
+    async fn test_dispatch_with_disabled_channel_skips() {
+        let mut d = NotifyDispatcher::new();
+        d.add_webhook_channel(
+            "w1".into(),
+            WebhookConfig {
+                url: "http://192.0.2.1:1/hook".into(),
+                auth_header: None,
+            },
+            vec![],
+            false, // disabled
+        );
+        let event = AlertEvent::new(AlertType::BackendDown, "test");
+        d.dispatch(&event).await;
+        // Should be in history (stdout always emits) but webhook not called
+        assert_eq!(d.history_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_with_unmatched_alert_type_skips() {
+        let mut d = NotifyDispatcher::new();
+        d.add_webhook_channel(
+            "w1".into(),
+            WebhookConfig {
+                url: "http://192.0.2.1:1/hook".into(),
+                auth_header: None,
+            },
+            vec!["cert_expiring".into()], // only cert_expiring
+            true,
+        );
+        let event = AlertEvent::new(AlertType::BackendDown, "test");
+        d.dispatch(&event).await;
+        // Webhook should be skipped (wrong alert type), but event still in history
+        assert_eq!(d.history_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_wildcard_matches_all() {
+        let mut d = NotifyDispatcher::new();
+        d.add_webhook_channel(
+            "w1".into(),
+            WebhookConfig {
+                url: "http://192.0.2.1:1/hook".into(),
+                auth_header: None,
+            },
+            vec!["*".into()], // wildcard
+            true,
+        );
+        let event = AlertEvent::new(AlertType::ConfigChanged, "test");
+        d.dispatch(&event).await;
+        // Event in history, webhook attempted (will fail but that's ok)
+        assert_eq!(d.history_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_email_with_invalid_address_logs_error() {
+        let mut d = NotifyDispatcher::new();
+        d.add_email_channel(
+            "e1".into(),
+            EmailConfig {
+                smtp_host: "192.0.2.1".into(),
+                smtp_port: None,
+                smtp_username: None,
+                smtp_password: None,
+                from_address: "not-valid".into(),
+                to_address: "admin@example.com".into(),
+            },
+            vec![],
+            true,
+        );
+        let event = AlertEvent::new(AlertType::BackendDown, "test");
+        d.dispatch(&event).await;
+        // Email send fails but doesn't panic, event still in history
+        assert_eq!(d.history_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_history_ring_buffer_overflow() {
+        let mut d = NotifyDispatcher::new();
+        // Default max_history is 100
+        for i in 0..110 {
+            let event = AlertEvent::new(AlertType::BackendDown, format!("event {i}"));
+            d.dispatch(&event).await;
+        }
+        assert_eq!(d.history_count(), 100);
+        let recent = d.recent_history(1);
+        assert!(recent[0].summary.contains("event 109"));
+    }
+
+    #[test]
+    fn test_default_dispatcher() {
+        let d = NotifyDispatcher::default();
+        assert_eq!(d.channel_count(), 0);
+        assert_eq!(d.history_count(), 0);
+        assert_eq!(d.suppressed_count(), 0);
+    }
+
+    #[test]
+    fn test_notify_error_display() {
+        let e1 = NotifyError::Email("test error".into());
+        assert_eq!(e1.to_string(), "email: test error");
+        let e2 = NotifyError::Webhook("timeout".into());
+        assert_eq!(e2.to_string(), "webhook: timeout");
+        let e3 = NotifyError::Config("missing field".into());
+        assert_eq!(e3.to_string(), "config: missing field");
+    }
 }

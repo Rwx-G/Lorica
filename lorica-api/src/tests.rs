@@ -12,6 +12,7 @@ use crate::middleware::auth::SessionStore;
 use crate::middleware::rate_limit::RateLimiter;
 use crate::server::{build_router, AppState};
 use crate::system::SystemCache;
+use crate::workers::WorkerMetrics;
 
 fn test_state() -> (AppState, SessionStore, RateLimiter) {
     let store = lorica_config::ConfigStore::open_in_memory().unwrap();
@@ -2676,4 +2677,308 @@ async fn test_status_counts_with_data() {
     assert_eq!(json["data"]["backends_count"], 1);
     assert_eq!(json["data"]["backends_healthy"], 1);
     assert_eq!(json["data"]["certificates_count"], 1);
+}
+
+// ---- WAF & Workers helpers ----
+
+fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
+    let store = lorica_config::ConfigStore::open_in_memory().unwrap();
+    let engine = Arc::new(lorica_waf::WafEngine::new());
+    let event_buffer = engine.event_buffer();
+    let rule_count = engine.rule_count();
+    let state = AppState {
+        store: Arc::new(Mutex::new(store)),
+        log_buffer: Arc::new(LogBuffer::new(1000)),
+        system_cache: Arc::new(Mutex::new(SystemCache::new())),
+        active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        started_at: Instant::now(),
+        config_reload_tx: None,
+        worker_metrics: None,
+        waf_event_buffer: Some(event_buffer),
+        waf_engine: Some(engine),
+        waf_rule_count: Some(rule_count),
+    };
+    let session_store = SessionStore::new();
+    let rate_limiter = RateLimiter::new();
+    (state, session_store, rate_limiter)
+}
+
+fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
+    let store = lorica_config::ConfigStore::open_in_memory().unwrap();
+    let state = AppState {
+        store: Arc::new(Mutex::new(store)),
+        log_buffer: Arc::new(LogBuffer::new(1000)),
+        system_cache: Arc::new(Mutex::new(SystemCache::new())),
+        active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        started_at: Instant::now(),
+        config_reload_tx: None,
+        worker_metrics: Some(Arc::new(WorkerMetrics::new())),
+        waf_event_buffer: None,
+        waf_engine: None,
+        waf_rule_count: None,
+    };
+    let session_store = SessionStore::new();
+    let rate_limiter = RateLimiter::new();
+    (state, session_store, rate_limiter)
+}
+
+// ---- WAF Tests ----
+
+#[tokio::test]
+async fn test_waf_events_empty() {
+    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/waf/events")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["events"], serde_json::json!([]));
+    assert_eq!(json["data"]["total"], 0);
+    assert!(json["data"]["rule_count"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn test_waf_stats_empty() {
+    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/waf/stats")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total_events"], 0);
+    assert!(json["data"]["rule_count"].as_u64().unwrap() > 0);
+    assert_eq!(json["data"]["by_category"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn test_waf_clear_events() {
+    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/waf/events")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["cleared"], true);
+}
+
+#[tokio::test]
+async fn test_waf_rules_list() {
+    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/waf/rules")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let total = json["data"]["total"].as_u64().unwrap();
+    let enabled = json["data"]["enabled"].as_u64().unwrap();
+    assert!(total > 0, "expected at least one WAF rule");
+    assert_eq!(total, enabled, "all rules should be enabled by default");
+    assert!(json["data"]["rules"].is_array());
+}
+
+#[tokio::test]
+async fn test_waf_rules_disable() {
+    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({"enabled": false});
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/waf/rules/942100")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["rule_id"], 942100);
+    assert_eq!(json["data"]["enabled"], false);
+}
+
+#[tokio::test]
+async fn test_waf_rules_enable() {
+    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // First disable rule 942100
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({"enabled": false});
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/waf/rules/942100")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Then re-enable it
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({"enabled": true});
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/waf/rules/942100")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["rule_id"], 942100);
+    assert_eq!(json["data"]["enabled"], true);
+}
+
+#[tokio::test]
+async fn test_waf_rules_not_found() {
+    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({"enabled": false});
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/waf/rules/999999")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_waf_events_without_engine() {
+    let (state, session_store, rate_limiter) = test_state();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/waf/events")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["events"], serde_json::json!([]));
+    assert_eq!(json["data"]["total"], 0);
+    assert_eq!(json["data"]["rule_count"], 0);
+}
+
+// ---- Workers Tests ----
+
+#[tokio::test]
+async fn test_workers_empty() {
+    let (state, session_store, rate_limiter) = test_state_with_workers();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/workers")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["workers"], serde_json::json!([]));
+    assert_eq!(json["data"]["total"], 0);
+}
+
+#[tokio::test]
+async fn test_workers_with_metrics() {
+    let (state, session_store, rate_limiter) = test_state_with_workers();
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Record a heartbeat for worker 1
+    let metrics = state.worker_metrics.as_ref().unwrap();
+    metrics.record_heartbeat(1, 12345, 5).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/workers")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["total"], 1);
+    let workers = json["data"]["workers"].as_array().unwrap();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0]["worker_id"], 1);
+    assert_eq!(workers[0]["pid"], 12345);
+    assert_eq!(workers[0]["healthy"], true);
 }

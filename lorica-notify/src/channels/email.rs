@@ -122,4 +122,76 @@ mod tests {
         assert!(body.contains("example.com"));
         assert!(body.contains("days_remaining"));
     }
+
+    #[test]
+    fn test_format_email_body_no_details() {
+        let event = AlertEvent::new(AlertType::WafAlert, "SQL injection detected");
+        let body = format_email_body(&event);
+        assert!(!body.contains("Details:"));
+        assert!(body.contains("waf_alert"));
+        assert!(body.contains("SQL injection"));
+        assert!(body.contains("Sent by Lorica"));
+    }
+
+    #[test]
+    fn test_format_email_body_all_event_types() {
+        for alert_type in [
+            AlertType::CertExpiring,
+            AlertType::BackendDown,
+            AlertType::WafAlert,
+            AlertType::ConfigChanged,
+        ] {
+            let event = AlertEvent::new(alert_type.clone(), "test summary");
+            let body = format_email_body(&event);
+            assert!(body.contains(alert_type.as_str()));
+            assert!(body.contains("test summary"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_invalid_from_address() {
+        let config = EmailConfig {
+            smtp_host: "mail.example.com".into(),
+            smtp_port: None,
+            smtp_username: None,
+            smtp_password: None,
+            from_address: "not-an-email".into(),
+            to_address: "admin@example.com".into(),
+        };
+        let event = AlertEvent::new(AlertType::BackendDown, "test");
+        let result = send(&config, &event).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("from_address"));
+    }
+
+    #[tokio::test]
+    async fn test_send_invalid_to_address() {
+        let config = EmailConfig {
+            smtp_host: "mail.example.com".into(),
+            smtp_port: None,
+            smtp_username: None,
+            smtp_password: None,
+            from_address: "noreply@example.com".into(),
+            to_address: "not-an-email".into(),
+        };
+        let event = AlertEvent::new(AlertType::BackendDown, "test");
+        let result = send(&config, &event).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("to_address"));
+    }
+
+    #[tokio::test]
+    async fn test_send_unreachable_smtp_fails() {
+        let config = EmailConfig {
+            smtp_host: "192.0.2.1".into(),
+            smtp_port: Some(25),
+            smtp_username: None,
+            smtp_password: None,
+            from_address: "noreply@example.com".into(),
+            to_address: "admin@example.com".into(),
+        };
+        let event = AlertEvent::new(AlertType::BackendDown, "test");
+        let result = send(&config, &event).await;
+        assert!(result.is_err());
+    }
 }
