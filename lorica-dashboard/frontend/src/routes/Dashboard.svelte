@@ -53,7 +53,8 @@
 <style>
   .content {
     flex: 1;
-    padding: 1.5rem 2rem;
+    padding: var(--space-8) var(--space-10);
     overflow-y: auto;
+    min-width: 0;
   }
 </style>

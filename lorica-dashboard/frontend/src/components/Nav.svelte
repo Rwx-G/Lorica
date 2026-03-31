@@ -81,7 +81,7 @@
 
 <style>
   .sidebar {
-    width: 220px;
+    width: 230px;
     min-height: 100vh;
     background: var(--color-bg-nav);
     border-right: 1px solid var(--color-border);
@@ -93,36 +93,43 @@
   .sidebar-header {
     display: flex;
     align-items: center;
-    gap: 0.625rem;
-    padding: 1.25rem 1rem;
+    gap: var(--space-3);
+    padding: var(--space-5) var(--space-4);
     border-bottom: 1px solid var(--color-border);
   }
 
   .sidebar-title {
-    font-size: 1.125rem;
+    font-size: 1.25rem;
     font-weight: 700;
     color: var(--color-text-heading);
+    letter-spacing: -0.02em;
   }
 
   .nav-list {
     list-style: none;
     margin: 0;
-    padding: 0.5rem 0;
+    padding: var(--space-2) var(--space-2);
     flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
   }
 
   .nav-item {
     display: flex;
     align-items: center;
-    gap: 0.625rem;
+    gap: var(--space-3);
     width: 100%;
-    padding: 0.5rem 1rem;
+    padding: 0.5rem 0.75rem;
     background: none;
     border: none;
+    border-left: 3px solid transparent;
+    border-radius: var(--radius-md);
     color: var(--color-text-muted);
-    font-size: 0.875rem;
+    font-size: var(--text-md);
+    font-weight: 450;
     text-align: left;
-    transition: background-color 0.15s, color 0.15s;
+    transition: background-color var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
     cursor: pointer;
   }
 
@@ -131,20 +138,33 @@
     color: var(--color-text);
   }
 
+  .nav-item:focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: -2px;
+  }
+
   .nav-item.active {
-    background: var(--color-bg-hover);
+    background: var(--color-primary-subtle);
     color: var(--color-primary);
+    border-left-color: var(--color-primary);
+    font-weight: 600;
   }
 
   .nav-icon {
     display: flex;
     align-items: center;
     flex-shrink: 0;
+    opacity: 0.7;
+  }
+
+  .nav-item.active .nav-icon,
+  .nav-item:hover .nav-icon {
+    opacity: 1;
   }
 
   .sidebar-footer {
     border-top: 1px solid var(--color-border);
-    padding: 0.5rem 0;
+    padding: var(--space-2);
   }
 
   .logout-btn:hover {
