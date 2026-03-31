@@ -105,7 +105,15 @@ impl ProxyConfig {
             routes_by_host
                 .entry(route.hostname.clone())
                 .or_default()
-                .push(entry);
+                .push(entry.clone());
+
+            // Index hostname aliases so they resolve to the same route entry
+            for alias in &route.hostname_aliases {
+                routes_by_host
+                    .entry(alias.clone())
+                    .or_default()
+                    .push(entry.clone());
+            }
         }
 
         // Sort each host's routes by path_prefix length descending (longest prefix match first)
@@ -226,6 +234,16 @@ impl EwmaTracker {
     }
 }
 
+/// Check whether an IP address matches a pattern (exact or CIDR prefix).
+fn ip_matches(ip: &str, pattern: &str) -> bool {
+    if pattern.contains('/') {
+        // CIDR - simple prefix match for now
+        ip.starts_with(pattern.split('/').next().unwrap_or(""))
+    } else {
+        ip == pattern
+    }
+}
+
 /// Per-request context carried through the proxy pipeline.
 pub struct RequestCtx {
     /// When the request started processing.
@@ -240,6 +258,10 @@ pub struct RequestCtx {
     pub route_id: Option<String>,
     /// Whether WAF blocked this request.
     pub waf_blocked: bool,
+    /// Snapshot of the matched route for use in later pipeline stages.
+    pub route_snapshot: Option<Route>,
+    /// Whether access logging is enabled for this route.
+    pub access_log_enabled: bool,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -296,6 +318,8 @@ impl ProxyHttp for LoricaProxy {
             matched_path: None,
             route_id: None,
             waf_blocked: false,
+            route_snapshot: None,
+            access_log_enabled: true,
         }
     }
 
@@ -357,6 +381,98 @@ impl ProxyHttp for LoricaProxy {
             Some(e) => e,
             None => return Ok(false), // No route = let upstream_peer handle 404
         };
+
+        // Store route snapshot and access log setting for later pipeline stages
+        ctx.route_snapshot = Some(entry.route.clone());
+        ctx.access_log_enabled = entry.route.access_log_enabled;
+
+        // Force HTTPS redirect
+        if entry.route.force_https {
+            let scheme = req
+                .headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("http");
+            if scheme != "https" {
+                let redir_host = req
+                    .headers
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let redir_path = req.uri.path();
+                let redir_query = req
+                    .uri
+                    .query()
+                    .map(|q| format!("?{q}"))
+                    .unwrap_or_default();
+                let location = format!("https://{redir_host}{redir_path}{redir_query}");
+                let mut header = lorica_http::ResponseHeader::build(301, None)?;
+                header.insert_header("Location", &location)?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        // Hostname redirect
+        if let Some(ref target) = entry.route.redirect_hostname {
+            if host != target.as_str() {
+                let redir_path = req.uri.path();
+                let redir_query = req
+                    .uri
+                    .query()
+                    .map(|q| format!("?{q}"))
+                    .unwrap_or_default();
+                let scheme = req
+                    .headers
+                    .get("x-forwarded-proto")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("https");
+                let location = format!("{scheme}://{target}{redir_path}{redir_query}");
+                let mut header = lorica_http::ResponseHeader::build(301, None)?;
+                header.insert_header("Location", &location)?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        // Per-route IP allowlist/denylist
+        if let Some(ref ip) = check_ip {
+            if !entry.route.ip_allowlist.is_empty()
+                && !entry.route.ip_allowlist.iter().any(|a| ip_matches(ip, a))
+            {
+                let header = lorica_http::ResponseHeader::build(403, None)?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                return Ok(true);
+            }
+            if entry.route.ip_denylist.iter().any(|d| ip_matches(ip, d)) {
+                let header = lorica_http::ResponseHeader::build(403, None)?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        // Request body size limit
+        if let Some(max_bytes) = entry.route.max_request_body_bytes {
+            if let Some(cl) = req.headers.get("content-length") {
+                if let Ok(len) = cl.to_str().unwrap_or("0").parse::<u64>() {
+                    if len > max_bytes {
+                        let header = lorica_http::ResponseHeader::build(413, None)?;
+                        session
+                            .write_response_header(Box::new(header), true)
+                            .await?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
 
         // Skip WAF evaluation entirely if not enabled (zero overhead)
         if !entry.route.waf_enabled {
@@ -454,6 +570,11 @@ impl ProxyHttp for LoricaProxy {
         ctx.matched_host = Some(entry.route.hostname.clone());
         ctx.matched_path = Some(entry.route.path_prefix.clone());
         ctx.route_id = Some(entry.route.id.clone());
+        // Ensure route snapshot is available for upstream_request_filter
+        if ctx.route_snapshot.is_none() {
+            ctx.route_snapshot = Some(entry.route.clone());
+            ctx.access_log_enabled = entry.route.access_log_enabled;
+        }
 
         // Filter healthy backends
         let healthy_backends: Vec<&Backend> = entry
@@ -512,6 +633,166 @@ impl ProxyHttp for LoricaProxy {
         Ok(peer)
     }
 
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        upstream_request: &mut lorica_http::RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let route = match ctx.route_snapshot {
+            Some(ref r) => r,
+            None => return Ok(()),
+        };
+
+        // Path rewriting: strip prefix then add prefix
+        let original_path = upstream_request.uri.path().to_string();
+        let query = upstream_request
+            .uri
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+
+        let mut rewritten = original_path.clone();
+
+        if let Some(ref strip) = route.strip_path_prefix {
+            if rewritten.starts_with(strip.as_str()) {
+                rewritten = rewritten[strip.len()..].to_string();
+                if rewritten.is_empty() || !rewritten.starts_with('/') {
+                    rewritten = format!("/{rewritten}");
+                }
+            }
+        }
+
+        if let Some(ref add) = route.add_path_prefix {
+            rewritten = format!("{add}{rewritten}");
+        }
+
+        if rewritten != original_path {
+            let new_uri_str = format!("{rewritten}{query}");
+            if let Ok(new_uri) = new_uri_str.parse::<http::Uri>() {
+                upstream_request.set_uri(new_uri);
+            }
+        }
+
+        // Default proxy headers
+        let req = session.req_header();
+        let client_ip = session
+            .as_downstream()
+            .client_addr()
+            .and_then(|addr| addr.as_inet())
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_default();
+
+        let xff = req
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .map(|existing| format!("{existing}, {client_ip}"))
+            .unwrap_or_else(|| client_ip.clone());
+
+        let proto = req
+            .headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("http");
+
+        let host_val = req
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let _ = upstream_request.insert_header("X-Real-IP", &client_ip);
+        let _ = upstream_request.insert_header("X-Forwarded-For", &xff);
+        let _ = upstream_request.insert_header("X-Forwarded-Proto", proto);
+        let _ = upstream_request.insert_header("Host", &host_val);
+
+        // Custom proxy headers from route config (override defaults)
+        for (name, value) in &route.proxy_headers {
+            let _ = upstream_request.insert_header(name.as_str(), value.as_str());
+        }
+
+        // Remove headers listed in proxy_headers_remove
+        for name in &route.proxy_headers_remove {
+            upstream_request.remove_header(name.as_str());
+        }
+
+        Ok(())
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut lorica_http::ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let route = match ctx.route_snapshot {
+            Some(ref r) => r,
+            None => return Ok(()),
+        };
+
+        // Inject custom response headers
+        for (name, value) in &route.response_headers {
+            let _ = upstream_response.insert_header(name.as_str(), value.as_str());
+        }
+
+        // Remove headers listed in response_headers_remove
+        for name in &route.response_headers_remove {
+            upstream_response.remove_header(name.as_str());
+        }
+
+        // Security headers based on preset level
+        match route.security_headers.as_str() {
+            "strict" => {
+                let _ = upstream_response
+                    .insert_header("X-Content-Type-Options", "nosniff");
+                let _ = upstream_response
+                    .insert_header("X-Frame-Options", "DENY");
+                let _ = upstream_response
+                    .insert_header("X-XSS-Protection", "1; mode=block");
+                let _ = upstream_response.insert_header(
+                    "Strict-Transport-Security",
+                    "max-age=63072000; includeSubDomains; preload",
+                );
+                let _ = upstream_response.insert_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'",
+                );
+                let _ = upstream_response
+                    .insert_header("Referrer-Policy", "no-referrer");
+                let _ = upstream_response.insert_header(
+                    "Permissions-Policy",
+                    "geolocation=(), camera=(), microphone=()",
+                );
+            }
+            "moderate" => {
+                let _ = upstream_response
+                    .insert_header("X-Content-Type-Options", "nosniff");
+                let _ = upstream_response
+                    .insert_header("X-Frame-Options", "SAMEORIGIN");
+                let _ = upstream_response
+                    .insert_header("X-XSS-Protection", "1; mode=block");
+                let _ = upstream_response.insert_header(
+                    "Strict-Transport-Security",
+                    "max-age=31536000; includeSubDomains",
+                );
+                let _ = upstream_response
+                    .insert_header("Referrer-Policy", "strict-origin-when-cross-origin");
+            }
+            // "none" or anything else - skip security headers
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX)
     where
         Self::CTX: Send + Sync,
@@ -568,19 +849,21 @@ impl ProxyHttp for LoricaProxy {
             self.backend_connections.decrement(addr);
         }
 
-        // Push to the in-memory log buffer for dashboard viewing
-        let entry = LogEntry {
-            id: 0, // assigned by LogBuffer
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            method: method.to_string(),
-            path: path.to_string(),
-            host: host.to_string(),
-            status,
-            latency_ms,
-            backend: backend_addr.to_string(),
-            error: error_str,
-        };
-        self.log_buffer.push(entry).await;
+        // Push to the in-memory log buffer for dashboard viewing (if enabled)
+        if ctx.access_log_enabled {
+            let entry = LogEntry {
+                id: 0, // assigned by LogBuffer
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                method: method.to_string(),
+                path: path.to_string(),
+                host: host.to_string(),
+                status,
+                latency_ms,
+                backend: backend_addr.to_string(),
+                error: error_str,
+            };
+            self.log_buffer.push(entry).await;
+        }
 
         // Record Prometheus metrics (bounded labels: route_id, not hostname)
         let route_label = ctx.route_id.as_deref().unwrap_or("_unknown");
@@ -632,6 +915,31 @@ mod tests {
             waf_mode: WafMode::Detection,
             topology_type: TopologyType::SingleVm,
             enabled,
+            force_https: false,
+            redirect_hostname: None,
+            hostname_aliases: Vec::new(),
+            proxy_headers: std::collections::HashMap::new(),
+            response_headers: std::collections::HashMap::new(),
+            security_headers: "moderate".to_string(),
+            connect_timeout_s: 5,
+            read_timeout_s: 60,
+            send_timeout_s: 60,
+            strip_path_prefix: None,
+            add_path_prefix: None,
+            access_log_enabled: true,
+            proxy_headers_remove: Vec::new(),
+            response_headers_remove: Vec::new(),
+            max_request_body_bytes: None,
+            websocket_enabled: true,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            ip_allowlist: Vec::new(),
+            ip_denylist: Vec::new(),
+            cors_allowed_origins: Vec::new(),
+            cors_allowed_methods: Vec::new(),
+            cors_max_age_s: None,
+            compression_enabled: false,
+            retry_attempts: None,
             created_at: now,
             updated_at: now,
         }
@@ -901,5 +1209,37 @@ mod tests {
         let tracker = EwmaTracker::new();
         let backends: Vec<&Backend> = vec![];
         assert_eq!(tracker.select_best(&backends), 0);
+    }
+
+    // ---- Hostname Aliases ----
+
+    #[test]
+    fn test_from_store_hostname_aliases_indexed() {
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.hostname_aliases = vec!["www.example.com".into(), "alias.example.com".into()];
+
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![]);
+        assert!(config.routes_by_host.contains_key("example.com"));
+        assert!(config.routes_by_host.contains_key("www.example.com"));
+        assert!(config.routes_by_host.contains_key("alias.example.com"));
+
+        // All point to the same route
+        let primary = &config.routes_by_host["example.com"][0];
+        let alias = &config.routes_by_host["www.example.com"][0];
+        assert_eq!(primary.route.id, alias.route.id);
+    }
+
+    // ---- IP Matching ----
+
+    #[test]
+    fn test_ip_matches_exact() {
+        assert!(ip_matches("192.168.1.1", "192.168.1.1"));
+        assert!(!ip_matches("192.168.1.1", "192.168.1.2"));
+    }
+
+    #[test]
+    fn test_ip_matches_cidr_prefix() {
+        assert!(ip_matches("192.168.1.100", "192.168.1/24"));
+        assert!(!ip_matches("10.0.0.1", "192.168.1/24"));
     }
 }
