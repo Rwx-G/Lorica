@@ -583,6 +583,7 @@ impl ProxyHttp for LoricaProxy {
         // Update EWMA latency tracker for Peak EWMA load balancing
         if let Some(ref addr) = ctx.backend_addr {
             self.ewma_tracker.record(addr, latency_ms as f64 * 1000.0);
+            lorica_api::metrics::set_ewma_score(addr, self.ewma_tracker.get_score(addr));
         }
     }
 

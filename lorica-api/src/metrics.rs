@@ -113,6 +113,26 @@ static WAF_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     counter
 });
 
+/// EWMA latency score per backend (microseconds). Labels: backend_address.
+static EWMA_SCORE: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::opts!(
+            "lorica_ewma_score_us",
+            "Peak EWMA latency score per backend in microseconds"
+        )
+        .namespace("lorica"),
+        &["backend_address"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).ok();
+    gauge
+});
+
+/// Update EWMA score metric for a backend.
+pub fn set_ewma_score(address: &str, score_us: f64) {
+    EWMA_SCORE.with_label_values(&[address]).set(score_us);
+}
+
 /// System CPU usage gauge (0-100).
 static SYSTEM_CPU_PERCENT: Lazy<prometheus::Gauge> = Lazy::new(|| {
     let gauge =
@@ -223,7 +243,12 @@ pub async fn get_metrics(
     let content_type = encoder.format_type().to_string();
     let metric_families = REGISTRY.gather();
     let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        return (
+            [(header::CONTENT_TYPE, "text/plain".to_string())],
+            format!("metrics encoding failed: {e}").into_bytes(),
+        );
+    }
 
     (
         [(header::CONTENT_TYPE, content_type)],
