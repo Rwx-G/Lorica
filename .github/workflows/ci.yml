@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  SKIP_FRONTEND_BUILD: 1
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build frontend
+        run: |
+          cd lorica-dashboard/frontend
+          npm ci
+          npm run build
+
+      - name: Run Rust tests
+        run: cargo test --workspace --exclude lorica
+        env:
+          SKIP_FRONTEND_BUILD: ""
+
+      - name: Run frontend tests
+        run: |
+          cd lorica-dashboard/frontend
+          npx vitest run
+
+      - name: Clippy
+        run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -- -D warnings
+
+      - name: Cargo audit
+        run: |
+          cargo install cargo-audit
+          cargo audit || true  # serde_yml warning from Pingora
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build frontend
+        run: |
+          cd lorica-dashboard/frontend
+          npm ci
+          npm run build
+
+      - name: Build release binary
+        run: cargo build --release -p lorica
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lorica-linux-x86_64
+          path: target/release/lorica
+
+  package:
+    name: Package .deb
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: lorica-linux-x86_64
+
+      - name: Build .deb package
+        run: |
+          chmod +x lorica
+          bash dist/build-deb.sh
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: lorica-deb
+          path: dist/*.deb
