@@ -26,9 +26,9 @@ New tests added in Epic 5: 51 (passive SLA: 19, active probes: 8, load testing: 
 
 | Story | Title | Gate | Score |
 |-------|-------|------|-------|
-| 5.1 | Passive SLA Monitoring | PASS | 96 |
-| 5.2 | Active SLA Monitoring | PASS | 95 |
-| 5.3 | Built-in Load Testing | PASS | 95 |
+| 5.1 | Passive SLA Monitoring | PASS | 98 |
+| 5.2 | Active SLA Monitoring | PASS | 97 |
+| 5.3 | Built-in Load Testing | PASS | 97 |
 
 ## PRD Acceptance Criteria Traceability
 

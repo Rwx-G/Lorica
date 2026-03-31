@@ -2,7 +2,7 @@ schema: 1
 story: "5.2"
 story_title: "Active SLA Monitoring (Internal/Engineering)"
 gate: PASS
-status_reason: "All backend ACs met. Probe configuration model, tokio-based scheduler with per-probe interval tasks, HTTP probe execution via reqwest, results stored independently as 'active' source in sla_buckets, CRUD API for probe management, alert integration on probe failure. Dashboard UI deferred."
+status_reason: "All backend ACs met. Probe configuration model, tokio-based scheduler with per-probe interval tasks and system-wide max_active_probes cap (default 50), HTTP probe execution against real route backends, results stored independently as 'active' source in sla_buckets, CRUD API for probe management, alert integration on probe failure. Dashboard UI deferred."
 reviewer: "Romain G."
 updated: "2026-03-31T20:00:00Z"
 
@@ -10,7 +10,7 @@ top_issues: []
 waiver:
   active: false
 
-quality_score: 95
+quality_score: 97
 expires: "2026-04-14T12:00:00Z"
 
 evidence:
@@ -38,5 +38,4 @@ nfr_validation:
 recommendations:
   immediate: []
   future:
-    - "Add probe target resolution from route backends instead of fixed localhost"
     - "Build dashboard side-by-side passive/active SLA comparison"

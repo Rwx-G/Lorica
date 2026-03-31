@@ -48,3 +48,5 @@ so that I can detect outages even when there is no user traffic.
 - Probes run from the main process, not from workers (avoid probe duplication)
 - Probe results stored in same time-bucket format as passive metrics
 - Don't confuse health checks (Story 1.8 - TCP, used for load balancing) with SLA probes (HTTP, used for monitoring). Health checks affect routing; probes only measure.
+- System-wide max_active_probes limit (default 50) configurable via global settings prevents probe overload
+- Probes resolve backend addresses from the route's configured backends instead of localhost

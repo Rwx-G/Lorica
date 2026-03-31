@@ -2,7 +2,7 @@ schema: 1
 story: "5.1"
 story_title: "Passive SLA Monitoring (Public/Contractual)"
 gate: PASS
-status_reason: "All backend ACs met. SLA data model, metrics collector with lock-free atomics, time-windowed aggregation (1h/24h/7d/30d), configurable success criteria, SQLite persistence, REST API endpoints, threshold alerts via lorica-notify, JSON data export. Dashboard UI deferred to frontend epic."
+status_reason: "All backend ACs met. SLA data model, metrics collector with lock-free atomics, time-windowed aggregation (1h/24h/7d/30d), configurable success criteria with config snapshot per bucket for historical consistency, SQLite persistence, REST API endpoints, threshold alerts via lorica-notify, JSON+CSV data export. Dashboard UI deferred to frontend epic."
 reviewer: "Romain G."
 updated: "2026-03-31T20:00:00Z"
 
@@ -10,7 +10,7 @@ top_issues: []
 waiver:
   active: false
 
-quality_score: 96
+quality_score: 98
 expires: "2026-04-14T12:00:00Z"
 
 evidence:
@@ -30,7 +30,7 @@ nfr_validation:
     notes: "Lock-free atomic counters in proxy hot path. Background flush every 60s."
   reliability:
     status: PASS
-    notes: "Data survives restart via SQLite persistence. Bucket pruning for data retention."
+    notes: "Data survives restart via SQLite persistence. Bucket pruning for data retention. Config snapshot per bucket ensures historical consistency."
   maintainability:
     status: PASS
     notes: "Clean separation: lorica-bench (engine) / lorica-config (storage) / lorica-api (endpoints)."

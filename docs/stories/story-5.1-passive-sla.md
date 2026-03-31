@@ -48,3 +48,4 @@ so that I have an accurate picture of what my users actually experience.
 - Default SLA target: 99.9% (configurable per route)
 - Use hdrhistogram or similar for efficient percentile computation
 - A backend with 0 traffic in a window should NOT count as 100% SLA - it's "no data"
+- SLA config (success criteria, target %) is snapshotted in each time bucket so historical reporting stays consistent after config changes (migration 006)

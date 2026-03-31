@@ -61,3 +61,6 @@ so that I can verify my infrastructure handles the expected traffic without need
 - Use case: "my app handled 1000 conn at launch, does it still after 6 months of data growth?"
 - Load test engine should NOT go through the proxy pipeline - it connects directly to backends
 - Consider running load tests in a dedicated thread/task pool to avoid impacting proxy performance
+- Safe limits are configurable via global settings (loadtest_max_concurrency/duration/rps), not hardcoded
+- CPU circuit breaker aborts load tests when system CPU exceeds 90% for 3 consecutive 2s checks
+- Config clone endpoint (POST /api/v1/loadtest/configs/:id/clone) for reproducible comparisons

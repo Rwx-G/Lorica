@@ -2,7 +2,7 @@ schema: 1
 story: "5.3"
 story_title: "Built-in Load Testing"
 gate: PASS
-status_reason: "All backend ACs met. Load test engine with concurrent tokio workers, configurable parameters (concurrency, RPS, duration, method, headers, body), safe limit enforcement with confirmation flow, auto-abort on error threshold, historical results with comparison. Dashboard UI and WebSocket streaming deferred."
+status_reason: "All backend ACs met. Load test engine with concurrent tokio workers, configurable parameters, configurable safe limits via global settings, CPU circuit breaker (90% threshold), auto-abort on error rate, SSE real-time streaming, cron-based scheduling, config cloning for reproducible comparisons, historical results. Dashboard UI deferred."
 reviewer: "Romain G."
 updated: "2026-03-31T20:00:00Z"
 
@@ -10,24 +10,24 @@ top_issues: []
 waiver:
   active: false
 
-quality_score: 95
+quality_score: 97
 expires: "2026-04-14T12:00:00Z"
 
 evidence:
   tests_reviewed: 12
   risks_identified: 0
   trace:
-    ac_covered: [1, 2, 4, 5, 6, 8, 10]
-    ac_gaps: [3, 7, 9]
-    ac_gap_reason: "Dashboard slider UI (AC3), real-time charts (AC7), and scheduled test execution (AC9 - schema ready, cron evaluation pending) deferred to frontend/scheduler work"
+    ac_covered: [1, 2, 4, 5, 6, 7, 8, 9, 10]
+    ac_gaps: [3]
+    ac_gap_reason: "Dashboard slider UI (AC3) deferred to frontend. AC7 real-time via SSE, AC9 cron scheduler implemented."
 
 nfr_validation:
   security:
     status: PASS
-    notes: "Load test endpoints behind auth. Safe limits require explicit confirmation."
+    notes: "Load test endpoints behind auth. Configurable safe limits require explicit confirmation. CPU circuit breaker protects proxy traffic."
   performance:
     status: PASS
-    notes: "Load tests run in dedicated tokio tasks. Connection pool with 200 max idle per host."
+    notes: "Load tests run in dedicated tokio tasks. CPU circuit breaker aborts if system exceeds 90%. Connection pool with 200 max idle per host."
   reliability:
     status: PASS
     notes: "Auto-abort prevents runaway tests. Results persisted before engine state cleared."
@@ -38,6 +38,4 @@ nfr_validation:
 recommendations:
   immediate: []
   future:
-    - "Add WebSocket/SSE real-time result streaming for dashboard"
-    - "Implement cron-based scheduled test execution"
     - "Build dashboard load test UI with parameter sliders"
