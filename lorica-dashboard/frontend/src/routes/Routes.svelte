@@ -63,6 +63,20 @@
   // Inline field errors
   let hostnameError = $state('');
 
+  // Search and sort state
+  let searchQuery = $state('');
+  let sortColumn = $state('');
+  let sortDirection: 'asc' | 'desc' = $state('asc');
+
+  function toggleSort(col: string) {
+    if (sortColumn === col) {
+      sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+    } else {
+      sortColumn = col;
+      sortDirection = 'asc';
+    }
+  }
+
   // Delete state
   let deletingRoute: RouteResponse | null = $state(null);
 
@@ -386,6 +400,35 @@
     if (statuses.every((s) => s === 'down')) return 'down';
     return 'unknown';
   }
+
+  let filteredRoutes: RouteResponse[] = $derived.by(() => {
+    let result = routes;
+    if (searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase();
+      result = result.filter((r) =>
+        r.hostname.toLowerCase().includes(q) ||
+        r.path_prefix.toLowerCase().includes(q) ||
+        r.id.toLowerCase().includes(q)
+      );
+    }
+    if (sortColumn) {
+      result = [...result].sort((a, b) => {
+        let va: string | number = '';
+        let vb: string | number = '';
+        switch (sortColumn) {
+          case 'route': va = a.hostname.toLowerCase(); vb = b.hostname.toLowerCase(); break;
+          case 'path': va = a.path_prefix.toLowerCase(); vb = b.path_prefix.toLowerCase(); break;
+          case 'backends': va = a.backends.length; vb = b.backends.length; break;
+          case 'health': va = resolveHealthStatus(a); vb = resolveHealthStatus(b); break;
+          case 'enabled': va = a.enabled ? 1 : 0; vb = b.enabled ? 1 : 0; break;
+        }
+        if (va < vb) return sortDirection === 'asc' ? -1 : 1;
+        if (va > vb) return sortDirection === 'asc' ? 1 : -1;
+        return 0;
+      });
+    }
+    return result;
+  });
 </script>
 
 <div class="routes-page">
@@ -406,22 +449,35 @@
       <button class="btn btn-primary" onclick={openCreateForm}>Create your first route</button>
     </div>
   {:else}
+    <div class="filter-bar">
+      <input type="text" class="search-input" bind:value={searchQuery} placeholder="Search by hostname, path, or route id..." />
+    </div>
     <div class="table-wrapper">
       <table>
         <thead>
           <tr>
-            <th>Hostname</th>
-            <th>Path</th>
-            <th>Backends</th>
+            <th class="sortable" onclick={() => toggleSort('route')}>
+              Route {sortColumn === 'route' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
+            </th>
+            <th class="sortable" onclick={() => toggleSort('path')}>
+              Path {sortColumn === 'path' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
+            </th>
+            <th class="sortable" onclick={() => toggleSort('backends')}>
+              Backends {sortColumn === 'backends' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
+            </th>
             <th>TLS</th>
             <th>WAF</th>
-            <th>Health</th>
-            <th>Enabled</th>
+            <th class="sortable" onclick={() => toggleSort('health')}>
+              Health {sortColumn === 'health' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
+            </th>
+            <th class="sortable" onclick={() => toggleSort('enabled')}>
+              Enabled {sortColumn === 'enabled' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
+            </th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody>
-          {#each routes as route (route.id)}
+          {#each filteredRoutes as route (route.id)}
             <tr>
               <td class="hostname">{route.hostname}</td>
               <td class="mono">{route.path_prefix}</td>
@@ -500,7 +556,7 @@
             {#each backends as b (b.id)}
               <label class="checkbox-item">
                 <input type="checkbox" checked={formBackendIds.includes(b.id)} onchange={() => toggleBackend(b.id)} />
-                <span>{b.address}</span>
+                <span>{b.name ? `${b.name} (${b.address})` : b.address}</span>
                 <StatusBadge status={b.health_status === 'healthy' ? 'healthy' : b.health_status === 'degraded' ? 'degraded' : b.health_status === 'down' ? 'down' : 'unknown'} />
               </label>
             {/each}
@@ -744,6 +800,12 @@
   }
 
   .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
+
+  .filter-bar { margin-bottom: var(--space-4); }
+  .search-input { width: 100%; max-width: 400px; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-bg-input); color: var(--color-text); font-size: var(--text-md); }
+  .search-input:focus { outline: none; border-color: var(--color-primary); box-shadow: 0 0 0 3px var(--color-primary-subtle); }
+  .sortable { cursor: pointer; user-select: none; }
+  .sortable:hover { color: var(--color-text-heading); }
 
   .page-header {
     display: flex;

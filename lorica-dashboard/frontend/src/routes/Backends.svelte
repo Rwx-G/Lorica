@@ -30,6 +30,48 @@
 
   let deletingBackend: BackendResponse | null = $state(null);
 
+  // Search and sort state
+  let searchQuery = $state('');
+  let sortColumn = $state('');
+  let sortDirection: 'asc' | 'desc' = $state('asc');
+
+  function toggleSort(col: string) {
+    if (sortColumn === col) {
+      sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+    } else {
+      sortColumn = col;
+      sortDirection = 'asc';
+    }
+  }
+
+  let filteredBackends: BackendResponse[] = $derived.by(() => {
+    let result = backends;
+    if (searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase();
+      result = result.filter((b) =>
+        (b.name ?? '').toLowerCase().includes(q) ||
+        (b.group_name ?? '').toLowerCase().includes(q) ||
+        b.address.toLowerCase().includes(q)
+      );
+    }
+    if (sortColumn) {
+      result = [...result].sort((a, b) => {
+        let va: string | number = '';
+        let vb: string | number = '';
+        switch (sortColumn) {
+          case 'name': va = (a.name ?? '').toLowerCase(); vb = (b.name ?? '').toLowerCase(); break;
+          case 'group': va = (a.group_name ?? '').toLowerCase(); vb = (b.group_name ?? '').toLowerCase(); break;
+          case 'address': va = a.address.toLowerCase(); vb = b.address.toLowerCase(); break;
+          case 'health': va = a.health_status; vb = b.health_status; break;
+        }
+        if (va < vb) return sortDirection === 'asc' ? -1 : 1;
+        if (va > vb) return sortDirection === 'asc' ? 1 : -1;
+        return 0;
+      });
+    }
+    return result;
+  });
+
   const ADDRESS_PATTERN = /^[a-zA-Z0-9._-]+:\d{1,5}$/;
 
   function validateAddress(value: string): string {
@@ -182,14 +224,25 @@
       <button class="btn btn-primary" onclick={openCreateForm}>Add your first backend</button>
     </div>
   {:else}
+    <div class="filter-bar">
+      <input type="text" class="search-input" bind:value={searchQuery} placeholder="Search by name, group, or address..." />
+    </div>
     <div class="table-wrapper">
       <table>
         <thead>
           <tr>
-            <th>Name</th>
-            <th>Group</th>
-            <th>Address</th>
-            <th>Health</th>
+            <th class="sortable" onclick={() => toggleSort('name')}>
+              Name {sortColumn === 'name' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
+            </th>
+            <th class="sortable" onclick={() => toggleSort('group')}>
+              Group {sortColumn === 'group' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
+            </th>
+            <th class="sortable" onclick={() => toggleSort('address')}>
+              Address {sortColumn === 'address' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
+            </th>
+            <th class="sortable" onclick={() => toggleSort('health')}>
+              Health {sortColumn === 'health' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
+            </th>
             <th>Weight</th>
             <th>Health Check</th>
             <th>TLS</th>
@@ -198,7 +251,7 @@
           </tr>
         </thead>
         <tbody>
-          {#each backends as b}
+          {#each filteredBackends as b}
             <tr>
               <td>{b.name || '-'}</td>
               <td>{b.group_name || '-'}</td>
@@ -325,4 +378,9 @@
   .backends-page { max-width: none; }
   .badge-on { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; background: rgba(34, 197, 94, 0.1); color: var(--color-green); }
   .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
+  .filter-bar { margin-bottom: var(--space-4); }
+  .search-input { width: 100%; max-width: 400px; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-bg-input); color: var(--color-text); font-size: var(--text-md); }
+  .search-input:focus { outline: none; border-color: var(--color-primary); box-shadow: 0 0 0 3px var(--color-primary-subtle); }
+  .sortable { cursor: pointer; user-select: none; }
+  .sortable:hover { color: var(--color-text-heading); }
 </style>
