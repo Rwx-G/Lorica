@@ -205,8 +205,57 @@ impl ConfigStore {
 
     // ---- Routes ----
 
+    /// Check that no other route uses any of the given hostnames (primary or alias).
+    /// Returns an error naming the conflicting hostname and route if found.
+    fn validate_hostname_uniqueness(
+        &self,
+        route_id: &str,
+        hostname: &str,
+        aliases: &[String],
+    ) -> Result<()> {
+        // Collect all hostnames to check
+        let mut check: Vec<&str> = vec![hostname];
+        for a in aliases {
+            check.push(a.as_str());
+        }
+
+        // Check against all existing routes
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, hostname, hostname_aliases FROM routes WHERE id != ?1")?;
+        let rows = stmt.query_map(params![route_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (other_id, other_host, aliases_json) = row?;
+            let other_aliases: Vec<String> =
+                serde_json::from_str(&aliases_json).unwrap_or_default();
+
+            for h in &check {
+                if *h == other_host {
+                    return Err(ConfigError::Validation(format!(
+                        "hostname '{h}' already used by route {other_id}"
+                    )));
+                }
+                if other_aliases.iter().any(|a| a == *h) {
+                    return Err(ConfigError::Validation(format!(
+                        "hostname '{h}' already used as alias on route {other_id}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Insert a new route into the database.
     pub fn create_route(&self, route: &Route) -> Result<()> {
+        self.validate_hostname_uniqueness(&route.id, &route.hostname, &route.hostname_aliases)?;
+
         let hostname_aliases_json = serde_json::to_string(&route.hostname_aliases)
             .map_err(|e| ConfigError::Validation(format!("invalid hostname_aliases: {e}")))?;
         let proxy_headers_json = serde_json::to_string(&route.proxy_headers)
@@ -341,6 +390,8 @@ impl ConfigStore {
 
     /// Update an existing route. Returns `NotFound` if the ID does not exist.
     pub fn update_route(&self, route: &Route) -> Result<()> {
+        self.validate_hostname_uniqueness(&route.id, &route.hostname, &route.hostname_aliases)?;
+
         let hostname_aliases_json = serde_json::to_string(&route.hostname_aliases)
             .map_err(|e| ConfigError::Validation(format!("invalid hostname_aliases: {e}")))?;
         let proxy_headers_json = serde_json::to_string(&route.proxy_headers)

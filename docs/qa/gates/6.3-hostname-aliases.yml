@@ -2,7 +2,7 @@ schema: 1
 story: "6.3"
 story_title: "Hostname Aliases and Redirects"
 gate: PASS
-status_reason: "All ACs met. Hostname aliases indexed in routes_by_host map (same RouteEntry referenced by primary + all aliases). redirect_to_hostname triggers 301 before proxying, preserving scheme/path/query. Dashboard route form includes alias list (CSV) and redirect hostname input. Alias matching tested via unit test. Persistence via SQLite JSON array column."
+status_reason: "All ACs met. Hostname aliases indexed in routes_by_host map (same RouteEntry referenced by primary + all aliases). redirect_to_hostname triggers 301 before proxying, preserving scheme/path/query. Dashboard route form includes alias list (CSV) and redirect hostname input. Alias matching tested via unit test. Persistence via SQLite JSON array column. Alias uniqueness enforced at store level (validate_hostname_uniqueness checks primary + aliases of all other routes on create and update)."
 reviewer: "Romain G."
 updated: "2026-03-31T22:00:00Z"
 
@@ -10,7 +10,7 @@ top_issues: []
 waiver:
   active: false
 
-quality_score: 96
+quality_score: 98
 expires: "2026-04-14T12:00:00Z"
 
 evidence:
@@ -37,5 +37,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Add unique alias constraint enforcement across routes (currently only documented, not enforced at DB level)"
+  future: []
