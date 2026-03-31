@@ -122,6 +122,12 @@ fn startup_banner(cli: &Cli) {
 }
 
 fn main() {
+    // Explicitly set ring as the default TLS crypto provider to avoid
+    // ambiguity when both ring and aws-lc-rs are in the dependency tree.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls CryptoProvider");
+
     let cli = Cli::parse();
 
     match cli.command {

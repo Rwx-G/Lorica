@@ -40,6 +40,7 @@ reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"
 bollard = { version = "0.18", optional = true }
 kube = { version = "0.98", default-features = false, features = ["client", "rustls-tls"], optional = true }
 k8s-openapi = { version = "0.24", features = ["latest"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 arc-swap = "1"
 async-trait = { workspace = true }
 chrono = "0.4"

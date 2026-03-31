@@ -20,5 +20,5 @@
 pub mod engine;
 pub mod rules;
 
-pub use engine::{RuleSummary, WafEngine, WafEvent, WafVerdict};
+pub use engine::{RuleSummary, WafEngine, WafEvent, WafMode, WafVerdict};
 pub use rules::{RuleCategory, RuleSet, WafRule};

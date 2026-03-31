@@ -5,12 +5,13 @@
 
 //! Docker Swarm service discovery via the Docker socket API.
 //!
-//! Connects to the Docker daemon (default: unix socket) and lists tasks
-//! for a given service. Each running task with a network endpoint becomes
-//! a discovered backend.
+//! Connects to the Docker daemon and lists services with their
+//! virtual IPs. Each Swarm service with an exposed endpoint
+//! becomes a discovered backend.
 
+use bollard::service::ListServicesOptions;
 use bollard::Docker;
-use bollard::service::TaskState;
+use std::collections::HashMap;
 use tracing::{debug, warn};
 
 use super::{DiscoveredEndpoint, DiscoveryError};
@@ -28,93 +29,97 @@ impl DockerDiscovery {
         Ok(Self { client })
     }
 
-    /// Connect to the Docker daemon at a specific URL.
+    /// Connect to the Docker daemon at a specific HTTP URL.
     pub fn connect_with_url(url: &str) -> Result<Self, DiscoveryError> {
         let client = Docker::connect_with_http(url, 5, bollard::API_DEFAULT_VERSION)
             .map_err(|e| DiscoveryError::Docker(format!("failed to connect to {url}: {e}")))?;
         Ok(Self { client })
     }
 
-    /// Discover endpoints for a Docker Swarm service by name or ID.
+    /// Discover endpoints for a Docker Swarm service by name.
     ///
-    /// Returns one endpoint per running task with a network attachment.
+    /// Uses the service's virtual IPs from its endpoint spec.
+    /// Each VIP on the ingress or custom overlay network is returned.
     pub async fn discover_service(
         &self,
         service_name: &str,
         target_port: u16,
     ) -> Result<Vec<DiscoveredEndpoint>, DiscoveryError> {
-        use bollard::service::TaskSpec;
-        use std::collections::HashMap;
-
-        // List tasks for the service
         let mut filters = HashMap::new();
-        filters.insert("service", vec![service_name]);
-        filters.insert("desired-state", vec!["running"]);
+        filters.insert("name", vec![service_name]);
 
-        let tasks = self
+        let services = self
             .client
-            .list_tasks(Some(bollard::task::ListTasksOptions {
+            .list_services(Some(ListServicesOptions {
                 filters,
+                ..Default::default()
             }))
             .await
-            .map_err(|e| DiscoveryError::Docker(format!("failed to list tasks: {e}")))?;
+            .map_err(|e| DiscoveryError::Docker(format!("failed to list services: {e}")))?;
 
         let mut endpoints = Vec::new();
 
-        for task in &tasks {
-            let task_id = task.id.as_deref().unwrap_or("unknown");
-            let node_id = task.node_id.as_deref().unwrap_or("unknown");
-
-            // Check task state
-            let state = task
-                .status
+        for svc in &services {
+            let svc_id = svc.id.as_deref().unwrap_or("unknown");
+            let svc_name = svc
+                .spec
                 .as_ref()
-                .and_then(|s| s.state.as_ref())
-                .cloned();
+                .and_then(|s| s.name.as_deref())
+                .unwrap_or(service_name);
 
-            let healthy = state == Some(TaskState::RUNNING);
+            // Extract virtual IPs from endpoint
+            if let Some(ref endpoint) = svc.endpoint {
+                if let Some(ref vips) = endpoint.virtual_ips {
+                    for vip in vips {
+                        if let Some(ref addr) = vip.addr {
+                            // VIP addresses are in CIDR format (e.g. "10.0.0.5/24")
+                            let ip = addr.split('/').next().unwrap_or(addr);
+                            let address = format!("{ip}:{target_port}");
 
-            // Get the task's network attachment IP
-            let ip = task
-                .network_attachments
-                .as_ref()
-                .and_then(|attachments| {
-                    attachments.iter().find_map(|a| {
-                        a.addresses.as_ref().and_then(|addrs| {
-                            addrs.first().map(|addr| {
-                                // Addresses are in CIDR format (e.g. "10.0.0.5/24")
-                                addr.split('/').next().unwrap_or(addr).to_string()
-                            })
-                        })
-                    })
-                });
+                            let mut labels = HashMap::new();
+                            labels.insert("source".to_string(), "docker_swarm".to_string());
+                            labels.insert("service_id".to_string(), svc_id.to_string());
+                            labels.insert("service_name".to_string(), svc_name.to_string());
+                            if let Some(ref net_id) = vip.network_id {
+                                labels.insert("network_id".to_string(), net_id.clone());
+                            }
 
-            if let Some(ip) = ip {
-                let address = format!("{ip}:{target_port}");
-                debug!(
-                    service = service_name,
-                    task_id = task_id,
-                    node = node_id,
-                    address = %address,
-                    healthy = healthy,
-                    "discovered Docker Swarm endpoint"
-                );
+                            debug!(
+                                service = svc_name,
+                                address = %address,
+                                "discovered Docker Swarm service VIP"
+                            );
 
-                let mut labels = std::collections::HashMap::new();
-                labels.insert("task_id".to_string(), task_id.to_string());
-                labels.insert("node_id".to_string(), node_id.to_string());
-                labels.insert("source".to_string(), "docker_swarm".to_string());
+                            endpoints.push(DiscoveredEndpoint {
+                                address,
+                                healthy: true,
+                                labels,
+                            });
+                        }
+                    }
+                }
 
-                endpoints.push(DiscoveredEndpoint {
-                    address,
-                    healthy,
-                    labels,
-                });
+                // Also check published ports
+                if let Some(ref ports) = endpoint.ports {
+                    for port in ports {
+                        if let (Some(published), Some(target)) =
+                            (port.published_port, port.target_port)
+                        {
+                            if target as u16 == target_port {
+                                debug!(
+                                    service = svc_name,
+                                    published = published,
+                                    target = target,
+                                    "discovered Docker Swarm published port"
+                                );
+                            }
+                        }
+                    }
+                }
             } else {
                 warn!(
-                    service = service_name,
-                    task_id = task_id,
-                    "Docker Swarm task has no network attachment IP"
+                    service = svc_name,
+                    "Docker Swarm service has no endpoint"
                 );
             }
         }
@@ -147,7 +152,7 @@ mod tests {
         let a = DiscoveredEndpoint {
             address: "10.0.0.1:8080".into(),
             healthy: true,
-            labels: std::collections::HashMap::new(),
+            labels: HashMap::new(),
         };
         let b = a.clone();
         assert_eq!(a, b);
@@ -155,30 +160,26 @@ mod tests {
 
     #[test]
     fn test_discovered_endpoint_with_labels() {
-        let mut labels = std::collections::HashMap::new();
-        labels.insert("task_id".to_string(), "abc123".to_string());
+        let mut labels = HashMap::new();
+        labels.insert("service_id".to_string(), "abc123".to_string());
         let ep = DiscoveredEndpoint {
             address: "10.0.0.2:80".into(),
             healthy: false,
             labels,
         };
-        assert_eq!(ep.labels.get("task_id").unwrap(), "abc123");
+        assert_eq!(ep.labels.get("service_id").unwrap(), "abc123");
         assert!(!ep.healthy);
     }
 
-    // Integration tests require a running Docker daemon - skip in CI
     #[tokio::test]
     async fn test_connect_fails_gracefully_without_docker() {
-        // Connect with a bogus URL should fail
         let result = DockerDiscovery::connect_with_url("http://192.0.2.1:1");
-        // bollard may succeed at creation but fail at use, or fail immediately
-        // Either way, we verify no panic
         match result {
             Ok(d) => {
                 let ping = d.ping().await;
                 assert!(ping.is_err());
             }
-            Err(_) => {} // Expected without Docker
+            Err(_) => {}
         }
     }
 }
