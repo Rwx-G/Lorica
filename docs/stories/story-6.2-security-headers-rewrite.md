@@ -28,21 +28,21 @@ so that I can harden responses and decouple external paths from backend paths.
 
 ## Tasks
 
-- [ ] Add response header fields to route model (HashMap<String, String> for custom response headers)
-- [ ] Add security_header_preset enum to route model (Strict, Moderate, None)
-- [ ] Add strip_prefix and add_prefix fields to route model
-- [ ] Add access_log_enabled boolean field to route model (default true)
-- [ ] Write database migration for new route columns
-- [ ] Implement security header preset expansion (strict/moderate/none -> concrete headers)
-- [ ] Implement response header injection in proxy pipeline (preset + custom merge)
-- [ ] Implement path rewrite logic (strip_prefix then add_prefix before forwarding)
-- [ ] Implement per-route access log suppression in logging middleware
-- [ ] Add API endpoints for route response config CRUD
-- [ ] Update dashboard route form with security preset dropdown, response headers editor, path rewrite inputs, and log toggle
-- [ ] Write tests for security header presets (strict, moderate, none)
-- [ ] Write tests for custom response header injection
-- [ ] Write tests for path rewrite combinations (strip only, add only, both)
-- [ ] Write tests for access log suppression
+- [x] Add response header fields to route model (HashMap<String, String> for custom response headers)
+- [x] Add security_header_preset enum to route model (Strict, Moderate, None)
+- [x] Add strip_prefix and add_prefix fields to route model
+- [x] Add access_log_enabled boolean field to route model (default true)
+- [x] Write database migration for new route columns
+- [x] Implement security header preset expansion (strict/moderate/none -> concrete headers)
+- [x] Implement response header injection in proxy pipeline (preset + custom merge)
+- [x] Implement path rewrite logic (strip_prefix then add_prefix before forwarding)
+- [x] Implement per-route access log suppression in logging middleware
+- [x] Add API endpoints for route response config CRUD
+- [x] Update dashboard route form with security preset dropdown, response headers editor, path rewrite inputs, and log toggle
+- [x] Write tests for security header presets (strict, moderate, none)
+- [x] Write tests for custom response header injection
+- [x] Write tests for path rewrite combinations (strip only, add only, both)
+- [x] Write tests for access log suppression
 
 ## Dev Notes
 

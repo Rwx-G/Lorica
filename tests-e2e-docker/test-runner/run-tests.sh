@@ -3,6 +3,7 @@
 # Lorica E2E Test Suite
 # Tests all features: auth, routing, WAF, health checks, API, dashboard,
 # topology, Prometheus metrics, Peak EWMA, SLA monitoring, active probes,
+# load testing, route config (headers, timeouts, redirect, rewrite, security),
 # load testing, config export/import
 # =============================================================================
 
@@ -1184,9 +1185,81 @@ if [ -n "$SESSION" ]; then
     ok "Load test configs cleaned up"
 
 # =============================================================================
-# 26. CLEANUP
+# 26. ROUTE CONFIGURATION (Epic 6)
 # =============================================================================
-    log "=== 26. Cleanup ==="
+    log "=== 26. Route Configuration ==="
+
+    # Update route with Epic 6 fields
+    RC_UPDATE=$(api_put "/api/v1/routes/$R1_ID" '{
+        "force_https": true,
+        "security_headers": "strict",
+        "connect_timeout_s": 10,
+        "read_timeout_s": 30,
+        "send_timeout_s": 30,
+        "access_log_enabled": true,
+        "websocket_enabled": true,
+        "compression_enabled": true,
+        "max_request_body_bytes": 10485760,
+        "proxy_headers": {"X-Custom-Proxy": "lorica"},
+        "response_headers": {"X-Served-By": "lorica"},
+        "response_headers_remove": ["Server"],
+        "hostname_aliases": ["alias1.local"],
+        "strip_path_prefix": null,
+        "add_path_prefix": null,
+        "cors_allowed_origins": ["https://example.com"],
+        "cors_allowed_methods": ["GET","POST"],
+        "rate_limit_rps": 100,
+        "rate_limit_burst": 200
+    }')
+    assert_json "$RC_UPDATE" '.data.force_https' 'true' "Route updated with force_https"
+    assert_json "$RC_UPDATE" '.data.security_headers' 'strict' "Route security_headers set to strict"
+    assert_json "$RC_UPDATE" '.data.connect_timeout_s' '10' "Route connect_timeout_s set to 10"
+    assert_json "$RC_UPDATE" '.data.compression_enabled' 'true' "Route compression_enabled"
+
+    # Verify route read-back includes all new fields
+    RC_GET=$(api_get "/api/v1/routes/$R1_ID")
+    assert_json "$RC_GET" '.data.force_https' 'true' "GET route has force_https"
+    assert_json "$RC_GET" '.data.websocket_enabled' 'true' "GET route has websocket_enabled"
+    assert_json "$RC_GET" '.data.max_request_body_bytes' '10485760' "GET route has max_request_body_bytes"
+
+    RC_RATE=$(echo "$RC_GET" | jq '.data.rate_limit_rps' 2>/dev/null || echo "null")
+    if [ "$RC_RATE" = "100" ]; then
+        ok "Route rate_limit_rps persisted"
+    else
+        fail "Route rate_limit_rps should be 100 (got $RC_RATE)"
+    fi
+
+    # Verify hostname aliases
+    RC_ALIASES=$(echo "$RC_GET" | jq '.data.hostname_aliases | length' 2>/dev/null || echo "0")
+    if [ "$RC_ALIASES" -ge 1 ]; then
+        ok "Hostname aliases persisted ($RC_ALIASES aliases)"
+    else
+        fail "Hostname aliases should have at least 1 entry"
+    fi
+
+    # Verify proxy_headers
+    RC_PH=$(echo "$RC_GET" | jq -r '.data.proxy_headers["X-Custom-Proxy"]' 2>/dev/null || echo "")
+    if [ "$RC_PH" = "lorica" ]; then
+        ok "Custom proxy header persisted"
+    else
+        fail "Custom proxy header should be 'lorica' (got '$RC_PH')"
+    fi
+
+    # Verify CORS config
+    RC_CORS=$(echo "$RC_GET" | jq '.data.cors_allowed_origins | length' 2>/dev/null || echo "0")
+    if [ "$RC_CORS" -ge 1 ]; then
+        ok "CORS allowed_origins persisted"
+    else
+        fail "CORS allowed_origins should have entries"
+    fi
+
+    # Reset route to defaults for cleanup
+    api_put "/api/v1/routes/$R1_ID" '{"force_https": false, "security_headers": "moderate"}' >/dev/null
+
+# =============================================================================
+# 27. CLEANUP
+# =============================================================================
+    log "=== 27. Cleanup ==="
 
     api_del "/api/v1/routes/$R1_ID" >/dev/null && ok "Route 1 deleted" || fail "Route 1 delete failed"
     api_del "/api/v1/routes/$R2_ID" >/dev/null && ok "Route 2 deleted" || fail "Route 2 delete failed"

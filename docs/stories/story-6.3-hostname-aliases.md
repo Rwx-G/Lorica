@@ -26,17 +26,17 @@ so that I can serve multiple domains from one route and canonicalize hostnames.
 
 ## Tasks
 
-- [ ] Add redirect_to_hostname optional field to route model
-- [ ] Add hostname_aliases list field to route model (stored as JSON array or separate table)
-- [ ] Write database migration for new route columns
-- [ ] Implement hostname alias resolution in request routing (match aliases same as primary hostname)
-- [ ] Implement hostname redirect middleware (301 with Location header to canonical hostname)
-- [ ] Ensure redirect preserves scheme, path, query string, and fragment
-- [ ] Add API endpoints for alias and redirect config CRUD
-- [ ] Update dashboard route form with alias list editor and redirect hostname input
-- [ ] Write tests for alias matching (request to alias routes to correct backend)
-- [ ] Write tests for hostname redirect (301 response with correct Location header)
-- [ ] Write tests for alias and redirect persistence across restart
+- [x] Add redirect_to_hostname optional field to route model
+- [x] Add hostname_aliases list field to route model (stored as JSON array or separate table)
+- [x] Write database migration for new route columns
+- [x] Implement hostname alias resolution in request routing (match aliases same as primary hostname)
+- [x] Implement hostname redirect middleware (301 with Location header to canonical hostname)
+- [x] Ensure redirect preserves scheme, path, query string, and fragment
+- [x] Add API endpoints for alias and redirect config CRUD
+- [x] Update dashboard route form with alias list editor and redirect hostname input
+- [x] Write tests for alias matching (request to alias routes to correct backend)
+- [x] Write tests for hostname redirect (301 response with correct Location header)
+- [x] Write tests for alias and redirect persistence across restart
 
 ## Dev Notes
 

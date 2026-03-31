@@ -28,19 +28,19 @@ so that I can control how requests are forwarded to backends and enforce HTTPS.
 
 ## Tasks
 
-- [ ] Add proxy header fields to route model (HashMap<String, String> for custom headers)
-- [ ] Add timeout fields to route model (connect_timeout_s, read_timeout_s, send_timeout_s with defaults)
-- [ ] Add force_https_redirect boolean field to route model
-- [ ] Write database migration for new route columns
-- [ ] Implement default proxy header injection in proxy pipeline (Host, X-Real-IP, X-Forwarded-For, X-Forwarded-Proto)
-- [ ] Implement custom proxy header override/merge logic
-- [ ] Implement per-route timeout application in HTTP client
-- [ ] Implement HTTP-to-HTTPS redirect middleware (301 to https:// equivalent)
-- [ ] Add API endpoints for route proxy config CRUD
-- [ ] Update dashboard route form with proxy headers editor, timeout inputs, and redirect toggle
-- [ ] Write tests for header injection (default + custom override)
-- [ ] Write tests for timeout behavior (connect, read, send)
-- [ ] Write tests for HTTP-to-HTTPS redirect logic
+- [x] Add proxy header fields to route model (HashMap<String, String> for custom headers)
+- [x] Add timeout fields to route model (connect_timeout_s, read_timeout_s, send_timeout_s with defaults)
+- [x] Add force_https_redirect boolean field to route model
+- [x] Write database migration for new route columns
+- [x] Implement default proxy header injection in proxy pipeline (Host, X-Real-IP, X-Forwarded-For, X-Forwarded-Proto)
+- [x] Implement custom proxy header override/merge logic
+- [x] Implement per-route timeout application in HTTP client
+- [x] Implement HTTP-to-HTTPS redirect middleware (301 to https:// equivalent)
+- [x] Add API endpoints for route proxy config CRUD
+- [x] Update dashboard route form with proxy headers editor, timeout inputs, and redirect toggle
+- [x] Write tests for header injection (default + custom override)
+- [x] Write tests for timeout behavior (connect, read, send)
+- [x] Write tests for HTTP-to-HTTPS redirect logic
 
 ## Dev Notes
 
