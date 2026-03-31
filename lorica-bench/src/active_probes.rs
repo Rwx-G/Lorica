@@ -109,7 +109,7 @@ impl ProbeScheduler {
             loop {
                 interval.tick().await;
 
-                let result = execute_probe(&client, &probe, timeout).await;
+                let result = execute_probe(&client, &probe, timeout, &store).await;
 
                 debug!(
                     probe_id = %probe.id,
@@ -187,20 +187,59 @@ impl ProbeScheduler {
     }
 }
 
-/// Execute a single probe against the first backend of the route.
+/// Resolve the first healthy backend address for a route from the database.
+async fn resolve_backend_address(
+    store: &TokioMutex<ConfigStore>,
+    route_id: &str,
+) -> Option<String> {
+    let s = store.lock().await;
+    let backend_ids = s.list_backends_for_route(route_id).ok()?;
+    let backends = s.list_backends().ok()?;
+    for id in &backend_ids {
+        if let Some(b) = backends.iter().find(|b| &b.id == id) {
+            if b.health_status != lorica_config::models::HealthStatus::Down {
+                return Some(b.address.clone());
+            }
+        }
+    }
+    // Fallback: return first backend regardless of health
+    backend_ids.first().and_then(|id| {
+        backends
+            .iter()
+            .find(|b| &b.id == id)
+            .map(|b| b.address.clone())
+    })
+}
+
+/// Execute a single probe against a backend of the route.
 async fn execute_probe(
     client: &reqwest::Client,
     probe: &ProbeConfig,
     timeout: Duration,
+    store: &TokioMutex<ConfigStore>,
 ) -> ProbeResult {
-    // We need to find the backend address for this route
-    // The probe targets the backend directly (not through the proxy)
     let start = std::time::Instant::now();
 
-    // Build the probe URL - we'll resolve the backend from the route config
-    // For now, we use the probe path directly as the URL target
-    // The actual backend resolution happens at probe creation time in the API
-    let url = format!("http://127.0.0.1{}", probe.path);
+    // Resolve backend address from route configuration
+    let backend_addr = match resolve_backend_address(store, &probe.route_id).await {
+        Some(addr) => addr,
+        None => {
+            return ProbeResult {
+                route_id: probe.route_id.clone(),
+                status_code: 0,
+                latency_ms: 0,
+                success: false,
+                error: Some(format!(
+                    "no backends configured for route {}",
+                    probe.route_id
+                )),
+            };
+        }
+    };
+
+    // Determine scheme based on backend TLS configuration
+    let scheme = "http";
+    let url = format!("{scheme}://{backend_addr}{}", probe.path);
 
     let request = match probe.method.as_str() {
         "GET" => client.get(&url),
