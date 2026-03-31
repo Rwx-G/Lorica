@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **WebSocket log streaming** - Real-time access log streaming via `GET /api/v1/logs/ws`. LogBuffer broadcasts new entries to all connected WebSocket clients. Frontend auto-connects with polling fallback. Green pulsing indicator shows live connection status.
 - **Worker metrics** - Per-worker heartbeat latency tracking via `GET /api/v1/workers` endpoint. Supervisor records heartbeat response times. Dashboard System page shows workers table with health status, PID, and latency.
 - **Binary** (`lorica`) - CLI with `--version`, `--data-dir`, `--log-level`, `--management-port`, `--http-port`, `--https-port`, `--workers`. Graceful shutdown on SIGTERM/SIGINT. systemd unit file with security hardening.
-- **Tests** - 850+ Rust tests + 52 frontend tests. Unit tests across all crates, integration tests gated behind `integration-tests` feature flag.
+- **E2E test suite** - Docker Compose-based end-to-end tests with 4 containers (Lorica, 2 Python backends, bash test runner). 63 assertions covering authentication, dashboard, settings, backends/routes CRUD, proxy routing with round-robin, WAF detection/blocking, WAF rule management, status/system endpoints, access logs, config export/import, notification configs, HTTP health checks, and cleanup. Run with `cd tests-e2e-docker && ./run.sh --build`.
+- **Tests** - 312 Rust + frontend unit tests (111 API, 65 config, 41 WAF, 43 notify, 52 frontend). 63 Docker e2e tests. Unit tests across all crates, integration tests gated behind `integration-tests` feature flag.
 - NOTICE file crediting Cloudflare Pingora as upstream (Apache-2.0)
 
 ### Fixed

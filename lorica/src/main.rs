@@ -684,12 +684,18 @@ fn run_single_process(cli: Cli) {
             }
         }
 
+        // Create shared WAF engine
+        let waf_engine = Arc::new(lorica_waf::WafEngine::new());
+        let waf_event_buffer = waf_engine.event_buffer();
+        let waf_rule_count = waf_engine.rule_count();
+
         // Start the HTTP proxy service
-        let lorica_proxy = LoricaProxy::new(
+        let mut lorica_proxy = LoricaProxy::new(
             Arc::clone(&proxy_config),
             Arc::clone(&log_buffer),
             Arc::clone(&active_connections),
         );
+        lorica_proxy.waf_engine = Arc::clone(&waf_engine);
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
@@ -728,9 +734,9 @@ fn run_single_process(cli: Cli) {
                 started_at: Instant::now(),
                 config_reload_tx: Some(config_reload_tx),
                 worker_metrics: None,
-                waf_event_buffer: None,
-                waf_engine: None,
-                waf_rule_count: None,
+                waf_event_buffer: Some(waf_event_buffer),
+                waf_engine: Some(waf_engine),
+                waf_rule_count: Some(waf_rule_count),
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();

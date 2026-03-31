@@ -74,12 +74,9 @@ done
 
 log "Waiting for Lorica API..."
 for i in $(seq 1 120); do
-    if curl -sf "$API/api/v1/auth/login" -X POST \
-        -H "Content-Type: application/json" \
-        -d '{"username":"x","password":"x"}' >/dev/null 2>&1 || \
-       [ "$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/auth/login" -X POST \
-        -H "Content-Type: application/json" \
-        -d '{"username":"x","password":"x"}')" != "000" ]; then
+    # Use dashboard endpoint to check readiness (no auth needed, no rate limiting)
+    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/" 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" != "000" ]; then
         break
     fi
     sleep 2
@@ -95,12 +92,12 @@ assert_status GET "$API/api/v1/status" "401" "Unauthenticated request returns 40
 assert_status GET "$API/api/v1/routes" "401" "Routes endpoint requires auth"
 assert_status GET "$API/api/v1/waf/events" "401" "WAF events endpoint requires auth"
 
-# Test invalid credentials
+# Test invalid credentials (401 or 429 if rate limited)
 LOGIN_RESULT=$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/auth/login" -X POST \
     -H "Content-Type: application/json" \
     -d '{"username":"admin","password":"wrong"}')
-if [ "$LOGIN_RESULT" = "401" ]; then
-    ok "Login rejects invalid credentials"
+if [ "$LOGIN_RESULT" = "401" ] || [ "$LOGIN_RESULT" = "429" ]; then
+    ok "Login rejects invalid credentials (HTTP $LOGIN_RESULT)"
 else
     fail "Login should reject invalid creds (got $LOGIN_RESULT)"
 fi
@@ -130,19 +127,55 @@ if [ -z "$ADMIN_PW" ]; then
     exit 1
 fi
 
-# Login with the real password
-LOGIN_RESP=$(curl -sf -c - "$API/api/v1/auth/login" -X POST \
+# Login with the real password (use jq to safely build JSON with special chars)
+# Note: cookie has Secure flag but we're on HTTP, so extract from response headers
+LOGIN_JSON=$(jq -nc --arg pw "$ADMIN_PW" '{"username":"admin","password":$pw}')
+LOGIN_HEADERS=$(mktemp)
+LOGIN_HTTP=$(curl -s -o /tmp/login_body.json -w '%{http_code}' -D "$LOGIN_HEADERS" \
+    "$API/api/v1/auth/login" -X POST \
     -H "Content-Type: application/json" \
-    -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PW\"}" 2>/dev/null || echo "")
+    -d "$LOGIN_JSON" 2>/dev/null || echo "000")
 
-SESSION_COOKIE=$(echo "$LOGIN_RESP" | grep lorica_session | awk '{print $NF}' || echo "")
-if [ -n "$SESSION_COOKIE" ]; then
-    SESSION="lorica_session=$SESSION_COOKIE"
+# Extract session cookie from Set-Cookie header directly
+SESSION_COOKIE=$(grep -i "Set-Cookie:" "$LOGIN_HEADERS" 2>/dev/null | \
+    grep -o 'lorica_session=[^;]*' | head -1 || echo "")
+
+if [ "$LOGIN_HTTP" = "200" ] && [ -n "$SESSION_COOKIE" ]; then
+    SESSION="$SESSION_COOKIE"
     ok "Login with admin password succeeded"
+
+    # Check if password change is required and do it
+    MUST_CHANGE=$(jq -r '.data.must_change_password' /tmp/login_body.json 2>/dev/null || echo "false")
+    if [ "$MUST_CHANGE" = "true" ]; then
+        NEW_PW="E2eTestPassword!42"
+        CHANGE_JSON=$(jq -nc --arg cur "$ADMIN_PW" --arg new "$NEW_PW" \
+            '{"current_password":$cur,"new_password":$new}')
+        CHANGE_HTTP=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
+            "$API/api/v1/auth/password" -X PUT \
+            -H "Content-Type: application/json" \
+            -d "$CHANGE_JSON" 2>/dev/null || echo "000")
+        if [ "$CHANGE_HTTP" = "200" ]; then
+            ok "First-run password changed"
+            # Re-login with new password
+            RELOGIN_JSON=$(jq -nc --arg pw "$NEW_PW" '{"username":"admin","password":$pw}')
+            RELOGIN_HEADERS=$(mktemp)
+            curl -s -o /dev/null -D "$RELOGIN_HEADERS" \
+                "$API/api/v1/auth/login" -X POST \
+                -H "Content-Type: application/json" \
+                -d "$RELOGIN_JSON" 2>/dev/null
+            SESSION_COOKIE=$(grep -i "Set-Cookie:" "$RELOGIN_HEADERS" 2>/dev/null | \
+                grep -o 'lorica_session=[^;]*' | head -1 || echo "")
+            SESSION="$SESSION_COOKIE"
+            rm -f "$RELOGIN_HEADERS"
+        else
+            fail "Password change failed (HTTP $CHANGE_HTTP)"
+        fi
+    fi
 else
-    fail "Login with known password failed"
+    fail "Login with known password failed (HTTP $LOGIN_HTTP)"
     SESSION=""
 fi
+rm -f "$LOGIN_HEADERS" /tmp/login_body.json
 
 # =============================================================================
 # 2. DASHBOARD
