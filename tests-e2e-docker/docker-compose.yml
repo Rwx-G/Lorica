@@ -8,19 +8,49 @@ services:
       - "8080:8080"   # HTTP proxy
     volumes:
       - lorica-data:/var/lib/lorica
+      - shared:/shared
     depends_on:
-      - app1
-      - app2
+      - backend1
+      - backend2
+    networks:
+      - e2e
 
-  app1:
-    image: nginx:alpine
-    volumes:
-      - ./app1/index.html:/usr/share/nginx/html/index.html:ro
+  backend1:
+    build:
+      context: ./backend
+    environment:
+      - BACKEND_ID=backend1
+      - LISTEN_PORT=80
+    networks:
+      - e2e
 
-  app2:
-    image: nginx:alpine
+  backend2:
+    build:
+      context: ./backend
+    environment:
+      - BACKEND_ID=backend2
+      - LISTEN_PORT=80
+    networks:
+      - e2e
+
+  test-runner:
+    build:
+      context: ./test-runner
+    depends_on:
+      - lorica
     volumes:
-      - ./app2/index.html:/usr/share/nginx/html/index.html:ro
+      - shared:/shared:ro
+    environment:
+      - LORICA_API=http://lorica:9443
+      - LORICA_PROXY=http://lorica:8080
+      - BACKEND1_ADDR=backend1:80
+      - BACKEND2_ADDR=backend2:80
+    networks:
+      - e2e
 
 volumes:
   lorica-data:
+  shared:
+
+networks:
+  e2e:

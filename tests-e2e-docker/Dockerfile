@@ -25,12 +25,14 @@ COPY lorica-lb/ lorica-lb/
 COPY lorica-limits/ lorica-limits/
 COPY lorica-lru/ lorica-lru/
 COPY lorica-memory-cache/ lorica-memory-cache/
+COPY lorica-notify/ lorica-notify/
 COPY lorica-pool/ lorica-pool/
 COPY lorica-proxy/ lorica-proxy/
 COPY lorica-runtime/ lorica-runtime/
 COPY lorica-timeout/ lorica-timeout/
 COPY lorica-tls/ lorica-tls/
 COPY lorica-command/ lorica-command/
+COPY lorica-waf/ lorica-waf/
 COPY lorica-worker/ lorica-worker/
 COPY tinyufo/ tinyufo/
 
