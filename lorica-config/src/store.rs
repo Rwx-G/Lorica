@@ -1416,6 +1416,28 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Clone a load test configuration with a new ID and name suffix.
+    pub fn clone_load_test_config(
+        &self,
+        source_id: &str,
+        new_name: &str,
+    ) -> Result<LoadTestConfig> {
+        let source = self
+            .get_load_test_config(source_id)?
+            .ok_or_else(|| ConfigError::NotFound(format!("load test config {source_id}")))?;
+        let now = Utc::now();
+        let cloned = LoadTestConfig {
+            id: new_id(),
+            name: new_name.to_string(),
+            created_at: now,
+            updated_at: now,
+            schedule_cron: None,
+            ..source
+        };
+        self.create_load_test_config(&cloned)?;
+        Ok(cloned)
+    }
+
     // ---- Load Test Results ----
 
     /// Insert a load test result.

@@ -24,6 +24,7 @@ use lorica_config::models::{
 use lorica_config::store::new_id;
 use lorica_config::ConfigStore;
 use serde::{Deserialize, Serialize};
+use sysinfo::System;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
@@ -153,32 +154,59 @@ impl RunState {
     }
 }
 
+/// Dynamic safe limits, read from GlobalSettings.
+pub struct SafeLimits {
+    pub max_concurrency: i32,
+    pub max_duration_s: i32,
+    pub max_rps: i32,
+}
+
+impl Default for SafeLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrency: SAFE_LIMIT_CONCURRENCY,
+            max_duration_s: SAFE_LIMIT_DURATION_S,
+            max_rps: SAFE_LIMIT_RPS,
+        }
+    }
+}
+
+impl SafeLimits {
+    pub fn from_settings(settings: &lorica_config::models::GlobalSettings) -> Self {
+        Self {
+            max_concurrency: settings.loadtest_max_concurrency,
+            max_duration_s: settings.loadtest_max_duration_s,
+            max_rps: settings.loadtest_max_rps,
+        }
+    }
+}
+
 /// Check if a load test configuration exceeds safe limits.
-pub fn exceeds_safe_limits(config: &LoadTestConfig) -> bool {
-    config.concurrency > SAFE_LIMIT_CONCURRENCY
-        || config.duration_s > SAFE_LIMIT_DURATION_S
-        || config.requests_per_second > SAFE_LIMIT_RPS
+pub fn exceeds_safe_limits(config: &LoadTestConfig, limits: &SafeLimits) -> bool {
+    config.concurrency > limits.max_concurrency
+        || config.duration_s > limits.max_duration_s
+        || config.requests_per_second > limits.max_rps
 }
 
 /// Describes which limits are exceeded.
-pub fn describe_exceeded_limits(config: &LoadTestConfig) -> Vec<String> {
+pub fn describe_exceeded_limits(config: &LoadTestConfig, limits: &SafeLimits) -> Vec<String> {
     let mut warnings = Vec::new();
-    if config.concurrency > SAFE_LIMIT_CONCURRENCY {
+    if config.concurrency > limits.max_concurrency {
         warnings.push(format!(
             "concurrency {} exceeds safe limit {}",
-            config.concurrency, SAFE_LIMIT_CONCURRENCY
+            config.concurrency, limits.max_concurrency
         ));
     }
-    if config.duration_s > SAFE_LIMIT_DURATION_S {
+    if config.duration_s > limits.max_duration_s {
         warnings.push(format!(
             "duration {}s exceeds safe limit {}s",
-            config.duration_s, SAFE_LIMIT_DURATION_S
+            config.duration_s, limits.max_duration_s
         ));
     }
-    if config.requests_per_second > SAFE_LIMIT_RPS {
+    if config.requests_per_second > limits.max_rps {
         warnings.push(format!(
             "rps {} exceeds safe limit {}",
-            config.requests_per_second, SAFE_LIMIT_RPS
+            config.requests_per_second, limits.max_rps
         ));
     }
     warnings
@@ -249,6 +277,36 @@ impl LoadTestEngine {
             duration_s = config.duration_s,
             "starting load test"
         );
+
+        // Spawn CPU circuit breaker monitor (aborts if CPU > 90% for 3 checks)
+        let cpu_state = Arc::clone(&state);
+        let cpu_monitor = tokio::spawn(async move {
+            let mut sys = System::new();
+            let mut high_cpu_count = 0u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if cpu_state.aborted.load(Ordering::Relaxed) {
+                    break;
+                }
+                sys.refresh_cpu_usage();
+                let cpu_pct = sys.global_cpu_usage();
+                if cpu_pct > 90.0 {
+                    high_cpu_count += 1;
+                    if high_cpu_count >= 3 {
+                        warn!(
+                            cpu_pct = format!("{cpu_pct:.1}"),
+                            "CPU circuit breaker: aborting load test to protect proxy traffic"
+                        );
+                        cpu_state.abort(&format!(
+                            "CPU circuit breaker: usage {cpu_pct:.0}% exceeded 90% threshold"
+                        ));
+                        break;
+                    }
+                } else {
+                    high_cpu_count = 0;
+                }
+            }
+        });
 
         // Spawn concurrent workers
         let mut handles = Vec::new();
@@ -325,6 +383,7 @@ impl LoadTestEngine {
         for handle in handles {
             let _ = handle.await;
         }
+        cpu_monitor.abort();
 
         let finished_at = Utc::now();
         let total = state.total.load(Ordering::Relaxed);
@@ -460,23 +519,39 @@ mod tests {
 
     #[test]
     fn test_safe_limits_check() {
+        let limits = SafeLimits::default();
         let mut config = make_test_config();
-        assert!(!exceeds_safe_limits(&config));
+        assert!(!exceeds_safe_limits(&config, &limits));
 
         config.concurrency = 200;
-        assert!(exceeds_safe_limits(&config));
+        assert!(exceeds_safe_limits(&config, &limits));
 
         config.concurrency = 10;
         config.duration_s = 120;
-        assert!(exceeds_safe_limits(&config));
+        assert!(exceeds_safe_limits(&config, &limits));
+    }
+
+    #[test]
+    fn test_safe_limits_custom() {
+        let limits = SafeLimits {
+            max_concurrency: 500,
+            max_duration_s: 300,
+            max_rps: 5000,
+        };
+        let mut config = make_test_config();
+        config.concurrency = 200;
+        assert!(!exceeds_safe_limits(&config, &limits)); // under custom limit
+        config.concurrency = 600;
+        assert!(exceeds_safe_limits(&config, &limits));
     }
 
     #[test]
     fn test_describe_exceeded_limits() {
+        let limits = SafeLimits::default();
         let mut config = make_test_config();
         config.concurrency = 200;
         config.duration_s = 120;
-        let warnings = describe_exceeded_limits(&config);
+        let warnings = describe_exceeded_limits(&config, &limits);
         assert_eq!(warnings.len(), 2);
         assert!(warnings[0].contains("concurrency"));
         assert!(warnings[1].contains("duration"));

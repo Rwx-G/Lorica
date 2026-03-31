@@ -235,6 +235,10 @@ pub fn build_router(
             delete(crate::loadtest::delete_config),
         )
         .route(
+            "/api/v1/loadtest/configs/:id/clone",
+            post(crate::loadtest::clone_config),
+        )
+        .route(
             "/api/v1/loadtest/start/:config_id",
             post(crate::loadtest::start_test),
         )

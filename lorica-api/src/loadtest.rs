@@ -110,12 +110,15 @@ pub async fn start_test(
     Extension(state): Extension<AppState>,
     Path(config_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = {
+    let (config, limits) = {
         let store = state.store.lock().await;
-        store
+        let config = store
             .get_load_test_config(&config_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::NotFound(format!("load test config {config_id}")))?
+            .ok_or_else(|| ApiError::NotFound(format!("load test config {config_id}")))?;
+        let settings = store.get_global_settings().unwrap_or_default();
+        let limits = load_test::SafeLimits::from_settings(&settings);
+        (config, limits)
     };
 
     let engine = state
@@ -127,9 +130,9 @@ pub async fn start_test(
         return Err(ApiError::Conflict("a load test is already running".into()));
     }
 
-    // Check safe limits
-    if load_test::exceeds_safe_limits(&config) {
-        let warnings = load_test::describe_exceeded_limits(&config);
+    // Check safe limits from global settings
+    if load_test::exceeds_safe_limits(&config, &limits) {
+        let warnings = load_test::describe_exceeded_limits(&config, &limits);
         return Ok(json_data(serde_json::json!({
             "status": "requires_confirmation",
             "warnings": warnings,
@@ -288,4 +291,27 @@ pub async fn stream_status(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     )
+}
+
+/// POST /api/v1/loadtest/configs/:id/clone
+/// Clone a load test configuration for reproducible comparisons.
+#[derive(Deserialize)]
+pub struct CloneConfig {
+    pub name: Option<String>,
+}
+
+pub async fn clone_config(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<CloneConfig>,
+) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
+    let store = state.store.lock().await;
+    let new_name = body.name.unwrap_or_else(|| format!("Copy of {id}"));
+    let cloned = store
+        .clone_load_test_config(&id, &new_name)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(json_data_with_status(
+        axum::http::StatusCode::CREATED,
+        cloned,
+    ))
 }
