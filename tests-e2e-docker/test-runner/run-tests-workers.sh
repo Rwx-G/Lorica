@@ -209,9 +209,47 @@ else
 fi
 
 # =============================================================================
-# 4. CLEANUP
+# 4. PROMETHEUS METRICS (Workers)
 # =============================================================================
-log "=== 4. Cleanup ==="
+log "=== 4. Prometheus Metrics ==="
+
+METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics" 2>/dev/null || echo "000")
+if [ "$METRICS_STATUS" = "200" ]; then
+    ok "Prometheus /metrics accessible in worker mode"
+else
+    fail "Prometheus /metrics should return 200 (got $METRICS_STATUS)"
+fi
+
+METRICS_BODY=$(curl -sf "$API/metrics" 2>/dev/null || echo "")
+if echo "$METRICS_BODY" | grep -q "lorica_http_requests_total" 2>/dev/null; then
+    ok "Workers: metrics contain request counters"
+else
+    fail "Workers: metrics should contain request counters"
+fi
+
+# =============================================================================
+# 5. SLA ENDPOINTS (Workers)
+# =============================================================================
+log "=== 5. SLA Endpoints ==="
+
+SLA_OVERVIEW=$(api_get "/api/v1/sla/overview")
+if echo "$SLA_OVERVIEW" | jq -e '.data' >/dev/null 2>&1; then
+    ok "Workers: SLA overview returns data"
+else
+    fail "Workers: SLA overview should return data"
+fi
+
+SLA_CFG=$(api_get "/api/v1/sla/routes/$R1_ID/config")
+if echo "$SLA_CFG" | jq -e '.data.target_pct' >/dev/null 2>&1; then
+    ok "Workers: SLA config returns target_pct"
+else
+    fail "Workers: SLA config should return target_pct"
+fi
+
+# =============================================================================
+# 6. CLEANUP
+# =============================================================================
+log "=== 6. Cleanup ==="
 
 api_del "/api/v1/routes/$R1_ID" >/dev/null 2>&1 && ok "Route deleted" || fail "Route delete failed"
 api_del "/api/v1/backends/$B1_ID" >/dev/null 2>&1 && ok "Backend deleted" || fail "Backend delete failed"
