@@ -151,6 +151,24 @@ impl K8sDiscovery {
 
         Ok(discovered)
     }
+
+    /// Watch Kubernetes Endpoints for a service in real-time.
+    ///
+    /// Returns a stream of endpoint change events with automatic reconnection.
+    /// The caller should rebuild the backend list when events arrive.
+    pub fn watch_endpoints(
+        &self,
+        namespace: &str,
+        service_name: &str,
+    ) -> impl futures_util::Stream<Item = Result<kube::runtime::watcher::Event<Endpoints>, kube::runtime::watcher::Error>>
+    {
+        let endpoints_api: Api<Endpoints> = Api::namespaced(self.client.clone(), namespace);
+
+        let config = kube::runtime::watcher::Config::default()
+            .fields(&format!("metadata.name={service_name}"));
+
+        kube::runtime::watcher::watcher(endpoints_api, config)
+    }
 }
 
 #[cfg(test)]
