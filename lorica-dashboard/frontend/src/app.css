@@ -68,35 +68,8 @@
 
 /* --- Color Themes --- */
 
+/* Light is the default theme */
 :root,
-:root[data-theme="dark"] {
-  --color-bg: #0b1120;
-  --color-bg-card: #151e2e;
-  --color-bg-input: #1e293b;
-  --color-bg-nav: #0f1729;
-  --color-bg-hover: rgba(255, 255, 255, 0.06);
-  --color-bg-elevated: #1a2435;
-  --color-text: #cbd5e1;
-  --color-text-muted: #64748b;
-  --color-text-heading: #f1f5f9;
-  --color-primary: #3b82f6;
-  --color-primary-hover: #2563eb;
-  --color-primary-subtle: rgba(59, 130, 246, 0.1);
-  --color-border: #1e293b;
-  --color-border-subtle: rgba(255, 255, 255, 0.06);
-  --color-green: #34d399;
-  --color-green-subtle: rgba(52, 211, 153, 0.1);
-  --color-orange: #fbbf24;
-  --color-orange-subtle: rgba(251, 191, 36, 0.1);
-  --color-red: #f87171;
-  --color-red-subtle: rgba(248, 113, 113, 0.1);
-  --color-error: #f87171;
-
-  color-scheme: dark;
-  color: var(--color-text);
-  background: var(--color-bg);
-}
-
 :root[data-theme="light"] {
   --color-bg: #f8fafc;
   --color-bg-card: #ffffff;
@@ -125,6 +98,34 @@
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
 
   color-scheme: light;
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+:root[data-theme="dark"] {
+  --color-bg: #0b1120;
+  --color-bg-card: #151e2e;
+  --color-bg-input: #1e293b;
+  --color-bg-nav: #0f1729;
+  --color-bg-hover: rgba(255, 255, 255, 0.06);
+  --color-bg-elevated: #1a2435;
+  --color-text: #cbd5e1;
+  --color-text-muted: #64748b;
+  --color-text-heading: #f1f5f9;
+  --color-primary: #3b82f6;
+  --color-primary-hover: #2563eb;
+  --color-primary-subtle: rgba(59, 130, 246, 0.1);
+  --color-border: #1e293b;
+  --color-border-subtle: rgba(255, 255, 255, 0.06);
+  --color-green: #34d399;
+  --color-green-subtle: rgba(52, 211, 153, 0.1);
+  --color-orange: #fbbf24;
+  --color-orange-subtle: rgba(251, 191, 36, 0.1);
+  --color-red: #f87171;
+  --color-red-subtle: rgba(248, 113, 113, 0.1);
+  --color-error: #f87171;
+
+  color-scheme: dark;
   color: var(--color-text);
   background: var(--color-bg);
 }

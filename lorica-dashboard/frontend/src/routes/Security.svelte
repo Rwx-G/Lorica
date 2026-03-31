@@ -274,7 +274,7 @@
         </table>
       </div>
     {/if}
-  {:else}
+  {:else if activeTab === 'rules'}
     <!-- Rules table -->
     {#if loading}
       <p class="loading">Loading...</p>

@@ -46,7 +46,7 @@
   let importSuccess = $state('');
 
   // Theme
-  let theme = $state<'dark' | 'light'>('dark');
+  let theme = $state<'dark' | 'light'>('light');
 
   let loading = $state(true);
   let error = $state('');
