@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -231,6 +232,56 @@ pub struct Route {
     pub waf_mode: WafMode,
     pub topology_type: TopologyType,
     pub enabled: bool,
+    #[serde(default)]
+    pub force_https: bool,
+    #[serde(default)]
+    pub redirect_hostname: Option<String>,
+    #[serde(default)]
+    pub hostname_aliases: Vec<String>,
+    #[serde(default)]
+    pub proxy_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub response_headers: HashMap<String, String>,
+    #[serde(default = "default_security_headers")]
+    pub security_headers: String,
+    #[serde(default = "default_connect_timeout_s")]
+    pub connect_timeout_s: i32,
+    #[serde(default = "default_read_timeout_s")]
+    pub read_timeout_s: i32,
+    #[serde(default = "default_send_timeout_s")]
+    pub send_timeout_s: i32,
+    #[serde(default)]
+    pub strip_path_prefix: Option<String>,
+    #[serde(default)]
+    pub add_path_prefix: Option<String>,
+    #[serde(default = "default_access_log_enabled")]
+    pub access_log_enabled: bool,
+    #[serde(default)]
+    pub proxy_headers_remove: Vec<String>,
+    #[serde(default)]
+    pub response_headers_remove: Vec<String>,
+    #[serde(default)]
+    pub max_request_body_bytes: Option<u64>,
+    #[serde(default = "default_websocket_enabled")]
+    pub websocket_enabled: bool,
+    #[serde(default)]
+    pub rate_limit_rps: Option<u32>,
+    #[serde(default)]
+    pub rate_limit_burst: Option<u32>,
+    #[serde(default)]
+    pub ip_allowlist: Vec<String>,
+    #[serde(default)]
+    pub ip_denylist: Vec<String>,
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub cors_allowed_methods: Vec<String>,
+    #[serde(default)]
+    pub cors_max_age_s: Option<i32>,
+    #[serde(default = "default_compression_enabled")]
+    pub compression_enabled: bool,
+    #[serde(default)]
+    pub retry_attempts: Option<u32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -323,6 +374,34 @@ pub struct GlobalSettings {
     pub loadtest_max_duration_s: i32,
     #[serde(default = "default_loadtest_max_rps")]
     pub loadtest_max_rps: i32,
+}
+
+fn default_security_headers() -> String {
+    "moderate".to_string()
+}
+
+fn default_connect_timeout_s() -> i32 {
+    5
+}
+
+fn default_read_timeout_s() -> i32 {
+    60
+}
+
+fn default_send_timeout_s() -> i32 {
+    60
+}
+
+fn default_access_log_enabled() -> bool {
+    true
+}
+
+fn default_websocket_enabled() -> bool {
+    true
+}
+
+fn default_compression_enabled() -> bool {
+    false
 }
 
 fn default_cert_warning_days() -> i32 {

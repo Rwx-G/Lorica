@@ -62,6 +62,31 @@ export interface RouteResponse {
   waf_mode: string;
   topology_type: string;
   enabled: boolean;
+  force_https: boolean;
+  redirect_hostname: string | null;
+  hostname_aliases: string[];
+  proxy_headers: Record<string, string>;
+  response_headers: Record<string, string>;
+  security_headers: string;
+  connect_timeout_s: number;
+  read_timeout_s: number;
+  send_timeout_s: number;
+  strip_path_prefix: string | null;
+  add_path_prefix: string | null;
+  access_log_enabled: boolean;
+  proxy_headers_remove: string[];
+  response_headers_remove: string[];
+  max_request_body_bytes: number | null;
+  websocket_enabled: boolean;
+  rate_limit_rps: number | null;
+  rate_limit_burst: number | null;
+  ip_allowlist: string[];
+  ip_denylist: string[];
+  cors_allowed_origins: string[];
+  cors_allowed_methods: string[];
+  cors_max_age_s: number | null;
+  compression_enabled: boolean;
+  retry_attempts: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -75,6 +100,31 @@ export interface CreateRouteRequest {
   topology_type?: string;
   waf_enabled?: boolean;
   waf_mode?: string;
+  force_https?: boolean;
+  redirect_hostname?: string;
+  hostname_aliases?: string[];
+  proxy_headers?: Record<string, string>;
+  response_headers?: Record<string, string>;
+  security_headers?: string;
+  connect_timeout_s?: number;
+  read_timeout_s?: number;
+  send_timeout_s?: number;
+  strip_path_prefix?: string;
+  add_path_prefix?: string;
+  access_log_enabled?: boolean;
+  proxy_headers_remove?: string[];
+  response_headers_remove?: string[];
+  max_request_body_bytes?: number;
+  websocket_enabled?: boolean;
+  rate_limit_rps?: number;
+  rate_limit_burst?: number;
+  ip_allowlist?: string[];
+  ip_denylist?: string[];
+  cors_allowed_origins?: string[];
+  cors_allowed_methods?: string[];
+  cors_max_age_s?: number;
+  compression_enabled?: boolean;
+  retry_attempts?: number;
 }
 
 export interface UpdateRouteRequest {
@@ -87,6 +137,31 @@ export interface UpdateRouteRequest {
   waf_enabled?: boolean;
   waf_mode?: string;
   enabled?: boolean;
+  force_https?: boolean;
+  redirect_hostname?: string;
+  hostname_aliases?: string[];
+  proxy_headers?: Record<string, string>;
+  response_headers?: Record<string, string>;
+  security_headers?: string;
+  connect_timeout_s?: number;
+  read_timeout_s?: number;
+  send_timeout_s?: number;
+  strip_path_prefix?: string;
+  add_path_prefix?: string;
+  access_log_enabled?: boolean;
+  proxy_headers_remove?: string[];
+  response_headers_remove?: string[];
+  max_request_body_bytes?: number;
+  websocket_enabled?: boolean;
+  rate_limit_rps?: number;
+  rate_limit_burst?: number;
+  ip_allowlist?: string[];
+  ip_denylist?: string[];
+  cors_allowed_origins?: string[];
+  cors_allowed_methods?: string[];
+  cors_max_age_s?: number;
+  compression_enabled?: boolean;
+  retry_attempts?: number;
 }
 
 export interface BackendResponse {

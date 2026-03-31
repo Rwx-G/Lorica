@@ -16,6 +16,7 @@ const MIGRATION_V3: &str = include_str!("migrations/003_sla_metrics.sql");
 const MIGRATION_V4: &str = include_str!("migrations/004_probe_configs.sql");
 const MIGRATION_V5: &str = include_str!("migrations/005_load_tests.sql");
 const MIGRATION_V6: &str = include_str!("migrations/006_sla_bucket_config_snapshot.sql");
+const MIGRATION_V7: &str = include_str!("migrations/007_route_config.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -170,6 +171,25 @@ impl ConfigStore {
             )?;
         }
 
+        if current_version < 7 {
+            let has_column: bool = self
+                .conn
+                .prepare(
+                    "SELECT COUNT(*) FROM pragma_table_info('routes') WHERE name='force_https'",
+                )?
+                .query_row([], |row| row.get::<_, i64>(0))
+                .map(|c| c > 0)?;
+
+            if !has_column {
+                tracing::info!("applying migration 007_route_config");
+                self.conn.execute_batch(MIGRATION_V7)?;
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![7],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -187,10 +207,45 @@ impl ConfigStore {
 
     /// Insert a new route into the database.
     pub fn create_route(&self, route: &Route) -> Result<()> {
+        let hostname_aliases_json = serde_json::to_string(&route.hostname_aliases)
+            .map_err(|e| ConfigError::Validation(format!("invalid hostname_aliases: {e}")))?;
+        let proxy_headers_json = serde_json::to_string(&route.proxy_headers)
+            .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers: {e}")))?;
+        let response_headers_json = serde_json::to_string(&route.response_headers)
+            .map_err(|e| ConfigError::Validation(format!("invalid response_headers: {e}")))?;
+        let proxy_headers_remove_json = serde_json::to_string(&route.proxy_headers_remove)
+            .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers_remove: {e}")))?;
+        let response_headers_remove_json = serde_json::to_string(&route.response_headers_remove)
+            .map_err(|e| {
+                ConfigError::Validation(format!("invalid response_headers_remove: {e}"))
+            })?;
+        let ip_allowlist_json = serde_json::to_string(&route.ip_allowlist)
+            .map_err(|e| ConfigError::Validation(format!("invalid ip_allowlist: {e}")))?;
+        let ip_denylist_json = serde_json::to_string(&route.ip_denylist)
+            .map_err(|e| ConfigError::Validation(format!("invalid ip_denylist: {e}")))?;
+        let cors_allowed_origins_json = serde_json::to_string(&route.cors_allowed_origins)
+            .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_origins: {e}")))?;
+        let cors_allowed_methods_json = serde_json::to_string(&route.cors_allowed_methods)
+            .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_methods: {e}")))?;
+
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
-             waf_enabled, waf_mode, topology_type, enabled, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             waf_enabled, waf_mode, topology_type, enabled,
+             force_https, redirect_hostname, hostname_aliases,
+             proxy_headers, response_headers, security_headers,
+             connect_timeout_s, read_timeout_s, send_timeout_s,
+             strip_path_prefix, add_path_prefix, access_log_enabled,
+             proxy_headers_remove, response_headers_remove,
+             max_request_body_bytes, websocket_enabled,
+             rate_limit_rps, rate_limit_burst,
+             ip_allowlist, ip_denylist,
+             cors_allowed_origins, cors_allowed_methods, cors_max_age_s,
+             compression_enabled, retry_attempts,
+             created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                     ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
+                     ?33, ?34, ?35, ?36)",
             params![
                 route.id,
                 route.hostname,
@@ -201,6 +256,31 @@ impl ConfigStore {
                 route.waf_mode.as_str(),
                 route.topology_type.as_str(),
                 route.enabled,
+                route.force_https,
+                route.redirect_hostname,
+                hostname_aliases_json,
+                proxy_headers_json,
+                response_headers_json,
+                route.security_headers,
+                route.connect_timeout_s,
+                route.read_timeout_s,
+                route.send_timeout_s,
+                route.strip_path_prefix,
+                route.add_path_prefix,
+                route.access_log_enabled,
+                proxy_headers_remove_json,
+                response_headers_remove_json,
+                route.max_request_body_bytes.map(|v| v as i64),
+                route.websocket_enabled,
+                route.rate_limit_rps.map(|v| v as i32),
+                route.rate_limit_burst.map(|v| v as i32),
+                ip_allowlist_json,
+                ip_denylist_json,
+                cors_allowed_origins_json,
+                cors_allowed_methods_json,
+                route.cors_max_age_s,
+                route.compression_enabled,
+                route.retry_attempts.map(|v| v as i32),
                 route.created_at.to_rfc3339(),
                 route.updated_at.to_rfc3339(),
             ],
@@ -213,7 +293,18 @@ impl ConfigStore {
         self.conn
             .query_row(
                 "SELECT id, hostname, path_prefix, certificate_id, load_balancing,
-                 waf_enabled, waf_mode, topology_type, enabled, created_at, updated_at
+                 waf_enabled, waf_mode, topology_type, enabled,
+                 force_https, redirect_hostname, hostname_aliases,
+                 proxy_headers, response_headers, security_headers,
+                 connect_timeout_s, read_timeout_s, send_timeout_s,
+                 strip_path_prefix, add_path_prefix, access_log_enabled,
+                 proxy_headers_remove, response_headers_remove,
+                 max_request_body_bytes, websocket_enabled,
+                 rate_limit_rps, rate_limit_burst,
+                 ip_allowlist, ip_denylist,
+                 cors_allowed_origins, cors_allowed_methods, cors_max_age_s,
+                 compression_enabled, retry_attempts,
+                 created_at, updated_at
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
@@ -226,7 +317,18 @@ impl ConfigStore {
     pub fn list_routes(&self) -> Result<Vec<Route>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, hostname, path_prefix, certificate_id, load_balancing,
-             waf_enabled, waf_mode, topology_type, enabled, created_at, updated_at
+             waf_enabled, waf_mode, topology_type, enabled,
+             force_https, redirect_hostname, hostname_aliases,
+             proxy_headers, response_headers, security_headers,
+             connect_timeout_s, read_timeout_s, send_timeout_s,
+             strip_path_prefix, add_path_prefix, access_log_enabled,
+             proxy_headers_remove, response_headers_remove,
+             max_request_body_bytes, websocket_enabled,
+             rate_limit_rps, rate_limit_burst,
+             ip_allowlist, ip_denylist,
+             cors_allowed_origins, cors_allowed_methods, cors_max_age_s,
+             compression_enabled, retry_attempts,
+             created_at, updated_at
              FROM routes ORDER BY hostname, path_prefix",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_route(row)))?;
@@ -239,10 +341,41 @@ impl ConfigStore {
 
     /// Update an existing route. Returns `NotFound` if the ID does not exist.
     pub fn update_route(&self, route: &Route) -> Result<()> {
+        let hostname_aliases_json = serde_json::to_string(&route.hostname_aliases)
+            .map_err(|e| ConfigError::Validation(format!("invalid hostname_aliases: {e}")))?;
+        let proxy_headers_json = serde_json::to_string(&route.proxy_headers)
+            .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers: {e}")))?;
+        let response_headers_json = serde_json::to_string(&route.response_headers)
+            .map_err(|e| ConfigError::Validation(format!("invalid response_headers: {e}")))?;
+        let proxy_headers_remove_json = serde_json::to_string(&route.proxy_headers_remove)
+            .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers_remove: {e}")))?;
+        let response_headers_remove_json = serde_json::to_string(&route.response_headers_remove)
+            .map_err(|e| {
+                ConfigError::Validation(format!("invalid response_headers_remove: {e}"))
+            })?;
+        let ip_allowlist_json = serde_json::to_string(&route.ip_allowlist)
+            .map_err(|e| ConfigError::Validation(format!("invalid ip_allowlist: {e}")))?;
+        let ip_denylist_json = serde_json::to_string(&route.ip_denylist)
+            .map_err(|e| ConfigError::Validation(format!("invalid ip_denylist: {e}")))?;
+        let cors_allowed_origins_json = serde_json::to_string(&route.cors_allowed_origins)
+            .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_origins: {e}")))?;
+        let cors_allowed_methods_json = serde_json::to_string(&route.cors_allowed_methods)
+            .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_methods: {e}")))?;
+
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,
              load_balancing=?5, waf_enabled=?6, waf_mode=?7, topology_type=?8,
-             enabled=?9, updated_at=?10 WHERE id=?1",
+             enabled=?9, force_https=?10, redirect_hostname=?11,
+             hostname_aliases=?12, proxy_headers=?13, response_headers=?14,
+             security_headers=?15, connect_timeout_s=?16, read_timeout_s=?17,
+             send_timeout_s=?18, strip_path_prefix=?19, add_path_prefix=?20,
+             access_log_enabled=?21, proxy_headers_remove=?22,
+             response_headers_remove=?23, max_request_body_bytes=?24,
+             websocket_enabled=?25, rate_limit_rps=?26, rate_limit_burst=?27,
+             ip_allowlist=?28, ip_denylist=?29,
+             cors_allowed_origins=?30, cors_allowed_methods=?31, cors_max_age_s=?32,
+             compression_enabled=?33, retry_attempts=?34,
+             updated_at=?35 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -253,6 +386,31 @@ impl ConfigStore {
                 route.waf_mode.as_str(),
                 route.topology_type.as_str(),
                 route.enabled,
+                route.force_https,
+                route.redirect_hostname,
+                hostname_aliases_json,
+                proxy_headers_json,
+                response_headers_json,
+                route.security_headers,
+                route.connect_timeout_s,
+                route.read_timeout_s,
+                route.send_timeout_s,
+                route.strip_path_prefix,
+                route.add_path_prefix,
+                route.access_log_enabled,
+                proxy_headers_remove_json,
+                response_headers_remove_json,
+                route.max_request_body_bytes.map(|v| v as i64),
+                route.websocket_enabled,
+                route.rate_limit_rps.map(|v| v as i32),
+                route.rate_limit_burst.map(|v| v as i32),
+                ip_allowlist_json,
+                ip_denylist_json,
+                cors_allowed_origins_json,
+                cors_allowed_methods_json,
+                route.cors_max_age_s,
+                route.compression_enabled,
+                route.retry_attempts.map(|v| v as i32),
                 route.updated_at.to_rfc3339(),
             ],
         )?;
@@ -1525,6 +1683,46 @@ fn parse_optional_datetime(s: Option<String>) -> Result<Option<DateTime<Utc>>> {
 }
 
 fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
+    let hostname_aliases_json: String = row.get(11)?;
+    let hostname_aliases: Vec<String> = serde_json::from_str(&hostname_aliases_json)
+        .map_err(|e| ConfigError::Validation(format!("invalid hostname_aliases JSON: {e}")))?;
+
+    let proxy_headers_json: String = row.get(12)?;
+    let proxy_headers: std::collections::HashMap<String, String> =
+        serde_json::from_str(&proxy_headers_json)
+            .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers JSON: {e}")))?;
+
+    let response_headers_json: String = row.get(13)?;
+    let response_headers: std::collections::HashMap<String, String> =
+        serde_json::from_str(&response_headers_json)
+            .map_err(|e| ConfigError::Validation(format!("invalid response_headers JSON: {e}")))?;
+
+    let proxy_headers_remove_json: String = row.get(21)?;
+    let proxy_headers_remove: Vec<String> = serde_json::from_str(&proxy_headers_remove_json)
+        .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers_remove JSON: {e}")))?;
+
+    let response_headers_remove_json: String = row.get(22)?;
+    let response_headers_remove: Vec<String> = serde_json::from_str(&response_headers_remove_json)
+        .map_err(|e| {
+            ConfigError::Validation(format!("invalid response_headers_remove JSON: {e}"))
+        })?;
+
+    let ip_allowlist_json: String = row.get(27)?;
+    let ip_allowlist: Vec<String> = serde_json::from_str(&ip_allowlist_json)
+        .map_err(|e| ConfigError::Validation(format!("invalid ip_allowlist JSON: {e}")))?;
+
+    let ip_denylist_json: String = row.get(28)?;
+    let ip_denylist: Vec<String> = serde_json::from_str(&ip_denylist_json)
+        .map_err(|e| ConfigError::Validation(format!("invalid ip_denylist JSON: {e}")))?;
+
+    let cors_allowed_origins_json: String = row.get(29)?;
+    let cors_allowed_origins: Vec<String> = serde_json::from_str(&cors_allowed_origins_json)
+        .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_origins JSON: {e}")))?;
+
+    let cors_allowed_methods_json: String = row.get(30)?;
+    let cors_allowed_methods: Vec<String> = serde_json::from_str(&cors_allowed_methods_json)
+        .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_methods JSON: {e}")))?;
+
     Ok(Route {
         id: row.get(0)?,
         hostname: row.get(1)?,
@@ -1537,8 +1735,33 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         topology_type: TopologyType::from_str(&row.get::<_, String>(7)?)
             .map_err(ConfigError::Validation)?,
         enabled: row.get(8)?,
-        created_at: parse_datetime(&row.get::<_, String>(9)?)?,
-        updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
+        force_https: row.get(9)?,
+        redirect_hostname: row.get(10)?,
+        hostname_aliases,
+        proxy_headers,
+        response_headers,
+        security_headers: row.get(14)?,
+        connect_timeout_s: row.get(15)?,
+        read_timeout_s: row.get(16)?,
+        send_timeout_s: row.get(17)?,
+        strip_path_prefix: row.get(18)?,
+        add_path_prefix: row.get(19)?,
+        access_log_enabled: row.get(20)?,
+        proxy_headers_remove,
+        response_headers_remove,
+        max_request_body_bytes: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+        websocket_enabled: row.get(24)?,
+        rate_limit_rps: row.get::<_, Option<i32>>(25)?.map(|v| v as u32),
+        rate_limit_burst: row.get::<_, Option<i32>>(26)?.map(|v| v as u32),
+        ip_allowlist,
+        ip_denylist,
+        cors_allowed_origins,
+        cors_allowed_methods,
+        cors_max_age_s: row.get(31)?,
+        compression_enabled: row.get(32)?,
+        retry_attempts: row.get::<_, Option<i32>>(33)?.map(|v| v as u32),
+        created_at: parse_datetime(&row.get::<_, String>(34)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(35)?)?,
     })
 }
 

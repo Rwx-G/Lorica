@@ -1,0 +1,26 @@
+-- Route proxy configuration
+ALTER TABLE routes ADD COLUMN force_https INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE routes ADD COLUMN redirect_hostname TEXT DEFAULT NULL;
+ALTER TABLE routes ADD COLUMN hostname_aliases TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE routes ADD COLUMN proxy_headers TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE routes ADD COLUMN response_headers TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE routes ADD COLUMN security_headers TEXT NOT NULL DEFAULT 'moderate';
+ALTER TABLE routes ADD COLUMN connect_timeout_s INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE routes ADD COLUMN read_timeout_s INTEGER NOT NULL DEFAULT 60;
+ALTER TABLE routes ADD COLUMN send_timeout_s INTEGER NOT NULL DEFAULT 60;
+ALTER TABLE routes ADD COLUMN strip_path_prefix TEXT DEFAULT NULL;
+ALTER TABLE routes ADD COLUMN add_path_prefix TEXT DEFAULT NULL;
+ALTER TABLE routes ADD COLUMN access_log_enabled INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE routes ADD COLUMN proxy_headers_remove TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE routes ADD COLUMN response_headers_remove TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE routes ADD COLUMN max_request_body_bytes INTEGER DEFAULT NULL;
+ALTER TABLE routes ADD COLUMN websocket_enabled INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE routes ADD COLUMN rate_limit_rps INTEGER DEFAULT NULL;
+ALTER TABLE routes ADD COLUMN rate_limit_burst INTEGER DEFAULT NULL;
+ALTER TABLE routes ADD COLUMN ip_allowlist TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE routes ADD COLUMN ip_denylist TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE routes ADD COLUMN cors_allowed_origins TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE routes ADD COLUMN cors_allowed_methods TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE routes ADD COLUMN cors_max_age_s INTEGER DEFAULT NULL;
+ALTER TABLE routes ADD COLUMN compression_enabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE routes ADD COLUMN retry_attempts INTEGER DEFAULT NULL;

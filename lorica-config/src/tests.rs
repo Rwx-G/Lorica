@@ -20,6 +20,31 @@ mod tests {
             waf_mode: WafMode::Detection,
             topology_type: TopologyType::SingleVm,
             enabled: true,
+            force_https: false,
+            redirect_hostname: None,
+            hostname_aliases: Vec::new(),
+            proxy_headers: std::collections::HashMap::new(),
+            response_headers: std::collections::HashMap::new(),
+            security_headers: "moderate".to_string(),
+            connect_timeout_s: 5,
+            read_timeout_s: 60,
+            send_timeout_s: 60,
+            strip_path_prefix: None,
+            add_path_prefix: None,
+            access_log_enabled: true,
+            proxy_headers_remove: Vec::new(),
+            response_headers_remove: Vec::new(),
+            max_request_body_bytes: None,
+            websocket_enabled: true,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            ip_allowlist: Vec::new(),
+            ip_denylist: Vec::new(),
+            cors_allowed_origins: Vec::new(),
+            cors_allowed_methods: Vec::new(),
+            cors_max_age_s: None,
+            compression_enabled: false,
+            retry_attempts: None,
             created_at: now,
             updated_at: now,
         }
@@ -328,7 +353,7 @@ mod tests {
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
     }
 
     #[test]
@@ -341,7 +366,7 @@ mod tests {
         }
         {
             let store = ConfigStore::open(path, None).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 6);
+            assert_eq!(store.schema_version().unwrap(), 7);
         }
     }
 
