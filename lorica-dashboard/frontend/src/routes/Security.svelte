@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus } from '../lib/api';
+  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule } from '../lib/api';
+  import ConfirmDialog from '../components/ConfirmDialog.svelte';
 
   let events: WafEvent[] = $state([]);
   let stats: { total_events: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
@@ -12,19 +13,32 @@
   let rulesEnabled = $state(0);
   let blocklist: BlocklistStatus = $state({ enabled: false, ip_count: 0, source: '' });
   let blocklistLoading = $state(false);
+  let customRules: CustomWafRule[] = $state([]);
   let loading = $state(true);
   let error = $state('');
   let filterCategory = $state('');
-  let activeTab: 'events' | 'rules' | 'blocklist' = $state('events');
+  let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' = $state('events');
+
+  // Custom rule form
+  let showCustomForm = $state(false);
+  let crId = $state(10000);
+  let crDescription = $state('');
+  let crCategory = $state('sql_injection');
+  let crPattern = $state('');
+  let crSeverity = $state(3);
+  let crError = $state('');
+  let crSubmitting = $state(false);
+  let deletingCustomRule: CustomWafRule | null = $state(null);
 
   async function loadData() {
     loading = true;
     error = '';
-    const [eventsRes, statsRes, rulesRes, blRes] = await Promise.all([
+    const [eventsRes, statsRes, rulesRes, blRes, crRes] = await Promise.all([
       api.getWafEvents({ limit: 100, category: filterCategory || undefined }),
       api.getWafStats(),
       api.getWafRules(),
       api.getBlocklistStatus(),
+      api.listCustomRules(),
     ]);
 
     if (eventsRes.error) {
@@ -44,6 +58,10 @@
 
     if (blRes.data) {
       blocklist = blRes.data;
+    }
+
+    if (crRes.data) {
+      customRules = crRes.data.rules;
     }
 
     loading = false;
@@ -70,6 +88,46 @@
     if (res.data) {
       blocklist = { ...blocklist, enabled: res.data.enabled, ip_count: res.data.ip_count };
     }
+  }
+
+  function openCustomForm() {
+    crId = 10000 + customRules.length;
+    crDescription = '';
+    crCategory = 'sql_injection';
+    crPattern = '';
+    crSeverity = 3;
+    crError = '';
+    showCustomForm = true;
+  }
+
+  async function handleCreateCustomRule() {
+    if (!crDescription.trim() || !crPattern.trim()) {
+      crError = 'Description and pattern are required';
+      return;
+    }
+    crSubmitting = true;
+    crError = '';
+    const res = await api.createCustomRule({
+      id: crId,
+      description: crDescription,
+      category: crCategory,
+      pattern: crPattern,
+      severity: crSeverity,
+    });
+    crSubmitting = false;
+    if (res.error) {
+      crError = res.error.message;
+    } else {
+      showCustomForm = false;
+      await loadData();
+    }
+  }
+
+  async function handleDeleteCustomRule() {
+    if (!deletingCustomRule) return;
+    await api.deleteCustomRule(deletingCustomRule.id);
+    deletingCustomRule = null;
+    await loadData();
   }
 
   async function reloadBlocklist() {
@@ -148,6 +206,12 @@
   <div class="tabs">
     <button class="tab" class:active={activeTab === 'events'} onclick={() => activeTab = 'events'}>Events</button>
     <button class="tab" class:active={activeTab === 'rules'} onclick={() => activeTab = 'rules'}>Rules</button>
+    <button class="tab" class:active={activeTab === 'custom'} onclick={() => activeTab = 'custom'}>
+      Custom Rules
+      {#if customRules.length > 0}
+        <span class="tab-badge-on">{customRules.length}</span>
+      {/if}
+    </button>
     <button class="tab" class:active={activeTab === 'blocklist'} onclick={() => activeTab = 'blocklist'}>
       IP Blocklist
       {#if blocklist.enabled}
@@ -245,6 +309,111 @@
         </table>
       </div>
     {/if}
+  {:else if activeTab === 'custom'}
+    <div class="custom-header">
+      <p class="text-muted">User-defined WAF rules with custom regex patterns.</p>
+      <button class="btn btn-primary" onclick={openCustomForm}>+ Add Rule</button>
+    </div>
+
+    {#if customRules.length === 0}
+      <div class="empty-state">
+        <p>No custom WAF rules defined.</p>
+        <button class="btn btn-primary" onclick={openCustomForm}>Create your first rule</button>
+      </div>
+    {:else}
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Category</th>
+              <th>Severity</th>
+              <th>Description</th>
+              <th>Pattern</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each customRules as rule}
+              <tr>
+                <td class="mono">{rule.id}</td>
+                <td><span class="category-badge">{categoryLabel(rule.category)}</span></td>
+                <td><span class={severityClass(rule.severity)}>{rule.severity}/5</span></td>
+                <td>{rule.description}</td>
+                <td class="mono matched-value" title={rule.pattern}>{rule.pattern}</td>
+                <td>
+                  <button class="btn-icon btn-icon-danger" onclick={() => (deletingCustomRule = rule)} title="Delete">
+                    {@html trashIcon}
+                  </button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+
+    {#if deletingCustomRule}
+      <ConfirmDialog
+        title="Delete Custom Rule"
+        message="Delete rule #{deletingCustomRule.id} '{deletingCustomRule.description}'?"
+        confirmLabel="Delete"
+        onconfirm={handleDeleteCustomRule}
+        oncancel={() => (deletingCustomRule = null)}
+      />
+    {/if}
+
+    {#if showCustomForm}
+      <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showCustomForm = false; }}>
+        <div class="modal">
+          <h2>Add Custom WAF Rule</h2>
+          {#if crError}
+            <div class="form-error">{crError}</div>
+          {/if}
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Rule ID</label>
+              <input type="number" bind:value={crId} min="10000" />
+            </div>
+            <div class="form-group">
+              <label>Severity (1-5)</label>
+              <input type="number" bind:value={crSeverity} min="1" max="5" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Category</label>
+            <select bind:value={crCategory}>
+              <option value="sql_injection">SQL Injection</option>
+              <option value="xss">XSS</option>
+              <option value="path_traversal">Path Traversal</option>
+              <option value="command_injection">Command Injection</option>
+              <option value="protocol_violation">Protocol Violation</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label>Description <span class="required">*</span></label>
+            <input type="text" bind:value={crDescription} placeholder="Block known exploit pattern" />
+          </div>
+
+          <div class="form-group">
+            <label>Regex Pattern <span class="required">*</span></label>
+            <input type="text" bind:value={crPattern} placeholder="(?i)malicious_pattern" />
+            <span class="hint">Rust regex syntax. Case-insensitive with (?i) prefix.</span>
+          </div>
+
+          <div class="form-actions">
+            <button class="btn btn-cancel" onclick={() => (showCustomForm = false)}>Cancel</button>
+            <button class="btn btn-primary" onclick={handleCreateCustomRule} disabled={crSubmitting}>
+              {crSubmitting ? 'Creating...' : 'Create Rule'}
+            </button>
+          </div>
+        </div>
+      </div>
+    {/if}
+
   {:else if activeTab === 'blocklist'}
     <div class="blocklist-section">
       <div class="blocklist-card">
@@ -284,6 +453,10 @@
     </div>
   {/if}
 </div>
+
+<script lang="ts" module>
+  const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+</script>
 
 <style>
   .security-page {
@@ -654,5 +827,17 @@
   .blocklist-actions {
     display: flex;
     gap: var(--space-3);
+  }
+
+  /* Custom rules */
+  .custom-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: var(--space-4);
+  }
+
+  .custom-header p {
+    margin: 0;
   }
 </style>

@@ -8,6 +8,8 @@
     type CreateCertificateRequest,
     type UpdateCertificateRequest,
     type GenerateSelfSignedRequest,
+    type AcmeProvisionRequest,
+    type AcmeDnsProvisionRequest,
   } from '../lib/api';
   import CertExpiryBadge from '../components/CertExpiryBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
@@ -58,6 +60,85 @@
   let selfSignedPref: 'never' | 'always' | 'once' | null = $state(null);
   let selfSignedPrefId: string | null = $state(null);
   let showSelfSignedPrefPrompt = $state(false);
+
+  // ACME provisioning state
+  let showAcmeForm = $state(false);
+  let acmeMode: 'http01' | 'dns01' = $state('http01');
+  let acmeDomain = $state('');
+  let acmeEmail = $state('');
+  let acmeStaging = $state(true);
+  let acmeDnsProvider = $state('cloudflare');
+  let acmeDnsZoneId = $state('');
+  let acmeDnsApiToken = $state('');
+  let acmeDnsApiSecret = $state('');
+  let acmeError = $state('');
+  let acmeSubmitting = $state(false);
+  let acmeSuccess = $state('');
+
+  function openAcmeForm() {
+    acmeDomain = '';
+    acmeEmail = '';
+    acmeStaging = true;
+    acmeMode = 'http01';
+    acmeDnsProvider = 'cloudflare';
+    acmeDnsZoneId = '';
+    acmeDnsApiToken = '';
+    acmeDnsApiSecret = '';
+    acmeError = '';
+    acmeSuccess = '';
+    showAcmeForm = true;
+  }
+
+  async function handleAcmeProvision() {
+    if (!acmeDomain.trim()) {
+      acmeError = 'Domain is required';
+      return;
+    }
+    acmeSubmitting = true;
+    acmeError = '';
+    acmeSuccess = '';
+
+    if (acmeMode === 'http01') {
+      const body: AcmeProvisionRequest = {
+        domain: acmeDomain,
+        staging: acmeStaging,
+        contact_email: acmeEmail || undefined,
+      };
+      const res = await api.provisionAcme(body);
+      acmeSubmitting = false;
+      if (res.error) {
+        acmeError = res.error.message;
+      } else if (res.data) {
+        acmeSuccess = res.data.message;
+        await loadData();
+      }
+    } else {
+      if (!acmeDnsZoneId.trim() || !acmeDnsApiToken.trim()) {
+        acmeError = 'Zone ID and API token are required for DNS-01';
+        acmeSubmitting = false;
+        return;
+      }
+      const body: AcmeDnsProvisionRequest = {
+        domain: acmeDomain,
+        staging: acmeStaging,
+        contact_email: acmeEmail || undefined,
+        dns: {
+          provider: acmeDnsProvider,
+          zone_id: acmeDnsZoneId,
+          api_token: acmeDnsApiToken,
+          api_secret: acmeDnsApiSecret || undefined,
+        },
+      };
+      const res = await api.provisionAcmeDns(body);
+      acmeSubmitting = false;
+      if (res.error) {
+        acmeError = res.error.message;
+      } else if (res.data) {
+        acmeSuccess = res.data.message;
+        await loadData();
+      }
+    }
+  }
 
   async function loadData() {
     loading = true;
@@ -361,6 +442,7 @@
         {@html gearIcon}
       </button>
       <button class="btn btn-secondary" onclick={openSelfSigned}>Self-signed</button>
+      <button class="btn btn-acme" onclick={openAcmeForm}>Let's Encrypt</button>
       <button class="btn btn-primary" onclick={openUploadForm}>+ Upload Certificate</button>
     </div>
   </div>
@@ -660,6 +742,88 @@
         <button class="btn btn-cancel" onclick={closeThresholdConfig}>Cancel</button>
         <button class="btn btn-primary" disabled={thresholdCritical >= thresholdWarning} onclick={saveThresholds}>Save</button>
       </div>
+    </div>
+  </div>
+{/if}
+
+<!-- ACME Provisioning Modal -->
+{#if showAcmeForm}
+  <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showAcmeForm = false; }}>
+    <div class="modal" onclick={(e) => e.stopPropagation()}>
+      <h2>Let's Encrypt Certificate</h2>
+
+      {#if acmeSuccess}
+        <div class="success-banner">{acmeSuccess}</div>
+        <div class="form-actions">
+          <button class="btn btn-primary" onclick={() => (showAcmeForm = false)}>Close</button>
+        </div>
+      {:else}
+        {#if acmeError}
+          <div class="form-error">{acmeError}</div>
+        {/if}
+
+        <div class="form-group">
+          <label>Domain <span class="required">*</span></label>
+          <input type="text" bind:value={acmeDomain} placeholder="example.com" />
+        </div>
+
+        <div class="form-group">
+          <label>Contact Email</label>
+          <input type="text" bind:value={acmeEmail} placeholder="admin@example.com" />
+        </div>
+
+        <div class="form-group">
+          <label>Challenge Method</label>
+          <div class="radio-group">
+            <label class="radio-item">
+              <input type="radio" bind:group={acmeMode} value="http01" />
+              HTTP-01 (port 80 must be reachable)
+            </label>
+            <label class="radio-item">
+              <input type="radio" bind:group={acmeMode} value="dns01" />
+              DNS-01 (Cloudflare or Route53)
+            </label>
+          </div>
+        </div>
+
+        {#if acmeMode === 'dns01'}
+          <div class="form-group">
+            <label>DNS Provider</label>
+            <select bind:value={acmeDnsProvider}>
+              <option value="cloudflare">Cloudflare</option>
+              <option value="route53">AWS Route53</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Zone ID <span class="required">*</span></label>
+            <input type="text" bind:value={acmeDnsZoneId} placeholder="Zone identifier" />
+          </div>
+          <div class="form-group">
+            <label>API Token <span class="required">*</span></label>
+            <input type="password" bind:value={acmeDnsApiToken} placeholder="API token" />
+          </div>
+          {#if acmeDnsProvider === 'route53'}
+            <div class="form-group">
+              <label>AWS Secret Access Key</label>
+              <input type="password" bind:value={acmeDnsApiSecret} placeholder="Secret key" />
+            </div>
+          {/if}
+        {/if}
+
+        <div class="form-group">
+          <label class="checkbox-item">
+            <input type="checkbox" bind:checked={acmeStaging} />
+            Use staging environment (for testing)
+          </label>
+        </div>
+
+        <div class="form-actions">
+          <button class="btn btn-cancel" onclick={() => (showAcmeForm = false)}>Cancel</button>
+          <button class="btn btn-primary" onclick={handleAcmeProvision} disabled={acmeSubmitting}>
+            {acmeSubmitting ? 'Provisioning...' : 'Provision Certificate'}
+          </button>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}
@@ -1046,5 +1210,48 @@
     display: flex;
     justify-content: flex-end;
     gap: 0.75rem;
+  }
+
+  .btn-acme {
+    padding: 0.5rem 1rem;
+    border-radius: var(--radius-md);
+    font-weight: 500;
+    border: 1px solid var(--color-green);
+    background: var(--color-green-subtle);
+    color: var(--color-green);
+    font-size: var(--text-md);
+    cursor: pointer;
+    transition: background-color var(--transition-fast);
+  }
+  .btn-acme:hover {
+    background: rgba(34, 197, 94, 0.2);
+  }
+
+  .success-banner {
+    background: var(--color-green-subtle);
+    border: 1px solid var(--color-green);
+    border-radius: var(--radius-md);
+    color: var(--color-green);
+    padding: var(--space-3) var(--space-4);
+    margin-bottom: var(--space-4);
+    font-size: var(--text-base);
+  }
+
+  .radio-group {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .radio-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-base);
+    cursor: pointer;
+  }
+
+  .radio-item input[type="radio"] {
+    accent-color: var(--color-primary);
   }
 </style>

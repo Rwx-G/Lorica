@@ -416,6 +416,23 @@ export const api = {
   reloadBlocklist: () =>
     request<{ reloaded: boolean; ip_count: number; source: string }>('POST', '/waf/blocklist/reload'),
 
+  // WAF Custom Rules
+  listCustomRules: () =>
+    request<{ rules: CustomWafRule[]; total: number }>('GET', '/waf/rules/custom'),
+
+  createCustomRule: (body: CreateCustomRuleRequest) =>
+    request<{ id: number; description: string; created: boolean }>('POST', '/waf/rules/custom', body),
+
+  deleteCustomRule: (id: number) =>
+    request<{ deleted: boolean; id: number }>('DELETE', `/waf/rules/custom/${id}`),
+
+  // ACME Certificate Provisioning
+  provisionAcme: (body: AcmeProvisionRequest) =>
+    request<AcmeProvisionResponse>('POST', '/acme/provision', body),
+
+  provisionAcmeDns: (body: AcmeDnsProvisionRequest) =>
+    request<AcmeProvisionResponse>('POST', '/acme/provision-dns', body),
+
   // Backends CRUD
   getBackend: (id: string) =>
     request<BackendResponse>('GET', `/backends/${id}`),
@@ -546,6 +563,47 @@ export interface WafRulesResponse {
   rules: WafRuleSummary[];
   total: number;
   enabled: number;
+}
+
+export interface CustomWafRule {
+  id: number;
+  description: string;
+  category: string;
+  severity: number;
+  pattern: string;
+}
+
+export interface CreateCustomRuleRequest {
+  id: number;
+  description: string;
+  category: string;
+  pattern: string;
+  severity?: number;
+}
+
+export interface AcmeProvisionRequest {
+  domain: string;
+  staging?: boolean;
+  contact_email?: string;
+}
+
+export interface AcmeDnsProvisionRequest {
+  domain: string;
+  staging?: boolean;
+  contact_email?: string;
+  dns: {
+    provider: string;
+    zone_id: string;
+    api_token: string;
+    api_secret?: string;
+  };
+}
+
+export interface AcmeProvisionResponse {
+  status: string;
+  domain: string;
+  staging: boolean;
+  message: string;
 }
 
 export interface BlocklistStatus {
