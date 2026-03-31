@@ -67,16 +67,22 @@ impl ProbeScheduler {
     }
 
     /// Reload probe configurations from the database and restart probe tasks.
+    /// Enforces the system-wide max_active_probes limit from global settings.
     pub async fn reload(&self) {
-        let probes = {
+        let (probes, max_probes) = {
             let store = self.store.lock().await;
-            match store.list_enabled_probes() {
+            let probes = match store.list_enabled_probes() {
                 Ok(p) => p,
                 Err(e) => {
                     error!(error = %e, "failed to load probe configs");
                     return;
                 }
-            }
+            };
+            let max = store
+                .get_global_settings()
+                .map(|s| s.max_active_probes as usize)
+                .unwrap_or(50);
+            (probes, max)
         };
 
         let mut tasks = self.tasks.lock().await;
@@ -86,14 +92,31 @@ impl ProbeScheduler {
             handle.abort();
         }
 
+        // Enforce the system-wide probe cap
+        let capped = if probes.len() > max_probes {
+            warn!(
+                total = probes.len(),
+                max = max_probes,
+                "probe count exceeds max_active_probes limit, only first {} will run",
+                max_probes
+            );
+            &probes[..max_probes]
+        } else {
+            &probes[..]
+        };
+
         // Start new probe tasks
-        for probe in probes {
+        for probe in capped {
             let id = probe.id.clone();
-            let handle = self.spawn_probe_task(probe);
+            let handle = self.spawn_probe_task(probe.clone());
             tasks.insert(id, handle);
         }
 
-        info!(count = tasks.len(), "active probes reloaded");
+        info!(
+            count = tasks.len(),
+            max = max_probes,
+            "active probes reloaded"
+        );
     }
 
     fn spawn_probe_task(&self, probe: ProbeConfig) -> JoinHandle<()> {

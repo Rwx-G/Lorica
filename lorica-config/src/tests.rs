@@ -314,6 +314,7 @@ mod tests {
             cert_warning_days: 14,
             cert_critical_days: 3,
             default_topology_type: TopologyType::Ha,
+            ..GlobalSettings::default()
         };
         store.update_global_settings(&new_settings).unwrap();
         let fetched = store.get_global_settings().unwrap();
@@ -378,6 +379,7 @@ mod tests {
             cert_warning_days: 14,
             cert_critical_days: 3,
             default_topology_type: TopologyType::Ha,
+            ..GlobalSettings::default()
         };
         store1.update_global_settings(&settings).unwrap();
 

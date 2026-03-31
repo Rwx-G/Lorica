@@ -315,6 +315,14 @@ pub struct GlobalSettings {
     pub cert_critical_days: i32,
     #[serde(default = "default_topology_type")]
     pub default_topology_type: TopologyType,
+    #[serde(default = "default_max_active_probes")]
+    pub max_active_probes: i32,
+    #[serde(default = "default_loadtest_max_concurrency")]
+    pub loadtest_max_concurrency: i32,
+    #[serde(default = "default_loadtest_max_duration_s")]
+    pub loadtest_max_duration_s: i32,
+    #[serde(default = "default_loadtest_max_rps")]
+    pub loadtest_max_rps: i32,
 }
 
 fn default_cert_warning_days() -> i32 {
@@ -329,6 +337,22 @@ fn default_topology_type() -> TopologyType {
     TopologyType::SingleVm
 }
 
+fn default_max_active_probes() -> i32 {
+    50
+}
+
+fn default_loadtest_max_concurrency() -> i32 {
+    100
+}
+
+fn default_loadtest_max_duration_s() -> i32 {
+    60
+}
+
+fn default_loadtest_max_rps() -> i32 {
+    1000
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
@@ -338,6 +362,10 @@ impl Default for GlobalSettings {
             cert_warning_days: 30,
             cert_critical_days: 7,
             default_topology_type: TopologyType::SingleVm,
+            max_active_probes: 50,
+            loadtest_max_concurrency: 100,
+            loadtest_max_duration_s: 60,
+            loadtest_max_rps: 1000,
         }
     }
 }
