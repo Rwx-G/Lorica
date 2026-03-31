@@ -350,6 +350,7 @@ fn run_supervisor(cli: Cli) {
                 waf_rule_count: None,
                 acme_challenge_store: None,
                 sla_collector: None,
+                load_test_engine: None,
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
@@ -758,6 +759,7 @@ fn run_single_process(cli: Cli) {
                 waf_rule_count: Some(waf_rule_count),
                 acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
+                load_test_engine: Some(Arc::new(lorica_bench::LoadTestEngine::new())),
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();

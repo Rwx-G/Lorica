@@ -6,6 +6,7 @@ pub mod backends;
 pub mod certificates;
 pub mod config;
 pub mod error;
+pub mod loadtest;
 pub mod logs;
 pub mod metrics;
 pub mod middleware;

@@ -39,6 +39,8 @@ pub struct AppState {
     pub acme_challenge_store: Option<crate::acme::AcmeChallengeStore>,
     /// Passive SLA metrics collector.
     pub sla_collector: Option<Arc<lorica_bench::SlaCollector>>,
+    /// Load test engine.
+    pub load_test_engine: Option<Arc<lorica_bench::LoadTestEngine>>,
 }
 
 impl AppState {
@@ -220,6 +222,36 @@ pub fn build_router(
         )
         .route("/api/v1/probes/:id", put(crate::probes::update_probe))
         .route("/api/v1/probes/:id", delete(crate::probes::delete_probe))
+        .route(
+            "/api/v1/loadtest/configs",
+            get(crate::loadtest::list_configs),
+        )
+        .route(
+            "/api/v1/loadtest/configs",
+            post(crate::loadtest::create_config),
+        )
+        .route(
+            "/api/v1/loadtest/configs/:id",
+            delete(crate::loadtest::delete_config),
+        )
+        .route(
+            "/api/v1/loadtest/start/:config_id",
+            post(crate::loadtest::start_test),
+        )
+        .route(
+            "/api/v1/loadtest/start/:config_id/confirm",
+            post(crate::loadtest::start_test_confirmed),
+        )
+        .route("/api/v1/loadtest/status", get(crate::loadtest::get_status))
+        .route("/api/v1/loadtest/abort", post(crate::loadtest::abort_test))
+        .route(
+            "/api/v1/loadtest/results/:config_id",
+            get(crate::loadtest::get_results),
+        )
+        .route(
+            "/api/v1/loadtest/results/:config_id/compare",
+            get(crate::loadtest::compare_results),
+        )
         .layer(middleware::from_fn(require_auth));
 
     // Dashboard routes serve embedded frontend assets (SPA with fallback)

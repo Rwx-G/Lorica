@@ -29,6 +29,7 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         waf_rule_count: None,
         acme_challenge_store: None,
         sla_collector: None,
+        load_test_engine: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
@@ -2738,6 +2739,7 @@ fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         waf_rule_count: Some(rule_count),
         acme_challenge_store: None,
         sla_collector: None,
+        load_test_engine: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
@@ -2759,6 +2761,7 @@ fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         waf_rule_count: None,
         acme_challenge_store: None,
         sla_collector: None,
+        load_test_engine: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
