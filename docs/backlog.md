@@ -6,8 +6,6 @@ Items identified during QA traceability audit (2026-04-01).
 
 | Source | Description | References |
 |--------|-------------|------------|
-| 7.3 AC5 | Adaptive flood defense: global RPS tracking exists but does not trigger stricter per-IP limits when threshold is exceeded. Currently tracking-only infrastructure. | `lorica/src/proxy_wiring.rs` flood rate counter |
-| 1.4 AC8 | OpenAPI spec (`lorica-api/openapi.yaml`) may be stale - verify it covers all 85 current endpoints | `lorica-api/openapi.yaml` vs `lorica-api/src/server.rs` |
 
 ## Medium Priority
 

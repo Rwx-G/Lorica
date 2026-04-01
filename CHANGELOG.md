@@ -31,7 +31,7 @@ Author: Rwx-G
 - Per-route max connections enforcement - 503 rejection when active connections reach limit, with per-route atomic counters that auto-decrement on request completion
 - Slowloris detection - requests with headers exceeding `slowloris_threshold_ms` (default 5000ms) rejected with 408 Request Timeout. Disabled when threshold is 0
 - Anti-DDoS auto-ban protection - per-IP violation counter (1-minute sliding window) escalates repeated 429s into temporary IP bans when exceeding `auto_ban_threshold`. Banned IPs receive 403 before route lookup or WAF. Configurable duration via `auto_ban_duration_s` (default 1h). Ban list API (`GET /api/v1/bans`, `DELETE /api/v1/bans/:ip`)
-- Global flood rate tracking - per-second request counter for dashboard metrics and future adaptive defense
+- Adaptive flood defense - when global RPS exceeds configurable `flood_threshold_rps` (in GlobalSettings), per-IP rate limits are automatically halved. Disabled by default (threshold = 0). Per-second request counter also feeds dashboard metrics
 - IP allowlist/denylist per route
 - CORS configuration per route (origins, methods, max-age)
 - Configurable security header presets ("strict", "moderate", "none") with support for custom presets via `custom_security_presets` in GlobalSettings. Presets include HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
@@ -90,7 +90,7 @@ Author: Rwx-G
 **Configuration & API**
 
 - Embedded SQLite database (`lorica-config`) with WAL mode, CRUD for routes, backends, certificates, global settings, notification configs, user preferences, and admin users. AES-256-GCM encryption for certificate private keys at rest
-- REST API (`lorica-api`) on localhost:9443 via axum. Session-based authentication with HTTP-only secure cookies, sliding window session renewal, first-run admin password generation, forced password change, rate-limited login. Full CRUD endpoints, config TOML export/import with preview and diff, notification test endpoint. Consistent JSON error envelope
+- REST API (`lorica-api`) on localhost:9443 via axum. Session-based authentication with HTTP-only secure cookies, sliding window session renewal, first-run admin password generation, forced password change, rate-limited login. Full CRUD endpoints, config TOML export/import with preview and diff, notification test endpoint. Consistent JSON error envelope. OpenAPI 3.0.3 specification (`openapi.yaml`) covering all 85 endpoints
 - CLI (`lorica`) with `--version`, `--data-dir`, `--log-level`, `--management-port`, `--http-port`, `--https-port`, `--workers`. Graceful shutdown on SIGTERM/SIGINT. systemd unit file with security hardening
 
 **Packaging (Epic 4)**

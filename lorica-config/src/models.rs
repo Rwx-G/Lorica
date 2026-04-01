@@ -470,6 +470,11 @@ pub struct GlobalSettings {
     pub loadtest_max_duration_s: i32,
     #[serde(default = "default_loadtest_max_rps")]
     pub loadtest_max_rps: i32,
+    /// Global flood detection threshold (requests per second).
+    /// When the proxy-wide RPS exceeds this value, per-IP rate limits are
+    /// halved to provide stricter protection. 0 = disabled (default).
+    #[serde(default)]
+    pub flood_threshold_rps: i32,
     /// User-defined security header presets, stored as JSON.
     /// These extend the builtin presets ("strict", "moderate", "none").
     /// If a custom preset shares a name with a builtin, the custom one wins.
@@ -562,6 +567,7 @@ impl Default for GlobalSettings {
             loadtest_max_concurrency: 100,
             loadtest_max_duration_s: 60,
             loadtest_max_rps: 1000,
+            flood_threshold_rps: 0,
             custom_security_presets: Vec::new(),
         }
     }

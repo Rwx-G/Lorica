@@ -11,10 +11,49 @@ servers:
   - url: http://localhost:9443
     description: Management port (localhost only)
 
+tags:
+  - name: Auth
+    description: Authentication and session management
+  - name: Settings
+    description: Global settings
+  - name: Routes
+    description: Proxy route management
+  - name: Backends
+    description: Backend server management
+  - name: Certificates
+    description: TLS certificate management
+  - name: ACME
+    description: ACME certificate provisioning
+  - name: Cache
+    description: Cache management and statistics
+  - name: Bans
+    description: IP ban management
+  - name: WAF
+    description: Web Application Firewall
+  - name: SLA
+    description: SLA monitoring and reporting
+  - name: Probes
+    description: Health probe management
+  - name: LoadTest
+    description: Load testing
+  - name: Logs
+    description: Log access and streaming
+  - name: System
+    description: System status and metrics
+  - name: Config
+    description: Configuration import/export
+  - name: Notifications
+    description: Notification channel management
+  - name: Preferences
+    description: User preferences
+
 paths:
+  # ---------------------------------------------------------------------------
+  # Auth (public)
+  # ---------------------------------------------------------------------------
   /api/v1/auth/login:
     post:
-      tags: [Authentication]
+      tags: [Auth]
       summary: Authenticate and create session
       requestBody:
         required: true
@@ -56,10 +95,8 @@ paths:
 
   /api/v1/auth/logout:
     post:
-      tags: [Authentication]
+      tags: [Auth]
       summary: Invalidate session and logout
-      security:
-        - sessionCookie: []
       responses:
         "200":
           description: Logout successful
@@ -68,9 +105,50 @@ paths:
               schema:
                 $ref: "#/components/schemas/MessageResponse"
 
+  # ---------------------------------------------------------------------------
+  # Metrics (public)
+  # ---------------------------------------------------------------------------
+  /metrics:
+    get:
+      tags: [System]
+      summary: Prometheus-compatible metrics endpoint
+      responses:
+        "200":
+          description: Metrics in Prometheus exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  # ---------------------------------------------------------------------------
+  # ACME challenge (public)
+  # ---------------------------------------------------------------------------
+  /.well-known/acme-challenge/{token}:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [ACME]
+      summary: Serve ACME HTTP-01 challenge response
+      responses:
+        "200":
+          description: Challenge token value
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Auth - password change (protected)
+  # ---------------------------------------------------------------------------
   /api/v1/auth/password:
     put:
-      tags: [Authentication]
+      tags: [Auth]
       summary: Change admin password
       security:
         - sessionCookie: []
@@ -99,6 +177,53 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  # ---------------------------------------------------------------------------
+  # Settings
+  # ---------------------------------------------------------------------------
+  /api/v1/settings:
+    get:
+      tags: [Settings]
+      summary: Get global settings
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Current settings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    put:
+      tags: [Settings]
+      summary: Update global settings
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Settings updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # Routes
+  # ---------------------------------------------------------------------------
   /api/v1/routes:
     get:
       tags: [Routes]
@@ -120,6 +245,8 @@ paths:
                         type: array
                         items:
                           $ref: "#/components/schemas/Route"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
     post:
       tags: [Routes]
       summary: Create a new route
@@ -143,15 +270,12 @@ paths:
                     $ref: "#/components/schemas/Route"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /api/v1/routes/{id}:
     parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
+      - $ref: "#/components/parameters/ResourceId"
     get:
       tags: [Routes]
       summary: Get route by ID
@@ -167,6 +291,8 @@ paths:
                 properties:
                   data:
                     $ref: "#/components/schemas/Route"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
     put:
@@ -190,6 +316,8 @@ paths:
                 properties:
                   data:
                     $ref: "#/components/schemas/Route"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
     delete:
@@ -204,9 +332,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
 
+  # ---------------------------------------------------------------------------
+  # Backends
+  # ---------------------------------------------------------------------------
   /api/v1/backends:
     get:
       tags: [Backends]
@@ -228,6 +361,8 @@ paths:
                         type: array
                         items:
                           $ref: "#/components/schemas/Backend"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
     post:
       tags: [Backends]
       summary: Add a new backend
@@ -251,15 +386,12 @@ paths:
                     $ref: "#/components/schemas/Backend"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /api/v1/backends/{id}:
     parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
+      - $ref: "#/components/parameters/ResourceId"
     get:
       tags: [Backends]
       summary: Get backend by ID
@@ -275,6 +407,8 @@ paths:
                 properties:
                   data:
                     $ref: "#/components/schemas/Backend"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
     put:
@@ -298,6 +432,8 @@ paths:
                 properties:
                   data:
                     $ref: "#/components/schemas/Backend"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
     delete:
@@ -312,9 +448,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
 
+  # ---------------------------------------------------------------------------
+  # Certificates
+  # ---------------------------------------------------------------------------
   /api/v1/certificates:
     get:
       tags: [Certificates]
@@ -336,6 +477,8 @@ paths:
                         type: array
                         items:
                           $ref: "#/components/schemas/Certificate"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
     post:
       tags: [Certificates]
       summary: Upload a certificate
@@ -359,15 +502,12 @@ paths:
                     $ref: "#/components/schemas/Certificate"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /api/v1/certificates/{id}:
     parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-          format: uuid
+      - $ref: "#/components/parameters/ResourceId"
     get:
       tags: [Certificates]
       summary: Get certificate details
@@ -383,6 +523,38 @@ paths:
                 properties:
                   data:
                     $ref: "#/components/schemas/CertificateDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Certificates]
+      summary: Update certificate
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cert_pem:
+                  type: string
+                key_pem:
+                  type: string
+      responses:
+        "200":
+          description: Certificate updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Certificate"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
     delete:
@@ -397,6 +569,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -406,9 +580,331 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/v1/certificates/self-signed:
+    post:
+      tags: [Certificates]
+      summary: Generate a self-signed certificate
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain]
+              properties:
+                domain:
+                  type: string
+      responses:
+        "201":
+          description: Self-signed certificate generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Certificate"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # ACME
+  # ---------------------------------------------------------------------------
+  /api/v1/acme/provision:
+    post:
+      tags: [ACME]
+      summary: Provision certificate via ACME HTTP-01 challenge
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain]
+              properties:
+                domain:
+                  type: string
+      responses:
+        "200":
+          description: Certificate provisioned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/acme/provision-dns:
+    post:
+      tags: [ACME]
+      summary: Provision certificate via ACME DNS-01 challenge (automatic)
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain]
+              properties:
+                domain:
+                  type: string
+      responses:
+        "200":
+          description: Certificate provisioned via DNS
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/acme/provision-dns-manual:
+    post:
+      tags: [ACME]
+      summary: Start manual DNS-01 challenge (returns TXT record to create)
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain]
+              properties:
+                domain:
+                  type: string
+      responses:
+        "200":
+          description: DNS TXT record details to create
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      record_name:
+                        type: string
+                      record_value:
+                        type: string
+                      challenge_id:
+                        type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/acme/provision-dns-manual/confirm:
+    post:
+      tags: [ACME]
+      summary: Confirm manual DNS-01 challenge after TXT record is set
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challenge_id]
+              properties:
+                challenge_id:
+                  type: string
+      responses:
+        "200":
+          description: Certificate provisioned after DNS verification
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # Cache
+  # ---------------------------------------------------------------------------
+  /api/v1/cache/routes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    delete:
+      tags: [Cache]
+      summary: Purge cached entries for a route
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Cache purged for route
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/cache/stats:
+    get:
+      tags: [Cache]
+      summary: Get cache hit/miss statistics
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Cache statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      hits:
+                        type: integer
+                      misses:
+                        type: integer
+                      hit_rate:
+                        type: number
+                        format: double
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # Bans
+  # ---------------------------------------------------------------------------
+  /api/v1/bans:
+    get:
+      tags: [Bans]
+      summary: List all banned IPs
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: List of banned IPs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      bans:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            ip:
+                              type: string
+                            banned_at:
+                              type: string
+                              format: date-time
+                            duration_s:
+                              type: integer
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/bans/{ip}:
+    parameters:
+      - name: ip
+        in: path
+        required: true
+        description: IP address to unban
+        schema:
+          type: string
+    delete:
+      tags: [Bans]
+      summary: Remove an IP ban
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Ban removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Logs
+  # ---------------------------------------------------------------------------
+  /api/v1/logs:
+    get:
+      tags: [Logs]
+      summary: Get recent log entries
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Log entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      logs:
+                        type: array
+                        items:
+                          type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [Logs]
+      summary: Clear log buffer
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Logs cleared
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/logs/ws:
+    get:
+      tags: [Logs]
+      summary: Stream logs via WebSocket
+      security:
+        - sessionCookie: []
+      responses:
+        "101":
+          description: WebSocket upgrade for real-time log streaming
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # System / Status / Workers
+  # ---------------------------------------------------------------------------
   /api/v1/status:
     get:
-      tags: [Status]
+      tags: [System]
       summary: Proxy status overview
       security:
         - sessionCookie: []
@@ -422,10 +918,879 @@ paths:
                 properties:
                   data:
                     $ref: "#/components/schemas/Status"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
+  /api/v1/system:
+    get:
+      tags: [System]
+      summary: System information (CPU, memory, uptime)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: System metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/workers:
+    get:
+      tags: [System]
+      summary: List worker processes and their health
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Worker status list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      workers:
+                        type: array
+                        items:
+                          type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # WAF
+  # ---------------------------------------------------------------------------
+  /api/v1/waf/events:
+    get:
+      tags: [WAF]
+      summary: List recent WAF events
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: WAF event list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      events:
+                        type: array
+                        items:
+                          type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [WAF]
+      summary: Clear WAF event buffer
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: WAF events cleared
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/waf/stats:
+    get:
+      tags: [WAF]
+      summary: Get WAF statistics (blocks, detections, top rules)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: WAF statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/waf/rules:
+    get:
+      tags: [WAF]
+      summary: List all WAF rules and their status
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: WAF rule list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      rules:
+                        type: array
+                        items:
+                          type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/waf/rules/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    put:
+      tags: [WAF]
+      summary: Toggle a WAF rule on/off
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        "200":
+          description: Rule toggled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/waf/rules/custom:
+    get:
+      tags: [WAF]
+      summary: List custom WAF rules
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Custom rule list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      rules:
+                        type: array
+                        items:
+                          type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [WAF]
+      summary: Create a custom WAF rule
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Custom rule created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/waf/rules/custom/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    delete:
+      tags: [WAF]
+      summary: Delete a custom WAF rule
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Custom rule deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/waf/blocklist:
+    get:
+      tags: [WAF]
+      summary: Get blocklist status
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Blocklist status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    put:
+      tags: [WAF]
+      summary: Toggle blocklist on/off
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        "200":
+          description: Blocklist toggled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/waf/blocklist/reload:
+    post:
+      tags: [WAF]
+      summary: Reload blocklist from source
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Blocklist reloaded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # SLA
+  # ---------------------------------------------------------------------------
+  /api/v1/sla/overview:
+    get:
+      tags: [SLA]
+      summary: Get SLA overview across all routes
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: SLA overview data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/sla/routes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [SLA]
+      summary: Get SLA metrics for a specific route
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Route SLA data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/sla/routes/{id}/buckets:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [SLA]
+      summary: Get SLA histogram buckets for a route
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: SLA bucket data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/sla/routes/{id}/config:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [SLA]
+      summary: Get SLA configuration for a route
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: SLA config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [SLA]
+      summary: Update SLA configuration for a route
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: SLA config updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/sla/routes/{id}/export:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [SLA]
+      summary: Export SLA data for a route
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Exported SLA data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/sla/routes/{id}/active:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [SLA]
+      summary: Get active probe SLA data for a route
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Active SLA data from probes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Probes
+  # ---------------------------------------------------------------------------
+  /api/v1/probes:
+    get:
+      tags: [Probes]
+      summary: List all health probes
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Probe list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      probes:
+                        type: array
+                        items:
+                          type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Probes]
+      summary: Create a health probe
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Probe created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/probes/route/{route_id}:
+    parameters:
+      - name: route_id
+        in: path
+        required: true
+        description: Route ID to filter probes by
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [Probes]
+      summary: List probes for a specific route
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Probes for the route
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      probes:
+                        type: array
+                        items:
+                          type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/probes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    put:
+      tags: [Probes]
+      summary: Update a health probe
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Probe updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Probes]
+      summary: Delete a health probe
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Probe deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # LoadTest
+  # ---------------------------------------------------------------------------
+  /api/v1/loadtest/configs:
+    get:
+      tags: [LoadTest]
+      summary: List load test configurations
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Config list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      configs:
+                        type: array
+                        items:
+                          type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [LoadTest]
+      summary: Create a load test configuration
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Config created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/loadtest/configs/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    put:
+      tags: [LoadTest]
+      summary: Update a load test configuration
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Config updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [LoadTest]
+      summary: Delete a load test configuration
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Config deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/loadtest/configs/{id}/clone:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    post:
+      tags: [LoadTest]
+      summary: Clone a load test configuration
+      security:
+        - sessionCookie: []
+      responses:
+        "201":
+          description: Config cloned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/loadtest/start/{config_id}:
+    parameters:
+      - name: config_id
+        in: path
+        required: true
+        description: Load test configuration ID
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [LoadTest]
+      summary: Start a load test (dry-run check)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Pre-flight check passed, confirmation required
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/loadtest/start/{config_id}/confirm:
+    parameters:
+      - name: config_id
+        in: path
+        required: true
+        description: Load test configuration ID
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [LoadTest]
+      summary: Confirm and start the load test
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Load test started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Another test is already running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/loadtest/status:
+    get:
+      tags: [LoadTest]
+      summary: Get current load test status
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Current test status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/loadtest/stream:
+    get:
+      tags: [LoadTest]
+      summary: Stream load test progress via SSE
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Server-Sent Events stream of test progress
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/loadtest/abort:
+    post:
+      tags: [LoadTest]
+      summary: Abort a running load test
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Test aborted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/loadtest/results/{config_id}:
+    parameters:
+      - name: config_id
+        in: path
+        required: true
+        description: Load test configuration ID
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [LoadTest]
+      summary: Get load test results for a configuration
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Test results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/loadtest/results/{config_id}/compare:
+    parameters:
+      - name: config_id
+        in: path
+        required: true
+        description: Load test configuration ID
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [LoadTest]
+      summary: Compare load test results across runs
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Comparison data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Config import/export
+  # ---------------------------------------------------------------------------
   /api/v1/config/export:
     post:
-      tags: [Configuration]
+      tags: [Config]
       summary: Export full configuration as TOML
       security:
         - sessionCookie: []
@@ -436,10 +1801,12 @@ paths:
             application/toml:
               schema:
                 type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /api/v1/config/import:
     post:
-      tags: [Configuration]
+      tags: [Config]
       summary: Import configuration from TOML
       security:
         - sessionCookie: []
@@ -463,6 +1830,229 @@ paths:
                 $ref: "#/components/schemas/MessageResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/config/import/preview:
+    post:
+      tags: [Config]
+      summary: Preview configuration import diff
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [toml_content]
+              properties:
+                toml_content:
+                  type: string
+                  description: Full TOML configuration content
+      responses:
+        "200":
+          description: Preview of changes that would be applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # Notifications
+  # ---------------------------------------------------------------------------
+  /api/v1/notifications:
+    get:
+      tags: [Notifications]
+      summary: List notification channels
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Notification channel list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      notifications:
+                        type: array
+                        items:
+                          type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Notifications]
+      summary: Create a notification channel
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Notification channel created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/notifications/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    put:
+      tags: [Notifications]
+      summary: Update a notification channel
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Notification channel updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Notifications]
+      summary: Delete a notification channel
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Notification channel deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/notifications/{id}/test:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    post:
+      tags: [Notifications]
+      summary: Send a test notification
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Test notification sent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Preferences
+  # ---------------------------------------------------------------------------
+  /api/v1/preferences:
+    get:
+      tags: [Preferences]
+      summary: List user preferences
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Preferences list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      preferences:
+                        type: array
+                        items:
+                          type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/preferences/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    put:
+      tags: [Preferences]
+      summary: Update a preference
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Preference updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Preferences]
+      summary: Delete a preference
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Preference deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
 components:
   securitySchemes:
@@ -470,6 +2060,15 @@ components:
       type: apiKey
       in: cookie
       name: lorica_session
+
+  parameters:
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
 
   schemas:
     Route:
