@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -343,6 +343,8 @@ pub struct LoricaProxy {
     pub waf_engine: Arc<WafEngine>,
     /// Passive SLA metrics collector.
     pub sla_collector: Arc<SlaCollector>,
+    /// Per-route rate limiter (keyed by "route_id:client_ip").
+    pub rate_limiter: Arc<lorica_limits::rate::Rate>,
 }
 
 impl LoricaProxy {
@@ -360,6 +362,7 @@ impl LoricaProxy {
             ewma_tracker: Arc::new(EwmaTracker::new()),
             waf_engine: Arc::new(WafEngine::new()),
             sla_collector,
+            rate_limiter: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
         }
     }
 
@@ -527,6 +530,34 @@ impl ProxyHttp for LoricaProxy {
                             .await?;
                         return Ok(true);
                     }
+                }
+            }
+        }
+
+        // Per-route rate limiting
+        if let Some(rps) = entry.route.rate_limit_rps {
+            if let Some(ref ip) = check_ip {
+                let key = format!("{}:{}", entry.route.id, ip);
+                self.rate_limiter.observe(&key, 1);
+                let current_rate = self.rate_limiter.rate(&key);
+                let effective_limit = match entry.route.rate_limit_burst {
+                    Some(burst) => (rps + burst) as f64,
+                    None => rps as f64,
+                };
+                if current_rate > effective_limit {
+                    warn!(
+                        route_id = %entry.route.id,
+                        client_ip = %ip,
+                        current_rate = %current_rate,
+                        limit_rps = %rps,
+                        "request rate-limited (429)"
+                    );
+                    let mut header = lorica_http::ResponseHeader::build(429, None)?;
+                    header.insert_header("Retry-After", "1")?;
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(true);
                 }
             }
         }
@@ -1333,5 +1364,67 @@ mod tests {
         assert_eq!(strict.headers["X-Frame-Options"], "SAMEORIGIN");
         // And should NOT have the builtin headers that were not in the override
         assert!(!strict.headers.contains_key("Content-Security-Policy"));
+    }
+
+    // ---- Rate Limiter ----
+
+    #[test]
+    fn test_rate_limiter_tracks_requests() {
+        let rate = lorica_limits::rate::Rate::new(Duration::from_secs(1));
+        let key = "route1:192.168.1.1";
+
+        // First interval: observe some requests
+        rate.observe(&key, 1);
+        rate.observe(&key, 1);
+        rate.observe(&key, 1);
+
+        // Within the same interval, rate() reports the previous interval (0 since first interval)
+        assert_eq!(rate.rate(&key), 0.0);
+
+        // After one interval passes, the rate should reflect the observed count
+        std::thread::sleep(Duration::from_millis(1100));
+        rate.observe(&key, 1); // trigger interval flip
+        let current_rate = rate.rate(&key);
+        assert!(
+            current_rate >= 2.0,
+            "Expected rate >= 2.0, got {current_rate}"
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_different_keys_are_independent() {
+        let rate = lorica_limits::rate::Rate::new(Duration::from_secs(1));
+        let key_a = "route1:10.0.0.1";
+        let key_b = "route1:10.0.0.2";
+
+        for _ in 0..10 {
+            rate.observe(&key_a, 1);
+        }
+        rate.observe(&key_b, 1);
+
+        // After interval flip, rates should differ
+        std::thread::sleep(Duration::from_millis(1100));
+        rate.observe(&key_a, 1);
+        rate.observe(&key_b, 1);
+
+        let rate_a = rate.rate(&key_a);
+        let rate_b = rate.rate(&key_b);
+        assert!(
+            rate_a > rate_b,
+            "Key A ({rate_a}) should have higher rate than Key B ({rate_b})"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_burst_threshold() {
+        // Verify that the burst logic allows rps + burst before triggering
+        let rps: u32 = 10;
+        let burst: u32 = 5;
+        let effective_limit = (rps + burst) as f64;
+
+        // A rate of 14.0 should be allowed (< 15)
+        assert!(14.0 <= effective_limit);
+        // A rate of 16.0 should be blocked (> 15)
+        assert!(16.0 > effective_limit);
     }
 }

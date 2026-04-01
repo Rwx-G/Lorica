@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-route rate limiting enforcement** - The `rate_limit_rps` and `rate_limit_burst` fields on routes are now enforced in the proxy hot path. Requests exceeding the configured rate receive a 429 response with a `Retry-After: 1` header. Uses the `lorica-limits` crate Rate estimator keyed by route ID + client IP for per-client fairness. Burst tolerance allows short spikes up to `rps + burst` before throttling.
+
 ### Changed
 
 - **Configurable security header presets** - Security header presets ("strict", "moderate", "none") are no longer hardcoded in the proxy engine. Builtin presets are defined as data in `builtin_security_presets()` and can be extended or overridden via `custom_security_presets` in GlobalSettings. Operators can define new named presets (e.g. "api-only") and reference them in route `security_headers` field. Custom presets with the same name as a builtin replace it.
