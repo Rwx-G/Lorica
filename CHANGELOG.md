@@ -5,85 +5,112 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+Author: Romain G.
+
 ## [Unreleased]
 
-### Changed
-
-- **Production-ready HTTP cache eviction** - Replaced the unbounded MemCache backend (no eviction, HashMap grows forever) with MemCache backed by a simple LRU eviction manager capped at 128 MiB. When the global cache exceeds the limit, least-recently-used entries are purged automatically. This makes the HTTP response cache safe for production workloads with bounded memory usage.
-- **DashMap for ban list and route connections** - Replaced `RwLock<HashMap>` with `DashMap` for the ban list and per-route connection counters in the proxy hot path. DashMap provides lock-free concurrent reads and sharded writes, reducing contention under high concurrency.
-
-### Fixed
-
-- **Cache purge endpoint now functional** - The `DELETE /api/v1/cache/routes/:id` endpoint was a stub. It now clears all cached entries via `MemCache::clear_all()` and resets hit/miss counters. Since cache keys are host+path+query (not route-keyed), a full purge is performed.
-
 ### Added
 
-- **Rate limit response headers** - Proxied responses now include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers when a route has `rate_limit_rps` configured. Rate info is stored in RequestCtx during request_filter and injected in response_filter.
-- **Cache stats API** - New `GET /api/v1/cache/stats` endpoint returning cache hit/miss counters and hit rate percentage. Counters are tracked per-process in the proxy engine via atomic counters incremented on each X-Cache-Status decision.
-- **Ban list API and dashboard** - New `GET /api/v1/bans` and `DELETE /api/v1/bans/:ip` endpoints to list and remove auto-banned IPs. Security dashboard has a new "Bans" tab showing banned IPs with remaining duration and an unban button. Auto-refreshes every 10 seconds.
+**Proxy Engine (Epics 1-2)**
 
-### Added
+- HTTP/HTTPS reverse proxy built on Cloudflare Pingora (17 crates, renamed to `lorica-*`). Host-based and path-prefix routing, TLS termination via rustls, structured JSON access logging, and configuration hot-reload via `arc-swap` on API mutations
+- Round-robin load balancing with health-aware backend filtering, plus Peak EWMA latency-based selection, Consistent Hash, and Random strategies - selectable per route
+- Process-based worker isolation (`lorica-worker`): supervisor forks N worker processes, passes listening sockets via SCM_RIGHTS. Exponential restart backoff (1s-30s), graceful SIGTERM shutdown. Configurable via `--workers N` (default 0 = single-process mode)
+- Protobuf command channel (`lorica-command`) between supervisor and workers over Unix socketpair with 8-byte LE size-prefix framing. Dispatches ConfigReload on API changes; workers apply inline without pausing traffic. Heartbeat monitoring every 5s with timeout detection
+- SNI-based certificate hot-swap (`lorica-tls`) with wildcard support (`*.example.com`). Multiple certificates per domain sorted by expiration. Atomic swap via `arc-swap` with zero downtime. Integrated through rustls `ResolvesServerCert` trait
+- Backend lifecycle management with per-backend active connection tracking (atomic counters), graceful drain on removal (Normal/Closing/Closed states), and load balancer exclusion of draining backends
+- TCP and HTTP health checks with configurable interval. Backends marked degraded (>2s latency) or down (unreachable) and excluded from rotation. HTTP probes via `health_check_path` expecting 2xx within timeout
+- Topology-aware health check behavior: SingleVM (passive only), HA/Custom (active TCP/HTTP probes), DockerSwarm/Kubernetes (service discovery integration). Multi-route priority resolution and global default topology in settings
+- WebSocket log streaming via `GET /api/v1/logs/ws` with LogBuffer broadcast and frontend auto-connect with polling fallback
 
-- **HTTP response caching** - Wired the Pingora MemCache engine into the proxy. Routes with `cache_enabled = true` now cache GET/HEAD responses in memory using TinyUFO eviction. Cache key is host + path + query. Requests with Authorization/Cookie headers or Cache-Control: no-cache/no-store bypass the cache. Origin Cache-Control headers are honoured; when absent, the route's `cache_ttl_s` (default 300s) applies to 200/301 responses. Max cacheable response size controlled by `cache_max_bytes`. X-Cache-Status response header indicates HIT, MISS, STALE, REVALIDATED, or BYPASS.
-- **Anti-DDoS auto-ban protection** - IPs that repeatedly exceed rate limits are automatically banned. A per-IP violation counter (1-minute sliding window) tracks 429 responses; when violations exceed the route's `auto_ban_threshold`, the IP is added to an in-memory ban list. Banned IPs receive 403 immediately (before any route lookup or WAF processing). Bans expire after `auto_ban_duration_s` (default 1 hour) with lazy cleanup on access. Ban list is ephemeral (memory-only, clears on restart). New `IpBanned` alert type in lorica-notify with Slack support.
-- **Per-route rate limiting enforcement** - The `rate_limit_rps` and `rate_limit_burst` fields on routes are now enforced in the proxy hot path. Requests exceeding the configured rate receive a 429 response with a `Retry-After: 1` header. Uses the `lorica-limits` crate Rate estimator keyed by route ID + client IP for per-client fairness. Burst tolerance allows short spikes up to `rps + burst` before throttling.
-- **Slowloris detection** - Requests where headers take longer than the route's `slowloris_threshold_ms` (default 5000ms) to arrive are rejected with 408 Request Timeout. Detects slow-header attacks by measuring elapsed time from connection start to request_filter. Disabled when threshold is set to 0.
-- **Per-route max connections enforcement** - Routes with `max_connections` configured now reject new requests with 503 Service Unavailable when the active connection count reaches the limit. Uses per-route atomic counters that auto-decrement when the request completes. Independent limits per route.
-- **Global flood rate tracking** - A global request rate counter tracks all incoming requests per second using the `lorica-limits` Rate estimator. Available for dashboard metrics and future adaptive defense policies.
+**Security (Epics 3, 7)**
 
-### Changed
+- WAF engine (`lorica-waf`) with 18 OWASP CRS-inspired rules covering SQL injection, XSS, path traversal, command injection, and protocol violations. Detection mode (log only) and blocking mode (403). Precompiled regex with URL decoding. Sub-0.5ms evaluation latency. Zero overhead when disabled
+- Configurable WAF rule sets - individual rules can be enabled/disabled at runtime via API (`GET/PUT /api/v1/waf/rules/:id`)
+- Per-route rate limiting enforcement using `lorica-limits` Rate estimator keyed by route ID + client IP. 429 responses with `Retry-After` header. Burst tolerance via `rate_limit_burst`. Rate limit response headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`)
+- Per-route max connections enforcement - 503 rejection when active connections reach limit, with per-route atomic counters that auto-decrement on request completion
+- Slowloris detection - requests with headers exceeding `slowloris_threshold_ms` (default 5000ms) rejected with 408 Request Timeout. Disabled when threshold is 0
+- Anti-DDoS auto-ban protection - per-IP violation counter (1-minute sliding window) escalates repeated 429s into temporary IP bans when exceeding `auto_ban_threshold`. Banned IPs receive 403 before route lookup or WAF. Configurable duration via `auto_ban_duration_s` (default 1h). Ban list API (`GET /api/v1/bans`, `DELETE /api/v1/bans/:ip`)
+- Global flood rate tracking - per-second request counter for dashboard metrics and future adaptive defense
+- IP allowlist/denylist per route
+- CORS configuration per route (origins, methods, max-age)
+- Configurable security header presets ("strict", "moderate", "none") with support for custom presets via `custom_security_presets` in GlobalSettings. Presets include HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
 
-- **Configurable security header presets** - Security header presets ("strict", "moderate", "none") are no longer hardcoded in the proxy engine. Builtin presets are defined as data in `builtin_security_presets()` and can be extended or overridden via `custom_security_presets` in GlobalSettings. Operators can define new named presets (e.g. "api-only") and reference them in route `security_headers` field. Custom presets with the same name as a builtin replace it.
+**Monitoring (Epic 5)**
 
-### Added
+- Passive SLA monitoring (`lorica-bench`) - per-route metrics from real traffic with lock-free atomic counters. Time-bucketed aggregation (1-minute resolution), rolling SLA windows (1h, 24h, 7d, 30d), configurable success criteria per route. Background flush to SQLite every 60s. CSV/JSON export. API: `GET /api/v1/sla/overview`, `/sla/routes/:id`, `/sla/routes/:id/buckets`, `PUT /sla/routes/:id/config`, export endpoint
+- Active SLA monitoring - synthetic health probes per route/backend with configurable HTTP method, path, expected status, interval (min 5s), and timeout. System-wide `max_active_probes` cap (default 50). ProbeScheduler manages per-probe tokio tasks with automatic reload on config change. API: `CRUD /api/v1/probes`, `GET /sla/routes/:id/active`
+- SLA threshold alerts (`sla_breached` alert type) - automatic notifications when passive SLA drops below configured target
+- Built-in load testing - concurrent HTTP request generation with configurable concurrency, RPS, duration, and request pattern. Safe limits via global settings (not hardcoded) with explicit confirmation for exceeding them. Auto-abort on error rate threshold (default 10%). CPU circuit breaker at 90% to protect real traffic. SSE real-time streaming, cron-based scheduling, config cloning for reproducible comparisons
+- Prometheus metrics at `/metrics` (no auth): request count + latency histogram (route_id, status_code labels), active connections, backend health gauge, certificate expiry days, WAF events by category/action, system CPU and memory
 
-- **Route configuration** (Epic 6) - 25 per-route production proxy settings: force HTTPS redirect (301), hostname redirect, hostname aliases, configurable proxy headers (set/remove), response headers (set/remove), security headers presets (strict/moderate/none with HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy), per-route timeouts (connect/read/send), path rewriting (strip/add prefix), access log toggle, max request body size, WebSocket toggle, per-route rate limiting (RPS + burst), IP allowlist/denylist, CORS configuration (origins, methods, max-age), gzip compression toggle, retry attempts. Dashboard Routes form with collapsible Advanced Configuration section.
-- **Passive SLA monitoring** (`lorica-bench`) - Per-route SLA metrics collected from real traffic with lock-free atomic counters in the proxy hot path. Time-bucketed aggregation (1-minute resolution), rolling SLA windows (1h, 24h, 7d, 30d), configurable success criteria per route (status range + max latency). SLA config snapshotted in each time bucket for historical consistency after config changes. Background flush to SQLite every 60s. CSV and JSON export. API endpoints: `GET /api/v1/sla/overview`, `GET /api/v1/sla/routes/:id`, `GET /api/v1/sla/routes/:id/buckets`, `PUT /api/v1/sla/routes/:id/config`, `GET /api/v1/sla/routes/:id/export?format=csv|json`.
-- **Active SLA monitoring** - Synthetic health probes per route/backend with configurable HTTP method, path, expected status, interval (min 5s), and timeout. Probes resolve real backend addresses from route configuration. System-wide `max_active_probes` cap (default 50) configurable via global settings. Probe results stored independently as "active" source SLA buckets. ProbeScheduler manages per-probe tokio tasks with automatic reload on config change. API endpoints: `CRUD /api/v1/probes`, `GET /api/v1/sla/routes/:id/active`.
-- **Built-in load testing** - Load test engine generating concurrent HTTP requests to backends. Configurable parameters: concurrency, RPS, duration, request pattern (URL, method, headers, body). Safe limits configurable via global settings (`loadtest_max_concurrency/duration/rps`), not hardcoded - explicit confirmation endpoint for exceeding them. Auto-abort when error rate exceeds configurable threshold (default 10%). CPU circuit breaker aborts load tests when system CPU exceeds 90% for 3 consecutive checks to protect real proxy traffic. SSE real-time streaming (`GET /api/v1/loadtest/stream`). Cron-based scheduled execution via `schedule_cron` field with 5-field cron syntax. Config cloning (`POST /api/v1/loadtest/configs/:id/clone`) for reproducible historical comparisons. API endpoints: `CRUD /api/v1/loadtest/configs`, `POST /api/v1/loadtest/start/:id`, `GET /api/v1/loadtest/status`, `POST /api/v1/loadtest/abort`, `GET /api/v1/loadtest/results/:id/compare`.
-- **SLA threshold alerts** - New `sla_breached` alert type in lorica-notify. Automatic alerts dispatched when passive SLA drops below configured target percentage.
-- **New `lorica-bench` crate** - SLA monitoring and load testing engine. Depends on lorica-config for persistence and lorica-notify for alerts.
-- **SLA dashboard page** - Per-route SLA overview cards, passive/active side-by-side comparison, latency percentile tables for all time windows, SLA config editor modal, CSV/JSON export, recent bucket history.
-- **Active Probes dashboard page** - CRUD management for synthetic health probes with route selection, HTTP method/path/status/interval/timeout configuration, enable/disable toggle.
-- **Load Test dashboard page** - Test config management with clone, one-click execution with safe limit confirmation, real-time SSE progress panel (requests, RPS, latency, error rate), abort button, historical results with comparison deltas.
-- **Backends CRUD dashboard page** - Full backend management replacing placeholder, with address, weight, health check (TCP/HTTP), TLS upstream, active connections.
+**Route Configuration (Epic 6)**
 
-- **WAF engine** (`lorica-waf`) - Optional per-route Web Application Firewall with 18 OWASP CRS-inspired rules covering SQL injection, XSS, path traversal, command injection, and protocol violations. Detection mode (log only) and blocking mode (403 response). Precompiled regex patterns with URL decoding. Event ring buffer (500 events) for dashboard consumption. Sub-0.5ms evaluation latency. Zero overhead when WAF is disabled on a route.
-- **Security dashboard** - New Security page showing WAF event table with category filtering, stats cards per attack category, and event clearing. WAF events API: `GET /api/v1/waf/events`, `GET /api/v1/waf/stats`, `DELETE /api/v1/waf/events`.
-- **WAF route controls** - WAF enabled/mode toggle in route create/update API and dashboard. Routes table shows WAF status (Detect/Block/-).
-- **Topology-aware health checks** - Health check behavior adapts to route topology type. SingleVM: no active probes (passive detection only). HA/Custom: active TCP or HTTP probes. DockerSwarm/Kubernetes: service discovery integration. Multi-route priority resolution (HA > Custom > SingleVM). Global default topology configurable in settings.
-- **Configurable WAF rule sets** - Individual WAF rules can be enabled/disabled at runtime via API (`GET/PUT /api/v1/waf/rules/:id`). Security dashboard Rules tab with toggle switches per rule.
-- **HTTP health checks** - Backends can specify `health_check_path` (e.g. "/healthz") for HTTP GET probes instead of TCP-only. Expects 2xx response within timeout. DB migration 002 adds the column.
-- **Notification rate limiting** - Per-channel sliding window rate limiter (default: 10 per 60s) prevents alert storms. Configurable via `RateLimitConfig`. Suppressed notifications logged with warning.
-- **Docker Swarm service discovery** - `DockerDiscovery` connects to Docker daemon via socket API (bollard), discovers services by virtual IP (Swarm internal LB handles per-task dispatch). Health derived from running vs desired task counts - a service with zero running replicas is marked unhealthy. Behind `docker` feature flag.
-- **Kubernetes pod discovery** - `K8sDiscovery` connects to Kubernetes API (kube-rs), reads Endpoints resources with ready/not-ready addresses. Behind `kubernetes` feature flag.
-- **Notification channels** (`lorica-notify`) - Alert event system with 4 types: cert_expiring, backend_down, waf_alert, config_changed. Three delivery channels: stdout (always on, structured JSON), SMTP email via lettre (STARTTLS, configurable auth), HTTP webhook via reqwest (JSON POST with optional Authorization header). NotifyDispatcher with channel subscription filtering and event history ring buffer (100 events).
+- 25+ per-route production proxy settings: force HTTPS redirect (301), hostname redirect, hostname aliases, configurable proxy headers (set/remove), response headers (set/remove), security header presets, per-route timeouts (connect/read/send), path rewriting (strip/add prefix), access log toggle, max request body size, WebSocket toggle, rate limiting (RPS + burst), IP allowlist/denylist, CORS, gzip compression toggle, retry attempts
 
-- **Proxy engine** - HTTP/HTTPS reverse proxy forked from Cloudflare Pingora, renamed to Lorica (17 crates). Host-based and path-prefix routing, round-robin load balancing with health-aware filtering, TLS termination via rustls, structured JSON access logging. Configuration hot-reload via `arc-swap` triggered automatically on API mutations.
-- **Configuration store** (`lorica-config`) - Embedded SQLite database with WAL mode for crash safety. Data models for routes, backends, certificates, global settings, notification configs, user preferences, and admin users. CRUD operations, database migrations, TOML export/import with referential integrity validation and diff preview. AES-256-GCM encryption for certificate private keys at rest.
-- **REST API** (`lorica-api`) - axum-based management API on localhost:9443. Session-based authentication with HTTP-only secure cookies, first-run admin password generation, forced password change, rate-limited login. Full CRUD for routes, backends, certificates, settings, notification configs, and user preferences. Config export/import with preview endpoint. Notification config JSON validation and connection test endpoint. TOML import size limit (1 MB). Consistent JSON error envelope.
-- **Embedded dashboard** (`lorica-dashboard`) - Svelte 5 + TypeScript frontend compiled into the binary via `rust-embed` (~59 KB bundle). Login and password change screens, sidebar navigation, and full management UI: overview status cards, route/certificate/backend CRUD, scrollable access logs with filtering, system metrics, settings with notification channels, config export/import with diff preview, light/dark theme toggle.
-- **Health checks** - Background TCP health check service with configurable interval. Backends marked as degraded (>2s latency) or down (unreachable) and excluded from rotation.
-- **Worker isolation** (`lorica-worker`) - Process-based worker isolation using fork+exec. Supervisor creates TCP listening sockets, forks N worker processes, and passes socket FDs via SCM_RIGHTS. Each worker runs the proxy engine independently. Configurable worker count via `--workers N` (default 0 = single-process mode). Exponential restart backoff (1s-30s) with explicit SIGTERM on shutdown. Per-worker command channels with heartbeat latency monitoring.
-- **Command channel** (`lorica-command`) - Protobuf-based command channel between supervisor and worker processes. 8-byte LE size-prefix framing over Unix socketpair. Supervisor dispatches ConfigReload commands when API configuration changes. Workers apply changes inline by reloading from database without pausing traffic. Three-state response protocol (Ok, Error, Processing). Heartbeat health monitoring every 5 seconds with timeout detection.
-- **Certificate hot-swap** (`lorica-tls`) - SNI-based certificate resolver with wildcard support (`*.example.com`). Multiple certificates per domain sorted by expiration (longest-lived first). Atomic hot-swap via `arc-swap` with zero downtime during certificate rotation. Certificates loaded from PEM in memory, no temporary files on disk. Integrated via rustls `ResolvesServerCert` trait.
-- **Backend lifecycle** - Per-backend active connection tracking via atomic counters. Backend states (Normal, Closing, Closed) with graceful drain on removal. API exposes `lifecycle_state` and `active_connections` per backend. Load balancer filters out Closing/Closed backends from rotation.
-- **WebSocket log streaming** - Real-time access log streaming via `GET /api/v1/logs/ws`. LogBuffer broadcasts new entries to all connected WebSocket clients. Frontend auto-connects with polling fallback. Green pulsing indicator shows live connection status.
-- **Worker metrics** - Per-worker heartbeat latency tracking via `GET /api/v1/workers` endpoint. Supervisor records heartbeat response times. Dashboard System page shows workers table with health status, PID, and latency.
-- **Binary** (`lorica`) - CLI with `--version`, `--data-dir`, `--log-level`, `--management-port`, `--http-port`, `--https-port`, `--workers`. Graceful shutdown on SIGTERM/SIGINT. systemd unit file with security hardening.
-- **ACME / Let's Encrypt** - Automatic TLS certificate provisioning via HTTP-01 challenge using instant-acme. POST `/api/v1/acme/provision` triggers provisioning. Challenge tokens served at `/.well-known/acme-challenge/:token`. Supports staging and production directories. Consent-driven (admin opt-in per domain). Certs stored with `is_acme=true`. Limitation: requires port 80 from Internet (DNS-01 planned).
-- **Prometheus metrics** - `/metrics` endpoint on management port (no auth). Request count + latency histogram (labels: route_id, status_code - bounded cardinality), active connections, backend health gauge, certificate expiry days, WAF events by category/action, system CPU and memory. Instrumented in proxy pipeline.
-- **Peak EWMA load balancing** - Latency-based backend selection using exponential weighted moving average (alpha=0.3). Selectable per route alongside Round Robin, Consistent Hash, Random. Unscored backends get exploration priority.
-- **Production packaging** - GitHub Actions CI pipeline (test, build, package). `.deb` package with systemd service, postinst (user creation, permissions, service enable), prerm/postrm scripts. Release workflow triggered on tags creates GitHub Release with binary and .deb artifacts.
-- **Security hardening** - Enhanced systemd unit (MemoryDenyWriteExecute, SystemCallFilter, RestrictNamespaces, UMask). Security documentation with threat model and hardening guide. Fuzz testing targets for WAF evaluation and API input. `cargo audit` clean (serde_yml warning from Pingora documented).
-- **E2E test suite** - Docker Compose-based end-to-end tests with 4 containers (Lorica, 2 Python backends, bash test runner). 63 assertions covering authentication, dashboard, settings, backends/routes CRUD, proxy routing with round-robin, WAF detection/blocking, WAF rule management, status/system endpoints, access logs, config export/import, notification configs, HTTP health checks, and cleanup. Run with `cd tests-e2e-docker && ./run.sh --build`.
-- **Tests** - 312 Rust + frontend unit tests (111 API, 65 config, 41 WAF, 43 notify, 52 frontend). 63 Docker e2e tests. Unit tests across all crates, integration tests gated behind `integration-tests` feature flag.
+**Caching (Epic 7)**
+
+- HTTP response caching via Pingora MemCache with LRU eviction capped at 128 MiB. Per-route toggle (`cache_enabled`), configurable TTL (`cache_ttl_s`, default 300s) and max size (`cache_max_bytes`). Respects Cache-Control headers; bypasses cache for Authorization/Cookie headers. X-Cache-Status response header (HIT/MISS/STALE/REVALIDATED/BYPASS). Cache purge API (`DELETE /api/v1/cache/routes/:id`). Cache stats API (`GET /api/v1/cache/stats`) with hit/miss counters
+
+**Notifications (Epic 3)**
+
+- Notification system (`lorica-notify`) with 5 alert types: `cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `ip_banned`. Three delivery channels: stdout (structured JSON, always on), SMTP email (STARTTLS, configurable auth), HTTP webhook (JSON POST with optional Authorization header). Channel subscription filtering and event history ring buffer (100 events)
+- Notification rate limiting - per-channel sliding window (default: 10 per 60s) to prevent alert storms
+
+**Service Discovery (Epic 3)**
+
+- Docker Swarm service discovery (`DockerDiscovery`) via Docker daemon socket API (bollard). Health derived from running vs desired task counts. Behind `docker` feature flag
+- Kubernetes pod discovery (`K8sDiscovery`) via Kubernetes API (kube-rs), reads Endpoints with ready/not-ready addresses. Behind `kubernetes` feature flag
+
+**Dashboard**
+
+- Embedded Svelte 5 + TypeScript frontend compiled into the binary via `rust-embed` (~59 KB bundle). Login and password change screens, sidebar navigation, light/dark theme toggle
+- Overview page with status cards
+- Routes CRUD with collapsible Advanced Configuration section for all 25+ settings, WAF status (Detect/Block/-) in routes table
+- Backends CRUD with address, weight, health check (TCP/HTTP), TLS upstream, active connections
+- Certificates management with ACME vs manual distinction
+- Security page with WAF event table (category filtering), stats cards per attack category, configurable rule toggles, ban list tab with unban controls (auto-refreshes every 10s)
+- SLA page with per-route overview cards, passive/active side-by-side comparison, latency percentile tables, SLA config editor, CSV/JSON export, bucket history
+- Active Probes page with CRUD management, route selection, enable/disable toggle
+- Load Test page with config management, clone, one-click execution with safe limit confirmation, real-time SSE progress panel, abort button, historical results with comparison deltas
+- Scrollable access logs with filtering and live WebSocket streaming (green pulsing indicator)
+- System metrics page with worker table (health status, PID, heartbeat latency)
+- Settings page with notification channel configuration, global settings
+- Config export/import with diff preview
+- Input validation on all forms, sort/filter on Backends and Routes tables
+
+**ACME (Epic 4)**
+
+- Automatic TLS certificate provisioning via HTTP-01 challenge using instant-acme. Challenge tokens served at `/.well-known/acme-challenge/:token`. Supports staging and production directories. Consent-driven (admin opt-in per domain). Certs stored with `is_acme=true`
+
+**Configuration & API**
+
+- Embedded SQLite database (`lorica-config`) with WAL mode, CRUD for routes, backends, certificates, global settings, notification configs, user preferences, and admin users. AES-256-GCM encryption for certificate private keys at rest
+- REST API (`lorica-api`) on localhost:9443 via axum. Session-based authentication with HTTP-only secure cookies, first-run admin password generation, forced password change, rate-limited login. Full CRUD endpoints, config TOML export/import with preview and diff, notification test endpoint. Consistent JSON error envelope
+- CLI (`lorica`) with `--version`, `--data-dir`, `--log-level`, `--management-port`, `--http-port`, `--https-port`, `--workers`. Graceful shutdown on SIGTERM/SIGINT. systemd unit file with security hardening
+
+**Packaging (Epic 4)**
+
+- GitHub Actions CI pipeline (test, build, package). Release workflow on tags creates GitHub Release with binary and `.deb` artifacts
+- `.deb` package with systemd service, postinst (user creation, permissions, service enable), prerm/postrm scripts
+- Security-hardened systemd unit (MemoryDenyWriteExecute, SystemCallFilter, RestrictNamespaces, UMask)
+
+**Testing**
+
+- 312 Rust + frontend unit tests (111 API, 65 config, 41 WAF, 43 notify, 52 frontend)
+- Docker Compose-based E2E test suite with 63 assertions covering auth, dashboard, settings, CRUD, proxy routing, WAF, rule management, config export/import, notifications, HTTP health checks
+- Fuzz testing targets for WAF evaluation and API input
 - NOTICE file crediting Cloudflare Pingora as upstream (Apache-2.0)
 
+### Changed
+
+- DashMap for ban list and per-route connection counters in the proxy hot path, replacing `RwLock<HashMap>` for reduced contention under high concurrency
+
 ### Fixed
 
-- **Database concurrency** - Added `PRAGMA busy_timeout=5000` and idempotent migration inserts (`INSERT OR IGNORE`) to prevent race conditions when multiple worker processes access the database concurrently.
+- Database concurrency - added `PRAGMA busy_timeout=5000` and idempotent migration inserts (`INSERT OR IGNORE`) to prevent race conditions with multiple worker processes
+- Cache purge endpoint (`DELETE /api/v1/cache/routes/:id`) was a stub - now clears all cached entries and resets hit/miss counters
 
 ### Removed
 
-- **Windows support** - Removed all Windows-specific code from forked Pingora crates (787 lines). Deleted `windows.rs` WinSock bindings module. Removed `windows-sys` dependency. Project is Linux-only.
+- Windows support - removed all Windows-specific code from forked Pingora crates (787 lines), deleted WinSock bindings, removed `windows-sys` dependency. Project is Linux-only
