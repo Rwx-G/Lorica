@@ -22,6 +22,9 @@ pub fn router() -> Router {
     Router::new()
         .route("/", get(index_handler))
         .route("/assets/*path", get(static_handler))
+        .route("/favicon.png", get(|| async { serve_embedded_file("favicon.png") }))
+        .route("/logo.png", get(|| async { serve_embedded_file("logo.png") }))
+        .route("/favicon.svg", get(|| async { serve_embedded_file("favicon.svg") }))
         .fallback(get(spa_fallback))
 }
 

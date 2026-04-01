@@ -1,7 +1,7 @@
 <script lang="ts">
   import { api } from '../lib/api';
   import { auth } from '../lib/auth';
-  import ShieldIcon from '../components/ShieldIcon.svelte';
+
 
   let username = $state('');
   let password = $state('');
@@ -35,7 +35,7 @@
 <div class="login-container">
   <div class="login-card">
     <div class="login-logo">
-      <ShieldIcon size={48} />
+      <img src="/logo.png" alt="Lorica" class="login-logo-img" />
       <h1>Lorica</h1>
     </div>
     <p class="login-subtitle">Sign in to your dashboard</p>
@@ -109,6 +109,12 @@
     gap: 0.75rem;
     justify-content: center;
     margin-bottom: 0.25rem;
+  }
+
+  .login-logo-img {
+    width: 48px;
+    height: 48px;
+    object-fit: contain;
   }
 
   .login-logo h1 {

@@ -2,7 +2,6 @@
   import { currentPath, navigate } from '../lib/router';
   import { api } from '../lib/api';
   import { auth } from '../lib/auth';
-  import ShieldIcon from './ShieldIcon.svelte';
 
   type NavItem = { path: string; label: string; icon: string } | { section: string };
 
@@ -38,7 +37,7 @@
 
 <nav class="sidebar">
   <div class="sidebar-header">
-    <ShieldIcon size={28} />
+    <img src="/logo.png" alt="Lorica" class="sidebar-logo" />
     <span class="sidebar-title">Lorica</span>
   </div>
 
@@ -106,6 +105,12 @@
     gap: var(--space-3);
     padding: var(--space-5) var(--space-4);
     border-bottom: 1px solid var(--color-border);
+  }
+
+  .sidebar-logo {
+    width: 28px;
+    height: 28px;
+    object-fit: contain;
   }
 
   .sidebar-title {
