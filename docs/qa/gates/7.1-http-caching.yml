@@ -38,4 +38,3 @@ nfr_validation:
 recommendations:
   immediate: []
   future: []
-    - "Polish cache purge integration with real-time dashboard feedback"

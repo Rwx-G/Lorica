@@ -39,4 +39,3 @@ nfr_validation:
 recommendations:
   immediate: []
   future: []
-    - "Consider DashMap instead of RwLock<HashMap> for higher concurrency"
