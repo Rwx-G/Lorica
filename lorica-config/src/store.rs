@@ -1120,6 +1120,11 @@ impl ConfigStore {
                         ConfigError::Validation("invalid default_topology_type".into())
                     })?;
                 }
+                "max_global_connections" => {
+                    settings.max_global_connections = value.parse().map_err(|_| {
+                        ConfigError::Validation("invalid max_global_connections".into())
+                    })?;
+                }
                 "flood_threshold_rps" => {
                     settings.flood_threshold_rps = value.parse().map_err(|_| {
                         ConfigError::Validation("invalid flood_threshold_rps".into())
@@ -1164,6 +1169,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('default_topology_type', ?1)",
             params![settings.default_topology_type.as_str()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('max_global_connections', ?1)",
+            params![settings.max_global_connections.to_string()],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('flood_threshold_rps', ?1)",

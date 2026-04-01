@@ -306,6 +306,7 @@ export interface GlobalSettingsResponse {
   cert_warning_days: number;
   cert_critical_days: number;
   default_topology_type: string;
+  max_global_connections: number;
   flood_threshold_rps: number;
   custom_security_presets?: SecurityHeaderPreset[];
 }
@@ -317,6 +318,7 @@ export interface UpdateSettingsRequest {
   cert_warning_days?: number;
   cert_critical_days?: number;
   default_topology_type?: string;
+  max_global_connections?: number;
   flood_threshold_rps?: number;
   custom_security_presets?: SecurityHeaderPreset[];
 }

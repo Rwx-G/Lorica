@@ -240,6 +240,13 @@ fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> Setting
             new_value: incoming.default_topology_type.as_str().to_string(),
         });
     }
+    if current.max_global_connections != incoming.max_global_connections {
+        changes.push(SettingChange {
+            key: "max_global_connections".to_string(),
+            old_value: current.max_global_connections.to_string(),
+            new_value: incoming.max_global_connections.to_string(),
+        });
+    }
     if current.flood_threshold_rps != incoming.flood_threshold_rps {
         changes.push(SettingChange {
             key: "flood_threshold_rps".to_string(),

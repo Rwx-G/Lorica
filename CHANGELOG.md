@@ -31,6 +31,7 @@ Author: Rwx-G
 - Per-route max connections enforcement - 503 rejection when active connections reach limit, with per-route atomic counters that auto-decrement on request completion
 - Slowloris detection - requests with headers exceeding `slowloris_threshold_ms` (default 5000ms) rejected with 408 Request Timeout. Disabled when threshold is 0
 - Anti-DDoS auto-ban protection - per-IP violation counter (1-minute sliding window) escalates repeated 429s into temporary IP bans when exceeding `auto_ban_threshold`. Banned IPs receive 403 before route lookup or WAF. Configurable duration via `auto_ban_duration_s` (default 1h). Ban list API (`GET /api/v1/bans`, `DELETE /api/v1/bans/:ip`)
+- Global connection limit via `max_global_connections` in GlobalSettings. New requests receive 503 when total active proxy connections reach the limit. 0 = unlimited (default)
 - Adaptive flood defense - when global RPS exceeds configurable `flood_threshold_rps` (in GlobalSettings), per-IP rate limits are automatically halved. Disabled by default (threshold = 0). Per-second request counter also feeds dashboard metrics
 - IP allowlist/denylist per route
 - CORS configuration per route (origins, methods, max-age)

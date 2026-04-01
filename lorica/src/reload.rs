@@ -38,6 +38,10 @@ pub async fn reload_proxy_config(
         .as_ref()
         .map(|s| s.custom_security_presets.clone())
         .unwrap_or_default();
+    let max_global_connections = settings
+        .as_ref()
+        .map(|s| s.max_global_connections.max(0) as u32)
+        .unwrap_or(0);
     let flood_threshold_rps = settings
         .as_ref()
         .map(|s| s.flood_threshold_rps.max(0) as u32)
@@ -54,6 +58,7 @@ pub async fn reload_proxy_config(
         certificates,
         links,
         custom_presets,
+        max_global_connections,
         flood_threshold_rps,
     );
 

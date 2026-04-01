@@ -11,7 +11,6 @@ Items identified during QA traceability audit (2026-04-01).
 
 | Source | Description | References |
 |--------|-------------|------------|
-| 7.3 AC4 | Global connection limit not implemented (only per-route `max_connections` exists). Decide: implement global cap or formally descope. | `lorica/src/proxy_wiring.rs` |
 
 ## Low Priority
 

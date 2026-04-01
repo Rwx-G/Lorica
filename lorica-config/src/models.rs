@@ -470,6 +470,10 @@ pub struct GlobalSettings {
     pub loadtest_max_duration_s: i32,
     #[serde(default = "default_loadtest_max_rps")]
     pub loadtest_max_rps: i32,
+    /// Maximum total proxy connections across all routes.
+    /// New requests receive 503 when this limit is reached. 0 = unlimited (default).
+    #[serde(default)]
+    pub max_global_connections: i32,
     /// Global flood detection threshold (requests per second).
     /// When the proxy-wide RPS exceeds this value, per-IP rate limits are
     /// halved to provide stricter protection. 0 = disabled (default).
@@ -567,6 +571,7 @@ impl Default for GlobalSettings {
             loadtest_max_concurrency: 100,
             loadtest_max_duration_s: 60,
             loadtest_max_rps: 1000,
+            max_global_connections: 0,
             flood_threshold_rps: 0,
             custom_security_presets: Vec::new(),
         }
