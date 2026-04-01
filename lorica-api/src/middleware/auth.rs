@@ -74,6 +74,14 @@ impl SessionStore {
         self.sessions.lock().await.remove(session_id);
     }
 
+    /// Renew a session's expiry (sliding window).
+    pub async fn renew(&self, session_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.expires_at = Utc::now() + Duration::minutes(SESSION_TIMEOUT_MINUTES);
+        }
+    }
+
     /// Get the expiration time of a session.
     pub async fn expires_at(&self, session_id: &str) -> Option<DateTime<Utc>> {
         self.sessions
@@ -144,6 +152,9 @@ pub async fn require_auth(req: Request, next: Next) -> Result<Response, ApiError
         .get(&session_id)
         .await
         .ok_or_else(|| ApiError::Unauthorized("invalid or expired session".into()))?;
+
+    // Sliding window: renew session expiry on every authenticated request
+    session_store.renew(&session_id).await;
 
     let mut req = req;
     req.extensions_mut().insert(session);
