@@ -60,6 +60,13 @@
   let formCorsMaxAge = $state('');
   let formCompressionEnabled = $state(false);
   let formRetryAttempts = $state('');
+  let formCacheEnabled = $state(false);
+  let formCacheTtl = $state(300);
+  let formCacheMaxMb = $state(50);
+  let formMaxConnections = $state<number | null>(null);
+  let formSlowlorisThreshold = $state(5000);
+  let formAutoBanThreshold = $state<number | null>(null);
+  let formAutoBanDuration = $state(3600);
 
   // Inline field errors
   let hostnameError = $state('');
@@ -159,6 +166,13 @@
     formCorsMaxAge = '';
     formCompressionEnabled = false;
     formRetryAttempts = '';
+    formCacheEnabled = false;
+    formCacheTtl = 300;
+    formCacheMaxMb = 50;
+    formMaxConnections = null;
+    formSlowlorisThreshold = 5000;
+    formAutoBanThreshold = null;
+    formAutoBanDuration = 3600;
     showForm = true;
   }
 
@@ -226,6 +240,13 @@
     formCorsMaxAge = route.cors_max_age_s != null ? String(route.cors_max_age_s) : '';
     formCompressionEnabled = route.compression_enabled;
     formRetryAttempts = route.retry_attempts != null ? String(route.retry_attempts) : '';
+    formCacheEnabled = route.cache_enabled;
+    formCacheTtl = route.cache_ttl_s;
+    formCacheMaxMb = Math.round(route.cache_max_bytes / 1048576);
+    formMaxConnections = route.max_connections;
+    formSlowlorisThreshold = route.slowloris_threshold_ms;
+    formAutoBanThreshold = route.auto_ban_threshold;
+    formAutoBanDuration = route.auto_ban_duration_s;
     showForm = true;
   }
 
@@ -321,6 +342,13 @@
       cors_max_age_s: formCorsMaxAge ? Number(formCorsMaxAge) : undefined,
       compression_enabled: formCompressionEnabled,
       retry_attempts: formRetryAttempts ? Number(formRetryAttempts) : undefined,
+      cache_enabled: formCacheEnabled,
+      cache_ttl_s: formCacheTtl,
+      cache_max_bytes: formCacheMaxMb * 1048576,
+      max_connections: formMaxConnections || undefined,
+      slowloris_threshold_ms: formSlowlorisThreshold,
+      auto_ban_threshold: formAutoBanThreshold || undefined,
+      auto_ban_duration_s: formAutoBanDuration,
     };
 
     if (editingRoute) {
@@ -770,6 +798,46 @@
           <div class="form-group">
             <label for="retry-attempts">Retry attempts</label>
             <input id="retry-attempts" type="number" min="0" bind:value={formRetryAttempts} placeholder="No retry" />
+          </div>
+
+          <h3 class="section-title">Caching</h3>
+          <div class="form-group">
+            <label class="checkbox-item">
+              <input type="checkbox" bind:checked={formCacheEnabled} />
+              <span>Enable cache</span>
+            </label>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="cache-ttl">Cache TTL (s)</label>
+              <input id="cache-ttl" type="number" min="1" bind:value={formCacheTtl} placeholder="300" />
+            </div>
+            <div class="form-group">
+              <label for="cache-max-mb">Cache max size (MB)</label>
+              <input id="cache-max-mb" type="number" min="1" bind:value={formCacheMaxMb} placeholder="50" />
+            </div>
+          </div>
+
+          <h3 class="section-title">Protection</h3>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="max-connections">Max connections</label>
+              <input id="max-connections" type="number" min="1" bind:value={formMaxConnections} placeholder="No limit" />
+            </div>
+            <div class="form-group">
+              <label for="slowloris-threshold">Slowloris threshold (ms)</label>
+              <input id="slowloris-threshold" type="number" min="100" bind:value={formSlowlorisThreshold} placeholder="5000" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="auto-ban-threshold">Auto-ban threshold <span class="hint">(violations before ban)</span></label>
+              <input id="auto-ban-threshold" type="number" min="1" bind:value={formAutoBanThreshold} placeholder="Disabled" />
+            </div>
+            <div class="form-group">
+              <label for="auto-ban-duration">Auto-ban duration (s)</label>
+              <input id="auto-ban-duration" type="number" min="1" bind:value={formAutoBanDuration} placeholder="3600" />
+            </div>
           </div>
         </div>
       {/if}
