@@ -23,6 +23,7 @@ pub enum AlertType {
     WafAlert,
     ConfigChanged,
     SlaBreached,
+    IpBanned,
 }
 
 impl AlertType {
@@ -33,6 +34,7 @@ impl AlertType {
             Self::WafAlert => "waf_alert",
             Self::ConfigChanged => "config_changed",
             Self::SlaBreached => "sla_breached",
+            Self::IpBanned => "ip_banned",
         }
     }
 }
@@ -46,6 +48,7 @@ impl std::str::FromStr for AlertType {
             "waf_alert" => Ok(Self::WafAlert),
             "config_changed" => Ok(Self::ConfigChanged),
             "sla_breached" => Ok(Self::SlaBreached),
+            "ip_banned" => Ok(Self::IpBanned),
             other => Err(format!("unknown alert type: {other}")),
         }
     }
@@ -94,6 +97,7 @@ mod tests {
             ("waf_alert", AlertType::WafAlert),
             ("config_changed", AlertType::ConfigChanged),
             ("sla_breached", AlertType::SlaBreached),
+            ("ip_banned", AlertType::IpBanned),
         ] {
             assert_eq!(s.parse::<AlertType>().unwrap(), variant);
             assert_eq!(variant.as_str(), s);

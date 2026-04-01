@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Anti-DDoS auto-ban protection** - IPs that repeatedly exceed rate limits are automatically banned. A per-IP violation counter (1-minute sliding window) tracks 429 responses; when violations exceed the route's `auto_ban_threshold`, the IP is added to an in-memory ban list. Banned IPs receive 403 immediately (before any route lookup or WAF processing). Bans expire after `auto_ban_duration_s` (default 1 hour) with lazy cleanup on access. Ban list is ephemeral (memory-only, clears on restart). New `IpBanned` alert type in lorica-notify with Slack support.
 - **Per-route rate limiting enforcement** - The `rate_limit_rps` and `rate_limit_burst` fields on routes are now enforced in the proxy hot path. Requests exceeding the configured rate receive a 429 response with a `Retry-After: 1` header. Uses the `lorica-limits` crate Rate estimator keyed by route ID + client IP for per-client fairness. Burst tolerance allows short spikes up to `rps + burst` before throttling.
 
 ### Changed

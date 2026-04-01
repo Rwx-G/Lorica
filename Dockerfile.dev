@@ -41,6 +41,9 @@ COPY lorica-timeout/ lorica-timeout/
 COPY lorica-tls/ lorica-tls/
 COPY lorica-worker/ lorica-worker/
 COPY lorica-command/ lorica-command/
+COPY lorica-bench/ lorica-bench/
+COPY lorica-notify/ lorica-notify/
+COPY lorica-waf/ lorica-waf/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend
