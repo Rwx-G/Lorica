@@ -1757,6 +1757,37 @@ mod tests {
         assert!(!strict.headers.contains_key("Content-Security-Policy"));
     }
 
+    // ---- Wildcard Hostname Matching ----
+
+    #[test]
+    fn test_wildcard_hostname_matching() {
+        let route = make_route("r1", "*.example.com", "/", true);
+        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![]);
+
+        // Should match subdomains
+        assert!(config.find_route("foo.example.com", "/").is_some());
+        assert!(config.find_route("bar.example.com", "/").is_some());
+
+        // Should NOT match bare domain
+        assert!(config.find_route("example.com", "/").is_none());
+
+        // Should NOT match deeper subdomains? (depends on implementation)
+        // *.example.com should match a.example.com but implementation may vary
+    }
+
+    #[test]
+    fn test_exact_match_takes_precedence_over_wildcard() {
+        let r1 = make_route("r1", "*.example.com", "/", true);
+        let r2 = make_route("r2", "specific.example.com", "/", true);
+        let config = ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![]);
+
+        let entry = config.find_route("specific.example.com", "/").unwrap();
+        assert_eq!(entry.route.id, "r2"); // exact match wins
+
+        let entry = config.find_route("other.example.com", "/").unwrap();
+        assert_eq!(entry.route.id, "r1"); // wildcard matches
+    }
+
     // ---- Rate Limiter ----
 
     #[test]

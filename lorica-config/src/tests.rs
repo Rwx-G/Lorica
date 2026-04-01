@@ -127,6 +127,42 @@ mod tests {
         }
     }
 
+    fn make_load_test_config() -> LoadTestConfig {
+        let now = Utc::now();
+        LoadTestConfig {
+            id: new_id(),
+            name: "Test Load Config".into(),
+            target_url: "http://localhost:8080/".into(),
+            method: "GET".into(),
+            headers: std::collections::HashMap::new(),
+            body: None,
+            concurrency: 10,
+            requests_per_second: 100,
+            duration_s: 30,
+            error_threshold_pct: 5.0,
+            schedule_cron: Some("0 * * * *".into()),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // ---- LoadTestConfig Clone ----
+
+    #[test]
+    fn test_clone_load_test_config() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let config = make_load_test_config();
+        store.create_load_test_config(&config).unwrap();
+
+        let cloned = store.clone_load_test_config(&config.id, "Cloned Test").unwrap();
+        assert_ne!(cloned.id, config.id);
+        assert_eq!(cloned.name, "Cloned Test");
+        assert_eq!(cloned.target_url, config.target_url);
+        assert_eq!(cloned.concurrency, config.concurrency);
+        assert!(cloned.schedule_cron.is_none()); // schedule not copied
+    }
+
     // ---- Route CRUD ----
 
     #[test]
