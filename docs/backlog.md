@@ -17,5 +17,4 @@ Items identified during QA traceability audit (2026-04-01).
 
 | Source | Description | References |
 |--------|-------------|------------|
-| NFR2 | 10k concurrent connections NFR has no automated soak/load test validating it | E2E suite covers functional, not scale |
-| NFR11 | Memory stability NFR has no long-running soak test (LRU caps exist but no automated verification) | Could add a CI nightly soak test |
+| NFR2+11 | Validation script created but not yet executed on a real Linux machine. Run `docs/testing/nfr-validate.sh` after .deb install. | `docs/testing/nfr-validate.sh` |
