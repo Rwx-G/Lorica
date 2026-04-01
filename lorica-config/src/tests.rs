@@ -1068,6 +1068,262 @@ cert_critical_days = 3
         assert_eq!(err.to_string(), "serialization error: toml fail");
     }
 
+    // ---- Backend address validation ----
+
+    #[test]
+    fn test_backend_address_missing_port_rejected() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut backend = make_backend();
+        backend.address = "192.168.1.10".into(); // no port
+        let result = store.create_backend(&backend);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("ip:port"));
+    }
+
+    #[test]
+    fn test_backend_address_trailing_colon_rejected() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut backend = make_backend();
+        backend.address = "192.168.1.10:".into();
+        let result = store.create_backend(&backend);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("ip:port"));
+    }
+
+    #[test]
+    fn test_backend_address_invalid_port_rejected() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut backend = make_backend();
+        backend.address = "192.168.1.10:notaport".into();
+        let result = store.create_backend(&backend);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid port"));
+    }
+
+    #[test]
+    fn test_backend_address_port_out_of_range_rejected() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut backend = make_backend();
+        backend.address = "192.168.1.10:99999".into(); // > u16::MAX
+        let result = store.create_backend(&backend);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_backend_address_valid_formats() {
+        let store = ConfigStore::open_in_memory().unwrap();
+
+        // IPv4 with port
+        let mut b1 = make_backend();
+        b1.address = "10.0.0.1:443".into();
+        assert!(store.create_backend(&b1).is_ok());
+
+        // hostname:port
+        let mut b2 = make_backend();
+        b2.address = "backend.internal:8080".into();
+        assert!(store.create_backend(&b2).is_ok());
+    }
+
+    #[test]
+    fn test_backend_update_also_validates_address() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut backend = make_backend();
+        store.create_backend(&backend).unwrap();
+
+        backend.address = "no-port-here".into();
+        let result = store.update_backend(&backend);
+        assert!(result.is_err());
+    }
+
+    // ---- Hostname uniqueness ----
+
+    #[test]
+    fn test_hostname_uniqueness_rejects_duplicate_primary() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route1 = make_route();
+        store.create_route(&route1).unwrap();
+
+        let mut route2 = make_route();
+        route2.hostname = "example.com".into(); // same hostname as route1
+        let result = store.create_route(&route2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("already used"));
+    }
+
+    #[test]
+    fn test_hostname_uniqueness_rejects_alias_conflict_with_primary() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route1 = make_route();
+        store.create_route(&route1).unwrap();
+
+        let mut route2 = make_route();
+        route2.hostname = "other.com".into();
+        route2.hostname_aliases = vec!["example.com".into()]; // alias conflicts with route1 primary
+        let result = store.create_route(&route2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("already used"));
+    }
+
+    #[test]
+    fn test_hostname_uniqueness_rejects_primary_conflict_with_alias() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route1 = make_route();
+        route1.hostname_aliases = vec!["alias.example.com".into()];
+        store.create_route(&route1).unwrap();
+
+        let mut route2 = make_route();
+        route2.hostname = "alias.example.com".into(); // primary conflicts with route1 alias
+        let result = store.create_route(&route2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("already used as alias"));
+    }
+
+    #[test]
+    fn test_hostname_uniqueness_allows_update_own_hostname() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        store.create_route(&route).unwrap();
+
+        // Updating route with same hostname should succeed
+        route.path_prefix = "/api".into();
+        route.updated_at = Utc::now();
+        assert!(store.update_route(&route).is_ok());
+    }
+
+    // ---- Route with Epic 6/7 fields round-trip ----
+
+    #[test]
+    fn test_route_cache_and_protection_fields_round_trip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.cache_enabled = true;
+        route.cache_ttl_s = 600;
+        route.cache_max_bytes = 104857600;
+        route.rate_limit_rps = Some(500);
+        route.rate_limit_burst = Some(100);
+        route.auto_ban_threshold = Some(50);
+        route.auto_ban_duration_s = 7200;
+        route.max_connections = Some(1000);
+        route.slowloris_threshold_ms = 10000;
+        route.ip_allowlist = vec!["10.0.0.0/8".into()];
+        route.ip_denylist = vec!["192.168.1.100".into()];
+        route.cors_allowed_origins = vec!["https://example.com".into()];
+        route.cors_allowed_methods = vec!["GET".into(), "POST".into()];
+        route.cors_max_age_s = Some(3600);
+        route.compression_enabled = true;
+        route.retry_attempts = Some(3);
+        route.max_request_body_bytes = Some(10485760);
+
+        store.create_route(&route).unwrap();
+        let fetched = store.get_route(&route.id).unwrap().unwrap();
+
+        assert!(fetched.cache_enabled);
+        assert_eq!(fetched.cache_ttl_s, 600);
+        assert_eq!(fetched.cache_max_bytes, 104857600);
+        assert_eq!(fetched.rate_limit_rps, Some(500));
+        assert_eq!(fetched.rate_limit_burst, Some(100));
+        assert_eq!(fetched.auto_ban_threshold, Some(50));
+        assert_eq!(fetched.auto_ban_duration_s, 7200);
+        assert_eq!(fetched.max_connections, Some(1000));
+        assert_eq!(fetched.slowloris_threshold_ms, 10000);
+        assert_eq!(fetched.ip_allowlist, vec!["10.0.0.0/8"]);
+        assert_eq!(fetched.ip_denylist, vec!["192.168.1.100"]);
+        assert_eq!(fetched.cors_allowed_origins, vec!["https://example.com"]);
+        assert_eq!(fetched.cors_allowed_methods, vec!["GET", "POST"]);
+        assert_eq!(fetched.cors_max_age_s, Some(3600));
+        assert!(fetched.compression_enabled);
+        assert_eq!(fetched.retry_attempts, Some(3));
+        assert_eq!(fetched.max_request_body_bytes, Some(10485760));
+    }
+
+    #[test]
+    fn test_route_optional_fields_none_round_trip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        // All optional fields are None/empty by default from make_route()
+
+        store.create_route(&route).unwrap();
+        let fetched = store.get_route(&route.id).unwrap().unwrap();
+
+        assert!(!fetched.cache_enabled);
+        assert!(fetched.rate_limit_rps.is_none());
+        assert!(fetched.rate_limit_burst.is_none());
+        assert!(fetched.auto_ban_threshold.is_none());
+        assert!(fetched.max_connections.is_none());
+        assert!(fetched.retry_attempts.is_none());
+        assert!(fetched.max_request_body_bytes.is_none());
+        assert!(fetched.cors_max_age_s.is_none());
+        assert!(fetched.ip_allowlist.is_empty());
+        assert!(fetched.ip_denylist.is_empty());
+    }
+
+    #[test]
+    fn test_route_advanced_config_fields_round_trip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.force_https = true;
+        route.redirect_hostname = Some("www.example.com".into());
+        route.strip_path_prefix = Some("/api".into());
+        route.add_path_prefix = Some("/v2".into());
+        route.access_log_enabled = false;
+        route.websocket_enabled = false;
+        route.security_headers = "strict".into();
+        route.connect_timeout_s = 10;
+        route.read_timeout_s = 120;
+        route.send_timeout_s = 120;
+        route.proxy_headers =
+            std::collections::HashMap::from([("X-Forwarded-For".into(), "$remote_addr".into())]);
+        route.response_headers =
+            std::collections::HashMap::from([("X-Powered-By".into(), "Lorica".into())]);
+        route.proxy_headers_remove = vec!["X-Debug".into()];
+        route.response_headers_remove = vec!["Server".into()];
+
+        store.create_route(&route).unwrap();
+        let fetched = store.get_route(&route.id).unwrap().unwrap();
+
+        assert!(fetched.force_https);
+        assert_eq!(
+            fetched.redirect_hostname.as_deref(),
+            Some("www.example.com")
+        );
+        assert_eq!(fetched.strip_path_prefix.as_deref(), Some("/api"));
+        assert_eq!(fetched.add_path_prefix.as_deref(), Some("/v2"));
+        assert!(!fetched.access_log_enabled);
+        assert!(!fetched.websocket_enabled);
+        assert_eq!(fetched.security_headers, "strict");
+        assert_eq!(fetched.connect_timeout_s, 10);
+        assert_eq!(fetched.read_timeout_s, 120);
+        assert_eq!(fetched.send_timeout_s, 120);
+        assert_eq!(fetched.proxy_headers["X-Forwarded-For"], "$remote_addr");
+        assert_eq!(fetched.response_headers["X-Powered-By"], "Lorica");
+        assert_eq!(fetched.proxy_headers_remove, vec!["X-Debug"]);
+        assert_eq!(fetched.response_headers_remove, vec!["Server"]);
+    }
+
+    // ---- Backend name and group fields ----
+
+    #[test]
+    fn test_backend_name_group_round_trip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut backend = make_backend();
+        backend.name = "web-server-1".into();
+        backend.group_name = "web-pool".into();
+        backend.health_check_path = Some("/healthz".into());
+
+        store.create_backend(&backend).unwrap();
+        let fetched = store.get_backend(&backend.id).unwrap().unwrap();
+
+        assert_eq!(fetched.name, "web-server-1");
+        assert_eq!(fetched.group_name, "web-pool");
+        assert_eq!(fetched.health_check_path.as_deref(), Some("/healthz"));
+    }
+
     #[test]
     fn test_export_import_with_encryption() {
         use crate::crypto::EncryptionKey;

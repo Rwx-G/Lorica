@@ -198,6 +198,44 @@ mod tests {
     }
 
     #[test]
+    fn test_cron_mixed_range_and_list() {
+        // "0,30 9-17 * * 1-5" = on the hour and half-hour, 9am-5pm, weekdays
+        assert!(cron_matches("0,30 9-17 * * 1-5", 0, 9, 1, 1, 1));
+        assert!(cron_matches("0,30 9-17 * * 1-5", 30, 12, 15, 6, 3));
+        assert!(cron_matches("0,30 9-17 * * 1-5", 0, 17, 1, 1, 5));
+        assert!(!cron_matches("0,30 9-17 * * 1-5", 15, 12, 1, 1, 3)); // minute 15 not matched
+        assert!(!cron_matches("0,30 9-17 * * 1-5", 0, 18, 1, 1, 3)); // hour 18 out of range
+        assert!(!cron_matches("0,30 9-17 * * 1-5", 0, 12, 1, 1, 0)); // Sunday
+    }
+
+    #[test]
+    fn test_field_matches_invalid_range() {
+        // Non-numeric range bounds should not match
+        assert!(!field_matches("a-z", 5));
+        assert!(!field_matches("1-abc", 2));
+    }
+
+    #[test]
+    fn test_field_matches_single_item_comma() {
+        // A single value in comma format
+        assert!(field_matches("5", 5));
+        assert!(!field_matches("5", 6));
+    }
+
+    #[test]
+    fn test_cron_specific_dom_and_month() {
+        // "0 0 25 12 *" = midnight on Dec 25
+        assert!(cron_matches("0 0 25 12 *", 0, 0, 25, 12, 3));
+        assert!(!cron_matches("0 0 25 12 *", 0, 0, 24, 12, 2));
+        assert!(!cron_matches("0 0 25 12 *", 0, 0, 25, 11, 3));
+    }
+
+    #[test]
+    fn test_cron_too_many_fields_fails() {
+        assert!(!cron_matches("* * * * * *", 0, 0, 1, 1, 0)); // 6 fields
+    }
+
+    #[test]
     fn test_cron_all_stars() {
         // "* * * * *" = every minute
         assert!(cron_matches("* * * * *", 0, 0, 1, 1, 0));

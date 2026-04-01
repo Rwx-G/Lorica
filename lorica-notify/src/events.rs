@@ -127,6 +127,27 @@ mod tests {
     }
 
     #[test]
+    fn test_ip_banned_alert_event() {
+        let event = AlertEvent::new(AlertType::IpBanned, "IP 1.2.3.4 auto-banned")
+            .with_detail("ip", "1.2.3.4")
+            .with_detail("route_id", "route-1")
+            .with_detail("duration_s", "3600");
+        assert_eq!(event.alert_type, AlertType::IpBanned);
+        assert_eq!(event.details.len(), 3);
+        assert_eq!(event.details.get("ip").unwrap(), "1.2.3.4");
+    }
+
+    #[test]
+    fn test_alert_event_serde_round_trip() {
+        let event = AlertEvent::new(AlertType::IpBanned, "banned").with_detail("ip", "10.0.0.1");
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: AlertEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.alert_type, AlertType::IpBanned);
+        assert_eq!(deserialized.summary, "banned");
+        assert_eq!(deserialized.details.get("ip").unwrap(), "10.0.0.1");
+    }
+
+    #[test]
     fn test_alert_event_serializes_to_json() {
         let event = AlertEvent::new(AlertType::WafAlert, "SQL injection detected")
             .with_detail("rule_id", "942100");

@@ -722,6 +722,123 @@ mod tests {
         assert_eq!(latest.id, "r1");
     }
 
+    #[test]
+    fn test_safe_limits_from_settings() {
+        let settings = lorica_config::models::GlobalSettings {
+            loadtest_max_concurrency: 500,
+            loadtest_max_duration_s: 300,
+            loadtest_max_rps: 5000,
+            ..lorica_config::models::GlobalSettings::default()
+        };
+        let limits = SafeLimits::from_settings(&settings);
+        assert_eq!(limits.max_concurrency, 500);
+        assert_eq!(limits.max_duration_s, 300);
+        assert_eq!(limits.max_rps, 5000);
+    }
+
+    #[test]
+    fn test_describe_exceeded_limits_rps() {
+        let limits = SafeLimits::default();
+        let mut config = make_test_config();
+        config.requests_per_second = 2000; // exceeds default 1000
+        let warnings = describe_exceeded_limits(&config, &limits);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("rps"));
+    }
+
+    #[test]
+    fn test_describe_exceeded_limits_none() {
+        let limits = SafeLimits::default();
+        let config = make_test_config(); // within limits
+        let warnings = describe_exceeded_limits(&config, &limits);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_describe_exceeded_limits_all_three() {
+        let limits = SafeLimits::default();
+        let mut config = make_test_config();
+        config.concurrency = 200;
+        config.duration_s = 120;
+        config.requests_per_second = 2000;
+        let warnings = describe_exceeded_limits(&config, &limits);
+        assert_eq!(warnings.len(), 3);
+    }
+
+    #[test]
+    fn test_run_state_progress_zero_total() {
+        let state = RunState::new();
+        let progress = state.progress();
+        assert_eq!(progress.total_requests, 0);
+        assert_eq!(progress.successful_requests, 0);
+        assert_eq!(progress.failed_requests, 0);
+        assert_eq!(progress.avg_latency_ms, 0.0);
+        assert_eq!(progress.error_rate_pct, 0.0);
+        assert!(!progress.aborted);
+    }
+
+    #[test]
+    fn test_compare_results_previous_zero_latency() {
+        let now = Utc::now();
+        let current = LoadTestResult {
+            id: "r1".to_string(),
+            config_id: "lt1".to_string(),
+            started_at: now,
+            finished_at: now,
+            total_requests: 100,
+            successful_requests: 100,
+            failed_requests: 0,
+            avg_latency_ms: 50.0,
+            p50_latency_ms: 45,
+            p95_latency_ms: 90,
+            p99_latency_ms: 95,
+            min_latency_ms: 10,
+            max_latency_ms: 100,
+            throughput_rps: 50.0,
+            aborted: false,
+            abort_reason: None,
+        };
+        let previous = LoadTestResult {
+            id: "r0".to_string(),
+            config_id: "lt1".to_string(),
+            started_at: now,
+            finished_at: now,
+            total_requests: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            avg_latency_ms: 0.0, // zero latency means no delta
+            p50_latency_ms: 0,
+            p95_latency_ms: 0,
+            p99_latency_ms: 0,
+            min_latency_ms: 0,
+            max_latency_ms: 0,
+            throughput_rps: 0.0,
+            aborted: false,
+            abort_reason: None,
+        };
+
+        let comparison = compare_results(current, Some(previous));
+        // When previous avg_latency_ms is 0, no delta should be computed
+        assert!(comparison.latency_delta_pct.is_none());
+    }
+
+    #[test]
+    fn test_load_test_config_store_update() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut config = make_test_config();
+        store.create_load_test_config(&config).unwrap();
+
+        config.name = "Updated Name".to_string();
+        config.concurrency = 50;
+        config.schedule_cron = Some("0 3 * * *".to_string());
+        store.update_load_test_config(&config).unwrap();
+
+        let fetched = store.get_load_test_config("lt1").unwrap().unwrap();
+        assert_eq!(fetched.name, "Updated Name");
+        assert_eq!(fetched.concurrency, 50);
+        assert_eq!(fetched.schedule_cron.as_deref(), Some("0 3 * * *"));
+    }
+
     #[tokio::test]
     async fn test_load_test_engine_not_running() {
         let engine = LoadTestEngine::new();

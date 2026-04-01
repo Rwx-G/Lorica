@@ -602,6 +602,122 @@ mod tests {
         assert!(recent[0].summary.contains("event 109"));
     }
 
+    #[tokio::test]
+    async fn test_dispatch_ip_banned_alert() {
+        let mut d = NotifyDispatcher::new();
+        d.add_webhook_channel(
+            "w1".into(),
+            WebhookConfig {
+                url: "http://192.0.2.1:1/hook".into(),
+                auth_header: None,
+            },
+            vec!["ip_banned".into()],
+            true,
+        );
+        let event = AlertEvent::new(
+            AlertType::IpBanned,
+            "IP 1.2.3.4 banned for rate limit abuse",
+        )
+        .with_detail("ip", "1.2.3.4")
+        .with_detail("route_id", "route-1")
+        .with_detail("duration_s", "3600");
+        d.dispatch(&event).await;
+        assert_eq!(d.history_count(), 1);
+        let recent = d.recent_history(1);
+        assert_eq!(recent[0].alert_type, AlertType::IpBanned);
+        assert_eq!(recent[0].details.get("ip").unwrap(), "1.2.3.4");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_sla_breached_alert() {
+        let d = NotifyDispatcher::new();
+        let event = AlertEvent::new(AlertType::SlaBreached, "SLA below target on route-1")
+            .with_detail("route_id", "route-1")
+            .with_detail("current_pct", "98.5")
+            .with_detail("target_pct", "99.9");
+        d.dispatch(&event).await;
+        assert_eq!(d.history_count(), 1);
+        let recent = d.recent_history(1);
+        assert_eq!(recent[0].alert_type, AlertType::SlaBreached);
+    }
+
+    #[test]
+    fn test_add_slack_channel() {
+        let mut d = NotifyDispatcher::new();
+        d.add_slack_channel(
+            "s1".into(),
+            WebhookConfig {
+                url: "https://hooks.slack.com/services/T00/B00/xxx".into(),
+                auth_header: None,
+            },
+            vec!["*".into()],
+            true,
+        );
+        assert_eq!(d.channel_count(), 1);
+    }
+
+    #[test]
+    fn test_validate_email_config_missing_from_address() {
+        let json =
+            r#"{"smtp_host":"mail.example.com","from_address":"","to_address":"admin@test.com"}"#;
+        let result = validate_email_config(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("from_address"));
+    }
+
+    #[test]
+    fn test_validate_email_config_missing_to_address() {
+        let json =
+            r#"{"smtp_host":"mail.example.com","from_address":"noreply@test.com","to_address":""}"#;
+        let result = validate_email_config(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("to_address"));
+    }
+
+    #[tokio::test]
+    async fn test_recent_history_respects_limit() {
+        let d = NotifyDispatcher::new();
+        for i in 0..10 {
+            let event = AlertEvent::new(AlertType::ConfigChanged, format!("event {i}"));
+            d.dispatch(&event).await;
+        }
+        assert_eq!(d.history_count(), 10);
+        let recent = d.recent_history(3);
+        assert_eq!(recent.len(), 3);
+        // Most recent first
+        assert!(recent[0].summary.contains("event 9"));
+        assert!(recent[1].summary.contains("event 8"));
+        assert!(recent[2].summary.contains("event 7"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_multiple_channels_same_event() {
+        let mut d = NotifyDispatcher::new();
+        d.add_webhook_channel(
+            "w1".into(),
+            WebhookConfig {
+                url: "http://192.0.2.1:1/hook1".into(),
+                auth_header: None,
+            },
+            vec![],
+            true,
+        );
+        d.add_webhook_channel(
+            "w2".into(),
+            WebhookConfig {
+                url: "http://192.0.2.1:1/hook2".into(),
+                auth_header: None,
+            },
+            vec![],
+            true,
+        );
+        let event = AlertEvent::new(AlertType::BackendDown, "test");
+        d.dispatch(&event).await;
+        // Both channels attempted, event in history once
+        assert_eq!(d.history_count(), 1);
+        assert_eq!(d.channel_count(), 2);
+    }
+
     #[test]
     fn test_default_dispatcher() {
         let d = NotifyDispatcher::default();

@@ -963,6 +963,98 @@ mod tests {
         assert!(resolve_security_preset("nonexistent", &presets).is_none());
     }
 
+    // ---- SlaConfig ----
+
+    #[test]
+    fn test_sla_config_default_for_route() {
+        let config = SlaConfig::default_for_route("route-1");
+        assert_eq!(config.route_id, "route-1");
+        assert!((config.target_pct - 99.9).abs() < f64::EPSILON);
+        assert_eq!(config.max_latency_ms, 500);
+        assert_eq!(config.success_status_min, 200);
+        assert_eq!(config.success_status_max, 399);
+    }
+
+    #[test]
+    fn test_sla_config_is_success_within_bounds() {
+        let config = SlaConfig::default_for_route("r1");
+        assert!(config.is_success(200, 100));
+        assert!(config.is_success(301, 400));
+        assert!(config.is_success(399, 500)); // exactly at max latency
+    }
+
+    #[test]
+    fn test_sla_config_is_success_status_out_of_range() {
+        let config = SlaConfig::default_for_route("r1");
+        assert!(!config.is_success(400, 100)); // 400 > 399
+        assert!(!config.is_success(500, 100));
+        assert!(!config.is_success(199, 100)); // 199 < 200
+    }
+
+    #[test]
+    fn test_sla_config_is_success_latency_exceeded() {
+        let config = SlaConfig::default_for_route("r1");
+        assert!(!config.is_success(200, 501)); // 501 > 500
+        assert!(!config.is_success(200, 10000));
+    }
+
+    #[test]
+    fn test_sla_config_is_success_both_fail() {
+        let config = SlaConfig::default_for_route("r1");
+        assert!(!config.is_success(500, 1000));
+    }
+
+    // ---- Route defaults via serde ----
+
+    #[test]
+    fn test_route_serde_defaults_applied() {
+        // Minimal JSON that omits all defaulted fields
+        let json = r#"{
+            "id": "r1",
+            "hostname": "test.com",
+            "path_prefix": "/",
+            "certificate_id": null,
+            "load_balancing": "round_robin",
+            "waf_enabled": false,
+            "waf_mode": "detection",
+            "topology_type": "single_vm",
+            "enabled": true,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let route: Route = serde_json::from_str(json).unwrap();
+        assert_eq!(route.security_headers, "moderate");
+        assert_eq!(route.connect_timeout_s, 5);
+        assert_eq!(route.read_timeout_s, 60);
+        assert_eq!(route.send_timeout_s, 60);
+        assert!(route.access_log_enabled);
+        assert!(route.websocket_enabled);
+        assert!(!route.compression_enabled);
+        assert!(!route.cache_enabled);
+        assert_eq!(route.cache_ttl_s, 300);
+        assert_eq!(route.cache_max_bytes, 52428800);
+        assert_eq!(route.slowloris_threshold_ms, 5000);
+        assert_eq!(route.auto_ban_duration_s, 3600);
+        assert!(!route.force_https);
+        assert!(route.hostname_aliases.is_empty());
+        assert!(route.rate_limit_rps.is_none());
+        assert!(route.auto_ban_threshold.is_none());
+    }
+
+    // ---- GlobalSettings defaults via serde ----
+
+    #[test]
+    fn test_global_settings_loadtest_defaults_on_missing() {
+        let json =
+            r#"{"management_port":9443,"log_level":"info","default_health_check_interval_s":10}"#;
+        let settings: GlobalSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.max_active_probes, 50);
+        assert_eq!(settings.loadtest_max_concurrency, 100);
+        assert_eq!(settings.loadtest_max_duration_s, 60);
+        assert_eq!(settings.loadtest_max_rps, 1000);
+        assert_eq!(settings.default_topology_type, TopologyType::SingleVm);
+    }
+
     #[test]
     fn test_security_header_preset_serde_round_trip() {
         let preset = SecurityHeaderPreset {
