@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Production-ready HTTP cache eviction** - Replaced the unbounded MemCache backend (no eviction, HashMap grows forever) with MemCache backed by a simple LRU eviction manager capped at 128 MiB. When the global cache exceeds the limit, least-recently-used entries are purged automatically. This makes the HTTP response cache safe for production workloads with bounded memory usage.
+
 ### Added
 
 - **Rate limit response headers** - Proxied responses now include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers when a route has `rate_limit_rps` configured. Rate info is stored in RequestCtx during request_filter and injected in response_filter.

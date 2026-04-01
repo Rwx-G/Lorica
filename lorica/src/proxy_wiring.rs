@@ -23,6 +23,7 @@ use lorica_api::logs::{LogBuffer, LogEntry};
 use lorica_bench::SlaCollector;
 use lorica_cache::cache_control::CacheControl;
 use lorica_cache::filters::resp_cacheable;
+use lorica_cache::eviction::simple_lru;
 use lorica_cache::{CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable};
 use lorica_http::ResponseHeader;
 use once_cell::sync::Lazy;
@@ -313,11 +314,21 @@ fn ip_matches(ip: &str, pattern: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP cache infrastructure (Pingora MemCache backend)
+// HTTP cache infrastructure (MemCache storage + LRU eviction)
 // ---------------------------------------------------------------------------
 
-/// In-memory cache storage backend (leaked to 'static for Pingora's Storage trait).
+/// Global size limit for the HTTP response cache (bytes).
+/// Entries beyond this threshold are evicted in LRU order.
+const CACHE_SIZE_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
+
+/// In-memory cache storage backend (leaked to 'static for the Storage trait).
 static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+
+/// LRU eviction manager that enforces [CACHE_SIZE_LIMIT].
+/// When new entries are admitted and the total tracked size exceeds the limit,
+/// the manager returns the least-recently-used keys for purging from storage.
+static CACHE_EVICTION: Lazy<simple_lru::Manager> =
+    Lazy::new(|| simple_lru::Manager::new(CACHE_SIZE_LIMIT));
 
 /// Default cache TTL for cacheable status codes when the origin does not send
 /// explicit `Cache-Control` headers. The route-specific `cache_ttl_s` is used
@@ -813,10 +824,10 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Enable the Pingora cache state machine with our MemCache backend
+        // Enable the cache state machine with MemCache storage + LRU eviction
         session.cache.enable(
             &*CACHE_BACKEND,
-            None,  // no eviction manager (MemCache handles its own via TinyUFO)
+            Some(&*CACHE_EVICTION),
             None,  // no predictor
             None,  // no cache lock
             None,  // no option overrides
