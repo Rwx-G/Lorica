@@ -58,7 +58,7 @@ jobs:
           npm run build
 
       - name: Run Rust unit tests (product crates)
-        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify
+        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench
         env:
           SKIP_FRONTEND_BUILD: ""
 
@@ -72,10 +72,11 @@ jobs:
           cd lorica-dashboard/frontend
           npx vitest run
 
-  build:
-    name: Build
+  build-and-package:
+    name: Build & Package
     needs: test
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -105,34 +106,11 @@ jobs:
           path: target/release/lorica
           retention-days: 30
 
-  build-deb:
-    name: Package .deb
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download artifact (with retry)
-        uses: actions/download-artifact@v4
-        with:
-          name: lorica-linux-x86_64
-          path: .
-        continue-on-error: true
-        id: download1
-      - name: Retry download if first attempt failed
-        if: steps.download1.outcome == 'failure'
-        run: sleep 15
-      - name: Download artifact (retry)
-        if: steps.download1.outcome == 'failure'
-        uses: actions/download-artifact@v4
-        with:
-          name: lorica-linux-x86_64
-          path: .
-
+      # Package .deb (same job, no artifact download needed)
       - name: Build .deb package
         run: |
-          chmod +x lorica
-          bash dist/build-deb.sh ./lorica
+          chmod +x target/release/lorica
+          bash dist/build-deb.sh ./target/release/lorica
 
       - name: Verify .deb package
         run: |
@@ -149,36 +127,15 @@ jobs:
           path: dist/*.deb
           retention-days: 30
 
-  build-rpm:
-    name: Package .rpm
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-    container: fedora:latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install build tools
-        run: dnf install -y rpm-build
-      - name: Download artifact (with retry)
-        uses: actions/download-artifact@v4
-        with:
-          name: lorica-linux-x86_64
-          path: .
-        continue-on-error: true
-        id: rpm-download1
-      - name: Retry download if first attempt failed
-        if: steps.rpm-download1.outcome == 'failure'
-        run: sleep 15
-      - name: Download artifact (retry)
-        if: steps.rpm-download1.outcome == 'failure'
-        uses: actions/download-artifact@v4
-        with:
-          name: lorica-linux-x86_64
-          path: .
+      # Package .rpm (using alien to convert deb -> rpm on Ubuntu)
+      - name: Install rpm tools
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
       - name: Build .rpm package
         run: |
-          chmod +x lorica
-          bash dist/build-rpm.sh ./lorica
+          chmod +x target/release/lorica
+          bash dist/build-rpm.sh ./target/release/lorica
+
       - name: Verify .rpm package
         run: |
           for rpm in dist/*.rpm; do
@@ -186,6 +143,7 @@ jobs:
             rpm -qpi "$rpm"
             rpm -qpl "$rpm"
           done
+
       - name: Upload .rpm artifact
         uses: actions/upload-artifact@v4
         with:
@@ -193,27 +151,9 @@ jobs:
           path: dist/*.rpm
           retention-days: 30
 
-  test-rpm-install:
-    name: Test .rpm install
-    needs: build-rpm
-    runs-on: ubuntu-latest
-    container: fedora:latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: lorica-rpm
-          path: dist/
-      - name: Install and verify
-        run: |
-          rpm -ivh dist/*.rpm
-          test -x /usr/bin/lorica
-          test -f /usr/lib/systemd/system/lorica.service
-          lorica --version
-          echo ".rpm installation verified OK"
-
   test-deb-install:
     name: Test .deb install
-    needs: build-deb
+    needs: build-and-package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -228,6 +168,24 @@ jobs:
           test -f /lib/systemd/system/lorica.service
           lorica --version
           echo ".deb installation verified OK"
+
+  test-rpm-install:
+    name: Test .rpm install
+    needs: build-and-package
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lorica-rpm
+          path: dist/
+      - name: Install and verify
+        run: |
+          rpm -ivh dist/*.rpm
+          test -x /usr/bin/lorica
+          test -f /usr/lib/systemd/system/lorica.service
+          lorica --version
+          echo ".rpm installation verified OK"
 
   release:
     name: Release
