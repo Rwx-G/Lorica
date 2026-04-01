@@ -84,6 +84,7 @@ Author: Rwx-G
 **ACME (Epic 4)**
 
 - Automatic TLS certificate provisioning via HTTP-01 challenge using instant-acme. Challenge tokens served at `/.well-known/acme-challenge/:token`. Supports staging and production directories. Consent-driven (admin opt-in per domain). Certs stored with `is_acme=true`
+- DNS-01 manual mode for ACME provisioning: two-step flow (`POST /api/v1/acme/provision-dns-manual` and `/confirm`) that returns TXT record info for the user to create at any DNS provider, then confirms and downloads the certificate. Pending challenges stored in memory with 10-minute expiry. Dashboard UI with copyable TXT record fields
 
 **Configuration & API**
 

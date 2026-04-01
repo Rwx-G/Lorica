@@ -14,16 +14,20 @@
 
 //! ACME / Let's Encrypt integration for automatic TLS certificate provisioning.
 //!
-//! Supports two challenge types:
+//! Supports three challenge modes:
 //! - **HTTP-01**: Requires port 80 reachable from the Internet.
-//! - **DNS-01**: Creates a `_acme-challenge.{domain}` TXT record via DNS provider API.
-//!   Supports Cloudflare and AWS Route53.
+//! - **DNS-01 (automated)**: Creates a `_acme-challenge.{domain}` TXT record via DNS
+//!   provider API. Supports Cloudflare and AWS Route53.
+//! - **DNS-01 (manual)**: Returns the TXT record info for the user to create manually,
+//!   then confirms the challenge in a second step.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::{Extension, Path};
 use axum::Json;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -57,6 +61,31 @@ impl AcmeChallengeStore {
     pub async fn remove(&self, token: &str) {
         self.challenges.write().await.remove(token);
     }
+}
+
+/// In-memory store for pending manual DNS-01 challenges.
+///
+/// Maps domain name to the pending challenge state. Entries are created by
+/// `provision_dns_manual` (step 1) and consumed by `provision_dns_manual_confirm`
+/// (step 2). Entries older than 10 minutes are considered expired.
+pub type PendingDnsChallenges = Arc<DashMap<String, PendingDnsChallenge>>;
+
+/// State for a pending manual DNS-01 challenge between the two-step flow.
+pub struct PendingDnsChallenge {
+    /// The order URL so we can restore the order from the ACME account.
+    pub order_url: String,
+    /// The challenge URL to mark as ready.
+    pub challenge_url: String,
+    /// The TXT record value the user must create.
+    pub txt_value: String,
+    /// Serialized account credentials (JSON) to restore the ACME account.
+    pub account_credentials_json: String,
+    /// Whether this was issued against the staging directory.
+    pub staging: bool,
+    /// Contact email used for the ACME account.
+    pub contact_email: Option<String>,
+    /// When this pending challenge was created (for expiry).
+    pub created_at: Instant,
 }
 
 /// ACME configuration for the Let's Encrypt directory.
@@ -979,6 +1008,345 @@ async fn provision_with_acme_dns(
     Ok(cert_id)
 }
 
+// ---------------------------------------------------------------------------
+// DNS-01 manual (two-step) challenge support
+// ---------------------------------------------------------------------------
+
+/// Maximum age for a pending manual DNS challenge before it is considered expired.
+const PENDING_DNS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600); // 10 min
+
+/// Request body for step 1: initiate a manual DNS-01 challenge.
+#[derive(Debug, Deserialize)]
+pub struct AcmeDnsManualRequest {
+    /// Domain to provision a certificate for.
+    pub domain: String,
+    /// Whether to use the staging environment.
+    #[serde(default = "default_true")]
+    pub staging: bool,
+    /// Contact email for the Let's Encrypt account.
+    pub contact_email: Option<String>,
+}
+
+/// Response for step 1: the TXT record the user must create.
+#[derive(Debug, Serialize)]
+struct AcmeDnsManualResponse {
+    status: String,
+    domain: String,
+    txt_record_name: String,
+    txt_record_value: String,
+    message: String,
+}
+
+/// Request body for step 2: confirm that the TXT record has been created.
+#[derive(Debug, Deserialize)]
+pub struct AcmeDnsManualConfirmRequest {
+    /// The domain whose pending challenge should be confirmed.
+    pub domain: String,
+}
+
+/// POST /api/v1/acme/provision-dns-manual - Step 1 of manual DNS-01 flow.
+///
+/// Creates an ACME order and extracts the DNS-01 challenge, but does NOT create
+/// the TXT record. Instead it returns the record name and value so the user can
+/// create it manually. The pending challenge is stored in memory.
+pub async fn provision_dns_manual(
+    Extension(state): Extension<AppState>,
+    Json(body): Json<AcmeDnsManualRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use instant_acme::{
+        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder,
+    };
+
+    if body.domain.is_empty() {
+        return Err(ApiError::BadRequest("domain is required".into()));
+    }
+
+    let config = AcmeConfig {
+        staging: body.staging,
+        contact_email: body.contact_email.clone(),
+    };
+
+    info!(
+        domain = %body.domain,
+        staging = config.staging,
+        "starting manual DNS-01 challenge (step 1)"
+    );
+
+    // Create ACME account
+    let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
+    let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
+
+    let (account, credentials) = Account::create(
+        &NewAccount {
+            contact: &contact_refs,
+            terms_of_service_agreed: true,
+            only_return_existing: false,
+        },
+        config.directory_url(),
+        None,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("ACME account creation failed: {e}")))?;
+
+    // Create order
+    let identifier = Identifier::Dns(body.domain.clone());
+    let mut order = account
+        .new_order(&NewOrder {
+            identifiers: &[identifier],
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("ACME order creation failed: {e}")))?;
+
+    // Get authorizations and find DNS-01 challenge
+    let authorizations = order
+        .authorizations()
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to get authorizations: {e}")))?;
+
+    let auth = authorizations
+        .first()
+        .ok_or_else(|| ApiError::Internal("no authorizations returned".into()))?;
+
+    if matches!(auth.status, AuthorizationStatus::Valid) {
+        return Err(ApiError::BadRequest(
+            "authorization already valid - no challenge needed".into(),
+        ));
+    }
+
+    let challenge = auth
+        .challenges
+        .iter()
+        .find(|c| c.r#type == ChallengeType::Dns01)
+        .ok_or_else(|| ApiError::Internal("no DNS-01 challenge available".into()))?;
+
+    let key_authorization = order.key_authorization(challenge);
+    let txt_value = key_authorization.dns_value();
+    let txt_record_name = format!("_acme-challenge.{}", body.domain);
+
+    // Serialize account credentials for later restoration
+    let credentials_json = serde_json::to_string(&credentials)
+        .map_err(|e| ApiError::Internal(format!("failed to serialize credentials: {e}")))?;
+
+    // Store the pending challenge
+    let pending = PendingDnsChallenge {
+        order_url: order.url().to_string(),
+        challenge_url: challenge.url.clone(),
+        txt_value: txt_value.clone(),
+        account_credentials_json: credentials_json,
+        staging: body.staging,
+        contact_email: body.contact_email.clone(),
+        created_at: Instant::now(),
+    };
+
+    state
+        .pending_dns_challenges
+        .insert(body.domain.clone(), pending);
+
+    info!(
+        domain = %body.domain,
+        txt_record = %txt_record_name,
+        "manual DNS-01 challenge created, waiting for user to set TXT record"
+    );
+
+    Ok(json_data(AcmeDnsManualResponse {
+        status: "pending_dns".into(),
+        domain: body.domain,
+        txt_record_name,
+        txt_record_value: txt_value,
+        message: "Create a DNS TXT record with the above name and value, then call confirm."
+            .into(),
+    }))
+}
+
+/// POST /api/v1/acme/provision-dns-manual/confirm - Step 2 of manual DNS-01 flow.
+///
+/// The user calls this after creating the TXT record. Lorica tells Let's Encrypt
+/// to verify the challenge, waits for validation, downloads the certificate, and
+/// stores it in the database.
+pub async fn provision_dns_manual_confirm(
+    Extension(state): Extension<AppState>,
+    Json(body): Json<AcmeDnsManualConfirmRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use instant_acme::{Account, AccountCredentials, AuthorizationStatus, OrderStatus};
+
+    if body.domain.is_empty() {
+        return Err(ApiError::BadRequest("domain is required".into()));
+    }
+
+    // Look up and remove the pending challenge
+    let (_, pending) = state
+        .pending_dns_challenges
+        .remove(&body.domain)
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "no pending DNS challenge for domain '{}'",
+                body.domain
+            ))
+        })?;
+
+    // Check expiry
+    if pending.created_at.elapsed() > PENDING_DNS_MAX_AGE {
+        return Err(ApiError::BadRequest(
+            "pending DNS challenge has expired (>10 min) - please start over".into(),
+        ));
+    }
+
+    info!(
+        domain = %body.domain,
+        "confirming manual DNS-01 challenge (step 2)"
+    );
+
+    // Restore ACME account from saved credentials
+    let credentials: AccountCredentials =
+        serde_json::from_str(&pending.account_credentials_json)
+            .map_err(|e| ApiError::Internal(format!("failed to deserialize credentials: {e}")))?;
+
+    let account = Account::from_credentials(credentials)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to restore ACME account: {e}")))?;
+
+    // Restore the order
+    let mut order = account
+        .order(pending.order_url.clone())
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to restore ACME order: {e}")))?;
+
+    // Tell ACME server the challenge is ready
+    order
+        .set_challenge_ready(&pending.challenge_url)
+        .await
+        .map_err(|e| ApiError::Internal(format!("set_challenge_ready failed: {e}")))?;
+
+    // Wait for validation (poll with backoff)
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let fresh_auth = order
+            .authorizations()
+            .await
+            .map_err(|e| ApiError::Internal(format!("failed to poll authorizations: {e}")))?;
+        let auth = &fresh_auth[0];
+
+        match auth.status {
+            AuthorizationStatus::Valid => break,
+            AuthorizationStatus::Pending => {
+                attempts += 1;
+                if attempts > 24 {
+                    return Err(ApiError::Internal(
+                        "DNS-01 challenge validation timed out after 120s".into(),
+                    ));
+                }
+            }
+            AuthorizationStatus::Invalid => {
+                return Err(ApiError::Internal(
+                    "DNS-01 challenge validation failed (invalid) - check your TXT record".into(),
+                ));
+            }
+            _ => {
+                return Err(ApiError::Internal(format!(
+                    "unexpected authorization status: {:?}",
+                    auth.status
+                )));
+            }
+        }
+    }
+
+    // Generate CSR and finalize order
+    let mut params = rcgen::CertificateParams::new(vec![body.domain.clone()])
+        .map_err(|e| ApiError::Internal(format!("CSR params error: {e}")))?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    let private_key =
+        rcgen::KeyPair::generate().map_err(|e| ApiError::Internal(format!("keygen error: {e}")))?;
+    let csr = params
+        .serialize_request(&private_key)
+        .map_err(|e| ApiError::Internal(format!("CSR serialize error: {e}")))?;
+
+    order
+        .finalize(csr.der())
+        .await
+        .map_err(|e| ApiError::Internal(format!("order finalize failed: {e}")))?;
+
+    // Wait for certificate issuance
+    let mut attempts = 0;
+    let cert_pem = loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let order_state = order.state();
+        match order_state.status {
+            OrderStatus::Valid => {
+                let cert = order
+                    .certificate()
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("certificate download failed: {e}")))?;
+                break cert
+                    .ok_or_else(|| ApiError::Internal("no certificate returned".into()))?;
+            }
+            OrderStatus::Processing => {
+                attempts += 1;
+                if attempts > 30 {
+                    return Err(ApiError::Internal(
+                        "certificate issuance timed out".into(),
+                    ));
+                }
+                order
+                    .refresh()
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("order refresh failed: {e}")))?;
+            }
+            status => {
+                return Err(ApiError::Internal(format!(
+                    "unexpected order status: {status:?}"
+                )));
+            }
+        }
+    };
+
+    let key_pem = private_key.serialize_pem();
+
+    // Store certificate in database
+    let now = chrono::Utc::now();
+    let cert_id = uuid::Uuid::new_v4().to_string();
+    let fingerprint = format!("acme-dns-manual:{}", body.domain);
+
+    let cert = lorica_config::models::Certificate {
+        id: cert_id.clone(),
+        domain: body.domain.clone(),
+        san_domains: vec![body.domain.clone()],
+        fingerprint,
+        cert_pem,
+        key_pem,
+        issuer: if pending.staging {
+            "(STAGING) Let's Encrypt".to_string()
+        } else {
+            "Let's Encrypt".to_string()
+        },
+        not_before: now,
+        not_after: now + chrono::Duration::days(90),
+        is_acme: true,
+        acme_auto_renew: false, // manual mode cannot auto-renew
+        created_at: now,
+    };
+
+    let store = state.store.lock().await;
+    store
+        .create_certificate(&cert)
+        .map_err(|e| ApiError::Internal(format!("failed to store certificate: {e}")))?;
+    drop(store);
+    state.notify_config_changed();
+
+    info!(
+        domain = %body.domain,
+        cert_id = %cert_id,
+        "manual DNS-01 certificate provisioned"
+    );
+
+    Ok(json_data(AcmeProvisionResponse {
+        status: "provisioned".into(),
+        domain: body.domain,
+        staging: pending.staging,
+        message: format!("Certificate provisioned via manual DNS-01 (id: {cert_id})"),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,5 +1507,59 @@ mod tests {
         assert!(xml.contains("TXT"));
         assert!(xml.contains("\"test-value-123\""));
         assert!(xml.contains("<TTL>120</TTL>"));
+    }
+
+    #[test]
+    fn test_pending_dns_challenges_store_and_retrieve() {
+        let store: PendingDnsChallenges = Arc::new(DashMap::new());
+        store.insert(
+            "example.com".to_string(),
+            PendingDnsChallenge {
+                order_url: "https://acme.example/order/1".into(),
+                challenge_url: "https://acme.example/chall/1".into(),
+                txt_value: "abc123".into(),
+                account_credentials_json: "{}".into(),
+                staging: true,
+                contact_email: Some("test@example.com".into()),
+                created_at: Instant::now(),
+            },
+        );
+
+        assert!(store.contains_key("example.com"));
+        assert!(!store.contains_key("other.com"));
+
+        let (_, pending) = store.remove("example.com").unwrap();
+        assert_eq!(pending.txt_value, "abc123");
+        assert_eq!(pending.challenge_url, "https://acme.example/chall/1");
+        assert!(pending.staging);
+        assert!(!store.contains_key("example.com"));
+    }
+
+    #[test]
+    fn test_pending_dns_challenge_expiry_check() {
+        let pending = PendingDnsChallenge {
+            order_url: String::new(),
+            challenge_url: String::new(),
+            txt_value: String::new(),
+            account_credentials_json: String::new(),
+            staging: false,
+            contact_email: None,
+            created_at: Instant::now() - std::time::Duration::from_secs(700),
+        };
+        assert!(pending.created_at.elapsed() > PENDING_DNS_MAX_AGE);
+    }
+
+    #[test]
+    fn test_pending_dns_challenge_not_expired() {
+        let pending = PendingDnsChallenge {
+            order_url: String::new(),
+            challenge_url: String::new(),
+            txt_value: String::new(),
+            account_credentials_json: String::new(),
+            staging: false,
+            contact_email: None,
+            created_at: Instant::now(),
+        };
+        assert!(pending.created_at.elapsed() < PENDING_DNS_MAX_AGE);
     }
 }

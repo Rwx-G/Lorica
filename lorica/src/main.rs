@@ -407,6 +407,7 @@ fn run_supervisor(cli: Cli) {
                 waf_engine: None,
                 waf_rule_count: None,
                 acme_challenge_store: None,
+                pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
                 load_test_engine: None,
                 // cache/ban are per-worker process, not available in supervisor
@@ -854,6 +855,7 @@ fn run_single_process(cli: Cli) {
                 waf_engine: Some(waf_engine),
                 waf_rule_count: Some(waf_rule_count),
                 acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::new()),
+                pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
                 load_test_engine: Some(Arc::clone(&load_test_engine)),
                 cache_hits: Some(proxy_cache_hits),

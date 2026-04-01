@@ -10,6 +10,8 @@
     type GenerateSelfSignedRequest,
     type AcmeProvisionRequest,
     type AcmeDnsProvisionRequest,
+    type AcmeDnsManualRequest,
+    type AcmeDnsManualConfirmRequest,
   } from '../lib/api';
   import CertExpiryBadge from '../components/CertExpiryBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
@@ -63,7 +65,7 @@
 
   // ACME provisioning state
   let showAcmeForm = $state(false);
-  let acmeMode: 'http01' | 'dns01' = $state('http01');
+  let acmeMode: 'http01' | 'dns01' | 'dns01-manual' = $state('http01');
   let acmeDomain = $state('');
   let acmeEmail = $state('');
   let acmeStaging = $state(false);
@@ -74,6 +76,12 @@
   let acmeError = $state('');
   let acmeSubmitting = $state(false);
   let acmeSuccess = $state('');
+  // Manual DNS-01 two-step state
+  let manualTxtName = $state('');
+  let manualTxtValue = $state('');
+  let manualPendingDomain = $state('');
+  let manualStep: 1 | 2 = $state(1);
+  let manualCopied = $state('');
 
   function openAcmeForm() {
     acmeDomain = '';
@@ -86,7 +94,23 @@
     acmeDnsApiSecret = '';
     acmeError = '';
     acmeSuccess = '';
+    manualTxtName = '';
+    manualTxtValue = '';
+    manualPendingDomain = '';
+    manualStep = 1;
+    manualCopied = '';
     showAcmeForm = true;
+  }
+
+  async function copyToClipboard(text: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      manualCopied = label;
+      setTimeout(() => { manualCopied = ''; }, 2000);
+    } catch {
+      // Fallback: select the text
+      manualCopied = '';
+    }
   }
 
   async function handleAcmeProvision() {
@@ -112,7 +136,7 @@
         acmeSuccess = res.data.message;
         await loadData();
       }
-    } else {
+    } else if (acmeMode === 'dns01') {
       if (!acmeDnsZoneId.trim() || !acmeDnsApiToken.trim()) {
         acmeError = 'Zone ID and API token are required for DNS-01';
         acmeSubmitting = false;
@@ -137,6 +161,41 @@
         acmeSuccess = res.data.message;
         await loadData();
       }
+    } else if (acmeMode === 'dns01-manual') {
+      // Step 1: get the TXT record info
+      const body: AcmeDnsManualRequest = {
+        domain: acmeDomain,
+        staging: acmeStaging,
+        contact_email: acmeEmail || undefined,
+      };
+      const res = await api.provisionAcmeDnsManual(body);
+      acmeSubmitting = false;
+      if (res.error) {
+        acmeError = res.error.message;
+      } else if (res.data) {
+        manualTxtName = res.data.txt_record_name;
+        manualTxtValue = res.data.txt_record_value;
+        manualPendingDomain = res.data.domain;
+        manualStep = 2;
+      }
+    }
+  }
+
+  async function handleManualDnsConfirm() {
+    acmeSubmitting = true;
+    acmeError = '';
+    const body: AcmeDnsManualConfirmRequest = { domain: manualPendingDomain };
+    const res = await api.confirmAcmeDnsManual(body);
+    acmeSubmitting = false;
+    if (res.error) {
+      acmeError = res.error.message;
+    } else if (res.data) {
+      acmeSuccess = res.data.message;
+      manualStep = 1;
+      manualTxtName = '';
+      manualTxtValue = '';
+      manualPendingDomain = '';
+      await loadData();
     }
   }
 
@@ -787,6 +846,42 @@
         <div class="form-actions">
           <button class="btn btn-primary" onclick={() => (showAcmeForm = false)}>Close</button>
         </div>
+      {:else if acmeMode === 'dns01-manual' && manualStep === 2}
+        <!-- Manual DNS-01 Step 2: show TXT record and confirm -->
+        {#if acmeError}
+          <div class="form-error">{acmeError}</div>
+        {/if}
+
+        <p>Create the following DNS TXT record, then click confirm:</p>
+
+        <div class="form-group">
+          <label>TXT Record Name</label>
+          <div class="copyable-field">
+            <code class="copyable-value">{manualTxtName}</code>
+            <button class="btn btn-small" onclick={() => copyToClipboard(manualTxtName, 'name')}>
+              {manualCopied === 'name' ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>TXT Record Value</label>
+          <div class="copyable-field">
+            <code class="copyable-value">{manualTxtValue}</code>
+            <button class="btn btn-small" onclick={() => copyToClipboard(manualTxtValue, 'value')}>
+              {manualCopied === 'value' ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+        </div>
+
+        <span class="hint">After creating the record, wait a minute or two for DNS propagation before confirming. The challenge expires after 10 minutes.</span>
+
+        <div class="form-actions">
+          <button class="btn btn-cancel" onclick={() => { manualStep = 1; manualTxtName = ''; manualTxtValue = ''; }}>Back</button>
+          <button class="btn btn-primary" onclick={handleManualDnsConfirm} disabled={acmeSubmitting}>
+            {acmeSubmitting ? 'Verifying...' : 'I have created the record - Confirm'}
+          </button>
+        </div>
       {:else}
         {#if acmeError}
           <div class="form-error">{acmeError}</div>
@@ -811,7 +906,11 @@
             </label>
             <label class="radio-item">
               <input type="radio" bind:group={acmeMode} value="dns01" />
-              DNS-01 (Cloudflare or Route53)
+              DNS-01 Automatic (Cloudflare or Route53)
+            </label>
+            <label class="radio-item">
+              <input type="radio" bind:group={acmeMode} value="dns01-manual" />
+              DNS-01 Manual (any provider)
             </label>
           </div>
         </div>
@@ -838,7 +937,11 @@
               <input type="password" bind:value={acmeDnsApiSecret} placeholder="Secret key" />
             </div>
           {/if}
-          <span class="hint">Currently supports Cloudflare and AWS Route53. For other providers, use HTTP-01 challenge instead (requires port 80 accessible from Internet). Manual DNS-01 support is planned.</span>
+          <span class="hint">Automated DNS-01 via Cloudflare or AWS Route53 API.</span>
+        {/if}
+
+        {#if acmeMode === 'dns01-manual'}
+          <span class="hint">You will be given a TXT record to create manually at your DNS provider. Works with any DNS provider. The challenge expires after 10 minutes.</span>
         {/if}
 
         <div class="form-group">
@@ -852,7 +955,11 @@
         <div class="form-actions">
           <button class="btn btn-cancel" onclick={() => (showAcmeForm = false)}>Cancel</button>
           <button class="btn btn-primary" onclick={handleAcmeProvision} disabled={acmeSubmitting}>
-            {acmeSubmitting ? 'Provisioning...' : 'Provision Certificate'}
+            {#if acmeMode === 'dns01-manual'}
+              {acmeSubmitting ? 'Requesting...' : 'Get TXT Record'}
+            {:else}
+              {acmeSubmitting ? 'Provisioning...' : 'Provision Certificate'}
+            {/if}
           </button>
         </div>
       {/if}
@@ -1285,5 +1392,39 @@
 
   .radio-item input[type="radio"] {
     accent-color: var(--color-primary);
+  }
+
+  .copyable-field {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .copyable-value {
+    flex: 1;
+    background: var(--color-bg-input);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: 0.5rem 0.75rem;
+    font-family: var(--mono);
+    font-size: 0.8125rem;
+    word-break: break-all;
+    color: var(--color-text);
+  }
+
+  .btn-small {
+    padding: 0.25rem 0.625rem;
+    font-size: 0.75rem;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--color-border);
+    background: var(--color-bg-input);
+    color: var(--color-text);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color var(--transition-fast);
+  }
+
+  .btn-small:hover {
+    background: var(--color-bg-hover);
   }
 </style>

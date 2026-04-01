@@ -39,6 +39,8 @@ pub struct AppState {
     pub waf_rule_count: Option<usize>,
     /// ACME HTTP-01 challenge store.
     pub acme_challenge_store: Option<crate::acme::AcmeChallengeStore>,
+    /// Pending manual DNS-01 challenges (two-step flow).
+    pub pending_dns_challenges: crate::acme::PendingDnsChallenges,
     /// Passive SLA metrics collector.
     pub sla_collector: Option<Arc<lorica_bench::SlaCollector>>,
     /// Load test engine.
@@ -194,6 +196,14 @@ pub fn build_router(
         .route(
             "/api/v1/acme/provision-dns",
             post(crate::acme::provision_certificate_dns),
+        )
+        .route(
+            "/api/v1/acme/provision-dns-manual",
+            post(crate::acme::provision_dns_manual),
+        )
+        .route(
+            "/api/v1/acme/provision-dns-manual/confirm",
+            post(crate::acme::provision_dns_manual_confirm),
         )
         .route("/api/v1/waf/rules", get(crate::waf::get_waf_rules))
         .route(

@@ -541,6 +541,12 @@ export const api = {
   provisionAcmeDns: (body: AcmeDnsProvisionRequest) =>
     request<AcmeProvisionResponse>('POST', '/acme/provision-dns', body),
 
+  provisionAcmeDnsManual: (body: AcmeDnsManualRequest) =>
+    request<AcmeDnsManualResponse>('POST', '/acme/provision-dns-manual', body),
+
+  confirmAcmeDnsManual: (body: AcmeDnsManualConfirmRequest) =>
+    request<AcmeProvisionResponse>('POST', '/acme/provision-dns-manual/confirm', body),
+
   // Backends CRUD
   getBackend: (id: string) =>
     request<BackendResponse>('GET', `/backends/${id}`),
@@ -725,6 +731,24 @@ export interface AcmeProvisionResponse {
   status: string;
   domain: string;
   staging: boolean;
+  message: string;
+}
+
+export interface AcmeDnsManualRequest {
+  domain: string;
+  staging?: boolean;
+  contact_email?: string;
+}
+
+export interface AcmeDnsManualConfirmRequest {
+  domain: string;
+}
+
+export interface AcmeDnsManualResponse {
+  status: string;
+  domain: string;
+  txt_record_name: string;
+  txt_record_value: string;
   message: string;
 }
 
