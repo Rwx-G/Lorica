@@ -157,9 +157,6 @@
           {/if}
         </div>
         <div class="drawer-header-right">
-          <button class="btn btn-primary" disabled={formSubmitting} onclick={handleSubmit}>
-            {formSubmitting ? 'Saving...' : editing ? 'Update' : 'Create'}
-          </button>
           <button class="btn-close" onclick={handleClose} title="Close" aria-label="Close drawer">
             {@html closeIcon}
           </button>
@@ -180,7 +177,7 @@
           >
             {tab.label}
             {#if tabHasModifiedFields(tab.id)}
-              <span class="tab-dot"></span>
+              <span class="tab-dot" title="This tab has non-default values"></span>
             {/if}
           </button>
         {/each}

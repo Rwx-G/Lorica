@@ -319,9 +319,9 @@
               <td>{c.concurrency}</td>
               <td>{c.requests_per_second}</td>
               <td>{c.duration_s}s</td>
-              <td class="mono small">{c.schedule_cron ?? '-'}</td>
+              <td class="mono small">{c.schedule_cron ?? 'Manual'}</td>
               <td class="actions">
-                <button class="btn btn-small btn-run" onclick={() => handleStart(c.id)} disabled={!!progress?.active} title="Run">
+                <button class="btn btn-small btn-run" onclick={() => handleStart(c.id)} disabled={!!progress?.active} title={progress?.active ? 'Another test is already running' : 'Run this test'}>
                   Run
                 </button>
                 <button class="btn-icon" onclick={() => openEditForm(c)} title="Edit">
@@ -348,7 +348,10 @@
       {#if resultsLoading}
         <p class="loading">Loading results...</p>
       {:else if results.length === 0}
-        <p class="text-muted">No test runs yet for this configuration.</p>
+        <div class="empty-state">
+          <p>No test runs yet for this configuration.</p>
+          <p class="text-muted">Click the Run button in the table above to execute a test.</p>
+        </div>
       {:else}
         <!-- Comparison card -->
         {#if comparison}
@@ -479,10 +482,12 @@
           <div class="form-group">
             <label>Concurrency</label>
             <input type="number" bind:value={formConcurrency} min="1" max="10000" />
+            <span class="hint">Number of simultaneous connections to the target.</span>
           </div>
           <div class="form-group">
             <label>Requests/sec</label>
             <input type="number" bind:value={formRps} min="1" max="100000" />
+            <span class="hint">Target throughput. Total requests = RPS x Duration.</span>
           </div>
         </div>
 

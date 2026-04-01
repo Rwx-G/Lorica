@@ -483,6 +483,9 @@
                 <span>{parseResult?.upstreams.length ?? 0} upstream block(s)</span>
                 <span>{importRoutes.length} route(s) to import</span>
               </div>
+              {#if importRoutes.length === 0 && errors.length === 0}
+                <p class="step-hint" style="margin-top: 0.75rem;">No routes were detected. The parser expects <code>server</code> blocks containing <code>server_name</code> and <code>proxy_pass</code> directives.</p>
+              {/if}
             </div>
 
             <!-- Backend coherence -->

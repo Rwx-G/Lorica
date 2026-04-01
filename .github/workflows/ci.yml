@@ -144,6 +144,24 @@ jobs:
             rpm -qpl "$rpm"
           done
 
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 -d | gpg --batch --import
+
+      - name: Sign .deb package
+        run: |
+          sudo apt-get install -y dpkg-sig
+          for deb in dist/*.deb; do
+            dpkg-sig --sign builder -g "--batch --pinentry-mode loopback --passphrase-fd 0" "$deb" <<< "${{ secrets.GPG_PASSPHRASE }}"
+          done
+
+      - name: Sign .rpm package
+        run: |
+          echo "%_gpg_name Rwx-G (Lorica Project on Github : github.com/rwx-g/Lorica) <romain@rwx-g.fr>" > ~/.rpmmacros
+          for rpm_file in dist/*.rpm; do
+            rpm --addsign "$rpm_file" <<< "${{ secrets.GPG_PASSPHRASE }}" || echo "RPM signing skipped (may need rpm-sign package)"
+          done
+
       - name: Upload .rpm artifact
         uses: actions/upload-artifact@v4
         with:

@@ -158,21 +158,21 @@
       <span>Force HTTPS redirect</span>
     </label>
     {#if isImported('force_https')}<span class="imported-badge">imported</span>{/if}
-    <span class="hint">Nginx: return 301 https://... | Traefik: RedirectScheme middleware</span>
+    {#if importedFields && importedFields.size > 0}<span class="hint">Nginx: return 301 https://... | Traefik: RedirectScheme middleware</span>{/if}
   </div>
 
   <div class="form-group" class:modified={isModified('redirect_hostname')}>
     <label for="redirect-hostname">Redirect hostname</label>
     {#if isImported('redirect_hostname')}<span class="imported-badge">imported</span>{/if}
     <input id="redirect-hostname" type="text" bind:value={form.redirect_hostname} placeholder="e.g. www.example.com" />
-    <span class="hint">Nginx: server_name www.x.com; return 301 https://x.com... | Traefik: RedirectRegex</span>
+    {#if importedFields && importedFields.size > 0}<span class="hint">Nginx: server_name www.x.com; return 301 https://x.com... | Traefik: RedirectRegex</span>{/if}
   </div>
 
   <div class="form-group" class:modified={isModified('hostname_aliases')}>
     <label for="hostname-aliases">Hostname aliases <span class="hint">(comma-separated)</span></label>
     {#if isImported('hostname_aliases')}<span class="imported-badge">imported</span>{/if}
     <input id="hostname-aliases" type="text" bind:value={form.hostname_aliases} placeholder="alias1.com, alias2.com" />
-    <span class="hint">Nginx: server_name x.com www.x.com | Traefik: Host rule with OR</span>
+    {#if importedFields && importedFields.size > 0}<span class="hint">Nginx: server_name x.com www.x.com | Traefik: Host rule with OR</span>{/if}
   </div>
 
   <div class="form-group" class:modified={isModified('websocket_enabled')}>

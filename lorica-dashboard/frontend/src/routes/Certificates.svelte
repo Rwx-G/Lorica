@@ -106,7 +106,7 @@
     try {
       await navigator.clipboard.writeText(text);
       manualCopied = label;
-      setTimeout(() => { manualCopied = ''; }, 2000);
+      setTimeout(() => { manualCopied = ''; }, 3000);
     } catch {
       // Fallback: select the text
       manualCopied = '';
@@ -116,6 +116,10 @@
   async function handleAcmeProvision() {
     if (!acmeDomain.trim()) {
       acmeError = 'Domain is required';
+      return;
+    }
+    if (acmeEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(acmeEmail.trim())) {
+      acmeError = 'Invalid email address';
       return;
     }
     acmeSubmitting = true;
@@ -536,6 +540,7 @@
   {:else if certificates.length === 0}
     <div class="empty-state">
       <p>No certificates configured yet.</p>
+      <p class="text-muted">You can upload a PEM certificate, generate a self-signed certificate for testing, or provision a free Let's Encrypt certificate.</p>
       <button class="btn btn-primary" onclick={openUploadForm}>Upload your first certificate</button>
     </div>
   {:else}
@@ -852,7 +857,8 @@
           <div class="form-error">{acmeError}</div>
         {/if}
 
-        <p>Create the following DNS TXT record, then click confirm:</p>
+        <h3>Step 2 of 2 - Create DNS Record</h3>
+        <p>Add this TXT record at your DNS provider for <strong>{manualPendingDomain}</strong>, then click confirm.</p>
 
         <div class="form-group">
           <label>TXT Record Name</label>
@@ -877,7 +883,7 @@
         <span class="hint">After creating the record, wait a minute or two for DNS propagation before confirming. The challenge expires after 10 minutes.</span>
 
         <div class="form-actions">
-          <button class="btn btn-cancel" onclick={() => { manualStep = 1; manualTxtName = ''; manualTxtValue = ''; }}>Back</button>
+          <button class="btn btn-cancel" onclick={() => { if (window.confirm('Going back will abandon the current ACME challenge. Continue?')) { manualStep = 1; manualTxtName = ''; manualTxtValue = ''; } }}>Back</button>
           <button class="btn btn-primary" onclick={handleManualDnsConfirm} disabled={acmeSubmitting}>
             {acmeSubmitting ? 'Verifying...' : 'I have created the record - Confirm'}
           </button>

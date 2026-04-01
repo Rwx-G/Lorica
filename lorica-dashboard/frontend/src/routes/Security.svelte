@@ -75,6 +75,7 @@
 
   onMount(() => {
     loadData();
+    loadBans();
     return () => {
       if (bansRefreshTimer) clearInterval(bansRefreshTimer);
     };
@@ -237,7 +238,7 @@
     <div class="header-actions">
       <button class="btn btn-secondary" onclick={loadData}>Refresh</button>
       {#if activeTab === 'events' && events.length > 0}
-        <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear Events</button>
+        <button class="btn btn-secondary" style="color: var(--color-red)" onclick={() => (showClearConfirm = true)}>Clear Events</button>
       {/if}
     </div>
   </div>

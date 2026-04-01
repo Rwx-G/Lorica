@@ -71,7 +71,7 @@ Internet  -->  [ Lorica Proxy (8080/8443) ]  -->  Backend Services
 |--------|-----------|--------|
 | Dependency vulnerabilities | `cargo-audit` in CI pipeline | Implemented |
 | Malicious crate injection | Cargo.lock pinned, reproducible builds | Implemented |
-| Binary tampering | GPG package signing | Planned (backlog) |
+| Binary tampering | GPG package signing | Implemented |
 
 ### T6: Operational
 
