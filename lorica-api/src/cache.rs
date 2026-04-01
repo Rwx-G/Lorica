@@ -81,13 +81,14 @@ pub async fn list_bans(
         Some(bl) => bl
             .iter()
             .filter_map(|entry| {
-                let elapsed = entry.value().elapsed().as_secs();
-                // Default ban duration is 3600s; only show non-expired
-                if elapsed < 3600 {
+                let (banned_at, duration_s) = entry.value();
+                let elapsed = banned_at.elapsed().as_secs();
+                // Only show non-expired bans
+                if elapsed < *duration_s {
                     Some(serde_json::json!({
                         "ip": entry.key(),
                         "banned_seconds_ago": elapsed,
-                        "remaining_seconds": 3600 - elapsed,
+                        "remaining_seconds": duration_s - elapsed,
                     }))
                 } else {
                     None

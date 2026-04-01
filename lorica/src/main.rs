@@ -726,6 +726,14 @@ fn run_single_process(cli: Cli) {
         ));
         probe_scheduler.reload().await;
 
+        // Create load test engine (shared between API and scheduler)
+        let load_test_engine = Arc::new(lorica_bench::LoadTestEngine::new());
+
+        // Start load test cron scheduler
+        let lt_scheduler_store = Arc::clone(&store);
+        let lt_scheduler_engine = Arc::clone(&load_test_engine);
+        lorica_bench::scheduler::start_scheduler(lt_scheduler_store, lt_scheduler_engine);
+
         // Start the HTTP proxy service
         let mut lorica_proxy = LoricaProxy::new(
             Arc::clone(&proxy_config),
@@ -780,7 +788,7 @@ fn run_single_process(cli: Cli) {
                 waf_rule_count: Some(waf_rule_count),
                 acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
-                load_test_engine: Some(Arc::new(lorica_bench::LoadTestEngine::new())),
+                load_test_engine: Some(Arc::clone(&load_test_engine)),
                 cache_hits: Some(proxy_cache_hits),
                 cache_misses: Some(proxy_cache_misses),
                 ban_list: Some(proxy_ban_list),
@@ -801,12 +809,18 @@ fn run_single_process(cli: Cli) {
         let reload_store = Arc::clone(&store);
         let reload_config = Arc::clone(&proxy_config);
         let reload_probe_scheduler = Arc::clone(&probe_scheduler);
+        let reload_sla_collector = Arc::clone(&sla_collector);
         let _reload_handle = tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
                 if let Err(e) = reload_proxy_config(&reload_store, &reload_config).await {
                     tracing::error!(error = %e, "failed to reload proxy configuration");
                 }
                 reload_probe_scheduler.reload().await;
+                // Refresh SLA success criteria cache
+                {
+                    let s = reload_store.lock().await;
+                    reload_sla_collector.load_configs(&s);
+                }
             }
         });
 

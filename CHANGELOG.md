@@ -9,6 +9,10 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Changed
+
+- Refactored Routes form from a narrow modal into a slide-in drawer (900px) with 7 tabbed sections (General, Timeouts, Security, Headers, CORS, Caching, Protection), dot indicators for modified fields, imported-field badges, unsaved-changes warning, and centralized form state/validation in `route-form.ts`
+
 ### Added
 
 **Proxy Engine (Epics 1-2)**

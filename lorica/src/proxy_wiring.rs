@@ -390,9 +390,9 @@ pub struct LoricaProxy {
     pub sla_collector: Arc<SlaCollector>,
     /// Per-route rate limiter (keyed by "route_id:client_ip").
     pub rate_limiter: Arc<lorica_limits::rate::Rate>,
-    /// Ban list: maps banned IP addresses to the time they were banned.
-    /// Bans expire after the route-specific `auto_ban_duration_s` (default 1 hour).
-    pub ban_list: Arc<DashMap<String, Instant>>,
+    /// Ban list: maps banned IP addresses to (ban timestamp, ban duration in seconds).
+    /// Bans expire after the route-specific `auto_ban_duration_s`.
+    pub ban_list: Arc<DashMap<String, (Instant, u64)>>,
     /// Rate limit violation counter (per minute) for auto-ban decisions.
     pub rate_violations: Arc<lorica_limits::rate::Rate>,
     /// Per-route active connection counters for `max_connections` enforcement.
@@ -485,7 +485,8 @@ impl ProxyHttp for LoricaProxy {
         // Ban list check (before any other processing for banned IPs)
         if let Some(ref ip) = check_ip {
             let banned = if let Some(entry) = self.ban_list.get(ip) {
-                if entry.value().elapsed() >= Duration::from_secs(3600) {
+                let (banned_at, duration_s) = entry.value();
+                if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
                     drop(entry);
                     // Ban expired - lazy cleanup
                     self.ban_list.remove(ip);
@@ -704,7 +705,10 @@ impl ProxyHttp for LoricaProxy {
                         let violations = self.rate_violations.rate(&violation_key);
                         if violations > ban_threshold as f64 {
                             let ban_duration = entry.route.auto_ban_duration_s;
-                            self.ban_list.insert(ip.to_string(), Instant::now());
+                            self.ban_list.insert(
+                                ip.to_string(),
+                                (Instant::now(), ban_duration as u64),
+                            );
                             warn!(
                                 ip = %ip,
                                 violations = %violations,
@@ -989,7 +993,7 @@ impl ProxyHttp for LoricaProxy {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
         self.backend_connections.increment(&backend.address);
 
-        let peer = Box::new(HttpPeer::new(
+        let mut peer = Box::new(HttpPeer::new(
             &*backend.address,
             backend.tls_upstream,
             if backend.tls_upstream {
@@ -999,6 +1003,14 @@ impl ProxyHttp for LoricaProxy {
                 String::new()
             },
         ));
+
+        // Apply route-level timeouts to the peer options
+        peer.options.connection_timeout =
+            Some(Duration::from_secs(entry.route.connect_timeout_s as u64));
+        peer.options.read_timeout =
+            Some(Duration::from_secs(entry.route.read_timeout_s as u64));
+        peer.options.write_timeout =
+            Some(Duration::from_secs(entry.route.send_timeout_s as u64));
 
         Ok(peer)
     }
@@ -1160,6 +1172,19 @@ impl ProxyHttp for LoricaProxy {
                     headers_to_set.push((name.clone(), value.clone()));
                 }
             }
+        }
+
+        // CORS headers
+        if !route.cors_allowed_origins.is_empty() {
+            let origins = route.cors_allowed_origins.join(", ");
+            headers_to_set.push(("Access-Control-Allow-Origin".to_string(), origins));
+        }
+        if !route.cors_allowed_methods.is_empty() {
+            let methods = route.cors_allowed_methods.join(", ");
+            headers_to_set.push(("Access-Control-Allow-Methods".to_string(), methods));
+        }
+        if let Some(max_age) = route.cors_max_age_s {
+            headers_to_set.push(("Access-Control-Max-Age".to_string(), max_age.to_string()));
         }
 
         // Rate limit response headers
