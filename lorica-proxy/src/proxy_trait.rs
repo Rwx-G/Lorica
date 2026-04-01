@@ -428,6 +428,28 @@ pub trait ProxyHttp {
         Ok(None)
     }
 
+    /// Called before upstream compression is applied to a response.
+    /// Return the desired compression level (0 = disabled, 1-9 = gzip/brotli level).
+    /// Default returns 0 (disabled).
+    ///
+    /// This is invoked once per response, when the first header task arrives from
+    /// upstream but before the compression context transitions to body phase.
+    fn response_compression_level(
+        &self,
+        _session: &mut Session,
+        _upstream_response: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> u32 {
+        0
+    }
+
+    /// Return the maximum number of retries for this request.
+    /// If None, uses the service-level max_retries.
+    /// Override this to implement per-route retry configuration.
+    fn max_request_retries(&self, _session: &Session, _ctx: &Self::CTX) -> Option<usize> {
+        None
+    }
+
     /// This filter is called when the entire response is sent to the downstream successfully or
     /// there is a fatal error that terminate the request.
     ///

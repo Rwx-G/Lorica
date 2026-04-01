@@ -413,6 +413,7 @@ where
                                 // skip downstream filtering entirely as the 304 will not be sent
                                 break;
                             }
+                            self.apply_response_compression_level(session, &t, ctx);
                             session.upstream_compression.response_filter(&mut t);
                             // check error and abort
                             // otherwise the error is surfaced via write_response_tasks()

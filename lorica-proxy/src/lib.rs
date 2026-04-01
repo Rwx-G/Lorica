@@ -362,6 +362,25 @@ where
         }
     }
 
+    /// Apply per-request compression level before the compression context
+    /// processes the first header task. This must be called while the
+    /// compression context is still in HeaderPhase.
+    fn apply_response_compression_level(
+        &self,
+        session: &mut Session,
+        task: &HttpTask,
+        ctx: &mut SV::CTX,
+    ) where
+        SV: ProxyHttp,
+    {
+        if let HttpTask::Header(header, _) = task {
+            let level = self.inner.response_compression_level(session, header, ctx);
+            if level > 0 {
+                session.upstream_compression.adjust_level(level);
+            }
+        }
+    }
+
     async fn upstream_filter(
         &self,
         session: &mut Session,
@@ -873,7 +892,11 @@ where
         let mut server_reuse = false;
         let mut proxy_error: Option<Box<Error>> = None;
 
-        while retries < self.max_retries {
+        let max_retries = self
+            .inner
+            .max_request_retries(&session, &ctx)
+            .unwrap_or(self.max_retries);
+        while retries < max_retries {
             retries += 1;
 
             let (reuse, e) = self.proxy_to_upstream(&mut session, &mut ctx).await;

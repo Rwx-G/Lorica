@@ -1226,6 +1226,24 @@ impl ProxyHttp for LoricaProxy {
         Ok(())
     }
 
+    fn response_compression_level(
+        &self,
+        _session: &mut Session,
+        _upstream_response: &ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> u32 {
+        match &ctx.route_snapshot {
+            Some(route) if route.compression_enabled => 6, // standard gzip level
+            _ => 0,
+        }
+    }
+
+    fn max_request_retries(&self, _session: &Session, ctx: &Self::CTX) -> Option<usize> {
+        ctx.route_snapshot
+            .as_ref()
+            .and_then(|r| r.retry_attempts.map(|n| n as usize))
+    }
+
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX)
     where
         Self::CTX: Send + Sync,
