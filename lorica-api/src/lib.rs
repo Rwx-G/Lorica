@@ -3,6 +3,7 @@
 pub mod acme;
 pub mod auth;
 pub mod backends;
+pub mod cache;
 pub mod certificates;
 pub mod config;
 pub mod error;

@@ -360,6 +360,20 @@ pub struct Route {
     pub compression_enabled: bool,
     #[serde(default)]
     pub retry_attempts: Option<u32>,
+    #[serde(default)]
+    pub cache_enabled: bool,
+    #[serde(default = "default_cache_ttl_s")]
+    pub cache_ttl_s: i32,
+    #[serde(default = "default_cache_max_bytes")]
+    pub cache_max_bytes: i64,
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+    #[serde(default = "default_slowloris_threshold_ms")]
+    pub slowloris_threshold_ms: i32,
+    #[serde(default)]
+    pub auto_ban_threshold: Option<u32>,
+    #[serde(default = "default_auto_ban_duration_s")]
+    pub auto_ban_duration_s: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -489,6 +503,22 @@ fn default_websocket_enabled() -> bool {
 
 fn default_compression_enabled() -> bool {
     false
+}
+
+fn default_cache_ttl_s() -> i32 {
+    300
+}
+
+fn default_cache_max_bytes() -> i64 {
+    52428800
+}
+
+fn default_slowloris_threshold_ms() -> i32 {
+    5000
+}
+
+fn default_auto_ban_duration_s() -> i32 {
+    3600
 }
 
 fn default_cert_warning_days() -> i32 {

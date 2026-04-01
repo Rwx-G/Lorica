@@ -87,6 +87,13 @@ export interface RouteResponse {
   cors_max_age_s: number | null;
   compression_enabled: boolean;
   retry_attempts: number | null;
+  cache_enabled: boolean;
+  cache_ttl_s: number;
+  cache_max_bytes: number;
+  max_connections: number | null;
+  slowloris_threshold_ms: number;
+  auto_ban_threshold: number | null;
+  auto_ban_duration_s: number;
   created_at: string;
   updated_at: string;
 }
@@ -125,6 +132,13 @@ export interface CreateRouteRequest {
   cors_max_age_s?: number;
   compression_enabled?: boolean;
   retry_attempts?: number;
+  cache_enabled?: boolean;
+  cache_ttl_s?: number;
+  cache_max_bytes?: number;
+  max_connections?: number;
+  slowloris_threshold_ms?: number;
+  auto_ban_threshold?: number;
+  auto_ban_duration_s?: number;
 }
 
 export interface UpdateRouteRequest {
@@ -162,6 +176,13 @@ export interface UpdateRouteRequest {
   cors_max_age_s?: number;
   compression_enabled?: boolean;
   retry_attempts?: number;
+  cache_enabled?: boolean;
+  cache_ttl_s?: number;
+  cache_max_bytes?: number;
+  max_connections?: number;
+  slowloris_threshold_ms?: number;
+  auto_ban_threshold?: number;
+  auto_ban_duration_s?: number;
 }
 
 export interface BackendResponse {
@@ -362,6 +383,9 @@ export const api = {
 
   deleteRoute: (id: string) =>
     request<{ message: string }>('DELETE', `/routes/${id}`),
+
+  purgeRouteCache: (id: string) =>
+    request<{ message: string }>('DELETE', `/cache/routes/${id}`),
 
   listBackends: () =>
     request<{ backends: BackendResponse[] }>('GET', '/backends'),

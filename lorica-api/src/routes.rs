@@ -46,6 +46,13 @@ pub struct RouteResponse {
     pub cors_max_age_s: Option<i32>,
     pub compression_enabled: bool,
     pub retry_attempts: Option<u32>,
+    pub cache_enabled: bool,
+    pub cache_ttl_s: i32,
+    pub cache_max_bytes: i64,
+    pub max_connections: Option<u32>,
+    pub slowloris_threshold_ms: i32,
+    pub auto_ban_threshold: Option<u32>,
+    pub auto_ban_duration_s: i32,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -85,6 +92,13 @@ pub struct CreateRouteRequest {
     pub cors_max_age_s: Option<i32>,
     pub compression_enabled: Option<bool>,
     pub retry_attempts: Option<u32>,
+    pub cache_enabled: Option<bool>,
+    pub cache_ttl_s: Option<i32>,
+    pub cache_max_bytes: Option<i64>,
+    pub max_connections: Option<u32>,
+    pub slowloris_threshold_ms: Option<i32>,
+    pub auto_ban_threshold: Option<u32>,
+    pub auto_ban_duration_s: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +137,13 @@ pub struct UpdateRouteRequest {
     pub cors_max_age_s: Option<i32>,
     pub compression_enabled: Option<bool>,
     pub retry_attempts: Option<u32>,
+    pub cache_enabled: Option<bool>,
+    pub cache_ttl_s: Option<i32>,
+    pub cache_max_bytes: Option<i64>,
+    pub max_connections: Option<u32>,
+    pub slowloris_threshold_ms: Option<i32>,
+    pub auto_ban_threshold: Option<u32>,
+    pub auto_ban_duration_s: Option<i32>,
 }
 
 fn route_to_response(
@@ -165,6 +186,13 @@ fn route_to_response(
         cors_max_age_s: route.cors_max_age_s,
         compression_enabled: route.compression_enabled,
         retry_attempts: route.retry_attempts,
+        cache_enabled: route.cache_enabled,
+        cache_ttl_s: route.cache_ttl_s,
+        cache_max_bytes: route.cache_max_bytes,
+        max_connections: route.max_connections,
+        slowloris_threshold_ms: route.slowloris_threshold_ms,
+        auto_ban_threshold: route.auto_ban_threshold,
+        auto_ban_duration_s: route.auto_ban_duration_s,
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -252,6 +280,13 @@ pub async fn create_route(
         cors_max_age_s: body.cors_max_age_s,
         compression_enabled: body.compression_enabled.unwrap_or(false),
         retry_attempts: body.retry_attempts,
+        cache_enabled: body.cache_enabled.unwrap_or(false),
+        cache_ttl_s: body.cache_ttl_s.unwrap_or(300),
+        cache_max_bytes: body.cache_max_bytes.unwrap_or(52428800),
+        max_connections: body.max_connections,
+        slowloris_threshold_ms: body.slowloris_threshold_ms.unwrap_or(5000),
+        auto_ban_threshold: body.auto_ban_threshold,
+        auto_ban_duration_s: body.auto_ban_duration_s.unwrap_or(3600),
         created_at: now,
         updated_at: now,
     };
@@ -397,6 +432,27 @@ pub async fn update_route(
     }
     if let Some(retry_attempts) = body.retry_attempts {
         route.retry_attempts = Some(retry_attempts);
+    }
+    if let Some(cache_enabled) = body.cache_enabled {
+        route.cache_enabled = cache_enabled;
+    }
+    if let Some(cache_ttl_s) = body.cache_ttl_s {
+        route.cache_ttl_s = cache_ttl_s;
+    }
+    if let Some(cache_max_bytes) = body.cache_max_bytes {
+        route.cache_max_bytes = cache_max_bytes;
+    }
+    if let Some(max_connections) = body.max_connections {
+        route.max_connections = Some(max_connections);
+    }
+    if let Some(slowloris_threshold_ms) = body.slowloris_threshold_ms {
+        route.slowloris_threshold_ms = slowloris_threshold_ms;
+    }
+    if let Some(auto_ban_threshold) = body.auto_ban_threshold {
+        route.auto_ban_threshold = Some(auto_ban_threshold);
+    }
+    if let Some(auto_ban_duration_s) = body.auto_ban_duration_s {
+        route.auto_ban_duration_s = auto_ban_duration_s;
     }
     route.updated_at = Utc::now();
 

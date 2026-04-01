@@ -80,6 +80,10 @@ pub fn build_router(
         .route("/api/v1/routes/:id", get(crate::routes::get_route))
         .route("/api/v1/routes/:id", put(crate::routes::update_route))
         .route("/api/v1/routes/:id", delete(crate::routes::delete_route))
+        .route(
+            "/api/v1/cache/routes/:id",
+            delete(crate::cache::purge_route_cache),
+        )
         .route("/api/v1/backends", get(crate::backends::list_backends))
         .route("/api/v1/backends", post(crate::backends::create_backend))
         .route("/api/v1/backends/:id", get(crate::backends::get_backend))

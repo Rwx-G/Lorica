@@ -18,6 +18,7 @@ const MIGRATION_V5: &str = include_str!("migrations/005_load_tests.sql");
 const MIGRATION_V6: &str = include_str!("migrations/006_sla_bucket_config_snapshot.sql");
 const MIGRATION_V7: &str = include_str!("migrations/007_route_config.sql");
 const MIGRATION_V8: &str = include_str!("migrations/008_backend_name_group.sql");
+const MIGRATION_V9: &str = include_str!("migrations/009_cache_and_protection.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -208,6 +209,25 @@ impl ConfigStore {
             )?;
         }
 
+        if current_version < 9 {
+            let has_column: bool = self
+                .conn
+                .prepare(
+                    "SELECT COUNT(*) FROM pragma_table_info('routes') WHERE name='cache_enabled'",
+                )?
+                .query_row([], |row| row.get::<_, i64>(0))
+                .map(|c| c > 0)?;
+
+            if !has_column {
+                tracing::info!("applying migration 009_cache_and_protection");
+                self.conn.execute_batch(MIGRATION_V9)?;
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![9],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -308,11 +328,14 @@ impl ConfigStore {
              ip_allowlist, ip_denylist,
              cors_allowed_origins, cors_allowed_methods, cors_max_age_s,
              compression_enabled, retry_attempts,
+             cache_enabled, cache_ttl_s, cache_max_bytes,
+             max_connections, slowloris_threshold_ms,
+             auto_ban_threshold, auto_ban_duration_s,
              created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                      ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
-                     ?33, ?34, ?35, ?36)",
+                     ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
             params![
                 route.id,
                 route.hostname,
@@ -348,6 +371,13 @@ impl ConfigStore {
                 route.cors_max_age_s,
                 route.compression_enabled,
                 route.retry_attempts.map(|v| v as i32),
+                route.cache_enabled,
+                route.cache_ttl_s,
+                route.cache_max_bytes,
+                route.max_connections.map(|v| v as i32),
+                route.slowloris_threshold_ms,
+                route.auto_ban_threshold.map(|v| v as i32),
+                route.auto_ban_duration_s,
                 route.created_at.to_rfc3339(),
                 route.updated_at.to_rfc3339(),
             ],
@@ -371,6 +401,9 @@ impl ConfigStore {
                  ip_allowlist, ip_denylist,
                  cors_allowed_origins, cors_allowed_methods, cors_max_age_s,
                  compression_enabled, retry_attempts,
+                 cache_enabled, cache_ttl_s, cache_max_bytes,
+                 max_connections, slowloris_threshold_ms,
+                 auto_ban_threshold, auto_ban_duration_s,
                  created_at, updated_at
                  FROM routes WHERE id = ?1",
                 params![id],
@@ -395,6 +428,9 @@ impl ConfigStore {
              ip_allowlist, ip_denylist,
              cors_allowed_origins, cors_allowed_methods, cors_max_age_s,
              compression_enabled, retry_attempts,
+             cache_enabled, cache_ttl_s, cache_max_bytes,
+             max_connections, slowloris_threshold_ms,
+             auto_ban_threshold, auto_ban_duration_s,
              created_at, updated_at
              FROM routes ORDER BY hostname, path_prefix",
         )?;
@@ -444,7 +480,10 @@ impl ConfigStore {
              ip_allowlist=?28, ip_denylist=?29,
              cors_allowed_origins=?30, cors_allowed_methods=?31, cors_max_age_s=?32,
              compression_enabled=?33, retry_attempts=?34,
-             updated_at=?35 WHERE id=?1",
+             cache_enabled=?35, cache_ttl_s=?36, cache_max_bytes=?37,
+             max_connections=?38, slowloris_threshold_ms=?39,
+             auto_ban_threshold=?40, auto_ban_duration_s=?41,
+             updated_at=?42 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -480,6 +519,13 @@ impl ConfigStore {
                 route.cors_max_age_s,
                 route.compression_enabled,
                 route.retry_attempts.map(|v| v as i32),
+                route.cache_enabled,
+                route.cache_ttl_s,
+                route.cache_max_bytes,
+                route.max_connections.map(|v| v as i32),
+                route.slowloris_threshold_ms,
+                route.auto_ban_threshold.map(|v| v as i32),
+                route.auto_ban_duration_s,
                 route.updated_at.to_rfc3339(),
             ],
         )?;
@@ -1867,8 +1913,15 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         cors_max_age_s: row.get(31)?,
         compression_enabled: row.get(32)?,
         retry_attempts: row.get::<_, Option<i32>>(33)?.map(|v| v as u32),
-        created_at: parse_datetime(&row.get::<_, String>(34)?)?,
-        updated_at: parse_datetime(&row.get::<_, String>(35)?)?,
+        cache_enabled: row.get(34)?,
+        cache_ttl_s: row.get(35)?,
+        cache_max_bytes: row.get(36)?,
+        max_connections: row.get::<_, Option<i32>>(37)?.map(|v| v as u32),
+        slowloris_threshold_ms: row.get(38)?,
+        auto_ban_threshold: row.get::<_, Option<i32>>(39)?.map(|v| v as u32),
+        auto_ban_duration_s: row.get(40)?,
+        created_at: parse_datetime(&row.get::<_, String>(41)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(42)?)?,
     })
 }
 

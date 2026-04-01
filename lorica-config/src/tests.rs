@@ -45,6 +45,13 @@ mod tests {
             cors_max_age_s: None,
             compression_enabled: false,
             retry_attempts: None,
+            cache_enabled: false,
+            cache_ttl_s: 300,
+            cache_max_bytes: 52428800,
+            max_connections: None,
+            slowloris_threshold_ms: 5000,
+            auto_ban_threshold: None,
+            auto_ban_duration_s: 3600,
             created_at: now,
             updated_at: now,
         }
@@ -385,7 +392,7 @@ mod tests {
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
     }
 
     #[test]
@@ -398,7 +405,7 @@ mod tests {
         }
         {
             let store = ConfigStore::open(path, None).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 8);
+            assert_eq!(store.schema_version().unwrap(), 9);
         }
     }
 

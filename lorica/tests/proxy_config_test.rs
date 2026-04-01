@@ -57,6 +57,13 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str, enabled: bool) -> Rou
         cors_max_age_s: None,
         compression_enabled: false,
         retry_attempts: None,
+        cache_enabled: false,
+        cache_ttl_s: 300,
+        cache_max_bytes: 52428800,
+        max_connections: None,
+        slowloris_threshold_ms: 5000,
+        auto_ban_threshold: None,
+        auto_ban_duration_s: 3600,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
