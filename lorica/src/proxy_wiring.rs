@@ -370,6 +370,8 @@ pub struct RequestCtx {
     pub route_conn_counter: Option<Arc<AtomicU64>>,
     /// Rate limit info for response headers: (limit_rps, current_rate).
     pub rate_limit_info: Option<(u32, f64)>,
+    /// Retry counter for upstream connection failures.
+    pub retry_count: u32,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -452,6 +454,7 @@ impl ProxyHttp for LoricaProxy {
             access_log_enabled: true,
             route_conn_counter: None,
             rate_limit_info: None,
+            retry_count: 0,
         }
     }
 
@@ -536,6 +539,23 @@ impl ProxyHttp for LoricaProxy {
         // Store route snapshot and access log setting for later pipeline stages
         ctx.route_snapshot = Some(entry.route.clone());
         ctx.access_log_enabled = entry.route.access_log_enabled;
+
+        // Block WebSocket upgrades if disabled on this route
+        if !entry.route.websocket_enabled {
+            if let Some(upgrade) = req.headers.get("upgrade") {
+                if upgrade
+                    .to_str()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case("websocket")
+                {
+                    let header = lorica_http::ResponseHeader::build(403, None)?;
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
 
         // Force HTTPS redirect
         if entry.route.force_https {
