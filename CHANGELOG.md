@@ -114,6 +114,9 @@ Author: Rwx-G
 
 ### Fixed
 
+- `X-RateLimit-Reset` header now returns a real Unix timestamp (current time + 1s) instead of a hardcoded "1", in both 429 responses and normal rate-limited responses
+- Settings update (`PUT /api/v1/settings`) now triggers proxy config reload so changes take effect immediately
+- Config import diff now detects changes to `default_topology_type` and `flood_threshold_rps` settings
 - Database concurrency - added `PRAGMA busy_timeout=5000` and idempotent migration inserts (`INSERT OR IGNORE`) to prevent race conditions with multiple worker processes
 - Cache purge endpoint (`DELETE /api/v1/cache/routes/:id`) was a stub - now clears all cached entries and resets hit/miss counters
 
