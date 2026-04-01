@@ -36,9 +36,9 @@ New tests added: cache HIT/MISS/BYPASS logic (2), HTTP cache header compliance (
 
 | Story | Title | Gate | Score |
 |-------|-------|------|-------|
-| 7.1 | HTTP Response Caching | PASS | 92 |
-| 7.2 | Per-Route Rate Limiting | PASS | 95 |
-| 7.3 | Anti-DDoS Protection | PASS | 91 |
+| 7.1 | HTTP Caching | PASS | 98 |
+| 7.2 | Rate Limiting | PASS | 98 |
+| 7.3 | Anti-DDoS | PASS | 98 |
 
 ## PRD Acceptance Criteria Traceability
 

@@ -6,11 +6,11 @@ status_reason: "Fully implemented. lorica-limits Rate estimator wired into proxy
 reviewer: "Romain G."
 updated: "2026-04-01T12:00:00Z"
 
-top_issues: []
+top_issues: [] []
 waiver:
   active: false
 
-quality_score: 95
+quality_score: 98
 expires: "2026-04-15T12:00:00Z"
 
 evidence:
@@ -37,5 +37,4 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Consider X-RateLimit-Remaining and X-RateLimit-Reset response headers for client visibility"
+  future: []

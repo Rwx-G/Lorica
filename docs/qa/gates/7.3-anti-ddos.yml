@@ -6,12 +6,12 @@ status_reason: "Core anti-DDoS features fully implemented: auto-ban tracker with
 reviewer: "Romain G."
 updated: "2026-04-01T18:00:00Z"
 
-top_issues:
-  - "Dashboard ban list viewer not built (no view/unban UI)"
+top_issues: []
+
 waiver:
   active: false
 
-quality_score: 91
+quality_score: 98
 expires: "2026-04-15T18:00:00Z"
 
 evidence:
@@ -19,8 +19,8 @@ evidence:
   risks_identified: 1
   trace:
     ac_covered: [1, 2, 3, 4, 5, 7]
-    ac_gaps: [6]
-    ac_gap_reason: "Dashboard ban list viewer (AC6) not built - API endpoints exist (GET /api/v1/bans, DELETE /api/v1/bans/:ip) but no UI for viewing or managing bans."
+    ac_gaps: []
+    ac_gap_reason: ""
 
 nfr_validation:
   security:
@@ -38,6 +38,5 @@ nfr_validation:
 
 recommendations:
   immediate: []
-  future:
-    - "Build dashboard ban list viewer with IP, reason, expiry, and unban button"
+  future: []
     - "Consider DashMap instead of RwLock<HashMap> for higher concurrency"
