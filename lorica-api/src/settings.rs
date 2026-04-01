@@ -25,6 +25,7 @@ pub struct UpdateSettingsRequest {
     pub cert_warning_days: Option<i32>,
     pub cert_critical_days: Option<i32>,
     pub default_topology_type: Option<String>,
+    pub flood_threshold_rps: Option<i32>,
 }
 
 /// PUT /api/v1/settings
@@ -75,6 +76,14 @@ pub async fn update_settings(
         settings.default_topology_type = topo
             .parse::<lorica_config::models::TopologyType>()
             .map_err(ApiError::BadRequest)?;
+    }
+    if let Some(threshold) = body.flood_threshold_rps {
+        if threshold < 0 {
+            return Err(ApiError::BadRequest(
+                "flood_threshold_rps must be >= 0".into(),
+            ));
+        }
+        settings.flood_threshold_rps = threshold;
     }
 
     store.update_global_settings(&settings)?;

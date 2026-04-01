@@ -210,6 +210,7 @@ if [ -n "$SESSION" ]; then
     assert_json "$SETTINGS" ".data.log_level" "info" "Default log level is info"
     assert_json "$SETTINGS" ".data.default_topology_type" "single_vm" "Default topology is single_vm"
     assert_json_gt "$SETTINGS" ".data.default_health_check_interval_s" "0" "Health check interval > 0"
+    assert_json "$SETTINGS" ".data.flood_threshold_rps" "0" "Default flood threshold is 0 (disabled)"
 
     # Update default topology
     UPDATED=$(api_put "/api/v1/settings" '{"default_topology_type":"ha"}')
@@ -217,6 +218,11 @@ if [ -n "$SESSION" ]; then
 
     # Reset
     api_put "/api/v1/settings" '{"default_topology_type":"single_vm"}' >/dev/null
+
+    # Flood threshold setting
+    FLOOD=$(api_put "/api/v1/settings" '{"flood_threshold_rps":5000}')
+    assert_json "$FLOOD" ".data.flood_threshold_rps" "5000" "Flood threshold updated to 5000"
+    api_put "/api/v1/settings" '{"flood_threshold_rps":0}' >/dev/null
 
 # =============================================================================
 # 4. API - BACKENDS CRUD
