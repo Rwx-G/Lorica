@@ -760,7 +760,7 @@ impl BodyReader {
 
                 // If the start of the buf is not CRLF and we are not in the middle of reading a
                 // valid CRLF sequence, return to let caller seek for next CRLF
-                if end_read % 2 == 0 && buf[0] != CR && buf[0] != LF {
+                if end_read.is_multiple_of(2) && buf[0] != CR && buf[0] != LF {
                     trace!(
                         "parse trailers end {:?}, not CRLF sequence",
                         String::from_utf8_lossy(buf).escape_default(),
