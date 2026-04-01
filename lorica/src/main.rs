@@ -776,7 +776,7 @@ fn run_single_process(cli: Cli) {
                 cache_hits: Some(proxy_cache_hits),
                 cache_misses: Some(proxy_cache_misses),
                 ban_list: Some(proxy_ban_list),
-                cache_backend: Some(&*crate::proxy_wiring::CACHE_BACKEND),
+                cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
