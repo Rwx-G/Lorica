@@ -130,19 +130,19 @@ async fn test_reload_builds_proxy_config() {
     assert_eq!(api_routes[0].backends.len(), 1);
 }
 
-/// Verify that longest path prefix is matched first.
+/// Verify that each hostname maps to its own route entry.
 #[tokio::test]
-async fn test_longest_prefix_ordering() {
+async fn test_multiple_hostnames_routed_independently() {
     let store = ConfigStore::open_in_memory().unwrap();
 
     store
-        .create_route(&make_route("r1", "app.test", "/"))
+        .create_route(&make_route("r1", "app1.test", "/"))
         .unwrap();
     store
-        .create_route(&make_route("r2", "app.test", "/api"))
+        .create_route(&make_route("r2", "app2.test", "/api"))
         .unwrap();
     store
-        .create_route(&make_route("r3", "app.test", "/api/v2"))
+        .create_route(&make_route("r3", "app3.test", "/api/v2"))
         .unwrap();
     store
         .create_backend(&make_backend("b1", "10.0.0.1:80"))
@@ -161,12 +161,10 @@ async fn test_longest_prefix_ordering() {
         .unwrap();
 
     let config = proxy_config.load();
-    let routes = config.routes_by_host.get("app.test").unwrap();
-    assert_eq!(routes.len(), 3);
-    // Longest prefix first
-    assert_eq!(routes[0].route.path_prefix, "/api/v2");
-    assert_eq!(routes[1].route.path_prefix, "/api");
-    assert_eq!(routes[2].route.path_prefix, "/");
+    assert_eq!(config.routes_by_host.len(), 3);
+    assert!(config.routes_by_host.contains_key("app1.test"));
+    assert!(config.routes_by_host.contains_key("app2.test"));
+    assert!(config.routes_by_host.contains_key("app3.test"));
 }
 
 /// Verify that disabled routes are excluded from the config.
@@ -174,11 +172,11 @@ async fn test_longest_prefix_ordering() {
 async fn test_disabled_routes_excluded() {
     let store = ConfigStore::open_in_memory().unwrap();
 
-    let mut disabled = make_route("r1", "example.com", "/");
+    let mut disabled = make_route("r1", "disabled.test", "/");
     disabled.enabled = false;
     store.create_route(&disabled).unwrap();
     store
-        .create_route(&make_route("r2", "example.com", "/api"))
+        .create_route(&make_route("r2", "enabled.test", "/"))
         .unwrap();
     store
         .create_backend(&make_backend("b1", "10.0.0.1:80"))
@@ -196,9 +194,11 @@ async fn test_disabled_routes_excluded() {
         .unwrap();
 
     let config = proxy_config.load();
-    let routes = config.routes_by_host.get("example.com").unwrap();
+    // Disabled route should not appear
+    assert!(!config.routes_by_host.contains_key("disabled.test"));
+    // Enabled route should be present
+    let routes = config.routes_by_host.get("enabled.test").unwrap();
     assert_eq!(routes.len(), 1);
-    assert_eq!(routes[0].route.path_prefix, "/api");
 }
 
 /// Verify that routes with no backends are still loaded (but will return 502).

@@ -6,7 +6,7 @@ Thank you for considering contributing to Lorica! This document explains how to 
 
 ### Prerequisites
 
-- Rust 1.84+ (stable)
+- Rust 1.88+ (stable)
 - Node.js 18+ (for dashboard frontend)
 - Linux x86_64 (native builds) or Docker (for development on other platforms)
 

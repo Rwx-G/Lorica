@@ -2181,12 +2181,12 @@ mod tests {
         }
 
         // Within the same interval, rate() reports the previous interval (0)
-        assert_eq!(global_rate.rate(&b"global"[..]), 0.0);
+        assert_eq!(global_rate.rate(&"global"), 0.0);
 
         // After interval flip, rate should reflect observed count
         std::thread::sleep(Duration::from_millis(1100));
         global_rate.observe(&"global", 1);
-        let rate = global_rate.rate(&b"global"[..]);
+        let rate = global_rate.rate(&"global");
         assert!(rate >= 40.0, "Expected global rate >= 40.0, got {rate}");
     }
 
@@ -2245,7 +2245,7 @@ mod tests {
 
         // Wait for two full intervals so data expires
         std::thread::sleep(Duration::from_millis(2100));
-        let rate = global_rate.rate(&b"global"[..]);
+        let rate = global_rate.rate(&"global");
         assert_eq!(
             rate, 0.0,
             "Rate should decay to 0 after 2 intervals of silence"

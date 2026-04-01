@@ -350,7 +350,7 @@ All endpoints are served on the management port (default `9443`) over HTTPS. Pro
 
 ```bash
 # Prerequisites
-# - Rust 1.84+
+# - Rust 1.88+
 # - Node.js 18+ (for dashboard compilation)
 # - Linux (x86_64)
 

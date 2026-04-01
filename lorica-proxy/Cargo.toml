@@ -5,7 +5,7 @@ authors = ["Rwx-G"]
 # Original author: Yuchen Wu <yuchen@cloudflare.com> (Cloudflare Pingora)
 license = "Apache-2.0"
 edition = "2021"
-rust-version = "1.84"
+rust-version = "1.88"
 repository = "https://github.com/Rwx-G/Lorica"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "http", "proxy", "lorica"]

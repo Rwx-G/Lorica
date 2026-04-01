@@ -839,6 +839,9 @@ fn run_single_process(cli: Cli) {
         // Create config reload channel so API mutations can trigger proxy reload
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
 
+        // Clone sla_collector before the async move closure captures it
+        let reload_sla_collector = Arc::clone(&sla_collector);
+
         // Start API server
         let api_store = Arc::clone(&store);
         let api_log_buffer = Arc::clone(&log_buffer);
@@ -881,7 +884,6 @@ fn run_single_process(cli: Cli) {
         let reload_store = Arc::clone(&store);
         let reload_config = Arc::clone(&proxy_config);
         let reload_probe_scheduler = Arc::clone(&probe_scheduler);
-        let reload_sla_collector = Arc::clone(&sla_collector);
         let _reload_handle = tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
                 if let Err(e) = reload_proxy_config(&reload_store, &reload_config).await {

@@ -141,18 +141,29 @@ fn test_config_store_disabled_route_not_linked() {
 }
 
 #[test]
-fn test_config_store_multiple_routes_same_host() {
+fn test_config_store_multiple_routes_different_hosts() {
     let store = ConfigStore::open_in_memory().unwrap();
 
-    let r1 = make_route("r1", "example.com", "/", true);
-    let r2 = make_route("r2", "example.com", "/api", true);
+    let r1 = make_route("r1", "app1.example.com", "/", true);
+    let r2 = make_route("r2", "app2.example.com", "/", true);
 
     store.create_route(&r1).unwrap();
     store.create_route(&r2).unwrap();
 
     let routes = store.list_routes().unwrap();
     assert_eq!(routes.len(), 2);
-    assert!(routes.iter().all(|r| r.hostname == "example.com"));
+}
+
+#[test]
+fn test_config_store_duplicate_hostname_rejected() {
+    let store = ConfigStore::open_in_memory().unwrap();
+
+    let r1 = make_route("r1", "example.com", "/", true);
+    let r2 = make_route("r2", "example.com", "/api", true);
+
+    store.create_route(&r1).unwrap();
+    let result = store.create_route(&r2);
+    assert!(result.is_err(), "Duplicate hostname should be rejected");
 }
 
 #[test]
