@@ -313,14 +313,6 @@
           <div class="form-error">{formError}</div>
         {/if}
 
-        <div class="form-group">
-          <label>Address <span class="required">*</span></label>
-          <input type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" pattern="^[a-zA-Z0-9._-]+:\d{1,5}$" onblur={handleAddressBlur} />
-          {#if addressError}
-            <span class="field-error">{addressError}</span>
-          {/if}
-        </div>
-
         <div class="form-row">
           <div class="form-group">
             <label>Name</label>
@@ -330,6 +322,14 @@
             <label>Group</label>
             <input type="text" bind:value={formGroupName} placeholder="e.g. kubernetes, production, dmz" />
           </div>
+        </div>
+
+        <div class="form-group">
+          <label>Address <span class="required">*</span></label>
+          <input type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" pattern="^[a-zA-Z0-9._-]+:\d{1,5}$" onblur={handleAddressBlur} />
+          {#if addressError}
+            <span class="field-error">{addressError}</span>
+          {/if}
         </div>
 
         <div class="form-row">

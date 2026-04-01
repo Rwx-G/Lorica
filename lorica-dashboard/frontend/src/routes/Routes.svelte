@@ -648,7 +648,7 @@
         <div class="form-group">
           <label class="checkbox-item">
             <input type="checkbox" bind:checked={formEnabled} />
-            <span>Enabled</span>
+            <span>Route enabled</span>
           </label>
         </div>
       {/if}
@@ -662,6 +662,7 @@
 
       {#if showAdvanced}
         <div class="advanced-section">
+          <p class="hint">These settings map to common reverse proxy configurations. For Nginx users: proxy headers = proxy_set_header, timeouts = proxy_read_timeout, path rewriting = location + proxy_pass, security headers = add_header, rate limiting = limit_req.</p>
           <h3 class="section-title">Proxy Settings</h3>
           <div class="form-group">
             <label class="checkbox-item">

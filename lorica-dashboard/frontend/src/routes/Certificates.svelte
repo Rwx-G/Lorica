@@ -845,6 +845,7 @@
             <input type="checkbox" bind:checked={acmeStaging} />
             Use staging environment (for testing)
           </label>
+          <span class="hint">Staging uses Let's Encrypt test servers - certificates won't be trusted by browsers but there are no rate limits. Disable for production certificates (rate limited to 50 per week per domain).</span>
         </div>
 
         <div class="form-actions">

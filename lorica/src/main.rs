@@ -718,6 +718,14 @@ fn run_single_process(cli: Cli) {
         }
         sla_collector.start_flush_task(Arc::clone(&store), None);
 
+        // Start active probe scheduler
+        let probe_store = Arc::clone(&store);
+        let _probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
+            probe_store,
+            None, // no notification dispatcher for now
+        ));
+        _probe_scheduler.reload().await;
+
         // Start the HTTP proxy service
         let mut lorica_proxy = LoricaProxy::new(
             Arc::clone(&proxy_config),

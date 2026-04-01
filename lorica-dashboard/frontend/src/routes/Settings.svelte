@@ -353,6 +353,12 @@
       </div>
     </section>
 
+    <!-- Ban configuration note -->
+    <section class="section">
+      <h2>Ban Rules</h2>
+      <p class="section-hint">Ban rules (slowloris protection, auto-ban threshold and duration) are configured per-route in the Routes page under Advanced Configuration > Protection.</p>
+    </section>
+
     <!-- Notification Preferences -->
     <section class="section">
       <div class="section-header">
