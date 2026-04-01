@@ -6,19 +6,14 @@ Items identified during development that are deferred to future stories.
 
 | Source | Description | References |
 |--------|-------------|------------|
-| Wiring audit | `compression_enabled` stored but no gzip/brotli logic in proxy | `proxy_wiring.rs`, Route model |
-| Wiring audit | `retry_attempts` stored but no retry on backend failure | `proxy_wiring.rs`, ProxyHttp trait |
-| Wiring audit | `websocket_enabled` stored but no WebSocket upgrade handling | `proxy_wiring.rs`, Route model |
+| Wiring audit | `compression_enabled` - Pingora has gzip/brotli/zstd in lorica-core but compression is a module-level setting (level 0 = disabled). Per-route activation requires modifying the ResponseCompressionCtx which is not directly accessible from ProxyHttp callbacks. Needs Pingora module extension. | `lorica-core/src/protocols/http/compression/`, `lorica-proxy/src/proxy_trait.rs:57` |
+| Wiring audit | `retry_attempts` - Pingora has `max_retries` at service level but not per-route. `fail_to_connect()` returns an Error, not a retry signal. Per-route retry needs proxy flow override or service-level config. | `lorica-proxy/src/lib.rs:122`, `proxy_trait.rs:505` |
 
 ## Medium Priority
 
 | Source | Description | References |
 |--------|-------------|------------|
 | Epic 4 QA | GPG package signing for apt/yum repository trust | Story 4.4, `dist/build-deb.sh` |
-| Wiring audit | Worker/supervisor mode: health checks not started | `main.rs` run_supervisor/run_worker |
-| Wiring audit | Worker/supervisor mode: probe scheduler not started | `main.rs` run_supervisor |
-| Wiring audit | Worker mode: SLA flush task not started, metrics accumulate in memory | `main.rs` run_worker |
-| Wiring audit | Supervisor mode: cache_backend/ban_list/sla_collector = None in AppState | `main.rs` run_supervisor |
 | Wiring audit | DNS-01 manual mode (without API provider, 2-step challenge flow) | `lorica-api/src/acme.rs` |
 
 ## Low Priority
