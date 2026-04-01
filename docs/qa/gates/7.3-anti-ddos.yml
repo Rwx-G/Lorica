@@ -2,48 +2,42 @@ schema: 1
 story: "7.3"
 story_title: "Anti-DDoS Protection"
 gate: PASS
-status_reason: "Core anti-DDoS features implemented: auto-ban tracker with per-IP violation counting, ban list with lazy expiry in request_filter, AlertType::IpBanned dispatched to notification system, ban list API endpoints, configurable auto_ban_threshold and auto_ban_duration_s fields in route model via migration 009, dashboard fields for auto-ban configuration. Tests cover ban list blocking, expired ban cleanup, auto-ban escalation, and unban logic. Slowloris detection, max_connections enforcement in proxy, global flood detection, and dashboard ban list viewer are not yet implemented."
+status_reason: "Core anti-DDoS features fully implemented: auto-ban tracker with per-IP violation counting, ban list with lazy expiry in request_filter, AlertType::IpBanned dispatched to notification system, ban list API endpoints. Slowloris detection enforced in request_filter (408 when headers too slow). Max connections enforced per route with AtomicU64 counter (503 when exceeded). Global flood detection via rate observer tracking all incoming requests. Tests cover all enforcement paths. Only remaining gap: dashboard ban list viewer not built (API endpoints exist but no UI)."
 reviewer: "Romain G."
-updated: "2026-04-01T12:00:00Z"
+updated: "2026-04-01T18:00:00Z"
 
 top_issues:
-  - "Slowloris detection not enforced in proxy connection handler"
-  - "max_connections not enforced at proxy level (field exists in model but not checked)"
-  - "Global flood detection (global RPS tracking + stricter per-IP limits) not implemented"
   - "Dashboard ban list viewer not built (no view/unban UI)"
 waiver:
   active: false
 
-quality_score: 72
-expires: "2026-04-15T12:00:00Z"
+quality_score: 91
+expires: "2026-04-15T18:00:00Z"
 
 evidence:
-  tests_reviewed: 7
-  risks_identified: 4
+  tests_reviewed: 12
+  risks_identified: 1
   trace:
-    ac_covered: [2, 3, 7]
-    ac_gaps: [1, 4, 5, 6]
-    ac_gap_reason: "Slowloris detection (AC1) not enforced. Global connection limit (AC4) not enforced. Flood detection (AC5) not implemented. Dashboard ban list viewer (AC6) not built."
+    ac_covered: [1, 2, 3, 4, 5, 7]
+    ac_gaps: [6]
+    ac_gap_reason: "Dashboard ban list viewer (AC6) not built - API endpoints exist (GET /api/v1/bans, DELETE /api/v1/bans/:ip) but no UI for viewing or managing bans."
 
 nfr_validation:
   security:
     status: PASS
-    notes: "Ban list checked early in request_filter - banned IPs get 403 immediately. Auto-ban escalation prevents sustained abuse. AlertType::IpBanned notifies administrators."
+    notes: "Ban list checked early in request_filter - banned IPs get 403 immediately. Auto-ban escalation prevents sustained abuse. Slowloris detection drops slow clients with 408. AlertType::IpBanned notifies administrators."
   performance:
     status: PASS
-    notes: "Ban list uses RwLock<HashMap> - read-heavy workload is efficient. Lazy expiry avoids background thread overhead. Violation tracking reuses lorica-limits Rate estimator."
+    notes: "Ban list uses RwLock<HashMap> - read-heavy workload is efficient. Lazy expiry avoids background thread overhead. AtomicU64 counter for max_connections is lock-free. Rate observer for flood detection is lightweight."
   reliability:
     status: PASS
-    notes: "Ban list is in-memory only (intentional - bans are temporary). Lazy cleanup removes expired entries during request processing. Default ban duration is 3600s."
+    notes: "Ban list is in-memory only (intentional - bans are temporary). Lazy cleanup removes expired entries during request processing. Default ban duration is 3600s. Max connections returns 503 gracefully."
   maintainability:
     status: PASS
     notes: "Ban list and violation tracker are Arc-shared. Clean separation between rate limiting (Story 7.2) and auto-ban escalation (Story 7.3). AlertType::IpBanned follows existing notification patterns."
 
 recommendations:
-  immediate:
-    - "Implement slowloris detection in proxy connection handler using header receive timeout"
-    - "Enforce max_connections per route in request_filter (field exists but not checked)"
+  immediate: []
   future:
-    - "Implement global flood detection with configurable flood_threshold_rps"
-    - "Build dashboard ban list viewer with unban button"
+    - "Build dashboard ban list viewer with IP, reason, expiry, and unban button"
     - "Consider DashMap instead of RwLock<HashMap> for higher concurrency"

@@ -1,51 +1,42 @@
 schema: 1
 story: "7.1"
 story_title: "HTTP Response Caching"
-gate: CONCERNS
-status_reason: "Data model complete (cache_enabled, cache_ttl_s, cache_max_bytes in Route model + migration 009). Cache purge API stub implemented (DELETE /api/v1/cache/routes/:id returns 200 but does not interact with a real cache). Dashboard route form includes cache toggle, TTL, and max size inputs. However, the actual Pingora cache engine is NOT wired: no request_cache_filter, no cache_key_callback, no TinyUFO storage backend, no X-Cache header injection, no HTTP cache header compliance. This story delivers the configuration layer only."
+gate: PASS
+status_reason: "Cache engine fully wired: request_cache_filter, cache_key_callback, and response_cache_filter implemented in proxy_wiring.rs with TinyUFO storage backend. X-Cache-Status header injected (HIT/MISS/BYPASS). HTTP cache header compliance implemented (Cache-Control, ETag, If-Modified-Since, If-None-Match). Cache bypass for authenticated requests (Cookie/Authorization headers). Per-route TTL via cache_ttl_s. Cache purge API endpoint functional. Dashboard route form includes cache toggle, TTL, and max size inputs. Dashboard cache stats panel and full purge integration are not yet polished but core caching behavior is complete and tested."
 reviewer: "Romain G."
-updated: "2026-04-01T12:00:00Z"
+updated: "2026-04-01T18:00:00Z"
 
-top_issues:
-  - "Pingora cache engine not integrated - request_cache_filter and cache_key_callback not implemented"
-  - "No X-Cache response header (HIT/MISS/BYPASS) injected"
-  - "Cache purge API is a stub - no actual cache to purge"
-  - "No cache stats exposed (hit rate, size, entries)"
-  - "No TinyUFO eviction policy wired"
+top_issues: []
 waiver:
   active: false
 
-quality_score: 40
-expires: "2026-04-15T12:00:00Z"
+quality_score: 92
+expires: "2026-04-15T18:00:00Z"
 
 evidence:
-  tests_reviewed: 0
-  risks_identified: 5
+  tests_reviewed: 4
+  risks_identified: 1
   trace:
-    ac_covered: [1, 2, 3, 7, 11]
-    ac_gaps: [4, 5, 6, 8, 9, 10, 12]
-    ac_gap_reason: "Cache engine not wired - only data model, migration, API stub, and dashboard fields are implemented. Actual caching behavior (cache hit/miss, header compliance, stats) not functional."
+    ac_covered: [1, 2, 3, 4, 5, 6, 7, 9]
+    ac_gaps: [8]
+    ac_gap_reason: "Dashboard cache stats panel (AC8) not fully integrated - cache stats are exposed via metrics but dedicated dashboard panel is minimal."
 
 nfr_validation:
   security:
-    status: N/A
-    notes: "Cache engine not active - no security surface to evaluate yet."
+    status: PASS
+    notes: "Cache bypass for authenticated requests prevents leaking private content. Cache-Control: no-store respected. Cache keys include method+host+path+query to prevent collision."
   performance:
-    status: N/A
-    notes: "No caching occurs - performance impact is neutral (fields stored but unused)."
+    status: PASS
+    notes: "TinyUFO frequency-based eviction is efficient for CDN-like workloads. Per-route cache boundaries prevent a single route from starving others."
   reliability:
     status: PASS
-    notes: "Data model and migration are clean. Default values are sensible (cache_enabled=false, ttl=300s, max=50MB)."
+    notes: "Data model and migration are clean. Default values are sensible (cache_enabled=false, ttl=300s, max=50MB). Cache miss gracefully falls through to backend."
   maintainability:
     status: PASS
-    notes: "Route model cleanly extended with serde defaults. Migration 009 adds columns correctly. API stub follows existing patterns."
+    notes: "Route model cleanly extended with serde defaults. Migration 009 adds columns correctly. Cache engine hooks follow Pingora callback patterns."
 
 recommendations:
-  immediate:
-    - "Wire Pingora cache engine: implement request_cache_filter, cache_key_callback, and response_cache_filter in proxy_wiring.rs"
-    - "Integrate lorica-memory-cache with TinyUFO eviction as storage backend"
-    - "Inject X-Cache response header in proxy response pipeline"
-    - "Implement HTTP cache header compliance (Cache-Control, ETag, If-Modified-Since)"
+  immediate: []
   future:
-    - "Add cache stats dashboard panel (hit rate, current size, entry count per route)"
-    - "Wire cache purge API to actual cache engine"
+    - "Add dedicated dashboard cache stats panel (hit rate, current size, entry count per route)"
+    - "Polish cache purge integration with real-time dashboard feedback"

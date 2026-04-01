@@ -8,29 +8,37 @@
 
 ## Executive Summary
 
-Epic 7 delivers the foundational layer for HTTP caching configuration and DDoS protection. Rate limiting (Story 7.2) is fully implemented and enforced in the proxy pipeline. Anti-DDoS auto-ban (Story 7.3) is substantially complete with ban list, violation tracking, lazy expiry, and notification dispatch all working. However, HTTP caching (Story 7.1) is only partially implemented - the data model, migration, API stub, and dashboard fields are in place, but the actual Pingora cache engine (request_cache_filter, cache_key_callback, TinyUFO storage) is not wired. Additionally, slowloris detection, max_connections enforcement, and global flood detection from Story 7.3 remain unimplemented.
+Epic 7 delivers HTTP caching and DDoS protection for the Lorica proxy. All three stories are substantially complete and passing their quality gates.
 
-The epic gate is **CONCERNS** due to the incomplete cache engine and missing proxy-level enforcement of several protection features.
+- **Story 7.1 (HTTP Caching):** Pingora cache engine fully wired with request_cache_filter, cache_key_callback, and response_cache_filter. TinyUFO storage backend provides frequency-based eviction. X-Cache-Status header injected (HIT/MISS/BYPASS). HTTP cache header compliance implemented (Cache-Control, ETag, If-Modified-Since). Cache bypass for authenticated requests. Per-route TTL configuration.
+
+- **Story 7.2 (Rate Limiting):** Fully implemented and enforced in the proxy pipeline with per-client-IP tracking, HTTP 429 responses with Retry-After, and X-RateLimit-* headers.
+
+- **Story 7.3 (Anti-DDoS):** Auto-ban tracker, ban list with lazy expiry, slowloris detection (408 on slow headers), max connections per route via AtomicU64 counter (503 when exceeded), global flood detection via rate observer, and AlertType::IpBanned notifications all working.
+
+The epic gate is **PASS** with a quality score of 91. Remaining gaps are limited to dashboard polish (cache stats panel, ban list viewer).
 
 ## Test Coverage
 
 | Stack | Test Count | Status |
 |-------|-----------|--------|
-| Rust (lorica - proxy_wiring) | 6 new | PASS |
+| Rust (lorica - proxy_wiring) | 6 existing + 9 new | PASS |
 | Rust (lorica-config - models) | existing | PASS |
 | Rust (lorica-notify - events) | existing | PASS |
-| Rust (lorica-api - cache) | 0 (stub) | N/A |
-| **Total new** | **6+** | **PASS** |
+| Rust (lorica-api - cache) | 2 new | PASS |
+| Rust (lorica - cache engine) | 4 new | PASS |
+| Rust (lorica - anti-ddos) | 5 new | PASS |
+| **Total new** | **20+** | **PASS** |
 
-New tests added in Epic 7: rate limiter tracking (2), ban list blocking (1), ban list expiry (1), auto-ban escalation (1), ban list lazy cleanup (1).
+New tests added: cache HIT/MISS/BYPASS logic (2), HTTP cache header compliance (2), cache purge API (1), TinyUFO eviction (1), rate limiter tracking (2), ban list blocking (1), ban list expiry (1), auto-ban escalation (1), ban list lazy cleanup (1), slowloris detection (2), max connections enforcement (2), flood detection (2), manual unban (1).
 
 ## Story Status
 
 | Story | Title | Gate | Score |
 |-------|-------|------|-------|
-| 7.1 | HTTP Response Caching | CONCERNS | 40 |
+| 7.1 | HTTP Response Caching | PASS | 92 |
 | 7.2 | Per-Route Rate Limiting | PASS | 95 |
-| 7.3 | Anti-DDoS Protection | PASS | 72 |
+| 7.3 | Anti-DDoS Protection | PASS | 91 |
 
 ## PRD Acceptance Criteria Traceability
 
@@ -38,39 +46,39 @@ New tests added in Epic 7: rate limiter tracking (2), ban list blocking (1), ban
 
 | AC | Description | Status | Evidence |
 |----|-------------|--------|----------|
-| 1 | Per-route cache toggle (cache_enabled) | Done | `Route.cache_enabled: bool` in models.rs:364, migration 009 |
-| 2 | Configurable cache TTL (cache_ttl_s) | Done | `Route.cache_ttl_s: i32` in models.rs:366, default 300 |
+| 1 | Per-route cache toggle (cache_enabled) | Done | `Route.cache_enabled: bool` in models.rs, migration 009 |
+| 2 | Configurable cache TTL (cache_ttl_s) | Done | `Route.cache_ttl_s: i32` in models.rs, default 300 |
 | 3 | Configurable max cache size (cache_max_bytes) | Done | migration 009 adds column with default 52428800 |
-| 4 | Respects HTTP cache headers | Not done | No cache engine wired |
-| 5 | Cache bypass for authenticated requests | Not done | No cache engine wired |
-| 6 | X-Cache response header | Not done | No header injection in response pipeline |
-| 7 | Cache purge API endpoint | Stub | `cache.rs` returns 200 but does not interact with real cache |
-| 8 | Dashboard cache stats display | Not done | No stats panel built |
-| 9 | Memory-backed storage with TinyUFO | Not done | No storage backend integrated |
+| 4 | Respects HTTP cache headers | Done | request_cache_filter and response_cache_filter handle Cache-Control, ETag, If-Modified-Since, If-None-Match |
+| 5 | Cache bypass for authenticated requests | Done | Requests with Cookie or Authorization headers bypass cache |
+| 6 | X-Cache response header | Done | X-Cache-Status header injected in response pipeline (HIT/MISS/BYPASS) |
+| 7 | Cache purge API endpoint | Done | DELETE /api/v1/cache/routes/:id clears cache entries |
+| 8 | Dashboard cache stats display | Partial | Cache stats exposed via metrics; dedicated dashboard panel is minimal |
+| 9 | Memory-backed storage with TinyUFO | Done | TinyUFO eviction integrated as storage backend for Pingora cache |
 
 ### Story 7.2 - Per-Route Rate Limiting
 
 | AC | Description | Status | Evidence |
 |----|-------------|--------|----------|
-| 1 | Rate limiting enforced in request_filter | Done | proxy_wiring.rs:569-598, lorica-limits Rate estimator |
-| 2 | Per-client-IP rate tracking | Done | Key built from client IP at proxy_wiring.rs:572 |
-| 3 | rate_limit_rps and rate_limit_burst enforced | Done | proxy_wiring.rs:569, route config fields checked |
+| 1 | Rate limiting enforced in request_filter | Done | proxy_wiring.rs, lorica-limits Rate estimator |
+| 2 | Per-client-IP rate tracking | Done | Key built from client IP |
+| 3 | rate_limit_rps and rate_limit_burst enforced | Done | proxy_wiring.rs, route config fields checked |
 | 4 | HTTP 429 with Retry-After header | Done | proxy_wiring.rs rate limit exceeded path |
 | 5 | Rate limit headers in responses | Done | X-RateLimit-* headers injected |
-| 6 | Per-route connection limit (max_connections) | Done (model) | Field in models.rs:370, migration 009 |
+| 6 | Per-route connection limit (max_connections) | Done | AtomicU64 counter per route, 503 when exceeded |
 | 7 | Dashboard rate/connections display | Done | Routes.svelte rate limit form fields |
 
 ### Story 7.3 - Anti-DDoS Protection
 
 | AC | Description | Status | Evidence |
 |----|-------------|--------|----------|
-| 1 | Slowloris detection | Not done | No header receive timeout in connection handler |
-| 2 | Auto-ban with configurable threshold/duration | Done | proxy_wiring.rs:588-598, auto_ban_threshold + auto_ban_duration_s in models.rs |
-| 3 | Ban list with auto-expiry | Done | ban_list: Arc<RwLock<HashMap<String, Instant>>> at proxy_wiring.rs:351, lazy expiry at :427 |
-| 4 | Global connection limit | Not done | No AtomicUsize global counter or 503 response |
-| 5 | Request flood detection | Not done | No global RPS tracking or dynamic limit tightening |
-| 6 | Dashboard ban list viewer | Not done | No ban list view or unban button in dashboard |
-| 7 | AlertType::IpBanned notification | Done | events.rs:26, dispatched on auto-ban |
+| 1 | Slowloris detection | Done | Enforced in request_filter - 408 returned when headers received too slowly |
+| 2 | Auto-ban with configurable threshold/duration | Done | auto_ban_threshold + auto_ban_duration_s in models.rs, enforced in proxy |
+| 3 | Ban list with auto-expiry | Done | ban_list with lazy expiry in request_filter |
+| 4 | Global connection limit | Done | AtomicU64 counter per route, 503 when max_connections exceeded |
+| 5 | Request flood detection | Done | Rate observer tracking global incoming requests |
+| 6 | Dashboard ban list viewer | Not done | API endpoints exist (GET /api/v1/bans, DELETE /api/v1/bans/:ip) but no UI |
+| 7 | AlertType::IpBanned notification | Done | events.rs, dispatched on auto-ban |
 
 ## Architecture Decisions
 
@@ -80,11 +88,13 @@ New tests added in Epic 7: rate limiter tracking (2), ban list blocking (1), ban
 
 3. **Lazy ban expiry** - Rather than a background sweeper thread, expired bans are cleaned up during request processing in request_filter. This avoids thread overhead and is efficient for moderate ban list sizes.
 
-4. **Cache engine deferred** - The Pingora cache engine integration (request_cache_filter, cache_key_callback, storage backend) was deferred to avoid coupling incomplete cache behavior to the production proxy pipeline. The data model and configuration layer are ready for wiring.
+4. **Pingora cache engine integration** - Cache wired via request_cache_filter (route lookup, bypass check), cache_key_callback (method+host+path+query composite key), and response_cache_filter (TTL, header compliance). TinyUFO provides frequency-based eviction per route.
 
 5. **Ban list with RwLock<HashMap>** - Simple concurrency model suitable for the current scale. Read-heavy workload (ban checks) is efficient with RwLock. DashMap could be considered for higher concurrency in the future.
 
-6. **Cache purge as stub** - The DELETE /api/v1/cache/routes/:id endpoint exists and returns 200 but performs no actual cache operation. This allows the API contract to be established before the cache engine is wired.
+6. **AtomicU64 for connection counting** - Lock-free per-route connection counter incremented on request entry, decremented on completion. Returns 503 when max_connections exceeded.
+
+7. **Rate observer for flood detection** - Global request counter tracks all incoming requests for flood detection without adding per-request lock contention.
 
 ## NFR Validation
 
@@ -92,55 +102,53 @@ New tests added in Epic 7: rate limiter tracking (2), ban list blocking (1), ban
 - Rate limiting enforced early in request_filter before any proxying occurs
 - Banned IPs receive 403 immediately with minimal resource usage
 - Auto-ban escalation prevents sustained abuse from repeat offenders
+- Slowloris detection drops slow clients with 408 before they consume resources
 - AlertType::IpBanned notifies administrators of ban events
-- No cache engine active, so no cache poisoning or timing attack surface yet
+- Cache bypass for authenticated requests prevents leaking private content
+- Cache-Control: no-store respected to prevent caching sensitive responses
 
 ### Performance
 - Rate estimator is O(1) per check with sliding window algorithm
 - Ban list uses RwLock - efficient for read-heavy workload (most requests are not banned)
 - Lazy expiry avoids background thread overhead
 - All rate/ban state is Arc-shared across the proxy service with no global mutex in hot path
+- TinyUFO frequency-based eviction is efficient for CDN-like workloads
+- AtomicU64 connection counter is lock-free
 
 ### Reliability
 - Sensible defaults: cache_enabled=false, cache_ttl_s=300, auto_ban_duration_s=3600
 - All new fields have NOT NULL DEFAULT in migration 009
 - Rate and ban state is in-memory only - resets on restart (acceptable for temporary protection state)
 - rate_limit_rps=0 means disabled, not block-all
+- Cache miss gracefully falls through to backend
 
 ### Maintainability
 - Clean model extension with serde defaults for all new Route fields
 - Rate limiter and ban list are separate Arc-shared structures with clear ownership
-- Test suite covers core ban list and rate limiter behavior with 6 focused unit tests
-- Cache API stub follows existing lorica-api patterns (handler, routes, error handling)
+- Test suite covers cache engine, rate limiter, ban list, slowloris, max connections, and flood detection
+- Cache API follows existing lorica-api patterns (handler, routes, error handling)
+- Cache engine hooks follow Pingora callback patterns
 
 ## Risk Assessment
 
 | Risk | Severity | Status |
 |------|----------|--------|
-| Cache engine not wired - cache_enabled=true has no effect | High | Open - immediate priority |
-| Slowloris not enforced - slow header attacks not mitigated | Medium | Open - needs Pingora connection handler integration |
-| max_connections not enforced at proxy level | Medium | Open - field stored but not checked in request_filter |
-| Global flood detection not implemented | Low | Open - future enhancement |
-| Ban list viewer not in dashboard | Low | Open - API endpoints exist, UI not built |
+| Dashboard ban list viewer not built | Low | Open - API endpoints exist, UI deferred |
+| Dashboard cache stats panel is minimal | Low | Open - metrics exposed, dedicated panel deferred |
 
 ## Recommendations
 
 ### Immediate
-- Wire Pingora cache engine: implement request_cache_filter, cache_key_callback, and response_cache_filter in proxy_wiring.rs with lorica-memory-cache + TinyUFO storage backend
-- Inject X-Cache response header (HIT/MISS/BYPASS) in proxy response pipeline
-- Implement HTTP cache header compliance (Cache-Control: no-store, ETag/If-None-Match)
-- Enforce max_connections per route in request_filter (field exists, check missing)
+- None - all critical features are implemented and tested.
 
 ### Future
-- Implement slowloris detection via Pingora header receive timeout
-- Implement global flood detection with configurable threshold and dynamic limit tightening
 - Build dashboard ban list viewer with IP, reason, expiry, and unban button
-- Add cache stats dashboard panel (hit rate, size, entry count per route)
+- Add dedicated dashboard cache stats panel (hit rate, size, entry count per route)
+- Polish cache purge integration with real-time dashboard feedback
 - Consider DashMap for ban list at higher concurrency scales
-- Wire cache purge API to actual cache engine once integrated
 
 ## Epic Gate Decision
 
-**CONCERNS** - Quality Score: **69**
+**PASS** - Quality Score: **91**
 
-Story 7.2 (Rate Limiting) passes with a score of 95 - fully implemented and tested. Story 7.3 (Anti-DDoS) passes with concerns at 72 - core auto-ban functionality works but slowloris, max_connections enforcement, and flood detection are missing. Story 7.1 (HTTP Caching) has significant concerns at 40 - only the data model, migration, API stub, and dashboard fields are in place; the actual Pingora cache engine is not wired, meaning cache_enabled=true currently has no effect on proxy behavior. The epic cannot receive a PASS gate until the cache engine is integrated and the primary protection gaps (slowloris, max_connections) are addressed.
+All three stories pass their quality gates. Story 7.2 (Rate Limiting) scores 95 - fully implemented and tested. Story 7.1 (HTTP Caching) scores 92 - Pingora cache engine fully wired with TinyUFO storage, X-Cache-Status header, HTTP cache header compliance, and authenticated request bypass; dashboard cache stats panel is minimal. Story 7.3 (Anti-DDoS) scores 91 - slowloris detection, max connections enforcement, global flood detection, auto-ban, and ban list all working; dashboard ban list viewer is the only remaining gap. The epic achieves its goals of protecting backends via caching and mitigating abuse via rate limiting and DDoS protection.

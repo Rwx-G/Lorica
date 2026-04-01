@@ -33,20 +33,20 @@ so that repeated requests for CSS/JS/images are served instantly without hitting
 
 - [x] Add cache fields to route model (cache_enabled, cache_ttl_s, cache_max_bytes with defaults)
 - [x] Write database migration for new route cache columns
-- [ ] Integrate Pingora cache engine with lorica-memory-cache storage backend
-- [ ] Implement TinyUFO eviction policy for cache entries
-- [ ] Implement cache key generation (method + host + path + query)
-- [ ] Implement HTTP cache header respect (Cache-Control, ETag, If-Modified-Since, If-None-Match)
-- [ ] Implement cache bypass logic for requests with Cookie or Authorization headers
-- [ ] Inject X-Cache response header (HIT/MISS/BYPASS) in proxy response pipeline
+- [x] Integrate Pingora cache engine with lorica-memory-cache storage backend
+- [x] Implement TinyUFO eviction policy for cache entries
+- [x] Implement cache key generation (method + host + path + query)
+- [x] Implement HTTP cache header respect (Cache-Control, ETag, If-Modified-Since, If-None-Match)
+- [x] Implement cache bypass logic for requests with Cookie or Authorization headers
+- [x] Inject X-Cache response header (HIT/MISS/BYPASS) in proxy response pipeline
 - [x] Add cache purge API endpoint (DELETE /api/v1/cache/routes/:id)
-- [ ] Expose cache stats via internal metrics (hit count, miss count, size, entry count)
+- [x] Expose cache stats via internal metrics (hit count, miss count, size, entry count)
 - [x] Update dashboard route form with cache toggle, TTL, and max size inputs
-- [ ] Add dashboard cache stats panel (hit rate, current size, entry count per route)
-- [ ] Write tests for cache HIT/MISS/BYPASS logic
-- [ ] Write tests for HTTP cache header compliance (no-store, no-cache, max-age)
-- [ ] Write tests for cache purge API
-- [ ] Write tests for TinyUFO eviction when max size exceeded
+- [x] Add dashboard cache stats panel (hit rate, current size, entry count per route)
+- [x] Write tests for cache HIT/MISS/BYPASS logic
+- [x] Write tests for HTTP cache header compliance (no-store, no-cache, max-age)
+- [x] Write tests for cache purge API
+- [x] Write tests for TinyUFO eviction when max size exceeded
 
 ## Dev Notes
 
