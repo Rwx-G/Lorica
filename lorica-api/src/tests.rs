@@ -35,6 +35,7 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         cache_misses: None,
         ban_list: None,
         cache_backend: None,
+        ewma_scores: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
@@ -2752,6 +2753,7 @@ fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         cache_misses: None,
         ban_list: None,
         cache_backend: None,
+        ewma_scores: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
@@ -2779,6 +2781,7 @@ fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         cache_misses: None,
         ban_list: None,
         cache_backend: None,
+        ewma_scores: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();

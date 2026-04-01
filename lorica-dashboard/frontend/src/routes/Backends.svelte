@@ -252,6 +252,7 @@
             <th>Health Check</th>
             <th>TLS</th>
             <th>Connections</th>
+            <th>EWMA</th>
             <th></th>
           </tr>
         </thead>
@@ -279,6 +280,7 @@
                 {/if}
               </td>
               <td class="mono">{b.active_connections}</td>
+              <td class="mono">{b.ewma_score_us > 0 ? `${(b.ewma_score_us / 1000).toFixed(1)}ms` : '-'}</td>
               <td class="actions">
                 <button class="btn-icon" onclick={() => openEditForm(b)} title="Edit">
                   {@html editIcon}

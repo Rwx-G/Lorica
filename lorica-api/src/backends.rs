@@ -21,6 +21,7 @@ pub struct BackendResponse {
     pub health_check_interval_s: i32,
     pub health_check_path: Option<String>,
     pub tls_upstream: bool,
+    pub ewma_score_us: f64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -49,7 +50,10 @@ pub struct UpdateBackendRequest {
     pub tls_upstream: Option<bool>,
 }
 
-fn backend_to_response(b: &lorica_config::models::Backend) -> BackendResponse {
+fn backend_to_response(
+    b: &lorica_config::models::Backend,
+    ewma_score: f64,
+) -> BackendResponse {
     BackendResponse {
         id: b.id.clone(),
         address: b.address.clone(),
@@ -63,9 +67,20 @@ fn backend_to_response(b: &lorica_config::models::Backend) -> BackendResponse {
         health_check_interval_s: b.health_check_interval_s,
         health_check_path: b.health_check_path.clone(),
         tls_upstream: b.tls_upstream,
+        ewma_score_us: ewma_score,
         created_at: b.created_at.to_rfc3339(),
         updated_at: b.updated_at.to_rfc3339(),
     }
+}
+
+/// Look up the EWMA score for a backend address from shared state.
+fn get_ewma_score(state: &crate::server::AppState, addr: &str) -> f64 {
+    state
+        .ewma_scores
+        .as_ref()
+        .and_then(|scores| scores.read().ok())
+        .and_then(|map| map.get(addr).copied())
+        .unwrap_or(0.0)
 }
 
 /// GET /api/v1/backends
@@ -74,7 +89,10 @@ pub async fn list_backends(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     let backends = store.list_backends()?;
-    let responses: Vec<_> = backends.iter().map(backend_to_response).collect();
+    let responses: Vec<_> = backends
+        .iter()
+        .map(|b| backend_to_response(b, get_ewma_score(&state, &b.address)))
+        .collect();
     Ok(json_data(serde_json::json!({ "backends": responses })))
 }
 
@@ -112,7 +130,7 @@ pub async fn create_backend(
 
     Ok(json_data_with_status(
         StatusCode::CREATED,
-        backend_to_response(&backend),
+        backend_to_response(&backend, 0.0),
     ))
 }
 
@@ -125,7 +143,7 @@ pub async fn get_backend(
     let backend = store
         .get_backend(&id)?
         .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
-    Ok(json_data(backend_to_response(&backend)))
+    Ok(json_data(backend_to_response(&backend, get_ewma_score(&state, &backend.address))))
 }
 
 /// PUT /api/v1/backends/:id
@@ -168,7 +186,7 @@ pub async fn update_backend(
     store.update_backend(&backend)?;
     drop(store);
     state.notify_config_changed();
-    Ok(json_data(backend_to_response(&backend)))
+    Ok(json_data(backend_to_response(&backend, get_ewma_score(&state, &backend.address))))
 }
 
 /// DELETE /api/v1/backends/:id

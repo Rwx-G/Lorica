@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 
@@ -257,7 +257,7 @@ impl BackendConnections {
 #[derive(Debug, Default)]
 pub struct EwmaTracker {
     /// EWMA score per backend address (microseconds).
-    scores: std::sync::RwLock<HashMap<String, f64>>,
+    pub(crate) scores: Arc<std::sync::RwLock<HashMap<String, f64>>>,
 }
 
 /// Decay factor for EWMA (tau = 10 seconds).
@@ -307,6 +307,11 @@ impl EwmaTracker {
             .get(addr)
             .copied()
             .unwrap_or(0.0)
+    }
+
+    /// Return a shared reference to the scores map (for passing to API state).
+    pub fn scores_ref(&self) -> Arc<std::sync::RwLock<HashMap<String, f64>>> {
+        Arc::clone(&self.scores)
     }
 }
 
@@ -753,8 +758,14 @@ impl ProxyHttp for LoricaProxy {
                         }
                     }
 
+                    let reset_ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        + 1;
                     let mut header = lorica_http::ResponseHeader::build(429, None)?;
                     header.insert_header("Retry-After", "1")?;
+                    header.insert_header("X-RateLimit-Reset", &reset_ts.to_string())?;
                     session
                         .write_response_header(Box::new(header), true)
                         .await?;
@@ -1225,9 +1236,14 @@ impl ProxyHttp for LoricaProxy {
         // Rate limit response headers
         if let Some((limit, current)) = ctx.rate_limit_info {
             let remaining = if current < limit as f64 { (limit as f64 - current) as u32 } else { 0 };
+            let reset_ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + 1;
             headers_to_set.push(("X-RateLimit-Limit".to_string(), limit.to_string()));
             headers_to_set.push(("X-RateLimit-Remaining".to_string(), remaining.to_string()));
-            headers_to_set.push(("X-RateLimit-Reset".to_string(), "1".to_string()));
+            headers_to_set.push(("X-RateLimit-Reset".to_string(), reset_ts.to_string()));
         }
 
         // Apply removals first, then additions

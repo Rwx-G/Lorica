@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -53,6 +53,8 @@ pub struct AppState {
     pub ban_list: Option<Arc<DashMap<String, (std::time::Instant, u64)>>>,
     /// Cache backend for purging cached entries.
     pub cache_backend: Option<&'static lorica_cache::MemCache>,
+    /// EWMA scores per backend address (microseconds). Shared with the proxy engine.
+    pub ewma_scores: Option<Arc<std::sync::RwLock<HashMap<String, f64>>>>,
 }
 
 impl AppState {

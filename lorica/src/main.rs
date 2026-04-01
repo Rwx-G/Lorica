@@ -415,6 +415,7 @@ fn run_supervisor(cli: Cli) {
                 cache_misses: None,
                 ban_list: None,
                 cache_backend: None,
+                ewma_scores: None,
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
@@ -814,6 +815,7 @@ fn run_single_process(cli: Cli) {
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
         let proxy_cache_misses = Arc::clone(&lorica_proxy.cache_misses);
         let proxy_ban_list = Arc::clone(&lorica_proxy.ban_list);
+        let proxy_ewma_scores = lorica_proxy.ewma_tracker.scores_ref();
         let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
         proxy_service.add_tcp(&format!("0.0.0.0:{}", cli.http_port));
@@ -862,6 +864,7 @@ fn run_single_process(cli: Cli) {
                 cache_misses: Some(proxy_cache_misses),
                 ban_list: Some(proxy_ban_list),
                 cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
+                ewma_scores: Some(proxy_ewma_scores),
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
