@@ -13,8 +13,6 @@ Items identified during development that are deferred to future stories.
 
 | Source | Description | References |
 |--------|-------------|------------|
-| Epic 4 QA | GPG package signing for apt/yum repository trust | Story 4.4, `dist/build-deb.sh` |
-| Wiring audit | DNS-01 manual mode (without API provider, 2-step challenge flow) | `lorica-api/src/acme.rs` |
 
 ## Low Priority
 
