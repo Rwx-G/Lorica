@@ -464,7 +464,7 @@ impl ProxyHttp for LoricaProxy {
         Self::CTX: Send + Sync,
     {
         // Global flood tracking (before any other processing)
-        self.global_rate.observe(&b"global"[..], 1);
+        self.global_rate.observe(&"global", 1);
 
         // IP blocklist check (before any other processing)
         let client_ip = session
@@ -2038,7 +2038,7 @@ mod tests {
 
         // Observe some requests
         for _ in 0..50 {
-            global_rate.observe(&b"global"[..], 1);
+            global_rate.observe(&"global", 1);
         }
 
         // Within the same interval, rate() reports the previous interval (0)
@@ -2046,7 +2046,7 @@ mod tests {
 
         // After interval flip, rate should reflect observed count
         std::thread::sleep(Duration::from_millis(1100));
-        global_rate.observe(&b"global"[..], 1);
+        global_rate.observe(&"global", 1);
         let rate = global_rate.rate(&b"global"[..]);
         assert!(rate >= 40.0, "Expected global rate >= 40.0, got {rate}");
     }
@@ -2056,7 +2056,7 @@ mod tests {
         let global_rate = Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1)));
 
         for _ in 0..10 {
-            global_rate.observe(&b"global"[..], 1);
+            global_rate.observe(&"global", 1);
         }
 
         // Wait for two full intervals so data expires
