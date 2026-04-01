@@ -4,6 +4,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
+use dashmap::DashMap;
+
 use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
@@ -46,7 +48,9 @@ pub struct AppState {
     /// Cache miss counter shared with the proxy engine.
     pub cache_misses: Option<Arc<AtomicU64>>,
     /// Ban list shared with the proxy engine.
-    pub ban_list: Option<Arc<std::sync::RwLock<std::collections::HashMap<String, std::time::Instant>>>>,
+    pub ban_list: Option<Arc<DashMap<String, std::time::Instant>>>,
+    /// Cache backend for purging cached entries.
+    pub cache_backend: Option<&'static lorica_cache::MemCache>,
 }
 
 impl AppState {

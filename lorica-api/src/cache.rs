@@ -9,15 +9,34 @@ use crate::server::AppState;
 
 /// DELETE /api/v1/cache/routes/:id
 ///
-/// Purge cached responses for a specific route. This is a stub that will be
-/// wired to the actual cache engine in a later Epic 7 milestone.
+/// Purge cached responses for a specific route.
+/// Since cache keys are composed of host+path+query (not route ID), a
+/// per-route purge is not feasible without a secondary index. This endpoint
+/// clears **all** cached entries as a pragmatic alternative and resets the
+/// hit/miss counters.
 pub async fn purge_route_cache(
+    Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    // Stub - cache engine integration will be added later
+    let entries_cleared = state
+        .cache_backend
+        .map(|backend| backend.clear_all())
+        .unwrap_or(0);
+
+    // Reset hit/miss counters so dashboard stats reflect the purge
+    if let Some(ref hits) = state.cache_hits {
+        hits.store(0, Ordering::Relaxed);
+    }
+    if let Some(ref misses) = state.cache_misses {
+        misses.store(0, Ordering::Relaxed);
+    }
+
     Ok(json_data_with_status(
         StatusCode::OK,
-        serde_json::json!({ "message": format!("cache purged for route {id}") }),
+        serde_json::json!({
+            "message": format!("cache purged (requested route {id}, all {entries_cleared} entries cleared)"),
+            "entries_cleared": entries_cleared,
+        }),
     ))
 }
 
@@ -59,24 +78,22 @@ pub async fn list_bans(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let bans = match &state.ban_list {
-        Some(bl) => {
-            let map = bl.read().unwrap();
-            map.iter()
-                .filter_map(|(ip, banned_at)| {
-                    let elapsed = banned_at.elapsed().as_secs();
-                    // Default ban duration is 3600s; only show non-expired
-                    if elapsed < 3600 {
-                        Some(serde_json::json!({
-                            "ip": ip,
-                            "banned_seconds_ago": elapsed,
-                            "remaining_seconds": 3600 - elapsed,
-                        }))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        }
+        Some(bl) => bl
+            .iter()
+            .filter_map(|entry| {
+                let elapsed = entry.value().elapsed().as_secs();
+                // Default ban duration is 3600s; only show non-expired
+                if elapsed < 3600 {
+                    Some(serde_json::json!({
+                        "ip": entry.key(),
+                        "banned_seconds_ago": elapsed,
+                        "remaining_seconds": 3600 - elapsed,
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>(),
         None => Vec::new(),
     };
 
@@ -95,8 +112,7 @@ pub async fn delete_ban(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match &state.ban_list {
         Some(bl) => {
-            let mut map = bl.write().unwrap();
-            if map.remove(&ip).is_some() {
+            if bl.remove(&ip).is_some() {
                 Ok(json_data(serde_json::json!({
                     "unbanned": true,
                     "ip": ip,

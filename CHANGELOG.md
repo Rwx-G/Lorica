@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - **Production-ready HTTP cache eviction** - Replaced the unbounded MemCache backend (no eviction, HashMap grows forever) with MemCache backed by a simple LRU eviction manager capped at 128 MiB. When the global cache exceeds the limit, least-recently-used entries are purged automatically. This makes the HTTP response cache safe for production workloads with bounded memory usage.
+- **DashMap for ban list and route connections** - Replaced `RwLock<HashMap>` with `DashMap` for the ban list and per-route connection counters in the proxy hot path. DashMap provides lock-free concurrent reads and sharded writes, reducing contention under high concurrency.
+
+### Fixed
+
+- **Cache purge endpoint now functional** - The `DELETE /api/v1/cache/routes/:id` endpoint was a stub. It now clears all cached entries via `MemCache::clear_all()` and resets hit/miss counters. Since cache keys are host+path+query (not route-keyed), a full purge is performed.
 
 ### Added
 

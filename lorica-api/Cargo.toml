@@ -8,6 +8,7 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
+lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
 lorica-config = { version = "0.3.0", path = "../lorica-config" }
 lorica-dashboard = { version = "0.3.0", path = "../lorica-dashboard" }
 lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
@@ -31,6 +32,7 @@ instant-acme = "0.7"
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
 async-trait = { workspace = true }
 base64 = "0.22"
+dashmap = "5"
 tracing = "0.1"
 prometheus = "0.14"
 once_cell = { workspace = true }

@@ -14,8 +14,10 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -250,7 +252,7 @@ impl BackendConnections {
 #[derive(Debug, Default)]
 pub struct EwmaTracker {
     /// EWMA score per backend address (microseconds).
-    scores: RwLock<HashMap<String, f64>>,
+    scores: std::sync::RwLock<HashMap<String, f64>>,
 }
 
 /// Decay factor for EWMA (tau = 10 seconds).
@@ -322,7 +324,7 @@ fn ip_matches(ip: &str, pattern: &str) -> bool {
 const CACHE_SIZE_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
 
 /// In-memory cache storage backend (leaked to 'static for the Storage trait).
-static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+pub static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
 
 /// LRU eviction manager that enforces [CACHE_SIZE_LIMIT].
 /// When new entries are admitted and the total tracked size exceeds the limit,
@@ -390,12 +392,11 @@ pub struct LoricaProxy {
     pub rate_limiter: Arc<lorica_limits::rate::Rate>,
     /// Ban list: maps banned IP addresses to the time they were banned.
     /// Bans expire after the route-specific `auto_ban_duration_s` (default 1 hour).
-    /// Uses `std::sync::RwLock` since it is accessed in sync context.
-    pub ban_list: Arc<RwLock<HashMap<String, Instant>>>,
+    pub ban_list: Arc<DashMap<String, Instant>>,
     /// Rate limit violation counter (per minute) for auto-ban decisions.
     pub rate_violations: Arc<lorica_limits::rate::Rate>,
     /// Per-route active connection counters for `max_connections` enforcement.
-    pub route_connections: Arc<RwLock<HashMap<String, Arc<AtomicU64>>>>,
+    pub route_connections: Arc<DashMap<String, Arc<AtomicU64>>>,
     /// Global request rate tracker for flood detection and dashboard metrics.
     pub global_rate: Arc<lorica_limits::rate::Rate>,
     /// Cache hit counter for dashboard stats.
@@ -420,9 +421,9 @@ impl LoricaProxy {
             waf_engine: Arc::new(WafEngine::new()),
             sla_collector,
             rate_limiter: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
-            ban_list: Arc::new(RwLock::new(HashMap::new())),
+            ban_list: Arc::new(DashMap::new()),
             rate_violations: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(60))),
-            route_connections: Arc::new(RwLock::new(HashMap::new())),
+            route_connections: Arc::new(DashMap::new()),
             global_rate: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
@@ -483,19 +484,17 @@ impl ProxyHttp for LoricaProxy {
 
         // Ban list check (before any other processing for banned IPs)
         if let Some(ref ip) = check_ip {
-            let banned = {
-                let mut bans = self.ban_list.write().unwrap();
-                if let Some(ban_time) = bans.get(ip) {
-                    if ban_time.elapsed() >= Duration::from_secs(3600) {
-                        // Ban expired - lazy cleanup
-                        bans.remove(ip);
-                        false
-                    } else {
-                        true
-                    }
-                } else {
+            let banned = if let Some(entry) = self.ban_list.get(ip) {
+                if entry.value().elapsed() >= Duration::from_secs(3600) {
+                    drop(entry);
+                    // Ban expired - lazy cleanup
+                    self.ban_list.remove(ip);
                     false
+                } else {
+                    true
                 }
+            } else {
+                false
             };
             if banned {
                 let header = lorica_http::ResponseHeader::build(403, None)?;
@@ -637,20 +636,12 @@ impl ProxyHttp for LoricaProxy {
         // Tracks active connections per route using atomic counters.
         // Returns 503 when a route exceeds its configured connection limit.
         if let Some(max_conn) = entry.route.max_connections {
-            let counter = {
-                let conns = self.route_connections.read().unwrap();
-                conns.get(&entry.route.id).cloned()
-            };
-            let counter = match counter {
-                Some(c) => c,
-                None => {
-                    let mut conns = self.route_connections.write().unwrap();
-                    let c = conns
-                        .entry(entry.route.id.clone())
-                        .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-                    Arc::clone(c)
-                }
-            };
+            let counter = self
+                .route_connections
+                .entry(entry.route.id.clone())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .value()
+                .clone();
             let current = counter.fetch_add(1, Ordering::Relaxed);
             if current >= max_conn as u64 {
                 counter.fetch_sub(1, Ordering::Relaxed);
@@ -713,8 +704,7 @@ impl ProxyHttp for LoricaProxy {
                         let violations = self.rate_violations.rate(&violation_key);
                         if violations > ban_threshold as f64 {
                             let ban_duration = entry.route.auto_ban_duration_s;
-                            let mut bans = self.ban_list.write().unwrap();
-                            bans.insert(ip.to_string(), Instant::now());
+                            self.ban_list.insert(ip.to_string(), Instant::now());
                             warn!(
                                 ip = %ip,
                                 violations = %violations,
@@ -1770,56 +1760,40 @@ mod tests {
 
     #[test]
     fn test_ban_list_blocked_ip_detected() {
-        let ban_list: Arc<RwLock<HashMap<String, Instant>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let ban_list: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
         // Ban an IP
-        {
-            let mut bans = ban_list.write().unwrap();
-            bans.insert("10.0.0.99".to_string(), Instant::now());
-        }
+        ban_list.insert("10.0.0.99".to_string(), Instant::now());
 
         // Check that the IP is banned
         let ip = "10.0.0.99";
-        let banned = {
-            let bans = ban_list.read().unwrap();
-            if let Some(ban_time) = bans.get(ip) {
-                ban_time.elapsed() < Duration::from_secs(3600)
-            } else {
-                false
-            }
-        };
+        let banned = ban_list
+            .get(ip)
+            .map(|entry| entry.value().elapsed() < Duration::from_secs(3600))
+            .unwrap_or(false);
         assert!(banned, "Recently banned IP should be detected as banned");
     }
 
     #[test]
     fn test_ban_list_expired_ban_allows_through() {
-        let ban_list: Arc<RwLock<HashMap<String, Instant>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let ban_list: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
         // Ban an IP with a time in the past (simulate expired ban)
-        {
-            let mut bans = ban_list.write().unwrap();
-            // Use an instant that is effectively "old" by subtracting from now
-            // We simulate this by checking against a very short duration
-            bans.insert("10.0.0.99".to_string(), Instant::now());
-        }
+        ban_list.insert("10.0.0.99".to_string(), Instant::now());
 
         // Check with zero-duration ban (expired immediately)
         let ip = "10.0.0.99";
-        let banned = {
-            let mut bans = ban_list.write().unwrap();
-            if let Some(ban_time) = bans.get(ip) {
-                if ban_time.elapsed() >= Duration::from_secs(0) {
-                    // Ban with 0s duration is immediately expired
-                    bans.remove(ip);
-                    false
-                } else {
-                    true
-                }
-            } else {
+        let banned = if let Some(entry) = ban_list.get(ip) {
+            if entry.value().elapsed() >= Duration::from_secs(0) {
+                drop(entry);
+                // Ban with 0s duration is immediately expired
+                ban_list.remove(ip);
                 false
+            } else {
+                true
             }
+        } else {
+            false
         };
         assert!(
             !banned,
@@ -1827,42 +1801,32 @@ mod tests {
         );
 
         // Verify the IP was removed from the ban list
-        let bans = ban_list.read().unwrap();
         assert!(
-            !bans.contains_key(ip),
+            !ban_list.contains_key(ip),
             "Expired ban should be removed from the ban list"
         );
     }
 
     #[test]
     fn test_ban_list_unbanned_ip_passes() {
-        let ban_list: Arc<RwLock<HashMap<String, Instant>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let ban_list: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
         // Ban a different IP
-        {
-            let mut bans = ban_list.write().unwrap();
-            bans.insert("10.0.0.99".to_string(), Instant::now());
-        }
+        ban_list.insert("10.0.0.99".to_string(), Instant::now());
 
         // Check an IP that is NOT banned
         let ip = "10.0.0.50";
-        let banned = {
-            let bans = ban_list.read().unwrap();
-            if let Some(ban_time) = bans.get(ip) {
-                ban_time.elapsed() < Duration::from_secs(3600)
-            } else {
-                false
-            }
-        };
+        let banned = ban_list
+            .get(ip)
+            .map(|entry| entry.value().elapsed() < Duration::from_secs(3600))
+            .unwrap_or(false);
         assert!(!banned, "Unbanned IP should not be detected as banned");
     }
 
     #[test]
     fn test_auto_ban_after_threshold_violations() {
         let rate_violations = Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(60)));
-        let ban_list: Arc<RwLock<HashMap<String, Instant>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let ban_list: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
         let ip = "10.0.0.99";
         let ban_threshold: u32 = 5;
@@ -1884,64 +1848,51 @@ mod tests {
         // Here we test the ban insertion logic directly.
         let violations_count = 20; // We observed 20 violations
         if violations_count > ban_threshold {
-            let mut bans = ban_list.write().unwrap();
-            bans.insert(ip.to_string(), Instant::now());
+            ban_list.insert(ip.to_string(), Instant::now());
         }
 
-        let bans = ban_list.read().unwrap();
         assert!(
-            bans.contains_key(ip),
+            ban_list.contains_key(ip),
             "IP should be auto-banned after exceeding violation threshold"
         );
     }
 
     #[test]
     fn test_ban_list_lazy_cleanup_removes_expired() {
-        let ban_list: Arc<RwLock<HashMap<String, Instant>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let ban_list: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
         // Insert two bans
-        {
-            let mut bans = ban_list.write().unwrap();
-            bans.insert("10.0.0.1".to_string(), Instant::now());
-            bans.insert("10.0.0.2".to_string(), Instant::now());
-        }
+        ban_list.insert("10.0.0.1".to_string(), Instant::now());
+        ban_list.insert("10.0.0.2".to_string(), Instant::now());
 
         // Lazy cleanup with 0s duration (all expired)
         let ban_duration = Duration::from_secs(0);
-        {
-            let mut bans = ban_list.write().unwrap();
-            let expired_ips: Vec<String> = bans
-                .iter()
-                .filter(|(_, ban_time)| ban_time.elapsed() >= ban_duration)
-                .map(|(ip, _)| ip.clone())
-                .collect();
-            for ip in expired_ips {
-                bans.remove(&ip);
-            }
+        let expired_ips: Vec<String> = ban_list
+            .iter()
+            .filter(|entry| entry.value().elapsed() >= ban_duration)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for ip in expired_ips {
+            ban_list.remove(&ip);
         }
 
-        let bans = ban_list.read().unwrap();
-        assert!(bans.is_empty(), "All expired bans should be cleaned up");
+        assert!(ban_list.is_empty(), "All expired bans should be cleaned up");
     }
 
     // ---- Max Connections ----
 
     #[test]
     fn test_route_connections_counter_increment_decrement() {
-        let route_connections: Arc<RwLock<HashMap<String, Arc<AtomicU64>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let route_connections: Arc<DashMap<String, Arc<AtomicU64>>> = Arc::new(DashMap::new());
 
         let route_id = "route-1";
 
         // Get or create counter
-        let counter = {
-            let mut conns = route_connections.write().unwrap();
-            let c = conns
-                .entry(route_id.to_string())
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-            Arc::clone(c)
-        };
+        let counter = route_connections
+            .entry(route_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .value()
+            .clone();
 
         // Increment
         let v = counter.fetch_add(1, Ordering::Relaxed);
@@ -2013,24 +1964,19 @@ mod tests {
 
     #[test]
     fn test_route_connections_independent_routes() {
-        let route_connections: Arc<RwLock<HashMap<String, Arc<AtomicU64>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let route_connections: Arc<DashMap<String, Arc<AtomicU64>>> = Arc::new(DashMap::new());
 
         // Create counters for two routes
-        let counter_a = {
-            let mut conns = route_connections.write().unwrap();
-            let c = conns
-                .entry("route-a".to_string())
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-            Arc::clone(c)
-        };
-        let counter_b = {
-            let mut conns = route_connections.write().unwrap();
-            let c = conns
-                .entry("route-b".to_string())
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-            Arc::clone(c)
-        };
+        let counter_a = route_connections
+            .entry("route-a".to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .value()
+            .clone();
+        let counter_b = route_connections
+            .entry("route-b".to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .value()
+            .clone();
 
         counter_a.fetch_add(1, Ordering::Relaxed);
         counter_a.fetch_add(1, Ordering::Relaxed);

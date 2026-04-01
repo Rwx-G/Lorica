@@ -82,6 +82,16 @@ impl MemCache {
             last_temp_id: AtomicU64::new(0),
         }
     }
+
+    /// Remove all cached entries (both completed and in-progress).
+    ///
+    /// Returns the number of completed entries that were removed.
+    pub fn clear_all(&self) -> usize {
+        let count = self.cached.read().len();
+        self.cached.write().clear();
+        self.temp.write().clear();
+        count
+    }
 }
 
 pub enum MemHitHandler {
