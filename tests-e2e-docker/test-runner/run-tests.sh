@@ -235,6 +235,14 @@ if [ -n "$SESSION" ]; then
     assert_json "$B1" ".data.address" "$BACKEND1" "Backend 1 created"
     assert_json "$B1" ".data.health_check_path" "/healthz" "Backend 1 has HTTP health check path"
 
+    # New backend has ewma_score_us = 0 (no traffic yet)
+    EWMA_VAL=$(echo "$B1" | jq -r '.data.ewma_score_us')
+    if [ "$EWMA_VAL" = "0" ] || [ "$EWMA_VAL" = "0.0" ]; then
+        ok "New backend has ewma_score_us = 0"
+    else
+        fail "Expected ewma_score_us = 0 for new backend, got $EWMA_VAL"
+    fi
+
     # Create backend 2
     B2=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND2\",\"health_check_enabled\":true}")
     B2_ID=$(echo "$B2" | jq -r '.data.id')
@@ -1445,6 +1453,18 @@ if [ -n "$SESSION" ]; then
         ok "Rate limiting returns 429 ($RATE_429/20 throttled, $RATE_200 passed)"
     else
         ok "Rate limiting: all passed ($RATE_200/20 - burst may absorb at low volume)"
+    fi
+
+    # Verify X-RateLimit-Reset is a real Unix timestamp (not "1")
+    RATE_HEADERS=$(curl -s -D - -o /dev/null --max-time 2 \
+        -H "Host: app1.local" "$PROXY/" 2>/dev/null || true)
+    RESET_VAL=$(echo "$RATE_HEADERS" | grep -i "X-RateLimit-Reset" | tr -d '\r' | awk '{print $2}')
+    if [ -n "$RESET_VAL" ] && [ "$RESET_VAL" -gt 1000000000 ] 2>/dev/null; then
+        ok "X-RateLimit-Reset is a Unix timestamp ($RESET_VAL)"
+    elif [ -n "$RESET_VAL" ]; then
+        fail "X-RateLimit-Reset is not a valid timestamp (got $RESET_VAL)"
+    else
+        ok "X-RateLimit-Reset header not present (rate limit not configured or burst absorbed)"
     fi
 
     # Reset rate limit

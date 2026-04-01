@@ -192,10 +192,13 @@ export interface BackendResponse {
   group_name: string;
   weight: number;
   health_status: string;
+  lifecycle_state: string;
+  active_connections: number;
   health_check_enabled: boolean;
   health_check_interval_s: number;
   health_check_path: string | null;
   tls_upstream: boolean;
+  ewma_score_us: number;
   created_at: string;
   updated_at: string;
 }
