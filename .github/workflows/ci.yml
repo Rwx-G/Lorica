@@ -112,7 +112,19 @@ jobs:
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Download artifact (with retry)
+        uses: actions/download-artifact@v4
+        with:
+          name: lorica-linux-x86_64
+          path: .
+        continue-on-error: true
+        id: download1
+      - name: Retry download if first attempt failed
+        if: steps.download1.outcome == 'failure'
+        run: sleep 15
+      - name: Download artifact (retry)
+        if: steps.download1.outcome == 'failure'
+        uses: actions/download-artifact@v4
         with:
           name: lorica-linux-x86_64
           path: .
@@ -147,7 +159,19 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install build tools
         run: dnf install -y rpm-build
-      - uses: actions/download-artifact@v4
+      - name: Download artifact (with retry)
+        uses: actions/download-artifact@v4
+        with:
+          name: lorica-linux-x86_64
+          path: .
+        continue-on-error: true
+        id: rpm-download1
+      - name: Retry download if first attempt failed
+        if: steps.rpm-download1.outcome == 'failure'
+        run: sleep 15
+      - name: Download artifact (retry)
+        if: steps.rpm-download1.outcome == 'failure'
+        uses: actions/download-artifact@v4
         with:
           name: lorica-linux-x86_64
           path: .
