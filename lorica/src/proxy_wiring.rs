@@ -23,7 +23,7 @@ use lorica_api::logs::{LogBuffer, LogEntry};
 use lorica_bench::SlaCollector;
 use lorica_cache::cache_control::CacheControl;
 use lorica_cache::filters::resp_cacheable;
-use lorica_cache::{CacheKey, CacheMetaDefaults, CachePhase, ForcedFreshness, HitHandler, MemCache, NoCacheReason, RespCacheable};
+use lorica_cache::{CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable};
 use lorica_http::ResponseHeader;
 use once_cell::sync::Lazy;
 use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route, WafMode};
@@ -847,9 +847,10 @@ impl ProxyHttp for LoricaProxy {
 
     /// Decide whether the upstream response should be admitted to cache.
     ///
-    /// Uses the standard `resp_cacheable` filter from lorica-cache which
-    /// respects origin `Cache-Control` headers, falling back to the route's
-    /// `cache_ttl_s` as default fresh duration for 200/301 responses.
+    /// When the origin sends Cache-Control, the standard resp_cacheable
+    /// logic is used (honouring max-age, no-store, private, etc.).
+    /// When the origin sends no cache directives, we build a [CacheMeta]
+    /// with the route's cache_ttl_s as the fresh duration.
     fn response_cache_filter(
         &self,
         _session: &Session,
@@ -862,21 +863,33 @@ impl ProxyHttp for LoricaProxy {
             .map(|r| r.cache_ttl_s as u64)
             .unwrap_or(300);
 
-        // Build per-route defaults. fn pointers cannot capture the TTL, so we
-        // use a fixed 300s fallback here. If the origin sends Cache-Control
-        // max-age, resp_cacheable honours it instead of this default.
-        let route_defaults = CacheMetaDefaults::new(
-            |status| match status.as_u16() {
-                200 | 301 => Some(Duration::from_secs(300)),
-                _ => None,
-            },
-            0,
-            0,
-        );
-
         let cc = CacheControl::from_resp_headers(resp);
-        let has_auth = false; // already filtered in request_cache_filter
-        Ok(resp_cacheable(cc.as_ref(), resp.clone(), has_auth, &route_defaults))
+
+        // If the origin sends explicit Cache-Control, honour it fully
+        if cc.is_some() {
+            return Ok(resp_cacheable(
+                cc.as_ref(),
+                resp.clone(),
+                false, // auth requests already filtered in request_cache_filter
+                &CACHE_DEFAULTS_5MIN,
+            ));
+        }
+
+        // No Cache-Control from origin: cache 200/301 with the route TTL
+        let status = resp.status.as_u16();
+        if status == 200 || status == 301 {
+            let now = std::time::SystemTime::now();
+            let fresh_until = now + Duration::from_secs(ttl_s);
+            Ok(RespCacheable::Cacheable(CacheMeta::new(
+                fresh_until,
+                now,
+                0, // stale-while-revalidate
+                0, // stale-if-error
+                resp.clone(),
+            )))
+        } else {
+            Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache))
+        }
     }
 
     async fn upstream_peer(
