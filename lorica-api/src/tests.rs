@@ -2719,7 +2719,9 @@ async fn test_status_counts_with_data() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["data"]["routes_count"], 1);
     assert_eq!(json["data"]["backends_count"], 1);
-    assert_eq!(json["data"]["backends_healthy"], 1);
+    // New backends are created with health_status=unknown (not healthy)
+    // so backends_healthy is 0 until a health check runs
+    assert_eq!(json["data"]["backends_healthy"], 0);
     assert_eq!(json["data"]["certificates_count"], 1);
 }
 
