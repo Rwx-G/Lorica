@@ -669,14 +669,17 @@
               <input type="checkbox" bind:checked={formForceHttps} />
               <span>Force HTTPS redirect</span>
             </label>
+            <span class="hint">Nginx: return 301 https://... | Traefik: RedirectScheme middleware</span>
           </div>
           <div class="form-group">
             <label for="redirect-hostname">Redirect hostname</label>
             <input id="redirect-hostname" type="text" bind:value={formRedirectHostname} placeholder="e.g. www.example.com" />
+            <span class="hint">Nginx: server_name www.x.com; return 301 https://x.com... | Traefik: RedirectRegex</span>
           </div>
           <div class="form-group">
             <label for="hostname-aliases">Hostname aliases <span class="hint">(comma-separated)</span></label>
             <input id="hostname-aliases" type="text" bind:value={formHostnameAliases} placeholder="alias1.com, alias2.com" />
+            <span class="hint">Nginx: server_name x.com www.x.com | Traefik: Host rule with OR</span>
           </div>
           <div class="form-group">
             <label class="checkbox-item">
@@ -696,14 +699,17 @@
             <div class="form-group">
               <label for="connect-timeout">Connect (s)</label>
               <input id="connect-timeout" type="number" min="1" max="3600" bind:value={formConnectTimeout} />
+              <span class="hint">Nginx: proxy_connect_timeout | HAProxy: timeout connect</span>
             </div>
             <div class="form-group">
               <label for="read-timeout">Read (s)</label>
               <input id="read-timeout" type="number" min="1" max="3600" bind:value={formReadTimeout} />
+              <span class="hint">Nginx: proxy_read_timeout | HAProxy: timeout server</span>
             </div>
             <div class="form-group">
               <label for="send-timeout">Send (s)</label>
               <input id="send-timeout" type="number" min="1" max="3600" bind:value={formSendTimeout} />
+              <span class="hint">Nginx: proxy_send_timeout</span>
             </div>
           </div>
 
@@ -712,10 +718,12 @@
             <div class="form-group">
               <label for="strip-path">Strip path prefix</label>
               <input id="strip-path" type="text" bind:value={formStripPathPrefix} placeholder="/api/v1" />
+              <span class="hint">Nginx: location /api/ { proxy_pass http://backend/; } | Traefik: StripPrefix middleware</span>
             </div>
             <div class="form-group">
               <label for="add-path">Add path prefix</label>
               <input id="add-path" type="text" bind:value={formAddPathPrefix} placeholder="/backend" />
+              <span class="hint">Traefik: AddPrefix middleware</span>
             </div>
           </div>
 
@@ -727,15 +735,18 @@
               <option value="moderate">Moderate</option>
               <option value="none">None</option>
             </select>
+            <span class="hint">Nginx: add_header Strict-Transport-Security... | Traefik: Headers middleware</span>
           </div>
           <div class="form-row form-row-3">
             <div class="form-group">
               <label for="max-body">Max body (MB)</label>
               <input id="max-body" type="number" min="0" step="1" bind:value={formMaxBodyMb} placeholder="No limit" />
+              <span class="hint">Nginx: client_max_body_size | Traefik: Buffering maxRequestBodyBytes</span>
             </div>
             <div class="form-group">
               <label for="rate-rps">Rate limit RPS</label>
               <input id="rate-rps" type="number" min="1" bind:value={formRateLimitRps} placeholder="No limit" />
+              <span class="hint">Nginx: limit_req zone rate=Xr/s | Traefik: RateLimit middleware</span>
             </div>
             <div class="form-group">
               <label for="rate-burst">Rate limit burst</label>
@@ -757,6 +768,7 @@
           <div class="form-group">
             <label for="proxy-headers">Custom proxy headers <span class="hint">(key=value, one per line)</span></label>
             <textarea id="proxy-headers" rows="3" bind:value={formProxyHeaders} placeholder="X-Forwarded-For=$remote_addr&#10;X-Custom=value"></textarea>
+            <span class="hint">Nginx: proxy_set_header | Traefik: Headers middleware customRequestHeaders</span>
           </div>
           <div class="form-group">
             <label for="proxy-headers-remove">Remove proxy headers <span class="hint">(comma-separated)</span></label>
@@ -765,6 +777,7 @@
           <div class="form-group">
             <label for="response-headers">Custom response headers <span class="hint">(key=value, one per line)</span></label>
             <textarea id="response-headers" rows="3" bind:value={formResponseHeaders} placeholder="X-Frame-Options=DENY&#10;Cache-Control=no-store"></textarea>
+            <span class="hint">Nginx: add_header | Traefik: Headers middleware customResponseHeaders</span>
           </div>
           <div class="form-group">
             <label for="response-headers-remove">Remove response headers <span class="hint">(comma-separated)</span></label>
@@ -807,6 +820,7 @@
               <input type="checkbox" bind:checked={formCacheEnabled} />
               <span>Enable cache</span>
             </label>
+            <span class="hint">Nginx: proxy_cache | Traefik: no built-in (plugin needed)</span>
           </div>
           <div class="form-row">
             <div class="form-group">
@@ -824,16 +838,19 @@
             <div class="form-group">
               <label for="max-connections">Max connections</label>
               <input id="max-connections" type="number" min="1" bind:value={formMaxConnections} placeholder="No limit" />
+              <span class="hint">Nginx: limit_conn | HAProxy: maxconn per backend</span>
             </div>
             <div class="form-group">
               <label for="slowloris-threshold">Slowloris threshold (ms)</label>
               <input id="slowloris-threshold" type="number" min="100" bind:value={formSlowlorisThreshold} placeholder="5000" />
+              <span class="hint">Nginx: client_header_timeout | HAProxy: timeout http-request</span>
             </div>
           </div>
           <div class="form-row">
             <div class="form-group">
               <label for="auto-ban-threshold">Auto-ban threshold <span class="hint">(violations before ban)</span></label>
               <input id="auto-ban-threshold" type="number" min="1" bind:value={formAutoBanThreshold} placeholder="Disabled" />
+              <span class="hint">Fail2ban-like behavior built into the proxy</span>
             </div>
             <div class="form-group">
               <label for="auto-ban-duration">Auto-ban duration (s)</label>

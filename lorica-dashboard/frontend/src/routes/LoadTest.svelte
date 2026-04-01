@@ -7,6 +7,7 @@
     type LoadTestProgress,
     type LoadTestComparison,
     type CreateLoadTestRequest,
+    type UpdateLoadTestRequest,
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { showToast } from '../lib/toast';
@@ -27,6 +28,7 @@
 
   // Form
   let showForm = $state(false);
+  let editingConfig: LoadTestConfigResponse | null = $state(null);
   let formName = $state('');
   let formTargetUrl = $state('');
   let formMethod = $state('GET');
@@ -83,6 +85,7 @@
   }
 
   function openCreateForm() {
+    editingConfig = null;
     formName = '';
     formTargetUrl = '';
     formMethod = 'GET';
@@ -91,6 +94,20 @@
     formDuration = 30;
     formErrorThreshold = 10.0;
     formCron = '';
+    formError = '';
+    showForm = true;
+  }
+
+  function openEditForm(config: LoadTestConfigResponse) {
+    editingConfig = config;
+    formName = config.name;
+    formTargetUrl = config.target_url;
+    formMethod = config.method;
+    formConcurrency = config.concurrency;
+    formRps = config.requests_per_second;
+    formDuration = config.duration_s;
+    formErrorThreshold = config.error_threshold_pct;
+    formCron = config.schedule_cron ?? '';
     formError = '';
     showForm = true;
   }
@@ -108,7 +125,7 @@
     return '';
   }
 
-  async function handleCreate() {
+  async function handleSubmit() {
     const err = validate();
     if (err) {
       formError = err;
@@ -116,21 +133,41 @@
     }
     formSubmitting = true;
     formError = '';
-    const body: CreateLoadTestRequest = {
-      name: formName,
-      target_url: formTargetUrl,
-      method: formMethod,
-      concurrency: formConcurrency,
-      requests_per_second: formRps,
-      duration_s: formDuration,
-      error_threshold_pct: formErrorThreshold,
-      schedule_cron: formCron || undefined,
-    };
-    const res = await api.createLoadTestConfig(body);
-    formSubmitting = false;
-    if (res.error) { formError = res.error.message; return; }
-    showToast('Test config created', 'success');
+
+    if (editingConfig) {
+      const body: UpdateLoadTestRequest = {
+        name: formName,
+        target_url: formTargetUrl,
+        method: formMethod,
+        concurrency: formConcurrency,
+        requests_per_second: formRps,
+        duration_s: formDuration,
+        error_threshold_pct: formErrorThreshold,
+        schedule_cron: formCron || undefined,
+      };
+      const res = await api.updateLoadTestConfig(editingConfig.id, body);
+      formSubmitting = false;
+      if (res.error) { formError = res.error.message; return; }
+      showToast('Test config updated', 'success');
+    } else {
+      const body: CreateLoadTestRequest = {
+        name: formName,
+        target_url: formTargetUrl,
+        method: formMethod,
+        concurrency: formConcurrency,
+        requests_per_second: formRps,
+        duration_s: formDuration,
+        error_threshold_pct: formErrorThreshold,
+        schedule_cron: formCron || undefined,
+      };
+      const res = await api.createLoadTestConfig(body);
+      formSubmitting = false;
+      if (res.error) { formError = res.error.message; return; }
+      showToast('Test config created', 'success');
+    }
+
     showForm = false;
+    editingConfig = null;
     await loadData();
   }
 
@@ -287,6 +324,9 @@
                 <button class="btn btn-small btn-run" onclick={() => handleStart(c.id)} disabled={!!progress?.active} title="Run">
                   Run
                 </button>
+                <button class="btn-icon" onclick={() => openEditForm(c)} title="Edit">
+                  {@html editIcon}
+                </button>
                 <button class="btn-icon" onclick={() => handleClone(c.id, c.name)} title="Clone">
                   {@html cloneIcon}
                 </button>
@@ -405,9 +445,9 @@
   {/if}
 
   {#if showForm}
-    <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showForm = false; }}>
+    <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) { showForm = false; editingConfig = null; } }}>
       <div class="modal">
-        <h2>New Load Test</h2>
+        <h2>{editingConfig ? 'Edit Load Test' : 'New Load Test'}</h2>
         {#if formError}
           <div class="form-error">{formError}</div>
         {/if}
@@ -458,9 +498,9 @@
         </div>
 
         <div class="form-actions">
-          <button class="btn btn-cancel" onclick={() => (showForm = false)}>Cancel</button>
-          <button class="btn btn-primary" onclick={handleCreate} disabled={formSubmitting}>
-            {formSubmitting ? 'Creating...' : 'Create'}
+          <button class="btn btn-cancel" onclick={() => { showForm = false; editingConfig = null; }}>Cancel</button>
+          <button class="btn btn-primary" onclick={handleSubmit} disabled={formSubmitting}>
+            {formSubmitting ? 'Saving...' : editingConfig ? 'Update' : 'Create'}
           </button>
         </div>
       </div>
@@ -469,6 +509,7 @@
 </div>
 
 <script lang="ts" module>
+  const editIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
   const cloneIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
   const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
 </script>

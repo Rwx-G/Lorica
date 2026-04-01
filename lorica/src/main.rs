@@ -720,11 +720,11 @@ fn run_single_process(cli: Cli) {
 
         // Start active probe scheduler
         let probe_store = Arc::clone(&store);
-        let _probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
+        let probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
             probe_store,
             None, // no notification dispatcher for now
         ));
-        _probe_scheduler.reload().await;
+        probe_scheduler.reload().await;
 
         // Start the HTTP proxy service
         let mut lorica_proxy = LoricaProxy::new(
@@ -797,14 +797,16 @@ fn run_single_process(cli: Cli) {
             }
         });
 
-        // Background task: reload proxy config when API signals a change
+        // Background task: reload proxy config and probe scheduler when API signals a change
         let reload_store = Arc::clone(&store);
         let reload_config = Arc::clone(&proxy_config);
+        let reload_probe_scheduler = Arc::clone(&probe_scheduler);
         let _reload_handle = tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
                 if let Err(e) = reload_proxy_config(&reload_store, &reload_config).await {
                     tracing::error!(error = %e, "failed to reload proxy configuration");
                 }
+                reload_probe_scheduler.reload().await;
             }
         });
 

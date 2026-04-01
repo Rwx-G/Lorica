@@ -6,6 +6,7 @@
     type NotificationConfigResponse,
     type UserPreferenceResponse,
     type ImportDiffResponse,
+    type SecurityHeaderPreset,
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
 
@@ -15,6 +16,22 @@
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
+
+  // Security header presets
+  let customPresets: SecurityHeaderPreset[] = $state([]);
+  let showPresetForm = $state(false);
+  let presetEditing: number | null = $state(null);
+  let presetName = $state('');
+  let presetHeaders = $state('');
+  let presetError = $state('');
+  let presetSaving = $state(false);
+  let deletingPresetIdx: number | null = $state(null);
+
+  const builtinPresets: Array<{ name: string; description: string }> = [
+    { name: 'strict', description: 'X-Frame-Options: DENY, X-Content-Type-Options: nosniff, Referrer-Policy: no-referrer, Permissions-Policy: camera=(), microphone=(), geolocation=()' },
+    { name: 'moderate', description: 'X-Frame-Options: SAMEORIGIN, X-Content-Type-Options: nosniff, Referrer-Policy: strict-origin-when-cross-origin' },
+    { name: 'none', description: 'No security headers added' },
+  ];
 
   // Notifications
   let notifications: NotificationConfigResponse[] = $state([]);
@@ -64,6 +81,7 @@
     } else if (settingsRes.data) {
       settings = settingsRes.data;
       settingsForm = { ...settingsRes.data };
+      customPresets = settingsRes.data.custom_security_presets ?? [];
     }
     if (notifRes.data) {
       notifications = notifRes.data.notifications;
@@ -113,6 +131,79 @@
       setTimeout(() => settingsMsg = '', 3000);
     }
     settingsSaving = false;
+  }
+
+  // ---- Security Header Presets ----
+
+  function headersToText(headers: Record<string, string>): string {
+    return Object.entries(headers).map(([k, v]) => `${k}=${v}`).join('\n');
+  }
+
+  function textToHeaders(text: string): Record<string, string> {
+    const headers: Record<string, string> = {};
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const idx = trimmed.indexOf('=');
+      if (idx < 1) continue;
+      headers[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
+    }
+    return headers;
+  }
+
+  function openPresetCreate() {
+    presetEditing = null;
+    presetName = '';
+    presetHeaders = '';
+    presetError = '';
+    showPresetForm = true;
+  }
+
+  function openPresetEdit(idx: number) {
+    const p = customPresets[idx];
+    presetEditing = idx;
+    presetName = p.name;
+    presetHeaders = headersToText(p.headers);
+    presetError = '';
+    showPresetForm = true;
+  }
+
+  async function savePreset() {
+    if (!presetName.trim()) {
+      presetError = 'Name is required.';
+      return;
+    }
+    const headers = textToHeaders(presetHeaders);
+    if (Object.keys(headers).length === 0) {
+      presetError = 'At least one header (Key=Value) is required.';
+      return;
+    }
+    presetSaving = true;
+    presetError = '';
+    const updated = [...customPresets];
+    if (presetEditing !== null) {
+      updated[presetEditing] = { name: presetName.trim(), headers };
+    } else {
+      updated.push({ name: presetName.trim(), headers });
+    }
+    const res = await api.updateSettings({ custom_security_presets: updated });
+    if (res.error) {
+      presetError = res.error.message;
+    } else {
+      customPresets = res.data?.custom_security_presets ?? updated;
+      showPresetForm = false;
+    }
+    presetSaving = false;
+  }
+
+  async function confirmDeletePreset() {
+    if (deletingPresetIdx === null) return;
+    const updated = customPresets.filter((_, i) => i !== deletingPresetIdx);
+    const res = await api.updateSettings({ custom_security_presets: updated });
+    if (!res.error) {
+      customPresets = res.data?.custom_security_presets ?? updated;
+    }
+    deletingPresetIdx = null;
   }
 
   // ---- Notifications ----
@@ -350,6 +441,50 @@
             {settingsSaving ? 'Saving...' : 'Save Settings'}
           </button>
         </div>
+      </div>
+    </section>
+
+    <!-- Security Header Presets -->
+    <section class="section">
+      <div class="section-header">
+        <h2>Security Header Presets</h2>
+        <button class="btn btn-primary" onclick={openPresetCreate}>Add Preset</button>
+      </div>
+      <p class="section-hint">Custom presets appear alongside builtin presets (strict, moderate, none) in the route security headers dropdown.</p>
+
+      <!-- Builtin presets (read-only) -->
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Headers</th>
+              <th>Type</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each builtinPresets as bp}
+              <tr>
+                <td><code>{bp.name}</code></td>
+                <td class="preset-desc">{bp.description}</td>
+                <td><span class="badge badge-builtin">builtin</span></td>
+                <td>-</td>
+              </tr>
+            {/each}
+            {#each customPresets as cp, idx}
+              <tr>
+                <td><code>{cp.name}</code></td>
+                <td class="preset-desc">{Object.keys(cp.headers).length} header{Object.keys(cp.headers).length !== 1 ? 's' : ''}</td>
+                <td><span class="badge badge-custom">custom</span></td>
+                <td class="actions-cell">
+                  <button class="btn-link" onclick={() => openPresetEdit(idx)}>Edit</button>
+                  <button class="btn-link danger" onclick={() => deletingPresetIdx = idx}>Delete</button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
       </div>
     </section>
 
@@ -617,6 +752,43 @@
     message="Are you sure you want to delete the preference '{deletingPref.preference_key}'?"
     onconfirm={confirmDeletePref}
     oncancel={() => deletingPref = null}
+  />
+{/if}
+
+<!-- Preset form modal -->
+{#if showPresetForm}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div class="overlay" onclick={() => showPresetForm = false} onkeydown={(e) => { if (e.key === 'Escape') showPresetForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
+      <h3>{presetEditing !== null ? 'Edit' : 'Add'} Security Header Preset</h3>
+      <div class="form-row">
+        <label for="preset-name">Preset Name <span class="required">*</span></label>
+        <input id="preset-name" type="text" bind:value={presetName} placeholder="e.g. my-api-preset" />
+      </div>
+      <div class="form-row">
+        <label for="preset-headers">Headers (one per line, Key=Value) <span class="required">*</span></label>
+        <textarea id="preset-headers" bind:value={presetHeaders} rows="6" placeholder="X-Frame-Options=DENY&#10;X-Content-Type-Options=nosniff&#10;Referrer-Policy=no-referrer"></textarea>
+      </div>
+      {#if presetError}
+        <div class="form-error">{presetError}</div>
+      {/if}
+      <div class="actions">
+        <button class="btn btn-cancel" onclick={() => showPresetForm = false}>Cancel</button>
+        <button class="btn btn-primary" onclick={savePreset} disabled={presetSaving}>
+          {presetSaving ? 'Saving...' : 'Save'}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Delete preset confirm -->
+{#if deletingPresetIdx !== null}
+  <ConfirmDialog
+    title="Delete Security Header Preset"
+    message="Are you sure you want to delete the preset '{customPresets[deletingPresetIdx]?.name}'?"
+    onconfirm={confirmDeletePreset}
+    oncancel={() => deletingPresetIdx = null}
   />
 {/if}
 
@@ -970,5 +1142,38 @@
 
   .loading {
     color: var(--color-text-muted);
+  }
+
+  .required {
+    color: var(--color-red);
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.25rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .badge-builtin {
+    background: var(--color-bg-input);
+    color: var(--color-text-muted);
+  }
+
+  .badge-custom {
+    background: rgba(59, 130, 246, 0.1);
+    color: var(--color-primary);
+  }
+
+  .preset-desc {
+    font-size: 0.8125rem;
+    color: var(--color-text-muted);
+    max-width: 400px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

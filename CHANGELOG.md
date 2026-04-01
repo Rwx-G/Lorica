@@ -76,8 +76,10 @@ Author: Rwx-G
 - Scrollable access logs with filtering and live WebSocket streaming (green pulsing indicator)
 - System metrics page with worker table (health status, PID, heartbeat latency)
 - Settings page with notification channel configuration, global settings
+- Security Header Presets management in Settings - view builtin presets (strict, moderate, none), create/edit/delete custom presets with name and key=value header pairs
 - Config export/import with diff preview
 - Input validation on all forms, sort/filter on Backends and Routes tables
+- DNS-01 ACME form hint explaining supported providers (Cloudflare, Route53) and planned manual DNS-01 support
 
 **ACME (Epic 4)**
 

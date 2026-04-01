@@ -66,7 +66,7 @@
   let acmeMode: 'http01' | 'dns01' = $state('http01');
   let acmeDomain = $state('');
   let acmeEmail = $state('');
-  let acmeStaging = $state(true);
+  let acmeStaging = $state(false);
   let acmeDnsProvider = $state('cloudflare');
   let acmeDnsZoneId = $state('');
   let acmeDnsApiToken = $state('');
@@ -78,7 +78,7 @@
   function openAcmeForm() {
     acmeDomain = '';
     acmeEmail = '';
-    acmeStaging = true;
+    acmeStaging = false;
     acmeMode = 'http01';
     acmeDnsProvider = 'cloudflare';
     acmeDnsZoneId = '';
@@ -838,6 +838,7 @@
               <input type="password" bind:value={acmeDnsApiSecret} placeholder="Secret key" />
             </div>
           {/if}
+          <span class="hint">Currently supports Cloudflare and AWS Route53. For other providers, use HTTP-01 challenge instead (requires port 80 accessible from Internet). Manual DNS-01 support is planned.</span>
         {/if}
 
         <div class="form-group">

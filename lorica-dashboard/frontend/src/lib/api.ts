@@ -291,6 +291,11 @@ export interface SystemResponse {
   proxy: ProxyInfo;
 }
 
+export interface SecurityHeaderPreset {
+  name: string;
+  headers: Record<string, string>;
+}
+
 export interface GlobalSettingsResponse {
   management_port: number;
   log_level: string;
@@ -298,6 +303,7 @@ export interface GlobalSettingsResponse {
   cert_warning_days: number;
   cert_critical_days: number;
   default_topology_type: string;
+  custom_security_presets?: SecurityHeaderPreset[];
 }
 
 export interface UpdateSettingsRequest {
@@ -307,6 +313,7 @@ export interface UpdateSettingsRequest {
   cert_warning_days?: number;
   cert_critical_days?: number;
   default_topology_type?: string;
+  custom_security_presets?: SecurityHeaderPreset[];
 }
 
 export interface NotificationConfigResponse {
@@ -600,6 +607,9 @@ export const api = {
   createLoadTestConfig: (body: CreateLoadTestRequest) =>
     request<LoadTestConfigResponse>('POST', '/loadtest/configs', body),
 
+  updateLoadTestConfig: (id: string, body: UpdateLoadTestRequest) =>
+    request<LoadTestConfigResponse>('PUT', `/loadtest/configs/${id}`, body),
+
   deleteLoadTestConfig: (id: string) =>
     request<{ deleted: string }>('DELETE', `/loadtest/configs/${id}`),
 
@@ -848,6 +858,20 @@ export interface CreateLoadTestRequest {
   duration_s?: number;
   error_threshold_pct?: number;
   schedule_cron?: string;
+}
+
+export interface UpdateLoadTestRequest {
+  name?: string;
+  target_url?: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  concurrency?: number;
+  requests_per_second?: number;
+  duration_s?: number;
+  error_threshold_pct?: number;
+  schedule_cron?: string;
+  enabled?: boolean;
 }
 
 export interface LoadTestResultResponse {

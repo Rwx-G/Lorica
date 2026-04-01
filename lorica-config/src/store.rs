@@ -19,6 +19,7 @@ const MIGRATION_V6: &str = include_str!("migrations/006_sla_bucket_config_snapsh
 const MIGRATION_V7: &str = include_str!("migrations/007_route_config.sql");
 const MIGRATION_V8: &str = include_str!("migrations/008_backend_name_group.sql");
 const MIGRATION_V9: &str = include_str!("migrations/009_cache_and_protection.sql");
+const MIGRATION_V10: &str = include_str!("migrations/010_sla_default_range.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -225,6 +226,15 @@ impl ConfigStore {
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![9],
+            )?;
+        }
+
+        if current_version < 10 {
+            tracing::info!("applying migration 010_sla_default_range");
+            self.conn.execute_batch(MIGRATION_V10)?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![10],
             )?;
         }
 

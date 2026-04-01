@@ -477,8 +477,10 @@ mod tests {
         let config = SlaConfig::default_for_route("r1");
         assert!(config.is_success(200, 100));
         assert!(config.is_success(399, 500));
-        assert!(!config.is_success(400, 100));
-        assert!(!config.is_success(200, 501));
+        assert!(config.is_success(404, 100)); // 4xx within 200-499 default
+        assert!(config.is_success(499, 100));
+        assert!(!config.is_success(500, 100)); // 5xx = real backend error
+        assert!(!config.is_success(200, 501)); // exceeds max_latency_ms
     }
 
     #[test]

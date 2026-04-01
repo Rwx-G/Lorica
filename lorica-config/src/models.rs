@@ -588,7 +588,7 @@ impl SlaConfig {
             target_pct: 99.9,
             max_latency_ms: 500,
             success_status_min: 200,
-            success_status_max: 399,
+            success_status_max: 499,
             created_at: now,
             updated_at: now,
         }
@@ -972,7 +972,7 @@ mod tests {
         assert!((config.target_pct - 99.9).abs() < f64::EPSILON);
         assert_eq!(config.max_latency_ms, 500);
         assert_eq!(config.success_status_min, 200);
-        assert_eq!(config.success_status_max, 399);
+        assert_eq!(config.success_status_max, 499);
     }
 
     #[test]
@@ -986,8 +986,9 @@ mod tests {
     #[test]
     fn test_sla_config_is_success_status_out_of_range() {
         let config = SlaConfig::default_for_route("r1");
-        assert!(!config.is_success(400, 100)); // 400 > 399
-        assert!(!config.is_success(500, 100));
+        assert!(config.is_success(400, 100)); // 400 is within 200-499
+        assert!(config.is_success(404, 100)); // 404 is a client error, not backend failure
+        assert!(!config.is_success(500, 100)); // 500 is a server error
         assert!(!config.is_success(199, 100)); // 199 < 200
     }
 

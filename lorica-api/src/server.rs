@@ -249,6 +249,10 @@ pub fn build_router(
         )
         .route(
             "/api/v1/loadtest/configs/:id",
+            put(crate::loadtest::update_config),
+        )
+        .route(
+            "/api/v1/loadtest/configs/:id",
             delete(crate::loadtest::delete_config),
         )
         .route(

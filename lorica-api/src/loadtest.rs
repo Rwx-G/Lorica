@@ -92,6 +92,54 @@ pub async fn create_config(
     ))
 }
 
+/// PUT /api/v1/loadtest/configs/:id
+/// Update an existing load test configuration.
+#[derive(Deserialize)]
+pub struct UpdateLoadTestConfig {
+    pub name: Option<String>,
+    pub target_url: Option<String>,
+    pub method: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub body: Option<String>,
+    pub concurrency: Option<i32>,
+    pub requests_per_second: Option<i32>,
+    pub duration_s: Option<i32>,
+    pub error_threshold_pct: Option<f64>,
+    pub schedule_cron: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+pub async fn update_config(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateLoadTestConfig>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.store.lock().await;
+    let mut config = store
+        .get_load_test_config(&id)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("load test config {id}")))?;
+
+    if let Some(v) = body.name { config.name = v; }
+    if let Some(v) = body.target_url { config.target_url = v; }
+    if let Some(v) = body.method { config.method = v; }
+    if let Some(v) = body.headers { config.headers = v; }
+    if let Some(v) = body.body { config.body = Some(v); }
+    if let Some(v) = body.concurrency { config.concurrency = v; }
+    if let Some(v) = body.requests_per_second { config.requests_per_second = v; }
+    if let Some(v) = body.duration_s { config.duration_s = v; }
+    if let Some(v) = body.error_threshold_pct { config.error_threshold_pct = v; }
+    if let Some(v) = body.schedule_cron { config.schedule_cron = Some(v); }
+    if let Some(v) = body.enabled { config.enabled = v; }
+    config.updated_at = Utc::now();
+
+    store
+        .update_load_test_config(&config)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(json_data(config))
+}
+
 /// DELETE /api/v1/loadtest/configs/:id
 pub async fn delete_config(
     Extension(state): Extension<AppState>,
