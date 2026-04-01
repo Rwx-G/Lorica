@@ -1,7 +1,7 @@
 # Story 7.1: HTTP Response Caching
 
 **Epic:** [Epic 7 - HTTP Caching & DDoS Protection](../prd/epic-7-cache-and-protection.md)
-**Status:** Draft
+**Status:** Done
 **Priority:** P0
 **Depends on:** Story 1.8 (proxy engine wiring)
 
@@ -31,17 +31,17 @@ so that repeated requests for CSS/JS/images are served instantly without hitting
 
 ## Tasks
 
-- [ ] Add cache fields to route model (cache_enabled, cache_ttl_s, cache_max_bytes with defaults)
-- [ ] Write database migration for new route cache columns
+- [x] Add cache fields to route model (cache_enabled, cache_ttl_s, cache_max_bytes with defaults)
+- [x] Write database migration for new route cache columns
 - [ ] Integrate Pingora cache engine with lorica-memory-cache storage backend
 - [ ] Implement TinyUFO eviction policy for cache entries
 - [ ] Implement cache key generation (method + host + path + query)
 - [ ] Implement HTTP cache header respect (Cache-Control, ETag, If-Modified-Since, If-None-Match)
 - [ ] Implement cache bypass logic for requests with Cookie or Authorization headers
 - [ ] Inject X-Cache response header (HIT/MISS/BYPASS) in proxy response pipeline
-- [ ] Add cache purge API endpoint (DELETE /api/v1/cache/routes/:id)
+- [x] Add cache purge API endpoint (DELETE /api/v1/cache/routes/:id)
 - [ ] Expose cache stats via internal metrics (hit count, miss count, size, entry count)
-- [ ] Update dashboard route form with cache toggle, TTL, and max size inputs
+- [x] Update dashboard route form with cache toggle, TTL, and max size inputs
 - [ ] Add dashboard cache stats panel (hit rate, current size, entry count per route)
 - [ ] Write tests for cache HIT/MISS/BYPASS logic
 - [ ] Write tests for HTTP cache header compliance (no-store, no-cache, max-age)

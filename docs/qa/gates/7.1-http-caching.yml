@@ -1,0 +1,51 @@
+schema: 1
+story: "7.1"
+story_title: "HTTP Response Caching"
+gate: CONCERNS
+status_reason: "Data model complete (cache_enabled, cache_ttl_s, cache_max_bytes in Route model + migration 009). Cache purge API stub implemented (DELETE /api/v1/cache/routes/:id returns 200 but does not interact with a real cache). Dashboard route form includes cache toggle, TTL, and max size inputs. However, the actual Pingora cache engine is NOT wired: no request_cache_filter, no cache_key_callback, no TinyUFO storage backend, no X-Cache header injection, no HTTP cache header compliance. This story delivers the configuration layer only."
+reviewer: "Romain G."
+updated: "2026-04-01T12:00:00Z"
+
+top_issues:
+  - "Pingora cache engine not integrated - request_cache_filter and cache_key_callback not implemented"
+  - "No X-Cache response header (HIT/MISS/BYPASS) injected"
+  - "Cache purge API is a stub - no actual cache to purge"
+  - "No cache stats exposed (hit rate, size, entries)"
+  - "No TinyUFO eviction policy wired"
+waiver:
+  active: false
+
+quality_score: 40
+expires: "2026-04-15T12:00:00Z"
+
+evidence:
+  tests_reviewed: 0
+  risks_identified: 5
+  trace:
+    ac_covered: [1, 2, 3, 7, 11]
+    ac_gaps: [4, 5, 6, 8, 9, 10, 12]
+    ac_gap_reason: "Cache engine not wired - only data model, migration, API stub, and dashboard fields are implemented. Actual caching behavior (cache hit/miss, header compliance, stats) not functional."
+
+nfr_validation:
+  security:
+    status: N/A
+    notes: "Cache engine not active - no security surface to evaluate yet."
+  performance:
+    status: N/A
+    notes: "No caching occurs - performance impact is neutral (fields stored but unused)."
+  reliability:
+    status: PASS
+    notes: "Data model and migration are clean. Default values are sensible (cache_enabled=false, ttl=300s, max=50MB)."
+  maintainability:
+    status: PASS
+    notes: "Route model cleanly extended with serde defaults. Migration 009 adds columns correctly. API stub follows existing patterns."
+
+recommendations:
+  immediate:
+    - "Wire Pingora cache engine: implement request_cache_filter, cache_key_callback, and response_cache_filter in proxy_wiring.rs"
+    - "Integrate lorica-memory-cache with TinyUFO eviction as storage backend"
+    - "Inject X-Cache response header in proxy response pipeline"
+    - "Implement HTTP cache header compliance (Cache-Control, ETag, If-Modified-Since)"
+  future:
+    - "Add cache stats dashboard panel (hit rate, current size, entry count per route)"
+    - "Wire cache purge API to actual cache engine"

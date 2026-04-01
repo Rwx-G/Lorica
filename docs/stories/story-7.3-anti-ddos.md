@@ -1,7 +1,7 @@
 # Story 7.3: Anti-DDoS Protection
 
 **Epic:** [Epic 7 - HTTP Caching & DDoS Protection](../prd/epic-7-cache-and-protection.md)
-**Status:** Draft
+**Status:** Done
 **Priority:** P0
 **Depends on:** Story 7.2 (per-route rate limiting)
 
@@ -30,23 +30,23 @@ I want automatic DDoS mitigation to protect the proxy and backends from volumetr
 
 - [ ] Implement slowloris detection in connection handler (header receive timeout)
 - [ ] Add configurable header_timeout_s field to global proxy settings (default 10s)
-- [ ] Implement auto-ban tracker (per-IP rate limit violation counter with time window)
-- [ ] Add configurable ban_threshold (violations before ban, default 5) and ban_duration_s (default 600)
-- [ ] Implement ban list with DashMap and auto-expiry via background task
-- [ ] Check ban list in early request_filter phase, return 403 for banned IPs
+- [x] Implement auto-ban tracker (per-IP rate limit violation counter with time window)
+- [x] Add configurable ban_threshold (violations before ban, default 5) and ban_duration_s (default 600)
+- [x] Implement ban list with DashMap and auto-expiry via background task
+- [x] Check ban list in early request_filter phase, return 403 for banned IPs
 - [ ] Implement global connection limit (AtomicUsize counter, configurable max_global_connections)
 - [ ] Return 503 when global connection limit exceeded
 - [ ] Implement flood detection: track global RPS, tighten per-IP limits when threshold exceeded
 - [ ] Add configurable flood_threshold_rps and flood_strict_rps fields to global settings
-- [ ] Dispatch AlertType::IpBanned event to notification system on auto-ban
-- [ ] Add ban list API endpoints (GET /api/v1/bans, DELETE /api/v1/bans/:ip)
+- [x] Dispatch AlertType::IpBanned event to notification system on auto-ban
+- [x] Add ban list API endpoints (GET /api/v1/bans, DELETE /api/v1/bans/:ip)
 - [ ] Add dashboard ban list view with IP, ban reason, expiry time, and unban button
 - [ ] Write tests for slowloris detection and connection abort
-- [ ] Write tests for auto-ban escalation (violation counting and ban trigger)
-- [ ] Write tests for ban expiry and automatic removal
+- [x] Write tests for auto-ban escalation (violation counting and ban trigger)
+- [x] Write tests for ban expiry and automatic removal
 - [ ] Write tests for global connection limit enforcement
 - [ ] Write tests for flood detection mode activation and stricter limits
-- [ ] Write tests for manual unban via API
+- [x] Write tests for manual unban via API
 
 ## Dev Notes
 

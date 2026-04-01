@@ -1,7 +1,7 @@
 # Story 7.2: Per-Route Rate Limiting
 
 **Epic:** [Epic 7 - HTTP Caching & DDoS Protection](../prd/epic-7-cache-and-protection.md)
-**Status:** Draft
+**Status:** Done
 **Priority:** P0
 **Depends on:** Story 7.1 (HTTP response caching)
 
@@ -28,20 +28,20 @@ I want per-route rate limiting to protect backends from traffic spikes and abusi
 
 ## Tasks
 
-- [ ] Wire lorica-limits Rate estimator into proxy request_filter phase
-- [ ] Implement client IP extraction (X-Forwarded-For rightmost untrusted, fallback to peer IP)
-- [ ] Enforce rate_limit_rps and rate_limit_burst fields from route config
-- [ ] Return HTTP 429 with Retry-After header when rate limit exceeded
-- [ ] Inject X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset in all responses
-- [ ] Implement per-route connection counter (AtomicUsize per route)
-- [ ] Enforce max_connections per route, return 503 when exceeded
-- [ ] Expose rate limit and connection metrics via internal metrics system
-- [ ] Update dashboard route detail view with live rate/connection counters
-- [ ] Write tests for rate limiting enforcement (under limit, at limit, over limit)
-- [ ] Write tests for Retry-After header calculation
-- [ ] Write tests for rate limit response headers
-- [ ] Write tests for connection limit enforcement and 503 response
-- [ ] Write tests for client IP extraction from X-Forwarded-For
+- [x] Wire lorica-limits Rate estimator into proxy request_filter phase
+- [x] Implement client IP extraction (X-Forwarded-For rightmost untrusted, fallback to peer IP)
+- [x] Enforce rate_limit_rps and rate_limit_burst fields from route config
+- [x] Return HTTP 429 with Retry-After header when rate limit exceeded
+- [x] Inject X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset in all responses
+- [x] Implement per-route connection counter (AtomicUsize per route)
+- [x] Enforce max_connections per route, return 503 when exceeded
+- [x] Expose rate limit and connection metrics via internal metrics system
+- [x] Update dashboard route detail view with live rate/connection counters
+- [x] Write tests for rate limiting enforcement (under limit, at limit, over limit)
+- [x] Write tests for Retry-After header calculation
+- [x] Write tests for rate limit response headers
+- [x] Write tests for connection limit enforcement and 503 response
+- [x] Write tests for client IP extraction from X-Forwarded-For
 
 ## Dev Notes
 
