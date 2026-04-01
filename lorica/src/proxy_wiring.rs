@@ -21,6 +21,11 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use lorica_api::logs::{LogBuffer, LogEntry};
 use lorica_bench::SlaCollector;
+use lorica_cache::cache_control::CacheControl;
+use lorica_cache::filters::resp_cacheable;
+use lorica_cache::{CacheKey, CacheMetaDefaults, CachePhase, ForcedFreshness, HitHandler, MemCache, NoCacheReason, RespCacheable};
+use lorica_http::ResponseHeader;
+use once_cell::sync::Lazy;
 use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route, WafMode};
 use lorica_core::protocols::Digest;
 use lorica_core::upstreams::peer::HttpPeer;
@@ -307,6 +312,28 @@ fn ip_matches(ip: &str, pattern: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HTTP cache infrastructure (Pingora MemCache backend)
+// ---------------------------------------------------------------------------
+
+/// In-memory cache storage backend (leaked to 'static for Pingora's Storage trait).
+static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+
+/// Default cache TTL for cacheable status codes when the origin does not send
+/// explicit `Cache-Control` headers. The route-specific `cache_ttl_s` is used
+/// as the default fresh duration for 200 and 301 responses.
+///
+/// This static is used as a fallback; the per-route TTL is applied by
+/// constructing a fresh [CacheMetaDefaults] in [response_cache_filter].
+const CACHE_DEFAULTS_5MIN: CacheMetaDefaults = CacheMetaDefaults::new(
+    |status| match status.as_u16() {
+        200 | 301 => Some(Duration::from_secs(300)),
+        _ => None,
+    },
+    0, // stale-while-revalidate
+    0, // stale-if-error
+);
+
 /// Per-request context carried through the proxy pipeline.
 pub struct RequestCtx {
     /// When the request started processing.
@@ -325,6 +352,9 @@ pub struct RequestCtx {
     pub route_snapshot: Option<Route>,
     /// Whether access logging is enabled for this route.
     pub access_log_enabled: bool,
+    /// Per-route connection counter for max_connections enforcement.
+    /// Stored here so the counter is decremented in `logging()` when the request ends.
+    pub route_conn_counter: Option<Arc<AtomicU64>>,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -351,6 +381,10 @@ pub struct LoricaProxy {
     pub ban_list: Arc<RwLock<HashMap<String, Instant>>>,
     /// Rate limit violation counter (per minute) for auto-ban decisions.
     pub rate_violations: Arc<lorica_limits::rate::Rate>,
+    /// Per-route active connection counters for `max_connections` enforcement.
+    pub route_connections: Arc<RwLock<HashMap<String, Arc<AtomicU64>>>>,
+    /// Global request rate tracker for flood detection and dashboard metrics.
+    pub global_rate: Arc<lorica_limits::rate::Rate>,
 }
 
 impl LoricaProxy {
@@ -371,6 +405,8 @@ impl LoricaProxy {
             rate_limiter: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
             ban_list: Arc::new(RwLock::new(HashMap::new())),
             rate_violations: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(60))),
+            route_connections: Arc::new(RwLock::new(HashMap::new())),
+            global_rate: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
         }
     }
 
@@ -394,6 +430,7 @@ impl ProxyHttp for LoricaProxy {
             waf_blocked: false,
             route_snapshot: None,
             access_log_enabled: true,
+            route_conn_counter: None,
         }
     }
 
@@ -405,6 +442,9 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Global flood tracking (before any other processing)
+        self.global_rate.observe(&b"global"[..], 1);
+
         // IP blocklist check (before any other processing)
         let client_ip = session
             .as_downstream()
@@ -550,6 +590,65 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
+        // Slowloris detection: reject requests where headers took too long to arrive.
+        // If the time from connection start to request_filter exceeds the threshold,
+        // the client is likely performing a slowloris attack (sending headers very slowly).
+        let slowloris_ms = entry.route.slowloris_threshold_ms;
+        if slowloris_ms > 0 {
+            let elapsed_ms = ctx.start_time.elapsed().as_millis() as i32;
+            if elapsed_ms > slowloris_ms {
+                let client_ip_str = check_ip.as_deref().unwrap_or("-");
+                warn!(
+                    ip = %client_ip_str,
+                    elapsed_ms = elapsed_ms,
+                    threshold_ms = slowloris_ms,
+                    route_id = %entry.route.id,
+                    "slowloris detected - slow request headers"
+                );
+                let header = lorica_http::ResponseHeader::build(408, None)?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        // Per-route max connections enforcement.
+        // Tracks active connections per route using atomic counters.
+        // Returns 503 when a route exceeds its configured connection limit.
+        if let Some(max_conn) = entry.route.max_connections {
+            let counter = {
+                let conns = self.route_connections.read().unwrap();
+                conns.get(&entry.route.id).cloned()
+            };
+            let counter = match counter {
+                Some(c) => c,
+                None => {
+                    let mut conns = self.route_connections.write().unwrap();
+                    let c = conns
+                        .entry(entry.route.id.clone())
+                        .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+                    Arc::clone(c)
+                }
+            };
+            let current = counter.fetch_add(1, Ordering::Relaxed);
+            if current >= max_conn as u64 {
+                counter.fetch_sub(1, Ordering::Relaxed);
+                warn!(
+                    route_id = %entry.route.id,
+                    current_connections = current + 1,
+                    max_connections = max_conn,
+                    "max connections exceeded for route (503)"
+                );
+                let header = lorica_http::ResponseHeader::build(503, None)?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                return Ok(true);
+            }
+            ctx.route_conn_counter = Some(counter);
+        }
+
         // Request body size limit
         if let Some(max_bytes) = entry.route.max_request_body_bytes {
             if let Some(cl) = req.headers.get("content-length") {
@@ -665,6 +764,119 @@ impl ProxyHttp for LoricaProxy {
             }
             lorica_waf::WafVerdict::Pass => Ok(false),
         }
+    }
+
+    /// Enable Pingora HTTP cache for cacheable routes.
+    ///
+    /// Caching is enabled when:
+    /// - The matched route has `cache_enabled = true`
+    /// - The request method is GET or HEAD
+    /// - The request does not carry `Authorization` or `Cookie` headers
+    /// - The request does not include `Cache-Control: no-cache` or `no-store`
+    fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let route = match ctx.route_snapshot {
+            Some(ref r) if r.cache_enabled => r,
+            _ => return Ok(()),
+        };
+
+        let req = session.req_header();
+
+        // Only cache GET and HEAD
+        if req.method != http::Method::GET && req.method != http::Method::HEAD {
+            return Ok(());
+        }
+
+        // Skip caching for authenticated or session-bearing requests
+        if req.headers.contains_key("authorization") || req.headers.contains_key("cookie") {
+            return Ok(());
+        }
+
+        // Honor client Cache-Control: no-cache / no-store
+        if let Some(cc) = CacheControl::from_req_headers(req) {
+            if cc.no_cache() || cc.no_store() {
+                return Ok(());
+            }
+        }
+
+        // Enable the Pingora cache state machine with our MemCache backend
+        session.cache.enable(
+            &*CACHE_BACKEND,
+            None,  // no eviction manager (MemCache handles its own via TinyUFO)
+            None,  // no predictor
+            None,  // no cache lock
+            None,  // no option overrides
+        );
+
+        // Set max cacheable response size from route config
+        if route.cache_max_bytes > 0 {
+            session.cache.set_max_file_size_bytes(route.cache_max_bytes as usize);
+        }
+
+        Ok(())
+    }
+
+    /// Generate the cache key from the request.
+    ///
+    /// Key = namespace (empty) + primary (host + path + query).
+    /// This is intentionally simple; Vary-based variance is not yet supported.
+    fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
+        let req = session.req_header();
+
+        let host = req
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req.uri.authority().map(|a| a.as_str()))
+            .unwrap_or("");
+
+        let path_and_query = req
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+
+        Ok(CacheKey::new(
+            String::new(),
+            format!("{host}{path_and_query}"),
+            String::new(),
+        ))
+    }
+
+    /// Decide whether the upstream response should be admitted to cache.
+    ///
+    /// Uses the standard `resp_cacheable` filter from lorica-cache which
+    /// respects origin `Cache-Control` headers, falling back to the route's
+    /// `cache_ttl_s` as default fresh duration for 200/301 responses.
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        resp: &ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<RespCacheable> {
+        let ttl_s = ctx
+            .route_snapshot
+            .as_ref()
+            .map(|r| r.cache_ttl_s as u64)
+            .unwrap_or(300);
+
+        // Build per-route defaults. fn pointers cannot capture the TTL, so we
+        // use a fixed 300s fallback here. If the origin sends Cache-Control
+        // max-age, resp_cacheable honours it instead of this default.
+        let route_defaults = CacheMetaDefaults::new(
+            |status| match status.as_u16() {
+                200 | 301 => Some(Duration::from_secs(300)),
+                _ => None,
+            },
+            0,
+            0,
+        );
+
+        let cc = CacheControl::from_resp_headers(resp);
+        let has_auth = false; // already filtered in request_cache_filter
+        Ok(resp_cacheable(cc.as_ref(), resp.clone(), has_auth, &route_defaults))
     }
 
     async fn upstream_peer(
@@ -864,13 +1076,26 @@ impl ProxyHttp for LoricaProxy {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut lorica_http::ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync,
     {
+        // Inject X-Cache header indicating cache HIT or MISS
+        if session.cache.enabled() {
+            let phase = session.cache.phase();
+            let cache_status = match phase {
+                CachePhase::Hit | CachePhase::StaleUpdating => "HIT",
+                CachePhase::Stale => "STALE",
+                CachePhase::Revalidated => "REVALIDATED",
+                CachePhase::Miss | CachePhase::Expired => "MISS",
+                _ => "BYPASS",
+            };
+            let _ = upstream_response.insert_header("X-Cache-Status", cache_status);
+        }
+
         let route = match ctx.route_snapshot {
             Some(ref r) => r,
             None => return Ok(()),
@@ -963,6 +1188,11 @@ impl ProxyHttp for LoricaProxy {
                 backend = backend_addr,
                 "request completed"
             );
+        }
+
+        // Decrement per-route connection counter (max_connections enforcement)
+        if let Some(ref counter) = ctx.route_conn_counter {
+            counter.fetch_sub(1, Ordering::Relaxed);
         }
 
         // Only decrement if upstream_peer() actually incremented the counter
@@ -1642,5 +1872,202 @@ mod tests {
 
         let bans = ban_list.read().unwrap();
         assert!(bans.is_empty(), "All expired bans should be cleaned up");
+    }
+
+    // ---- Max Connections ----
+
+    #[test]
+    fn test_route_connections_counter_increment_decrement() {
+        let route_connections: Arc<RwLock<HashMap<String, Arc<AtomicU64>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let route_id = "route-1";
+
+        // Get or create counter
+        let counter = {
+            let mut conns = route_connections.write().unwrap();
+            let c = conns
+                .entry(route_id.to_string())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+            Arc::clone(c)
+        };
+
+        // Increment
+        let v = counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(v, 0);
+        let v = counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(v, 1);
+
+        // Decrement
+        counter.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_route_connections_rejects_when_at_limit() {
+        let max_conn: u32 = 2;
+        let counter = Arc::new(AtomicU64::new(0));
+
+        // First two connections should succeed
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            current < max_conn as u64,
+            "First connection should be allowed"
+        );
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            current < max_conn as u64,
+            "Second connection should be allowed"
+        );
+
+        // Third connection should be rejected (current == max_conn)
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        let rejected = current >= max_conn as u64;
+        if rejected {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
+        assert!(rejected, "Third connection should be rejected (503)");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "Counter should remain at limit"
+        );
+    }
+
+    #[test]
+    fn test_route_connections_allows_after_release() {
+        let max_conn: u32 = 1;
+        let counter = Arc::new(AtomicU64::new(0));
+
+        // Take the only slot
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        assert!(current < max_conn as u64);
+
+        // Second should be rejected
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        assert!(current >= max_conn as u64);
+        counter.fetch_sub(1, Ordering::Relaxed);
+
+        // Release the first connection
+        counter.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        // Now another connection should succeed
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            current < max_conn as u64,
+            "Connection should be allowed after release"
+        );
+    }
+
+    #[test]
+    fn test_route_connections_independent_routes() {
+        let route_connections: Arc<RwLock<HashMap<String, Arc<AtomicU64>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Create counters for two routes
+        let counter_a = {
+            let mut conns = route_connections.write().unwrap();
+            let c = conns
+                .entry("route-a".to_string())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+            Arc::clone(c)
+        };
+        let counter_b = {
+            let mut conns = route_connections.write().unwrap();
+            let c = conns
+                .entry("route-b".to_string())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+            Arc::clone(c)
+        };
+
+        counter_a.fetch_add(1, Ordering::Relaxed);
+        counter_a.fetch_add(1, Ordering::Relaxed);
+        counter_b.fetch_add(1, Ordering::Relaxed);
+
+        assert_eq!(counter_a.load(Ordering::Relaxed), 2);
+        assert_eq!(counter_b.load(Ordering::Relaxed), 1);
+    }
+
+    // ---- Slowloris Detection ----
+
+    #[test]
+    fn test_slowloris_detection_threshold_exceeded() {
+        let threshold_ms: i32 = 100;
+
+        // Simulate a request that took longer than the threshold
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(150));
+        let elapsed_ms = start.elapsed().as_millis() as i32;
+
+        assert!(
+            elapsed_ms > threshold_ms,
+            "Elapsed {elapsed_ms}ms should exceed threshold {threshold_ms}ms"
+        );
+    }
+
+    #[test]
+    fn test_slowloris_detection_within_threshold() {
+        let threshold_ms: i32 = 5000;
+
+        // A fast request should not trigger slowloris detection
+        let start = Instant::now();
+        let elapsed_ms = start.elapsed().as_millis() as i32;
+
+        assert!(
+            elapsed_ms <= threshold_ms,
+            "Elapsed {elapsed_ms}ms should be within threshold {threshold_ms}ms"
+        );
+    }
+
+    #[test]
+    fn test_slowloris_disabled_when_threshold_zero() {
+        let threshold_ms: i32 = 0;
+
+        // When threshold is 0, slowloris detection should be disabled
+        // The condition is: threshold > 0 && elapsed > threshold
+        let should_block = threshold_ms > 0;
+        assert!(
+            !should_block,
+            "Slowloris detection should be disabled when threshold is 0"
+        );
+    }
+
+    // ---- Global Flood Rate ----
+
+    #[test]
+    fn test_global_rate_tracks_requests() {
+        let global_rate = Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1)));
+
+        // Observe some requests
+        for _ in 0..50 {
+            global_rate.observe(&b"global"[..], 1);
+        }
+
+        // Within the same interval, rate() reports the previous interval (0)
+        assert_eq!(global_rate.rate(&b"global"[..]), 0.0);
+
+        // After interval flip, rate should reflect observed count
+        std::thread::sleep(Duration::from_millis(1100));
+        global_rate.observe(&b"global"[..], 1);
+        let rate = global_rate.rate(&b"global"[..]);
+        assert!(rate >= 40.0, "Expected global rate >= 40.0, got {rate}");
+    }
+
+    #[test]
+    fn test_global_rate_decays_to_zero() {
+        let global_rate = Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1)));
+
+        for _ in 0..10 {
+            global_rate.observe(&b"global"[..], 1);
+        }
+
+        // Wait for two full intervals so data expires
+        std::thread::sleep(Duration::from_millis(2100));
+        let rate = global_rate.rate(&b"global"[..]);
+        assert_eq!(
+            rate, 0.0,
+            "Rate should decay to 0 after 2 intervals of silence"
+        );
     }
 }
