@@ -41,6 +41,12 @@ pub struct AppState {
     pub sla_collector: Option<Arc<lorica_bench::SlaCollector>>,
     /// Load test engine.
     pub load_test_engine: Option<Arc<lorica_bench::LoadTestEngine>>,
+    /// Cache hit counter shared with the proxy engine.
+    pub cache_hits: Option<Arc<AtomicU64>>,
+    /// Cache miss counter shared with the proxy engine.
+    pub cache_misses: Option<Arc<AtomicU64>>,
+    /// Ban list shared with the proxy engine.
+    pub ban_list: Option<Arc<std::sync::RwLock<std::collections::HashMap<String, std::time::Instant>>>>,
 }
 
 impl AppState {
@@ -84,6 +90,9 @@ pub fn build_router(
             "/api/v1/cache/routes/:id",
             delete(crate::cache::purge_route_cache),
         )
+        .route("/api/v1/cache/stats", get(crate::cache::get_cache_stats))
+        .route("/api/v1/bans", get(crate::cache::list_bans))
+        .route("/api/v1/bans/:ip", delete(crate::cache::delete_ban))
         .route("/api/v1/backends", get(crate::backends::list_backends))
         .route("/api/v1/backends", post(crate::backends::create_backend))
         .route("/api/v1/backends/:id", get(crate::backends::get_backend))

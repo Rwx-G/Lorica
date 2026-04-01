@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule } from '../lib/api';
+  import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { showToast } from '../lib/toast';
 
@@ -18,8 +18,12 @@
   let loading = $state(true);
   let error = $state('');
   let filterCategory = $state('');
-  let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' = $state('events');
+  let activeTab: 'events' | 'rules' | 'blocklist' | 'custom' | 'bans' = $state('events');
   let showClearConfirm = $state(false);
+  let bans: BanEntry[] = $state([]);
+  let bansLoading = $state(false);
+  let unbanningIp: string | null = $state(null);
+  let bansRefreshTimer: ReturnType<typeof setInterval> | null = $state(null);
 
   // Custom rule form
   let showCustomForm = $state(false);
@@ -69,7 +73,54 @@
     loading = false;
   }
 
-  onMount(loadData);
+  onMount(() => {
+    loadData();
+    return () => {
+      if (bansRefreshTimer) clearInterval(bansRefreshTimer);
+    };
+  });
+
+  async function loadBans() {
+    bansLoading = true;
+    const res = await api.listBans();
+    if (res.data) {
+      bans = res.data.bans;
+    }
+    bansLoading = false;
+  }
+
+  function startBansRefresh() {
+    if (bansRefreshTimer) clearInterval(bansRefreshTimer);
+    bansRefreshTimer = setInterval(loadBans, 10000);
+    loadBans();
+  }
+
+  function stopBansRefresh() {
+    if (bansRefreshTimer) {
+      clearInterval(bansRefreshTimer);
+      bansRefreshTimer = null;
+    }
+  }
+
+  async function handleUnban(ip: string) {
+    const res = await api.deleteBan(ip);
+    if (res.data) {
+      showToast(`IP ${ip} unbanned`, 'success');
+      await loadBans();
+    } else if (res.error) {
+      showToast(res.error.message, 'error');
+    }
+    unbanningIp = null;
+  }
+
+  function formatDuration(seconds: number): string {
+    if (seconds < 60) return `${seconds}s`;
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    if (m < 60) return `${m}m ${s}s`;
+    const h = Math.floor(m / 60);
+    return `${h}h ${m % 60}m`;
+  }
 
   async function handleClear() {
     await api.clearWafEvents();
@@ -215,20 +266,26 @@
 
   <!-- Tabs -->
   <div class="tabs">
-    <button class="tab" class:active={activeTab === 'events'} onclick={() => activeTab = 'events'}>Events</button>
-    <button class="tab" class:active={activeTab === 'rules'} onclick={() => activeTab = 'rules'}>Rules</button>
-    <button class="tab" class:active={activeTab === 'custom'} onclick={() => activeTab = 'custom'}>
+    <button class="tab" class:active={activeTab === 'events'} onclick={() => { stopBansRefresh(); activeTab = 'events'; }}>Events</button>
+    <button class="tab" class:active={activeTab === 'rules'} onclick={() => { stopBansRefresh(); activeTab = 'rules'; }}>Rules</button>
+    <button class="tab" class:active={activeTab === 'custom'} onclick={() => { stopBansRefresh(); activeTab = 'custom'; }}>
       Custom Rules
       {#if customRules.length > 0}
         <span class="tab-badge-on">{customRules.length}</span>
       {/if}
     </button>
-    <button class="tab" class:active={activeTab === 'blocklist'} onclick={() => activeTab = 'blocklist'}>
+    <button class="tab" class:active={activeTab === 'blocklist'} onclick={() => { stopBansRefresh(); activeTab = 'blocklist'; }}>
       IP Blocklist
       {#if blocklist.enabled}
         <span class="tab-badge-on">ON</span>
       {:else}
         <span class="tab-badge-off">OFF</span>
+      {/if}
+    </button>
+    <button class="tab" class:active={activeTab === 'bans'} onclick={() => { activeTab = 'bans'; startBansRefresh(); }}>
+      Bans
+      {#if bans.length > 0}
+        <span class="tab-badge-on">{bans.length}</span>
       {/if}
     </button>
   </div>
@@ -462,6 +519,60 @@
         </div>
       </div>
     </div>
+  {:else if activeTab === 'bans'}
+    <div class="bans-section">
+      <p class="text-muted">
+        IPs automatically banned for repeated rate limit violations. Bans expire after 1 hour.
+        Auto-refreshes every 10 seconds.
+      </p>
+
+      {#if bansLoading && bans.length === 0}
+        <p class="loading">Loading...</p>
+      {:else if bans.length === 0}
+        <div class="empty-state">
+          <p>No IPs currently banned.</p>
+          <p class="text-muted">IPs are auto-banned when they exceed rate limits repeatedly.</p>
+        </div>
+      {:else}
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>IP Address</th>
+                <th>Banned</th>
+                <th>Expires In</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each bans as ban}
+                <tr>
+                  <td class="mono">{ban.ip}</td>
+                  <td>{formatDuration(ban.banned_seconds_ago)} ago</td>
+                  <td>{formatDuration(ban.remaining_seconds)}</td>
+                  <td>
+                    <button
+                      class="btn btn-danger btn-sm"
+                      onclick={() => (unbanningIp = ban.ip)}
+                    >Unban</button>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    </div>
+
+    {#if unbanningIp}
+      <ConfirmDialog
+        title="Unban IP"
+        message="Remove {unbanningIp} from the ban list? This IP will be able to send requests again immediately."
+        confirmLabel="Unban"
+        onconfirm={() => { if (unbanningIp) handleUnban(unbanningIp); }}
+        oncancel={() => (unbanningIp = null)}
+      />
+    {/if}
   {/if}
 
   {#if showClearConfirm}
@@ -860,5 +971,19 @@
 
   .custom-header p {
     margin: 0;
+  }
+
+  /* Bans */
+  .bans-section {
+    padding-top: var(--space-4);
+  }
+
+  .bans-section > .text-muted {
+    margin-bottom: var(--space-4);
+  }
+
+  .btn-sm {
+    padding: 0.25rem 0.625rem;
+    font-size: 0.75rem;
   }
 </style>

@@ -351,6 +351,9 @@ fn run_supervisor(cli: Cli) {
                 acme_challenge_store: None,
                 sla_collector: None,
                 load_test_engine: None,
+                cache_hits: None,
+                cache_misses: None,
+                ban_list: None,
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
@@ -723,6 +726,9 @@ fn run_single_process(cli: Cli) {
         );
         lorica_proxy.waf_engine = Arc::clone(&waf_engine);
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
+        let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
+        let proxy_cache_misses = Arc::clone(&lorica_proxy.cache_misses);
+        let proxy_ban_list = Arc::clone(&lorica_proxy.ban_list);
         let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
         proxy_service.add_tcp(&format!("0.0.0.0:{}", cli.http_port));
@@ -766,6 +772,9 @@ fn run_single_process(cli: Cli) {
                 acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
                 load_test_engine: Some(Arc::new(lorica_bench::LoadTestEngine::new())),
+                cache_hits: Some(proxy_cache_hits),
+                cache_misses: Some(proxy_cache_misses),
+                ban_list: Some(proxy_ban_list),
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();

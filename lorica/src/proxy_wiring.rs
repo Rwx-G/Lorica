@@ -355,6 +355,8 @@ pub struct RequestCtx {
     /// Per-route connection counter for max_connections enforcement.
     /// Stored here so the counter is decremented in `logging()` when the request ends.
     pub route_conn_counter: Option<Arc<AtomicU64>>,
+    /// Rate limit info for response headers: (limit_rps, current_rate).
+    pub rate_limit_info: Option<(u32, f64)>,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -385,6 +387,10 @@ pub struct LoricaProxy {
     pub route_connections: Arc<RwLock<HashMap<String, Arc<AtomicU64>>>>,
     /// Global request rate tracker for flood detection and dashboard metrics.
     pub global_rate: Arc<lorica_limits::rate::Rate>,
+    /// Cache hit counter for dashboard stats.
+    pub cache_hits: Arc<AtomicU64>,
+    /// Cache miss counter for dashboard stats.
+    pub cache_misses: Arc<AtomicU64>,
 }
 
 impl LoricaProxy {
@@ -407,6 +413,8 @@ impl LoricaProxy {
             rate_violations: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(60))),
             route_connections: Arc::new(RwLock::new(HashMap::new())),
             global_rate: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
+            cache_hits: Arc::new(AtomicU64::new(0)),
+            cache_misses: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -431,6 +439,7 @@ impl ProxyHttp for LoricaProxy {
             route_snapshot: None,
             access_log_enabled: true,
             route_conn_counter: None,
+            rate_limit_info: None,
         }
     }
 
@@ -674,6 +683,9 @@ impl ProxyHttp for LoricaProxy {
                     Some(burst) => (rps + burst) as f64,
                     None => rps as f64,
                 };
+                // Store rate info for response headers (even if not throttled)
+                ctx.rate_limit_info = Some((rps, current_rate));
+
                 if current_rate > effective_limit {
                     warn!(
                         route_id = %entry.route.id,
@@ -1107,6 +1119,13 @@ impl ProxyHttp for LoricaProxy {
                 _ => "BYPASS",
             };
             let _ = upstream_response.insert_header("X-Cache-Status", cache_status);
+
+            // Increment cache counters for dashboard stats
+            match cache_status {
+                "HIT" | "REVALIDATED" => { self.cache_hits.fetch_add(1, Ordering::Relaxed); }
+                "MISS" | "BYPASS" | "STALE" => { self.cache_misses.fetch_add(1, Ordering::Relaxed); }
+                _ => {}
+            }
         }
 
         let route = match ctx.route_snapshot {
@@ -1140,6 +1159,14 @@ impl ProxyHttp for LoricaProxy {
                     headers_to_set.push((name.clone(), value.clone()));
                 }
             }
+        }
+
+        // Rate limit response headers
+        if let Some((limit, current)) = ctx.rate_limit_info {
+            let remaining = if current < limit as f64 { (limit as f64 - current) as u32 } else { 0 };
+            headers_to_set.push(("X-RateLimit-Limit".to_string(), limit.to_string()));
+            headers_to_set.push(("X-RateLimit-Remaining".to_string(), remaining.to_string()));
+            headers_to_set.push(("X-RateLimit-Reset".to_string(), "1".to_string()));
         }
 
         // Apply removals first, then additions

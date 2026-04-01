@@ -623,6 +623,17 @@ export const api = {
 
   compareLoadTestResults: (configId: string) =>
     request<LoadTestComparison>('GET', `/loadtest/results/${configId}/compare`),
+
+  // Cache Stats
+  getCacheStats: () =>
+    request<CacheStatsResponse>('GET', '/cache/stats'),
+
+  // Ban List
+  listBans: () =>
+    request<BanListResponse>('GET', '/bans'),
+
+  deleteBan: (ip: string) =>
+    request<{ unbanned: boolean; ip: string }>('DELETE', `/bans/${encodeURIComponent(ip)}`),
 };
 
 export interface WafEvent {
@@ -900,4 +911,22 @@ export interface UpdateBackendRequest {
   health_check_interval_s?: number;
   health_check_path?: string;
   tls_upstream?: boolean;
+}
+
+export interface CacheStatsResponse {
+  hits: number;
+  misses: number;
+  total: number;
+  hit_rate: number;
+}
+
+export interface BanEntry {
+  ip: string;
+  banned_seconds_ago: number;
+  remaining_seconds: number;
+}
+
+export interface BanListResponse {
+  bans: BanEntry[];
+  total: number;
 }

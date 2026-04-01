@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Rate limit response headers** - Proxied responses now include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers when a route has `rate_limit_rps` configured. Rate info is stored in RequestCtx during request_filter and injected in response_filter.
+- **Cache stats API** - New `GET /api/v1/cache/stats` endpoint returning cache hit/miss counters and hit rate percentage. Counters are tracked per-process in the proxy engine via atomic counters incremented on each X-Cache-Status decision.
+- **Ban list API and dashboard** - New `GET /api/v1/bans` and `DELETE /api/v1/bans/:ip` endpoints to list and remove auto-banned IPs. Security dashboard has a new "Bans" tab showing banned IPs with remaining duration and an unban button. Auto-refreshes every 10 seconds.
+
+### Added
+
 - **HTTP response caching** - Wired the Pingora MemCache engine into the proxy. Routes with `cache_enabled = true` now cache GET/HEAD responses in memory using TinyUFO eviction. Cache key is host + path + query. Requests with Authorization/Cookie headers or Cache-Control: no-cache/no-store bypass the cache. Origin Cache-Control headers are honoured; when absent, the route's `cache_ttl_s` (default 300s) applies to 200/301 responses. Max cacheable response size controlled by `cache_max_bytes`. X-Cache-Status response header indicates HIT, MISS, STALE, REVALIDATED, or BYPASS.
 - **Anti-DDoS auto-ban protection** - IPs that repeatedly exceed rate limits are automatically banned. A per-IP violation counter (1-minute sliding window) tracks 429 responses; when violations exceed the route's `auto_ban_threshold`, the IP is added to an in-memory ban list. Banned IPs receive 403 immediately (before any route lookup or WAF processing). Bans expire after `auto_ban_duration_s` (default 1 hour) with lazy cleanup on access. Ban list is ephemeral (memory-only, clears on restart). New `IpBanned` alert type in lorica-notify with Slack support.
 - **Per-route rate limiting enforcement** - The `rate_limit_rps` and `rate_limit_burst` fields on routes are now enforced in the proxy hot path. Requests exceeding the configured rate receive a 429 response with a `Retry-After: 1` header. Uses the `lorica-limits` crate Rate estimator keyed by route ID + client IP for per-client fairness. Burst tolerance allows short spikes up to `rps + burst` before throttling.
