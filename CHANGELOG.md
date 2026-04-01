@@ -46,7 +46,7 @@ Author: Rwx-G
 
 **Route Configuration (Epic 6)**
 
-- 25+ per-route production proxy settings: force HTTPS redirect (301), hostname redirect, hostname aliases, configurable proxy headers (set/remove), response headers (set/remove), security header presets, per-route timeouts (connect/read/send), path rewriting (strip/add prefix), access log toggle, max request body size, WebSocket toggle, rate limiting (RPS + burst), IP allowlist/denylist, CORS, gzip compression toggle, retry attempts
+- 25+ per-route production proxy settings: force HTTPS redirect (301), hostname redirect, hostname aliases, configurable proxy headers (set/remove), response headers (set/remove), security header presets, per-route timeouts (connect/read/send), path rewriting (strip/add prefix), access log toggle, max request body size, WebSocket toggle, rate limiting (RPS + burst), IP allowlist/denylist, CORS, per-route gzip compression and retry attempts (both wired through Pingora fork modifications)
 
 **Caching (Epic 7)**
 
@@ -65,7 +65,7 @@ Author: Rwx-G
 **Dashboard**
 
 - Embedded Svelte 5 + TypeScript frontend compiled into the binary via `rust-embed` (~59 KB bundle). Login and password change screens, sidebar navigation, light/dark theme toggle
-- Overview page with status cards
+- Overview cockpit dashboard with route/backend/certificate/alert summary cards, SLA chart, request rate sparkline, top routes table, and recent events timeline
 - Routes CRUD with collapsible Advanced Configuration section for all 25+ settings, WAF status (Detect/Block/-) in routes table
 - Backends CRUD with address, weight, health check (TCP/HTTP), TLS upstream, active connections
 - Certificates management with ACME vs manual distinction
@@ -78,6 +78,7 @@ Author: Rwx-G
 - Settings page with notification channel configuration, global settings
 - Security Header Presets management in Settings - view builtin presets (strict, moderate, none), create/edit/delete custom presets with name and key=value header pairs
 - Config export/import with diff preview
+- Nginx config import wizard - paste an `nginx.conf` to auto-create routes, backends, and certificates
 - Input validation on all forms, sort/filter on Backends and Routes tables
 - DNS-01 ACME form hint explaining supported providers (Cloudflare, Route53) and planned manual DNS-01 support
 
@@ -89,21 +90,23 @@ Author: Rwx-G
 **Configuration & API**
 
 - Embedded SQLite database (`lorica-config`) with WAL mode, CRUD for routes, backends, certificates, global settings, notification configs, user preferences, and admin users. AES-256-GCM encryption for certificate private keys at rest
-- REST API (`lorica-api`) on localhost:9443 via axum. Session-based authentication with HTTP-only secure cookies, first-run admin password generation, forced password change, rate-limited login. Full CRUD endpoints, config TOML export/import with preview and diff, notification test endpoint. Consistent JSON error envelope
+- REST API (`lorica-api`) on localhost:9443 via axum. Session-based authentication with HTTP-only secure cookies, sliding window session renewal, first-run admin password generation, forced password change, rate-limited login. Full CRUD endpoints, config TOML export/import with preview and diff, notification test endpoint. Consistent JSON error envelope
 - CLI (`lorica`) with `--version`, `--data-dir`, `--log-level`, `--management-port`, `--http-port`, `--https-port`, `--workers`. Graceful shutdown on SIGTERM/SIGINT. systemd unit file with security hardening
 
 **Packaging (Epic 4)**
 
-- GitHub Actions CI pipeline (test, build, package). Release workflow on tags creates GitHub Release with binary and `.deb` artifacts
+- GitHub Actions CI pipeline (lint, test, build, package). Release workflow on tags creates GitHub Release with binary, `.deb`, and `.rpm` artifacts
+- GPG package signing for `.deb` and `.rpm` artifacts in CI
 - `.deb` package with systemd service, postinst (user creation, permissions, service enable), prerm/postrm scripts
 - Security-hardened systemd unit (MemoryDenyWriteExecute, SystemCallFilter, RestrictNamespaces, UMask)
+- NOTICE file crediting Cloudflare Pingora as upstream (Apache-2.0)
+- FORK.md documenting fork origin, renaming rules, removed components, and upstream comparison strategy
 
 **Testing**
 
-- 207+ Rust unit tests across product crates (96 config, 57 bench, 54 notify) + frontend Vitest suite
-- Docker Compose-based E2E test suite with 147 assertions across 27 sections covering auth, dashboard, CRUD, proxy routing, WAF, health checks, Prometheus, Peak EWMA, SLA, probes, load testing, route config, and worker isolation
+- 655 Rust unit tests (280 product crates: 97 config, 55 bench, 52 waf, 39 api, 37 notify + 375 forked Pingora crates) and 52 frontend Vitest tests
+- Docker Compose-based E2E test suite with 200 assertions across 33 sections covering auth, dashboard, CRUD, proxy routing, WAF, health checks, certificates, TLS upstream, failover, Prometheus, Peak EWMA, SLA, probes, load testing, route config, rate limiting, CORS, cache, bans, compression, WebSocket blocking, backend validation, and worker isolation
 - Fuzz testing targets for WAF evaluation and API input
-- NOTICE file crediting Cloudflare Pingora as upstream (Apache-2.0)
 
 ### Changed
 

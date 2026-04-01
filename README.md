@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/version-0.3.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Tests-414%20passing-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/Tests-907%20passing-brightgreen.svg" alt="Tests">
 </p>
 
 ---
@@ -54,6 +54,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Web dashboard** - Svelte 5 UI (~59 KB) embedded in the binary: routes, backends, certs, WAF, SLA, load tests, settings
 - **REST API** - full CRUD for all entities, session-based auth, rate-limited login
 - **TOML config export/import** - with diff preview before applying changes
+- **Nginx config import** - paste an `nginx.conf` to auto-create routes, backends, and certificates
 - **ACME / Let's Encrypt** - automatic TLS provisioning via HTTP-01 challenge
 - **Notification channels** - stdout, SMTP email, HTTP webhook with per-channel rate limiting
 - **Ban list management** - view and unban auto-banned IPs from the dashboard
@@ -113,7 +114,7 @@ Options:
 
 The dashboard ships inside the binary and is served on the management port (default 9443). It provides:
 
-- **Overview** - status cards with active routes, backends, certificates, and system health
+- **Overview** - cockpit dashboard with route/backend/certificate/alert summary cards, SLA chart, request rate sparkline, top routes table, and recent events timeline
 - **Routes** - create/edit routes with host matching, path prefixes, load balancing, WAF mode, rate limits, caching, timeouts, security headers, CORS, and 25 other per-route settings in a collapsible Advanced Configuration section
 - **Backends** - manage backend addresses, weights, health check type (TCP/HTTP), TLS upstream, active connections, lifecycle state
 - **Certificates** - upload PEM certificates, view expiry dates, provision via ACME/Let's Encrypt
@@ -127,7 +128,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 ## Architecture
 
-Lorica is a Rust workspace with 26 crates, forked from Cloudflare Pingora (17 core crates) and extended with 9 product crates:
+Lorica is a Rust workspace with 25 crates: 15 forked from Cloudflare Pingora and 10 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
 
 | Crate | Purpose |
 |-------|---------|
@@ -208,6 +209,143 @@ curl -sk https://localhost:9443/api/v1/routes \
 
 Or just use the dashboard - it covers all the same operations with zero curl.
 
+## REST API Reference
+
+All endpoints are served on the management port (default `9443`) over HTTPS. Protected endpoints require a session cookie obtained via `/api/v1/auth/login`.
+
+### Public endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/auth/login` | Authenticate (returns session cookie) |
+| `POST` | `/api/v1/auth/logout` | Invalidate session |
+| `GET` | `/metrics` | Prometheus metrics (no auth) |
+| `GET` | `/.well-known/acme-challenge/:token` | ACME HTTP-01 challenge response |
+
+### Routes
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/routes` | List all routes |
+| `POST` | `/api/v1/routes` | Create route |
+| `GET` | `/api/v1/routes/:id` | Get route |
+| `PUT` | `/api/v1/routes/:id` | Update route |
+| `DELETE` | `/api/v1/routes/:id` | Delete route |
+
+### Backends
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/backends` | List all backends |
+| `POST` | `/api/v1/backends` | Create backend |
+| `GET` | `/api/v1/backends/:id` | Get backend |
+| `PUT` | `/api/v1/backends/:id` | Update backend |
+| `DELETE` | `/api/v1/backends/:id` | Delete backend |
+
+### Certificates
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/certificates` | List certificates |
+| `POST` | `/api/v1/certificates` | Upload PEM certificate |
+| `POST` | `/api/v1/certificates/self-signed` | Generate self-signed certificate |
+| `GET` | `/api/v1/certificates/:id` | Get certificate |
+| `PUT` | `/api/v1/certificates/:id` | Update certificate |
+| `DELETE` | `/api/v1/certificates/:id` | Delete certificate |
+
+### ACME
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/acme/provision` | Provision via HTTP-01 |
+| `POST` | `/api/v1/acme/provision-dns` | Provision via DNS-01 |
+| `POST` | `/api/v1/acme/provision-dns-manual` | Start manual DNS-01 flow |
+| `POST` | `/api/v1/acme/provision-dns-manual/confirm` | Confirm manual DNS-01 |
+
+### WAF
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/waf/events` | Recent WAF events (with category filter) |
+| `DELETE` | `/api/v1/waf/events` | Clear WAF events |
+| `GET` | `/api/v1/waf/stats` | WAF statistics |
+| `GET` | `/api/v1/waf/rules` | List WAF rules |
+| `PUT` | `/api/v1/waf/rules/:id` | Enable/disable rule |
+| `GET` | `/api/v1/waf/rules/custom` | List custom rules |
+| `POST` | `/api/v1/waf/rules/custom` | Create custom rule |
+| `DELETE` | `/api/v1/waf/rules/custom/:id` | Delete custom rule |
+| `GET` | `/api/v1/waf/blocklist` | Blocklist status |
+| `PUT` | `/api/v1/waf/blocklist` | Enable/disable blocklist |
+| `POST` | `/api/v1/waf/blocklist/reload` | Reload blocklist |
+
+### SLA & Probes
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/sla/overview` | SLA overview for all routes |
+| `GET` | `/api/v1/sla/routes/:id` | SLA metrics for route |
+| `GET` | `/api/v1/sla/routes/:id/buckets` | Time-bucketed SLA data |
+| `GET` | `/api/v1/sla/routes/:id/config` | SLA config |
+| `PUT` | `/api/v1/sla/routes/:id/config` | Update SLA config |
+| `GET` | `/api/v1/sla/routes/:id/export` | Export SLA data (CSV/JSON) |
+| `GET` | `/api/v1/sla/routes/:id/active` | Active probe results |
+| `GET` | `/api/v1/probes` | List probes |
+| `POST` | `/api/v1/probes` | Create probe |
+| `GET` | `/api/v1/probes/route/:route_id` | Probes for route |
+| `PUT` | `/api/v1/probes/:id` | Update probe |
+| `DELETE` | `/api/v1/probes/:id` | Delete probe |
+
+### Load Testing
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/loadtest/configs` | List configs |
+| `POST` | `/api/v1/loadtest/configs` | Create config |
+| `PUT` | `/api/v1/loadtest/configs/:id` | Update config |
+| `DELETE` | `/api/v1/loadtest/configs/:id` | Delete config |
+| `POST` | `/api/v1/loadtest/configs/:id/clone` | Clone config |
+| `POST` | `/api/v1/loadtest/start/:config_id` | Start test (requires confirm) |
+| `POST` | `/api/v1/loadtest/start/:config_id/confirm` | Confirm and execute |
+| `GET` | `/api/v1/loadtest/status` | Current test status |
+| `GET` | `/api/v1/loadtest/stream` | SSE real-time results |
+| `POST` | `/api/v1/loadtest/abort` | Abort running test |
+| `GET` | `/api/v1/loadtest/results/:config_id` | Test results |
+| `GET` | `/api/v1/loadtest/results/:config_id/compare` | Compare runs |
+
+### Cache & Bans
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `DELETE` | `/api/v1/cache/routes/:id` | Purge route cache |
+| `GET` | `/api/v1/cache/stats` | Cache hit/miss stats |
+| `GET` | `/api/v1/bans` | List banned IPs |
+| `DELETE` | `/api/v1/bans/:ip` | Unban IP |
+
+### System & Configuration
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `PUT` | `/api/v1/auth/password` | Change password |
+| `GET` | `/api/v1/settings` | Global settings |
+| `PUT` | `/api/v1/settings` | Update settings |
+| `GET` | `/api/v1/status` | System status summary |
+| `GET` | `/api/v1/system` | CPU, memory, disk usage |
+| `GET` | `/api/v1/workers` | Worker heartbeat metrics |
+| `GET` | `/api/v1/logs` | Access logs |
+| `DELETE` | `/api/v1/logs` | Clear logs |
+| `GET` | `/api/v1/logs/ws` | WebSocket log stream |
+| `POST` | `/api/v1/config/export` | Export config as TOML |
+| `POST` | `/api/v1/config/import` | Import TOML config |
+| `POST` | `/api/v1/config/import/preview` | Preview import diff |
+| `GET` | `/api/v1/notifications` | List notification configs |
+| `POST` | `/api/v1/notifications` | Create notification config |
+| `PUT` | `/api/v1/notifications/:id` | Update notification config |
+| `DELETE` | `/api/v1/notifications/:id` | Delete notification config |
+| `POST` | `/api/v1/notifications/:id/test` | Test notification channel |
+| `GET` | `/api/v1/preferences` | List user preferences |
+| `PUT` | `/api/v1/preferences/:id` | Update preference |
+| `DELETE` | `/api/v1/preferences/:id` | Delete preference |
+
 ## Building from Source
 
 ```bash
@@ -227,11 +365,16 @@ cargo build --release
 ### Running tests
 
 ```bash
-# Unit tests (312 Rust + 52 frontend)
+# All Rust unit tests (655 tests across 25 crates)
+cargo test
+
+# Product crate tests only (280 tests)
 cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench
+
+# Frontend tests (52 Vitest tests)
 cd lorica-dashboard/frontend && npx vitest run
 
-# E2E tests (63 assertions, Docker required)
+# E2E tests (200 assertions across 33 sections, Docker required)
 cd tests-e2e-docker && ./run.sh --build
 ```
 
@@ -244,12 +387,21 @@ The `.deb` package installs a hardened systemd unit with:
 - `RestrictNamespaces=yes`, `RestrictSUIDSGID=yes`
 - Runs as dedicated `lorica` user with `CAP_NET_BIND_SERVICE`
 
+## Package Verification
+
+Release `.deb` and `.rpm` packages are GPG-signed. Import the public key to verify:
+
+```bash
+curl -fsSL https://github.com/Rwx-G/Lorica/raw/main/docs/lorica-signing-key.asc | sudo gpg --dearmor -o /usr/share/keyrings/lorica.gpg
+dpkg-sig --verify lorica.deb
+```
+
 ## License
 
 Apache-2.0 - see [LICENSE](LICENSE).
 
 ## Credits
 
-Built on [Pingora](https://github.com/cloudflare/pingora) by Cloudflare (Apache-2.0). See [NOTICE](NOTICE).
+Built on [Pingora](https://github.com/cloudflare/pingora) by Cloudflare (Apache-2.0). See [NOTICE](NOTICE) and [FORK.md](FORK.md) for fork details.
 
 Author: Rwx-G
