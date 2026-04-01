@@ -9,6 +9,7 @@
   import StatusBadge from '../components/StatusBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import RouteDrawer from '../components/RouteDrawer.svelte';
+  import NginxImportWizard from '../components/NginxImportWizard.svelte';
   import { showToast } from '../lib/toast';
 
   let routes: RouteResponse[] = $state([]);
@@ -20,6 +21,9 @@
   // Drawer state
   let showDrawer = $state(false);
   let editingRoute: RouteResponse | null = $state(null);
+
+  // Nginx import wizard state
+  let showImportWizard = $state(false);
 
   // Search and sort state
   let searchQuery = $state('');
@@ -134,7 +138,10 @@
 <div class="routes-page">
   <div class="page-header">
     <h1>Routes</h1>
-    <button class="btn btn-primary" onclick={openCreateForm}>+ New Route</button>
+    <div class="header-actions">
+      <button class="btn btn-secondary" onclick={() => { showImportWizard = true; }}>Import from Nginx</button>
+      <button class="btn btn-primary" onclick={openCreateForm}>+ New Route</button>
+    </div>
   </div>
 
   {#if error}
@@ -233,6 +240,12 @@
   onclose={() => { showDrawer = false; editingRoute = null; }}
 />
 
+<NginxImportWizard
+  open={showImportWizard}
+  onclose={() => { showImportWizard = false; }}
+  onimported={loadData}
+/>
+
 {#if deletingRoute}
   <ConfirmDialog
     title="Delete Route"
@@ -267,6 +280,23 @@
 
   .page-header h1 {
     margin: 0;
+  }
+
+  .header-actions {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+  }
+
+  .btn-secondary {
+    background: none;
+    color: var(--color-text-muted);
+    border: 1px solid var(--color-border);
+  }
+
+  .btn-secondary:hover {
+    background: var(--color-bg-hover);
+    color: var(--color-text);
   }
 
   .error-banner {
