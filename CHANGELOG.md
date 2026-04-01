@@ -9,10 +9,6 @@ Author: Rwx-G
 
 ## [Unreleased]
 
-### Changed
-
-- Refactored Routes form from a narrow modal into a slide-in drawer (900px) with 7 tabbed sections (General, Timeouts, Security, Headers, CORS, Caching, Protection), dot indicators for modified fields, imported-field badges, unsaved-changes warning, and centralized form state/validation in `route-form.ts`
-
 ### Added
 
 **Proxy Engine (Epics 1-2)**
@@ -103,8 +99,8 @@ Author: Rwx-G
 
 **Testing**
 
-- 312 Rust + frontend unit tests (111 API, 65 config, 41 WAF, 43 notify, 52 frontend)
-- Docker Compose-based E2E test suite with 63 assertions covering auth, dashboard, settings, CRUD, proxy routing, WAF, rule management, config export/import, notifications, HTTP health checks
+- 207+ Rust unit tests across product crates (96 config, 57 bench, 54 notify) + frontend Vitest suite
+- Docker Compose-based E2E test suite with 147 assertions across 27 sections covering auth, dashboard, CRUD, proxy routing, WAF, health checks, Prometheus, Peak EWMA, SLA, probes, load testing, route config, and worker isolation
 - Fuzz testing targets for WAF evaluation and API input
 - NOTICE file crediting Cloudflare Pingora as upstream (Apache-2.0)
 
