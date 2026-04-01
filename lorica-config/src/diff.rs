@@ -233,6 +233,20 @@ fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> Setting
             new_value: incoming.cert_critical_days.to_string(),
         });
     }
+    if current.default_topology_type != incoming.default_topology_type {
+        changes.push(SettingChange {
+            key: "default_topology_type".to_string(),
+            old_value: current.default_topology_type.as_str().to_string(),
+            new_value: incoming.default_topology_type.as_str().to_string(),
+        });
+    }
+    if current.flood_threshold_rps != incoming.flood_threshold_rps {
+        changes.push(SettingChange {
+            key: "flood_threshold_rps".to_string(),
+            old_value: current.flood_threshold_rps.to_string(),
+            new_value: incoming.flood_threshold_rps.to_string(),
+        });
+    }
     SettingsDiff { changes }
 }
 
