@@ -83,7 +83,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 # Download the latest release
 wget https://github.com/Rwx-G/Lorica/releases/latest/download/lorica.deb
 sudo dpkg -i lorica.deb
-sudo systemctl start lorica
+sudo systemctl enable --now lorica
 ```
 
 ### Run directly
@@ -252,4 +252,4 @@ Apache-2.0 - see [LICENSE](LICENSE).
 
 Built on [Pingora](https://github.com/cloudflare/pingora) by Cloudflare (Apache-2.0). See [NOTICE](NOTICE).
 
-Author: Romain G.
+Author: Rwx-G
