@@ -210,9 +210,9 @@ The MVP is successful when the author can fully replace Nginx on at least one pr
 
 ### Platform Requirements
 
-- **Primary target:** Linux (x86_64, aarch64)
-- **Development:** Linux, macOS
-- **Future consideration:** Windows (limited by fork() requirement for worker isolation)
+- **Primary target:** Linux x86_64 only
+- **Development:** Linux (via Docker on other host OSes)
+- **No support:** aarch64, macOS, Windows (fork+exec worker model requires Linux)
 - **Performance target:** Comparable to Pingora benchmarks (Cloudflare production-proven)
 
 ### Technology Preferences

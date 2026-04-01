@@ -30,7 +30,7 @@ so that deployment is simple and follows standard Linux conventions.
 ## Tasks
 
 - [x] Set up GitHub Actions CI (cargo test, clippy, fmt)
-- [x] Set up release build pipeline (cross-compilation: x86_64, aarch64)
+- [x] Set up release build pipeline (x86_64 only)
 - [x] Create debian packaging files (control, postinst, prerm, postrm)
 - [x] Implement post-install script (create user, set permissions, enable service)
 - [x] Implement post-install credential display

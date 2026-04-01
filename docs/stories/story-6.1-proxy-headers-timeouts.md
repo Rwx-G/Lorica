@@ -1,7 +1,7 @@
 # Story 6.1: Proxy Headers and Timeouts
 
 **Epic:** [Epic 6 - Route Configuration](../prd/epic-6-route-config.md)
-**Status:** Draft
+**Status:** Done
 **Priority:** P1
 **Depends on:** Story 1.8 (proxy engine wiring)
 

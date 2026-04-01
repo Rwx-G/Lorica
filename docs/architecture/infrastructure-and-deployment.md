@@ -20,7 +20,7 @@
 
 **Pipeline Integration:**
 - GitHub Actions for CI (cargo test, cargo clippy, cargo fmt --check)
-- GitHub Actions for release builds (cross-compilation for x86_64, aarch64)
+- GitHub Actions for release builds (x86_64 only)
 - GitHub Actions for .deb package building and apt repository publishing
 
 ## Rollback Strategy

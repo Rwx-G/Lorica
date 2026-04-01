@@ -191,7 +191,7 @@ Current reverse proxies are either opaque config-file daemons (Nginx) or Go-base
 - **NFR3:** Dashboard pages shall load in < 200ms.
 - **NFR4:** Base binary size (including embedded dashboard assets) shall be < 50MB.
 - **NFR5:** Startup time from service start to accepting traffic shall be < 2 seconds.
-- **NFR6:** Lorica shall compile and run on Linux x86_64 and aarch64. macOS support for development.
+- **NFR6:** Lorica shall compile and run on Linux x86_64. No aarch64, macOS, or Windows support.
 - **NFR7:** All code shall be written in Rust with strict clippy lints and formatted with rustfmt.
 - **NFR8:** The codebase shall be fully auditable: no closed-source dependencies, no C code beyond system libraries.
 - **NFR9:** The management port shall bind exclusively to localhost (127.0.0.1 / ::1) by default with no option to change this in the dashboard.
