@@ -12,7 +12,7 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, default_topology_type: 'single_vm' });
+  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, default_topology_type: 'single_vm', flood_threshold_rps: 0 });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -429,6 +429,11 @@
             <option value="kubernetes">Kubernetes</option>
             <option value="custom">Custom</option>
           </select>
+        </div>
+        <div class="form-row">
+          <label for="flood-threshold">Flood Detection Threshold (RPS)</label>
+          <input id="flood-threshold" type="number" bind:value={settingsForm.flood_threshold_rps} min="0" max="1000000" />
+          <span class="hint">0 = disabled. When exceeded, per-IP rate limits are halved.</span>
         </div>
         {#if settingsError}
           <div class="form-error">{settingsError}</div>

@@ -87,6 +87,8 @@ pub async fn update_settings(
     }
 
     store.update_global_settings(&settings)?;
+    drop(store);
+    state.notify_config_changed();
     Ok(json_data(settings))
 }
 
