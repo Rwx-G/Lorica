@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-04-01
+
 ### Added
 
 **Proxy Engine (Epics 1-2)**
