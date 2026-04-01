@@ -331,6 +331,64 @@ fn run_supervisor(cli: Cli) {
             });
         }
 
+        // Bug 1 fix: Create a ProxyConfig for health checks in supervisor mode.
+        // The supervisor does not route traffic, but it needs a ProxyConfig to
+        // resolve backend topologies for health check decisions. It also triggers
+        // reload_proxy_config so the health loop sees updated backends.
+        let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+        if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
+            warn!(error = %e, "supervisor: failed to load initial proxy config for health checks");
+        }
+
+        // Start health check background task (runs in supervisor, not workers)
+        let health_store = Arc::clone(&store);
+        let health_config = Arc::clone(&proxy_config);
+        let health_interval = {
+            let s = store.lock().await;
+            s.get_global_settings()
+                .map(|gs| gs.default_health_check_interval_s as u64)
+                .unwrap_or(10)
+        };
+        let health_handle = tokio::spawn(async move {
+            // No backend_connections in supervisor - drain monitoring is per-worker
+            health::health_check_loop(health_store, health_config, health_interval, None).await;
+        });
+
+        // Bug 2 fix: Start probe scheduler in supervisor mode
+        let probe_store = Arc::clone(&store);
+        let probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
+            probe_store,
+            None, // no notification dispatcher for now
+        ));
+        probe_scheduler.reload().await;
+
+        // Bug 4 fix: Create SLA collector in supervisor and start flush task
+        let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
+        {
+            let s = store.lock().await;
+            sla_collector.load_configs(&s);
+        }
+        sla_collector.start_flush_task(Arc::clone(&store), None);
+
+        // Reload proxy config, probe scheduler, and SLA configs on config changes
+        let reload_store = Arc::clone(&store);
+        let reload_config = Arc::clone(&proxy_config);
+        let reload_probe_scheduler = Arc::clone(&probe_scheduler);
+        let reload_sla_collector = Arc::clone(&sla_collector);
+        let mut reload_rx = reload_bc_tx.subscribe();
+        tokio::spawn(async move {
+            while reload_rx.recv().await.is_ok() {
+                if let Err(e) = reload_proxy_config(&reload_store, &reload_config).await {
+                    tracing::error!(error = %e, "supervisor: failed to reload proxy config");
+                }
+                reload_probe_scheduler.reload().await;
+                {
+                    let s = reload_store.lock().await;
+                    reload_sla_collector.load_configs(&s);
+                }
+            }
+        });
+
         // Start API server
         let api_store = Arc::clone(&store);
         let api_log_buffer = Arc::clone(&log_buffer);
@@ -349,8 +407,9 @@ fn run_supervisor(cli: Cli) {
                 waf_engine: None,
                 waf_rule_count: None,
                 acme_challenge_store: None,
-                sla_collector: None,
+                sla_collector: Some(Arc::clone(&sla_collector)),
                 load_test_engine: None,
+                // cache/ban are per-worker process, not available in supervisor
                 cache_hits: None,
                 cache_misses: None,
                 ban_list: None,
@@ -451,6 +510,7 @@ fn run_supervisor(cli: Cli) {
         // Explicit SIGTERM to all workers before exiting
         manager.lock().unwrap().shutdown_all();
         api_handle.abort();
+        health_handle.abort();
         monitor_handle.abort();
     });
 }
@@ -594,8 +654,15 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
         });
     });
 
-    // Build the proxy service
+    // Bug 3 fix: Create SLA collector, load configs, and start flush task in worker mode
     let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
+    rt.block_on(async {
+        let s = store.lock().await;
+        sla_collector.load_configs(&s);
+    });
+    sla_collector.start_flush_task(Arc::clone(&store), None);
+
+    // Build the proxy service
     let lorica_proxy = LoricaProxy::new(
         Arc::clone(&proxy_config),
         Arc::clone(&log_buffer),
