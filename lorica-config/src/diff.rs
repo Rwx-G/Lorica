@@ -276,6 +276,7 @@ fn backend_eq(a: &Backend, b: &Backend) -> bool {
         && a.health_check_enabled == b.health_check_enabled
         && a.health_check_interval_s == b.health_check_interval_s
         && a.tls_upstream == b.tls_upstream
+        && a.h2_upstream == b.h2_upstream
 }
 
 fn cert_eq(a: &Certificate, b: &Certificate) -> bool {
