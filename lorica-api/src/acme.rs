@@ -646,21 +646,29 @@ impl Route53DnsChallenger {
         let record_name = format!("_acme-challenge.{domain}.");
         let txt_value = format!("\"{value}\"");
 
+        let record_set = ResourceRecordSet::builder()
+            .name(&record_name)
+            .r#type(RrType::Txt)
+            .ttl(120)
+            .resource_records(
+                ResourceRecord::builder()
+                    .value(&txt_value)
+                    .build()
+                    .map_err(|e| format!("Route53 record build error: {e}"))?,
+            )
+            .build()
+            .map_err(|e| format!("Route53 record set build error: {e}"))?;
+
         let change = Change::builder()
             .action(action)
-            .resource_record_set(
-                ResourceRecordSet::builder()
-                    .name(&record_name)
-                    .r#type(RrType::Txt)
-                    .ttl(120)
-                    .resource_records(
-                        ResourceRecord::builder().value(&txt_value).build(),
-                    )
-                    .build(),
-            )
-            .build();
+            .resource_record_set(record_set)
+            .build()
+            .map_err(|e| format!("Route53 change build error: {e}"))?;
 
-        let batch = ChangeBatch::builder().changes(change).build();
+        let batch = ChangeBatch::builder()
+            .changes(change)
+            .build()
+            .map_err(|e| format!("Route53 batch build error: {e}"))?;
 
         self.client
             .change_resource_record_sets()
