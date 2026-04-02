@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-04-02
+
 ### Fixed
 
 - Worker mode: SLA collector no longer panics on startup (tokio::spawn called outside runtime context)

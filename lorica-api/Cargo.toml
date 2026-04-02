@@ -1,6 +1,6 @@
 [package]
 name = "lorica-api"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -9,10 +9,10 @@ description = "REST API for Lorica reverse proxy management"
 
 [dependencies]
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-config = { version = "0.1.1", path = "../lorica-config" }
-lorica-dashboard = { version = "0.1.1", path = "../lorica-dashboard" }
+lorica-config = { version = "0.1.2", path = "../lorica-config" }
+lorica-dashboard = { version = "0.1.2", path = "../lorica-dashboard" }
 lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
-lorica-bench = { version = "0.1.1", path = "../lorica-bench" }
+lorica-bench = { version = "0.1.2", path = "../lorica-bench" }
 axum = { version = "0.7", features = ["multipart", "ws"] }
 futures-util = "0.3"
 tower = "0.4"

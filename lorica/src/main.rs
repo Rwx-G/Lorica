@@ -793,7 +793,7 @@ fn run_single_process(cli: Cli) {
             // Restore custom WAF rules
             if let Ok(custom_rules) = s.load_waf_custom_rules() {
                 for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
-                    let category = cat.parse().unwrap_or(lorica_waf::RuleCategory::Custom);
+                    let category = cat.parse().unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
                     let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
                 }
                 if !custom_rules.is_empty() {

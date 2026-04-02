@@ -1282,6 +1282,7 @@ impl ConfigStore {
     }
 
     /// Load all WAF custom rules from the database.
+    #[allow(clippy::type_complexity)]
     pub fn load_waf_custom_rules(&self) -> Result<Vec<(u32, String, String, String, u8, bool)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, description, category, pattern, severity, enabled FROM waf_custom_rules ORDER BY id"
