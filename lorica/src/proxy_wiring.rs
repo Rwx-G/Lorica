@@ -407,6 +407,8 @@ pub struct RequestCtx {
     /// Per-route connection counter for max_connections enforcement.
     /// Stored here so the counter is decremented in `logging()` when the request ends.
     pub route_conn_counter: Option<Arc<AtomicU64>>,
+    /// Precompiled regex for path rewriting (from RouteEntry, avoids recompiling per request).
+    pub path_rewrite_regex: Option<regex::Regex>,
     /// Rate limit info for response headers: (limit_rps, current_rate).
     pub rate_limit_info: Option<(u32, f64)>,
     /// Retry counter for upstream connection failures.
@@ -490,6 +492,7 @@ impl ProxyHttp for LoricaProxy {
             route_id: None,
             waf_blocked: false,
             route_snapshot: None,
+            path_rewrite_regex: None,
             access_log_enabled: true,
             route_conn_counter: None,
             rate_limit_info: None,
@@ -585,8 +588,9 @@ impl ProxyHttp for LoricaProxy {
             None => return Ok(false), // No route = let upstream_peer handle 404
         };
 
-        // Store route snapshot and access log setting for later pipeline stages
+        // Store route snapshot, precompiled regex, and access log setting for later pipeline stages
         ctx.route_snapshot = Some(entry.route.clone());
+        ctx.path_rewrite_regex = entry.path_rewrite_regex.clone();
         ctx.access_log_enabled = entry.route.access_log_enabled;
 
         // Block WebSocket upgrades if disabled on this route
@@ -1032,6 +1036,7 @@ impl ProxyHttp for LoricaProxy {
         // Ensure route snapshot is available for upstream_request_filter
         if ctx.route_snapshot.is_none() {
             ctx.route_snapshot = Some(entry.route.clone());
+            ctx.path_rewrite_regex = entry.path_rewrite_regex.clone();
             ctx.access_log_enabled = entry.route.access_log_enabled;
         }
 
@@ -1143,7 +1148,7 @@ impl ProxyHttp for LoricaProxy {
         }
 
         // Regex path rewrite (applied after strip/add prefix)
-        if let Some(ref re) = entry.path_rewrite_regex {
+        if let Some(ref re) = ctx.path_rewrite_regex {
             if let Some(ref replacement) = route.path_rewrite_replacement {
                 let result = re.replace(&rewritten, replacement.as_str());
                 if result != rewritten {

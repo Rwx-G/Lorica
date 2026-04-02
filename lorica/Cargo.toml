@@ -1,6 +1,6 @@
 [package]
 name = "lorica"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -29,17 +29,17 @@ lorica-http = { version = "0.1.0", path = "../lorica-http" }
 lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }
 lorica-lb = { version = "0.1.0", path = "../lorica-lb", optional = true, default-features = false }
 lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, default-features = false }
-lorica-config = { version = "0.1.0", path = "../lorica-config" }
-lorica-api = { version = "0.1.0", path = "../lorica-api" }
+lorica-config = { version = "0.1.1", path = "../lorica-config" }
+lorica-api = { version = "0.1.1", path = "../lorica-api" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
-lorica-worker = { version = "0.1.0", path = "../lorica-worker" }
-lorica-command = { version = "0.1.0", path = "../lorica-command" }
+lorica-worker = { version = "0.1.1", path = "../lorica-worker" }
+lorica-command = { version = "0.1.1", path = "../lorica-command" }
 lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
 lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
 once_cell = { workspace = true }
-lorica-bench = { version = "0.1.0", path = "../lorica-bench" }
+lorica-bench = { version = "0.1.1", path = "../lorica-bench" }
 regex = "1"
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 bollard = { version = "0.18", optional = true }

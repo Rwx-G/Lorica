@@ -6,10 +6,10 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-0.1.0-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.1.1-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-532-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-502-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-375-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -375,7 +375,7 @@ cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lori
 # Frontend tests (52 Vitest tests)
 cd lorica-dashboard/frontend && npx vitest run
 
-# E2E tests (200 assertions across 33 sections, Docker required)
+# E2E tests (170+ assertions across 35 sections, Docker required)
 cd tests-e2e-docker && ./run.sh --build
 ```
 

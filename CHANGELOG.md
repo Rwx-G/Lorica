@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-02
+
 ### Added
 
 - Per-backend `h2_upstream` toggle to force HTTP/2 upstream connections (h2c for plaintext, ALPN h2 for TLS). Enables gRPC proxying via HTTP/2 end-to-end
@@ -116,7 +118,7 @@ Author: Rwx-G
 **Testing**
 
 - 655 Rust unit tests (280 product crates: 97 config, 55 bench, 52 waf, 39 api, 37 notify + 375 forked Pingora crates) and 52 frontend Vitest tests
-- Docker Compose-based E2E test suite with 200 assertions across 33 sections covering auth, dashboard, CRUD, proxy routing, WAF, health checks, certificates, TLS upstream, failover, Prometheus, Peak EWMA, SLA, probes, load testing, route config, rate limiting, CORS, cache, bans, compression, WebSocket blocking, backend validation, and worker isolation
+- Docker Compose-based E2E test suite with 170+ assertions across 35 sections covering auth, dashboard, CRUD, proxy routing, WAF, health checks, certificates, TLS upstream, failover, Prometheus, Peak EWMA, SLA, probes, load testing, route config, rate limiting, CORS, cache, bans, compression, WebSocket blocking, backend validation, and worker isolation
 - Fuzz testing targets for WAF evaluation and API input
 
 ### Changed
