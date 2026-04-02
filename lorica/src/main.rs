@@ -354,6 +354,45 @@ fn run_supervisor(cli: Cli) {
             health::health_check_loop(health_store, health_config, health_interval, None).await;
         });
 
+        // Create WAF engine in supervisor for API access (rules listing,
+        // blocklist toggle, events). Workers have their own engines for
+        // real-time evaluation in the proxy pipeline.
+        let waf_engine = Arc::new(lorica_waf::WafEngine::new());
+        let waf_event_buffer = waf_engine.event_buffer();
+        let waf_rule_count = waf_engine.rule_count();
+
+        // Restore WAF state from persisted settings
+        {
+            let s = store.lock().await;
+            if let Ok(settings) = s.get_global_settings() {
+                if settings.ip_blocklist_enabled {
+                    waf_engine.ip_blocklist().set_enabled(true);
+                    info!("supervisor: IP blocklist restored as enabled");
+                }
+            }
+            if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
+                if !disabled_ids.is_empty() {
+                    waf_engine.set_disabled_rules(&disabled_ids);
+                    info!(count = disabled_ids.len(), "supervisor: WAF disabled rules restored");
+                }
+            }
+            if let Ok(custom_rules) = s.load_waf_custom_rules() {
+                for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
+                    let category = cat.parse().unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
+                    let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
+                }
+                if !custom_rules.is_empty() {
+                    info!(count = custom_rules.len(), "supervisor: WAF custom rules restored");
+                }
+            }
+        }
+
+        // Spawn IP blocklist auto-refresh in supervisor
+        let _blocklist_refresh = lorica_api::waf::spawn_blocklist_refresh(
+            Arc::clone(&waf_engine),
+            std::time::Duration::from_secs(6 * 3600),
+        );
+
         // Bug 2 fix: Start probe scheduler in supervisor mode
         let probe_store = Arc::clone(&store);
         let probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
@@ -403,9 +442,9 @@ fn run_supervisor(cli: Cli) {
                 started_at: Instant::now(),
                 config_reload_tx: Some(config_reload_tx),
                 worker_metrics: Some(Arc::clone(&worker_metrics)),
-                waf_event_buffer: None,
-                waf_engine: None,
-                waf_rule_count: None,
+                waf_event_buffer: Some(waf_event_buffer),
+                waf_engine: Some(waf_engine),
+                waf_rule_count: Some(waf_rule_count),
                 acme_challenge_store: None,
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
