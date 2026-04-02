@@ -736,12 +736,24 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
         });
     });
 
-    // Forward access logs to supervisor in real-time via UDS
+    // Create SLA collector and load configs
+    let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
+    rt.block_on(async {
+        let s = store.lock().await;
+        sla_collector.load_configs(&s);
+    });
+
+    // Worker background tasks: log forwarding via UDS + SLA flush to DB
     let log_fwd_buffer = Arc::clone(&log_buffer);
-    let log_sock_path = PathBuf::from(data_dir).join("log.sock");
+    let sla_flush_collector = Arc::clone(&sla_collector);
+    let sla_flush_store = Arc::clone(&store);
+    let log_sock_path = PathBuf::from(&data_dir).join("log.sock");
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("log forwarder runtime");
+        let rt = tokio::runtime::Runtime::new().expect("worker background runtime");
         rt.block_on(async move {
+            // Start SLA flush task (writes worker SLA buckets to shared SQLite DB every 60s)
+            sla_flush_collector.start_flush_task(sla_flush_store, None);
+
             // Connect to supervisor's log socket (retry until available)
             let stream = loop {
                 match tokio::net::UnixStream::connect(&log_sock_path).await {
@@ -767,15 +779,6 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
                 }
             }
         });
-    });
-
-    // Create SLA collector for metric collection in worker mode.
-    // Flush task is NOT started here: workers collect metrics only,
-    // the supervisor handles DB persistence via the API server.
-    let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
-    rt.block_on(async {
-        let s = store.lock().await;
-        sla_collector.load_configs(&s);
     });
 
     // Build the proxy service

@@ -28,6 +28,7 @@ Author: Rwx-G
 - Worker mode: supervisor closes listening sockets after spawning workers. Fixes requests hanging indefinitely (kernel was routing connections to supervisor which had no proxy service)
 - Worker mode: use `TcpListener::from_raw_fd` instead of `TcpStream::from_raw_fd` for inherited listening sockets (correct socket type)
 - Worker mode: respawn recreates listening sockets (previously used closed FDs)
+- Worker mode: SLA flush task re-enabled in background runtime. Workers now flush SLA metrics to shared SQLite DB every 60s, making SLA monitoring work in multi-worker mode
 - systemd service file: add `LimitNOFILE=65536` for 10k+ concurrent connections out of the box
 
 ## [0.1.2] - 2026-04-02
