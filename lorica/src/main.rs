@@ -676,6 +676,8 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
 
+    // Register the same addresses that the supervisor bound, so that
+    // build() can match them against the FDs received via SCM_RIGHTS.
     for addr in &listener_addrs {
         proxy_service.add_tcp(addr);
     }

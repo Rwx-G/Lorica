@@ -26,7 +26,7 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 use std::time::Duration;
 use std::fs::Permissions;
 use std::sync::Arc;
-use tokio::net::TcpSocket;
+use tokio::net::{TcpListener, TcpSocket};
 
 #[cfg(feature = "connection_filter")]
 use super::connection_filter::ConnectionFilter;
@@ -199,13 +199,11 @@ fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
             Ok(uds::set_backlog(std_listener, LISTENER_BACKLOG)?.into())
         }
         ServerAddress::Tcp(_, _) => {
-            let std_listener_socket = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-            let listener_socket = TcpSocket::from_std_stream(std_listener_socket);
-            // Note that we call listen on an already listening socket
-            // POSIX undefined but on Linux it will update the backlog size
-            Ok(listener_socket
-                .listen(LISTENER_BACKLOG)
-                .or_err_with(BindError, || format!("Listen() failed on {address:?}"))?
+            let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+            std_listener.set_nonblocking(true)
+                .or_err_with(BindError, || format!("set_nonblocking failed on {address:?}"))?;
+            Ok(TcpListener::from_std(std_listener)
+                .or_err_with(BindError, || format!("TcpListener::from_std failed on {address:?}"))?
                 .into())
         }
     }

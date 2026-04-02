@@ -140,6 +140,16 @@ impl WorkerManager {
             self.spawn_worker(id as u32, 0)?;
         }
 
+        // Close the supervisor's copies of the listening sockets. With
+        // SO_REUSEPORT, the kernel would otherwise distribute connections
+        // to the supervisor (which has no proxy service), causing requests
+        // to hang. Workers have their own copies via SCM_RIGHTS.
+        // For respawn, we recreate sockets via create_listen_sockets().
+        for &fd in &self.listen_fds {
+            unsafe { fd_passing::close_fd(fd) };
+        }
+        self.listen_fds.clear();
+
         Ok(())
     }
 
@@ -308,7 +318,18 @@ impl WorkerManager {
         }
 
         info!(worker_id = id, restart_count = next_count, "restarting worker");
+
+        // Recreate listening sockets if they were closed after initial spawn
+        if self.listen_fds.is_empty() {
+            self.create_listen_sockets()?;
+        }
         self.spawn_worker(id, next_count)?;
+
+        // Close supervisor's copies again so kernel doesn't route to us
+        for &fd in &self.listen_fds {
+            unsafe { fd_passing::close_fd(fd) };
+        }
+        self.listen_fds.clear();
 
         // Return the cmd_fd of the newly spawned worker
         let fd = self
