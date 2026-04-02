@@ -86,6 +86,29 @@ echo ""
 echo " NFR Validation Script - $(date)"
 echo -e "${RESET}"
 
+# --- Check prerequisites ---
+header "Prerequisites"
+for cmd in curl jq python3 ss awk; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        fail "required command '$cmd' not found. Install it first."
+        exit 1
+    fi
+done
+ok "Required tools: curl, jq, python3, ss, awk"
+
+CURRENT_ULIMIT=$(ulimit -n 2>/dev/null || echo "0")
+REQUIRED_ULIMIT=20000
+if [ "$SKIP_NFR2" = "false" ] && [ "$CURRENT_ULIMIT" -lt "$REQUIRED_ULIMIT" ] 2>/dev/null; then
+    fail "ulimit -n is $CURRENT_ULIMIT (need >= $REQUIRED_ULIMIT for 10k connections test)"
+    echo ""
+    echo "  Run this script with a higher limit:"
+    echo ""
+    echo "    sudo bash -c 'ulimit -n 65536 && ./nfr-validate.sh $*'"
+    echo ""
+    exit 1
+fi
+ok "ulimit -n: $CURRENT_ULIMIT (>= $REQUIRED_ULIMIT)"
+
 # --- Check Lorica is running ---
 header "Checking Lorica"
 LORICA_PID=$(get_lorica_pid)
