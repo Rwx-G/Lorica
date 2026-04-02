@@ -235,10 +235,12 @@ jobs:
 
       - name: Create GitHub Release
         run: |
+          # Collect only files (not directories) from dist/
+          ASSETS=$(find dist/ -maxdepth 1 -type f)
           # Create release (or update if it already exists from a previous failed run)
-          gh release create "${{ github.ref_name }}" dist/* \
+          gh release create "${{ github.ref_name }}" $ASSETS \
             --title "Lorica ${{ github.ref_name }}" \
             --generate-notes 2>/dev/null \
-          || gh release upload "${{ github.ref_name }}" dist/* --clobber
+          || gh release upload "${{ github.ref_name }}" $ASSETS --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
