@@ -7,7 +7,7 @@ COPY lorica-dashboard/frontend/ ./
 RUN npm run build
 
 # Stage 2: Build Rust binary
-FROM rust:1.88-bookworm AS builder
+FROM rust:1-bookworm AS builder
 RUN apt-get update && apt-get install -y cmake pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./

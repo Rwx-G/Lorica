@@ -14,7 +14,7 @@ COPY lorica-dashboard/frontend/ ./
 RUN npm run build
 
 # Stage 2: Rust development environment
-FROM rust:1.88-bookworm
+FROM rust:1-bookworm
 RUN apt-get update && apt-get install -y cmake pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
