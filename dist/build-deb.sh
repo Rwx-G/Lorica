@@ -58,19 +58,22 @@ fi
 chown -R lorica:lorica /var/lib/lorica
 chmod 750 /var/lib/lorica
 
-# Enable and start service
+# Enable and (re)start service
 systemctl daemon-reload
 systemctl enable lorica.service
+systemctl restart lorica.service 2>/dev/null || systemctl start lorica.service
 
 echo ""
 echo "  ================================================"
 echo "  Lorica installed successfully!"
 echo "  "
-echo "  Start:     systemctl start lorica"
 echo "  Dashboard: https://localhost:9443"
 echo "  "
 echo "  The admin password will be printed in the journal:"
 echo "    journalctl -u lorica -n 20"
+echo "  "
+echo "  Customize with: systemctl edit lorica"
+echo "    (e.g. add --workers 6 via ExecStart override)"
 echo "  ================================================"
 echo ""
 EOF
@@ -97,10 +100,10 @@ systemctl daemon-reload
 EOF
 chmod 755 "$PKG_DIR/DEBIAN/postrm"
 
-# Conffiles (mark service file as config)
-cat > "$PKG_DIR/DEBIAN/conffiles" << EOF
-/lib/systemd/system/lorica.service
-EOF
+# No conffiles - the systemd service file is owned by the package and
+# replaced freely on upgrade. Users customize via drop-in overrides:
+#   systemctl edit lorica
+# This creates /etc/systemd/system/lorica.service.d/override.conf
 
 # Build the package
 dpkg-deb --build "$PKG_DIR"

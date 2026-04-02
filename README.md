@@ -381,12 +381,26 @@ cd tests-e2e-docker && ./run.sh --build
 
 ## systemd Service
 
-The `.deb` package installs a hardened systemd unit with:
+The `.deb` and `.rpm` packages install a hardened systemd unit with:
 
 - `ProtectSystem=strict`, `PrivateTmp=yes`, `NoNewPrivileges=yes`
 - `MemoryDenyWriteExecute=yes`, `SystemCallFilter=@system-service`
 - `RestrictNamespaces=yes`, `RestrictSUIDSGID=yes`
 - Runs as dedicated `lorica` user with `CAP_NET_BIND_SERVICE`
+- Service auto-starts on install and auto-restarts on upgrade
+- Data directory (`/var/lib/lorica`) preserved across upgrades
+
+Customize the service (e.g. enable workers) via drop-in override:
+
+```bash
+sudo systemctl edit lorica
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/lorica --workers 6
+```
 
 ## Performance Tuning
 

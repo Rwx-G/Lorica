@@ -1,5 +1,5 @@
 Name:           lorica
-Version:        0.3.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Modern reverse proxy with built-in dashboard
 License:        Apache-2.0
@@ -30,15 +30,18 @@ chown -R lorica:lorica /var/lib/lorica
 chmod 750 /var/lib/lorica
 systemctl daemon-reload
 systemctl enable lorica.service
+systemctl restart lorica.service 2>/dev/null || systemctl start lorica.service
 echo ""
 echo "  ================================================"
 echo "  Lorica installed successfully!"
 echo "  "
-echo "  Start:     systemctl start lorica"
 echo "  Dashboard: https://localhost:9443"
 echo "  "
 echo "  The admin password will be in the journal:"
 echo "    journalctl -u lorica -n 20"
+echo "  "
+echo "  Customize with: systemctl edit lorica"
+echo "    (e.g. add --workers 6 via ExecStart override)"
 echo "  ================================================"
 echo ""
 

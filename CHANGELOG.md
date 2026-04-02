@@ -16,6 +16,9 @@ Author: Rwx-G
 - NFR validation script: prerequisite checks (ulimit >= 20000, required tools) with clear error messages before running
 - NFR validation script: Python backend suppresses BrokenPipeError under load, SO_REUSEADDR for port reuse
 - Dashboard sidebar now stays fixed during page scroll (position: sticky)
+- NFR validation script: force `LC_ALL=C` for consistent decimal separator on French locale systems
+- Packaging (.deb/.rpm): service auto-restarts on upgrade (no manual `systemctl start` needed)
+- Packaging (.deb): removed conffiles prompt on upgrade - service file replaced cleanly, customize via `systemctl edit lorica` (drop-in overrides)
 
 ## [0.1.1] - 2026-04-02
 
