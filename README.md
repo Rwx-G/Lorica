@@ -26,7 +26,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - HTTP/HTTPS reverse proxy with host-based and path-prefix routing
 - TLS termination via rustls (no OpenSSL dependency)
 - SNI-based certificate selection with wildcard domain support (`*.example.com`)
-- Path rewriting (strip/add prefix), hostname aliases, HTTP-to-HTTPS redirect
+- Path rewriting (strip/add prefix, regex with capture groups), hostname aliases, HTTP-to-HTTPS redirect
 - Configurable proxy headers, per-route timeouts, WebSocket passthrough
 - Connection pooling with health-aware backend filtering
 
@@ -400,6 +400,15 @@ Release `.deb` and `.rpm` packages are GPG-signed. Import the public key to veri
 curl -fsSL https://github.com/Rwx-G/Lorica/raw/main/docs/lorica-signing-key.asc | sudo gpg --dearmor -o /usr/share/keyrings/lorica.gpg
 gpg --verify lorica.deb.asc lorica.deb
 ```
+
+## Not Supported
+
+| Feature | Status | Rationale |
+|---------|--------|-----------|
+| **HTTP/3 / QUIC** | Planned (post-0.2.0) | Waiting for [Pingora PR #524](https://github.com/cloudflare/pingora/pull/524) (tokio-quiche integration) to merge upstream |
+| **io_uring** | Not planned | tokio-uring is unmaintained since 2022. epoll via Tokio delivers sufficient performance (40M req/s at Cloudflare scale) |
+| **Windows / macOS** | Not supported | Linux x86_64 only (fork+exec worker model requires Linux) |
+| **OpenSSL / BoringSSL** | Removed | rustls is the sole TLS provider |
 
 ## License
 
