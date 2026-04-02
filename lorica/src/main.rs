@@ -16,7 +16,7 @@ mod health;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
@@ -246,6 +246,46 @@ fn run_supervisor(cli: Cli) {
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let worker_metrics = Arc::new(lorica_api::workers::WorkerMetrics::new());
 
+        // UDS log stream: workers send access logs in real-time to the supervisor
+        let log_sock_path = data_dir.join("log.sock");
+        let _ = std::fs::remove_file(&log_sock_path); // clean stale socket
+        let log_listener = tokio::net::UnixListener::bind(&log_sock_path)
+            .expect("failed to bind log socket");
+        // Make socket writable by the lorica user (workers run as same user)
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&log_sock_path, std::fs::Permissions::from_mode(0o660));
+        }
+        let log_sink = Arc::clone(&log_buffer);
+        tokio::spawn(async move {
+            loop {
+                match log_listener.accept().await {
+                    Ok((stream, _)) => {
+                        let sink = Arc::clone(&log_sink);
+                        tokio::spawn(async move {
+                            let mut reader = tokio::io::BufReader::new(stream);
+                            let mut line = String::new();
+                            loop {
+                                line.clear();
+                                match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
+                                    Ok(0) => break, // EOF - worker disconnected
+                                    Ok(_) => {
+                                        if let Ok(entry) = serde_json::from_str::<lorica_api::logs::LogEntry>(&line) {
+                                            sink.push(entry).await;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "log socket accept failed");
+                    }
+                }
+            }
+        });
+
         // Broadcast channel: API config changes fan out to all per-worker tasks
         let (reload_bc_tx, _) = broadcast::channel::<u64>(16);
         // Clone for the API's watch-based reload signal
@@ -280,6 +320,7 @@ fn run_supervisor(cli: Cli) {
                 let heartbeat_interval = Duration::from_secs(5);
                 let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
                 heartbeat_timer.tick().await; // skip first immediate tick
+
 
                 loop {
                     tokio::select! {
@@ -690,6 +731,39 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
                     CommandType::Unspecified => {
                         warn!(worker_id = id, "received unspecified command");
                     }
+                }
+            }
+        });
+    });
+
+    // Forward access logs to supervisor in real-time via UDS
+    let log_fwd_buffer = Arc::clone(&log_buffer);
+    let log_sock_path = PathBuf::from(data_dir).join("log.sock");
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("log forwarder runtime");
+        rt.block_on(async move {
+            // Connect to supervisor's log socket (retry until available)
+            let stream = loop {
+                match tokio::net::UnixStream::connect(&log_sock_path).await {
+                    Ok(s) => break s,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                }
+            };
+            let mut writer = tokio::io::BufWriter::new(stream);
+            let mut rx = log_fwd_buffer.subscribe();
+            loop {
+                match rx.recv().await {
+                    Ok(entry) => {
+                        if let Ok(json) = serde_json::to_string(&entry) {
+                            let line = format!("{json}\n");
+                            if tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes()).await.is_err() {
+                                break; // supervisor disconnected
+                            }
+                            let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
                 }
             }
         });
