@@ -490,6 +490,27 @@ tbody tr:hover td {
   background: var(--color-bg-hover);
 }
 
+.btn-secondary {
+  background: var(--color-bg-input);
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.btn-secondary:hover {
+  background: var(--color-bg-hover);
+}
+
+.btn-danger {
+  background: var(--color-red-subtle);
+  color: var(--color-red);
+  border: 1px solid var(--color-red);
+  cursor: pointer;
+}
+
+.btn-danger:hover {
+  opacity: 0.85;
+}
+
 /* Badges */
 .badge {
   display: inline-block;

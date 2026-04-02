@@ -397,7 +397,7 @@
 
 <style>
   .backends-page { max-width: none; }
-  .badge-on { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; background: rgba(34, 197, 94, 0.1); color: var(--color-green); }
+  .badge-on { display: inline-block; padding: 0.125rem 0.5rem; border-radius: var(--radius-full); font-size: var(--text-sm); font-weight: 500; background: var(--color-green-subtle); color: var(--color-green); }
   .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
   .filter-bar { margin-bottom: var(--space-4); }
   .search-input { width: 100%; max-width: 400px; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-bg-input); color: var(--color-text); font-size: var(--text-md); }

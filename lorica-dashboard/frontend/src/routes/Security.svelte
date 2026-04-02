@@ -592,33 +592,11 @@
 </script>
 
 <style>
-  .security-page {
-    max-width: none;
-  }
-
-  .page-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 1.5rem;
-  }
-
-  .page-header h1 {
-    margin: 0;
-  }
+  .security-page { max-width: none; }
 
   .header-actions {
     display: flex;
-    gap: 0.5rem;
-  }
-
-  .error-banner {
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid var(--color-red);
-    border-radius: 0.5rem;
-    color: var(--color-red);
-    padding: 0.75rem 1rem;
-    margin-bottom: 1rem;
+    gap: var(--space-2);
   }
 
   .stats-grid {
@@ -679,9 +657,9 @@
   .filter-bar {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
-    margin-bottom: 1rem;
-    font-size: 0.875rem;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+    font-size: var(--text-md);
   }
 
   .filter-bar label {
@@ -689,69 +667,16 @@
   }
 
   .filter-bar select {
-    padding: 0.375rem 0.75rem;
+    padding: var(--space-1) var(--space-3);
     border: 1px solid var(--color-border);
-    border-radius: 0.375rem;
+    border-radius: var(--radius-md);
     background: var(--color-bg-input);
     color: var(--color-text);
-    font-size: 0.875rem;
-  }
-
-  .loading {
-    color: var(--color-text-muted);
-  }
-
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 3rem 0;
-    color: var(--color-text-muted);
-  }
-
-  .text-muted {
-    color: var(--color-text-muted);
-    font-size: 0.875rem;
-  }
-
-  .table-wrapper {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-
-  th {
-    text-align: left;
-    padding: 0.5rem 0.75rem;
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--color-text-muted);
-    border-bottom: 1px solid var(--color-border);
-  }
-
-  td {
-    padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid var(--color-border);
-    font-size: 0.8125rem;
-    vertical-align: middle;
-  }
-
-  tr:hover td {
-    background: rgba(255, 255, 255, 0.02);
+    font-size: var(--text-md);
   }
 
   .disabled-rule td {
     opacity: 0.5;
-  }
-
-  .mono {
-    font-family: var(--mono);
-    font-size: 0.75rem;
   }
 
   .matched-value {
@@ -764,11 +689,11 @@
   .category-badge {
     display: inline-block;
     padding: 0.125rem 0.5rem;
-    border-radius: 9999px;
-    font-size: 0.75rem;
+    border-radius: var(--radius-full);
+    font-size: var(--text-sm);
     font-weight: 500;
-    background: rgba(251, 146, 60, 0.1);
-    color: var(--color-orange, #fb923c);
+    background: var(--color-orange-subtle);
+    color: var(--color-orange);
   }
 
   .severity-critical {
@@ -834,34 +759,6 @@
     transform: translateX(16px);
   }
 
-  .btn {
-    padding: 0.5rem 1rem;
-    border-radius: 0.375rem;
-    font-weight: 500;
-    border: none;
-    font-size: 0.875rem;
-    cursor: pointer;
-  }
-
-  .btn-secondary {
-    background: var(--color-bg-input);
-    color: var(--color-text);
-  }
-
-  .btn-secondary:hover {
-    background: var(--color-bg-hover);
-  }
-
-  .btn-danger {
-    background: rgba(239, 68, 68, 0.1);
-    color: var(--color-red);
-    border: 1px solid var(--color-red);
-  }
-
-  .btn-danger:hover {
-    background: rgba(239, 68, 68, 0.2);
-  }
-
   /* Tab badges */
   .tab-badge-on {
     display: inline-block;
@@ -880,7 +777,7 @@
     border-radius: var(--radius-full);
     font-size: var(--text-xs);
     font-weight: 600;
-    background: rgba(100, 116, 139, 0.1);
+    background: var(--color-bg-hover);
     color: var(--color-text-muted);
     margin-left: 0.375rem;
   }

@@ -195,32 +195,19 @@
 </div>
 
 <style>
-  .system-page {
-    max-width: 900px;
-  }
-
-  .page-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 1.5rem;
-  }
-
-  .page-header h1 {
-    margin: 0;
-  }
+  .system-page { max-width: none; }
 
   .header-actions {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: var(--space-3);
   }
 
   .auto-refresh {
     display: flex;
     align-items: center;
     gap: 0.375rem;
-    font-size: 0.8125rem;
+    font-size: var(--text-base);
     color: var(--color-text-muted);
     cursor: pointer;
   }
@@ -230,8 +217,8 @@
   }
 
   h2 {
-    margin-top: 1.5rem;
-    margin-bottom: 0.75rem;
+    margin-top: var(--space-6);
+    margin-bottom: var(--space-3);
     font-size: 1rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -241,13 +228,13 @@
   .card-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 1rem;
+    gap: var(--space-4);
   }
 
   .gauges-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-    gap: 1rem;
+    gap: var(--space-4);
   }
 
   .gauge-card {
@@ -289,36 +276,6 @@
   .gauge-detail {
     font-size: 0.8125rem;
     color: var(--color-text-muted);
-  }
-
-  .error-banner {
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid var(--color-red);
-    border-radius: 0.5rem;
-    color: var(--color-red);
-    padding: 0.75rem 1rem;
-    margin-bottom: 1rem;
-  }
-
-  .loading {
-    color: var(--color-text-muted);
-  }
-
-  .btn {
-    padding: 0.5rem 1rem;
-    border-radius: 0.375rem;
-    font-weight: 500;
-    border: none;
-    font-size: 0.875rem;
-  }
-
-  .btn-secondary {
-    background: var(--color-bg-input);
-    color: var(--color-text);
-  }
-
-  .btn-secondary:hover {
-    background: var(--color-bg-hover);
   }
 
   .workers-table {

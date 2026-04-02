@@ -261,9 +261,7 @@
 </script>
 
 <style>
-  .routes-page {
-    max-width: none;
-  }
+  .routes-page { max-width: none; }
 
   .filter-bar { margin-bottom: var(--space-4); }
   .search-input { width: 100%; max-width: 400px; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-bg-input); color: var(--color-text); font-size: var(--text-md); }
@@ -271,98 +269,15 @@
   .sortable { cursor: pointer; user-select: none; }
   .sortable:hover { color: var(--color-text-heading); }
 
-  .page-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 1.5rem;
-  }
-
-  .page-header h1 {
-    margin: 0;
-  }
-
   .header-actions {
     display: flex;
-    gap: 0.5rem;
+    gap: var(--space-2);
     align-items: center;
-  }
-
-  .btn-secondary {
-    background: none;
-    color: var(--color-text-muted);
-    border: 1px solid var(--color-border);
-  }
-
-  .btn-secondary:hover {
-    background: var(--color-bg-hover);
-    color: var(--color-text);
-  }
-
-  .error-banner {
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid var(--color-red);
-    border-radius: 0.5rem;
-    color: var(--color-red);
-    padding: 0.75rem 1rem;
-    margin-bottom: 1rem;
-  }
-
-  .loading {
-    color: var(--color-text-muted);
-  }
-
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 1rem;
-    padding: 3rem 0;
-    color: var(--color-text-muted);
-  }
-
-  .table-wrapper {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-
-  th {
-    text-align: left;
-    padding: 0.75rem 1rem;
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--color-text-muted);
-    border-bottom: 1px solid var(--color-border);
-  }
-
-  td {
-    padding: 0.75rem 1rem;
-    border-bottom: 1px solid var(--color-border);
-    font-size: 0.875rem;
-    vertical-align: middle;
-  }
-
-  tr:hover td {
-    background: rgba(255, 255, 255, 0.02);
   }
 
   .hostname {
     font-weight: 600;
     color: var(--color-text-heading);
-  }
-
-  .mono {
-    font-family: var(--mono);
-    font-size: 0.8125rem;
-  }
-
-  .text-muted {
-    color: var(--color-text-muted);
   }
 
   .backend-count {
@@ -372,10 +287,10 @@
   .tls-on {
     display: inline-block;
     padding: 0.125rem 0.5rem;
-    border-radius: 9999px;
-    font-size: 0.75rem;
+    border-radius: var(--radius-full);
+    font-size: var(--text-sm);
     font-weight: 500;
-    background: rgba(34, 197, 94, 0.1);
+    background: var(--color-green-subtle);
     color: var(--color-green);
   }
 
@@ -386,11 +301,11 @@
   .waf-on {
     display: inline-block;
     padding: 0.125rem 0.5rem;
-    border-radius: 9999px;
-    font-size: 0.75rem;
+    border-radius: var(--radius-full);
+    font-size: var(--text-sm);
     font-weight: 500;
-    background: rgba(251, 146, 60, 0.1);
-    color: var(--color-orange, #fb923c);
+    background: var(--color-orange-subtle);
+    color: var(--color-orange);
   }
 
   .waf-off {
@@ -403,50 +318,5 @@
 
   .enabled-indicator.off {
     color: var(--color-text-muted);
-  }
-
-  .actions {
-    display: flex;
-    gap: 0.25rem;
-  }
-
-  .btn-icon {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 2rem;
-    height: 2rem;
-    border: none;
-    border-radius: 0.375rem;
-    background: none;
-    color: var(--color-text-muted);
-    transition: background-color 0.15s, color 0.15s;
-  }
-
-  .btn-icon:hover {
-    background: var(--color-bg-hover);
-    color: var(--color-text);
-  }
-
-  .btn-icon-danger:hover {
-    background: rgba(239, 68, 68, 0.1);
-    color: var(--color-red);
-  }
-
-  .btn {
-    padding: 0.5rem 1rem;
-    border-radius: 0.375rem;
-    font-weight: 500;
-    border: none;
-    font-size: 0.875rem;
-  }
-
-  .btn-primary {
-    background: var(--color-primary);
-    color: white;
-  }
-
-  .btn-primary:hover {
-    background: var(--color-primary-hover);
   }
 </style>

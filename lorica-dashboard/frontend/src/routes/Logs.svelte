@@ -293,32 +293,19 @@
 </div>
 
 <style>
-  .logs-page {
-    max-width: 1400px;
-  }
-
-  .page-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 1rem;
-  }
-
-  .page-header h1 {
-    margin: 0;
-  }
+  .logs-page { max-width: none; }
 
   .header-actions {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: var(--space-3);
   }
 
   .auto-refresh {
     display: flex;
     align-items: center;
     gap: 0.375rem;
-    font-size: 0.8125rem;
+    font-size: var(--text-base);
     color: var(--color-text-muted);
     cursor: pointer;
   }
@@ -330,22 +317,23 @@
   .filters {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
-    margin-bottom: 1rem;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
   }
 
   .filter-input {
-    padding: 0.5rem 0.75rem;
+    padding: var(--space-2) var(--space-3);
     border: 1px solid var(--color-border);
-    border-radius: 0.375rem;
+    border-radius: var(--radius-md);
     background: var(--color-bg-input);
     color: var(--color-text);
-    font-size: 0.875rem;
+    font-size: var(--text-md);
   }
 
   .filter-input:focus {
     outline: none;
     border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--color-primary-subtle);
   }
 
   .search-input {
@@ -358,80 +346,24 @@
   }
 
   .filter-select {
-    padding: 0.5rem 0.75rem;
+    padding: var(--space-2) var(--space-3);
     border: 1px solid var(--color-border);
-    border-radius: 0.375rem;
+    border-radius: var(--radius-md);
     background: var(--color-bg-input);
     color: var(--color-text);
-    font-size: 0.875rem;
+    font-size: var(--text-md);
   }
 
   .filter-select:focus {
     outline: none;
     border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--color-primary-subtle);
   }
 
   .entry-count {
-    font-size: 0.8125rem;
+    font-size: var(--text-base);
     color: var(--color-text-muted);
     white-space: nowrap;
-  }
-
-  .error-banner {
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid var(--color-red);
-    border-radius: 0.5rem;
-    color: var(--color-red);
-    padding: 0.75rem 1rem;
-    margin-bottom: 1rem;
-  }
-
-  .loading {
-    color: var(--color-text-muted);
-  }
-
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 3rem 0;
-    color: var(--color-text-muted);
-  }
-
-  .table-wrapper {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-
-  th {
-    text-align: left;
-    padding: 0.5rem 0.75rem;
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--color-text-muted);
-    border-bottom: 1px solid var(--color-border);
-    white-space: nowrap;
-  }
-
-  td {
-    padding: 0.375rem 0.75rem;
-    border-bottom: 1px solid var(--color-border);
-    font-size: 0.8125rem;
-    vertical-align: middle;
-  }
-
-  tr:hover td {
-    background: rgba(255, 255, 255, 0.02);
-  }
-
-  .mono {
-    font-family: var(--mono);
-    font-size: 0.75rem;
   }
 
   .time-col {
@@ -442,11 +374,11 @@
   .method-badge {
     display: inline-block;
     padding: 0.0625rem 0.375rem;
-    border-radius: 0.25rem;
+    border-radius: var(--radius-sm);
     font-size: 0.6875rem;
     font-weight: 600;
     font-family: var(--mono);
-    background: rgba(59, 130, 246, 0.1);
+    background: var(--color-primary-subtle);
     color: var(--color-primary);
   }
 
@@ -467,7 +399,7 @@
   .status-code {
     font-family: var(--mono);
     font-weight: 600;
-    font-size: 0.8125rem;
+    font-size: var(--text-base);
   }
 
   .backend-col {
@@ -484,42 +416,12 @@
 
   .error-text {
     color: var(--color-red);
-    font-size: 0.75rem;
+    font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     display: block;
     max-width: 200px;
-  }
-
-  .text-muted {
-    color: var(--color-text-muted);
-  }
-
-  .btn {
-    padding: 0.5rem 1rem;
-    border-radius: 0.375rem;
-    font-weight: 500;
-    border: none;
-    font-size: 0.875rem;
-  }
-
-  .btn-secondary {
-    background: var(--color-bg-input);
-    color: var(--color-text);
-  }
-
-  .btn-secondary:hover {
-    background: var(--color-bg-hover);
-  }
-
-  .btn-danger {
-    background: rgba(239, 68, 68, 0.1);
-    color: var(--color-red);
-  }
-
-  .btn-danger:hover {
-    background: rgba(239, 68, 68, 0.2);
   }
 
   .ws-dot {

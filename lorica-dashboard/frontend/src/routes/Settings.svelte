@@ -803,17 +803,7 @@
 {/if}
 
 <style>
-  .settings-page {
-    max-width: 900px;
-  }
-
-  .page-header {
-    margin-bottom: 1.5rem;
-  }
-
-  .page-header h1 {
-    margin: 0;
-  }
+  .settings-page { max-width: none; }
 
   .section {
     margin-bottom: 2rem;
@@ -1048,17 +1038,17 @@
   }
 
   .diff-added li {
-    background: rgba(34, 197, 94, 0.1);
+    background: var(--color-green-subtle);
     color: var(--color-green);
   }
 
   .diff-modified li {
-    background: rgba(245, 158, 11, 0.1);
+    background: var(--color-orange-subtle);
     color: var(--color-orange);
   }
 
   .diff-removed li {
-    background: rgba(239, 68, 68, 0.1);
+    background: var(--color-red-subtle);
     color: var(--color-red);
   }
 
@@ -1073,24 +1063,27 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: rgba(0, 0, 0, 0.6);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 100;
+    animation: fadeIn var(--transition-fast);
   }
 
   .dialog {
-    background: var(--color-bg-card);
+    background: var(--color-bg-elevated);
     border: 1px solid var(--color-border);
-    border-radius: 0.75rem;
-    padding: 1.5rem;
+    border-radius: var(--radius-xl);
+    padding: var(--space-6);
     max-width: 500px;
     width: 90%;
+    box-shadow: var(--shadow-lg);
+    animation: slideUp var(--transition-base);
   }
 
   .dialog h3 {
-    margin: 0 0 1rem;
+    margin: 0 0 var(--space-4);
   }
 
   .actions {
@@ -1100,59 +1093,7 @@
     margin-top: 1rem;
   }
 
-  /* Buttons */
-  .btn {
-    padding: 0.5rem 1rem;
-    border-radius: 0.375rem;
-    font-weight: 500;
-    border: none;
-    font-size: 0.875rem;
-  }
 
-  .btn-primary {
-    background: var(--color-primary);
-    color: white;
-  }
-
-  .btn-primary:hover {
-    background: var(--color-primary-hover);
-  }
-
-  .btn-primary:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .btn-cancel {
-    background: var(--color-bg-input);
-    color: var(--color-text);
-  }
-
-  .btn-cancel:hover {
-    background: var(--color-bg-hover);
-  }
-
-  .btn-secondary {
-    background: var(--color-bg-input);
-    color: var(--color-text);
-  }
-
-  .btn-secondary:hover {
-    background: var(--color-bg-hover);
-  }
-
-  .error-banner {
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid var(--color-red);
-    border-radius: 0.5rem;
-    color: var(--color-red);
-    padding: 0.75rem 1rem;
-    margin-bottom: 1rem;
-  }
-
-  .loading {
-    color: var(--color-text-muted);
-  }
 
   .required {
     color: var(--color-red);
@@ -1174,7 +1115,7 @@
   }
 
   .badge-custom {
-    background: rgba(59, 130, 246, 0.1);
+    background: var(--color-primary-subtle);
     color: var(--color-primary);
   }
 

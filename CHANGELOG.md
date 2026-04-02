@@ -9,6 +9,14 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Changed
+
+- Dashboard: all pages now use consistent full-width layout (removed hardcoded max-width on Overview, Logs, System, Settings)
+- Dashboard: replaced all hardcoded `rgba()` colors with CSS design-token variables for proper dark/light mode support
+- Dashboard: removed redundant scoped CSS overrides (error-banner, loading, table, badges, buttons) in favor of global styles in app.css
+- Dashboard: added global `.btn-secondary` and `.btn-danger` classes to the design system
+- Dashboard: standardized grid gaps, filter-bar spacing, and modal styling across all pages
+
 ### Fixed
 
 - systemd service file: add `LimitNOFILE=65536` for 10k+ concurrent connections out of the box

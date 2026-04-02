@@ -1002,57 +1002,6 @@
     align-items: center;
   }
 
-  .error-banner {
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid var(--color-red);
-    border-radius: 0.5rem;
-    color: var(--color-red);
-    padding: 0.75rem 1rem;
-    margin-bottom: 1rem;
-  }
-
-  .loading {
-    color: var(--color-text-muted);
-  }
-
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 1rem;
-    padding: 3rem 0;
-    color: var(--color-text-muted);
-  }
-
-  .table-wrapper {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-
-  th {
-    text-align: left;
-    padding: 0.75rem 1rem;
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--color-text-muted);
-    border-bottom: 1px solid var(--color-border);
-  }
-
-  td {
-    padding: 0.75rem 1rem;
-    border-bottom: 1px solid var(--color-border);
-    font-size: 0.875rem;
-    vertical-align: middle;
-  }
-
-  tr:hover td {
-    background: rgba(255, 255, 255, 0.02);
-  }
 
   .domain {
     font-weight: 600;
@@ -1101,72 +1050,19 @@
     color: var(--color-text);
   }
 
-  .actions {
-    display: flex;
-    gap: 0.25rem;
-  }
-
-  .btn-icon {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 2rem;
-    height: 2rem;
-    border: none;
-    border-radius: 0.375rem;
-    background: none;
-    color: var(--color-text-muted);
-    transition: background-color 0.15s, color 0.15s;
-  }
-
-  .btn-icon:hover {
-    background: var(--color-bg-hover);
-    color: var(--color-text);
-  }
-
-  .btn-icon-danger:hover {
-    background: rgba(239, 68, 68, 0.1);
-    color: var(--color-red);
-  }
-
   /* Modal / Form */
-  .overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
-  }
-
-  .modal {
-    background: var(--color-bg-card);
-    border: 1px solid var(--color-border);
-    border-radius: 0.75rem;
-    padding: 1.5rem;
-    width: 90%;
-    max-width: 520px;
-    max-height: 90vh;
-    overflow-y: auto;
-  }
-
   .modal-wide {
     max-width: 680px;
   }
 
-  .modal h2 {
-    margin: 0 0 1.25rem;
-  }
-
   .form-error {
-    background: rgba(239, 68, 68, 0.1);
+    background: var(--color-red-subtle);
     border: 1px solid var(--color-red);
-    border-radius: 0.375rem;
+    border-radius: var(--radius-md);
     color: var(--color-red);
-    padding: 0.5rem 0.75rem;
-    font-size: 0.8125rem;
-    margin-bottom: 1rem;
+    padding: var(--space-2) var(--space-3);
+    font-size: var(--text-base);
+    margin-bottom: var(--space-4);
   }
 
   .form-group {
@@ -1369,7 +1265,7 @@
     transition: background-color var(--transition-fast);
   }
   .btn-acme:hover {
-    background: rgba(34, 197, 94, 0.2);
+    opacity: 0.85;
   }
 
   .success-banner {

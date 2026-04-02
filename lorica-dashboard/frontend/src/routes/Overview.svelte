@@ -308,7 +308,7 @@
 
 <style>
   .overview {
-    max-width: 1100px;
+    max-width: none;
   }
 
   .overview-header {
@@ -378,18 +378,6 @@
   .card-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: var(--space-3);
-  }
-
-  .error-banner {
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid var(--color-red);
-    border-radius: var(--radius-lg);
-    color: var(--color-red);
-    padding: var(--space-3) var(--space-4);
-  }
-
-  .loading {
-    color: var(--color-text-muted);
+    gap: var(--space-4);
   }
 </style>
