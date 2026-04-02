@@ -91,12 +91,15 @@
 <style>
   .sidebar {
     width: 230px;
-    min-height: 100vh;
+    height: 100vh;
+    position: sticky;
+    top: 0;
     background: var(--color-bg-nav);
     border-right: 1px solid var(--color-border);
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
+    overflow-y: auto;
   }
 
   .sidebar-header {
