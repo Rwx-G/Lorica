@@ -142,6 +142,12 @@ pub fn create_tcp_listener(addr: &str) -> Result<(RawFd, String), WorkerError> {
         .set_reuse_address(true)
         .map_err(WorkerError::CreateSocket)?;
 
+    // Enable SO_REUSEPORT so multiple workers can share the socket efficiently.
+    // The kernel distributes incoming connections across workers.
+    socket
+        .set_reuse_port(true)
+        .map_err(WorkerError::CreateSocket)?;
+
     socket
         .bind(&sock_addr.into())
         .map_err(WorkerError::CreateSocket)?;

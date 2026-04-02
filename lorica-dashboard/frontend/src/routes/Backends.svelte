@@ -24,6 +24,7 @@
   let formHealthCheckInterval = $state(10);
   let formHealthCheckPath = $state('');
   let formTlsUpstream = $state(false);
+  let formH2Upstream = $state(false);
   let formError = $state('');
   let formSubmitting = $state(false);
 
@@ -119,6 +120,7 @@
     formHealthCheckInterval = 10;
     formHealthCheckPath = '';
     formTlsUpstream = false;
+    formH2Upstream = false;
     formError = '';
     addressError = '';
     showForm = true;
@@ -134,6 +136,7 @@
     formHealthCheckInterval = b.health_check_interval_s;
     formHealthCheckPath = b.health_check_path ?? '';
     formTlsUpstream = b.tls_upstream;
+    formH2Upstream = b.h2_upstream;
     formError = '';
     addressError = '';
     showForm = true;
@@ -158,6 +161,7 @@
         health_check_interval_s: formHealthCheckInterval,
         health_check_path: formHealthCheckPath || undefined,
         tls_upstream: formTlsUpstream,
+        h2_upstream: formH2Upstream,
       };
       const res = await api.updateBackend(editingBackend.id, body);
       if (res.error) {
@@ -176,6 +180,7 @@
         health_check_interval_s: formHealthCheckInterval,
         health_check_path: formHealthCheckPath || undefined,
         tls_upstream: formTlsUpstream,
+        h2_upstream: formH2Upstream,
       };
       const res = await api.createBackend(body);
       if (res.error) {
@@ -278,6 +283,9 @@
                 {:else}
                   <span class="text-muted">Plain</span>
                 {/if}
+                {#if b.h2_upstream}
+                  <span class="badge-on">H2</span>
+                {/if}
               </td>
               <td class="mono">{b.active_connections}</td>
               <td class="mono">{b.ewma_score_us > 0 ? `${(b.ewma_score_us / 1000).toFixed(1)}ms` : '-'}</td>
@@ -361,6 +369,12 @@
             <label class="checkbox-item">
               <input type="checkbox" bind:checked={formTlsUpstream} />
               TLS upstream
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-item">
+              <input type="checkbox" bind:checked={formH2Upstream} />
+              HTTP/2 upstream (h2c for plaintext, ALPN h2 for TLS)
             </label>
           </div>
         </div>

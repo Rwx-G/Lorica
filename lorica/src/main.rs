@@ -818,7 +818,9 @@ fn run_single_process(cli: Cli) {
         let proxy_ewma_scores = lorica_proxy.ewma_tracker.scores_ref();
         let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
-        proxy_service.add_tcp(&format!("0.0.0.0:{}", cli.http_port));
+        let mut tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
+        tcp_opts.so_reuseport = Some(true);
+        proxy_service.add_tcp_with_settings(&format!("0.0.0.0:{}", cli.http_port), tcp_opts);
 
         info!(port = cli.http_port, "HTTP proxy listener configured");
 
@@ -828,9 +830,11 @@ fn run_single_process(cli: Cli) {
             let mut tls_settings =
                 lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
             tls_settings.enable_h2();
+            let mut tls_tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
+            tls_tcp_opts.so_reuseport = Some(true);
             proxy_service.add_tls_with_settings(
                 &format!("0.0.0.0:{https_port}"),
-                None,
+                Some(tls_tcp_opts),
                 tls_settings,
             );
             info!(port = https_port, "HTTPS proxy listener configured with SNI resolver");

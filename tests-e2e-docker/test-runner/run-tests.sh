@@ -241,6 +241,9 @@ if [ -n "$SESSION" ]; then
     assert_json "$B1" ".data.address" "$BACKEND1" "Backend 1 created"
     assert_json "$B1" ".data.health_check_path" "/healthz" "Backend 1 has HTTP health check path"
 
+    # New backend defaults
+    assert_json "$B1" ".data.h2_upstream" "false" "Backend 1 h2_upstream defaults to false"
+
     # New backend has ewma_score_us = 0 (no traffic yet)
     EWMA_VAL=$(echo "$B1" | jq -r '.data.ewma_score_us')
     if [ "$EWMA_VAL" = "0" ] || [ "$EWMA_VAL" = "0.0" ]; then
@@ -263,9 +266,13 @@ if [ -n "$SESSION" ]; then
         fail "Expected >= 2 backends, got $BACKEND_COUNT"
     fi
 
-    # Update backend 2 with health check path
-    B2_UPD=$(api_put "/api/v1/backends/$B2_ID" '{"health_check_path":"/healthz"}')
+    # Update backend 2 with health check path and h2_upstream
+    B2_UPD=$(api_put "/api/v1/backends/$B2_ID" '{"health_check_path":"/healthz","h2_upstream":true}')
     assert_json "$B2_UPD" ".data.health_check_path" "/healthz" "Backend 2 updated with health check path"
+    assert_json "$B2_UPD" ".data.h2_upstream" "true" "Backend 2 h2_upstream enabled"
+
+    # Reset h2_upstream
+    api_put "/api/v1/backends/$B2_ID" '{"h2_upstream":false}' >/dev/null
 
 # =============================================================================
 # 5. API - ROUTES CRUD + WAF TOGGLE

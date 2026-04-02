@@ -9,6 +9,11 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Added
+
+- Per-backend `h2_upstream` toggle to force HTTP/2 upstream connections (h2c for plaintext, ALPN h2 for TLS). Enables gRPC proxying via HTTP/2 end-to-end
+- SO_REUSEPORT enabled on all proxy listeners (both worker mode and single-process mode) for improved kernel-level connection distribution
+
 ## [0.1.0] - 2026-04-01
 
 ### Added

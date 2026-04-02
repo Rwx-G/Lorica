@@ -397,6 +397,10 @@ pub struct Backend {
     pub lifecycle_state: LifecycleState,
     pub active_connections: i32,
     pub tls_upstream: bool,
+    /// Force HTTP/2 when connecting to this backend (h2c for plaintext,
+    /// ALPN h2 for TLS). Default false (HTTP/1.1).
+    #[serde(default)]
+    pub h2_upstream: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -1064,6 +1064,11 @@ impl ProxyHttp for LoricaProxy {
             },
         ));
 
+        // Force HTTP/2 upstream if configured on the backend
+        if backend.h2_upstream {
+            peer.options.set_http_version(2, 2);
+        }
+
         // Apply route-level timeouts to the peer options
         peer.options.connection_timeout =
             Some(Duration::from_secs(entry.route.connect_timeout_s as u64));
@@ -1468,6 +1473,7 @@ mod tests {
             lifecycle_state: LifecycleState::Normal,
             active_connections: 0,
             tls_upstream: false,
+            h2_upstream: false,
             created_at: now,
             updated_at: now,
         }

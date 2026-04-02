@@ -72,6 +72,7 @@ mod tests {
             lifecycle_state: LifecycleState::Normal,
             active_connections: 0,
             tls_upstream: false,
+            h2_upstream: false,
             created_at: now,
             updated_at: now,
         }
@@ -428,7 +429,7 @@ mod tests {
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
     }
 
     #[test]
@@ -441,7 +442,7 @@ mod tests {
         }
         {
             let store = ConfigStore::open(path, None).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 10);
+            assert_eq!(store.schema_version().unwrap(), 11);
         }
     }
 
