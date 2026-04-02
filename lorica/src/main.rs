@@ -774,13 +774,30 @@ fn run_single_process(cli: Cli) {
         let waf_event_buffer = waf_engine.event_buffer();
         let waf_rule_count = waf_engine.rule_count();
 
-        // Restore IP blocklist enabled state from persisted settings
+        // Restore WAF state from persisted settings
         {
             let s = store.lock().await;
             if let Ok(settings) = s.get_global_settings() {
                 if settings.ip_blocklist_enabled {
                     waf_engine.ip_blocklist().set_enabled(true);
                     info!("IP blocklist restored as enabled from settings");
+                }
+            }
+            // Restore disabled WAF rules
+            if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
+                if !disabled_ids.is_empty() {
+                    waf_engine.set_disabled_rules(&disabled_ids);
+                    info!(count = disabled_ids.len(), "WAF disabled rules restored");
+                }
+            }
+            // Restore custom WAF rules
+            if let Ok(custom_rules) = s.load_waf_custom_rules() {
+                for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
+                    let category = cat.parse().unwrap_or(lorica_waf::RuleCategory::Custom);
+                    let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
+                }
+                if !custom_rules.is_empty() {
+                    info!(count = custom_rules.len(), "WAF custom rules restored");
                 }
             }
         }

@@ -154,6 +154,11 @@ impl WafEngine {
         }
     }
 
+    /// Return the IDs of currently disabled rules.
+    pub fn disabled_rule_ids(&self) -> Vec<u32> {
+        self.disabled_rules.read().unwrap().iter().copied().collect()
+    }
+
     /// Bulk-set which rules are disabled.
     pub fn set_disabled_rules(&self, rule_ids: &[u32]) {
         let mut disabled = self.disabled_rules.write().unwrap();

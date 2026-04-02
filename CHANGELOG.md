@@ -20,6 +20,8 @@ Author: Rwx-G
 - Packaging (.deb/.rpm): service auto-restarts on upgrade (no manual `systemctl start` needed)
 - Packaging (.deb): removed conffiles prompt on upgrade - service file replaced cleanly, customize via `systemctl edit lorica` (drop-in overrides)
 - IP blocklist enabled/disabled state now persisted in GlobalSettings and restored on restart
+- WAF disabled rules persisted in GlobalSettings (JSON array) and restored on restart
+- WAF custom rules persisted in dedicated `waf_custom_rules` table (migration v13) and restored on restart
 
 ## [0.1.1] - 2026-04-02
 

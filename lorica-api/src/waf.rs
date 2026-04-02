@@ -164,6 +164,13 @@ pub async fn toggle_waf_rule(
         return Err(ApiError::NotFound(format!("rule {rule_id} not found")));
     }
 
+    // Persist disabled rules so they survive restarts
+    {
+        let disabled_ids = engine.disabled_rule_ids();
+        let store = state.store.lock().await;
+        let _ = store.save_waf_disabled_rules(&disabled_ids);
+    }
+
     Ok(json_data(serde_json::json!({
         "rule_id": rule_id,
         "enabled": body.enabled,
@@ -217,6 +224,19 @@ pub async fn create_custom_rule(
         )
         .map_err(ApiError::BadRequest)?;
 
+    // Persist custom rule to DB
+    {
+        let store = state.store.lock().await;
+        let _ = store.save_waf_custom_rule(
+            body.id,
+            &body.description,
+            &body.category,
+            &body.pattern,
+            body.severity.unwrap_or(3),
+            true,
+        );
+    }
+
     Ok(json_data(serde_json::json!({
         "id": body.id,
         "description": body.description,
@@ -251,6 +271,11 @@ pub async fn delete_custom_rule(
         .ok_or_else(|| ApiError::BadRequest("WAF engine not initialized".into()))?;
 
     if engine.remove_custom_rule(rule_id) {
+        // Remove from DB
+        {
+            let store = state.store.lock().await;
+            let _ = store.delete_waf_custom_rule(rule_id);
+        }
         Ok(json_data(
             serde_json::json!({"deleted": true, "id": rule_id}),
         ))
