@@ -656,13 +656,14 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
         });
     });
 
-    // Bug 3 fix: Create SLA collector, load configs, and start flush task in worker mode
+    // Create SLA collector for metric collection in worker mode.
+    // Flush task is NOT started here: workers collect metrics only,
+    // the supervisor handles DB persistence via the API server.
     let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
     rt.block_on(async {
         let s = store.lock().await;
         sla_collector.load_configs(&s);
     });
-    sla_collector.start_flush_task(Arc::clone(&store), None);
 
     // Build the proxy service
     let lorica_proxy = LoricaProxy::new(

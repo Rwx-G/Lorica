@@ -105,14 +105,18 @@ if [ -f "$PASSWORD_FILE" ]; then
     ADMIN_PW=$(cat "$PASSWORD_FILE")
 else
     echo -n "Admin password: "
-    read -r ADMIN_PW
+    read -rs ADMIN_PW
+    echo ""
 fi
+
+# Build JSON payload safely (jq escapes special characters)
+LOGIN_JSON=$(printf '%s' "$ADMIN_PW" | jq -Rs '{username: "admin", password: .}')
 
 SESSION=$(mktemp)
 HTTP_CODE=$(curl -sf -k -o /dev/null -w '%{http_code}' \
     -c "$SESSION" \
     -H "Content-Type: application/json" \
-    -d "{\"password\":\"${ADMIN_PW}\"}" \
+    -d "$LOGIN_JSON" \
     "${API}/api/v1/auth/login" 2>/dev/null || echo "000")
 
 if [ "$HTTP_CODE" != "200" ]; then
