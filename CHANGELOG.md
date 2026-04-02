@@ -9,6 +9,10 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Fixed
+
+- systemd service file: add `LimitNOFILE=65536` for 10k+ concurrent connections out of the box
+
 ## [0.1.2] - 2026-04-02
 
 ### Fixed

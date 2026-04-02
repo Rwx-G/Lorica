@@ -11,6 +11,7 @@ Group=lorica
 ExecStart=/usr/bin/lorica --data-dir /var/lib/lorica
 Restart=on-failure
 RestartSec=5
+LimitNOFILE=65536
 
 # Logging
 StandardOutput=journal
