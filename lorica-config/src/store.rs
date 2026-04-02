@@ -21,6 +21,7 @@ const MIGRATION_V8: &str = include_str!("migrations/008_backend_name_group.sql")
 const MIGRATION_V9: &str = include_str!("migrations/009_cache_and_protection.sql");
 const MIGRATION_V10: &str = include_str!("migrations/010_sla_default_range.sql");
 const MIGRATION_V11: &str = include_str!("migrations/011_backend_h2_upstream.sql");
+const MIGRATION_V12: &str = include_str!("migrations/012_route_regex_rewrite.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -248,6 +249,15 @@ impl ConfigStore {
             )?;
         }
 
+        if current_version < 12 {
+            tracing::info!("applying migration 012_route_regex_rewrite");
+            self.conn.execute_batch(MIGRATION_V12)?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![12],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -341,7 +351,9 @@ impl ConfigStore {
              force_https, redirect_hostname, hostname_aliases,
              proxy_headers, response_headers, security_headers,
              connect_timeout_s, read_timeout_s, send_timeout_s,
-             strip_path_prefix, add_path_prefix, access_log_enabled,
+             strip_path_prefix, add_path_prefix,
+             path_rewrite_pattern, path_rewrite_replacement,
+             access_log_enabled,
              proxy_headers_remove, response_headers_remove,
              max_request_body_bytes, websocket_enabled,
              rate_limit_rps, rate_limit_burst,
@@ -353,9 +365,9 @@ impl ConfigStore {
              auto_ban_threshold, auto_ban_duration_s,
              created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                     ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
-                     ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
+                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22,
+                     ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33,
+                     ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)",
             params![
                 route.id,
                 route.hostname,
@@ -377,6 +389,8 @@ impl ConfigStore {
                 route.send_timeout_s,
                 route.strip_path_prefix,
                 route.add_path_prefix,
+                route.path_rewrite_pattern,
+                route.path_rewrite_replacement,
                 route.access_log_enabled,
                 proxy_headers_remove_json,
                 response_headers_remove_json,
@@ -414,7 +428,9 @@ impl ConfigStore {
                  force_https, redirect_hostname, hostname_aliases,
                  proxy_headers, response_headers, security_headers,
                  connect_timeout_s, read_timeout_s, send_timeout_s,
-                 strip_path_prefix, add_path_prefix, access_log_enabled,
+                 strip_path_prefix, add_path_prefix,
+                 path_rewrite_pattern, path_rewrite_replacement,
+                 access_log_enabled,
                  proxy_headers_remove, response_headers_remove,
                  max_request_body_bytes, websocket_enabled,
                  rate_limit_rps, rate_limit_burst,
@@ -441,7 +457,9 @@ impl ConfigStore {
              force_https, redirect_hostname, hostname_aliases,
              proxy_headers, response_headers, security_headers,
              connect_timeout_s, read_timeout_s, send_timeout_s,
-             strip_path_prefix, add_path_prefix, access_log_enabled,
+             strip_path_prefix, add_path_prefix,
+             path_rewrite_pattern, path_rewrite_replacement,
+             access_log_enabled,
              proxy_headers_remove, response_headers_remove,
              max_request_body_bytes, websocket_enabled,
              rate_limit_rps, rate_limit_burst,
@@ -494,16 +512,17 @@ impl ConfigStore {
              hostname_aliases=?12, proxy_headers=?13, response_headers=?14,
              security_headers=?15, connect_timeout_s=?16, read_timeout_s=?17,
              send_timeout_s=?18, strip_path_prefix=?19, add_path_prefix=?20,
-             access_log_enabled=?21, proxy_headers_remove=?22,
-             response_headers_remove=?23, max_request_body_bytes=?24,
-             websocket_enabled=?25, rate_limit_rps=?26, rate_limit_burst=?27,
-             ip_allowlist=?28, ip_denylist=?29,
-             cors_allowed_origins=?30, cors_allowed_methods=?31, cors_max_age_s=?32,
-             compression_enabled=?33, retry_attempts=?34,
-             cache_enabled=?35, cache_ttl_s=?36, cache_max_bytes=?37,
-             max_connections=?38, slowloris_threshold_ms=?39,
-             auto_ban_threshold=?40, auto_ban_duration_s=?41,
-             updated_at=?42 WHERE id=?1",
+             path_rewrite_pattern=?21, path_rewrite_replacement=?22,
+             access_log_enabled=?23, proxy_headers_remove=?24,
+             response_headers_remove=?25, max_request_body_bytes=?26,
+             websocket_enabled=?27, rate_limit_rps=?28, rate_limit_burst=?29,
+             ip_allowlist=?30, ip_denylist=?31,
+             cors_allowed_origins=?32, cors_allowed_methods=?33, cors_max_age_s=?34,
+             compression_enabled=?35, retry_attempts=?36,
+             cache_enabled=?37, cache_ttl_s=?38, cache_max_bytes=?39,
+             max_connections=?40, slowloris_threshold_ms=?41,
+             auto_ban_threshold=?42, auto_ban_duration_s=?43,
+             updated_at=?44 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -525,6 +544,8 @@ impl ConfigStore {
                 route.send_timeout_s,
                 route.strip_path_prefix,
                 route.add_path_prefix,
+                route.path_rewrite_pattern,
+                route.path_rewrite_replacement,
                 route.access_log_enabled,
                 proxy_headers_remove_json,
                 response_headers_remove_json,
@@ -1890,29 +1911,29 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         serde_json::from_str(&response_headers_json)
             .map_err(|e| ConfigError::Validation(format!("invalid response_headers JSON: {e}")))?;
 
-    let proxy_headers_remove_json: String = row.get(21)?;
+    let proxy_headers_remove_json: String = row.get(23)?;
     let proxy_headers_remove: Vec<String> = serde_json::from_str(&proxy_headers_remove_json)
         .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers_remove JSON: {e}")))?;
 
-    let response_headers_remove_json: String = row.get(22)?;
+    let response_headers_remove_json: String = row.get(24)?;
     let response_headers_remove: Vec<String> = serde_json::from_str(&response_headers_remove_json)
         .map_err(|e| {
             ConfigError::Validation(format!("invalid response_headers_remove JSON: {e}"))
         })?;
 
-    let ip_allowlist_json: String = row.get(27)?;
+    let ip_allowlist_json: String = row.get(29)?;
     let ip_allowlist: Vec<String> = serde_json::from_str(&ip_allowlist_json)
         .map_err(|e| ConfigError::Validation(format!("invalid ip_allowlist JSON: {e}")))?;
 
-    let ip_denylist_json: String = row.get(28)?;
+    let ip_denylist_json: String = row.get(30)?;
     let ip_denylist: Vec<String> = serde_json::from_str(&ip_denylist_json)
         .map_err(|e| ConfigError::Validation(format!("invalid ip_denylist JSON: {e}")))?;
 
-    let cors_allowed_origins_json: String = row.get(29)?;
+    let cors_allowed_origins_json: String = row.get(31)?;
     let cors_allowed_origins: Vec<String> = serde_json::from_str(&cors_allowed_origins_json)
         .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_origins JSON: {e}")))?;
 
-    let cors_allowed_methods_json: String = row.get(30)?;
+    let cors_allowed_methods_json: String = row.get(32)?;
     let cors_allowed_methods: Vec<String> = serde_json::from_str(&cors_allowed_methods_json)
         .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_methods JSON: {e}")))?;
 
@@ -1939,29 +1960,31 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         send_timeout_s: row.get(17)?,
         strip_path_prefix: row.get(18)?,
         add_path_prefix: row.get(19)?,
-        access_log_enabled: row.get(20)?,
+        path_rewrite_pattern: row.get(20)?,
+        path_rewrite_replacement: row.get(21)?,
+        access_log_enabled: row.get(22)?,
         proxy_headers_remove,
         response_headers_remove,
-        max_request_body_bytes: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
-        websocket_enabled: row.get(24)?,
-        rate_limit_rps: row.get::<_, Option<i32>>(25)?.map(|v| v as u32),
-        rate_limit_burst: row.get::<_, Option<i32>>(26)?.map(|v| v as u32),
+        max_request_body_bytes: row.get::<_, Option<i64>>(25)?.map(|v| v as u64),
+        websocket_enabled: row.get(26)?,
+        rate_limit_rps: row.get::<_, Option<i32>>(27)?.map(|v| v as u32),
+        rate_limit_burst: row.get::<_, Option<i32>>(28)?.map(|v| v as u32),
         ip_allowlist,
         ip_denylist,
         cors_allowed_origins,
         cors_allowed_methods,
-        cors_max_age_s: row.get(31)?,
-        compression_enabled: row.get(32)?,
-        retry_attempts: row.get::<_, Option<i32>>(33)?.map(|v| v as u32),
-        cache_enabled: row.get(34)?,
-        cache_ttl_s: row.get(35)?,
-        cache_max_bytes: row.get(36)?,
-        max_connections: row.get::<_, Option<i32>>(37)?.map(|v| v as u32),
-        slowloris_threshold_ms: row.get(38)?,
-        auto_ban_threshold: row.get::<_, Option<i32>>(39)?.map(|v| v as u32),
-        auto_ban_duration_s: row.get(40)?,
-        created_at: parse_datetime(&row.get::<_, String>(41)?)?,
-        updated_at: parse_datetime(&row.get::<_, String>(42)?)?,
+        cors_max_age_s: row.get(33)?,
+        compression_enabled: row.get(34)?,
+        retry_attempts: row.get::<_, Option<i32>>(35)?.map(|v| v as u32),
+        cache_enabled: row.get(36)?,
+        cache_ttl_s: row.get(37)?,
+        cache_max_bytes: row.get(38)?,
+        max_connections: row.get::<_, Option<i32>>(39)?.map(|v| v as u32),
+        slowloris_threshold_ms: row.get(40)?,
+        auto_ban_threshold: row.get::<_, Option<i32>>(41)?.map(|v| v as u32),
+        auto_ban_duration_s: row.get(42)?,
+        created_at: parse_datetime(&row.get::<_, String>(43)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })
 }
 

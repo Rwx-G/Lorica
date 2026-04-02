@@ -25,6 +25,7 @@ uuid = { version = "1", features = ["v4"] }
 argon2 = "0.5"
 rand = "0.8"
 rcgen = "0.13"
+regex = "1"
 ring = "0.17"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"], optional = true }
 aws-sdk-route53 = { version = "1", optional = true }

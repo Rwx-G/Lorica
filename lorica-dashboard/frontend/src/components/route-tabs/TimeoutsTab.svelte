@@ -56,6 +56,18 @@
       <span class="hint">Traefik: AddPrefix middleware</span>
     </div>
   </div>
+  <div class="form-row">
+    <div class="form-group" class:modified={isModified('path_rewrite_pattern')}>
+      <label for="rewrite-pattern">Regex rewrite pattern</label>
+      <input id="rewrite-pattern" type="text" bind:value={form.path_rewrite_pattern} placeholder="^/api/v1/(.*)" />
+      <span class="hint">Rust regex syntax. Linear time, ReDoS-safe. Applied after strip/add prefix.</span>
+    </div>
+    <div class="form-group" class:modified={isModified('path_rewrite_replacement')}>
+      <label for="rewrite-replacement">Regex rewrite replacement</label>
+      <input id="rewrite-replacement" type="text" bind:value={form.path_rewrite_replacement} placeholder="/v2/$1" />
+      <span class="hint">Use $1, $2, etc. for capture groups.</span>
+    </div>
+  </div>
 
   <h3 class="section-title">Retry</h3>
   <div class="form-group" class:modified={isModified('retry_attempts')}>

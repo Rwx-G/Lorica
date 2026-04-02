@@ -21,6 +21,8 @@ export interface RouteFormState {
   send_timeout_s: number;
   strip_path_prefix: string;
   add_path_prefix: string;
+  path_rewrite_pattern: string;
+  path_rewrite_replacement: string;
   retry_attempts: string;
   security_headers: string;
   max_body_mb: string;
@@ -65,6 +67,8 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   send_timeout_s: 60,
   strip_path_prefix: '',
   add_path_prefix: '',
+  path_rewrite_pattern: '',
+  path_rewrite_replacement: '',
   retry_attempts: '',
   security_headers: 'moderate',
   max_body_mb: '',
@@ -97,7 +101,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   ],
   timeouts: [
     'connect_timeout_s', 'read_timeout_s', 'send_timeout_s',
-    'strip_path_prefix', 'add_path_prefix', 'retry_attempts',
+    'strip_path_prefix', 'add_path_prefix', 'path_rewrite_pattern', 'path_rewrite_replacement', 'retry_attempts',
   ],
   security: [
     'security_headers', 'max_body_mb', 'rate_limit_rps',
@@ -166,6 +170,8 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     send_timeout_s: route.send_timeout_s,
     strip_path_prefix: route.strip_path_prefix ?? '',
     add_path_prefix: route.add_path_prefix ?? '',
+    path_rewrite_pattern: route.path_rewrite_pattern ?? '',
+    path_rewrite_replacement: route.path_rewrite_replacement ?? '',
     retry_attempts: route.retry_attempts != null ? String(route.retry_attempts) : '',
     security_headers: route.security_headers,
     max_body_mb: route.max_request_body_bytes != null ? String(route.max_request_body_bytes / (1024 * 1024)) : '',
@@ -202,6 +208,8 @@ function buildAdvancedFields(form: RouteFormState) {
     send_timeout_s: form.send_timeout_s,
     strip_path_prefix: form.strip_path_prefix || undefined,
     add_path_prefix: form.add_path_prefix || undefined,
+    path_rewrite_pattern: form.path_rewrite_pattern || undefined,
+    path_rewrite_replacement: form.path_rewrite_replacement || undefined,
     security_headers: form.security_headers,
     max_request_body_bytes: form.max_body_mb ? Math.round(Number(form.max_body_mb) * 1024 * 1024) : undefined,
     rate_limit_rps: form.rate_limit_rps ? Number(form.rate_limit_rps) : undefined,

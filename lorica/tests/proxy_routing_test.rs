@@ -41,6 +41,8 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str) -> Route {
         send_timeout_s: 60,
         strip_path_prefix: None,
         add_path_prefix: None,
+            path_rewrite_pattern: None,
+            path_rewrite_replacement: None,
         access_log_enabled: true,
         proxy_headers_remove: Vec::new(),
         response_headers_remove: Vec::new(),

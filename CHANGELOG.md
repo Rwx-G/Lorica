@@ -15,6 +15,7 @@ Author: Rwx-G
 - SO_REUSEPORT enabled on all proxy listeners (both worker mode and single-process mode) for improved kernel-level connection distribution
 - Performance tuning guide (`docs/tuning.md`) covering kernel sysctl, file descriptor limits, worker sizing, cache and rate limit tuning, and production readiness checklist
 - Reproducible benchmark suite (`bench/`) using oha in Docker. Supports single-process, multi-worker, WAF, and cache scenarios with JSON output for comparison
+- Regex path rewriting per route (`path_rewrite_pattern` + `path_rewrite_replacement`). Supports capture groups ($1, $2). Uses Rust regex crate (linear time, ReDoS-safe by design). Applied after strip/add prefix. Pattern validated and precompiled at config reload. Nginx import wizard parses `rewrite` directives into regex fields
 
 ## [0.1.0] - 2026-04-01
 

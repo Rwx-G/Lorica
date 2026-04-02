@@ -40,6 +40,7 @@ lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
 once_cell = { workspace = true }
 lorica-bench = { version = "0.1.0", path = "../lorica-bench" }
+regex = "1"
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 bollard = { version = "0.18", optional = true }
 kube = { version = "0.98", default-features = false, features = ["client", "rustls-tls", "runtime"], optional = true }

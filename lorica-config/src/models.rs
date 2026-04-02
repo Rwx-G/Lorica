@@ -332,6 +332,13 @@ pub struct Route {
     pub strip_path_prefix: Option<String>,
     #[serde(default)]
     pub add_path_prefix: Option<String>,
+    /// Regex pattern for path rewriting (e.g. `^/api/v1/(.*)`).
+    /// Applied after strip/add prefix. Rust regex crate (linear time, ReDoS-safe).
+    #[serde(default)]
+    pub path_rewrite_pattern: Option<String>,
+    /// Replacement string for regex rewrite (e.g. `/v2/$1`).
+    #[serde(default)]
+    pub path_rewrite_replacement: Option<String>,
     #[serde(default = "default_access_log_enabled")]
     pub access_log_enabled: bool,
     #[serde(default)]

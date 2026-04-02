@@ -77,6 +77,8 @@ export interface LoricaRouteImport {
   security_headers: string;
   strip_path_prefix: string | null;
   add_path_prefix: string | null;
+  path_rewrite_pattern: string | null;
+  path_rewrite_replacement: string | null;
   rate_limit_rps: number | null;
   rate_limit_burst: number | null;
   cache_enabled: boolean;
@@ -326,11 +328,30 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
   },
 
   rewrite: (v, r) => {
-    // Try to detect path prefix stripping: rewrite ^/prefix/(.*) /$1
-    const match = v.match(/^\^?(\/.+?)\/(.*?)\s+\/\$1/);
-    if (match) {
-      r.strip_path_prefix = match[1];
+    // Parse: rewrite <pattern> <replacement> [flag];
+    // Example: rewrite ^/api/v1/(.*) /v2/$1 break;
+    const parts = v.replace(/;$/, '').trim().split(/\s+/);
+    if (parts.length < 2) return;
+
+    const pattern = parts[0];
+    const replacement = parts[1];
+
+    // Simple case: rewrite ^/prefix/(.*) /$1 -> strip_path_prefix
+    const stripMatch = pattern.match(/^\^?(\/.+?)\/(.*?)\s*$/) ||
+                       pattern.match(/^\^(\/.+?)\/\(\.\*\)$/);
+    if (stripMatch && replacement === '/$1') {
+      r.strip_path_prefix = stripMatch[1];
       r.importedFields.add('strip_path_prefix');
+      return;
+    }
+
+    // General regex rewrite -> path_rewrite_pattern + path_rewrite_replacement
+    // Convert PCRE to Rust regex (basic: they are mostly compatible)
+    if (pattern && replacement) {
+      r.path_rewrite_pattern = pattern;
+      r.path_rewrite_replacement = replacement;
+      r.importedFields.add('path_rewrite_pattern');
+      r.importedFields.add('path_rewrite_replacement');
     }
   },
 };
@@ -664,6 +685,8 @@ function createDefaultRoute(): LoricaRouteImport {
     security_headers: 'none',
     strip_path_prefix: null,
     add_path_prefix: null,
+    path_rewrite_pattern: null,
+    path_rewrite_replacement: null,
     rate_limit_rps: null,
     rate_limit_burst: null,
     cache_enabled: false,

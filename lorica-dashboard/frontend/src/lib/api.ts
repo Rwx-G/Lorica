@@ -73,6 +73,8 @@ export interface RouteResponse {
   send_timeout_s: number;
   strip_path_prefix: string | null;
   add_path_prefix: string | null;
+  path_rewrite_pattern: string | null;
+  path_rewrite_replacement: string | null;
   access_log_enabled: boolean;
   proxy_headers_remove: string[];
   response_headers_remove: string[];
@@ -118,6 +120,8 @@ export interface CreateRouteRequest {
   send_timeout_s?: number;
   strip_path_prefix?: string;
   add_path_prefix?: string;
+  path_rewrite_pattern?: string;
+  path_rewrite_replacement?: string;
   access_log_enabled?: boolean;
   proxy_headers_remove?: string[];
   response_headers_remove?: string[];
@@ -162,6 +166,8 @@ export interface UpdateRouteRequest {
   send_timeout_s?: number;
   strip_path_prefix?: string;
   add_path_prefix?: string;
+  path_rewrite_pattern?: string;
+  path_rewrite_replacement?: string;
   access_log_enabled?: boolean;
   proxy_headers_remove?: string[];
   response_headers_remove?: string[];

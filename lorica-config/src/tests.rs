@@ -31,6 +31,8 @@ mod tests {
             send_timeout_s: 60,
             strip_path_prefix: None,
             add_path_prefix: None,
+            path_rewrite_pattern: None,
+            path_rewrite_replacement: None,
             access_log_enabled: true,
             proxy_headers_remove: Vec::new(),
             response_headers_remove: Vec::new(),
@@ -429,7 +431,7 @@ mod tests {
     #[test]
     fn test_migration_version() {
         let store = ConfigStore::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), 12);
     }
 
     #[test]
@@ -442,7 +444,7 @@ mod tests {
         }
         {
             let store = ConfigStore::open(path, None).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 11);
+            assert_eq!(store.schema_version().unwrap(), 12);
         }
     }
 

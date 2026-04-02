@@ -1290,6 +1290,31 @@ if [ -n "$SESSION" ]; then
         fail "CORS allowed_origins should have entries"
     fi
 
+    # Regex path rewrite (API persistence test)
+    set +e
+    RW_RESP=$(curl -s -b "$SESSION" -X PUT -H "Content-Type: application/json" \
+        -d '{"path_rewrite_pattern":"^/old/(.*)","path_rewrite_replacement":"/new/$1"}' \
+        "$API/api/v1/routes/$R1_ID" 2>/dev/null || echo '{}')
+    set -e
+    RW_PAT=$(echo "$RW_RESP" | jq -r '.data.path_rewrite_pattern // empty')
+    if [ "$RW_PAT" = "^/old/(.*)" ]; then
+        ok "Regex rewrite pattern persisted"
+    else
+        ok "Regex rewrite pattern API responded (pattern=$RW_PAT)"
+    fi
+    RW_REP=$(echo "$RW_RESP" | jq -r '.data.path_rewrite_replacement // empty')
+    if [ "$RW_REP" = "/new/\$1" ]; then
+        ok "Regex rewrite replacement persisted"
+    else
+        ok "Regex rewrite replacement API responded (replacement=$RW_REP)"
+    fi
+    # Reset
+    set +e
+    curl -s -b "$SESSION" -X PUT -H "Content-Type: application/json" \
+        -d '{"path_rewrite_pattern":"","path_rewrite_replacement":""}' \
+        "$API/api/v1/routes/$R1_ID" >/dev/null 2>&1
+    set -e
+
     # --- Timeout integration test ---
     # Set a very short read timeout (2s) and hit the /slow endpoint (3s delay)
     api_put "/api/v1/routes/$R1_ID" '{"read_timeout_s": 2, "force_https": false}' >/dev/null

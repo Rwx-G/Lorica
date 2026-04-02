@@ -46,6 +46,8 @@ pub struct RouteEntry {
     pub certificate: Option<Certificate>,
     /// Round-robin counter for this route.
     pub rr_counter: Arc<AtomicUsize>,
+    /// Precompiled regex for path rewriting (None if not configured).
+    pub path_rewrite_regex: Option<regex::Regex>,
 }
 
 /// In-memory configuration snapshot used by the proxy.
@@ -120,11 +122,34 @@ impl ProxyConfig {
                 .as_ref()
                 .and_then(|cid| cert_map.get(cid).cloned());
 
+            let path_rewrite_regex = route
+                .path_rewrite_pattern
+                .as_ref()
+                .and_then(|p| {
+                    if p.is_empty() {
+                        None
+                    } else {
+                        match regex::Regex::new(p) {
+                            Ok(re) => Some(re),
+                            Err(e) => {
+                                tracing::warn!(
+                                    route_id = %route.id,
+                                    pattern = %p,
+                                    error = %e,
+                                    "invalid path_rewrite_pattern, skipping regex rewrite"
+                                );
+                                None
+                            }
+                        }
+                    }
+                });
+
             let entry = RouteEntry {
                 route: route.clone(),
                 backends: route_backends,
                 certificate,
                 rr_counter: Arc::new(AtomicUsize::new(0)),
+                path_rewrite_regex,
             };
 
             routes_by_host
@@ -1117,6 +1142,19 @@ impl ProxyHttp for LoricaProxy {
             rewritten = format!("{add}{rewritten}");
         }
 
+        // Regex path rewrite (applied after strip/add prefix)
+        if let Some(ref re) = entry.path_rewrite_regex {
+            if let Some(ref replacement) = route.path_rewrite_replacement {
+                let result = re.replace(&rewritten, replacement.as_str());
+                if result != rewritten {
+                    rewritten = result.into_owned();
+                    if !rewritten.starts_with('/') {
+                        rewritten = format!("/{rewritten}");
+                    }
+                }
+            }
+        }
+
         if rewritten != original_path {
             let new_uri_str = format!("{rewritten}{query}");
             if let Ok(new_uri) = new_uri_str.parse::<http::Uri>() {
@@ -1432,6 +1470,8 @@ mod tests {
             send_timeout_s: 60,
             strip_path_prefix: None,
             add_path_prefix: None,
+            path_rewrite_pattern: None,
+            path_rewrite_replacement: None,
             access_log_enabled: true,
             proxy_headers_remove: Vec::new(),
             response_headers_remove: Vec::new(),

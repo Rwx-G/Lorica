@@ -266,6 +266,8 @@ fn route_eq(a: &Route, b: &Route) -> bool {
         && a.waf_mode == b.waf_mode
         && a.topology_type == b.topology_type
         && a.enabled == b.enabled
+        && a.path_rewrite_pattern == b.path_rewrite_pattern
+        && a.path_rewrite_replacement == b.path_rewrite_replacement
 }
 
 fn backend_eq(a: &Backend, b: &Backend) -> bool {

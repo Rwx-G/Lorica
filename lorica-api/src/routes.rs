@@ -32,6 +32,8 @@ pub struct RouteResponse {
     pub send_timeout_s: i32,
     pub strip_path_prefix: Option<String>,
     pub add_path_prefix: Option<String>,
+    pub path_rewrite_pattern: Option<String>,
+    pub path_rewrite_replacement: Option<String>,
     pub access_log_enabled: bool,
     pub proxy_headers_remove: Vec<String>,
     pub response_headers_remove: Vec<String>,
@@ -78,6 +80,8 @@ pub struct CreateRouteRequest {
     pub send_timeout_s: Option<i32>,
     pub strip_path_prefix: Option<String>,
     pub add_path_prefix: Option<String>,
+    pub path_rewrite_pattern: Option<String>,
+    pub path_rewrite_replacement: Option<String>,
     pub access_log_enabled: Option<bool>,
     pub proxy_headers_remove: Option<Vec<String>>,
     pub response_headers_remove: Option<Vec<String>>,
@@ -123,6 +127,8 @@ pub struct UpdateRouteRequest {
     pub send_timeout_s: Option<i32>,
     pub strip_path_prefix: Option<String>,
     pub add_path_prefix: Option<String>,
+    pub path_rewrite_pattern: Option<String>,
+    pub path_rewrite_replacement: Option<String>,
     pub access_log_enabled: Option<bool>,
     pub proxy_headers_remove: Option<Vec<String>>,
     pub response_headers_remove: Option<Vec<String>>,
@@ -172,6 +178,8 @@ fn route_to_response(
         send_timeout_s: route.send_timeout_s,
         strip_path_prefix: route.strip_path_prefix.clone(),
         add_path_prefix: route.add_path_prefix.clone(),
+        path_rewrite_pattern: route.path_rewrite_pattern.clone(),
+        path_rewrite_replacement: route.path_rewrite_replacement.clone(),
         access_log_enabled: route.access_log_enabled,
         proxy_headers_remove: route.proxy_headers_remove.clone(),
         response_headers_remove: route.response_headers_remove.clone(),
@@ -266,6 +274,8 @@ pub async fn create_route(
         send_timeout_s: body.send_timeout_s.unwrap_or(60),
         strip_path_prefix: body.strip_path_prefix,
         add_path_prefix: body.add_path_prefix,
+        path_rewrite_pattern: body.path_rewrite_pattern,
+        path_rewrite_replacement: body.path_rewrite_replacement,
         access_log_enabled: body.access_log_enabled.unwrap_or(true),
         proxy_headers_remove: body.proxy_headers_remove.unwrap_or_default(),
         response_headers_remove: body.response_headers_remove.unwrap_or_default(),
@@ -390,6 +400,28 @@ pub async fn update_route(
     }
     if let Some(add_path_prefix) = body.add_path_prefix {
         route.add_path_prefix = Some(add_path_prefix);
+    }
+    if let Some(ref pattern) = body.path_rewrite_pattern {
+        if pattern.is_empty() {
+            route.path_rewrite_pattern = None;
+            route.path_rewrite_replacement = None;
+        } else {
+            // Validate regex at API level
+            if regex::Regex::new(pattern).is_err() {
+                return Err(ApiError::BadRequest(format!(
+                    "invalid path_rewrite_pattern regex: {pattern}"
+                )));
+            }
+            if pattern.len() > 1024 {
+                return Err(ApiError::BadRequest(
+                    "path_rewrite_pattern must be <= 1024 characters".into(),
+                ));
+            }
+            route.path_rewrite_pattern = Some(pattern.clone());
+        }
+    }
+    if let Some(replacement) = body.path_rewrite_replacement {
+        route.path_rewrite_replacement = Some(replacement);
     }
     if let Some(access_log_enabled) = body.access_log_enabled {
         route.access_log_enabled = access_log_enabled;
