@@ -17,8 +17,17 @@ Author: Rwx-G
 - Dashboard: added global `.btn-secondary` and `.btn-danger` classes to the design system
 - Dashboard: standardized grid gaps, filter-bar spacing, and modal styling across all pages
 
+### Added
+
+- Real-time access log forwarding in worker mode via Unix domain socket (`/var/lib/lorica/log.sock`). Workers stream logs to the supervisor with sub-millisecond latency, making WebSocket live logs work in multi-worker mode
+- WAF engine in supervisor process for worker mode: rules listing, blocklist toggle, custom rules, and event viewing now work in the dashboard when running with `--workers N`
+- IP blocklist auto-refresh (every 6h) in supervisor mode
+
 ### Fixed
 
+- Worker mode: supervisor closes listening sockets after spawning workers. Fixes requests hanging indefinitely (kernel was routing connections to supervisor which had no proxy service)
+- Worker mode: use `TcpListener::from_raw_fd` instead of `TcpStream::from_raw_fd` for inherited listening sockets (correct socket type)
+- Worker mode: respawn recreates listening sockets (previously used closed FDs)
 - systemd service file: add `LimitNOFILE=65536` for 10k+ concurrent connections out of the box
 
 ## [0.1.2] - 2026-04-02
