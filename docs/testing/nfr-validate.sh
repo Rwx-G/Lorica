@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Force C locale for consistent decimal separator (dot, not comma)
+export LC_ALL=C
 # =============================================================================
 # Lorica NFR Validation Script
 #
