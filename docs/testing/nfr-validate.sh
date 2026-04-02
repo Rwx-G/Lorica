@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-API="https://localhost:${API_PORT}"
+API="http://localhost:${API_PORT}"
 
 # --- Colors ---
 GREEN='\033[1;32m'
@@ -58,9 +58,9 @@ fail()    { echo -e "  ${RED}FAIL${RESET} $*"; }
 info()    { echo -e "  ${YELLOW}INFO${RESET} $*"; }
 
 # --- Helpers ---
-api_get()  { curl -sf -k -b "$SESSION" "${API}$1" 2>/dev/null; }
-api_post() { curl -sf -k -b "$SESSION" -X POST -H "Content-Type: application/json" -d "$2" "${API}$1" 2>/dev/null; }
-api_del()  { curl -sf -k -b "$SESSION" -X DELETE "${API}$1" 2>/dev/null; }
+api_get()  { curl -sf -b "$SESSION" "${API}$1" 2>/dev/null; }
+api_post() { curl -sf -b "$SESSION" -X POST -H "Content-Type: application/json" -d "$2" "${API}$1" 2>/dev/null; }
+api_del()  { curl -sf -b "$SESSION" -X DELETE "${API}$1" 2>/dev/null; }
 
 get_lorica_pid() {
     pgrep -x lorica | head -1 || systemctl show lorica --property=MainPID --value 2>/dev/null || echo ""
@@ -113,7 +113,7 @@ fi
 LOGIN_JSON=$(printf '%s' "$ADMIN_PW" | jq -Rs '{username: "admin", password: .}')
 
 SESSION=$(mktemp)
-HTTP_CODE=$(curl -sf -k -o /dev/null -w '%{http_code}' \
+HTTP_CODE=$(curl -sf -o /dev/null -w '%{http_code}' \
     -c "$SESSION" \
     -H "Content-Type: application/json" \
     -d "$LOGIN_JSON" \
