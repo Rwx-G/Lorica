@@ -9,6 +9,14 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Fixed
+
+- Worker mode: SLA collector no longer panics on startup (tokio::spawn called outside runtime context)
+- NFR validation script: password input masked, special characters escaped via jq, HTTP instead of HTTPS for localhost API
+- NFR validation script: prerequisite checks (ulimit >= 20000, required tools) with clear error messages before running
+- NFR validation script: Python backend suppresses BrokenPipeError under load, SO_REUSEADDR for port reuse
+- Dashboard sidebar now stays fixed during page scroll (position: sticky)
+
 ## [0.1.1] - 2026-04-02
 
 ### Added
