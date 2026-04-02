@@ -390,7 +390,7 @@ The `.deb` package installs a hardened systemd unit with:
 
 ## Performance Tuning
 
-See [docs/tuning.md](docs/tuning.md) for kernel parameters (`sysctl`), file descriptor limits, worker configuration, cache settings, and a production readiness checklist.
+See [docs/tuning.md](docs/tuning.md) for kernel parameters (`sysctl`), file descriptor limits, worker configuration, cache settings, and a production readiness checklist. Run [bench/](bench/) for reproducible throughput measurements.
 
 ## Package Verification
 

@@ -14,6 +14,7 @@ Author: Rwx-G
 - Per-backend `h2_upstream` toggle to force HTTP/2 upstream connections (h2c for plaintext, ALPN h2 for TLS). Enables gRPC proxying via HTTP/2 end-to-end
 - SO_REUSEPORT enabled on all proxy listeners (both worker mode and single-process mode) for improved kernel-level connection distribution
 - Performance tuning guide (`docs/tuning.md`) covering kernel sysctl, file descriptor limits, worker sizing, cache and rate limit tuning, and production readiness checklist
+- Reproducible benchmark suite (`bench/`) using oha in Docker. Supports single-process, multi-worker, WAF, and cache scenarios with JSON output for comparison
 
 ## [0.1.0] - 2026-04-01
 

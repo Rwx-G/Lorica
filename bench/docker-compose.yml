@@ -1,0 +1,62 @@
+# Lorica benchmark topology
+#
+# Topology:
+#   [oha] --> [lorica:8080] --> [backend1:80, backend2:80]
+#
+# All containers on the same Docker network (no host overhead).
+# Backend is a minimal Go HTTP server returning a small JSON body.
+
+services:
+  lorica:
+    image: lorica-bench
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/usr/local/bin/lorica"]
+    command:
+      - "--data-dir=/var/lib/lorica"
+      - "--http-port=8080"
+      - "--https-port=8443"
+      - "--management-port=9443"
+      - "--log-level=warn"
+    volumes:
+      - lorica-data:/var/lib/lorica
+    depends_on:
+      - backend1
+      - backend2
+    networks:
+      - bench
+
+  backend1:
+    build:
+      context: ../tests-e2e-docker/backend
+    environment:
+      - BACKEND_ID=backend1
+      - LISTEN_PORT=80
+    networks:
+      - bench
+
+  backend2:
+    build:
+      context: ../tests-e2e-docker/backend
+    environment:
+      - BACKEND_ID=backend2
+      - LISTEN_PORT=80
+    networks:
+      - bench
+
+  runner:
+    image: alpine:3.20
+    depends_on:
+      - lorica
+    networks:
+      - bench
+    volumes:
+      - ./results:/results
+    entrypoint: ["sh", "-c", "echo 'runner ready'; sleep infinity"]
+
+volumes:
+  lorica-data:
+
+networks:
+  bench:
