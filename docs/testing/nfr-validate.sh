@@ -129,23 +129,35 @@ ok "Authenticated"
 # --- Start backend stub ---
 header "Starting test backend"
 
-# Minimal HTTP server: returns 200 with small body
+# Minimal HTTP server: returns 200 with small body.
+# Suppresses BrokenPipeError (normal under load testing) and all logging.
 BACKEND_PY=$(mktemp /tmp/nfr-backend-XXXX.py)
 cat > "$BACKEND_PY" << 'PYEOF'
-import http.server, socketserver, sys
+import http.server, socketserver, sys, signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type","text/plain")
-        self.end_headers()
-        self.wfile.write(b"ok\n")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type","text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+        except BrokenPipeError:
+            pass
     def log_message(self, *a): pass
+    def handle(self):
+        try:
+            super().handle()
+        except BrokenPipeError:
+            pass
 port = int(sys.argv[1])
+socketserver.TCPServer.allow_reuse_address = True
 with socketserver.TCPServer(("0.0.0.0", port), H) as s:
     s.serve_forever()
 PYEOF
 
-python3 "$BACKEND_PY" "$BACKEND_PORT" &
+BACKEND_LOG=$(mktemp /tmp/nfr-backend-log-XXXX.txt)
+python3 "$BACKEND_PY" "$BACKEND_PORT" > "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 sleep 1
 
@@ -415,7 +427,7 @@ header "Cleanup"
 api_del "/api/v1/routes/${NFR_ROUTE_ID}" >/dev/null 2>&1 && ok "Route deleted" || info "Route cleanup skipped"
 api_del "/api/v1/backends/${NFR_BACKEND_ID}" >/dev/null 2>&1 && ok "Backend deleted" || info "Backend cleanup skipped"
 kill "$BACKEND_PID" 2>/dev/null && ok "Backend stub stopped" || true
-rm -f "$BACKEND_PY" "$SESSION"
+rm -f "$BACKEND_PY" "$SESSION" "$BACKEND_LOG"
 
 # =============================================================================
 # Report
