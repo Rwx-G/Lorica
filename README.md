@@ -388,6 +388,10 @@ The `.deb` package installs a hardened systemd unit with:
 - `RestrictNamespaces=yes`, `RestrictSUIDSGID=yes`
 - Runs as dedicated `lorica` user with `CAP_NET_BIND_SERVICE`
 
+## Performance Tuning
+
+See [docs/tuning.md](docs/tuning.md) for kernel parameters (`sysctl`), file descriptor limits, worker configuration, cache settings, and a production readiness checklist.
+
 ## Package Verification
 
 Release `.deb` and `.rpm` packages are GPG-signed. Import the public key to verify:
