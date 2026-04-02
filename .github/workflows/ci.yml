@@ -150,9 +150,10 @@ jobs:
 
       - name: Sign .deb package
         run: |
-          sudo apt-get install -y dpkg-sig
           for deb in dist/*.deb; do
-            dpkg-sig --sign builder -g "--batch --pinentry-mode loopback --passphrase-fd 0" "$deb" <<< "${{ secrets.GPG_PASSPHRASE }}"
+            gpg --batch --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" \
+              --detach-sign --armor "$deb"
+            echo "Signed: ${deb}.asc"
           done
 
       - name: Sign .rpm package

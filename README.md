@@ -393,7 +393,7 @@ Release `.deb` and `.rpm` packages are GPG-signed. Import the public key to veri
 
 ```bash
 curl -fsSL https://github.com/Rwx-G/Lorica/raw/main/docs/lorica-signing-key.asc | sudo gpg --dearmor -o /usr/share/keyrings/lorica.gpg
-dpkg-sig --verify lorica.deb
+gpg --verify lorica.deb.asc lorica.deb
 ```
 
 ## License
