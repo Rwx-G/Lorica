@@ -601,169 +601,135 @@ impl DnsChallenger for CloudflareDnsChallenger {
     }
 }
 
-/// AWS Route53 DNS-01 challenger.
+/// AWS Route53 DNS-01 challenger using the official AWS SDK.
+#[cfg(feature = "route53")]
 pub struct Route53DnsChallenger {
     hosted_zone_id: String,
-    access_key: String,
-    secret_key: String,
-    client: reqwest::Client,
+    client: aws_sdk_route53::Client,
+    /// Track created TXT values so DELETE can provide the exact value.
+    created_values: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
+#[cfg(feature = "route53")]
 impl Route53DnsChallenger {
-    pub fn new(hosted_zone_id: String, access_key: String, secret_key: String) -> Self {
-        Self {
-            hosted_zone_id,
+    pub async fn new(hosted_zone_id: String, access_key: String, secret_key: String) -> Self {
+        let creds = aws_sdk_route53::config::Credentials::new(
             access_key,
             secret_key,
-            client: reqwest::Client::new(),
+            None,
+            None,
+            "lorica-acme",
+        );
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_sdk_route53::config::Region::new("us-east-1"))
+            .credentials_provider(creds)
+            .load()
+            .await;
+        let client = aws_sdk_route53::Client::new(&config);
+        Self {
+            hosted_zone_id,
+            client,
+            created_values: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    /// Build the Route53 ChangeResourceRecordSets XML payload.
-    fn build_change_xml(action: &str, domain: &str, value: &str) -> String {
+    async fn change_record(
+        &self,
+        action: aws_sdk_route53::types::ChangeAction,
+        domain: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        use aws_sdk_route53::types::{
+            Change, ChangeBatch, ResourceRecord, ResourceRecordSet, RrType,
+        };
+
         let record_name = format!("_acme-challenge.{domain}.");
-        format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<ChangeResourceRecordSetsRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">
-  <ChangeBatch>
-    <Changes>
-      <Change>
-        <Action>{action}</Action>
-        <ResourceRecordSet>
-          <Name>{record_name}</Name>
-          <Type>TXT</Type>
-          <TTL>120</TTL>
-          <ResourceRecords>
-            <ResourceRecord>
-              <Value>"{value}"</Value>
-            </ResourceRecord>
-          </ResourceRecords>
-        </ResourceRecordSet>
-      </Change>
-    </Changes>
-  </ChangeBatch>
-</ChangeResourceRecordSetsRequest>"#
-        )
-    }
+        let txt_value = format!("\"{value}\"");
 
-    /// Sign and send a Route53 ChangeResourceRecordSets request.
-    ///
-    /// Uses a simplified AWS Signature V4 approach. For production use, consider
-    /// integrating the `aws-sdk-route53` crate for full SigV4 support.
-    async fn send_change_request(&self, xml_body: &str) -> Result<(), String> {
-        let url = format!(
-            "https://route53.amazonaws.com/2013-04-01/hostedzone/{}/rrset",
-            self.hosted_zone_id
-        );
+        let change = Change::builder()
+            .action(action)
+            .resource_record_set(
+                ResourceRecordSet::builder()
+                    .name(&record_name)
+                    .r#type(RrType::Txt)
+                    .ttl(120)
+                    .resource_records(
+                        ResourceRecord::builder().value(&txt_value).build(),
+                    )
+                    .build(),
+            )
+            .build();
 
-        let date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let date_short = &date[..8];
+        let batch = ChangeBatch::builder().changes(change).build();
 
-        // Compute SHA-256 hash of the request body
-        use ring::digest;
-        let body_hash = digest::digest(&digest::SHA256, xml_body.as_bytes());
-        let body_hash_hex = hex_encode(body_hash.as_ref());
-
-        // Build canonical request components for AWS SigV4
-        let canonical_uri = format!("/2013-04-01/hostedzone/{}/rrset", self.hosted_zone_id);
-        let canonical_headers = format!(
-            "content-type:application/xml\nhost:route53.amazonaws.com\nx-amz-date:{date}\n"
-        );
-        let signed_headers = "content-type;host;x-amz-date";
-
-        let canonical_request = format!(
-            "POST\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{body_hash_hex}"
-        );
-
-        let canonical_request_hash =
-            hex_encode(digest::digest(&digest::SHA256, canonical_request.as_bytes()).as_ref());
-
-        let credential_scope = format!("{date_short}/us-east-1/route53/aws4_request");
-        let string_to_sign =
-            format!("AWS4-HMAC-SHA256\n{date}\n{credential_scope}\n{canonical_request_hash}");
-
-        // Derive signing key
-        let k_date = hmac_sha256(
-            format!("AWS4{}", self.secret_key).as_bytes(),
-            date_short.as_bytes(),
-        );
-        let k_region = hmac_sha256(&k_date, b"us-east-1");
-        let k_service = hmac_sha256(&k_region, b"route53");
-        let k_signing = hmac_sha256(&k_service, b"aws4_request");
-
-        let signature = hex_encode(&hmac_sha256(&k_signing, string_to_sign.as_bytes()));
-
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
-            self.access_key
-        );
-
-        let resp = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/xml")
-            .header("X-Amz-Date", &date)
-            .header("Authorization", &authorization)
-            .body(xml_body.to_string())
+        self.client
+            .change_resource_record_sets()
+            .hosted_zone_id(&self.hosted_zone_id)
+            .change_batch(batch)
             .send()
             .await
-            .map_err(|e| format!("Route53 API request failed: {e}"))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Route53 API returned {status}: {body}"));
-        }
+            .map_err(|e| format!("Route53 API error: {e}"))?;
 
         Ok(())
     }
 }
 
+#[cfg(feature = "route53")]
 #[async_trait::async_trait]
 impl DnsChallenger for Route53DnsChallenger {
     async fn create_txt_record(&self, domain: &str, value: &str) -> Result<(), String> {
-        let xml = Self::build_change_xml("UPSERT", domain, value);
-        self.send_change_request(&xml).await?;
+        self.change_record(
+            aws_sdk_route53::types::ChangeAction::Upsert,
+            domain,
+            value,
+        )
+        .await?;
+        self.created_values
+            .lock()
+            .unwrap()
+            .insert(domain.to_string(), value.to_string());
         info!(domain = %domain, "Route53 DNS TXT record created");
         Ok(())
     }
 
     async fn delete_txt_record(&self, domain: &str) -> Result<(), String> {
-        // DELETE requires the exact value; use a placeholder since Route53
-        // UPSERT + DELETE semantics require knowing the value. We pass an
-        // empty string which will match the most recent UPSERT.
-        let xml = Self::build_change_xml("DELETE", domain, "");
-        self.send_change_request(&xml).await?;
+        let value = self
+            .created_values
+            .lock()
+            .unwrap()
+            .remove(domain)
+            .unwrap_or_default();
+        if value.is_empty() {
+            warn!(domain = %domain, "Route53 delete: no tracked value, skipping");
+            return Ok(());
+        }
+        self.change_record(
+            aws_sdk_route53::types::ChangeAction::Delete,
+            domain,
+            &value,
+        )
+        .await?;
         info!(domain = %domain, "Route53 DNS TXT record deleted");
         Ok(())
     }
 }
 
-/// Compute HMAC-SHA256 and return raw bytes.
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    use ring::hmac;
-    let k = hmac::Key::new(hmac::HMAC_SHA256, key);
-    hmac::sign(&k, data).as_ref().to_vec()
-}
-
-/// Hex-encode a byte slice.
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Build a `DnsChallenger` from a `DnsChallengeConfig`.
-pub fn build_dns_challenger(config: &DnsChallengeConfig) -> Result<Box<dyn DnsChallenger>, String> {
+pub async fn build_dns_challenger(config: &DnsChallengeConfig) -> Result<Box<dyn DnsChallenger>, String> {
     config.validate()?;
     match config.provider.as_str() {
         "cloudflare" => Ok(Box::new(CloudflareDnsChallenger::new(
             config.zone_id.clone(),
             config.api_token.clone(),
         ))),
+        #[cfg(feature = "route53")]
         "route53" => Ok(Box::new(Route53DnsChallenger::new(
             config.zone_id.clone(),
             config.api_token.clone(),
             config.api_secret.clone().unwrap_or_default(),
-        ))),
+        ).await)),
+        #[cfg(not(feature = "route53"))]
+        "route53" => Err("route53 provider requires the 'route53' feature flag".into()),
         other => Err(format!("unsupported DNS provider: {other}")),
     }
 }
@@ -800,6 +766,7 @@ pub async fn provision_certificate_dns(
     }
 
     let challenger = build_dns_challenger(&body.dns)
+        .await
         .map_err(|e| ApiError::BadRequest(format!("failed to build DNS challenger: {e}")))?;
 
     let config = AcmeConfig {
@@ -1466,47 +1433,37 @@ mod tests {
         assert!(err.contains("api_secret"));
     }
 
-    #[test]
-    fn test_build_dns_challenger_cloudflare() {
+    #[tokio::test]
+    async fn test_build_dns_challenger_cloudflare() {
         let config = DnsChallengeConfig {
             provider: "cloudflare".into(),
             zone_id: "zone123".into(),
             api_token: "token456".into(),
             api_secret: None,
         };
-        assert!(build_dns_challenger(&config).is_ok());
+        assert!(build_dns_challenger(&config).await.is_ok());
     }
 
-    #[test]
-    fn test_build_dns_challenger_route53() {
+    #[tokio::test]
+    async fn test_build_dns_challenger_route53() {
         let config = DnsChallengeConfig {
             provider: "route53".into(),
             zone_id: "Z1234567890".into(),
             api_token: "AKIAIOSFODNN7EXAMPLE".into(),
             api_secret: Some("secret".into()),
         };
-        assert!(build_dns_challenger(&config).is_ok());
+        assert!(build_dns_challenger(&config).await.is_ok());
     }
 
-    #[test]
-    fn test_build_dns_challenger_invalid() {
+    #[tokio::test]
+    async fn test_build_dns_challenger_invalid() {
         let config = DnsChallengeConfig {
             provider: "invalid".into(),
             zone_id: "zone".into(),
             api_token: "token".into(),
             api_secret: None,
         };
-        assert!(build_dns_challenger(&config).is_err());
-    }
-
-    #[test]
-    fn test_route53_change_xml_structure() {
-        let xml = Route53DnsChallenger::build_change_xml("UPSERT", "example.com", "test-value-123");
-        assert!(xml.contains("_acme-challenge.example.com."));
-        assert!(xml.contains("UPSERT"));
-        assert!(xml.contains("TXT"));
-        assert!(xml.contains("\"test-value-123\""));
-        assert!(xml.contains("<TTL>120</TTL>"));
+        assert!(build_dns_challenger(&config).await.is_err());
     }
 
     #[test]

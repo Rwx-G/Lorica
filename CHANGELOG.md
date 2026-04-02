@@ -83,7 +83,7 @@ Author: Rwx-G
 - Config export/import with diff preview
 - Nginx config import wizard - paste an `nginx.conf` to auto-create routes, backends, and certificates
 - Input validation on all forms, sort/filter on Backends and Routes tables
-- DNS-01 ACME form hint explaining supported providers (Cloudflare, Route53) and planned manual DNS-01 support
+- DNS-01 ACME form with automatic (Cloudflare, Route53 via AWS SDK) and manual (any provider) modes
 
 **ACME (Epic 4)**
 
@@ -114,6 +114,7 @@ Author: Rwx-G
 ### Changed
 
 - DashMap for ban list and per-route connection counters in the proxy hot path, replacing `RwLock<HashMap>` for reduced contention under high concurrency
+- Route53 DNS-01 provider migrated from custom SigV4 signing to official `aws-sdk-route53` crate. DELETE now uses the exact TXT value (tracked from create). Behind `route53` feature flag (enabled by default)
 
 ### Fixed
 

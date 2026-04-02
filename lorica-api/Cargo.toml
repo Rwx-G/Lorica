@@ -26,6 +26,8 @@ argon2 = "0.5"
 rand = "0.8"
 rcgen = "0.13"
 ring = "0.17"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"], optional = true }
+aws-sdk-route53 = { version = "1", optional = true }
 sysinfo = "0.33"
 thiserror = "2"
 instant-acme = "0.7"
@@ -37,6 +39,10 @@ tracing = "0.1"
 prometheus = "0.14"
 once_cell = { workspace = true }
 http = { workspace = true }
+
+[features]
+default = ["route53"]
+route53 = ["aws-config", "aws-sdk-route53"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
