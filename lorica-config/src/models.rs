@@ -485,6 +485,9 @@ pub struct GlobalSettings {
     /// New requests receive 503 when this limit is reached. 0 = unlimited (default).
     #[serde(default)]
     pub max_global_connections: i32,
+    /// Whether the IP blocklist is enabled. Persisted so it survives restarts.
+    #[serde(default)]
+    pub ip_blocklist_enabled: bool,
     /// Global flood detection threshold (requests per second).
     /// When the proxy-wide RPS exceeds this value, per-IP rate limits are
     /// halved to provide stricter protection. 0 = disabled (default).
@@ -582,6 +585,7 @@ impl Default for GlobalSettings {
             loadtest_max_concurrency: 100,
             loadtest_max_duration_s: 60,
             loadtest_max_rps: 1000,
+            ip_blocklist_enabled: false,
             max_global_connections: 0,
             flood_threshold_rps: 0,
             custom_security_presets: Vec::new(),

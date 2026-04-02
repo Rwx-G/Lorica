@@ -240,6 +240,13 @@ fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> Setting
             new_value: incoming.default_topology_type.as_str().to_string(),
         });
     }
+    if current.ip_blocklist_enabled != incoming.ip_blocklist_enabled {
+        changes.push(SettingChange {
+            key: "ip_blocklist_enabled".to_string(),
+            old_value: current.ip_blocklist_enabled.to_string(),
+            new_value: incoming.ip_blocklist_enabled.to_string(),
+        });
+    }
     if current.max_global_connections != incoming.max_global_connections {
         changes.push(SettingChange {
             key: "max_global_connections".to_string(),

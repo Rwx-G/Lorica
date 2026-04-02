@@ -19,6 +19,7 @@ Author: Rwx-G
 - NFR validation script: force `LC_ALL=C` for consistent decimal separator on French locale systems
 - Packaging (.deb/.rpm): service auto-restarts on upgrade (no manual `systemctl start` needed)
 - Packaging (.deb): removed conffiles prompt on upgrade - service file replaced cleanly, customize via `systemctl edit lorica` (drop-in overrides)
+- IP blocklist enabled/disabled state now persisted in GlobalSettings and restored on restart
 
 ## [0.1.1] - 2026-04-02
 

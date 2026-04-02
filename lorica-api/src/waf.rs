@@ -296,6 +296,15 @@ pub async fn toggle_blocklist(
     engine.ip_blocklist().set_enabled(body.enabled);
     let count = engine.ip_blocklist().len();
 
+    // Persist blocklist state so it survives restarts
+    {
+        let store = state.store.lock().await;
+        if let Ok(mut settings) = store.get_global_settings() {
+            settings.ip_blocklist_enabled = body.enabled;
+            let _ = store.update_global_settings(&settings);
+        }
+    }
+
     Ok(json_data(serde_json::json!({
         "enabled": body.enabled,
         "ip_count": count,

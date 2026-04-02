@@ -774,6 +774,17 @@ fn run_single_process(cli: Cli) {
         let waf_event_buffer = waf_engine.event_buffer();
         let waf_rule_count = waf_engine.rule_count();
 
+        // Restore IP blocklist enabled state from persisted settings
+        {
+            let s = store.lock().await;
+            if let Ok(settings) = s.get_global_settings() {
+                if settings.ip_blocklist_enabled {
+                    waf_engine.ip_blocklist().set_enabled(true);
+                    info!("IP blocklist restored as enabled from settings");
+                }
+            }
+        }
+
         // Spawn IP blocklist auto-refresh (every 6 hours, matching Data-Shield update frequency)
         let _blocklist_refresh = lorica_api::waf::spawn_blocklist_refresh(
             Arc::clone(&waf_engine),
