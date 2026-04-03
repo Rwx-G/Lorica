@@ -55,6 +55,8 @@ pub struct AppState {
     pub cache_backend: Option<&'static lorica_cache::MemCache>,
     /// EWMA scores per backend address (microseconds). Shared with the proxy engine.
     pub ewma_scores: Option<Arc<std::sync::RwLock<HashMap<String, f64>>>>,
+    /// Notification event history ring buffer (shared with NotifyDispatcher).
+    pub notification_history: Option<Arc<std::sync::Mutex<VecDeque<lorica_notify::AlertEvent>>>>,
 }
 
 impl AppState {
@@ -166,6 +168,10 @@ pub fn build_router(
         .route(
             "/api/v1/notifications/:id/test",
             post(crate::settings::test_notification),
+        )
+        .route(
+            "/api/v1/notifications/history",
+            get(crate::settings::notification_history),
         )
         .route(
             "/api/v1/preferences",

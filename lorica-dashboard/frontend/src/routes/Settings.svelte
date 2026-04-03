@@ -51,6 +51,15 @@
   let preferences: UserPreferenceResponse[] = $state([]);
   let deletingPref: UserPreferenceResponse | null = $state(null);
 
+  // Notification history
+  interface NotifEvent {
+    alert_type: string;
+    summary: string;
+    timestamp: string;
+    details: Record<string, string>;
+  }
+  let notifHistory: NotifEvent[] = $state([]);
+
   // Getting started guide (localStorage)
   const HELPER_KEY = 'lorica_helper_dismissed';
   let helperGuideVisible = $state(localStorage.getItem(HELPER_KEY) !== 'true');
@@ -84,10 +93,11 @@
   async function loadAll() {
     loading = true;
     error = '';
-    const [settingsRes, notifRes, prefRes] = await Promise.all([
+    const [settingsRes, notifRes, prefRes, histRes] = await Promise.all([
       api.getSettings(),
       api.listNotifications(),
       api.listPreferences(),
+      api.notificationHistory(),
     ]);
     if (settingsRes.error) {
       error = settingsRes.error.message;
@@ -98,6 +108,9 @@
     }
     if (notifRes.data) {
       notifications = notifRes.data.notifications;
+    }
+    if (histRes.data) {
+      notifHistory = histRes.data.events;
     }
     if (prefRes.data) {
       preferences = prefRes.data.preferences;
@@ -552,6 +565,37 @@
                     <button class="btn-link" onclick={() => openNotifEdit(nc)}>Edit</button>
                     <button class="btn-link danger" onclick={() => deletingNotif = nc}>Delete</button>
                   </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    </section>
+
+    <!-- Notification History -->
+    <section class="section">
+      <h2>Notification History</h2>
+      <p class="section-hint">Recent alert events dispatched by Lorica (last 100).</p>
+
+      {#if notifHistory.length === 0}
+        <p class="empty-text">No notification events yet.</p>
+      {:else}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Type</th>
+                <th>Summary</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each notifHistory as ev}
+                <tr>
+                  <td class="mono">{new Date(ev.timestamp).toLocaleString()}</td>
+                  <td><span class="badge badge-{ev.alert_type === 'sla_breached' || ev.alert_type === 'backend_down' ? 'red' : ev.alert_type === 'cert_expiring' ? 'orange' : 'blue'}">{ev.alert_type}</span></td>
+                  <td>{ev.summary}</td>
                 </tr>
               {/each}
             </tbody>

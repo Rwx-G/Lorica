@@ -498,6 +498,9 @@ export const api = {
   testNotification: (id: string) =>
     request<{ message: string; channel: string }>('POST', `/notifications/${id}/test`),
 
+  notificationHistory: () =>
+    request<{ events: { alert_type: string; summary: string; timestamp: string; details: Record<string, string> }[]; total: number }>('GET', '/notifications/history'),
+
   // Preferences
   listPreferences: () =>
     request<{ preferences: UserPreferenceResponse[] }>('GET', '/preferences'),

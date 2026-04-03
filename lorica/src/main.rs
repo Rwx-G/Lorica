@@ -532,6 +532,10 @@ fn run_supervisor(cli: Cli) {
                 ban_list: None,
                 cache_backend: None,
                 ewma_scores: None,
+                notification_history: {
+                    let d = notify_dispatcher.lock().await;
+                    Some(d.history())
+                },
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
@@ -1017,6 +1021,7 @@ fn run_single_process(cli: Cli) {
             let s = store.lock().await;
             build_notify_dispatcher(&s)
         };
+        let notification_history = notify_dispatcher.history();
         let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
         let _alert_dispatcher = lorica_notify::spawn_alert_dispatcher(
             &alert_sender,
@@ -1126,6 +1131,7 @@ fn run_single_process(cli: Cli) {
                 ban_list: Some(proxy_ban_list),
                 cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
                 ewma_scores: Some(proxy_ewma_scores),
+                notification_history: Some(notification_history),
             };
 
             // Spawn ACME certificate auto-renewal (check every 12h, renew at 30 days before expiry)

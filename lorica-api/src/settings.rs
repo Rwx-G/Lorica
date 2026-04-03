@@ -181,6 +181,22 @@ pub async fn test_notification(
     })))
 }
 
+/// GET /api/v1/notifications/history
+pub async fn notification_history(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let events = if let Some(ref history) = state.notification_history {
+        let h = history.lock().unwrap();
+        h.iter().rev().cloned().collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+    Ok(json_data(serde_json::json!({
+        "events": events,
+        "total": events.len(),
+    })))
+}
+
 fn validate_notification_config(config: &str) -> Result<(), ApiError> {
     if config.is_empty() {
         return Err(ApiError::BadRequest("config must not be empty".into()));
