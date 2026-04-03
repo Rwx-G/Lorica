@@ -3,6 +3,13 @@
 **/*.rs.bk
 Cargo.lock
 
+# Working docs
+FIXLIST.md
+
+# Build artifacts
+/dist/
+/.pnpm-store/
+
 # Frontend
 node_modules/
 **/frontend/dist/
