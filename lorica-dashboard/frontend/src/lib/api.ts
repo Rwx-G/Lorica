@@ -23,12 +23,34 @@ async function request<T>(
   if (body !== undefined) {
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(`${BASE}${path}`, opts);
-  const json = await res.json();
-  if (!res.ok) {
-    return { error: json.error ?? { code: 'unknown', message: res.statusText } };
+
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, opts);
+  } catch {
+    // Network error (backend unreachable, connection refused)
+    return { error: { code: 'network_error', message: 'Unable to reach the server. Is Lorica running?' } };
   }
-  return { data: json.data };
+
+  // Session expired or invalid - redirect to login
+  if (res.status === 401 && path !== '/auth/login') {
+    const { auth } = await import('./auth');
+    auth.set({ status: 'unauthenticated' });
+    return { error: { code: 'unauthorized', message: 'Session expired. Please log in again.' } };
+  }
+
+  let json: Record<string, unknown>;
+  try {
+    json = await res.json();
+  } catch {
+    // Non-JSON response (e.g., backend returned HTML error page)
+    return { error: { code: 'parse_error', message: `Server returned invalid response (${res.status})` } };
+  }
+
+  if (!res.ok) {
+    return { error: (json.error as ApiError) ?? { code: 'unknown', message: res.statusText } };
+  }
+  return { data: json.data as T };
 }
 
 export interface LoginRequest {

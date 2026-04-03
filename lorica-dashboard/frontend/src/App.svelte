@@ -36,11 +36,14 @@
 
   onMount(async () => {
     // Check if we already have a valid session cookie (survives F5)
-    const res = await api.getStatus();
-    if (res.data) {
-      auth.set({ status: 'authenticated' });
-      // Load theme preference immediately after confirming session
-      await loadTheme();
+    try {
+      const res = await api.getStatus();
+      if (res.data) {
+        auth.set({ status: 'authenticated' });
+        await loadTheme();
+      }
+    } catch {
+      // Backend unreachable - stay on login screen
     }
     checking = false;
   });
