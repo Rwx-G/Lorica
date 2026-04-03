@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import type { RouteResponse, BackendResponse, CertificateResponse } from '../lib/api';
   import { api } from '../lib/api';
   import {
@@ -36,7 +37,6 @@
   let formError = $state('');
   let formSubmitting = $state(false);
   let activeTab = $state('general');
-  let hasUnsavedChanges = $state(false);
   let initialFormJson = $state('');
 
   const TABS = [
@@ -49,28 +49,26 @@
     { id: 'protection', label: 'Protection' },
   ];
 
-  // Reset form when drawer opens or editing target changes
+  // Reset form when drawer opens - untrack body so form/editing changes
+  // don't re-trigger this effect (would reset activeTab on every keystroke)
   $effect(() => {
     if (open) {
-      if (editing) {
-        form = routeToFormState(editing);
-      } else {
-        form = { ...ROUTE_DEFAULTS, backend_ids: [] };
-      }
-      initialFormJson = JSON.stringify(form);
-      formError = '';
-      formSubmitting = false;
-      activeTab = 'general';
-      hasUnsavedChanges = false;
+      untrack(() => {
+        if (editing) {
+          form = routeToFormState(editing);
+        } else {
+          form = { ...ROUTE_DEFAULTS, backend_ids: [] };
+        }
+        initialFormJson = JSON.stringify(form);
+        formError = '';
+        formSubmitting = false;
+        activeTab = 'general';
+      });
     }
   });
 
-  // Track unsaved changes
-  $effect(() => {
-    if (open && initialFormJson) {
-      hasUnsavedChanges = JSON.stringify(form) !== initialFormJson;
-    }
-  });
+  // Track unsaved changes (derived - no side effects)
+  let hasUnsavedChanges = $derived(open && initialFormJson ? JSON.stringify(form) !== initialFormJson : false);
 
   let modifiedFields: Set<string> = $derived(getModifiedFields(form));
 
@@ -90,12 +88,6 @@
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
-      handleClose();
-    }
-  }
-
-  function handleOverlayClick(e: MouseEvent) {
-    if (e.target === e.currentTarget) {
       handleClose();
     }
   }
@@ -130,7 +122,6 @@
     }
 
     formSubmitting = false;
-    hasUnsavedChanges = false;
     onclose();
     onsave();
   }
@@ -140,13 +131,14 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="drawer-overlay"
-    onclick={handleOverlayClick}
     onkeydown={handleKeydown}
     role="dialog"
     aria-modal="true"
     tabindex="-1"
   >
+    <!-- Backdrop: separate DOM branch so clicks don't interfere with drawer buttons (Svelte 5 event delegation) -->
     <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+    <div class="drawer-backdrop" onclick={handleClose}></div>
     <div class="drawer" role="document">
       <!-- Header -->
       <div class="drawer-header">
@@ -221,13 +213,20 @@
   .drawer-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
     z-index: 100;
     display: flex;
     justify-content: flex-end;
   }
 
+  .drawer-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+  }
+
   .drawer {
+    position: relative;
+    z-index: 1;
     width: 900px;
     max-width: 100vw;
     height: 100vh;
