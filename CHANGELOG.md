@@ -23,6 +23,7 @@ Author: Rwx-G
 - Real-time access log forwarding in worker mode via Unix domain socket (`/var/lib/lorica/log.sock`). Workers stream logs to the supervisor with sub-millisecond latency, making WebSocket live logs work in multi-worker mode
 - WAF engine in supervisor process for worker mode: rules listing, blocklist toggle, custom rules, and event viewing now work in the dashboard when running with `--workers N`
 - IP blocklist auto-refresh (every 6h) in supervisor mode
+- WAF: 10 new detection rules - SSRF (cloud metadata, localhost, dangerous URI schemes, internal networks), Log4Shell/JNDI injection, XXE (DOCTYPE/ENTITY), CRLF injection. Total: 28 rules across 8 categories
 
 ### Fixed
 
@@ -33,7 +34,8 @@ Author: Rwx-G
 - Worker mode: graceful shutdown with 30s drain timeout then SIGKILL (Sozu soft-stop pattern, fixes `systemctl stop lorica` hanging)
 - Worker mode: worker PIDs now correctly reported in System dashboard (was hardcoded to 0)
 - IP blocklist: loaded immediately at startup when enabled (previously empty until first 6h refresh)
-- Dashboard: all modal/drawer buttons now functional (RouteDrawer tabs, cancel, close; ConfirmDialog; Certificates modals; Settings dialogs). Root cause: Svelte 5 event delegation incompatible with stopPropagation on container divs
+- Dashboard: all modal/drawer buttons now functional. Root cause: Svelte 5 event delegation incompatible with stopPropagation on container divs, plus RouteDrawer $effect tracking `form` as dependency caused state reset on every interaction (fixed via untrack + $derived)
+- Dashboard: graceful error handling when backend is unreachable (network error, JSON parse failure). Auto-redirect to login on 401 session expiry instead of crashing with JSON error
 - Dashboard: HTTP/2 upstream checkbox text no longer wraps to two lines in backend form
 - Dashboard: ACME certificate form has proper spacing before "Use staging environment" checkbox when DNS-01 mode is selected
 - NFR validation script: use threaded backend with `/slow` endpoint (3s delay) for realistic 10k connection holding test
