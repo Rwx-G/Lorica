@@ -446,6 +446,8 @@ pub struct LoricaProxy {
     pub cache_hits: Arc<AtomicU64>,
     /// Cache miss counter for dashboard stats.
     pub cache_misses: Arc<AtomicU64>,
+    /// ACME HTTP-01 challenge store (shared with API, None in worker mode).
+    pub acme_challenge_store: Option<lorica_api::acme::AcmeChallengeStore>,
 }
 
 impl LoricaProxy {
@@ -470,6 +472,7 @@ impl LoricaProxy {
             global_rate: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
+            acme_challenge_store: None,
         }
     }
 
@@ -508,6 +511,21 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // ACME HTTP-01 challenge intercept (must respond before any other check)
+        if let Some(ref challenge_store) = self.acme_challenge_store {
+            let path = session.req_header().uri.path();
+            if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+                if let Some(key_auth) = challenge_store.get(token).await {
+                    let mut header = ResponseHeader::build(200, None)?;
+                    header.insert_header("Content-Type", "text/plain")?;
+                    header.insert_header("Content-Length", key_auth.len().to_string())?;
+                    session.write_response_header(Box::new(header), false).await?;
+                    session.write_response_body(Some(bytes::Bytes::from(key_auth)), true).await?;
+                    return Ok(true);
+                }
+            }
+        }
+
         // Global flood tracking (before any other processing)
         self.global_rate.observe(&"global", 1);
 
