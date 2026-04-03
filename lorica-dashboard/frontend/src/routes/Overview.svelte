@@ -646,6 +646,10 @@
     transition: grid-template-rows 0.25s ease, opacity 0.25s ease;
   }
 
+  .detail-anim:not(.open) {
+    pointer-events: none;
+  }
+
   .detail-anim.open {
     grid-template-rows: 1fr;
     opacity: 1;
@@ -654,6 +658,12 @@
   .detail-anim > * {
     overflow: hidden;
     min-height: 0;
+    padding: 0;
+    margin: 0;
+  }
+
+  .detail-anim.open > * {
+    padding-top: var(--space-2);
   }
 
   /* Helper / Getting Started banner */
@@ -734,7 +744,7 @@
     border-radius: var(--radius-md);
     background: var(--color-bg-card);
     border: 1px solid var(--color-border);
-    padding: var(--space-3) var(--space-4);
+    padding: var(--space-2) var(--space-4);
   }
 
   .setup-step.done {
@@ -800,7 +810,7 @@
   }
 
   .step-detail {
-    margin: var(--space-2) 0 0;
+    margin: 0;
     font-size: var(--text-sm);
     color: var(--color-text-muted);
     line-height: 1.5;
@@ -872,8 +882,9 @@
   }
 
   .section-helper-text {
-    margin: 0 0 var(--space-3);
+    margin: 0;
     padding: var(--space-3);
+    margin-bottom: var(--space-3);
     font-size: var(--text-sm);
     color: var(--color-text-muted);
     line-height: 1.5;
