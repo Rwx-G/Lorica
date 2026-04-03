@@ -51,6 +51,8 @@ pub struct WorkerConfig {
     pub http_addr: String,
     /// HTTPS proxy listen address (e.g. "0.0.0.0:8443").
     pub https_addr: Option<String>,
+    /// HTTPS port number for workers to identify TLS listeners.
+    pub https_port: u16,
 }
 
 impl WorkerConfig {
@@ -218,6 +220,8 @@ impl WorkerManager {
                     cmd_fd_raw.to_string(),
                     "--data-dir".to_string(),
                     self.config.data_dir.clone(),
+                    "--https-port".to_string(),
+                    self.config.https_port.to_string(),
                     "--log-level".to_string(),
                     self.config.log_level.clone(),
                 ];
@@ -433,6 +437,7 @@ mod tests {
             log_level: "info".to_string(),
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: None,
+            https_port: 0,
         };
         let mgr = WorkerManager::new(config);
         assert_eq!(mgr.worker_count(), 0);
@@ -477,6 +482,7 @@ mod tests {
             log_level: "info".to_string(),
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: None,
+            https_port: 0,
         };
         let mgr = WorkerManager::new(config);
         let events = mgr.check_workers();

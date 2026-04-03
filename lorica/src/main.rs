@@ -89,6 +89,10 @@ enum Commands {
         #[arg(long)]
         data_dir: String,
 
+        /// HTTPS port (0 = no TLS)
+        #[arg(long, default_value = "0")]
+        https_port: u16,
+
         /// Log level
         #[arg(long, default_value = "info")]
         log_level: String,
@@ -135,10 +139,11 @@ fn main() {
             id,
             cmd_fd,
             data_dir,
+            https_port,
             log_level,
         }) => {
             init_logging(&log_level);
-            run_worker(id, cmd_fd, &data_dir);
+            run_worker(id, cmd_fd, &data_dir, https_port);
         }
         None => {
             init_logging(&cli.log_level);
@@ -179,6 +184,7 @@ fn run_supervisor(cli: Cli) {
         log_level: cli.log_level.clone(),
         http_addr: format!("0.0.0.0:{}", cli.http_port),
         https_addr: Some(format!("0.0.0.0:{}", cli.https_port)),
+        https_port: cli.https_port,
     };
 
     // Fork workers BEFORE creating any threads/runtime
@@ -631,7 +637,7 @@ fn run_supervisor(cli: Cli) {
 // Worker mode (Unix only): receives FDs from supervisor, runs proxy engine
 // ---------------------------------------------------------------------------
 
-fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
+fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16) {
     use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_core::server::Fds;
     use lorica_worker::fd_passing;
@@ -662,10 +668,12 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
         info!(worker_id = id, addr = %addr, fd = fd, "registered listener FD");
     }
 
-    // Open the configuration database (read-only access via WAL mode)
+    // Open the configuration database with encryption key
     let data_dir = PathBuf::from(data_dir);
+    let key_path = data_dir.join("encryption.key");
+    let encryption_key = lorica_config::crypto::EncryptionKey::load_or_create(&key_path).ok();
     let db_path = data_dir.join("lorica.db");
-    let store = match ConfigStore::open(&db_path, None) {
+    let store = match ConfigStore::open(&db_path, encryption_key) {
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, "worker failed to open database");
@@ -687,10 +695,35 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
         }
     });
 
+    // Build CertResolver for TLS termination in worker
+    let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
+    rt.block_on(async {
+        let db_certs = store.lock().await;
+        let certs = db_certs.list_certificates().unwrap_or_default();
+        if !certs.is_empty() {
+            let cert_data: Vec<lorica_tls::cert_resolver::CertData> = certs
+                .iter()
+                .map(|c| lorica_tls::cert_resolver::CertData {
+                    domain: c.domain.clone(),
+                    san_domains: c.san_domains.clone(),
+                    cert_pem: c.cert_pem.clone(),
+                    key_pem: c.key_pem.clone(),
+                    not_after_epoch: c.not_after.timestamp(),
+                })
+                .collect();
+            if let Err(e) = cert_resolver.reload(cert_data) {
+                warn!(error = %e, "worker failed to load certificates into resolver");
+            } else {
+                info!(worker_id = id, domains = cert_resolver.domain_count(), "worker loaded TLS certificates");
+            }
+        }
+    });
+
     // Start the command channel listener in a background thread
     // (the proxy server's run_forever blocks the main thread)
     let cmd_store = Arc::clone(&store);
     let cmd_config = Arc::clone(&proxy_config);
+    let cmd_cert_resolver = Arc::clone(&cert_resolver);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create command channel runtime");
         rt.block_on(async move {
@@ -720,6 +753,7 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
                 match cmd.typed_command() {
                     CommandType::ConfigReload => {
                         info!(worker_id = id, seq = cmd.sequence, "applying config reload");
+                        lorica::reload::reload_cert_resolver(&cmd_store, &cmd_cert_resolver).await;
                         match reload_proxy_config(&cmd_store, &cmd_config).await {
                             Ok(()) => {
                                 let resp = Response::ok(cmd.sequence);
@@ -822,10 +856,19 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str) {
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
 
-    // Register the same addresses that the supervisor bound, so that
-    // build() can match them against the FDs received via SCM_RIGHTS.
+    // Register listeners - TCP for HTTP, TLS for HTTPS
+    let https_suffix = format!(":{https_port}");
     for addr in &listener_addrs {
-        proxy_service.add_tcp(addr);
+        if https_port > 0 && addr.ends_with(&https_suffix) {
+            let mut tls_settings =
+                lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
+            tls_settings.enable_h2();
+            proxy_service.add_tls_with_settings(addr, None, tls_settings);
+            info!(worker_id = id, addr = %addr, "registered TLS listener");
+        } else {
+            proxy_service.add_tcp(addr);
+            info!(worker_id = id, addr = %addr, "registered TCP listener");
+        }
     }
 
     info!(worker_id = id, "starting proxy engine");
