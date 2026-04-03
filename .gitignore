@@ -7,8 +7,10 @@ Cargo.lock
 FIXLIST.md
 
 # Build artifacts
-/dist/
 /.pnpm-store/
+dist/*.deb
+dist/*.rpm
+dist/lorica_*/
 
 # Frontend
 node_modules/
