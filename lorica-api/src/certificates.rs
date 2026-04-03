@@ -72,7 +72,111 @@ fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateRespon
 }
 
 /// Compute a SHA-256 fingerprint from PEM cert data using ring.
-fn compute_fingerprint(cert_pem: &str) -> String {
+/// Parsed X.509 metadata from a PEM certificate.
+struct ParsedCertInfo {
+    issuer: String,
+    not_before: chrono::DateTime<chrono::Utc>,
+    not_after: chrono::DateTime<chrono::Utc>,
+    san_domains: Vec<String>,
+    fingerprint: String,
+}
+
+/// Parse X.509 metadata from a PEM certificate string.
+/// Falls back to defaults if parsing fails (so uploads always succeed).
+fn parse_cert_pem(cert_pem: &str) -> ParsedCertInfo {
+    let defaults = || ParsedCertInfo {
+        issuer: "unknown".to_string(),
+        not_before: chrono::Utc::now(),
+        not_after: chrono::Utc::now() + chrono::Duration::days(365),
+        san_domains: Vec::new(),
+        fingerprint: compute_fingerprint_from_pem(cert_pem),
+    };
+
+    let pem_block = match pem::parse(cert_pem) {
+        Ok(p) => p,
+        Err(_) => {
+            // Try parsing first block from multi-block PEM (cert chain)
+            match pem::parse_many(cert_pem) {
+                Ok(blocks) if !blocks.is_empty() => blocks.into_iter().next().unwrap(),
+                _ => return defaults(),
+            }
+        }
+    };
+
+    let der = pem_block.contents();
+    let cert = match x509_parser::parse_x509_certificate(der) {
+        Ok((_, cert)) => cert,
+        Err(_) => return defaults(),
+    };
+
+    // Issuer: extract Organization + Common Name
+    let issuer = {
+        let mut parts = Vec::new();
+        for attr in cert.issuer().iter_organization() {
+            if let Ok(s) = attr.as_str() {
+                parts.push(s.to_string());
+            }
+        }
+        for attr in cert.issuer().iter_common_name() {
+            if let Ok(s) = attr.as_str() {
+                parts.push(s.to_string());
+            }
+        }
+        if parts.is_empty() {
+            "unknown".to_string()
+        } else {
+            parts.join(" - ")
+        }
+    };
+
+    // Validity dates
+    let not_before = asn1_to_chrono(cert.validity().not_before);
+    let not_after = asn1_to_chrono(cert.validity().not_after);
+
+    // SAN domains
+    let mut san_domains = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            if let x509_parser::prelude::GeneralName::DNSName(dns) = name {
+                san_domains.push(dns.to_string());
+            }
+        }
+    }
+
+    // Fingerprint from DER bytes (matches browser display)
+    let fingerprint = compute_fingerprint_from_der(der);
+
+    ParsedCertInfo {
+        issuer,
+        not_before,
+        not_after,
+        san_domains,
+        fingerprint,
+    }
+}
+
+fn asn1_to_chrono(t: x509_parser::prelude::ASN1Time) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_opt(t.timestamp(), 0)
+        .single()
+        .unwrap_or_else(chrono::Utc::now)
+}
+
+fn compute_fingerprint_from_der(der: &[u8]) -> String {
+    use std::fmt::Write;
+    let digest = ring::digest::digest(&ring::digest::SHA256, der);
+    let mut hex = String::with_capacity(digest.as_ref().len() * 3);
+    for (i, byte) in digest.as_ref().iter().enumerate() {
+        if i > 0 {
+            hex.push(':');
+        }
+        write!(hex, "{byte:02X}").unwrap();
+    }
+    hex
+}
+
+fn compute_fingerprint_from_pem(cert_pem: &str) -> String {
     use std::fmt::Write;
     let digest = ring::digest::digest(&ring::digest::SHA256, cert_pem.as_bytes());
     let mut hex = String::with_capacity(digest.as_ref().len() * 3);
@@ -109,19 +213,19 @@ pub async fn create_certificate(
         ));
     }
 
-    let fingerprint = compute_fingerprint(&body.cert_pem);
+    let parsed = parse_cert_pem(&body.cert_pem);
     let now = Utc::now();
 
     let cert = lorica_config::models::Certificate {
         id: uuid::Uuid::new_v4().to_string(),
         domain: body.domain,
-        san_domains: Vec::new(),
-        fingerprint,
+        san_domains: parsed.san_domains,
+        fingerprint: parsed.fingerprint,
         cert_pem: body.cert_pem,
         key_pem: body.key_pem,
-        issuer: "unknown".to_string(),
-        not_before: now,
-        not_after: now + chrono::Duration::days(365),
+        issuer: parsed.issuer,
+        not_before: parsed.not_before,
+        not_after: parsed.not_after,
         is_acme: false,
         acme_auto_renew: false,
         created_at: now,
@@ -187,7 +291,12 @@ pub async fn update_certificate(
         cert.domain = domain;
     }
     if let Some(cert_pem) = body.cert_pem {
-        cert.fingerprint = compute_fingerprint(&cert_pem);
+        let parsed = parse_cert_pem(&cert_pem);
+        cert.fingerprint = parsed.fingerprint;
+        cert.issuer = parsed.issuer;
+        cert.not_before = parsed.not_before;
+        cert.not_after = parsed.not_after;
+        cert.san_domains = parsed.san_domains;
         cert.cert_pem = cert_pem;
     }
     if let Some(key_pem) = body.key_pem {
@@ -249,19 +358,19 @@ pub async fn generate_self_signed(
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
 
-    let fingerprint = compute_fingerprint(&cert_pem);
+    let parsed = parse_cert_pem(&cert_pem);
     let now = Utc::now();
 
     let certificate = lorica_config::models::Certificate {
         id: uuid::Uuid::new_v4().to_string(),
         domain: body.domain,
-        san_domains: Vec::new(),
-        fingerprint,
+        san_domains: parsed.san_domains,
+        fingerprint: parsed.fingerprint,
         cert_pem: cert_pem.clone(),
         key_pem,
-        issuer: "Self-signed".to_string(),
-        not_before: now,
-        not_after: now + chrono::Duration::days(365),
+        issuer: parsed.issuer,
+        not_before: parsed.not_before,
+        not_after: parsed.not_after,
         is_acme: false,
         acme_auto_renew: false,
         created_at: now,
