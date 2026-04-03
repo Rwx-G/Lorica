@@ -393,6 +393,18 @@ pub fn spawn_blocklist_refresh(
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Initial fetch at startup if blocklist is already enabled (restored from settings)
+        if engine.ip_blocklist().is_enabled() {
+            match fetch_and_load_blocklist(engine.ip_blocklist()).await {
+                Ok(count) => {
+                    tracing::info!(count, "IP blocklist loaded at startup");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "IP blocklist initial load failed");
+                }
+            }
+        }
+
         loop {
             tokio::time::sleep(interval).await;
 
@@ -403,7 +415,7 @@ pub fn spawn_blocklist_refresh(
 
             match fetch_and_load_blocklist(engine.ip_blocklist()).await {
                 Ok(count) => {
-                    tracing::info!(count = count, "IP blocklist refreshed from remote");
+                    tracing::info!(count, "IP blocklist refreshed from remote");
                 }
                 Err(e) => {
                     tracing::warn!(
