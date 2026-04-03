@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use lorica_config::ConfigStore;
+use lorica_tls::cert_resolver::{CertData, CertResolver};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::proxy_wiring::ProxyConfig;
 
@@ -67,4 +68,36 @@ pub async fn reload_proxy_config(
 
     proxy_config.store(Arc::new(new_config));
     Ok(())
+}
+
+/// Reload the TLS certificate resolver from the database.
+/// Called alongside `reload_proxy_config` when certificates change.
+pub async fn reload_cert_resolver(
+    store: &Arc<Mutex<ConfigStore>>,
+    cert_resolver: &Arc<CertResolver>,
+) {
+    let s = store.lock().await;
+    let db_certs = match s.list_certificates() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "failed to list certificates for resolver reload");
+            return;
+        }
+    };
+
+    let cert_data: Vec<CertData> = db_certs
+        .iter()
+        .map(|c| CertData {
+            domain: c.domain.clone(),
+            san_domains: c.san_domains.clone(),
+            cert_pem: c.cert_pem.clone(),
+            key_pem: c.key_pem.clone(),
+            not_after_epoch: c.not_after.timestamp(),
+        })
+        .collect();
+
+    match cert_resolver.reload(cert_data) {
+        Ok(()) => info!(domains = cert_resolver.domain_count(), "TLS certificate resolver reloaded"),
+        Err(e) => warn!(error = %e, "failed to reload TLS certificate resolver"),
+    }
 }
