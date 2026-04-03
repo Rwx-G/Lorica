@@ -447,11 +447,18 @@ fn run_supervisor(cli: Cli) {
             std::time::Duration::from_secs(6 * 3600),
         );
 
+        // Create notification dispatcher from DB configs
+        let notify_dispatcher = {
+            let s = store.lock().await;
+            build_notify_dispatcher(&s)
+        };
+        let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
+
         // Bug 2 fix: Start probe scheduler in supervisor mode
         let probe_store = Arc::clone(&store);
         let probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
             probe_store,
-            None, // no notification dispatcher for now
+            Some(Arc::clone(&notify_dispatcher)),
         ));
         probe_scheduler.reload().await;
 
@@ -461,7 +468,7 @@ fn run_supervisor(cli: Cli) {
             let s = store.lock().await;
             sla_collector.load_configs(&s);
         }
-        sla_collector.start_flush_task(Arc::clone(&store), None);
+        sla_collector.start_flush_task(Arc::clone(&store), Some(Arc::clone(&notify_dispatcher)));
 
         // Reload proxy config, probe scheduler, and SLA configs on config changes
         let reload_store = Arc::clone(&store);
@@ -502,7 +509,7 @@ fn run_supervisor(cli: Cli) {
                 acme_challenge_store: None,
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
-                load_test_engine: None,
+                load_test_engine: Some(Arc::new(lorica_bench::LoadTestEngine::new())),
                 // cache/ban are per-worker process, not available in supervisor
                 cache_hits: None,
                 cache_misses: None,
@@ -951,19 +958,26 @@ fn run_single_process(cli: Cli) {
             std::time::Duration::from_secs(6 * 3600),
         );
 
+        // Create notification dispatcher from DB configs
+        let notify_dispatcher = {
+            let s = store.lock().await;
+            build_notify_dispatcher(&s)
+        };
+        let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
+
         // Create SLA collector and start background flush task
         let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
         {
             let s = store.lock().await;
             sla_collector.load_configs(&s);
         }
-        sla_collector.start_flush_task(Arc::clone(&store), None);
+        sla_collector.start_flush_task(Arc::clone(&store), Some(Arc::clone(&notify_dispatcher)));
 
         // Start active probe scheduler
         let probe_store = Arc::clone(&store);
         let probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
             probe_store,
-            None, // no notification dispatcher for now
+            Some(Arc::clone(&notify_dispatcher)),
         ));
         probe_scheduler.reload().await;
 
@@ -975,6 +989,9 @@ fn run_single_process(cli: Cli) {
         let lt_scheduler_engine = Arc::clone(&load_test_engine);
         lorica_bench::scheduler::start_scheduler(lt_scheduler_store, lt_scheduler_engine);
 
+        // Create shared ACME challenge store for proxy + API (internally Arc'd)
+        let acme_challenge_store = lorica_api::acme::AcmeChallengeStore::new();
+
         // Start the HTTP proxy service
         let mut lorica_proxy = LoricaProxy::new(
             Arc::clone(&proxy_config),
@@ -983,6 +1000,7 @@ fn run_single_process(cli: Cli) {
             Arc::clone(&sla_collector),
         );
         lorica_proxy.waf_engine = Arc::clone(&waf_engine);
+        lorica_proxy.acme_challenge_store = Some(acme_challenge_store.clone());
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
         let proxy_cache_misses = Arc::clone(&lorica_proxy.cache_misses);
@@ -996,9 +1014,11 @@ fn run_single_process(cli: Cli) {
 
         info!(port = cli.http_port, "HTTP proxy listener configured");
 
-        // Add TLS listener with SNI-based cert resolver (no cert files on disk)
+        // Add TLS listener with SNI-based cert resolver (always, even with no certs yet).
+        // Connections to unknown domains fail TLS handshake; when the first cert is uploaded
+        // and the resolver is reloaded, TLS starts working without restart.
         let https_port = cli.https_port;
-        if cert_resolver.domain_count() > 0 {
+        {
             let mut tls_settings =
                 lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
             tls_settings.enable_h2();
@@ -1009,7 +1029,7 @@ fn run_single_process(cli: Cli) {
                 Some(tls_tcp_opts),
                 tls_settings,
             );
-            info!(port = https_port, "HTTPS proxy listener configured with SNI resolver");
+            info!(port = https_port, domains = cert_resolver.domain_count(), "HTTPS proxy listener configured with SNI resolver");
         }
 
         // Create config reload channel so API mutations can trigger proxy reload
@@ -1035,7 +1055,7 @@ fn run_single_process(cli: Cli) {
                 waf_event_buffer: Some(waf_event_buffer),
                 waf_engine: Some(waf_engine),
                 waf_rule_count: Some(waf_rule_count),
-                acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::new()),
+                acme_challenge_store: Some(acme_challenge_store),
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
                 load_test_engine: Some(Arc::clone(&load_test_engine)),
@@ -1064,17 +1084,18 @@ fn run_single_process(cli: Cli) {
             }
         });
 
-        // Background task: reload proxy config and probe scheduler when API signals a change
+        // Background task: reload proxy config, cert resolver, and probe scheduler when API signals a change
         let reload_store = Arc::clone(&store);
         let reload_config = Arc::clone(&proxy_config);
+        let reload_cert_resolver = Arc::clone(&cert_resolver);
         let reload_probe_scheduler = Arc::clone(&probe_scheduler);
         let _reload_handle = tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
                 if let Err(e) = reload_proxy_config(&reload_store, &reload_config).await {
                     tracing::error!(error = %e, "failed to reload proxy configuration");
                 }
+                lorica::reload::reload_cert_resolver(&reload_store, &reload_cert_resolver).await;
                 reload_probe_scheduler.reload().await;
-                // Refresh SLA success criteria cache
                 {
                     let s = reload_store.lock().await;
                     reload_sla_collector.load_configs(&s);
@@ -1112,6 +1133,29 @@ fn run_single_process(cli: Cli) {
         api_handle.abort();
         health_handle.abort();
     });
+}
+
+/// Build a NotifyDispatcher from database notification configs.
+fn build_notify_dispatcher(store: &lorica_config::ConfigStore) -> lorica_notify::NotifyDispatcher {
+    let mut dispatcher = lorica_notify::NotifyDispatcher::new();
+    if let Ok(configs) = store.list_notification_configs() {
+        for nc in configs {
+            let config_json = &nc.config;
+            match nc.channel {
+                lorica_config::models::NotificationChannel::Email => {
+                    if let Ok(email_cfg) = serde_json::from_str::<lorica_notify::channels::EmailConfig>(config_json) {
+                        dispatcher.add_email_channel(nc.id, email_cfg, nc.alert_types, nc.enabled);
+                    }
+                }
+                lorica_config::models::NotificationChannel::Webhook => {
+                    if let Ok(webhook_cfg) = serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json) {
+                        dispatcher.add_webhook_channel(nc.id, webhook_cfg, nc.alert_types, nc.enabled);
+                    }
+                }
+            }
+        }
+    }
+    dispatcher
 }
 
 /// Restrict private key file permissions to owner-only read.
