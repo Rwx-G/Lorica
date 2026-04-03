@@ -358,25 +358,19 @@
           <input type="text" bind:value={formHealthCheckPath} placeholder="/healthz" />
         </div>
 
-        <div class="form-row">
-          <div class="form-group">
-            <label class="checkbox-item">
-              <input type="checkbox" bind:checked={formHealthCheckEnabled} />
-              Health check enabled
-            </label>
-          </div>
-          <div class="form-group">
-            <label class="checkbox-item">
-              <input type="checkbox" bind:checked={formTlsUpstream} />
-              TLS upstream
-            </label>
-          </div>
-          <div class="form-group">
-            <label class="checkbox-item">
-              <input type="checkbox" bind:checked={formH2Upstream} />
-              HTTP/2 upstream (h2c for plaintext, ALPN h2 for TLS)
-            </label>
-          </div>
+        <div class="checkbox-row">
+          <label class="checkbox-item">
+            <input type="checkbox" bind:checked={formHealthCheckEnabled} />
+            Health check enabled
+          </label>
+          <label class="checkbox-item">
+            <input type="checkbox" bind:checked={formTlsUpstream} />
+            TLS upstream
+          </label>
+          <label class="checkbox-item">
+            <input type="checkbox" bind:checked={formH2Upstream} />
+            HTTP/2 upstream (h2c for plaintext, ALPN h2 for TLS)
+          </label>
         </div>
 
         <div class="form-actions">
@@ -404,4 +398,6 @@
   .search-input:focus { outline: none; border-color: var(--color-primary); box-shadow: 0 0 0 3px var(--color-primary-subtle); }
   .sortable { cursor: pointer; user-select: none; }
   .sortable:hover { color: var(--color-text-heading); }
+  .checkbox-row { display: flex; flex-wrap: wrap; gap: var(--space-4) var(--space-6); margin-top: var(--space-2); }
+  .checkbox-row .checkbox-item { white-space: nowrap; }
 </style>
