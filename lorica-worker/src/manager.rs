@@ -341,31 +341,43 @@ impl WorkerManager {
     }
 
     /// Send SIGTERM to all workers for graceful shutdown.
+    /// Graceful shutdown: send SIGTERM so workers stop accepting new connections
+    /// and drain active ones. After the drain timeout, send SIGKILL to any
+    /// workers still alive. Follows the Sozu soft-stop pattern.
     pub fn shutdown_all(&self) {
-        info!("sending SIGTERM to all workers");
+        self.shutdown_all_with_timeout(Duration::from_secs(30));
+    }
+
+    fn shutdown_all_with_timeout(&self, drain_timeout: Duration) {
+        info!("sending SIGTERM to all workers (drain timeout: {}s)", drain_timeout.as_secs());
         for handle in &self.workers {
             let _ = signal::kill(handle.pid, Signal::SIGTERM);
             info!(worker_id = handle.id, pid = handle.pid.as_raw(), "sent SIGTERM to worker");
         }
 
-        // Wait up to 5 seconds for workers to exit, then SIGKILL
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Wait for workers to drain active connections and exit
+        let deadline = Instant::now() + drain_timeout;
         loop {
             let all_dead = self.workers.iter().all(|h| {
-                signal::kill(h.pid, None).is_err() // kill(0) = check if alive
+                signal::kill(h.pid, None).is_err()
             });
             if all_dead {
-                info!("all workers exited cleanly");
-                break;
+                info!("all workers exited after draining connections");
+                return;
             }
             if Instant::now() >= deadline {
-                warn!("workers did not exit in 5s, sending SIGKILL");
-                for handle in &self.workers {
-                    let _ = signal::kill(handle.pid, Signal::SIGKILL);
-                }
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        // Drain timeout exceeded - force kill remaining workers
+        warn!("drain timeout exceeded, sending SIGKILL to remaining workers");
+        for handle in &self.workers {
+            if signal::kill(handle.pid, None).is_ok() {
+                let _ = signal::kill(handle.pid, Signal::SIGKILL);
+                warn!(worker_id = handle.id, "SIGKILL sent to worker");
+            }
         }
     }
 

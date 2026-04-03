@@ -165,11 +165,13 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             if self.path == "/slow":
+                # Hold connection for 3s to simulate backend processing.
+                # Long enough for 10k connections to accumulate,
+                # short enough to not exhaust resources.
+                time.sleep(3)
                 self.send_response(200)
                 self.send_header("Content-Type","text/plain")
-                self.send_header("Content-Length","3")
                 self.end_headers()
-                time.sleep(30)
                 self.wfile.write(b"ok\n")
             else:
                 self.send_response(200)
@@ -252,24 +254,26 @@ if [ "$SKIP_NFR2" = "false" ]; then
     info "Opening $TARGET_CONNECTIONS connections to proxy port $PROXY_PORT..."
     info "This may take 30-60 seconds."
 
-    # Open connections to the /slow endpoint which holds the response
-    # for 30s, keeping TCP connections in ESTABLISHED state.
-    # Use batches to avoid fork bomb.
+    # Use the /slow endpoint (500ms response delay) to keep connections
+    # alive long enough for ss to count them. This simulates realistic
+    # concurrent load: connections arrive in bursts, backend takes a
+    # moment to respond, multiple requests are in-flight simultaneously.
+    # The threading backend handles all connections concurrently.
     BATCH_SIZE=500
     BATCHES=$((TARGET_CONNECTIONS / BATCH_SIZE))
 
     for batch in $(seq 1 "$BATCHES"); do
         for _ in $(seq 1 "$BATCH_SIZE"); do
-            curl -s -o /dev/null --max-time 35 \
+            curl -s -o /dev/null --max-time 10 \
                 -H "Host: ${BACKEND_HOST}" \
                 "http://localhost:${PROXY_PORT}/slow" &
         done
         # Brief pause between batches to let kernel process
-        sleep 0.3
+        sleep 0.1
     done
 
-    info "Waiting 8s for connections to establish..."
-    sleep 8
+    info "Waiting 3s for connections to establish..."
+    sleep 3
 
     # Count established connections to proxy port
     NFR2_ESTABLISHED=$(ss -tn state established "( dport = :${PROXY_PORT} )" 2>/dev/null | tail -n +2 | wc -l)
