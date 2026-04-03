@@ -254,40 +254,62 @@ if [ "$SKIP_NFR2" = "false" ]; then
     info "Opening $TARGET_CONNECTIONS connections to proxy port $PROXY_PORT..."
     info "This may take 30-60 seconds."
 
-    # Use the /slow endpoint (500ms response delay) to keep connections
-    # alive long enough for ss to count them. This simulates realistic
-    # concurrent load: connections arrive in bursts, backend takes a
-    # moment to respond, multiple requests are in-flight simultaneously.
-    # The threading backend handles all connections concurrently.
-    BATCH_SIZE=500
-    BATCHES=$((TARGET_CONNECTIONS / BATCH_SIZE))
+    # Open raw TCP connections to the proxy port and hold them open.
+    # This tests the proxy's ability to handle 10k concurrent sockets,
+    # independent of backend capacity. Uses a single Python process
+    # with non-blocking sockets (no thread-per-connection overhead).
+    CONN_SCRIPT=$(mktemp /tmp/nfr-conns-XXXX.py)
+    cat > "$CONN_SCRIPT" << 'PYEOF'
+import socket, sys, time, select
+target = sys.argv[1]
+port = int(sys.argv[2])
+count = int(sys.argv[3])
+sockets = []
+for i in range(count):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect((target, port))
+        sockets.append(s)
+    except Exception:
+        pass
+    if (i + 1) % 1000 == 0:
+        print(f"  connected: {len(sockets)}/{i+1}", flush=True)
+print(f"  total connected: {len(sockets)}/{count}", flush=True)
+# Hold connections open until killed
+try:
+    time.sleep(120)
+except:
+    pass
+for s in sockets:
+    try:
+        s.close()
+    except:
+        pass
+PYEOF
 
-    for batch in $(seq 1 "$BATCHES"); do
-        for _ in $(seq 1 "$BATCH_SIZE"); do
-            curl -s -o /dev/null --max-time 10 \
-                -H "Host: ${BACKEND_HOST}" \
-                "http://localhost:${PROXY_PORT}/slow" &
-        done
-        # Brief pause between batches to let kernel process
-        sleep 0.1
-    done
+    python3 "$CONN_SCRIPT" "127.0.0.1" "$PROXY_PORT" "$TARGET_CONNECTIONS" &
+    CONN_PID=$!
+    sleep 10
 
-    info "Waiting 3s for connections to establish..."
-    sleep 3
-
-    # Count established connections to proxy port
-    NFR2_ESTABLISHED=$(ss -tn state established "( dport = :${PROXY_PORT} )" 2>/dev/null | tail -n +2 | wc -l)
+    # Count established connections on proxy listening port
+    # Use intermediate file to avoid pipefail issues with ss
+    ss -tn state established "( sport = :${PROXY_PORT} )" > /tmp/nfr-ss.txt 2>/dev/null || true
+    NFR2_ESTABLISHED=$(( $(wc -l < /tmp/nfr-ss.txt) - 1 ))
+    [ "$NFR2_ESTABLISHED" -lt 0 ] && NFR2_ESTABLISHED=0
+    rm -f /tmp/nfr-ss.txt
     info "Established connections: $NFR2_ESTABLISHED / $TARGET_CONNECTIONS"
 
-    # Health check during load
+    # Health check during load (on a different route or direct)
     NFR2_HEALTH=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
         -H "Host: ${BACKEND_HOST}" "http://localhost:${PROXY_PORT}/" 2>/dev/null || echo "000")
     info "Health check during load: HTTP $NFR2_HEALTH"
 
-    # Wait for background curls to finish
-    info "Waiting for connections to drain..."
-    wait 2>/dev/null || true
-    rm -rf "$CONN_DIR"
+    # Release connections
+    info "Releasing connections..."
+    kill "$CONN_PID" 2>/dev/null || true
+    wait "$CONN_PID" 2>/dev/null || true
+    rm -f "$CONN_SCRIPT"
 
     # Check proxy is still alive
     NEW_PID=$(get_lorica_pid)

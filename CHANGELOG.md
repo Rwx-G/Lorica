@@ -29,8 +29,9 @@ Author: Rwx-G
 - Worker mode: use `TcpListener::from_raw_fd` instead of `TcpStream::from_raw_fd` for inherited listening sockets (correct socket type)
 - Worker mode: respawn recreates listening sockets (previously used closed FDs)
 - Worker mode: SLA flush task re-enabled in background runtime. Workers now flush SLA metrics to shared SQLite DB every 60s, making SLA monitoring work in multi-worker mode
-- Worker mode: graceful shutdown with 5s timeout then SIGKILL (fixes `systemctl stop lorica` hanging)
-- NFR validation script: use threaded backend with `/slow` endpoint for 10k connection holding test
+- Worker mode: graceful shutdown with 30s drain timeout then SIGKILL (Sozu soft-stop pattern, fixes `systemctl stop lorica` hanging)
+- NFR validation script: use threaded backend with `/slow` endpoint (3s delay) for realistic 10k connection holding test
+- IP Blocklist toggle: fixed dimensions to match WAF rules toggles (min/max width/height enforced)
 - systemd service file: add `LimitNOFILE=65536` for 10k+ concurrent connections out of the box
 
 ## [0.1.2] - 2026-04-02

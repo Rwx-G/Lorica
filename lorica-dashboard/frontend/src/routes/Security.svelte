@@ -718,8 +718,13 @@
     position: relative;
     display: inline-block;
     width: 36px;
+    min-width: 36px;
+    max-width: 36px;
     height: 20px;
+    min-height: 20px;
+    max-height: 20px;
     cursor: pointer;
+    flex-shrink: 0;
   }
 
   .toggle input {
@@ -799,7 +804,7 @@
   .blocklist-header {
     display: flex;
     justify-content: space-between;
-    align-items: flex-start;
+    align-items: center;
     gap: var(--space-4);
     margin-bottom: var(--space-6);
   }

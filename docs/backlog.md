@@ -16,4 +16,4 @@ Items identified during QA traceability audit (2026-04-01).
 
 | Source | Description | References |
 |--------|-------------|------------|
-| NFR2+11 | Validation script created but not yet executed on a real Linux machine. Run `docs/testing/nfr-validate.sh` after .deb install. | `docs/testing/nfr-validate.sh` |
+| Worker metrics | Cache hits/misses, ban list, active connections not aggregated from workers to supervisor dashboard. Per-worker only. | Needs command channel protocol extension |
