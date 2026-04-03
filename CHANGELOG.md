@@ -23,6 +23,7 @@ Author: Rwx-G
 - Real-time access log forwarding in worker mode via Unix domain socket (`/var/lib/lorica/log.sock`). Workers stream logs to the supervisor with sub-millisecond latency, making WebSocket live logs work in multi-worker mode
 - WAF engine in supervisor process for worker mode: rules listing, blocklist toggle, custom rules, and event viewing now work in the dashboard when running with `--workers N`
 - IP blocklist auto-refresh (every 6h) in supervisor mode
+- Dashboard Overview: getting started guide with interactive setup checklist (backends, routes, certificates, WAF) and per-section "?" helper toggles with contextual explanations. Dismissible with localStorage persistence
 - WAF: 10 new detection rules - SSRF (cloud metadata, localhost, dangerous URI schemes, internal networks), Log4Shell/JNDI injection, XXE (DOCTYPE/ENTITY), CRLF injection. Total: 28 rules across 8 categories
 
 ### Fixed
