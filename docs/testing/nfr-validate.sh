@@ -154,19 +154,28 @@ ok "Authenticated"
 # --- Start backend stub ---
 header "Starting test backend"
 
-# Minimal HTTP server: returns 200 with small body.
-# Suppresses BrokenPipeError (normal under load testing) and all logging.
+# HTTP server with two modes:
+# - /        -> instant 200 (for normal tests and health checks)
+# - /slow    -> 30s delayed response (for connection holding in NFR2)
 BACKEND_PY=$(mktemp /tmp/nfr-backend-XXXX.py)
 cat > "$BACKEND_PY" << 'PYEOF'
-import http.server, socketserver, sys, signal
+import http.server, socketserver, sys, signal, time, threading
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         try:
-            self.send_response(200)
-            self.send_header("Content-Type","text/plain")
-            self.end_headers()
-            self.wfile.write(b"ok\n")
+            if self.path == "/slow":
+                self.send_response(200)
+                self.send_header("Content-Type","text/plain")
+                self.send_header("Content-Length","3")
+                self.end_headers()
+                time.sleep(30)
+                self.wfile.write(b"ok\n")
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type","text/plain")
+                self.end_headers()
+                self.wfile.write(b"ok\n")
         except BrokenPipeError:
             pass
     def log_message(self, *a): pass
@@ -177,7 +186,9 @@ class H(http.server.BaseHTTPRequestHandler):
             pass
 port = int(sys.argv[1])
 socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("0.0.0.0", port), H) as s:
+class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+with ThreadedServer(("0.0.0.0", port), H) as s:
     s.serve_forever()
 PYEOF
 
@@ -241,26 +252,24 @@ if [ "$SKIP_NFR2" = "false" ]; then
     info "Opening $TARGET_CONNECTIONS connections to proxy port $PROXY_PORT..."
     info "This may take 30-60 seconds."
 
-    # Use background curl processes that hold connections open
-    CONN_DIR=$(mktemp -d /tmp/nfr-conns-XXXX)
-
-    # Open connections in batches of 500
+    # Open connections to the /slow endpoint which holds the response
+    # for 30s, keeping TCP connections in ESTABLISHED state.
+    # Use batches to avoid fork bomb.
     BATCH_SIZE=500
     BATCHES=$((TARGET_CONNECTIONS / BATCH_SIZE))
 
     for batch in $(seq 1 "$BATCHES"); do
         for _ in $(seq 1 "$BATCH_SIZE"); do
-            # Each curl: slow download (timeout 30s, keepalive)
-            curl -s -o /dev/null --max-time 30 \
+            curl -s -o /dev/null --max-time 35 \
                 -H "Host: ${BACKEND_HOST}" \
-                "http://localhost:${PROXY_PORT}/" &
+                "http://localhost:${PROXY_PORT}/slow" &
         done
-        # Brief pause between batches to avoid fork bomb
-        sleep 0.2
+        # Brief pause between batches to let kernel process
+        sleep 0.3
     done
 
-    info "Waiting 5s for connections to establish..."
-    sleep 5
+    info "Waiting 8s for connections to establish..."
+    sleep 8
 
     # Count established connections to proxy port
     NFR2_ESTABLISHED=$(ss -tn state established "( dport = :${PROXY_PORT} )" 2>/dev/null | tail -n +2 | wc -l)
