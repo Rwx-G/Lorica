@@ -377,6 +377,7 @@ pub fn spawn_renewal_task(
     state: AppState,
     check_interval: std::time::Duration,
     renewal_threshold_days: i64,
+    alert_sender: Option<lorica_notify::AlertSender>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -410,6 +411,19 @@ pub fn spawn_renewal_task(
                     threshold = renewal_threshold_days,
                     "ACME certificate approaching expiry, attempting renewal"
                 );
+
+                // Dispatch cert_expiring notification
+                if let Some(ref sender) = alert_sender {
+                    sender.send(
+                        lorica_notify::AlertEvent::new(
+                            lorica_notify::events::AlertType::CertExpiring,
+                            format!("Certificate for {} expires in {} days", cert.domain, days_remaining),
+                        )
+                        .with_detail("domain", cert.domain.clone())
+                        .with_detail("days_remaining", days_remaining.to_string())
+                        .with_detail("cert_id", cert.id.clone()),
+                    );
+                }
 
                 let config = AcmeConfig {
                     staging: cert.issuer.contains("STAGING"),

@@ -65,6 +65,7 @@ pub async fn health_check_loop(
     proxy_config: Arc<ArcSwap<ProxyConfig>>,
     default_interval_s: u64,
     backend_connections: Option<Arc<BackendConnections>>,
+    alert_sender: Option<lorica_notify::AlertSender>,
 ) {
     let interval = Duration::from_secs(default_interval_s.max(5));
     // Track when each backend entered Closing state for drain timeout
@@ -200,7 +201,22 @@ pub async fn health_check_loop(
                 );
 
                 let mut updated = backend.clone();
-                updated.health_status = new_status;
+                updated.health_status = new_status.clone();
+
+                // Dispatch backend_down notification on transition to Down
+                if new_status == HealthStatus::Down {
+                    if let Some(ref sender) = alert_sender {
+                        sender.send(
+                            lorica_notify::AlertEvent::new(
+                                lorica_notify::events::AlertType::BackendDown,
+                                format!("Backend {} is down", backend.address),
+                            )
+                            .with_detail("backend_id", backend.id.clone())
+                            .with_detail("address", backend.address.clone())
+                            .with_detail("name", backend.name.clone()),
+                        );
+                    }
+                }
 
                 let store = store.lock().await;
                 if let Err(e) = store.update_backend(&updated) {

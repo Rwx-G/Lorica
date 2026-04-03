@@ -448,6 +448,8 @@ pub struct LoricaProxy {
     pub cache_misses: Arc<AtomicU64>,
     /// ACME HTTP-01 challenge store (shared with API, None in worker mode).
     pub acme_challenge_store: Option<lorica_api::acme::AcmeChallengeStore>,
+    /// Non-blocking alert sender for notification dispatch.
+    pub alert_sender: Option<lorica_notify::AlertSender>,
 }
 
 impl LoricaProxy {
@@ -473,6 +475,7 @@ impl LoricaProxy {
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
             acme_challenge_store: None,
+            alert_sender: None,
         }
     }
 
@@ -816,6 +819,18 @@ impl ProxyHttp for LoricaProxy {
                                 ban_duration_s = %ban_duration,
                                 "IP auto-banned for rate limit abuse"
                             );
+                            // Dispatch ip_banned notification
+                            if let Some(ref sender) = self.alert_sender {
+                                sender.send(
+                                    lorica_notify::AlertEvent::new(
+                                        lorica_notify::events::AlertType::IpBanned,
+                                        format!("IP {} auto-banned for rate limit abuse", ip),
+                                    )
+                                    .with_detail("ip", ip.to_string())
+                                    .with_detail("violations", violations.to_string())
+                                    .with_detail("ban_duration_s", ban_duration.to_string()),
+                                );
+                            }
                         }
                     }
 
@@ -871,6 +886,20 @@ impl ProxyHttp for LoricaProxy {
             lorica_waf::WafVerdict::Blocked(ref events) => {
                 for ev in events {
                     lorica_api::metrics::record_waf_event(ev.category.as_str(), "blocked");
+                }
+                // Dispatch waf_alert notification
+                if let (Some(ref sender), Some(ev)) = (&self.alert_sender, events.first()) {
+                    sender.send(
+                        lorica_notify::AlertEvent::new(
+                            lorica_notify::events::AlertType::WafAlert,
+                            format!("WAF blocked {} on {}{}", ev.category.as_str(), host, path),
+                        )
+                        .with_detail("rule_id", ev.rule_id.to_string())
+                        .with_detail("category", ev.category.as_str().to_string())
+                        .with_detail("host", host.to_string())
+                        .with_detail("path", path.to_string())
+                        .with_detail("client_ip", check_ip.as_deref().unwrap_or("-").to_string()),
+                    );
                 }
                 ctx.waf_blocked = true;
                 ctx.matched_host = Some(host.to_string());

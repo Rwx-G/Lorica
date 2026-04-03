@@ -394,7 +394,11 @@ fn run_supervisor(cli: Cli) {
             warn!(error = %e, "supervisor: failed to load initial proxy config for health checks");
         }
 
+        // Create non-blocking alert sender (broadcast channel for proxy/health/acme -> dispatcher)
+        let alert_sender = lorica_notify::AlertSender::new(256);
+
         // Start health check background task (runs in supervisor, not workers)
+        let health_alert_sender = alert_sender.clone();
         let health_store = Arc::clone(&store);
         let health_config = Arc::clone(&proxy_config);
         let health_interval = {
@@ -405,7 +409,7 @@ fn run_supervisor(cli: Cli) {
         };
         let health_handle = tokio::spawn(async move {
             // No backend_connections in supervisor - drain monitoring is per-worker
-            health::health_check_loop(health_store, health_config, health_interval, None).await;
+            health::health_check_loop(health_store, health_config, health_interval, None, Some(health_alert_sender)).await;
         });
 
         // Create WAF engine in supervisor for API access (rules listing,
@@ -453,6 +457,12 @@ fn run_supervisor(cli: Cli) {
             build_notify_dispatcher(&s)
         };
         let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
+
+        // Bridge: alert_sender (broadcast) -> NotifyDispatcher (async dispatch)
+        let _alert_dispatcher = lorica_notify::spawn_alert_dispatcher(
+            &alert_sender,
+            Arc::clone(&notify_dispatcher),
+        );
 
         // Bug 2 fix: Start probe scheduler in supervisor mode
         let probe_store = Arc::clone(&store);
@@ -958,12 +968,17 @@ fn run_single_process(cli: Cli) {
             std::time::Duration::from_secs(6 * 3600),
         );
 
-        // Create notification dispatcher from DB configs
+        // Create non-blocking alert sender and notification dispatcher
+        let alert_sender = lorica_notify::AlertSender::new(256);
         let notify_dispatcher = {
             let s = store.lock().await;
             build_notify_dispatcher(&s)
         };
         let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
+        let _alert_dispatcher = lorica_notify::spawn_alert_dispatcher(
+            &alert_sender,
+            Arc::clone(&notify_dispatcher),
+        );
 
         // Create SLA collector and start background flush task
         let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
@@ -1001,6 +1016,7 @@ fn run_single_process(cli: Cli) {
         );
         lorica_proxy.waf_engine = Arc::clone(&waf_engine);
         lorica_proxy.acme_challenge_store = Some(acme_challenge_store.clone());
+        lorica_proxy.alert_sender = Some(alert_sender.clone());
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
         let proxy_cache_misses = Arc::clone(&lorica_proxy.cache_misses);
@@ -1038,6 +1054,9 @@ fn run_single_process(cli: Cli) {
         // Clone sla_collector before the async move closure captures it
         let reload_sla_collector = Arc::clone(&sla_collector);
 
+        // Clone alert_sender before it's moved into the API spawn block
+        let health_alert_sender2 = alert_sender.clone();
+
         // Start API server
         let api_store = Arc::clone(&store);
         let api_log_buffer = Arc::clone(&log_buffer);
@@ -1071,6 +1090,7 @@ fn run_single_process(cli: Cli) {
                 state.clone(),
                 std::time::Duration::from_secs(12 * 3600),
                 30,
+                Some(alert_sender.clone()),
             );
 
             let session_store = SessionStore::new();
@@ -1113,7 +1133,7 @@ fn run_single_process(cli: Cli) {
                 .unwrap_or(10)
         };
         let health_handle = tokio::spawn(async move {
-            health::health_check_loop(health_store, health_config, health_interval, Some(backend_conns)).await;
+            health::health_check_loop(health_store, health_config, health_interval, Some(backend_conns), Some(health_alert_sender2)).await;
         });
 
         // Run the proxy engine in a dedicated thread

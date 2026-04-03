@@ -21,3 +21,54 @@ pub mod events;
 
 pub use channels::{NotifyDispatcher, NotifyError, RateLimitConfig};
 pub use events::AlertEvent;
+
+/// Non-blocking alert sender for the proxy hot path.
+///
+/// Wraps a `tokio::sync::broadcast::Sender<AlertEvent>` so the proxy can
+/// emit alert events (waf_alert, ip_banned, backend_down, etc.) without
+/// blocking. A background task subscribes and dispatches via NotifyDispatcher.
+#[derive(Clone)]
+pub struct AlertSender {
+    tx: tokio::sync::broadcast::Sender<AlertEvent>,
+}
+
+impl AlertSender {
+    /// Create a new alert sender with a bounded broadcast channel.
+    pub fn new(capacity: usize) -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(capacity);
+        Self { tx }
+    }
+
+    /// Send an alert event (fire-and-forget, never blocks).
+    pub fn send(&self, event: AlertEvent) {
+        let _ = self.tx.send(event);
+    }
+
+    /// Subscribe to the alert channel (for the background dispatcher).
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AlertEvent> {
+        self.tx.subscribe()
+    }
+}
+
+/// Spawn a background task that reads from the AlertSender channel and
+/// dispatches events via the NotifyDispatcher.
+pub fn spawn_alert_dispatcher(
+    alert_sender: &AlertSender,
+    dispatcher: std::sync::Arc<tokio::sync::Mutex<NotifyDispatcher>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = alert_sender.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let d = dispatcher.lock().await;
+                    d.dispatch(&event).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(dropped = n, "alert dispatcher lagged, some notifications were dropped");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
