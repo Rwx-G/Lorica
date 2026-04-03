@@ -214,14 +214,27 @@ fn run_supervisor(cli: Cli) {
             std::process::exit(1);
         }
 
+        // Load or create encryption key for certificate private keys at rest
+        let key_path = data_dir.join("encryption.key");
+        let encryption_key = match lorica_config::crypto::EncryptionKey::load_or_create(&key_path) {
+            Ok(k) => k,
+            Err(e) => {
+                error!(error = %e, "failed to load/create encryption key");
+                std::process::exit(1);
+            }
+        };
+        restrict_key_permissions(&key_path);
+
         let db_path = data_dir.join("lorica.db");
-        let store = match ConfigStore::open(&db_path, None) {
+        let store = match ConfigStore::open(&db_path, Some(encryption_key)) {
             Ok(s) => s,
             Err(e) => {
                 error!(error = %e, "failed to open configuration database");
                 std::process::exit(1);
             }
         };
+        // Restrict database file permissions (contains encrypted private keys)
+        restrict_key_permissions(&db_path);
 
         match lorica_api::auth::ensure_admin_user(&store) {
             Ok(Some(password)) => {
@@ -821,15 +834,27 @@ fn run_single_process(cli: Cli) {
             std::process::exit(1);
         }
 
+        // Load or create encryption key for certificate private keys at rest
+        let key_path = data_dir.join("encryption.key");
+        let encryption_key = match lorica_config::crypto::EncryptionKey::load_or_create(&key_path) {
+            Ok(k) => k,
+            Err(e) => {
+                error!(error = %e, "failed to load/create encryption key");
+                std::process::exit(1);
+            }
+        };
+        restrict_key_permissions(&key_path);
+
         // Open the configuration database
         let db_path = data_dir.join("lorica.db");
-        let store = match ConfigStore::open(&db_path, None) {
+        let store = match ConfigStore::open(&db_path, Some(encryption_key)) {
             Ok(s) => s,
             Err(e) => {
                 error!(error = %e, "failed to open configuration database");
                 std::process::exit(1);
             }
         };
+        restrict_key_permissions(&db_path);
 
         // Ensure an admin user exists (first-run password generation)
         match lorica_api::auth::ensure_admin_user(&store) {
@@ -1020,6 +1045,14 @@ fn run_single_process(cli: Cli) {
                 cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
                 ewma_scores: Some(proxy_ewma_scores),
             };
+
+            // Spawn ACME certificate auto-renewal (check every 12h, renew at 30 days before expiry)
+            let _acme_renewal = lorica_api::acme::spawn_renewal_task(
+                state.clone(),
+                std::time::Duration::from_secs(12 * 3600),
+                30,
+            );
+
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
 
