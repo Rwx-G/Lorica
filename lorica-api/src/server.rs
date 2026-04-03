@@ -207,6 +207,10 @@ pub fn build_router(
             "/api/v1/acme/provision-dns-manual/confirm",
             post(crate::acme::provision_dns_manual_confirm),
         )
+        .route(
+            "/api/v1/certificates/:id/renew",
+            post(crate::acme::renew_certificate),
+        )
         .route("/api/v1/waf/rules", get(crate::waf::get_waf_rules))
         .route(
             "/api/v1/waf/rules/custom",

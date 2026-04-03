@@ -439,6 +439,48 @@ pub fn spawn_renewal_task(
     })
 }
 
+/// POST /api/v1/certificates/:id/renew - manually trigger ACME renewal for a certificate
+pub async fn renew_certificate(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let cert = {
+        let store = state.store.lock().await;
+        store
+            .get_certificate(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?
+    };
+
+    if !cert.is_acme {
+        return Err(ApiError::BadRequest(
+            "only ACME certificates can be renewed (use upload for manual certs)".into(),
+        ));
+    }
+
+    let config = AcmeConfig {
+        staging: cert.issuer.contains("STAGING") || cert.issuer.contains("(staging)"),
+        contact_email: None,
+    };
+
+    let new_cert_id = provision_with_acme(&state, &config, &cert.domain)
+        .await
+        .map_err(|e| ApiError::Internal(format!("ACME renewal failed: {e}")))?;
+
+    tracing::info!(
+        domain = %cert.domain,
+        old_cert_id = %cert.id,
+        new_cert_id = %new_cert_id,
+        "certificate manually renewed"
+    );
+
+    Ok(crate::error::json_data(serde_json::json!({
+        "renewed": true,
+        "old_cert_id": cert.id,
+        "new_cert_id": new_cert_id,
+        "domain": cert.domain,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // DNS-01 challenge support
 // ---------------------------------------------------------------------------
