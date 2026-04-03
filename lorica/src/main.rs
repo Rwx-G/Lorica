@@ -196,12 +196,12 @@ fn run_supervisor(cli: Cli) {
     // Extract raw FDs from worker handles before entering the tokio runtime.
     // CommandChannel::from_raw_fd requires a tokio runtime, so we take the raw FDs
     // here and create channels inside block_on.
-    let worker_fds: Vec<(u32, RawFd)> = manager
+    let worker_fds: Vec<(u32, i32, RawFd)> = manager
         .workers_mut()
         .iter_mut()
         .filter_map(|w| {
             let fd = w.take_cmd_fd()?;
-            Some((w.id(), fd.into_raw_fd()))
+            Some((w.id(), w.pid().as_raw(), fd.into_raw_fd()))
         })
         .collect();
 
@@ -304,7 +304,7 @@ fn run_supervisor(cli: Cli) {
 
         // Spawn a per-worker task that handles both config reload and heartbeat
         // No shared Mutex - each worker has its own channel and task
-        for (worker_id, raw_fd) in worker_fds {
+        for (worker_id, worker_pid, raw_fd) in worker_fds {
             let mut channel = match unsafe { CommandChannel::from_raw_fd(raw_fd) } {
                 Ok(ch) => ch,
                 Err(e) => {
@@ -359,7 +359,7 @@ fn run_supervisor(cli: Cli) {
                             match channel.recv::<Response>().await {
                                 Ok(_) => {
                                     let latency_ms = start.elapsed().as_millis() as u64;
-                                    hb_metrics.record_heartbeat(worker_id, 0, latency_ms).await;
+                                    hb_metrics.record_heartbeat(worker_id, worker_pid, latency_ms).await;
                                     info!(worker_id, latency_ms, "heartbeat ok");
                                 }
                                 Err(e) => {
