@@ -77,6 +77,54 @@
         detail: 'The Web Application Firewall (WAF) inspects incoming requests for SQL injection, XSS, path traversal, SSRF, Log4Shell, and other attacks. Enable it per route in detection mode (log only) or blocking mode (reject with 403). Lorica includes 28 built-in rules inspired by OWASP Core Rule Set.',
         route: '/routes',
       },
+      {
+        key: 'ratelimit',
+        done: status.routes_count > 0,
+        label: 'Configure rate limiting',
+        summary: 'Prevent abuse by limiting requests per IP.',
+        detail: 'Rate limiting caps the number of requests a single IP can make per second to a route. Exceeding the limit returns 429 Too Many Requests. Repeated offenders are auto-banned temporarily. Configure per-route via rate_limit_rps and rate_limit_burst. Also supports global flood defense that halves all limits under extreme load.',
+        route: '/routes',
+      },
+      {
+        key: 'blocklist',
+        done: (bans?.total ?? 0) >= 0,
+        label: 'Enable IP blocklist',
+        summary: 'Block 80k+ known malicious IPs automatically.',
+        detail: 'The IPv4 blocklist contains 80,000+ IPs flagged for scanning, brute-force, and botnet activity (updated every 6 hours from Data-Shield). Blocked IPs receive 403 before any route lookup or WAF evaluation. Toggle it on the Security page. You can also manually ban/unban individual IPs.',
+        route: '/security',
+      },
+      {
+        key: 'logs',
+        done: true,
+        label: 'Monitor access logs',
+        summary: 'Watch real-time traffic flowing through Lorica.',
+        detail: 'The Logs page shows live access logs streamed via WebSocket. Each entry shows the client IP, method, path, status code, latency, and which route/backend handled the request. Use filters to find specific requests. In worker mode, logs are forwarded from all workers to the supervisor in real-time.',
+        route: '/logs',
+      },
+      {
+        key: 'sla',
+        done: true,
+        label: 'Track SLA and performance',
+        summary: 'Monitor uptime, latency, and error rates per route.',
+        detail: 'SLA monitoring collects metrics from real traffic: success rate, average/p50/p95/p99 latency, and total requests. Data is aggregated in 1-minute buckets with rolling windows (1h, 24h, 7d, 30d). Set a target SLA per route and get alerted when it drops below. Export data as CSV or JSON.',
+        route: '/sla',
+      },
+      {
+        key: 'probes',
+        done: probes.length > 0,
+        label: 'Set up active probes',
+        summary: 'Synthetic health checks independent of real traffic.',
+        detail: 'Active probes send HTTP requests to your backends at regular intervals (e.g. every 30s). Unlike passive SLA which only measures real user traffic, probes detect problems before users are affected - useful for low-traffic routes or scheduled maintenance windows.',
+        route: '/probes',
+      },
+      {
+        key: 'system',
+        done: true,
+        label: 'Review system settings',
+        summary: 'Workers, notifications, global limits, and more.',
+        detail: 'The Settings page lets you configure notification channels (email, webhook) for alerts like backend down or certificate expiring. Global settings include max connections, flood defense threshold, and default topology. The System page shows worker health, CPU/memory, and process metrics.',
+        route: '/settings',
+      },
     ];
   });
 
@@ -656,16 +704,18 @@
 
   .step-row {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     gap: var(--space-3);
   }
 
   .step-check {
     flex-shrink: 0;
-    width: 1.5rem;
-    text-align: center;
-    font-size: 1rem;
-    line-height: 1.5;
+    width: 1.25rem;
+    height: 1.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.875rem;
   }
 
   .setup-step.done .step-check {
