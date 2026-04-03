@@ -95,7 +95,7 @@
   }
 
   function handleOverlayClick(e: MouseEvent) {
-    if ((e.target as HTMLElement).classList.contains('drawer-overlay')) {
+    if (e.target === e.currentTarget) {
       handleClose();
     }
   }
