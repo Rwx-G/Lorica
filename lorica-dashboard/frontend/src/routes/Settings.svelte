@@ -706,8 +706,8 @@
 <!-- Notification form modal -->
 {#if showNotifForm}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={() => showNotifForm = false} onkeydown={(e) => { if (e.key === 'Escape') showNotifForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
+  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) showNotifForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showNotifForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="dialog" role="document">
       <h3>{notifEditing ? 'Edit' : 'Add'} Notification Channel</h3>
       <div class="form-row">
         <label for="notif-channel">Channel</label>
@@ -768,8 +768,8 @@
 <!-- Preset form modal -->
 {#if showPresetForm}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={() => showPresetForm = false} onkeydown={(e) => { if (e.key === 'Escape') showPresetForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
+  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) showPresetForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showPresetForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="dialog" role="document">
       <h3>{presetEditing !== null ? 'Edit' : 'Add'} Security Header Preset</h3>
       <div class="form-row">
         <label for="preset-name">Preset Name <span class="required">*</span></label>

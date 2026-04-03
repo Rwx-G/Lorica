@@ -20,8 +20,8 @@
 </script>
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-<div class="overlay" onclick={oncancel} onkeydown={handleKeydown} role="dialog" aria-modal="true" tabindex="-1">
-  <div class="dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
+<div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) oncancel(); }} onkeydown={handleKeydown} role="dialog" aria-modal="true" tabindex="-1">
+  <div class="dialog" role="document">
     <h3>{title}</h3>
     <p>{message}</p>
     <div class="actions">

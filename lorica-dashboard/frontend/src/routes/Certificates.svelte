@@ -606,8 +606,8 @@
 <!-- Upload Form Modal -->
 {#if showUploadForm}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={closeUploadForm} onkeydown={handleUploadKeydown} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
+  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) closeUploadForm(); }} onkeydown={handleUploadKeydown} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal" role="document">
       <h2>Upload Certificate</h2>
 
       {#if formError}
@@ -648,8 +648,8 @@
 <!-- Edit Form Modal -->
 {#if showEditForm && editingCert}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={closeEditForm} onkeydown={handleEditKeydown} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
+  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) closeEditForm(); }} onkeydown={handleEditKeydown} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal" role="document">
       <h2>Edit Certificate</h2>
 
       {#if editError}
@@ -684,8 +684,8 @@
 <!-- Detail View Modal -->
 {#if showDetail}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={closeDetail} onkeydown={handleDetailKeydown} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal modal-wide" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
+  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) closeDetail(); }} onkeydown={handleDetailKeydown} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal modal-wide" role="document">
       {#if detailLoading}
         <p class="loading">Loading certificate details...</p>
       {:else if detailCert}
@@ -770,8 +770,8 @@
 <!-- Self-signed Preference Prompt -->
 {#if showSelfSignedPrefPrompt}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={() => { showSelfSignedPrefPrompt = false; }} onkeydown={(e) => { if (e.key === 'Escape') showSelfSignedPrefPrompt = false; }} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
+  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) showSelfSignedPrefPrompt = false; }} onkeydown={(e) => { if (e.key === 'Escape') showSelfSignedPrefPrompt = false; }} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal" role="document">
       <h2>Self-signed Certificate Generation</h2>
       <p class="pref-text">Self-signed certificates are useful for development and testing but should not be used in production. How would you like to handle this?</p>
       <div class="pref-actions">
@@ -786,8 +786,8 @@
 <!-- Self-signed Generation Modal -->
 {#if showSelfSigned}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={closeSelfSigned} onkeydown={handleSelfSignedKeydown} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
+  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) closeSelfSigned(); }} onkeydown={handleSelfSignedKeydown} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal" role="document">
       <h2>Generate Self-signed Certificate</h2>
 
       {#if selfSignedError}
@@ -812,8 +812,8 @@
 <!-- Threshold Configuration Modal -->
 {#if showThresholdConfig}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={closeThresholdConfig} onkeydown={handleThresholdKeydown} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="document">
+  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) closeThresholdConfig(); }} onkeydown={handleThresholdKeydown} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal" role="document">
       <h2>Expiration Thresholds</h2>
 
       <div class="form-group">
@@ -843,7 +843,7 @@
 <!-- ACME Provisioning Modal -->
 {#if showAcmeForm}
   <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showAcmeForm = false; }}>
-    <div class="modal" onclick={(e) => e.stopPropagation()}>
+    <div class="modal">
       <h2>Let's Encrypt Certificate</h2>
 
       {#if acmeSuccess}
@@ -950,7 +950,7 @@
           <span class="hint">You will be given a TXT record to create manually at your DNS provider. Works with any DNS provider. The challenge expires after 10 minutes.</span>
         {/if}
 
-        <div class="form-group">
+        <div class="form-group" style="margin-top: var(--space-4);">
           <label class="checkbox-item">
             <input type="checkbox" bind:checked={acmeStaging} />
             Use staging environment (for testing)

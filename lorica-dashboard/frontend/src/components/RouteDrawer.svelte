@@ -147,7 +147,7 @@
     tabindex="-1"
   >
     <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-    <div class="drawer" onclick={(e) => e.stopPropagation()} role="document">
+    <div class="drawer" role="document">
       <!-- Header -->
       <div class="drawer-header">
         <div class="drawer-header-left">
@@ -365,38 +365,6 @@
     padding: 1rem 1.5rem;
     border-top: 1px solid var(--color-border);
     flex-shrink: 0;
-  }
-
-  .btn {
-    padding: 0.5rem 1rem;
-    border-radius: 0.375rem;
-    font-weight: 500;
-    border: none;
-    font-size: 0.875rem;
-    cursor: pointer;
-  }
-
-  .btn-primary {
-    background: var(--color-primary);
-    color: white;
-  }
-
-  .btn-primary:hover {
-    background: var(--color-primary-hover);
-  }
-
-  .btn-primary:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .btn-cancel {
-    background: var(--color-bg-input);
-    color: var(--color-text);
-  }
-
-  .btn-cancel:hover {
-    background: var(--color-bg-hover);
   }
 
   @media (max-width: 960px) {
