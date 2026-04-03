@@ -150,157 +150,169 @@
   {:else}
 
     <!-- SYSTEM -->
-    <button class="section-header" onclick={() => navigate('/system')}>
-      <h2>System</h2>
-      <span class="section-link">View details</span>
-    </button>
-    <div class="card-grid">
-      {#if system}
-        <Card title="Uptime" value={formatUptime(system.proxy.uptime_seconds)} />
-        <Card title="Active Connections" value={system.proxy.active_connections} />
-        <Card
-          title="CPU"
-          value="{system.host.cpu_usage_percent.toFixed(1)}%"
-          color={cpuColor(system.host.cpu_usage_percent)}
-        />
-        <Card
-          title="Memory"
-          value="{system.host.memory_usage_percent.toFixed(1)}%"
-          color={memColor(system.host.memory_usage_percent)}
-        />
-      {:else}
-        <Card title="System" value="-" />
-      {/if}
+    <div class="section-group">
+      <button class="section-header" onclick={() => navigate('/system')}>
+        <h2>System</h2>
+        <span class="section-link">View details</span>
+      </button>
+      <div class="card-grid">
+        {#if system}
+          <Card title="Uptime" value={formatUptime(system.proxy.uptime_seconds)} />
+          <Card title="Active Connections" value={system.proxy.active_connections} />
+          <Card
+            title="CPU"
+            value="{system.host.cpu_usage_percent.toFixed(1)}%"
+            color={cpuColor(system.host.cpu_usage_percent)}
+          />
+          <Card
+            title="Memory"
+            value="{system.host.memory_usage_percent.toFixed(1)}%"
+            color={memColor(system.host.memory_usage_percent)}
+          />
+        {:else}
+          <Card title="System" value="-" />
+        {/if}
+      </div>
     </div>
 
     <!-- ROUTES & BACKENDS -->
-    <button class="section-header" onclick={() => navigate('/routes')}>
-      <h2>Routes & Backends</h2>
-      <span class="section-link">Manage</span>
-    </button>
-    <div class="card-grid">
-      {#if status}
-        <Card title="Routes" value={status.routes_count} />
-        <Card title="Backends" value={status.backends_count} />
-        <Card
-          title="Healthy"
-          value={status.backends_healthy}
-          color={status.backends_healthy > 0 ? 'green' : 'default'}
-        />
-        <Card
-          title="Degraded"
-          value={status.backends_degraded}
-          color={status.backends_degraded > 0 ? 'orange' : 'default'}
-        />
-        <Card
-          title="Down"
-          value={status.backends_down}
-          color={status.backends_down > 0 ? 'red' : 'default'}
-        />
-      {/if}
+    <div class="section-group">
+      <button class="section-header" onclick={() => navigate('/routes')}>
+        <h2>Routes & Backends</h2>
+        <span class="section-link">Manage</span>
+      </button>
+      <div class="card-grid">
+        {#if status}
+          <Card title="Routes" value={status.routes_count} color={status.routes_count === 0 ? 'orange' : 'default'} />
+          <Card title="Backends" value={status.backends_count} color={status.backends_count === 0 ? 'orange' : 'default'} />
+          <Card
+            title="Backends Healthy"
+            value={status.backends_healthy}
+            color={status.backends_count > 0 ? (status.backends_healthy > 0 ? 'green' : 'red') : 'default'}
+          />
+          <Card
+            title="Backends Degraded"
+            value={status.backends_degraded}
+            color={status.backends_degraded > 0 ? 'orange' : 'default'}
+          />
+          <Card
+            title="Backends Down"
+            value={status.backends_down}
+            color={status.backends_count > 0 ? (status.backends_down > 0 ? 'red' : 'green') : 'default'}
+          />
+        {/if}
+      </div>
     </div>
 
     <!-- CERTIFICATES -->
-    <button class="section-header" onclick={() => navigate('/certificates')}>
-      <h2>Certificates</h2>
-      <span class="section-link">Manage</span>
-    </button>
-    <div class="card-grid">
-      {#if status}
-        <Card title="Total" value={status.certificates_count} />
-        <Card
-          title="Expiring Soon"
-          value={status.certificates_expiring_soon}
-          color={status.certificates_expiring_soon > 0 ? 'orange' : 'green'}
-        />
-      {/if}
+    <div class="section-group">
+      <button class="section-header" onclick={() => navigate('/certificates')}>
+        <h2>Certificates</h2>
+        <span class="section-link">Manage</span>
+      </button>
+      <div class="card-grid">
+        {#if status}
+          <Card title="Total" value={status.certificates_count} color={status.certificates_count === 0 ? 'orange' : 'default'} />
+          <Card
+            title="Expiring Soon"
+            value={status.certificates_expiring_soon}
+            color={status.certificates_expiring_soon > 0 ? 'orange' : 'green'}
+          />
+        {/if}
+      </div>
     </div>
 
     <!-- SECURITY -->
-    <button class="section-header" onclick={() => navigate('/security')}>
-      <h2>Security</h2>
-      <span class="section-link">View details</span>
-    </button>
-    <div class="card-grid">
-      <Card
-        title="WAF Events"
-        value={wafStats?.total_events ?? 0}
-        color={wafStats && wafStats.total_events > 0 ? 'orange' : 'green'}
-      />
-      {#if wafTopCategory}
-        <Card title="Top Category" value={wafTopCategory.category} />
-      {/if}
-      <Card
-        title="Active Bans"
-        value={bans?.total ?? 0}
-        color={bans && bans.total > 0 ? 'red' : 'default'}
-      />
-      <Card
-        title="WAF Rules"
-        value={wafStats?.rule_count ?? 0}
-      />
+    <div class="section-group">
+      <button class="section-header" onclick={() => navigate('/security')}>
+        <h2>Security</h2>
+        <span class="section-link">View details</span>
+      </button>
+      <div class="card-grid">
+        <Card
+          title="WAF Events"
+          value={wafStats?.total_events ?? 0}
+          color={wafStats && wafStats.total_events > 0 ? 'orange' : 'green'}
+        />
+        {#if wafTopCategory}
+          <Card title="Top Category" value={wafTopCategory.category} />
+        {/if}
+        <Card
+          title="Active Bans"
+          value={bans?.total ?? 0}
+          color={bans && bans.total > 0 ? 'red' : 'default'}
+        />
+        <Card
+          title="WAF Rules"
+          value={wafStats?.rule_count ?? 0}
+        />
+      </div>
     </div>
 
     <!-- PERFORMANCE -->
-    <button class="section-header" onclick={() => navigate('/sla')}>
-      <h2>Performance</h2>
-      <span class="section-link">View SLA</span>
-    </button>
-    <div class="card-grid">
-      <Card
-        title="Requests (1h)"
-        value={totalRequests1h.toLocaleString()}
-      />
-      {#if avgSla !== null}
+    <div class="section-group">
+      <button class="section-header" onclick={() => navigate('/sla')}>
+        <h2>Performance</h2>
+        <span class="section-link">View SLA</span>
+      </button>
+      <div class="card-grid">
         <Card
-          title="Avg SLA (1h)"
-          value="{avgSla.toFixed(2)}%"
-          color={avgSla >= 99.9 ? 'green' : avgSla >= 99 ? 'orange' : 'red'}
+          title="Requests (1h)"
+          value={totalRequests1h.toLocaleString()}
         />
-      {:else}
-        <Card title="Avg SLA (1h)" value="-" />
-      {/if}
-      {#if avgLatency !== null}
+        {#if avgSla !== null}
+          <Card
+            title="Avg SLA (1h)"
+            value="{avgSla.toFixed(2)}%"
+            color={avgSla >= 99.9 ? 'green' : avgSla >= 99 ? 'orange' : 'red'}
+          />
+        {:else}
+          <Card title="Avg SLA (1h)" value="-" />
+        {/if}
+        {#if avgLatency !== null}
+          <Card
+            title="Avg Latency (1h)"
+            value="{avgLatency.toFixed(0)} ms"
+            color={avgLatency <= 100 ? 'green' : avgLatency <= 500 ? 'orange' : 'red'}
+          />
+        {:else}
+          <Card title="Avg Latency (1h)" value="-" />
+        {/if}
         <Card
-          title="Avg Latency (1h)"
-          value="{avgLatency.toFixed(0)} ms"
-          color={avgLatency <= 100 ? 'green' : avgLatency <= 500 ? 'orange' : 'red'}
+          title="SLA Breaches"
+          value={slaBreaches}
+          color={slaBreaches > 0 ? 'red' : 'green'}
         />
-      {:else}
-        <Card title="Avg Latency (1h)" value="-" />
-      {/if}
-      <Card
-        title="SLA Breaches"
-        value={slaBreaches}
-        color={slaBreaches > 0 ? 'red' : 'green'}
-      />
-      <Card
-        title="Cache Hit Rate"
-        value={cacheStats ? `${(cacheStats.hit_rate * 100).toFixed(1)}%` : '-'}
-        color={cacheStats && cacheStats.hit_rate >= 0.5 ? 'green' : 'default'}
-      />
+        <Card
+          title="Cache Hit Rate"
+          value={cacheStats ? `${(cacheStats.hit_rate * 100).toFixed(1)}%` : '-'}
+          color={cacheStats && cacheStats.hit_rate >= 0.5 ? 'green' : 'default'}
+        />
+      </div>
     </div>
 
     <!-- MONITORING -->
-    <button class="section-header" onclick={() => navigate('/probes')}>
-      <h2>Monitoring</h2>
-      <span class="section-link">View probes</span>
-    </button>
-    <div class="card-grid">
-      <Card title="Active Probes" value={probesEnabled} color={probesEnabled > 0 ? 'green' : 'default'} />
-      <Card title="Total Probes" value={probes.length} />
-      {#if workers.length > 0}
-        <Card
-          title="Workers"
-          value={workers.length}
-          color={workersUnhealthy > 0 ? 'red' : 'green'}
-        />
-        {#if workersUnhealthy > 0}
-          <Card title="Unhealthy Workers" value={workersUnhealthy} color="red" />
+    <div class="section-group">
+      <button class="section-header" onclick={() => navigate('/probes')}>
+        <h2>Monitoring</h2>
+        <span class="section-link">View probes</span>
+      </button>
+      <div class="card-grid">
+        <Card title="Active Probes" value={probesEnabled} color={probesEnabled > 0 ? 'green' : 'default'} />
+        <Card title="Total Probes" value={probes.length} />
+        {#if workers.length > 0}
+          <Card
+            title="Workers"
+            value={workers.length}
+            color={workersUnhealthy > 0 ? 'red' : 'green'}
+          />
+          {#if workersUnhealthy > 0}
+            <Card title="Unhealthy Workers" value={workersUnhealthy} color="red" />
+          {/if}
+        {:else}
+          <Card title="Workers" value="Single-process" />
         {/if}
-      {:else}
-        <Card title="Workers" value="Single-process" />
-      {/if}
+      </div>
     </div>
 
   {/if}
@@ -343,16 +355,24 @@
     50% { opacity: 0.4; }
   }
 
+  .section-group {
+    margin-top: var(--space-5);
+  }
+
+  .section-group:first-child {
+    margin-top: 0;
+  }
+
   .section-header {
     display: flex;
     align-items: baseline;
-    justify-content: space-between;
+    gap: var(--space-3);
     width: 100%;
-    margin-top: var(--space-6);
     margin-bottom: var(--space-3);
-    padding: 0;
-    background: none;
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-bg-input);
     border: none;
+    border-radius: var(--radius-md);
     cursor: pointer;
     text-align: left;
   }
@@ -363,10 +383,11 @@
 
   .section-header h2 {
     margin: 0;
-    font-size: 1rem;
+    font-size: 0.875rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: var(--color-text-muted);
+    font-weight: 600;
+    color: var(--color-text-heading);
   }
 
   .section-link {
@@ -375,9 +396,14 @@
     transition: color var(--transition-fast);
   }
 
+  .section-link::after {
+    content: ' \203A';
+    font-size: 0.875rem;
+  }
+
   .card-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: var(--space-4);
+    gap: var(--space-3);
   }
 </style>

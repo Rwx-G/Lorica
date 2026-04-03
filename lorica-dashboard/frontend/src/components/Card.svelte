@@ -18,17 +18,12 @@
     background: var(--color-bg-card);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-xl);
-    padding: var(--space-5);
+    padding: var(--space-4) var(--space-5);
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    align-items: center;
+    gap: var(--space-1);
     box-shadow: var(--shadow-sm);
-    transition: box-shadow var(--transition-base), border-color var(--transition-base), transform var(--transition-fast);
-  }
-
-  .card:hover {
-    box-shadow: var(--shadow-md);
-    transform: translateY(-1px);
   }
 
   .card-title {
