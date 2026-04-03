@@ -51,6 +51,19 @@
   let preferences: UserPreferenceResponse[] = $state([]);
   let deletingPref: UserPreferenceResponse | null = $state(null);
 
+  // Getting started guide (localStorage)
+  const HELPER_KEY = 'lorica_helper_dismissed';
+  let helperGuideVisible = $state(localStorage.getItem(HELPER_KEY) !== 'true');
+
+  function toggleHelperGuide() {
+    helperGuideVisible = !helperGuideVisible;
+    if (helperGuideVisible) {
+      localStorage.removeItem(HELPER_KEY);
+    } else {
+      localStorage.setItem(HELPER_KEY, 'true');
+    }
+  }
+
   // Export/Import
   let exporting = $state(false);
   let exportError = $state('');
@@ -550,10 +563,23 @@
     <!-- Preference Memory -->
     <section class="section">
       <h2>Preference Memory</h2>
-      <p class="section-hint">Stored decisions for prompts (never/always/once).</p>
+      <p class="section-hint">Stored decisions for prompts and UI preferences.</p>
+
+      <div class="pref-row">
+        <div class="pref-info">
+          <code>getting_started_guide</code>
+          <span class="pref-hint">Show the getting started guide on the Overview page</span>
+        </div>
+        <label class="toggle-label">
+          <span>{helperGuideVisible ? 'Visible' : 'Hidden'}</span>
+          <button class="toggle" class:on={helperGuideVisible} onclick={toggleHelperGuide}>
+            <span class="toggle-knob"></span>
+          </button>
+        </label>
+      </div>
 
       {#if preferences.length === 0}
-        <p class="empty-text">No stored preferences.</p>
+        <p class="empty-text">No other stored preferences.</p>
       {:else}
         <div class="table-wrap">
           <table>
@@ -1126,5 +1152,71 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .pref-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--space-3) var(--space-4);
+    background: var(--color-bg-card);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    margin-bottom: var(--space-4);
+  }
+
+  .pref-info {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .pref-hint {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+  }
+
+  .toggle-label {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+  }
+
+  .toggle {
+    position: relative;
+    width: 36px;
+    min-width: 36px;
+    max-width: 36px;
+    height: 20px;
+    min-height: 20px;
+    max-height: 20px;
+    border-radius: var(--radius-full);
+    border: none;
+    background: var(--color-bg-input);
+    cursor: pointer;
+    transition: background-color var(--transition-fast);
+    padding: 0;
+    flex-shrink: 0;
+  }
+
+  .toggle.on {
+    background: var(--color-green);
+  }
+
+  .toggle-knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: white;
+    transition: transform var(--transition-fast);
+  }
+
+  .toggle.on .toggle-knob {
+    transform: translateX(16px);
   }
 </style>
