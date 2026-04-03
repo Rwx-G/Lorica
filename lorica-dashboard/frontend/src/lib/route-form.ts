@@ -254,7 +254,7 @@ export function formStateToUpdateRequest(form: RouteFormState): UpdateRouteReque
     hostname: form.hostname,
     path_prefix: form.path_prefix,
     backend_ids: form.backend_ids,
-    certificate_id: form.certificate_id || undefined,
+    certificate_id: form.certificate_id !== undefined ? form.certificate_id : undefined,
     load_balancing: form.load_balancing,
     topology_type: form.topology_type,
     waf_enabled: form.waf_enabled,

@@ -345,7 +345,11 @@ pub async fn update_route(
         route.path_prefix = path_prefix;
     }
     if let Some(certificate_id) = body.certificate_id {
-        route.certificate_id = Some(certificate_id);
+        if certificate_id.is_empty() {
+            route.certificate_id = None;
+        } else {
+            route.certificate_id = Some(certificate_id);
+        }
     }
     if let Some(lb) = body.load_balancing {
         route.load_balancing = lb
