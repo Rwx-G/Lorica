@@ -16,6 +16,7 @@ Author: Rwx-G
 - Dashboard: removed redundant scoped CSS overrides (error-banner, loading, table, badges, buttons) in favor of global styles in app.css
 - Dashboard: added global `.btn-secondary` and `.btn-danger` classes to the design system
 - Dashboard: standardized grid gaps, filter-bar spacing, and modal styling across all pages
+- Dashboard Overview: redesigned with header highlight bands replacing double-card panels, centered card values, stronger section hierarchy, and contextual color logic (orange for unconfigured, green for healthy)
 
 ### Added
 
@@ -30,6 +31,11 @@ Author: Rwx-G
 - Worker mode: respawn recreates listening sockets (previously used closed FDs)
 - Worker mode: SLA flush task re-enabled in background runtime. Workers now flush SLA metrics to shared SQLite DB every 60s, making SLA monitoring work in multi-worker mode
 - Worker mode: graceful shutdown with 30s drain timeout then SIGKILL (Sozu soft-stop pattern, fixes `systemctl stop lorica` hanging)
+- Worker mode: worker PIDs now correctly reported in System dashboard (was hardcoded to 0)
+- IP blocklist: loaded immediately at startup when enabled (previously empty until first 6h refresh)
+- Dashboard: all modal/drawer buttons now functional (RouteDrawer tabs, cancel, close; ConfirmDialog; Certificates modals; Settings dialogs). Root cause: Svelte 5 event delegation incompatible with stopPropagation on container divs
+- Dashboard: HTTP/2 upstream checkbox text no longer wraps to two lines in backend form
+- Dashboard: ACME certificate form has proper spacing before "Use staging environment" checkbox when DNS-01 mode is selected
 - NFR validation script: use threaded backend with `/slow` endpoint (3s delay) for realistic 10k connection holding test
 - IP Blocklist toggle: fixed dimensions to match WAF rules toggles (min/max width/height enforced)
 - systemd service file: add `LimitNOFILE=65536` for 10k+ concurrent connections out of the box
