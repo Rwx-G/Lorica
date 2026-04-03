@@ -9,39 +9,39 @@ Author: Rwx-G
 
 ## [Unreleased]
 
-### Changed
-
-- Dashboard: all pages now use consistent full-width layout (removed hardcoded max-width on Overview, Logs, System, Settings)
-- Dashboard: replaced all hardcoded `rgba()` colors with CSS design-token variables for proper dark/light mode support
-- Dashboard: removed redundant scoped CSS overrides (error-banner, loading, table, badges, buttons) in favor of global styles in app.css
-- Dashboard: added global `.btn-secondary` and `.btn-danger` classes to the design system
-- Dashboard: standardized grid gaps, filter-bar spacing, and modal styling across all pages
-- Dashboard Overview: redesigned with header highlight bands replacing double-card panels, centered card values, stronger section hierarchy, and contextual color logic (orange for unconfigured, green for healthy)
+## [0.1.3] - 2026-04-03
 
 ### Added
 
 - Real-time access log forwarding in worker mode via Unix domain socket (`/var/lib/lorica/log.sock`). Workers stream logs to the supervisor with sub-millisecond latency, making WebSocket live logs work in multi-worker mode
 - WAF engine in supervisor process for worker mode: rules listing, blocklist toggle, custom rules, and event viewing now work in the dashboard when running with `--workers N`
-- IP blocklist auto-refresh (every 6h) in supervisor mode
-- Dashboard Overview: getting started guide with interactive setup checklist (backends, routes, certificates, WAF) and per-section "?" helper toggles with contextual explanations. Dismissible with localStorage persistence
+- IP blocklist auto-refresh (every 6h) in supervisor mode, with immediate fetch at startup when enabled
 - WAF: 10 new detection rules - SSRF (cloud metadata, localhost, dangerous URI schemes, internal networks), Log4Shell/JNDI injection, XXE (DOCTYPE/ENTITY), CRLF injection. Total: 28 rules across 8 categories
+- Dashboard Overview: getting started guide with 10-step interactive setup checklist and per-section "?" helper toggles with contextual explanations. Animated expand/collapse. Dismissible with localStorage persistence and re-enable toggle in Settings
+- Dashboard: graceful error handling when backend is unreachable (network error, JSON parse failure). Auto-redirect to login on 401 session expiry
+- Self-proxy dashboard guide (`docs/self-proxy-dashboard.md`) with API setup script for exposing the dashboard through Lorica itself
+
+### Changed
+
+- Dashboard: all pages now use consistent full-width layout (removed hardcoded max-width on Overview, Logs, System, Settings)
+- Dashboard: replaced all hardcoded `rgba()` colors with CSS design-token variables for proper dark/light mode support
+- Dashboard: removed redundant scoped CSS overrides in favor of global styles in app.css, added `.btn-secondary` and `.btn-danger` to the design system
+- Dashboard Overview: redesigned with header highlight bands, centered card values, stronger section hierarchy, and contextual color logic (orange for unconfigured, green for healthy)
+- systemd service file: add `LimitNOFILE=65536` for 10k+ concurrent connections out of the box
 
 ### Fixed
 
 - Worker mode: supervisor closes listening sockets after spawning workers. Fixes requests hanging indefinitely (kernel was routing connections to supervisor which had no proxy service)
 - Worker mode: use `TcpListener::from_raw_fd` instead of `TcpStream::from_raw_fd` for inherited listening sockets (correct socket type)
 - Worker mode: respawn recreates listening sockets (previously used closed FDs)
-- Worker mode: SLA flush task re-enabled in background runtime. Workers now flush SLA metrics to shared SQLite DB every 60s, making SLA monitoring work in multi-worker mode
+- Worker mode: SLA flush task re-enabled in background runtime. Workers now flush SLA metrics to shared SQLite DB every 60s
 - Worker mode: graceful shutdown with 30s drain timeout then SIGKILL (Sozu soft-stop pattern, fixes `systemctl stop lorica` hanging)
 - Worker mode: worker PIDs now correctly reported in System dashboard (was hardcoded to 0)
-- IP blocklist: loaded immediately at startup when enabled (previously empty until first 6h refresh)
-- Dashboard: all modal/drawer buttons now functional. Root cause: Svelte 5 event delegation incompatible with stopPropagation on container divs, plus RouteDrawer $effect tracking `form` as dependency caused state reset on every interaction (fixed via untrack + $derived)
-- Dashboard: graceful error handling when backend is unreachable (network error, JSON parse failure). Auto-redirect to login on 401 session expiry instead of crashing with JSON error
+- Dashboard: all modal/drawer buttons now functional. Root cause: Svelte 5 event delegation incompatible with stopPropagation on container divs, plus RouteDrawer `$effect` tracking `form` as dependency caused state reset on every interaction (fixed via `untrack` + `$derived`)
 - Dashboard: HTTP/2 upstream checkbox text no longer wraps to two lines in backend form
-- Dashboard: ACME certificate form has proper spacing before "Use staging environment" checkbox when DNS-01 mode is selected
-- NFR validation script: use threaded backend with `/slow` endpoint (3s delay) for realistic 10k connection holding test
-- IP Blocklist toggle: fixed dimensions to match WAF rules toggles (min/max width/height enforced)
-- systemd service file: add `LimitNOFILE=65536` for 10k+ concurrent connections out of the box
+- Dashboard: ACME certificate form spacing before "Use staging environment" checkbox in DNS-01 mode
+- IP Blocklist toggle: fixed dimensions to match WAF rules toggles
+- NFR validation script: threaded backend with `/slow` endpoint for realistic 10k connection holding test
 
 ## [0.1.2] - 2026-04-02
 

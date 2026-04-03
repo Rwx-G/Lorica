@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-0.1.2-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.1.3-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Lorica%20Tests-502-brightgreen.svg" alt="Lorica Tests">
@@ -32,8 +32,8 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 ### :lock: Security
 
-- **WAF engine** - 18 OWASP CRS-inspired rules (SQLi, XSS, path traversal, command injection, protocol violations)
-- **IP blocklist** - auto-fetched from Data-Shield IPv4 Blocklist (800k+ entries, O(1) lookup, updated every 6h)
+- **WAF engine** - 28 OWASP CRS-inspired rules (SQLi, XSS, path traversal, command injection, SSRF, Log4Shell, XXE, CRLF)
+- **IP blocklist** - auto-fetched from Data-Shield IPv4 Blocklist (~80,000 entries, O(1) lookup, updated every 6h)
 - **Rate limiting** - per-route, per-client-IP with configurable RPS and burst tolerance
 - **Auto-ban** - IPs that repeatedly exceed rate limits are banned automatically (configurable threshold and duration)
 - **DDoS protection** - per-route max connections, global flood rate tracking
@@ -113,18 +113,51 @@ Options:
 
 ## Dashboard
 
-The dashboard ships inside the binary and is served on the management port (default 9443). It provides:
+The dashboard ships inside the binary and is served on the management port (default 9443). No separate frontend server, no npm, no build step - just open your browser.
 
-- **Overview** - cockpit dashboard with route/backend/certificate/alert summary cards, SLA chart, request rate sparkline, top routes table, and recent events timeline
-- **Routes** - create/edit routes with host matching, path prefixes, load balancing, WAF mode, rate limits, caching, timeouts, security headers, CORS, and 25 other per-route settings in a collapsible Advanced Configuration section
-- **Backends** - manage backend addresses, weights, health check type (TCP/HTTP), TLS upstream, active connections, lifecycle state
-- **Certificates** - upload PEM certificates, view expiry dates, provision via ACME/Let's Encrypt
-- **Security** - WAF event table with category filtering, stats per attack category, rule toggle switches, ban list with unban button
+<p align="center">
+  <img src="docs/screenshots/overview-guide.png" alt="Overview - Getting Started Guide" width="100%">
+  <br><em>Getting started guide with interactive setup checklist</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/overview.png" alt="Overview Dashboard" width="100%">
+  <br><em>Overview cockpit with system health, routes, security, and performance at a glance</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/routes.png" alt="Routes Management" width="100%">
+  <br><em>Routes table with hostname, backends, WAF mode, health status, and TLS</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/routesDrawer.png" alt="Route Configuration Drawer" width="100%">
+  <br><em>Route editor with 25+ settings across 7 tabs (General, Timeouts, Security, Headers, CORS, Caching, Protection)</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/security.png" alt="Security - WAF Rules" width="100%">
+  <br><em>28 WAF rules with per-rule toggle, covering SQLi, XSS, SSRF, Log4Shell, XXE, and more</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/system.png" alt="System - Workers" width="100%">
+  <br><em>System page with worker health, heartbeat latency, CPU/memory gauges, and process metrics</em>
+</p>
+
+### Pages
+
+- **Overview** - cockpit dashboard with section helpers, setup checklist, system/route/security/performance cards
+- **Routes** - create/edit routes with host matching, path prefixes, load balancing, WAF mode, rate limits, caching, timeouts, security headers, CORS, and 25 other per-route settings
+- **Backends** - manage backend addresses, weights, health check type (TCP/HTTP), TLS upstream, active connections
+- **Certificates** - upload PEM certificates, view expiry dates, provision via ACME/Let's Encrypt (HTTP-01, DNS-01)
+- **Security** - WAF event table with category filtering, 28 rule toggles, IP ban list with unban button
 - **SLA** - per-route passive/active SLA side-by-side, latency percentile tables, config editor, CSV/JSON export
 - **Load Tests** - test config management with clone, one-click execution, real-time SSE progress panel, historical results
 - **Active Probes** - CRUD for synthetic health probes with route selection, HTTP method/path/status/interval/timeout
 - **Access Logs** - scrollable real-time log stream via WebSocket with green pulsing indicator
-- **Settings** - notification channels (stdout/SMTP/webhook), topology config, config export/import with diff preview
+- **System** - worker table with PID, health, heartbeat latency; CPU/memory/disk gauges
+- **Settings** - notification channels, security header presets, topology config, config export/import with diff preview
 - **Theme** - light/dark mode toggle
 
 ## Architecture
