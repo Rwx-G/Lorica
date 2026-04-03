@@ -94,8 +94,8 @@
         key: 'blocklist',
         done: (bans?.total ?? 0) >= 0,
         label: 'Enable IP blocklist',
-        summary: 'Block 80k+ known malicious IPs automatically.',
-        detail: 'The IPv4 blocklist contains 80,000+ IPs flagged for scanning, brute-force, and botnet activity (updated every 6 hours from Data-Shield). Blocked IPs receive 403 before any route lookup or WAF evaluation. Toggle it on the Security page. You can also manually ban/unban individual IPs.',
+        summary: 'Block approx. 80,000 known malicious IPs automatically.',
+        detail: 'The IPv4 blocklist contains approximately 80,000 IPs flagged for scanning, brute-force, and botnet activity (updated every 6 hours from Data-Shield). Blocked IPs receive 403 before any route lookup or WAF evaluation. Toggle it on the Security page. You can also manually ban/unban individual IPs.',
         route: '/security',
       },
       {
@@ -743,7 +743,7 @@
 
   .step-row {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: var(--space-3);
   }
 
@@ -755,6 +755,11 @@
     align-items: center;
     justify-content: center;
     font-size: 0.875rem;
+    margin-top: 0.125rem;
+  }
+
+  .step-row > .btn-small {
+    margin-top: 0.0625rem;
   }
 
   .setup-step.done .step-check {
