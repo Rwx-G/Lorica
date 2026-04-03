@@ -448,6 +448,9 @@ export const api = {
   deleteCertificate: (id: string) =>
     request<{ message: string }>('DELETE', `/certificates/${id}`),
 
+  renewCertificate: (id: string) =>
+    request<{ renewed: boolean; old_cert_id: string; new_cert_id: string; domain: string }>('POST', `/certificates/${id}/renew`),
+
   generateSelfSigned: (body: GenerateSelfSignedRequest) =>
     request<CertificateResponse>('POST', '/certificates/self-signed', body),
 

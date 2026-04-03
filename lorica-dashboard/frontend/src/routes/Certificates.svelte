@@ -15,6 +15,7 @@
   } from '../lib/api';
   import CertExpiryBadge from '../components/CertExpiryBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
+  import { showToast } from '../lib/toast';
 
   let certificates: CertificateResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
@@ -53,6 +54,9 @@
   // Delete state
   let deletingCert: CertificateResponse | null = $state(null);
   let deleteRoutes: RouteResponse[] = $state([]);
+
+  // Renew state
+  let renewingId = $state('');
 
   // Self-signed generation state
   let showSelfSigned = $state(false);
@@ -417,10 +421,24 @@
     if (!deletingCert) return;
     const res = await api.deleteCertificate(deletingCert.id);
     if (res.error) {
-      error = res.error.message;
+      showToast(res.error.message, 'error');
+    } else {
+      showToast('Certificate deleted', 'success');
     }
     deletingCert = null;
     deleteRoutes = [];
+    await loadData();
+  }
+
+  async function handleRenew(cert: CertificateResponse) {
+    renewingId = cert.id;
+    const res = await api.renewCertificate(cert.id);
+    if (res.error) {
+      showToast(res.error.message, 'error');
+    } else {
+      showToast(`Certificate for ${cert.domain} renewed successfully`, 'success');
+    }
+    renewingId = '';
     await loadData();
   }
 
@@ -591,6 +609,11 @@
                 <button class="btn-icon" title="Edit" onclick={() => openEditForm(cert)}>
                   {@html editIcon}
                 </button>
+                {#if cert.is_acme}
+                  <button class="btn-icon" title="Renew" onclick={() => handleRenew(cert)} disabled={renewingId === cert.id}>
+                    {@html renewIcon}
+                  </button>
+                {/if}
                 <button class="btn-icon btn-icon-danger" title="Delete" onclick={() => openDelete(cert)}>
                   {@html trashIcon}
                 </button>
@@ -977,6 +1000,7 @@
   const eyeIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
   const editIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
   const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+  const renewIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
   const gearIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
 </script>
 
