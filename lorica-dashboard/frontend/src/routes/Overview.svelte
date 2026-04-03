@@ -30,11 +30,16 @@
   // Helper / getting started guide
   const HELPER_KEY = 'lorica_helper_dismissed';
   let helperDismissed = $state(localStorage.getItem(HELPER_KEY) === 'true');
+  let helperClosing = $state(false);
   let expandedHelpers: Record<string, boolean> = $state({});
 
   function dismissHelper() {
-    helperDismissed = true;
-    localStorage.setItem(HELPER_KEY, 'true');
+    helperClosing = true;
+    setTimeout(() => {
+      helperDismissed = true;
+      helperClosing = false;
+      localStorage.setItem(HELPER_KEY, 'true');
+    }, 300);
   }
 
   function toggleHelperDetail(key: string) {
@@ -291,7 +296,7 @@
 
     <!-- GETTING STARTED GUIDE -->
     {#if !helperDismissed}
-      <div class="helper-banner">
+      <div class="helper-banner" class:closing={helperClosing}>
         <div class="helper-banner-header">
           <div>
             <h2>Welcome to Lorica</h2>
@@ -310,9 +315,9 @@
                     <span class="step-summary">{step.summary}</span>
                     <span class="chevron" class:expanded={expandedHelpers[step.key]}></span>
                   </button>
-                  {#if expandedHelpers[step.key]}
+                  <div class="detail-anim" class:open={expandedHelpers[step.key]}>
                     <p class="step-detail">{step.detail}</p>
-                  {/if}
+                  </div>
                 </div>
                 <button class="btn btn-small" onclick={() => navigate(step.route)}>Go</button>
               </div>
@@ -337,9 +342,9 @@
           <button class="helper-toggle" class:active={expandedHelpers['section-system']} onclick={() => toggleHelperDetail('section-system')} title="What is this?">?</button>
         {/if}
       </div>
-      {#if expandedHelpers['section-system']}
+      <div class="detail-anim" class:open={expandedHelpers['section-system']}>
         <p class="section-helper-text">{sectionHelpers.system.description}</p>
-      {/if}
+      </div>
       <div class="card-grid">
         {#if system}
           <Card title="Uptime" value={formatUptime(system.proxy.uptime_seconds)} />
@@ -371,9 +376,9 @@
           <button class="helper-toggle" class:active={expandedHelpers['section-routes']} onclick={() => toggleHelperDetail('section-routes')} title="What is this?">?</button>
         {/if}
       </div>
-      {#if expandedHelpers['section-routes']}
+      <div class="detail-anim" class:open={expandedHelpers['section-routes']}>
         <p class="section-helper-text">{sectionHelpers.routes.description}</p>
-      {/if}
+      </div>
       <div class="card-grid">
         {#if status}
           <Card title="Routes" value={status.routes_count} color={status.routes_count === 0 ? 'orange' : 'default'} />
@@ -408,9 +413,9 @@
           <button class="helper-toggle" class:active={expandedHelpers['section-certs']} onclick={() => toggleHelperDetail('section-certs')} title="What is this?">?</button>
         {/if}
       </div>
-      {#if expandedHelpers['section-certs']}
+      <div class="detail-anim" class:open={expandedHelpers['section-certs']}>
         <p class="section-helper-text">{sectionHelpers.certificates.description}</p>
-      {/if}
+      </div>
       <div class="card-grid">
         {#if status}
           <Card title="Total" value={status.certificates_count} color={status.certificates_count === 0 ? 'orange' : 'default'} />
@@ -434,9 +439,9 @@
           <button class="helper-toggle" class:active={expandedHelpers['section-security']} onclick={() => toggleHelperDetail('section-security')} title="What is this?">?</button>
         {/if}
       </div>
-      {#if expandedHelpers['section-security']}
+      <div class="detail-anim" class:open={expandedHelpers['section-security']}>
         <p class="section-helper-text">{sectionHelpers.security.description}</p>
-      {/if}
+      </div>
       <div class="card-grid">
         <Card
           title="WAF Events"
@@ -469,9 +474,9 @@
           <button class="helper-toggle" class:active={expandedHelpers['section-perf']} onclick={() => toggleHelperDetail('section-perf')} title="What is this?">?</button>
         {/if}
       </div>
-      {#if expandedHelpers['section-perf']}
+      <div class="detail-anim" class:open={expandedHelpers['section-perf']}>
         <p class="section-helper-text">{sectionHelpers.performance.description}</p>
-      {/if}
+      </div>
       <div class="card-grid">
         <Card
           title="Requests (1h)"
@@ -519,9 +524,9 @@
           <button class="helper-toggle" class:active={expandedHelpers['section-monitoring']} onclick={() => toggleHelperDetail('section-monitoring')} title="What is this?">?</button>
         {/if}
       </div>
-      {#if expandedHelpers['section-monitoring']}
+      <div class="detail-anim" class:open={expandedHelpers['section-monitoring']}>
         <p class="section-helper-text">{sectionHelpers.monitoring.description}</p>
-      {/if}
+      </div>
       <div class="card-grid">
         <Card title="Active Probes" value={probesEnabled} color={probesEnabled > 0 ? 'green' : 'default'} />
         <Card title="Total Probes" value={probes.length} />
@@ -632,14 +637,48 @@
     gap: var(--space-3);
   }
 
+  /* Animations */
+
+  .detail-anim {
+    display: grid;
+    grid-template-rows: 0fr;
+    opacity: 0;
+    transition: grid-template-rows 0.25s ease, opacity 0.25s ease;
+  }
+
+  .detail-anim.open {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+
+  .detail-anim > * {
+    overflow: hidden;
+    min-height: 0;
+  }
+
   /* Helper / Getting Started banner */
 
   .helper-banner {
+    animation: banner-in 0.3s ease-out;
     background: var(--color-primary-subtle);
     border: 1px solid var(--color-primary);
     border-radius: var(--radius-xl);
     padding: var(--space-5);
     margin-bottom: var(--space-4);
+  }
+
+  .helper-banner.closing {
+    animation: banner-out 0.3s ease-in forwards;
+  }
+
+  @keyframes banner-in {
+    from { opacity: 0; transform: translateY(-1rem); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @keyframes banner-out {
+    from { opacity: 1; transform: translateY(0); }
+    to { opacity: 0; transform: translateY(-1rem); }
   }
 
   .helper-banner-header {
