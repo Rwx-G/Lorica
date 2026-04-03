@@ -20,6 +20,14 @@ Author: Rwx-G
 - Dashboard Overview: getting started guide with 10-step interactive setup checklist and per-section "?" helper toggles with contextual explanations. Animated expand/collapse. Dismissible with localStorage persistence and re-enable toggle in Settings
 - Dashboard: graceful error handling when backend is unreachable (network error, JSON parse failure). Auto-redirect to login on 401 session expiry
 - Self-proxy dashboard guide (`docs/self-proxy-dashboard.md`) with API setup script for exposing the dashboard through Lorica itself
+- Certificate upload now parses X.509 metadata (issuer, validity dates, SAN domains, DER fingerprint) instead of hardcoded placeholders
+- Manual certificate renewal button on ACME certificates in the dashboard
+- ACME auto-renewal background task (checks every 12h, renews at 30 days before expiry)
+- ACME HTTP-01 challenges served on proxy port 80 (previously only on management port, which Let's Encrypt cannot reach)
+- TLS termination in worker mode: workers create their own CertResolver, load certs from DB, and reload on config changes. HTTPS now works with `--workers N`
+- Notification system fully wired: NotifyDispatcher created from DB configs at startup, broadcast-based AlertSender for proxy hot path. Alert dispatch sites for `waf_alert`, `ip_banned`, `backend_down`, `cert_expiring`, `sla_breached`
+- Notification history endpoint (`GET /api/v1/notifications/history`) and dashboard table in Settings
+- Load testing available in supervisor/worker mode (was single-process only)
 
 ### Changed
 
@@ -28,6 +36,12 @@ Author: Rwx-G
 - Dashboard: removed redundant scoped CSS overrides in favor of global styles in app.css, added `.btn-secondary` and `.btn-danger` to the design system
 - Dashboard Overview: redesigned with header highlight bands, centered card values, stronger section hierarchy, and contextual color logic (orange for unconfigured, green for healthy)
 - systemd service file: add `LimitNOFILE=65536` for 10k+ concurrent connections out of the box
+- HTTPS listener starts unconditionally (even with no certs). TLS handshakes fail for unknown domains; when the first cert is uploaded and the resolver reloaded, TLS starts working without restart
+
+### Security
+
+- AES-256-GCM encryption enabled for certificate private keys at rest (encryption key auto-generated at `encryption.key`, chmod 0600)
+- Database file permissions restricted to 0600 (owner-only read/write)
 
 ### Fixed
 
@@ -37,6 +51,10 @@ Author: Rwx-G
 - Worker mode: SLA flush task re-enabled in background runtime. Workers now flush SLA metrics to shared SQLite DB every 60s
 - Worker mode: graceful shutdown with 30s drain timeout then SIGKILL (Sozu soft-stop pattern, fixes `systemctl stop lorica` hanging)
 - Worker mode: worker PIDs now correctly reported in System dashboard (was hardcoded to 0)
+- TLS CertResolver now hot-reloads on certificate upload/update/delete (was only loaded at startup)
+- Certificate CRUD triggers proxy config reload (was missing `notify_config_changed`)
+- Route certificate removal: setting certificate_id to empty string now clears the TLS association
+- Certificate delete shows error toast when cert is referenced by routes (was silent failure)
 - Dashboard: all modal/drawer buttons now functional. Root cause: Svelte 5 event delegation incompatible with stopPropagation on container divs, plus RouteDrawer `$effect` tracking `form` as dependency caused state reset on every interaction (fixed via `untrack` + `$derived`)
 - Dashboard: HTTP/2 upstream checkbox text no longer wraps to two lines in backend form
 - Dashboard: ACME certificate form spacing before "Use staging environment" checkbox in DNS-01 mode
