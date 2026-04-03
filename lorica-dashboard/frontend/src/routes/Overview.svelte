@@ -743,23 +743,14 @@
 
   .step-row {
     display: flex;
-    align-items: flex-start;
+    align-items: first baseline;
     gap: var(--space-3);
   }
 
   .step-check {
     flex-shrink: 0;
-    width: 1.25rem;
-    height: 1.25rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
     font-size: 0.875rem;
-    margin-top: 0.125rem;
-  }
-
-  .step-row > .btn-small {
-    margin-top: 0.0625rem;
+    line-height: 1;
   }
 
   .setup-step.done .step-check {
@@ -773,9 +764,7 @@
   }
 
   .step-toggle {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-2);
+    display: inline;
     background: none;
     border: none;
     padding: 0;
@@ -783,11 +772,11 @@
     text-align: left;
     color: var(--color-text);
     font-size: var(--text-md);
-    flex-wrap: wrap;
   }
 
   .step-toggle strong {
     color: var(--color-text-heading);
+    margin-right: var(--space-2);
   }
 
   .step-summary {
