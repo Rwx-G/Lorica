@@ -233,6 +233,8 @@ pub async fn create_certificate(
 
     let store = state.store.lock().await;
     store.create_certificate(&cert)?;
+    drop(store);
+    state.notify_config_changed();
 
     Ok(json_data_with_status(
         StatusCode::CREATED,
@@ -304,6 +306,8 @@ pub async fn update_certificate(
     }
 
     store.update_certificate(&cert)?;
+    drop(store);
+    state.notify_config_changed();
     Ok(json_data(cert_to_response(&cert)))
 }
 
@@ -330,6 +334,8 @@ pub async fn delete_certificate(
     }
 
     store.delete_certificate(&id)?;
+    drop(store);
+    state.notify_config_changed();
     Ok(json_data(
         serde_json::json!({"message": "certificate deleted"}),
     ))
@@ -378,6 +384,8 @@ pub async fn generate_self_signed(
 
     let store = state.store.lock().await;
     store.create_certificate(&certificate)?;
+    drop(store);
+    state.notify_config_changed();
 
     Ok(json_data_with_status(
         StatusCode::CREATED,
