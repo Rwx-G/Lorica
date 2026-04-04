@@ -1221,6 +1221,11 @@ fn build_notify_dispatcher(store: &lorica_config::ConfigStore) -> lorica_notify:
                         dispatcher.add_webhook_channel(nc.id, webhook_cfg, nc.alert_types, nc.enabled);
                     }
                 }
+                lorica_config::models::NotificationChannel::Slack => {
+                    if let Ok(slack_cfg) = serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json) {
+                        dispatcher.add_slack_channel(nc.id, slack_cfg, nc.alert_types, nc.enabled);
+                    }
+                }
             }
         }
     }
