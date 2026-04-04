@@ -73,8 +73,7 @@ nix = { version = "~0.29", features = ["socket", "uio", "net", "fs", "signal", "
 h2 = { workspace = true, features = ["unstable"] }
 tokio-stream = { version = "0.1", features = ["full"] }
 env_logger = "0.11"
-reqwest = { version = "0.11", features = ["rustls-tls"], default-features = false }
-hyper = "0.14"
+reqwest = { version = "0.12", features = ["rustls-tls-webpki-roots"], default-features = false }
 rstest = "0.23.0"
 rustls = "0.23"
 

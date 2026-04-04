@@ -22,6 +22,7 @@ Author: Rwx-G
 ### Changed
 
 - Post-install message now lists all CLI flags and notes dashboard is localhost-only
+- Upgrade reqwest 0.11 to 0.12 across all crates, eliminating duplicate rustls-pemfile dependency tree
 
 ### Fixed
 
