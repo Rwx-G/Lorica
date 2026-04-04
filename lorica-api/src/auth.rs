@@ -10,6 +10,17 @@ use crate::middleware::auth::{clear_session_cookie, session_cookie, Session, Ses
 use crate::middleware::rate_limit::RateLimiter;
 use crate::server::AppState;
 
+/// Build the Argon2 hasher with explicit production parameters.
+/// Algorithm: Argon2id v0x13, 19 MiB memory, 2 iterations, 1 parallelism.
+/// These match OWASP recommendations for password storage.
+fn argon2_hasher() -> argon2::Argon2<'static> {
+    argon2::Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2::Params::new(19456, 2, 1, None).expect("valid Argon2 params"),
+    )
+}
+
 #[derive(Deserialize)]
 pub struct LoginRequest {
     pub username: String,
@@ -54,7 +65,7 @@ pub async fn login(
         .map_err(|_| ApiError::Internal("invalid stored password hash".into()))?;
 
     use argon2::PasswordVerifier;
-    argon2::Argon2::default()
+    argon2_hasher()
         .verify_password(body.password.as_bytes(), &parsed_hash)
         .map_err(|_| ApiError::Unauthorized("invalid credentials".into()))?;
 
@@ -132,7 +143,7 @@ pub async fn change_password(
         .map_err(|_| ApiError::Internal("invalid stored password hash".into()))?;
 
     use argon2::PasswordVerifier;
-    argon2::Argon2::default()
+    argon2_hasher()
         .verify_password(body.current_password.as_bytes(), &parsed_hash)
         .map_err(|_| ApiError::Unauthorized("current password is incorrect".into()))?;
 
