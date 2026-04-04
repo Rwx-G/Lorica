@@ -118,6 +118,9 @@ pub struct ServerConf {
     ///
     /// When not set, the tokio default (10 seconds) is used.
     pub blocking_threads_ttl_seconds: Option<u64>,
+    /// Path to a CRL (Certificate Revocation List) file in PEM or DER format.
+    /// When set, upstream server certificates are checked against this CRL.
+    pub upstream_crl_file: Option<String>,
 }
 
 impl Default for ServerConf {
@@ -146,6 +149,7 @@ impl Default for ServerConf {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            upstream_crl_file: None,
         }
     }
 }

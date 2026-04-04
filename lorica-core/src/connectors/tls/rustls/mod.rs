@@ -88,10 +88,21 @@ impl TlsConnector {
             (ca_certs, certs_key)
         };
 
-        // TODO: WebPkiServerVerifier for CRL/OCSP validation
-        let builder =
+        // Build TLS client config, optionally with CRL-based revocation checking
+        let ca_certs_arc = Arc::new(ca_certs.clone());
+        let builder = if let Some(crl_path) = options.as_ref().and_then(|o| o.crl_file.as_ref()) {
+            let crls = lorica_tls::load_crls_from_file(crl_path)?;
+            debug!("loaded {} CRL(s) from {}", crls.len(), crl_path);
+            let verifier = WebPkiServerVerifier::builder(ca_certs_arc)
+                .with_crls(crls)
+                .build()
+                .or_err(InvalidCert, "Failed to build server verifier with CRLs")?;
             RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
-                .with_root_certificates(ca_certs.clone());
+                .with_webpki_verifier(verifier)
+        } else {
+            RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+                .with_root_certificates(ca_certs.clone())
+        };
 
         let mut config = match certs_key {
             Some((certs, key)) => {

@@ -36,7 +36,9 @@ pub use rustls::{
 };
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
-pub use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+pub use rustls_pki_types::{
+    CertificateRevocationListDer, CertificateDer, PrivateKeyDer, ServerName, UnixTime,
+};
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
 pub use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector, TlsStream};
@@ -173,6 +175,28 @@ pub fn load_pem_file_private_key(path: &String) -> Result<Vec<u8>> {
         )?
         .map(|key| key.secret_der().to_vec())
         .unwrap_or_default())
+}
+
+/// Load CRLs from a PEM or DER file. Supports files containing multiple CRLs.
+pub fn load_crls_from_file<P: AsRef<Path>>(path: P) -> Result<Vec<CertificateRevocationListDer<'static>>> {
+    let mut reader = load_file(&path)?;
+    let crls: Vec<CertificateRevocationListDer<'static>> = rustls_pemfile::crls(&mut reader)
+        .map(|item_res| {
+            item_res.or_err(
+                ErrorType::InvalidCert,
+                "Failed to load CRL from file",
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if crls.is_empty() {
+        // Try DER format as fallback
+        let raw = std::fs::read(path.as_ref())
+            .or_err(ErrorType::FileReadError, "Failed to read CRL file")?;
+        return Ok(vec![CertificateRevocationListDer::from(raw)]);
+    }
+
+    Ok(crls)
 }
 
 pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {

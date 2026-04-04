@@ -71,6 +71,9 @@ pub struct ConnectorOptions {
     pub bind_to_v4: Vec<SocketAddr>,
     /// Bind to any of the given source IPv4 addresses
     pub bind_to_v6: Vec<SocketAddr>,
+    /// Path to a CRL (Certificate Revocation List) file in PEM or DER format.
+    /// When set, upstream server certificates are checked against this CRL.
+    pub crl_file: Option<String>,
 }
 
 impl ConnectorOptions {
@@ -109,6 +112,7 @@ impl ConnectorOptions {
             offload_threadpool,
             bind_to_v4,
             bind_to_v6,
+            crl_file: server_conf.upstream_crl_file.clone(),
         }
     }
 
@@ -122,6 +126,7 @@ impl ConnectorOptions {
             offload_threadpool: None,
             bind_to_v4: vec![],
             bind_to_v6: vec![],
+            crl_file: None,
         }
     }
 }

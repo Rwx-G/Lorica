@@ -17,6 +17,7 @@ Author: Rwx-G
 - Real test notification delivery via Test button (sends actual email/webhook/slack)
 - Toast notifications for test notification success/failure in dashboard
 - Overview: section helper "?" buttons visible independently of getting started guide
+- CRL (Certificate Revocation List) support for upstream TLS connections via `upstream_crl_file` config option. When set, server certificates are checked against the CRL (PEM or DER format)
 
 ### Changed
 
