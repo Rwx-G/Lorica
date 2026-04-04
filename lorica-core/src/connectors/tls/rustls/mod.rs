@@ -176,8 +176,12 @@ where
                 .for_each(|i| cert_chain.push(i));
 
             let certs: Vec<CertificateDer> = cert_chain.into_iter().map(|c| c.into()).collect();
-            let private_key: PrivateKeyDer =
-                key_arc.key().as_slice().to_owned().try_into().unwrap();
+            let private_key: PrivateKeyDer = key_arc
+                .key()
+                .as_slice()
+                .to_owned()
+                .try_into()
+                .or_err(InvalidCert, "Failed to convert private key to PrivateKeyDer")?;
 
             let builder = RusTlsClientConfig::builder_with_protocol_versions(&[
                 &version::TLS12,
