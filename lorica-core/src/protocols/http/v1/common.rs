@@ -386,4 +386,39 @@ mod test {
         }
         assert_eq!(is_chunked_encoding_from_headers(&headers), expected);
     }
+
+    // ---- Smuggling-specific TE parsing tests ----
+
+    #[rstest]
+    #[case::chunked_with_parameter("chunked;q=0.1", false)]
+    #[case::chunked_with_extension("chunked;ext", false)]
+    #[case::chunked_semicolon_only("chunked;", false)]
+    #[case::uppercase_chunked("CHUNKED", true)]
+    #[case::mixed_case("ChUnKeD", true)]
+    #[case::chunked_tab_padded("\tchunked\t", true)]
+    fn test_smuggling_te_obfuscation(#[case] value: &str, #[case] expected: bool) {
+        let mut headers = HMap::new();
+        headers.insert(TRANSFER_ENCODING, value.try_into().unwrap());
+        assert_eq!(is_chunked_encoding_from_headers(&headers), expected);
+    }
+
+    #[test]
+    fn test_smuggling_dup_cl_with_te_ignores_cl() {
+        // When TE is present, duplicate CL check is skipped (TE takes priority)
+        let mut headers = HMap::new();
+        headers.append(CONTENT_LENGTH, "5".try_into().unwrap());
+        headers.append(CONTENT_LENGTH, "100".try_into().unwrap());
+        headers.insert(TRANSFER_ENCODING, "chunked".try_into().unwrap());
+        // Should be Ok because TE presence makes CL irrelevant
+        assert!(check_dup_content_length(&headers).is_ok());
+    }
+
+    #[test]
+    fn test_smuggling_dup_cl_without_te_rejected() {
+        // Without TE, duplicate CL with different values must be rejected
+        let mut headers = HMap::new();
+        headers.append(CONTENT_LENGTH, "5".try_into().unwrap());
+        headers.append(CONTENT_LENGTH, "100".try_into().unwrap());
+        assert!(check_dup_content_length(&headers).is_err());
+    }
 }

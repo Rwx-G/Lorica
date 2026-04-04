@@ -14,6 +14,7 @@ Author: Rwx-G
 - Fix encryption key file created with restrictive permissions (0600) atomically at creation, eliminating race condition window (`lorica-config/src/crypto.rs`)
 - Fix potential panic on invalid private key format during mTLS client cert setup, replaced `.unwrap()` with proper error propagation (`lorica-core/src/connectors/tls/rustls/mod.rs`)
 - Redact password hashes from config export; import now rejects redacted hashes with a clear error message
+- Add HTTP request smuggling test suite (CL.TE desync, TE obfuscation, duplicate CL, HTTP/1.0+TE rejection)
 
 ## [0.1.3] - 2026-04-03
 

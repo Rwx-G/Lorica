@@ -2979,4 +2979,128 @@ mod test_overread {
         let reused = http_stream.reuse().await.unwrap();
         assert!(reused.is_none());
     }
+
+    // ---- HTTP request smuggling tests ----
+
+    #[tokio::test]
+    async fn test_smuggling_te_with_parameter_rejected() {
+        init_log();
+        // TE value "chunked;q=0.1" is NOT valid chunked - parameters are forbidden
+        // per RFC 9112 Section 7.1. Must NOT be treated as chunked.
+        let input = b"POST / HTTP/1.1\r\n\
+Host: lorica.org\r\n\
+Transfer-Encoding: chunked;q=0.1\r\n\
+\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        // Should fail because final TE is not "chunked"
+        http_stream.read_request().await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_smuggling_te_comma_separated_with_parameter_rejected() {
+        init_log();
+        // "identity, chunked;ext" - last token has parameter, not valid chunked
+        let input = b"POST / HTTP/1.1\r\n\
+Host: lorica.org\r\n\
+Transfer-Encoding: identity, chunked;ext\r\n\
+\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_smuggling_cl_te_removes_cl_and_disables_keepalive() {
+        init_log();
+        // Classic CL.TE smuggling: both headers present.
+        // Lorica must: remove CL, keep TE, disable keepalive.
+        let input = b"POST / HTTP/1.1\r\n\
+Host: lorica.org\r\n\
+Content-Length: 100\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+
+        // CL must be removed when TE is present
+        assert!(http_stream.get_header(CONTENT_LENGTH).is_none());
+        assert!(http_stream.get_header(TRANSFER_ENCODING).is_some());
+
+        // Keepalive must be disabled
+        assert!(!http_stream.will_keepalive());
+
+        // Body must be read as chunked (5 bytes), not CL (100 bytes)
+        let body = http_stream.read_body_bytes().await.unwrap();
+        assert_eq!(body.unwrap().as_ref(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_smuggling_empty_te_value_rejected() {
+        init_log();
+        // Empty Transfer-Encoding value - ambiguous framing
+        let input = b"POST / HTTP/1.1\r\n\
+Host: lorica.org\r\n\
+Transfer-Encoding: \r\n\
+\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        // Should fail: TE present but not chunked
+        http_stream.read_request().await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_smuggling_te_case_insensitive() {
+        init_log();
+        // "CHUNKED" in uppercase must be accepted
+        let input = b"POST / HTTP/1.1\r\n\
+Host: lorica.org\r\n\
+Transfer-Encoding: CHUNKED\r\n\
+\r\n\
+5\r\nhello\r\n0\r\n\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_chunked_encoding());
+    }
+
+    #[tokio::test]
+    async fn test_smuggling_duplicate_cl_different_values_rejected() {
+        init_log();
+        // Two Content-Length headers with different values - classic desync
+        let input = b"POST / HTTP/1.1\r\n\
+Host: lorica.org\r\n\
+Content-Length: 5\r\n\
+Content-Length: 100\r\n\
+\r\nhello";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_smuggling_http10_with_te_rejected() {
+        init_log();
+        // HTTP/1.0 + Transfer-Encoding is invalid per RFC 9112
+        let input = b"POST / HTTP/1.0\r\n\
+Host: lorica.org\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let err = http_stream.read_request().await.unwrap_err();
+        assert!(err.to_string().contains("Transfer-Encoding"));
+    }
 }
