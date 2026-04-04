@@ -108,7 +108,10 @@ pub async fn list_notifications(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
-    let configs = store.list_notification_configs()?;
+    let mut configs = store.list_notification_configs()?;
+    for nc in &mut configs {
+        nc.config = mask_sensitive_config(&nc.channel, &nc.config);
+    }
     Ok(json_data(serde_json::json!({ "notifications": configs })))
 }
 
@@ -142,10 +145,12 @@ pub async fn create_notification(
 
     let store = state.store.lock().await;
     store.create_notification_config(&nc)?;
-    Ok(json_data_with_status(StatusCode::CREATED, nc))
+    let mut masked = nc;
+    masked.config = mask_sensitive_config(&masked.channel, &masked.config);
+    Ok(json_data_with_status(StatusCode::CREATED, masked))
 }
 
-/// POST /api/v1/notifications/:id/test - validate notification config reachability
+/// POST /api/v1/notifications/:id/test - send a real test notification
 pub async fn test_notification(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -154,29 +159,42 @@ pub async fn test_notification(
     let nc = store
         .get_notification_config(&id)?
         .ok_or_else(|| ApiError::NotFound(format!("notification_config {id}")))?;
+    drop(store);
 
-    let config_json: serde_json::Value = serde_json::from_str(&nc.config)
-        .map_err(|e| ApiError::BadRequest(format!("invalid config JSON: {e}")))?;
+    let test_event = lorica_notify::events::AlertEvent::new(
+        lorica_notify::events::AlertType::ConfigChanged,
+        "Lorica test notification - if you receive this, your channel is working!",
+    );
 
     match nc.channel {
         lorica_config::models::NotificationChannel::Email => {
-            if config_json.get("smtp_host").is_none() {
-                return Err(ApiError::BadRequest(
-                    "email config missing required field: smtp_host".into(),
-                ));
-            }
+            let config: lorica_notify::channels::EmailConfig =
+                serde_json::from_str(&nc.config)
+                    .map_err(|e| ApiError::BadRequest(format!("invalid email config: {e}")))?;
+            lorica_notify::channels::email::send(&config, &test_event)
+                .await
+                .map_err(|e| ApiError::Internal(format!("email send failed: {e}")))?;
         }
         lorica_config::models::NotificationChannel::Webhook => {
-            if config_json.get("url").is_none() {
-                return Err(ApiError::BadRequest(
-                    "webhook config missing required field: url".into(),
-                ));
-            }
+            let config: lorica_notify::channels::WebhookConfig =
+                serde_json::from_str(&nc.config)
+                    .map_err(|e| ApiError::BadRequest(format!("invalid webhook config: {e}")))?;
+            lorica_notify::channels::webhook::send(&config, &test_event)
+                .await
+                .map_err(|e| ApiError::Internal(format!("webhook send failed: {e}")))?;
+        }
+        lorica_config::models::NotificationChannel::Slack => {
+            let config: lorica_notify::channels::WebhookConfig =
+                serde_json::from_str(&nc.config)
+                    .map_err(|e| ApiError::BadRequest(format!("invalid slack config: {e}")))?;
+            lorica_notify::channels::slack::send(&config, &test_event)
+                .await
+                .map_err(|e| ApiError::Internal(format!("slack send failed: {e}")))?;
         }
     }
 
     Ok(json_data(serde_json::json!({
-        "message": "notification config is valid",
+        "message": "test notification sent successfully",
         "channel": nc.channel.as_str(),
     })))
 }
@@ -195,6 +213,24 @@ pub async fn notification_history(
         "events": events,
         "total": events.len(),
     })))
+}
+
+fn mask_sensitive_config(
+    channel: &lorica_config::models::NotificationChannel,
+    config: &str,
+) -> String {
+    if *channel == lorica_config::models::NotificationChannel::Email {
+        if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(config) {
+            if val
+                .get("smtp_password")
+                .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+            {
+                val["smtp_password"] = serde_json::json!("********");
+            }
+            return serde_json::to_string(&val).unwrap_or_else(|_| config.to_string());
+        }
+    }
+    config.to_string()
 }
 
 fn validate_notification_config(config: &str) -> Result<(), ApiError> {
@@ -219,17 +255,42 @@ pub async fn update_notification(
 
     validate_notification_config(&body.config)?;
 
+    let mut config = body.config.clone();
+    if channel == lorica_config::models::NotificationChannel::Email {
+        if let Ok(mut new_val) = serde_json::from_str::<serde_json::Value>(&config) {
+            if new_val
+                .get("smtp_password")
+                .is_some_and(|v| v.as_str() == Some("********"))
+            {
+                let store = state.store.lock().await;
+                if let Some(existing) = store.get_notification_config(&id)? {
+                    if let Ok(existing_val) =
+                        serde_json::from_str::<serde_json::Value>(&existing.config)
+                    {
+                        if let Some(pwd) = existing_val.get("smtp_password") {
+                            new_val["smtp_password"] = pwd.clone();
+                            config = serde_json::to_string(&new_val).unwrap_or(config);
+                        }
+                    }
+                }
+                drop(store);
+            }
+        }
+    }
+
     let nc = lorica_config::models::NotificationConfig {
         id,
         channel,
         enabled: body.enabled.unwrap_or(true),
-        config: body.config,
+        config,
         alert_types: body.alert_types,
     };
 
     let store = state.store.lock().await;
     store.update_notification_config(&nc)?;
-    Ok(json_data(nc))
+    let mut masked = nc;
+    masked.config = mask_sensitive_config(&masked.channel, &masked.config);
+    Ok(json_data(masked))
 }
 
 /// DELETE /api/v1/notifications/:id
