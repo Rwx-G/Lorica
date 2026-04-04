@@ -9,46 +9,46 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | # | Test | Method | Expected | Story | Status |
 |---|------|--------|----------|-------|--------|
 | | **0. INSTALLATION AND STARTUP** | | | | |
-| 0.1 | Install .deb package | CLI | `dpkg -i` succeeds, service enabled | 4.4 | |
-| 0.2 | Service starts, admin password in journal | CLI | `journalctl -u lorica` shows password | 1.2, 1.4 | |
-| 0.3 | Binary shows version | CLI | `lorica --version` -> 0.1.3 | 1.2 | |
-| 0.4 | Data directory created | CLI | `/var/lib/lorica/lorica.db` exists | 1.3 | |
-| 0.5 | Encryption key created with 0600 perms | CLI | `encryption.key` exists, `-rw-------` | 4.5 | |
-| 0.6 | Database has 0600 perms | CLI | `lorica.db` shows `-rw-------` | 4.5 | |
-| 0.7 | systemd hardening active | CLI | PrivateTmp, NoNewPrivileges, ProtectSystem | 4.5 | |
-| 0.8 | LimitNOFILE=65536 | CLI | `/proc/$(pgrep lorica)/limits` shows 65536 | 4.5 | |
-| 0.9 | Workers spawned | CLI | `ps aux` shows 6 worker processes | 2.1 | |
-| 0.10 | Log socket created | CLI | `/var/lib/lorica/log.sock` exists | - | |
+| 0.1 | Install .deb package | CLI | `dpkg -i` succeeds, service enabled | 4.4 | OK |
+| 0.2 | Service starts, admin password in journal | CLI | `journalctl -u lorica` shows password | 1.2, 1.4 | OK |
+| 0.3 | Binary shows version | CLI | `lorica --version` -> 0.1.3 | 1.2 | OK |
+| 0.4 | Data directory created | CLI | `/var/lib/lorica/lorica.db` exists | 1.3 | OK |
+| 0.5 | Encryption key created with 0600 perms | CLI | `encryption.key` exists, `-rw-------` | 4.5 | OK |
+| 0.6 | Database has 0600 perms | CLI | `lorica.db` shows `-rw-------` | 4.5 | OK |
+| 0.7 | systemd hardening active | CLI | PrivateTmp, NoNewPrivileges, ProtectSystem | 4.5 | OK |
+| 0.8 | LimitNOFILE=65536 | CLI | `/proc/$(pgrep lorica)/limits` shows 65536 | 4.5 | OK |
+| 0.9 | Workers spawned | CLI | `ps aux` shows 6 worker processes | 2.1 | OK |
+| 0.10 | Log socket created | CLI | `/var/lib/lorica/log.sock` exists | - | OK |
 | | **1. AUTHENTICATION** | | | | |
-| 1.1 | Open dashboard in browser | Dashboard | Login page at `http://localhost:9443` | 1.5 | |
-| 1.2 | Login with initial admin password | Dashboard | Redirected to "Change Password" | 1.4 | |
-| 1.3 | Change password (weak) | Dashboard | Error: password too short/weak | 1.4 | |
-| 1.4 | Change password (valid) | Dashboard | Redirected to Overview | 1.4 | |
-| 1.5 | Login with new password | Dashboard | Overview displayed | 1.4 | |
-| 1.6 | Login with wrong password | Dashboard | Error message displayed | 1.4 | |
+| 1.1 | Open dashboard in browser | Dashboard | Login page at `http://localhost:9443` | 1.5 | OK |
+| 1.2 | Login with initial admin password | Dashboard | Redirected to "Change Password" | 1.4 | OK |
+| 1.3 | Change password (weak) | Dashboard | Error: password too short/weak | 1.4 | OK |
+| 1.4 | Change password (valid) | Dashboard | Redirected to Overview | 1.4 | OK |
+| 1.5 | Login with new password | Dashboard | Overview displayed | 1.4 | OK |
+| 1.6 | Login with wrong password | Dashboard | Error message displayed | 1.4 | OK |
 | 1.7 | Login rate limiting | API | 5+ failed logins -> 429 | 4.5 | |
 | 1.8 | Session cookie HTTP-only, Secure | API | Inspect Set-Cookie header | 4.5 | |
-| 1.9 | Session expiry | Dashboard | Idle timeout -> redirected to login | 4.5 | |
-| 1.10 | Logout | Dashboard | Click "Sign out" -> login page | 1.5 | |
-| 1.11 | Graceful disconnect on restart | Dashboard | Restart Lorica -> error message, redirect to login | - | |
+| 1.9 | Session expiry | Dashboard | Idle timeout -> redirected to login | 4.5 | OK |
+| 1.10 | Logout | Dashboard | Click "Sign out" -> login page | 1.5 | OK |
+| 1.11 | Graceful disconnect on restart | Dashboard | Restart Lorica -> error message, redirect to login | - | OK |
 | | **2. OVERVIEW** | | | | |
-| 2.1 | Getting started guide visible | Dashboard | Banner with 10 setup steps | - | |
-| 2.2 | Steps expand/collapse animated | Dashboard | Click chevron, smooth open/close | - | |
-| 2.3 | "Go" buttons navigate | Dashboard | Each "Go" -> correct page | - | |
-| 2.4 | "Don't show this again" | Dashboard | Banner dismissed, persisted localStorage | - | |
-| 2.5 | Settings toggle re-enables guide | Dashboard | Settings > Preferences > toggle on | - | |
-| 2.6 | Section helpers ("?" buttons) | Dashboard | Click "?" -> description appears | - | |
-| 2.7 | System section metrics | Dashboard | Uptime, connections, CPU, memory | 1.9 | |
-| 2.8 | Routes & Backends section | Dashboard | Counts, health status colors | 1.6 | |
-| 2.9 | Auto-refresh (30s) | Dashboard | "Last update" timestamp updates | 1.9 | |
-| 2.10 | Color: orange for 0 routes | Dashboard | 0 routes/backends/certs -> orange | - | |
-| 2.11 | Color: green for healthy | Dashboard | Backends healthy > 0 -> green | - | |
+| 2.1 | Getting started guide visible | Dashboard | Banner with 10 setup steps | - | OK |
+| 2.2 | Steps expand/collapse animated | Dashboard | Click chevron, smooth open/close | - | OK |
+| 2.3 | "Go" buttons navigate | Dashboard | Each "Go" -> correct page | - | OK |
+| 2.4 | "Don't show this again" | Dashboard | Banner dismissed, persisted localStorage | - | OK |
+| 2.5 | Settings toggle re-enables guide | Dashboard | Settings > Preferences > toggle on | - | OK |
+| 2.6 | Section helpers ("?" buttons) | Dashboard | Click "?" -> description appears | - | OK |
+| 2.7 | System section metrics | Dashboard | Uptime, connections, CPU, memory | 1.9 | OK |
+| 2.8 | Routes & Backends section | Dashboard | Counts, health status colors | 1.6 | OK |
+| 2.9 | Auto-refresh (30s) | Dashboard | "Last update" timestamp updates | 1.9 | OK |
+| 2.10 | Color: orange for 0 routes | Dashboard | 0 routes/backends/certs -> orange | - | OK |
+| 2.11 | Color: green for healthy | Dashboard | Backends healthy > 0 -> green | - | OK |
 | | **3. BACKENDS** | | | | |
-| 3.1 | Create backend | Dashboard | Add with address, name, group | 1.6 | |
-| 3.2 | Health check TCP | Proxy | Reachable port -> healthy (green) | 1.8 | |
-| 3.3 | Health check HTTP | Proxy | health_check_path -> healthy if 2xx | 1.8 | |
+| 3.1 | Create backend | Dashboard | Add with address, name, group | 1.6 | OK |
+| 3.2 | Health check TCP | Proxy | Reachable port -> healthy (green) | 1.8 | OK |
+| 3.3 | Health check HTTP | Proxy | health_check_path -> healthy if 2xx | 1.8 | OK |
 | 3.4 | Health check - degraded | Proxy | >2s latency -> degraded (orange) | 1.8 | |
-| 3.5 | Health check - down | Proxy | Unreachable port -> down (red) | 1.8 | |
+| 3.5 | Health check - down | Proxy | Unreachable port -> down (red) | 1.8 | OK |
 | 3.6 | TLS upstream | Dashboard | tls_upstream -> proxy connects via TLS | 1.8 | |
 | 3.7 | HTTP/2 upstream | Dashboard | h2_upstream -> proxy uses h2c/h2 | - | |
 | 3.8 | Weight | Dashboard | Set weight, observe distribution | 1.8 | |
@@ -88,7 +88,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.26 | Load balancing: random | Proxy | Random distribution | - | |
 | 4.27 | Topology type | Dashboard | SingleVM/HA/Custom adapts health behavior | 3.2 | |
 | 4.28 | Route enable/disable | Dashboard | Disabled -> 404 for that hostname | 1.6 | |
-| 4.29 | Delete route | Dashboard | Confirm dialog, removed | 1.6 | |
+| 4.29 | Delete route | Dashboard | Confirm dialog, removed | 1.6 | OK |
 | 4.30 | Search/filter/sort | Dashboard | Search hostname, sort health/enabled | 1.6 | |
 | 4.31 | Nginx import wizard | Dashboard | Paste nginx.conf -> resources created | - | |
 | 4.32 | Hot-reload on API change | Proxy | Edit route -> traffic reflects change immediately | 1.8, 2.2 | |
