@@ -57,4 +57,5 @@ RUN chmod +x /entrypoint.sh /entrypoint-workers.sh
 
 EXPOSE 9443 8080 8443
 
+# Runs as root: entrypoint needs socat bind + su to drop to lorica user
 ENTRYPOINT ["/entrypoint.sh"]
