@@ -170,6 +170,7 @@ impl FromStr for LifecycleState {
 pub enum NotificationChannel {
     Email,
     Webhook,
+    Slack,
 }
 
 impl NotificationChannel {
@@ -177,6 +178,7 @@ impl NotificationChannel {
         match self {
             Self::Email => "email",
             Self::Webhook => "webhook",
+            Self::Slack => "slack",
         }
     }
 }
@@ -187,6 +189,7 @@ impl FromStr for NotificationChannel {
         match s {
             "email" => Ok(Self::Email),
             "webhook" => Ok(Self::Webhook),
+            "slack" => Ok(Self::Slack),
             other => Err(format!("unknown notification channel: {other}")),
         }
     }
@@ -865,6 +868,7 @@ mod tests {
         for (s, variant) in [
             ("email", NotificationChannel::Email),
             ("webhook", NotificationChannel::Webhook),
+            ("slack", NotificationChannel::Slack),
         ] {
             assert_eq!(s.parse::<NotificationChannel>().unwrap(), variant);
             assert_eq!(variant.as_str(), s);
@@ -873,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_notification_channel_unknown() {
-        assert!("slack".parse::<NotificationChannel>().is_err());
+        assert!("sms".parse::<NotificationChannel>().is_err());
     }
 
     // ---- PreferenceValue ----

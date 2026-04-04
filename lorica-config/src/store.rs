@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::str::FromStr;
 
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json;
@@ -88,6 +89,33 @@ impl ConfigStore {
             }
             None => String::from_utf8(data.to_vec())
                 .map_err(|e| ConfigError::Validation(format!("key_pem is not valid UTF-8: {e}"))),
+        }
+    }
+
+    fn encrypt_config(&self, config: &str) -> Result<String> {
+        match &self.encryption_key {
+            Some(key) => {
+                let encrypted = key.encrypt(config.as_bytes())?;
+                Ok(base64::engine::general_purpose::STANDARD.encode(&encrypted))
+            }
+            None => Ok(config.to_string()),
+        }
+    }
+
+    fn decrypt_config(&self, stored: &str) -> Result<String> {
+        match &self.encryption_key {
+            Some(key) => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(stored)
+                    .map_err(|e| {
+                        ConfigError::Validation(format!("invalid base64 config: {e}"))
+                    })?;
+                let plaintext = key.decrypt(&decoded)?;
+                String::from_utf8(plaintext).map_err(|e| {
+                    ConfigError::Validation(format!("decrypted config not UTF-8: {e}"))
+                })
+            }
+            None => Ok(stored.to_string()),
         }
     }
 
@@ -867,6 +895,7 @@ impl ConfigStore {
     pub fn create_notification_config(&self, nc: &NotificationConfig) -> Result<()> {
         let alert_json = serde_json::to_string(&nc.alert_types)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        let encrypted_config = self.encrypt_config(&nc.config)?;
         self.conn.execute(
             "INSERT INTO notification_configs (id, channel, enabled, config, alert_types)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -874,7 +903,7 @@ impl ConfigStore {
                 nc.id,
                 nc.channel.as_str(),
                 nc.enabled,
-                nc.config,
+                encrypted_config,
                 alert_json,
             ],
         )?;
@@ -883,7 +912,8 @@ impl ConfigStore {
 
     /// Fetch a notification config by ID, or `None` if not found.
     pub fn get_notification_config(&self, id: &str) -> Result<Option<NotificationConfig>> {
-        self.conn
+        let nc = self
+            .conn
             .query_row(
                 "SELECT id, channel, enabled, config, alert_types
                  FROM notification_configs WHERE id = ?1",
@@ -891,7 +921,14 @@ impl ConfigStore {
                 |row| Ok(row_to_notification_config(row)),
             )
             .optional()?
-            .transpose()
+            .transpose()?;
+        match nc {
+            Some(mut nc) => {
+                nc.config = self.decrypt_config(&nc.config)?;
+                Ok(Some(nc))
+            }
+            None => Ok(None),
+        }
     }
 
     /// List all notification configs, ordered by channel.
@@ -903,7 +940,9 @@ impl ConfigStore {
         let rows = stmt.query_map([], |row| Ok(row_to_notification_config(row)))?;
         let mut configs = Vec::new();
         for r in rows {
-            configs.push(r??);
+            let mut nc = r??;
+            nc.config = self.decrypt_config(&nc.config)?;
+            configs.push(nc);
         }
         Ok(configs)
     }
@@ -912,6 +951,7 @@ impl ConfigStore {
     pub fn update_notification_config(&self, nc: &NotificationConfig) -> Result<()> {
         let alert_json = serde_json::to_string(&nc.alert_types)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        let encrypted_config = self.encrypt_config(&nc.config)?;
         let changed = self.conn.execute(
             "UPDATE notification_configs SET channel=?2, enabled=?3, config=?4, alert_types=?5
              WHERE id=?1",
@@ -919,7 +959,7 @@ impl ConfigStore {
                 nc.id,
                 nc.channel.as_str(),
                 nc.enabled,
-                nc.config,
+                encrypted_config,
                 alert_json
             ],
         )?;
