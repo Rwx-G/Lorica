@@ -9,6 +9,10 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Security
+
+- Fix encryption key file created with restrictive permissions (0600) atomically at creation, eliminating race condition window (`lorica-config/src/crypto.rs`)
+
 ## [0.1.3] - 2026-04-03
 
 ### Added

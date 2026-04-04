@@ -46,12 +46,23 @@ impl EncryptionKey {
             Ok(Self { raw })
         } else {
             let key = Self::generate()?;
-            std::fs::write(path, key.raw)?;
-            // Restrict permissions to owner-only (0600)
+            // Create file with restricted permissions (0600) before writing content
+            // to avoid any window where the key is readable by other users.
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                use std::fs::OpenOptions;
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)?;
+                file.write_all(&key.raw)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(path, key.raw)?;
             }
             tracing::info!("generated new encryption key at {}", path.display());
             Ok(key)
