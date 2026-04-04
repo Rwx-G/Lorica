@@ -22,7 +22,17 @@ pub struct ExportData {
 }
 
 /// Export the full database state to a TOML string.
+/// Password hashes are redacted from the export for security.
 pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
+    let admin_users: Vec<AdminUser> = store
+        .list_admin_users()?
+        .into_iter()
+        .map(|mut u| {
+            u.password_hash = "**REDACTED**".into();
+            u
+        })
+        .collect();
+
     let data = ExportData {
         version: EXPORT_FORMAT_VERSION,
         global_settings: store.get_global_settings()?,
@@ -32,7 +42,7 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
         certificates: store.list_certificates()?,
         notification_configs: store.list_notification_configs()?,
         user_preferences: store.list_user_preferences()?,
-        admin_users: store.list_admin_users()?,
+        admin_users,
     };
 
     toml::to_string_pretty(&data)

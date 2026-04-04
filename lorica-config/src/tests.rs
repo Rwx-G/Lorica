@@ -489,9 +489,14 @@ mod tests {
         // Export
         let toml_str = export_to_toml(&store1).unwrap();
 
-        // Import into a fresh store
+        // Verify password hash is redacted in export
+        assert!(toml_str.contains("**REDACTED**"));
+        assert!(!toml_str.contains(&user.password_hash));
+
+        // Import into a fresh store - restore real hash since export redacts it
         let store2 = ConfigStore::open_in_memory().unwrap();
-        let data = parse_toml(&toml_str).unwrap();
+        let toml_for_import = toml_str.replace("**REDACTED**", &user.password_hash);
+        let data = parse_toml(&toml_for_import).unwrap();
         import_to_store(&store2, &data).unwrap();
 
         // Verify all data matches
@@ -981,6 +986,8 @@ default_health_check_interval_s = 10
         temp.create_admin_user(&modified).unwrap();
         let toml_str = export_to_toml(&temp).unwrap();
 
+        // Restore real hash since export redacts it
+        let toml_str = toml_str.replace("**REDACTED**", &modified.password_hash);
         let import_data = parse_toml(&toml_str).unwrap();
         let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
 

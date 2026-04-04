@@ -58,6 +58,17 @@ fn validate(data: &ImportData) -> Result<()> {
         }
     }
 
+    // Reject redacted password hashes (from exports)
+    for user in &data.admin_users {
+        if user.password_hash == "**REDACTED**" {
+            return Err(ConfigError::Validation(format!(
+                "admin user '{}' has a redacted password hash (from export); \
+                 set a real password hash or remove the user from the import file",
+                user.username
+            )));
+        }
+    }
+
     // Validate certificate references in routes
     for route in &data.routes {
         if let Some(cert_id) = &route.certificate_id {
