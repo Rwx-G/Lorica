@@ -633,11 +633,18 @@ impl ProxyHttp for LoricaProxy {
 
         // Force HTTPS redirect
         if entry.route.force_https {
-            let scheme = req
-                .headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("http");
+            let is_tls = session
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref())
+                .is_some();
+            let scheme = if is_tls {
+                "https"
+            } else {
+                req.headers
+                    .get("x-forwarded-proto")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("http")
+            };
             if scheme != "https" {
                 let redir_host = req
                     .headers
