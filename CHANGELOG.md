@@ -9,8 +9,30 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Added
+
+- Notification form: structured fields per channel type (SMTP, Webhook, Slack) replacing raw JSON textarea
+- Notification form: alert type checkboxes with human-readable labels and select all/none
+- Slack notification channel support in dashboard and API
+- Real test notification delivery via Test button (sends actual email/webhook/slack)
+- Toast notifications for test notification success/failure in dashboard
+- Overview: section helper "?" buttons visible independently of getting started guide
+
+### Changed
+
+- Post-install message now lists all CLI flags and notes dashboard is localhost-only
+
+### Fixed
+
+- Overview: fix spacing between section headers and cards when helper is collapsed
+- Overview: smooth single-motion expand/collapse animation for section helpers
+- Settings: fix theme toggle requiring two clicks (race condition with preferences reload)
+
 ### Security
 
+- Encrypt notification config at rest using AES-256-GCM (same key as certificate private keys)
+- Mask SMTP password in API responses (returned as `********`)
+- Preserve existing SMTP password on update when masked value is submitted
 - Fix encryption key file created with restrictive permissions (0600) atomically at creation, eliminating race condition window (`lorica-config/src/crypto.rs`)
 - Fix potential panic on invalid private key format during mTLS client cert setup, replaced `.unwrap()` with proper error propagation (`lorica-core/src/connectors/tls/rustls/mod.rs`)
 - Redact password hashes from config export; import now rejects redacted hashes with a clear error message
