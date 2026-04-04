@@ -338,12 +338,12 @@
           <h2>System</h2>
           <span class="section-link">View details</span>
         </button>
-        {#if !helperDismissed}
-          <button class="helper-toggle" class:active={expandedHelpers['section-system']} onclick={() => toggleHelperDetail('section-system')} title="What is this?">?</button>
-        {/if}
+        <button class="helper-toggle" class:active={expandedHelpers['section-system']} onclick={() => toggleHelperDetail('section-system')} title="What is this?">?</button>
       </div>
       <div class="detail-anim" class:open={expandedHelpers['section-system']}>
-        <p class="section-helper-text">{sectionHelpers.system.description}</p>
+        <div class="detail-anim-inner">
+          <p class="section-helper-text">{sectionHelpers.system.description}</p>
+        </div>
       </div>
       <div class="card-grid">
         {#if system}
@@ -372,12 +372,12 @@
           <h2>Routes & Backends</h2>
           <span class="section-link">Manage</span>
         </button>
-        {#if !helperDismissed}
-          <button class="helper-toggle" class:active={expandedHelpers['section-routes']} onclick={() => toggleHelperDetail('section-routes')} title="What is this?">?</button>
-        {/if}
+        <button class="helper-toggle" class:active={expandedHelpers['section-routes']} onclick={() => toggleHelperDetail('section-routes')} title="What is this?">?</button>
       </div>
       <div class="detail-anim" class:open={expandedHelpers['section-routes']}>
-        <p class="section-helper-text">{sectionHelpers.routes.description}</p>
+        <div class="detail-anim-inner">
+          <p class="section-helper-text">{sectionHelpers.routes.description}</p>
+        </div>
       </div>
       <div class="card-grid">
         {#if status}
@@ -409,12 +409,12 @@
           <h2>Certificates</h2>
           <span class="section-link">Manage</span>
         </button>
-        {#if !helperDismissed}
-          <button class="helper-toggle" class:active={expandedHelpers['section-certs']} onclick={() => toggleHelperDetail('section-certs')} title="What is this?">?</button>
-        {/if}
+        <button class="helper-toggle" class:active={expandedHelpers['section-certs']} onclick={() => toggleHelperDetail('section-certs')} title="What is this?">?</button>
       </div>
       <div class="detail-anim" class:open={expandedHelpers['section-certs']}>
-        <p class="section-helper-text">{sectionHelpers.certificates.description}</p>
+        <div class="detail-anim-inner">
+          <p class="section-helper-text">{sectionHelpers.certificates.description}</p>
+        </div>
       </div>
       <div class="card-grid">
         {#if status}
@@ -435,12 +435,12 @@
           <h2>Security</h2>
           <span class="section-link">View details</span>
         </button>
-        {#if !helperDismissed}
-          <button class="helper-toggle" class:active={expandedHelpers['section-security']} onclick={() => toggleHelperDetail('section-security')} title="What is this?">?</button>
-        {/if}
+        <button class="helper-toggle" class:active={expandedHelpers['section-security']} onclick={() => toggleHelperDetail('section-security')} title="What is this?">?</button>
       </div>
       <div class="detail-anim" class:open={expandedHelpers['section-security']}>
-        <p class="section-helper-text">{sectionHelpers.security.description}</p>
+        <div class="detail-anim-inner">
+          <p class="section-helper-text">{sectionHelpers.security.description}</p>
+        </div>
       </div>
       <div class="card-grid">
         <Card
@@ -470,12 +470,12 @@
           <h2>Performance</h2>
           <span class="section-link">View SLA</span>
         </button>
-        {#if !helperDismissed}
-          <button class="helper-toggle" class:active={expandedHelpers['section-perf']} onclick={() => toggleHelperDetail('section-perf')} title="What is this?">?</button>
-        {/if}
+        <button class="helper-toggle" class:active={expandedHelpers['section-perf']} onclick={() => toggleHelperDetail('section-perf')} title="What is this?">?</button>
       </div>
       <div class="detail-anim" class:open={expandedHelpers['section-perf']}>
-        <p class="section-helper-text">{sectionHelpers.performance.description}</p>
+        <div class="detail-anim-inner">
+          <p class="section-helper-text">{sectionHelpers.performance.description}</p>
+        </div>
       </div>
       <div class="card-grid">
         <Card
@@ -520,12 +520,12 @@
           <h2>Monitoring</h2>
           <span class="section-link">View probes</span>
         </button>
-        {#if !helperDismissed}
-          <button class="helper-toggle" class:active={expandedHelpers['section-monitoring']} onclick={() => toggleHelperDetail('section-monitoring')} title="What is this?">?</button>
-        {/if}
+        <button class="helper-toggle" class:active={expandedHelpers['section-monitoring']} onclick={() => toggleHelperDetail('section-monitoring')} title="What is this?">?</button>
       </div>
       <div class="detail-anim" class:open={expandedHelpers['section-monitoring']}>
-        <p class="section-helper-text">{sectionHelpers.monitoring.description}</p>
+        <div class="detail-anim-inner">
+          <p class="section-helper-text">{sectionHelpers.monitoring.description}</p>
+        </div>
       </div>
       <div class="card-grid">
         <Card title="Active Probes" value={probesEnabled} color={probesEnabled > 0 ? 'green' : 'default'} />
@@ -598,7 +598,7 @@
     align-items: baseline;
     gap: var(--space-3);
     width: 100%;
-    margin-bottom: var(--space-3);
+    margin-bottom: 0;
     padding: var(--space-2) var(--space-3);
     background: var(--color-bg-input);
     border: none;
@@ -642,8 +642,7 @@
   .detail-anim {
     display: grid;
     grid-template-rows: 0fr;
-    opacity: 0;
-    transition: grid-template-rows 0.25s ease, opacity 0.25s ease;
+    transition: grid-template-rows 0.35s ease;
   }
 
   .detail-anim:not(.open) {
@@ -652,18 +651,11 @@
 
   .detail-anim.open {
     grid-template-rows: 1fr;
-    opacity: 1;
   }
 
-  .detail-anim > * {
+  .detail-anim-inner {
     overflow: hidden;
     min-height: 0;
-    padding: 0;
-    margin: 0;
-  }
-
-  .detail-anim.open > * {
-    padding-top: var(--space-2);
   }
 
   /* Helper / Getting Started banner */
@@ -851,7 +843,7 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    margin-bottom: var(--space-3);
+    margin-bottom: var(--space-2);
   }
 
   .section-header-row .section-header {
@@ -882,9 +874,8 @@
   }
 
   .section-helper-text {
-    margin: 0;
+    margin: 0 0 var(--space-2) 0;
     padding: var(--space-3);
-    margin-bottom: var(--space-3);
     font-size: var(--text-sm);
     color: var(--color-text-muted);
     line-height: 1.5;
