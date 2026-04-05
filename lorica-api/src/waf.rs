@@ -171,6 +171,7 @@ pub async fn toggle_waf_rule(
         let _ = store.save_waf_disabled_rules(&disabled_ids);
     }
 
+    state.notify_config_changed();
     Ok(json_data(serde_json::json!({
         "rule_id": rule_id,
         "enabled": body.enabled,
@@ -242,6 +243,7 @@ pub async fn create_custom_rule(
         );
     }
 
+    state.notify_config_changed();
     Ok(json_data(serde_json::json!({
         "id": body.id,
         "description": body.description,
@@ -281,6 +283,7 @@ pub async fn delete_custom_rule(
             let store = state.store.lock().await;
             let _ = store.delete_waf_custom_rule(rule_id);
         }
+        state.notify_config_changed();
         Ok(json_data(
             serde_json::json!({"deleted": true, "id": rule_id}),
         ))

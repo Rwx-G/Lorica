@@ -1080,13 +1080,33 @@ fn run_worker(
                     CommandType::ConfigReload => {
                         info!(worker_id = id, seq = cmd.sequence, "applying config reload");
                         lorica::reload::reload_cert_resolver(&cmd_store, &cmd_cert_resolver).await;
-                        // Sync WAF blocklist state from persisted settings
+                        // Sync WAF state from persisted settings/DB
                         {
                             let s = cmd_store.lock().await;
                             if let Ok(settings) = s.get_global_settings() {
                                 cmd_waf_engine
                                     .ip_blocklist()
                                     .set_enabled(settings.ip_blocklist_enabled);
+                            }
+                            // Reload disabled rules
+                            if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
+                                cmd_waf_engine.set_disabled_rules(&disabled_ids);
+                            }
+                            // Reload custom rules
+                            cmd_waf_engine.clear_custom_rules();
+                            if let Ok(custom_rules) = s.load_waf_custom_rules() {
+                                for (rule_id, desc, cat, pattern, severity, _enabled) in &custom_rules {
+                                    let category = cat
+                                        .parse()
+                                        .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
+                                    let _ = cmd_waf_engine.add_custom_rule(
+                                        *rule_id,
+                                        desc.clone(),
+                                        category,
+                                        pattern,
+                                        *severity,
+                                    );
+                                }
                             }
                         }
                         match reload_proxy_config(&cmd_store, &cmd_config).await {

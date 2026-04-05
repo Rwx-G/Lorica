@@ -223,6 +223,11 @@ impl WafEngine {
         rules.len() < before
     }
 
+    /// Remove all custom rules.
+    pub fn clear_custom_rules(&self) {
+        self.custom_rules.write().unwrap().clear();
+    }
+
     /// List all custom rules.
     pub fn list_custom_rules(&self) -> Vec<CustomRule> {
         self.custom_rules
