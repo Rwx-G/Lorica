@@ -541,12 +541,14 @@ fn run_supervisor(cli: Cli) {
         }
         let waf_event_sink = Arc::clone(&waf_event_buffer);
         let waf_log_store = log_store.clone();
+        let waf_alert_sender = alert_sender.clone();
         tokio::spawn(async move {
             loop {
                 match waf_listener.accept().await {
                     Ok((stream, _)) => {
                         let sink = Arc::clone(&waf_event_sink);
                         let store = waf_log_store.clone();
+                        let alert_tx = waf_alert_sender.clone();
                         tokio::spawn(async move {
                             let mut reader = tokio::io::BufReader::new(stream);
                             let mut line = String::new();
@@ -559,6 +561,16 @@ fn run_supervisor(cli: Cli) {
                                             if let Some(ref s) = store {
                                                 let _ = s.insert_waf_event(&event);
                                             }
+                                            // Dispatch WAF alert notification
+                                            alert_tx.send(
+                                                lorica_notify::AlertEvent::new(
+                                                    lorica_notify::events::AlertType::WafAlert,
+                                                    format!("WAF {}: {} (rule {})", event.category.as_str(), event.description, event.rule_id),
+                                                )
+                                                .with_detail("rule_id", event.rule_id.to_string())
+                                                .with_detail("category", event.category.as_str().to_string())
+                                                .with_detail("severity", event.severity.to_string()),
+                                            );
                                             let mut buf = sink.lock().unwrap();
                                             if buf.len() >= 500 {
                                                 buf.pop_front();
