@@ -335,6 +335,9 @@ pub async fn toggle_blocklist(
         }
     }
 
+    // Notify workers so they apply the new blocklist state
+    state.notify_config_changed();
+
     Ok(json_data(serde_json::json!({
         "enabled": body.enabled,
         "ip_count": count,

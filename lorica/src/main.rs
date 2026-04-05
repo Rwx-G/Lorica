@@ -897,6 +897,7 @@ fn run_worker(
     let cmd_store = Arc::clone(&store);
     let cmd_config = Arc::clone(&proxy_config);
     let cmd_cert_resolver = Arc::clone(&cert_resolver);
+    let cmd_waf_engine = Arc::clone(&waf_engine);
     let cmd_cache_hits = Arc::clone(&worker_cache_hits);
     let cmd_cache_misses = Arc::clone(&worker_cache_misses);
     let cmd_active_conns = Arc::clone(&active_connections);
@@ -932,6 +933,15 @@ fn run_worker(
                     CommandType::ConfigReload => {
                         info!(worker_id = id, seq = cmd.sequence, "applying config reload");
                         lorica::reload::reload_cert_resolver(&cmd_store, &cmd_cert_resolver).await;
+                        // Sync WAF blocklist state from persisted settings
+                        {
+                            let s = cmd_store.lock().await;
+                            if let Ok(settings) = s.get_global_settings() {
+                                cmd_waf_engine
+                                    .ip_blocklist()
+                                    .set_enabled(settings.ip_blocklist_enabled);
+                            }
+                        }
                         match reload_proxy_config(&cmd_store, &cmd_config).await {
                             Ok(()) => {
                                 let resp = Response::ok(cmd.sequence);
