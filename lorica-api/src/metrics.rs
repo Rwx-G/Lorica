@@ -33,7 +33,7 @@ static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 /// HTTP request counter. Labels: route_id, status_code.
 static HTTP_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let counter = IntCounterVec::new(
-        prometheus::opts!("lorica_http_requests_total", "Total HTTP requests proxied")
+        prometheus::opts!("http_requests_total", "Total HTTP requests proxied")
             .namespace("lorica"),
         &["route_id", "status_code"],
     )
@@ -46,7 +46,7 @@ static HTTP_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     let histogram = HistogramVec::new(
         HistogramOpts::new(
-            "lorica_http_request_duration_seconds",
+            "http_request_duration_seconds",
             "HTTP request latency in seconds",
         )
         .namespace("lorica")
@@ -62,9 +62,9 @@ static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
 
 /// Active proxy connections gauge.
 static ACTIVE_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
-    let gauge = IntGauge::new(
-        "lorica_active_connections",
-        "Current number of active proxy connections",
+    let gauge = IntGauge::with_opts(
+        prometheus::Opts::new("active_connections", "Current number of active proxy connections")
+            .namespace("lorica"),
     )
     .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).ok();
@@ -75,7 +75,7 @@ static ACTIVE_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
 static BACKEND_HEALTH: Lazy<GaugeVec> = Lazy::new(|| {
     let gauge = GaugeVec::new(
         prometheus::opts!(
-            "lorica_backend_health",
+            "backend_health",
             "Backend health status (1=healthy, 0.5=degraded, 0=down)"
         )
         .namespace("lorica"),
@@ -90,7 +90,7 @@ static BACKEND_HEALTH: Lazy<GaugeVec> = Lazy::new(|| {
 static CERT_EXPIRY_DAYS: Lazy<GaugeVec> = Lazy::new(|| {
     let gauge = GaugeVec::new(
         prometheus::opts!(
-            "lorica_certificate_expiry_days",
+            "certificate_expiry_days",
             "Days until certificate expiration"
         )
         .namespace("lorica"),
@@ -104,7 +104,7 @@ static CERT_EXPIRY_DAYS: Lazy<GaugeVec> = Lazy::new(|| {
 /// WAF events counter. Labels: category, action (detected/blocked).
 static WAF_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let counter = IntCounterVec::new(
-        prometheus::opts!("lorica_waf_events_total", "Total WAF events").namespace("lorica"),
+        prometheus::opts!("waf_events_total", "Total WAF events").namespace("lorica"),
         &["category", "action"],
     )
     .unwrap();
@@ -116,7 +116,7 @@ static WAF_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 static EWMA_SCORE: Lazy<GaugeVec> = Lazy::new(|| {
     let gauge = GaugeVec::new(
         prometheus::opts!(
-            "lorica_ewma_score_us",
+            "ewma_score_us",
             "Peak EWMA latency score per backend in microseconds"
         )
         .namespace("lorica"),
@@ -134,17 +134,20 @@ pub fn set_ewma_score(address: &str, score_us: f64) {
 
 /// System CPU usage gauge (0-100).
 static SYSTEM_CPU_PERCENT: Lazy<prometheus::Gauge> = Lazy::new(|| {
-    let gauge =
-        prometheus::Gauge::new("lorica_system_cpu_percent", "System CPU usage percentage").unwrap();
+    let gauge = prometheus::Gauge::with_opts(
+        prometheus::Opts::new("system_cpu_percent", "System CPU usage percentage")
+            .namespace("lorica"),
+    )
+    .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).ok();
     gauge
 });
 
 /// System memory usage gauge (bytes).
 static SYSTEM_MEMORY_USED_BYTES: Lazy<IntGauge> = Lazy::new(|| {
-    let gauge = IntGauge::new(
-        "lorica_system_memory_used_bytes",
-        "System memory used in bytes",
+    let gauge = IntGauge::with_opts(
+        prometheus::Opts::new("system_memory_used_bytes", "System memory used in bytes")
+            .namespace("lorica"),
     )
     .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).ok();
