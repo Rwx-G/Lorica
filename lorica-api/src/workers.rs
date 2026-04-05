@@ -124,6 +124,8 @@ struct WorkerSnapshot {
     ban_entries: Vec<(String, u64, u64)>,
     /// backend_address -> score_us
     ewma_scores: HashMap<String, f64>,
+    /// backend_address -> active connections
+    backend_connections: HashMap<String, u64>,
 }
 
 impl Default for AggregatedMetrics {
@@ -148,6 +150,7 @@ impl AggregatedMetrics {
         active_connections: u64,
         ban_entries: Vec<(String, u64, u64)>,
         ewma_scores: HashMap<String, f64>,
+        backend_connections: HashMap<String, u64>,
     ) {
         let mut map = self.inner.write().await;
         map.insert(
@@ -158,6 +161,7 @@ impl AggregatedMetrics {
                 active_connections,
                 ban_entries,
                 ewma_scores,
+                backend_connections,
             },
         );
     }
@@ -208,6 +212,18 @@ impl AggregatedMetrics {
             .into_iter()
             .map(|(ip, (remaining, duration))| (ip, remaining, duration))
             .collect()
+    }
+
+    /// Sum of active connections per backend across all workers.
+    pub async fn merged_backend_connections(&self) -> HashMap<String, u64> {
+        let map = self.inner.read().await;
+        let mut merged: HashMap<String, u64> = HashMap::new();
+        for w in map.values() {
+            for (addr, count) in &w.backend_connections {
+                *merged.entry(addr.clone()).or_insert(0) += count;
+            }
+        }
+        merged
     }
 
     /// Minimum EWMA score per backend across all workers (best latency wins).

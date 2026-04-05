@@ -56,7 +56,11 @@ pub struct UpdateBackendRequest {
     pub h2_upstream: Option<bool>,
 }
 
-fn backend_to_response(b: &lorica_config::models::Backend, ewma_score: f64) -> BackendResponse {
+fn backend_to_response(
+    b: &lorica_config::models::Backend,
+    ewma_score: f64,
+    active_connections: i32,
+) -> BackendResponse {
     BackendResponse {
         id: b.id.clone(),
         address: b.address.clone(),
@@ -65,7 +69,7 @@ fn backend_to_response(b: &lorica_config::models::Backend, ewma_score: f64) -> B
         weight: b.weight,
         health_status: b.health_status.as_str().to_string(),
         lifecycle_state: b.lifecycle_state.as_str().to_string(),
-        active_connections: b.active_connections,
+        active_connections,
         health_check_enabled: b.health_check_enabled,
         health_check_interval_s: b.health_check_interval_s,
         health_check_path: b.health_check_path.clone(),
@@ -76,6 +80,21 @@ fn backend_to_response(b: &lorica_config::models::Backend, ewma_score: f64) -> B
         created_at: b.created_at.to_rfc3339(),
         updated_at: b.updated_at.to_rfc3339(),
     }
+}
+
+/// Look up active connections for a backend address from shared state.
+async fn get_backend_connections_async(state: &crate::server::AppState, addr: &str) -> i32 {
+    // Direct counters (single-process mode)
+    if let Some(ref bc) = state.backend_connections {
+        return bc.get(addr) as i32;
+    }
+    // Aggregated from workers (supervisor mode)
+    if let Some(ref agg) = state.aggregated_metrics {
+        if let Some(count) = agg.merged_backend_connections().await.get(addr).copied() {
+            return count as i32;
+        }
+    }
+    0
 }
 
 /// Look up the EWMA score for a backend address from shared state.
@@ -109,7 +128,8 @@ pub async fn list_backends(
     let mut responses = Vec::with_capacity(backends.len());
     for b in &backends {
         let score = get_ewma_score_async(&state, &b.address).await;
-        responses.push(backend_to_response(b, score));
+        let conns = get_backend_connections_async(&state, &b.address).await;
+        responses.push(backend_to_response(b, score, conns));
     }
     Ok(json_data(serde_json::json!({ "backends": responses })))
 }
@@ -150,7 +170,7 @@ pub async fn create_backend(
 
     Ok(json_data_with_status(
         StatusCode::CREATED,
-        backend_to_response(&backend, 0.0),
+        backend_to_response(&backend, 0.0, 0),
     ))
 }
 
@@ -164,7 +184,8 @@ pub async fn get_backend(
         .get_backend(&id)?
         .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
     let score = get_ewma_score_async(&state, &backend.address).await;
-    Ok(json_data(backend_to_response(&backend, score)))
+    let conns = get_backend_connections_async(&state, &backend.address).await;
+    Ok(json_data(backend_to_response(&backend, score, conns)))
 }
 
 /// PUT /api/v1/backends/:id
@@ -214,7 +235,8 @@ pub async fn update_backend(
     drop(store);
     state.notify_config_changed();
     let score = get_ewma_score_async(&state, &backend.address).await;
-    Ok(json_data(backend_to_response(&backend, score)))
+    let conns = get_backend_connections_async(&state, &backend.address).await;
+    Ok(json_data(backend_to_response(&backend, score, conns)))
 }
 
 /// DELETE /api/v1/backends/:id

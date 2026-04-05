@@ -153,6 +153,17 @@ pub struct BanReportEntry {
     pub ban_duration_seconds: u64,
 }
 
+/// A single backend active connection count in a metrics report.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BackendConnEntry {
+    /// Backend address (e.g. "10.0.0.1:8080").
+    #[prost(string, tag = "1")]
+    pub backend_address: String,
+    /// Active connections to this backend.
+    #[prost(uint64, tag = "2")]
+    pub connections: u64,
+}
+
 /// A single backend EWMA latency entry in a metrics report.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct EwmaReportEntry {
@@ -194,6 +205,9 @@ pub struct MetricsReport {
     /// Per-backend EWMA latency scores.
     #[prost(message, repeated, tag = "8")]
     pub ewma_entries: Vec<EwmaReportEntry>,
+    /// Per-backend active connection counts.
+    #[prost(message, repeated, tag = "9")]
+    pub backend_conn_entries: Vec<BackendConnEntry>,
 }
 
 impl MetricsReport {
@@ -211,6 +225,7 @@ impl MetricsReport {
             cache_misses: 0,
             ban_entries: Vec::new(),
             ewma_entries: Vec::new(),
+            backend_conn_entries: Vec::new(),
         }
     }
 }

@@ -436,6 +436,11 @@ fn run_supervisor(cli: Cli) {
                                             .iter()
                                             .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
                                             .collect();
+                                        let backend_conns: std::collections::HashMap<String, u64> = report
+                                            .backend_conn_entries
+                                            .iter()
+                                            .map(|e| (e.backend_address.clone(), e.connections))
+                                            .collect();
                                         agg_metrics
                                             .update_worker(
                                                 worker_id,
@@ -444,6 +449,7 @@ fn run_supervisor(cli: Cli) {
                                                 report.active_connections,
                                                 bans,
                                                 ewma,
+                                                backend_conns,
                                             )
                                             .await;
                                     }
@@ -648,6 +654,7 @@ fn run_supervisor(cli: Cli) {
                 ban_list: None,
                 cache_backend: None,
                 ewma_scores: None,
+                backend_connections: None,
                 aggregated_metrics: Some(Arc::clone(&aggregated_metrics)),
                 notification_history: {
                     let d = notify_dispatcher.lock().await;
@@ -891,6 +898,7 @@ fn run_worker(
     let worker_ban_list: Arc<dashmap::DashMap<String, (std::time::Instant, u64)>> =
         Arc::new(dashmap::DashMap::new());
     let worker_ewma = Arc::new(lorica::proxy_wiring::EwmaTracker::new());
+    let worker_backend_conns = Arc::new(lorica::proxy_wiring::BackendConnections::new());
 
     // Create shared WAF engine for worker (must be before command channel setup)
     let waf_engine = Arc::new(lorica_waf::WafEngine::new());
@@ -932,6 +940,7 @@ fn run_worker(
     let cmd_active_conns = Arc::clone(&active_connections);
     let cmd_ban_list = Arc::clone(&worker_ban_list);
     let cmd_ewma = worker_ewma.scores_ref();
+    let cmd_backend_conns = Arc::clone(&worker_backend_conns);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create command channel runtime");
         rt.block_on(async move {
@@ -1045,6 +1054,14 @@ fn run_worker(
                             cmd_cache_misses.load(std::sync::atomic::Ordering::Relaxed);
                         report.ban_entries = ban_entries;
                         report.ewma_entries = ewma_entries;
+                        report.backend_conn_entries = cmd_backend_conns
+                            .snapshot()
+                            .into_iter()
+                            .map(|(addr, conns)| lorica_command::BackendConnEntry {
+                                backend_address: addr,
+                                connections: conns,
+                            })
+                            .collect();
 
                         if let Err(e) = channel.send(&report).await {
                             warn!(error = %e, "failed to send metrics report");
@@ -1168,6 +1185,7 @@ fn run_worker(
     lorica_proxy.cache_misses = worker_cache_misses;
     lorica_proxy.ban_list = worker_ban_list;
     lorica_proxy.ewma_tracker = worker_ewma;
+    lorica_proxy.backend_connections = worker_backend_conns;
     lorica_proxy.waf_engine = waf_engine;
 
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
@@ -1464,6 +1482,7 @@ fn run_single_process(cli: Cli) {
                 ban_list: Some(proxy_ban_list),
                 cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
                 ewma_scores: Some(proxy_ewma_scores),
+                backend_connections: Some(backend_conns),
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
                 aggregated_metrics: None, // single-process uses direct Arc references

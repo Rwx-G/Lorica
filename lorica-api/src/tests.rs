@@ -36,6 +36,7 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         ban_list: None,
         cache_backend: None,
         ewma_scores: None,
+        backend_connections: None,
         notification_history: None,
         log_store: None,
     };
@@ -2757,6 +2758,7 @@ fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         ban_list: None,
         cache_backend: None,
         ewma_scores: None,
+        backend_connections: None,
         notification_history: None,
         log_store: None,
     };
@@ -2787,6 +2789,7 @@ fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         ban_list: None,
         cache_backend: None,
         ewma_scores: None,
+        backend_connections: None,
         notification_history: None,
         log_store: None,
     };

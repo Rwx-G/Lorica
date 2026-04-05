@@ -282,6 +282,15 @@ impl BackendConnections {
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
+
+    /// Return a snapshot of all backend connection counts.
+    pub fn snapshot(&self) -> HashMap<String, u64> {
+        let counts = self.counts.read().unwrap();
+        counts
+            .iter()
+            .map(|(addr, c)| (addr.clone(), c.load(Ordering::Relaxed)))
+            .collect()
+    }
 }
 
 /// Peak EWMA latency tracker for load balancing.
