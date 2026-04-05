@@ -237,61 +237,7 @@ impl ProxyConfig {
 
 /// Per-backend active connection counter.
 ///
-/// Thread-safe counters keyed by backend address. Used to track how many
-/// active connections each backend has, enabling graceful drain on removal.
-#[derive(Debug, Default)]
-pub struct BackendConnections {
-    counts: std::sync::RwLock<HashMap<String, Arc<AtomicU64>>>,
-}
-
-impl BackendConnections {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Increment the connection count for a backend, returning the counter.
-    pub fn increment(&self, addr: &str) -> Arc<AtomicU64> {
-        let counts = self.counts.read().unwrap();
-        if let Some(counter) = counts.get(addr) {
-            counter.fetch_add(1, Ordering::Relaxed);
-            return Arc::clone(counter);
-        }
-        drop(counts);
-
-        let mut counts = self.counts.write().unwrap();
-        let counter = counts
-            .entry(addr.to_string())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-        counter.fetch_add(1, Ordering::Relaxed);
-        Arc::clone(counter)
-    }
-
-    /// Decrement the connection count for a backend.
-    pub fn decrement(&self, addr: &str) {
-        let counts = self.counts.read().unwrap();
-        if let Some(counter) = counts.get(addr) {
-            counter.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Get the current connection count for a backend.
-    pub fn get(&self, addr: &str) -> u64 {
-        let counts = self.counts.read().unwrap();
-        counts
-            .get(addr)
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-
-    /// Return a snapshot of all backend connection counts.
-    pub fn snapshot(&self) -> HashMap<String, u64> {
-        let counts = self.counts.read().unwrap();
-        counts
-            .iter()
-            .map(|(addr, c)| (addr.clone(), c.load(Ordering::Relaxed)))
-            .collect()
-    }
-}
+pub use lorica_api::connections::BackendConnections;
 
 /// Peak EWMA latency tracker for load balancing.
 ///

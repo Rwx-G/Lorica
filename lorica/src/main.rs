@@ -1409,6 +1409,7 @@ fn run_single_process(cli: Cli) {
         lorica_proxy.alert_sender = Some(alert_sender.clone());
         lorica_proxy.log_store = log_store.clone();
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
+        let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
         let proxy_cache_misses = Arc::clone(&lorica_proxy.cache_misses);
         let proxy_ban_list = Arc::clone(&lorica_proxy.ban_list);
@@ -1482,7 +1483,7 @@ fn run_single_process(cli: Cli) {
                 ban_list: Some(proxy_ban_list),
                 cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
                 ewma_scores: Some(proxy_ewma_scores),
-                backend_connections: Some(backend_conns),
+                backend_connections: Some(backend_conns.clone()),
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
                 aggregated_metrics: None, // single-process uses direct Arc references
@@ -1578,7 +1579,7 @@ fn run_single_process(cli: Cli) {
                 health_store,
                 health_config,
                 health_interval,
-                Some(backend_conns),
+                Some(health_backend_conns),
                 Some(health_alert_sender2),
             )
             .await;

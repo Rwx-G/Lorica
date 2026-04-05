@@ -25,7 +25,8 @@ pub mod messages;
 
 pub use channel::CommandChannel;
 pub use messages::{
-    BanReportEntry, Command, CommandType, EwmaReportEntry, MetricsReport, Response, ResponseStatus,
+    BackendConnEntry, BanReportEntry, Command, CommandType, EwmaReportEntry, MetricsReport,
+    Response, ResponseStatus,
 };
 
 /// Errors from the command channel.
