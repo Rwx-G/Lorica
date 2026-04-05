@@ -194,58 +194,6 @@ pub fn set_system_metrics(cpu_percent: f64, memory_used_bytes: i64) {
     SYSTEM_MEMORY_USED_BYTES.set(memory_used_bytes);
 }
 
-/// Collect current HTTP request counter values (for worker metric reports).
-pub fn collect_request_counts() -> Vec<(String, u32, u64)> {
-    let families = HTTP_REQUESTS_TOTAL.collect();
-    let mut result = Vec::new();
-    for family in &families {
-        for metric in family.get_metric() {
-            let labels = metric.get_label();
-            let route_id = labels
-                .iter()
-                .find(|l| l.get_name() == "route_id")
-                .map(|l| l.get_value().to_string())
-                .unwrap_or_default();
-            let status_code = labels
-                .iter()
-                .find(|l| l.get_name() == "status_code")
-                .map(|l| l.get_value().parse::<u32>().unwrap_or(0))
-                .unwrap_or(0);
-            let count = metric.get_counter().get_value() as u64;
-            if count > 0 {
-                result.push((route_id, status_code, count));
-            }
-        }
-    }
-    result
-}
-
-/// Collect current WAF event counter values (for worker metric reports).
-pub fn collect_waf_counts() -> Vec<(String, String, u64)> {
-    let families = WAF_EVENTS_TOTAL.collect();
-    let mut result = Vec::new();
-    for family in &families {
-        for metric in family.get_metric() {
-            let labels = metric.get_label();
-            let category = labels
-                .iter()
-                .find(|l| l.get_name() == "category")
-                .map(|l| l.get_value().to_string())
-                .unwrap_or_default();
-            let action = labels
-                .iter()
-                .find(|l| l.get_name() == "action")
-                .map(|l| l.get_value().to_string())
-                .unwrap_or_default();
-            let count = metric.get_counter().get_value() as u64;
-            if count > 0 {
-                result.push((category, action, count));
-            }
-        }
-    }
-    result
-}
-
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,

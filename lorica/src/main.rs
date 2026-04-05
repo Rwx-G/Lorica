@@ -990,6 +990,10 @@ fn run_worker(
         Arc::new(dashmap::DashMap::new());
     let worker_ewma = Arc::new(lorica::proxy_wiring::EwmaTracker::new());
     let worker_backend_conns = Arc::new(lorica::proxy_wiring::BackendConnections::new());
+    let worker_request_counts: Arc<dashmap::DashMap<(String, u16), std::sync::atomic::AtomicU64>> =
+        Arc::new(dashmap::DashMap::new());
+    let worker_waf_counts: Arc<dashmap::DashMap<(String, String), std::sync::atomic::AtomicU64>> =
+        Arc::new(dashmap::DashMap::new());
 
     // Create shared WAF engine for worker (must be before command channel setup)
     let waf_engine = Arc::new(lorica_waf::WafEngine::new());
@@ -1032,6 +1036,8 @@ fn run_worker(
     let cmd_ban_list = Arc::clone(&worker_ban_list);
     let cmd_ewma = worker_ewma.scores_ref();
     let cmd_backend_conns = Arc::clone(&worker_backend_conns);
+    let cmd_request_counts = Arc::clone(&worker_request_counts);
+    let cmd_waf_counts = Arc::clone(&worker_waf_counts);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create command channel runtime");
         rt.block_on(async move {
@@ -1153,16 +1159,26 @@ fn run_worker(
                                 connections: conns,
                             })
                             .collect();
-                        report.request_entries = lorica_api::metrics::collect_request_counts()
-                            .into_iter()
-                            .map(|(route_id, status_code, count)| {
-                                lorica_command::RequestCountEntry { route_id, status_code, count }
+                        report.request_entries = cmd_request_counts
+                            .iter()
+                            .map(|entry| {
+                                let ((route_id, status_code), counter) = (entry.key(), entry.value());
+                                lorica_command::RequestCountEntry {
+                                    route_id: route_id.clone(),
+                                    status_code: *status_code as u32,
+                                    count: counter.load(std::sync::atomic::Ordering::Relaxed),
+                                }
                             })
                             .collect();
-                        report.waf_entries = lorica_api::metrics::collect_waf_counts()
-                            .into_iter()
-                            .map(|(category, action, count)| {
-                                lorica_command::WafCountEntry { category, action, count }
+                        report.waf_entries = cmd_waf_counts
+                            .iter()
+                            .map(|entry| {
+                                let ((category, action), counter) = (entry.key(), entry.value());
+                                lorica_command::WafCountEntry {
+                                    category: category.clone(),
+                                    action: action.clone(),
+                                    count: counter.load(std::sync::atomic::Ordering::Relaxed),
+                                }
                             })
                             .collect();
 
@@ -1289,6 +1305,8 @@ fn run_worker(
     lorica_proxy.ban_list = worker_ban_list;
     lorica_proxy.ewma_tracker = worker_ewma;
     lorica_proxy.backend_connections = worker_backend_conns;
+    lorica_proxy.request_counts = worker_request_counts;
+    lorica_proxy.waf_counts = worker_waf_counts;
     lorica_proxy.waf_engine = waf_engine;
 
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {

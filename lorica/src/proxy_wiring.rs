@@ -405,6 +405,10 @@ pub struct LoricaProxy {
     pub cache_hits: Arc<AtomicU64>,
     /// Cache miss counter for dashboard stats.
     pub cache_misses: Arc<AtomicU64>,
+    /// Per-(route_id, status_code) request counters for Prometheus aggregation.
+    pub request_counts: Arc<DashMap<(String, u16), AtomicU64>>,
+    /// Per-(category, action) WAF event counters for Prometheus aggregation.
+    pub waf_counts: Arc<DashMap<(String, String), AtomicU64>>,
     /// ACME HTTP-01 challenge store (shared with API, None in worker mode).
     pub acme_challenge_store: Option<lorica_api::acme::AcmeChallengeStore>,
     /// Non-blocking alert sender for notification dispatch.
@@ -435,6 +439,8 @@ impl LoricaProxy {
             global_rate: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
+            request_counts: Arc::new(DashMap::new()),
+            waf_counts: Arc::new(DashMap::new()),
             acme_challenge_store: None,
             alert_sender: None,
             log_store: None,
@@ -571,6 +577,10 @@ impl ProxyHttp for LoricaProxy {
                 let host_val = extract_host(req);
                 self.waf_engine.record_blocklist_event(ip, host_val, path);
                 lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
+                self.waf_counts
+                    .entry(("ip_blocklist".to_string(), "blocked".to_string()))
+                    .or_insert_with(|| AtomicU64::new(0))
+                    .fetch_add(1, Ordering::Relaxed);
                 if let Some(ref store) = self.log_store {
                     let ev = lorica_waf::WafEvent {
                         rule_id: 0,
@@ -871,6 +881,10 @@ impl ProxyHttp for LoricaProxy {
             lorica_waf::WafVerdict::Blocked(ref events) => {
                 for ev in events {
                     lorica_api::metrics::record_waf_event(ev.category.as_str(), "blocked");
+                    self.waf_counts
+                        .entry((ev.category.as_str().to_string(), "blocked".to_string()))
+                        .or_insert_with(|| AtomicU64::new(0))
+                        .fetch_add(1, Ordering::Relaxed);
                     if let Some(ref store) = self.log_store {
                         let _ = store.insert_waf_event(ev);
                     }
@@ -902,6 +916,10 @@ impl ProxyHttp for LoricaProxy {
             lorica_waf::WafVerdict::Detected(ref events) => {
                 for ev in events {
                     lorica_api::metrics::record_waf_event(ev.category.as_str(), "detected");
+                    self.waf_counts
+                        .entry((ev.category.as_str().to_string(), "detected".to_string()))
+                        .or_insert_with(|| AtomicU64::new(0))
+                        .fetch_add(1, Ordering::Relaxed);
                     if let Some(ref store) = self.log_store {
                         let _ = store.insert_waf_event(ev);
                     }
@@ -1477,6 +1495,12 @@ impl ProxyHttp for LoricaProxy {
         // Record Prometheus metrics (bounded labels: route_id, not hostname)
         let route_label = ctx.route_id.as_deref().unwrap_or("_unknown");
         lorica_api::metrics::record_request(route_label, status, elapsed.as_secs_f64());
+
+        // Track request count for worker -> supervisor aggregation
+        self.request_counts
+            .entry((route_label.to_string(), status))
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
 
         // Record SLA metrics for passive monitoring
         if let Some(ref route_id) = ctx.route_id {
