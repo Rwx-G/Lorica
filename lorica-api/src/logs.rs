@@ -43,7 +43,7 @@ struct LogBufferInner {
 impl LogBuffer {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "LogBuffer capacity must be > 0");
-        let (tx, _) = broadcast::channel(256);
+        let (tx, _) = broadcast::channel(2048);
         Self {
             entries: tokio::sync::RwLock::new(LogBufferInner {
                 buf: Vec::with_capacity(capacity),
@@ -251,11 +251,20 @@ async fn handle_log_stream(socket: WebSocket, mut rx: broadcast::Receiver<LogEnt
 
     // Forward broadcast entries to the WebSocket client
     let send_task = tokio::spawn(async move {
-        while let Ok(entry) = rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&entry) {
-                if sender.send(Message::Text(json)).await.is_err() {
-                    break; // Client disconnected
+        loop {
+            match rx.recv().await {
+                Ok(entry) => {
+                    if let Ok(json) = serde_json::to_string(&entry) {
+                        if sender.send(Message::Text(json)).await.is_err() {
+                            break; // Client disconnected
+                        }
+                    }
                 }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!(skipped = n, "log WebSocket subscriber lagged, resuming");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
