@@ -165,10 +165,10 @@
         weight: formWeight,
         health_check_enabled: formHealthCheckEnabled,
         health_check_interval_s: formHealthCheckInterval,
-        health_check_path: formHealthCheckPath || undefined,
+        health_check_path: formHealthCheckPath,
         tls_upstream: formTlsUpstream,
         tls_skip_verify: formTlsSkipVerify,
-        tls_sni: formTlsSni || undefined,
+        tls_sni: formTlsSni,
         h2_upstream: formH2Upstream,
       };
       const res = await api.updateBackend(editingBackend.id, body);
