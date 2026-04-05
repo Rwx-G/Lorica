@@ -449,7 +449,8 @@
           color={wafStats && wafStats.total_events > 0 ? 'orange' : 'green'}
         />
         {#if wafTopCategory}
-          <Card title="Top Category" value={wafTopCategory.category} />
+          {@const shortCat = { sql_injection: 'SQLi', xss: 'XSS', path_traversal: 'Path Trav.', command_injection: 'Cmd Inj.', protocol_violation: 'Proto Viol.', ssrf: 'SSRF', log_injection: 'Log4Shell', xxe: 'XXE', ip_blocklist: 'IP Block' }[wafTopCategory.category] ?? wafTopCategory.category}
+          <Card title="Top Category" value="{shortCat} ({wafTopCategory.count})" tooltip="{wafTopCategory.category}: {wafTopCategory.count} events" />
         {/if}
         <Card
           title="Active Bans"

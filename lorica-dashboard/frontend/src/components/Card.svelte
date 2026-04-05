@@ -3,12 +3,13 @@
     title: string;
     value: string | number;
     color?: 'default' | 'green' | 'orange' | 'red';
+    tooltip?: string;
   }
 
-  let { title, value, color = 'default' }: Props = $props();
+  let { title, value, color = 'default', tooltip }: Props = $props();
 </script>
 
-<div class="card" class:green={color === 'green'} class:orange={color === 'orange'} class:red={color === 'red'}>
+<div class="card" class:green={color === 'green'} class:orange={color === 'orange'} class:red={color === 'red'} title={tooltip ?? ''}>
   <span class="card-title">{title}</span>
   <span class="card-value">{value}</span>
 </div>
@@ -40,6 +41,11 @@
     color: var(--color-text-heading);
     font-family: var(--mono);
     letter-spacing: -0.02em;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: center;
   }
 
   .green {
