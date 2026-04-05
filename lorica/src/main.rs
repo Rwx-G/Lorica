@@ -272,6 +272,14 @@ fn run_supervisor(cli: Cli) {
             }
         }
 
+        let log_store = match lorica_api::log_store::LogStore::open(&data_dir) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                warn!(error = %e, "failed to open access log database, persistence disabled");
+                None
+            }
+        };
+
         let store = Arc::new(Mutex::new(store));
         let log_buffer = Arc::new(LogBuffer::new(10_000));
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -288,11 +296,13 @@ fn run_supervisor(cli: Cli) {
             let _ = std::fs::set_permissions(&log_sock_path, std::fs::Permissions::from_mode(0o660));
         }
         let log_sink = Arc::clone(&log_buffer);
+        let log_store_sink = log_store.clone();
         tokio::spawn(async move {
             loop {
                 match log_listener.accept().await {
                     Ok((stream, _)) => {
                         let sink = Arc::clone(&log_sink);
+                        let store_sink = log_store_sink.clone();
                         tokio::spawn(async move {
                             let mut reader = tokio::io::BufReader::new(stream);
                             let mut line = String::new();
@@ -302,6 +312,11 @@ fn run_supervisor(cli: Cli) {
                                     Ok(0) => break, // EOF - worker disconnected
                                     Ok(_) => {
                                         if let Ok(entry) = serde_json::from_str::<lorica_api::logs::LogEntry>(&line) {
+                                            if let Some(ref s) = store_sink {
+                                                if let Err(e) = s.insert(&entry) {
+                                                    tracing::warn!(error = %e, "failed to persist access log entry");
+                                                }
+                                            }
                                             sink.push(entry).await;
                                         }
                                     }
@@ -521,6 +536,7 @@ fn run_supervisor(cli: Cli) {
         let api_store = Arc::clone(&store);
         let api_log_buffer = Arc::clone(&log_buffer);
         let api_active_connections = Arc::clone(&active_connections);
+        let api_log_store = log_store.clone();
         let management_port = cli.management_port;
         let api_handle = tokio::spawn(async move {
             let state = AppState {
@@ -548,6 +564,7 @@ fn run_supervisor(cli: Cli) {
                     let d = notify_dispatcher.lock().await;
                     Some(d.history())
                 },
+                log_store: api_log_store,
             };
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
@@ -559,6 +576,28 @@ fn run_supervisor(cli: Cli) {
                 error!(error = %e, "API server exited with error");
             }
         });
+
+        if let Some(ref retention_store) = log_store {
+            let retention_log_store = Arc::clone(retention_store);
+            let retention_config_store = Arc::clone(&store);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(3600));
+                loop {
+                    interval.tick().await;
+                    let retention = {
+                        let s = retention_config_store.lock().await;
+                        s.get_global_settings()
+                            .map(|gs| gs.access_log_retention)
+                            .unwrap_or(100_000)
+                    };
+                    if retention > 0 {
+                        if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
+                            tracing::warn!(error = %e, "access log retention cleanup failed");
+                        }
+                    }
+                }
+            });
+        }
 
         // Worker monitoring loop (crash detection and restart with backoff)
         let manager = Arc::new(std::sync::Mutex::new(manager));
@@ -953,6 +992,14 @@ fn run_single_process(cli: Cli) {
             }
         }
 
+        let log_store = match lorica_api::log_store::LogStore::open(&data_dir) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                warn!(error = %e, "failed to open access log database, persistence disabled");
+                None
+            }
+        };
+
         let store = Arc::new(Mutex::new(store));
         let log_buffer = Arc::new(LogBuffer::new(10_000));
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1079,6 +1126,7 @@ fn run_single_process(cli: Cli) {
         lorica_proxy.waf_engine = Arc::clone(&waf_engine);
         lorica_proxy.acme_challenge_store = Some(acme_challenge_store.clone());
         lorica_proxy.alert_sender = Some(alert_sender.clone());
+        lorica_proxy.log_store = log_store.clone();
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
         let proxy_cache_misses = Arc::clone(&lorica_proxy.cache_misses);
@@ -1125,6 +1173,7 @@ fn run_single_process(cli: Cli) {
         let api_store = Arc::clone(&store);
         let api_log_buffer = Arc::clone(&log_buffer);
         let api_active_connections = Arc::clone(&active_connections);
+        let api_log_store = log_store.clone();
         let management_port = cli.management_port;
         let api_handle = tokio::spawn(async move {
             let state = AppState {
@@ -1148,6 +1197,7 @@ fn run_single_process(cli: Cli) {
                 cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
                 ewma_scores: Some(proxy_ewma_scores),
                 notification_history: Some(notification_history),
+                log_store: api_log_store,
             };
 
             // Spawn ACME certificate auto-renewal (check every 12h, renew at 30 days before expiry)
@@ -1168,6 +1218,28 @@ fn run_single_process(cli: Cli) {
                 error!(error = %e, "API server exited with error");
             }
         });
+
+        if let Some(ref retention_store) = log_store {
+            let retention_log_store = Arc::clone(retention_store);
+            let retention_config_store = Arc::clone(&store);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(3600));
+                loop {
+                    interval.tick().await;
+                    let retention = {
+                        let s = retention_config_store.lock().await;
+                        s.get_global_settings()
+                            .map(|gs| gs.access_log_retention)
+                            .unwrap_or(100_000)
+                    };
+                    if retention > 0 {
+                        if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
+                            tracing::warn!(error = %e, "access log retention cleanup failed");
+                        }
+                    }
+                }
+            });
+        }
 
         // Background task: reload proxy config, cert resolver, and probe scheduler when API signals a change
         let reload_store = Arc::clone(&store);

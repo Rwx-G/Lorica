@@ -57,6 +57,8 @@ pub struct AppState {
     pub ewma_scores: Option<Arc<std::sync::RwLock<HashMap<String, f64>>>>,
     /// Notification event history ring buffer (shared with NotifyDispatcher).
     pub notification_history: Option<Arc<std::sync::Mutex<VecDeque<lorica_notify::AlertEvent>>>>,
+    /// Persistent access log store (SQLite). `None` in tests or worker mode.
+    pub log_store: Option<Arc<crate::log_store::LogStore>>,
 }
 
 impl AppState {

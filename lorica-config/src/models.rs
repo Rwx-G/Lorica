@@ -505,6 +505,10 @@ pub struct GlobalSettings {
     /// If a custom preset shares a name with a builtin, the custom one wins.
     #[serde(default)]
     pub custom_security_presets: Vec<SecurityHeaderPreset>,
+    /// Maximum number of access log entries to retain in the persistent store.
+    /// Older entries are purged periodically. 0 = unlimited. Default: 100000.
+    #[serde(default = "default_access_log_retention")]
+    pub access_log_retention: i64,
 }
 
 fn default_security_headers() -> String {
@@ -579,6 +583,10 @@ fn default_loadtest_max_rps() -> i32 {
     1000
 }
 
+fn default_access_log_retention() -> i64 {
+    100_000
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
@@ -596,6 +604,7 @@ impl Default for GlobalSettings {
             max_global_connections: 0,
             flood_threshold_rps: 0,
             custom_security_presets: Vec::new(),
+            access_log_retention: default_access_log_retention(),
         }
     }
 }

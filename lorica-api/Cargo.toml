@@ -43,6 +43,7 @@ tracing = "0.1"
 prometheus = "0.14"
 once_cell = { workspace = true }
 http = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 default = ["route53"]

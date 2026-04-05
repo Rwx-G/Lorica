@@ -27,6 +27,7 @@ pub struct UpdateSettingsRequest {
     pub default_topology_type: Option<String>,
     pub max_global_connections: Option<i32>,
     pub flood_threshold_rps: Option<i32>,
+    pub access_log_retention: Option<i64>,
 }
 
 /// PUT /api/v1/settings
@@ -93,6 +94,14 @@ pub async fn update_settings(
             ));
         }
         settings.flood_threshold_rps = threshold;
+    }
+    if let Some(retention) = body.access_log_retention {
+        if retention < 0 {
+            return Err(ApiError::BadRequest(
+                "access_log_retention must be >= 0".into(),
+            ));
+        }
+        settings.access_log_retention = retention;
     }
 
     store.update_global_settings(&settings)?;

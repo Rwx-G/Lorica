@@ -13,7 +13,7 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, default_topology_type: 'single_vm', max_global_connections: 0, flood_threshold_rps: 0 });
+  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, default_topology_type: 'single_vm', max_global_connections: 0, flood_threshold_rps: 0, access_log_retention: 100000 });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -553,6 +553,11 @@
           <label for="flood-threshold">Flood Detection Threshold (RPS)</label>
           <input id="flood-threshold" type="number" bind:value={settingsForm.flood_threshold_rps} min="0" max="1000000" />
           <span class="hint">0 = disabled. When exceeded, per-IP rate limits are halved.</span>
+        </div>
+        <div class="form-row">
+          <label for="s-log-retention">Access Log Retention (entries)</label>
+          <input id="s-log-retention" type="number" min="0" bind:value={settingsForm.access_log_retention} />
+          <span class="hint">Maximum entries in persistent log store (0 = unlimited).</span>
         </div>
         {#if settingsError}
           <div class="form-error">{settingsError}</div>

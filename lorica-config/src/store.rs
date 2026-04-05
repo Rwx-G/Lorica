@@ -1236,6 +1236,11 @@ impl ConfigStore {
                             ))
                         })?;
                 }
+                "access_log_retention" => {
+                    settings.access_log_retention = value.parse().map_err(|_| {
+                        ConfigError::Validation("invalid access_log_retention".into())
+                    })?;
+                }
                 _ => {}
             }
         }
@@ -1287,6 +1292,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('custom_security_presets', ?1)",
             params![presets_json],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('access_log_retention', ?1)",
+            params![settings.access_log_retention.to_string()],
         )?;
         Ok(())
     }

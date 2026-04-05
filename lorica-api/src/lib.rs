@@ -8,6 +8,7 @@ pub mod certificates;
 pub mod config;
 pub mod error;
 pub mod loadtest;
+pub mod log_store;
 pub mod logs;
 pub mod metrics;
 pub mod middleware;

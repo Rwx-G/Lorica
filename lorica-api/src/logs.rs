@@ -144,6 +144,13 @@ pub async fn get_logs(
     Extension(state): Extension<AppState>,
     Query(params): Query<LogsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(ref store) = state.log_store {
+        let (entries, total) = store
+            .query(&params)
+            .map_err(|e| ApiError::Internal(format!("log query failed: {e}")))?;
+        return Ok(json_data(LogsResponse { entries, total }));
+    }
+
     let all_entries = state.log_buffer.snapshot().await;
     let limit = params.limit.unwrap_or(200).min(10_000);
 
@@ -218,6 +225,11 @@ pub async fn clear_logs(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.log_buffer.clear().await;
+    if let Some(ref store) = state.log_store {
+        store
+            .clear()
+            .map_err(|e| ApiError::Internal(format!("log clear failed: {e}")))?;
+    }
     Ok(json_data(serde_json::json!({ "message": "logs cleared" })))
 }
 

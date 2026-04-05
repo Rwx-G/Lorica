@@ -338,6 +338,7 @@ export interface GlobalSettingsResponse {
   default_topology_type: string;
   max_global_connections: number;
   flood_threshold_rps: number;
+  access_log_retention: number;
   custom_security_presets?: SecurityHeaderPreset[];
 }
 
@@ -350,6 +351,7 @@ export interface UpdateSettingsRequest {
   default_topology_type?: string;
   max_global_connections?: number;
   flood_threshold_rps?: number;
+  access_log_retention?: number;
   custom_security_presets?: SecurityHeaderPreset[];
 }
 

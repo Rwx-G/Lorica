@@ -450,6 +450,8 @@ pub struct LoricaProxy {
     pub acme_challenge_store: Option<lorica_api::acme::AcmeChallengeStore>,
     /// Non-blocking alert sender for notification dispatch.
     pub alert_sender: Option<lorica_notify::AlertSender>,
+    /// Persistent access log store (SQLite).
+    pub log_store: Option<Arc<lorica_api::log_store::LogStore>>,
 }
 
 impl LoricaProxy {
@@ -476,6 +478,7 @@ impl LoricaProxy {
             cache_misses: Arc::new(AtomicU64::new(0)),
             acme_challenge_store: None,
             alert_sender: None,
+            log_store: None,
         }
     }
 
@@ -1450,6 +1453,11 @@ impl ProxyHttp for LoricaProxy {
                 backend: backend_addr.to_string(),
                 error: error_str,
             };
+            if let Some(ref store) = self.log_store {
+                if let Err(e) = store.insert(&entry) {
+                    tracing::warn!(error = %e, "failed to persist access log entry");
+                }
+            }
             self.log_buffer.push(entry).await;
         }
 
