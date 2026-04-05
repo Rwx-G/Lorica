@@ -485,6 +485,17 @@ impl LoricaProxy {
     }
 }
 
+/// Extract the request host from the Host header, falling back to URI authority.
+/// HTTP/2 uses :authority pseudo-header which pingora maps to the URI authority,
+/// while the Host header may be absent.
+fn extract_host(req: &lorica_http::RequestHeader) -> &str {
+    req.headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri.authority().map(|a| a.as_str()))
+        .unwrap_or("")
+}
+
 #[async_trait]
 impl ProxyHttp for LoricaProxy {
     type CTX = RequestCtx;
@@ -593,12 +604,8 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        let host = req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .map(|h| h.split(':').next().unwrap_or(h))
-            .unwrap_or("");
+        let host_raw = extract_host(req);
+        let host = host_raw.split(':').next().unwrap_or(host_raw);
 
         let path = req.uri.path();
         let query = req.uri.query();
@@ -646,11 +653,7 @@ impl ProxyHttp for LoricaProxy {
                     .unwrap_or("http")
             };
             if scheme != "https" {
-                let redir_host = req
-                    .headers
-                    .get("host")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
+                let redir_host = extract_host(req);
                 let redir_path = req.uri.path();
                 let redir_query = req
                     .uri
@@ -985,12 +988,7 @@ impl ProxyHttp for LoricaProxy {
     fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
         let req = session.req_header();
 
-        let host = req
-            .headers
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| req.uri.authority().map(|a| a.as_str()))
-            .unwrap_or("");
+        let host = extract_host(req);
 
         let path_and_query = req
             .uri
@@ -1059,16 +1057,8 @@ impl ProxyHttp for LoricaProxy {
     ) -> Result<Box<HttpPeer>> {
         let req = session.req_header();
 
-        // Extract the Host header
-        let host = req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .map(|h| {
-                // Strip port from host header if present
-                h.split(':').next().unwrap_or(h)
-            })
-            .unwrap_or("");
+        let host_raw = extract_host(req);
+        let host = host_raw.split(':').next().unwrap_or(host_raw);
 
         let path = req.uri.path();
         let config = self.config.load();
@@ -1246,12 +1236,7 @@ impl ProxyHttp for LoricaProxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("http");
 
-        let host_val = req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        let host_val = extract_host(req).to_string();
 
         let _ = upstream_request.insert_header("X-Real-IP", &client_ip);
         let _ = upstream_request.insert_header("X-Forwarded-For", &xff);
@@ -1404,11 +1389,8 @@ impl ProxyHttp for LoricaProxy {
 
         let method = req.method.as_str();
         let path = req.uri.path();
-        let host = req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-");
+        let host_val = extract_host(req);
+        let host = if host_val.is_empty() { "-" } else { host_val };
 
         let status = session
             .as_downstream()
