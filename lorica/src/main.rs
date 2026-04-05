@@ -206,6 +206,21 @@ fn run_supervisor(cli: Cli) {
         upstream_crl_file: cli.upstream_crl_file.clone(),
     };
 
+    // Run DB migrations BEFORE forking workers to avoid SQLite lock contention.
+    // Workers will open the DB after migrations are complete.
+    {
+        let data_dir = PathBuf::from(&cli.data_dir);
+        let _ = std::fs::create_dir_all(&data_dir);
+        let key_path = data_dir.join("encryption.key");
+        let encryption_key = lorica_config::crypto::EncryptionKey::load_or_create(&key_path).ok();
+        let db_path = data_dir.join("lorica.db");
+        if let Err(e) = ConfigStore::open(&db_path, encryption_key) {
+            error!(error = %e, "failed to run database migrations before forking workers");
+            std::process::exit(1);
+        }
+        info!("database migrations completed, forking workers");
+    }
+
     // Fork workers BEFORE creating any threads/runtime
     let mut manager = WorkerManager::new(config);
     if let Err(e) = manager.start() {
