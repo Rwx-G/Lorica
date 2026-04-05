@@ -1,0 +1,1 @@
+ALTER TABLE backends ADD COLUMN tls_sni TEXT NOT NULL DEFAULT '';

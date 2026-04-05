@@ -24,6 +24,7 @@
   let formHealthCheckInterval = $state(10);
   let formHealthCheckPath = $state('');
   let formTlsUpstream = $state(false);
+  let formTlsSni = $state('');
   let formH2Upstream = $state(false);
   let formError = $state('');
   let formSubmitting = $state(false);
@@ -120,6 +121,7 @@
     formHealthCheckInterval = 10;
     formHealthCheckPath = '';
     formTlsUpstream = false;
+    formTlsSni = '';
     formH2Upstream = false;
     formError = '';
     addressError = '';
@@ -136,6 +138,7 @@
     formHealthCheckInterval = b.health_check_interval_s;
     formHealthCheckPath = b.health_check_path ?? '';
     formTlsUpstream = b.tls_upstream;
+    formTlsSni = b.tls_sni ?? '';
     formH2Upstream = b.h2_upstream;
     formError = '';
     addressError = '';
@@ -161,6 +164,7 @@
         health_check_interval_s: formHealthCheckInterval,
         health_check_path: formHealthCheckPath || undefined,
         tls_upstream: formTlsUpstream,
+        tls_sni: formTlsSni || undefined,
         h2_upstream: formH2Upstream,
       };
       const res = await api.updateBackend(editingBackend.id, body);
@@ -180,6 +184,7 @@
         health_check_interval_s: formHealthCheckInterval,
         health_check_path: formHealthCheckPath || undefined,
         tls_upstream: formTlsUpstream,
+        tls_sni: formTlsSni || undefined,
         h2_upstream: formH2Upstream,
       };
       const res = await api.createBackend(body);
@@ -372,6 +377,14 @@
             HTTP/2 upstream (h2c for plaintext, ALPN h2 for TLS)
           </label>
         </div>
+
+        {#if formTlsUpstream}
+          <div class="form-row">
+            <label for="form-tls-sni">TLS SNI override</label>
+            <input id="form-tls-sni" type="text" bind:value={formTlsSni} placeholder="Leave empty to use route hostname" />
+            <span class="form-hint">Override the server name sent during TLS handshake to the backend</span>
+          </div>
+        {/if}
 
         <div class="form-actions">
           <button class="btn btn-cancel" onclick={() => (showForm = false)}>Cancel</button>

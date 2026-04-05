@@ -1141,8 +1141,11 @@ impl ProxyHttp for LoricaProxy {
             &*backend.address,
             backend.tls_upstream,
             if backend.tls_upstream {
-                // Use the backend address host as SNI
-                backend.address.split(':').next().unwrap_or("").to_string()
+                // SNI priority: backend tls_sni override > route hostname
+                backend
+                    .tls_sni
+                    .clone()
+                    .unwrap_or_else(|| entry.route.hostname.clone())
             } else {
                 String::new()
             },
@@ -1572,6 +1575,7 @@ mod tests {
             lifecycle_state: LifecycleState::Normal,
             active_connections: 0,
             tls_upstream: false,
+            tls_sni: None,
             h2_upstream: false,
             created_at: now,
             updated_at: now,

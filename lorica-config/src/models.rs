@@ -407,6 +407,10 @@ pub struct Backend {
     pub lifecycle_state: LifecycleState,
     pub active_connections: i32,
     pub tls_upstream: bool,
+    /// Override the SNI sent to this backend during TLS handshake.
+    /// When empty, the route hostname is used instead.
+    #[serde(default)]
+    pub tls_sni: Option<String>,
     /// Force HTTP/2 when connecting to this backend (h2c for plaintext,
     /// ALPN h2 for TLS). Default false (HTTP/1.1).
     #[serde(default)]

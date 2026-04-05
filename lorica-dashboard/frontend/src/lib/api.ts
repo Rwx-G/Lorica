@@ -226,6 +226,7 @@ export interface BackendResponse {
   health_check_interval_s: number;
   health_check_path: string | null;
   tls_upstream: boolean;
+  tls_sni: string | null;
   h2_upstream: boolean;
   ewma_score_us: number;
   created_at: string;
@@ -990,6 +991,7 @@ export interface CreateBackendRequest {
   health_check_interval_s?: number;
   health_check_path?: string;
   tls_upstream?: boolean;
+  tls_sni?: string;
   h2_upstream?: boolean;
 }
 
@@ -1002,6 +1004,7 @@ export interface UpdateBackendRequest {
   health_check_interval_s?: number;
   health_check_path?: string;
   tls_upstream?: boolean;
+  tls_sni?: string;
   h2_upstream?: boolean;
 }
 

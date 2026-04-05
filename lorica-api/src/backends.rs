@@ -21,6 +21,7 @@ pub struct BackendResponse {
     pub health_check_interval_s: i32,
     pub health_check_path: Option<String>,
     pub tls_upstream: bool,
+    pub tls_sni: Option<String>,
     pub h2_upstream: bool,
     pub ewma_score_us: f64,
     pub created_at: String,
@@ -37,6 +38,7 @@ pub struct CreateBackendRequest {
     pub health_check_interval_s: Option<i32>,
     pub health_check_path: Option<String>,
     pub tls_upstream: Option<bool>,
+    pub tls_sni: Option<String>,
     pub h2_upstream: Option<bool>,
 }
 
@@ -50,6 +52,7 @@ pub struct UpdateBackendRequest {
     pub health_check_interval_s: Option<i32>,
     pub health_check_path: Option<String>,
     pub tls_upstream: Option<bool>,
+    pub tls_sni: Option<String>,
     pub h2_upstream: Option<bool>,
 }
 
@@ -70,6 +73,7 @@ fn backend_to_response(
         health_check_interval_s: b.health_check_interval_s,
         health_check_path: b.health_check_path.clone(),
         tls_upstream: b.tls_upstream,
+        tls_sni: b.tls_sni.clone(),
         h2_upstream: b.h2_upstream,
         ewma_score_us: ewma_score,
         created_at: b.created_at.to_rfc3339(),
@@ -123,6 +127,7 @@ pub async fn create_backend(
         lifecycle_state: lorica_config::models::LifecycleState::Normal,
         active_connections: 0,
         tls_upstream: body.tls_upstream.unwrap_or(false),
+        tls_sni: body.tls_sni.clone().filter(|s| !s.is_empty()),
         h2_upstream: body.h2_upstream.unwrap_or(false),
         created_at: now,
         updated_at: now,
@@ -185,6 +190,9 @@ pub async fn update_backend(
     }
     if let Some(tls) = body.tls_upstream {
         backend.tls_upstream = tls;
+    }
+    if let Some(sni) = body.tls_sni {
+        backend.tls_sni = if sni.is_empty() { None } else { Some(sni) };
     }
     if let Some(h2) = body.h2_upstream {
         backend.h2_upstream = h2;

@@ -83,6 +83,7 @@ fn make_backend(id: &str, address: &str) -> Backend {
         lifecycle_state: LifecycleState::Normal,
         active_connections: 0,
         tls_upstream: false,
+        tls_sni: None,
         h2_upstream: false,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
