@@ -339,6 +339,9 @@ export interface GlobalSettingsResponse {
   max_global_connections: number;
   flood_threshold_rps: number;
   access_log_retention: number;
+  sla_purge_enabled: boolean;
+  sla_purge_retention_days: number;
+  sla_purge_schedule: string;
   custom_security_presets?: SecurityHeaderPreset[];
 }
 
@@ -352,6 +355,9 @@ export interface UpdateSettingsRequest {
   max_global_connections?: number;
   flood_threshold_rps?: number;
   access_log_retention?: number;
+  sla_purge_enabled?: boolean;
+  sla_purge_retention_days?: number;
+  sla_purge_schedule?: string;
   custom_security_presets?: SecurityHeaderPreset[];
 }
 

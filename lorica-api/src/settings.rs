@@ -28,6 +28,9 @@ pub struct UpdateSettingsRequest {
     pub max_global_connections: Option<i32>,
     pub flood_threshold_rps: Option<i32>,
     pub access_log_retention: Option<i64>,
+    pub sla_purge_enabled: Option<bool>,
+    pub sla_purge_retention_days: Option<i32>,
+    pub sla_purge_schedule: Option<String>,
 }
 
 /// PUT /api/v1/settings
@@ -102,6 +105,28 @@ pub async fn update_settings(
             ));
         }
         settings.access_log_retention = retention;
+    }
+    if let Some(enabled) = body.sla_purge_enabled {
+        settings.sla_purge_enabled = enabled;
+    }
+    if let Some(days) = body.sla_purge_retention_days {
+        if days < 1 {
+            return Err(ApiError::BadRequest(
+                "sla_purge_retention_days must be >= 1".into(),
+            ));
+        }
+        settings.sla_purge_retention_days = days;
+    }
+    if let Some(ref schedule) = body.sla_purge_schedule {
+        let valid = matches!(schedule.as_str(), "first_of_month" | "daily")
+            || schedule.parse::<i32>().is_ok_and(|d| (1..=28).contains(&d));
+        if !valid {
+            return Err(ApiError::BadRequest(
+                "sla_purge_schedule must be 'first_of_month', 'daily', or a day number (1-28)"
+                    .into(),
+            ));
+        }
+        settings.sla_purge_schedule = schedule.clone();
     }
 
     store.update_global_settings(&settings)?;

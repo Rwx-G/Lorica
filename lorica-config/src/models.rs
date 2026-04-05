@@ -509,6 +509,17 @@ pub struct GlobalSettings {
     /// Older entries are purged periodically. 0 = unlimited. Default: 100000.
     #[serde(default = "default_access_log_retention")]
     pub access_log_retention: i64,
+    /// Whether automatic SLA data purge is enabled. Default: false.
+    #[serde(default)]
+    pub sla_purge_enabled: bool,
+    /// Number of days to retain SLA buckets. Buckets older than this are deleted.
+    /// Default: 90 days.
+    #[serde(default = "default_sla_purge_retention_days")]
+    pub sla_purge_retention_days: i32,
+    /// Purge schedule: "first_of_month", "daily", or a day number (1-28).
+    /// Default: "first_of_month".
+    #[serde(default = "default_sla_purge_schedule")]
+    pub sla_purge_schedule: String,
 }
 
 fn default_security_headers() -> String {
@@ -587,6 +598,14 @@ fn default_access_log_retention() -> i64 {
     100_000
 }
 
+fn default_sla_purge_retention_days() -> i32 {
+    90
+}
+
+fn default_sla_purge_schedule() -> String {
+    "first_of_month".to_string()
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
@@ -605,6 +624,9 @@ impl Default for GlobalSettings {
             flood_threshold_rps: 0,
             custom_security_presets: Vec::new(),
             access_log_retention: default_access_log_retention(),
+            sla_purge_enabled: false,
+            sla_purge_retention_days: default_sla_purge_retention_days(),
+            sla_purge_schedule: default_sla_purge_schedule(),
         }
     }
 }

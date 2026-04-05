@@ -27,6 +27,7 @@ use lorica_api::server::AppState;
 use lorica_api::system::SystemCache;
 use lorica_config::ConfigStore;
 use tokio::sync::Mutex;
+use chrono::Datelike;
 use tracing::{error, info, warn};
 
 use lorica::proxy_wiring::{LoricaProxy, ProxyConfig};
@@ -622,6 +623,7 @@ fn run_supervisor(cli: Cli) {
             let retention_config_store = Arc::clone(&store);
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(3600));
+                let mut last_sla_purge_day: u32 = 0;
                 loop {
                     interval.tick().await;
                     let retention = {
@@ -641,6 +643,8 @@ fn run_supervisor(cli: Cli) {
                             tracing::warn!(error = %e, "probe result retention cleanup failed");
                         }
                     }
+                    last_sla_purge_day =
+                        run_sla_purge(&retention_config_store, last_sla_purge_day).await;
                 }
             });
         }
@@ -1356,6 +1360,7 @@ fn run_single_process(cli: Cli) {
             let retention_config_store = Arc::clone(&store);
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(3600));
+                let mut last_sla_purge_day: u32 = 0;
                 loop {
                     interval.tick().await;
                     let retention = {
@@ -1375,6 +1380,8 @@ fn run_single_process(cli: Cli) {
                             tracing::warn!(error = %e, "probe result retention cleanup failed");
                         }
                     }
+                    last_sla_purge_day =
+                        run_sla_purge(&retention_config_store, last_sla_purge_day).await;
                 }
             });
         }
@@ -1438,6 +1445,49 @@ fn run_single_process(cli: Cli) {
 }
 
 /// Build a NotifyDispatcher from database notification configs.
+/// Run the SLA data purge if enabled and the schedule matches today.
+/// Returns the day-of-month on which the last purge ran (used as guard to run once per day).
+async fn run_sla_purge(
+    store: &Arc<Mutex<lorica_config::ConfigStore>>,
+    last_purge_day: u32,
+) -> u32 {
+    let today = chrono::Utc::now().day();
+    if today == last_purge_day {
+        return last_purge_day;
+    }
+    let s = store.lock().await;
+    let gs = match s.get_global_settings() {
+        Ok(gs) => gs,
+        Err(_) => return last_purge_day,
+    };
+    if !gs.sla_purge_enabled {
+        return last_purge_day;
+    }
+    let should_run = match gs.sla_purge_schedule.as_str() {
+        "daily" => true,
+        "first_of_month" => today == 1,
+        other => other.parse::<u32>().is_ok_and(|d| d == today),
+    };
+    if !should_run {
+        return last_purge_day;
+    }
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(gs.sla_purge_retention_days as i64);
+    match s.prune_sla_buckets(&cutoff) {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                count = n,
+                retention_days = gs.sla_purge_retention_days,
+                "purged old SLA buckets"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "SLA purge failed");
+        }
+        _ => {}
+    }
+    today
+}
+
 fn build_notify_dispatcher(store: &lorica_config::ConfigStore) -> lorica_notify::NotifyDispatcher {
     let mut dispatcher = lorica_notify::NotifyDispatcher::new();
     if let Ok(configs) = store.list_notification_configs() {

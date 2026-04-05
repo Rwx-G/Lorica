@@ -27,6 +27,9 @@
   let cfgStatusMax = $state(399);
   let cfgSaving = $state(false);
 
+  let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let lastRefresh: Date | null = $state(null);
+
   async function loadData() {
     loading = true;
     error = '';
@@ -38,9 +41,23 @@
     if (overviewRes.data) overview = overviewRes.data;
     if (routesRes.error) error = routesRes.error.message;
     loading = false;
+    lastRefresh = new Date();
   }
 
-  onMount(loadData);
+  async function refreshAll() {
+    await loadData();
+    if (selectedRouteId) {
+      await selectRoute(selectedRouteId);
+    }
+  }
+
+  onMount(() => {
+    refreshAll();
+    refreshTimer = setInterval(refreshAll, 30000);
+    return () => {
+      if (refreshTimer) clearInterval(refreshTimer);
+    };
+  });
 
   async function selectRoute(routeId: string) {
     selectedRouteId = routeId;
@@ -93,6 +110,25 @@
     URL.revokeObjectURL(url);
   }
 
+  let showClearModal = $state(false);
+  let clearing = $state(false);
+
+  async function clearSlaData() {
+    clearing = true;
+    const res = await api.clearRouteSla(selectedRouteId);
+    clearing = false;
+    if (res.error) {
+      error = res.error.message;
+      showClearModal = false;
+    } else if (res.data) {
+      showClearModal = false;
+      passiveSla = [];
+      activeSla = [];
+      buckets = [];
+      await loadData();
+    }
+  }
+
   function slaColor(pct: number, target: number): string {
     if (pct >= target) return 'var(--color-green)';
     if (pct >= target - 1) return 'var(--color-orange)';
@@ -107,6 +143,12 @@
 <div class="sla-page">
   <div class="page-header">
     <h1>SLA Monitoring</h1>
+    {#if lastRefresh}
+      <span class="refresh-indicator" title="Auto-refresh every 30s">
+        <span class="refresh-dot"></span>
+        Last update: {lastRefresh.toLocaleTimeString()}
+      </span>
+    {/if}
   </div>
 
   {#if error}
@@ -155,6 +197,7 @@
               <button class="btn btn-small" onclick={openConfigModal}>Configure</button>
               <button class="btn btn-small" onclick={() => handleExport('csv')}>Export CSV</button>
               <button class="btn btn-small" onclick={() => handleExport('json')}>Export JSON</button>
+              <button class="btn btn-small btn-danger" onclick={() => (showClearModal = true)}>Clear SLA</button>
             </div>
           </div>
 
@@ -287,10 +330,34 @@
       </div>
     </div>
   {/if}
+
+  <!-- Clear SLA confirmation modal -->
+  {#if showClearModal}
+    <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showClearModal = false; }}>
+      <div class="modal">
+        <h2>Clear SLA Data</h2>
+        <p>This will permanently delete all SLA buckets for <strong>{getRouteHostname(selectedRouteId)}</strong>.</p>
+        <p class="text-muted">This action cannot be undone.</p>
+        <div class="form-actions">
+          <button class="btn btn-cancel" onclick={() => (showClearModal = false)}>Cancel</button>
+          <button class="btn btn-danger" onclick={clearSlaData} disabled={clearing}>
+            {clearing ? 'Clearing...' : 'Clear all data'}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
   .sla-page { max-width: none; }
+
+  .page-header { display: flex; align-items: baseline; gap: var(--space-4); margin-bottom: var(--space-2); }
+  .page-header h1 { margin: 0; }
+
+  .refresh-indicator { font-size: var(--text-xs); color: var(--color-text-muted); display: flex; align-items: center; gap: var(--space-2); }
+  .refresh-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--color-green); animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
   .overview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: var(--space-4); margin-bottom: var(--space-8); }
   .sla-card { background: var(--color-bg-card); border: 1px solid var(--color-border); border-radius: var(--radius-xl); padding: var(--space-4); text-align: left; cursor: pointer; box-shadow: var(--shadow-sm); transition: border-color var(--transition-fast), box-shadow var(--transition-base), transform var(--transition-fast); }

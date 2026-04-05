@@ -256,6 +256,33 @@ pub async fn export_sla_data(
     }
 }
 
+/// DELETE /api/v1/sla/routes/:id/data
+/// Clear all SLA data for a route.
+pub async fn clear_route_sla(
+    Extension(state): Extension<AppState>,
+    Path(route_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.store.lock().await;
+
+    store
+        .get_route(&route_id)?
+        .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
+
+    let deleted = store
+        .delete_sla_buckets_for_route(&route_id)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Clear in-memory buckets for this route
+    if let Some(ref collector) = state.sla_collector {
+        collector.clear_route(&route_id);
+    }
+
+    Ok(json_data(serde_json::json!({
+        "route_id": route_id,
+        "deleted_buckets": deleted,
+    })))
+}
+
 /// GET /api/v1/sla/overview
 /// Returns SLA summaries for all routes (24h window).
 pub async fn get_sla_overview(

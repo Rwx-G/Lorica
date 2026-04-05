@@ -13,7 +13,7 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, default_topology_type: 'single_vm', max_global_connections: 0, flood_threshold_rps: 0, access_log_retention: 100000 });
+  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, default_topology_type: 'single_vm', max_global_connections: 0, flood_threshold_rps: 0, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month' });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -568,6 +568,35 @@
           <input id="s-log-retention" type="number" min="0" bind:value={settingsForm.access_log_retention} />
           <span class="hint">Maximum entries in persistent log store (0 = unlimited).</span>
         </div>
+
+        <h3 class="subsection-title">SLA Data Purge</h3>
+        <div class="form-row">
+          <label for="sla-purge-toggle" class="toggle-label">
+            <input id="sla-purge-toggle" type="checkbox" bind:checked={settingsForm.sla_purge_enabled} />
+            Enable automatic SLA purge
+          </label>
+        </div>
+        {#if settingsForm.sla_purge_enabled}
+          <div class="form-row">
+            <label for="sla-purge-days">Purge SLA data older than (days)</label>
+            <input id="sla-purge-days" type="number" min="1" max="3650" bind:value={settingsForm.sla_purge_retention_days} />
+            <span class="hint">Buckets older than this will be permanently deleted.</span>
+          </div>
+          <div class="form-row">
+            <label for="sla-purge-schedule">Purge schedule</label>
+            <select id="sla-purge-schedule" bind:value={settingsForm.sla_purge_schedule}>
+              <option value="first_of_month">First day of the month</option>
+              <option value="daily">Daily (rolling)</option>
+              <optgroup label="Specific day of month">
+                {#each Array.from({ length: 28 }, (_, i) => i + 1) as day}
+                  <option value={String(day)}>Day {day}</option>
+                {/each}
+              </optgroup>
+            </select>
+            <span class="hint">When the purge job runs.</span>
+          </div>
+        {/if}
+
         {#if settingsError}
           <div class="form-error">{settingsError}</div>
         {/if}
@@ -1386,6 +1415,14 @@
   .pref-hint {
     font-size: var(--text-sm);
     color: var(--color-text-muted);
+  }
+
+  .subsection-title {
+    margin: var(--space-4) 0 var(--space-2);
+    font-size: var(--text-md);
+    color: var(--color-text-heading);
+    border-top: 1px solid var(--color-border);
+    padding-top: var(--space-4);
   }
 
   .toggle-label {

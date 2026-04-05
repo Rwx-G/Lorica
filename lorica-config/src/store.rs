@@ -1249,6 +1249,17 @@ impl ConfigStore {
                         ConfigError::Validation("invalid access_log_retention".into())
                     })?;
                 }
+                "sla_purge_enabled" => {
+                    settings.sla_purge_enabled = value == "true" || value == "1";
+                }
+                "sla_purge_retention_days" => {
+                    settings.sla_purge_retention_days = value.parse().map_err(|_| {
+                        ConfigError::Validation("invalid sla_purge_retention_days".into())
+                    })?;
+                }
+                "sla_purge_schedule" => {
+                    settings.sla_purge_schedule = value;
+                }
                 _ => {}
             }
         }
@@ -1304,6 +1315,18 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('access_log_retention', ?1)",
             params![settings.access_log_retention.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('sla_purge_enabled', ?1)",
+            params![settings.sla_purge_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('sla_purge_retention_days', ?1)",
+            params![settings.sla_purge_retention_days.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('sla_purge_schedule', ?1)",
+            params![settings.sla_purge_schedule],
         )?;
         Ok(())
     }
