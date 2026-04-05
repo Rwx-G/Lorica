@@ -373,6 +373,10 @@ fn run_supervisor(cli: Cli) {
         // Aggregated metrics from all workers (shared with API)
         let aggregated_metrics = Arc::new(lorica_api::workers::AggregatedMetrics::new());
 
+        // Track per-worker task handles so we can abort stale tasks on restart
+        let worker_task_handles: Arc<std::sync::Mutex<std::collections::HashMap<u32, tokio::task::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
         // Spawn a per-worker task that handles both config reload and heartbeat
         // No shared Mutex - each worker has its own channel and task
         for (worker_id, worker_pid, raw_fd) in worker_fds {
@@ -388,7 +392,7 @@ fn run_supervisor(cli: Cli) {
             let hb_metrics = Arc::clone(&worker_metrics);
             let agg_metrics = Arc::clone(&aggregated_metrics);
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let heartbeat_interval = Duration::from_secs(5);
                 let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
                 heartbeat_timer.tick().await; // skip first immediate tick
@@ -477,6 +481,7 @@ fn run_supervisor(cli: Cli) {
                     }
                 }
             });
+            worker_task_handles.lock().unwrap().insert(worker_id, handle);
         }
 
         // Bug 1 fix: Create a ProxyConfig for health checks in supervisor mode.
@@ -732,6 +737,7 @@ fn run_supervisor(cli: Cli) {
         let monitor_seq = Arc::clone(&sequence);
         let monitor_hb_metrics = Arc::clone(&worker_metrics);
         let monitor_agg_metrics = Arc::clone(&aggregated_metrics);
+        let monitor_task_handles = Arc::clone(&worker_task_handles);
         let monitor_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -750,6 +756,12 @@ fn run_supervisor(cli: Cli) {
                         }
                     };
 
+                    // Abort the old heartbeat/reload task for this worker
+                    if let Some(old_handle) = monitor_task_handles.lock().unwrap().remove(&id) {
+                        old_handle.abort();
+                        info!(worker_id = id, "aborted stale worker task");
+                    }
+
                     match mgr.restart_worker(id) {
                         Ok(Some(new_fd)) => {
                             // Get the new PID for metrics reporting
@@ -766,7 +778,7 @@ fn run_supervisor(cli: Cli) {
                                     let seq = Arc::clone(&monitor_seq);
                                     let hb_metrics = Arc::clone(&monitor_hb_metrics);
                                     let agg_metrics = Arc::clone(&monitor_agg_metrics);
-                                    tokio::spawn(async move {
+                                    let new_handle = tokio::spawn(async move {
                                         info!(worker_id = id, "restarted worker channel task started");
                                         let mut timer = tokio::time::interval(Duration::from_secs(5));
                                         timer.tick().await;
@@ -827,6 +839,7 @@ fn run_supervisor(cli: Cli) {
                                             }
                                         }
                                     });
+                                    monitor_task_handles.lock().unwrap().insert(id, new_handle);
                                 }
                                 Err(e) => error!(worker_id = id, error = %e, "failed to create channel for restarted worker"),
                             }
