@@ -767,6 +767,7 @@ fn run_supervisor(cli: Cli) {
                                     let hb_metrics = Arc::clone(&monitor_hb_metrics);
                                     let agg_metrics = Arc::clone(&monitor_agg_metrics);
                                     tokio::spawn(async move {
+                                        info!(worker_id = id, "restarted worker channel task started");
                                         let mut timer = tokio::time::interval(Duration::from_secs(5));
                                         timer.tick().await;
                                         loop {
@@ -787,38 +788,40 @@ fn run_supervisor(cli: Cli) {
                                                     let hb_s = seq.fetch_add(1, Ordering::Relaxed);
                                                     let cmd = Command::new(CommandType::Heartbeat, hb_s);
                                                     let start = Instant::now();
-                                                    if channel.send(&cmd).await.is_ok() {
-                                                        match channel.recv::<Response>().await {
-                                                            Ok(_) => {
-                                                                let latency_ms = start.elapsed().as_millis() as u64;
-                                                                hb_metrics.record_heartbeat(id, new_pid, latency_ms).await;
+                                                    if let Err(e) = channel.send(&cmd).await {
+                                                        warn!(worker_id = id, error = %e, "restarted worker heartbeat send failed");
+                                                        continue;
+                                                    }
+                                                    match channel.recv::<Response>().await {
+                                                        Ok(_) => {
+                                                            let latency_ms = start.elapsed().as_millis() as u64;
+                                                            hb_metrics.record_heartbeat(id, new_pid, latency_ms).await;
 
-                                                                // Request metrics from restarted worker
-                                                                let m_seq = seq.fetch_add(1, Ordering::Relaxed);
-                                                                let m_cmd = Command::new(CommandType::MetricsRequest, m_seq);
-                                                                if let Err(e) = channel.send(&m_cmd).await {
-                                                                    warn!(worker_id = id, error = %e, "metrics request send failed");
-                                                                } else if let Ok(report) = channel.recv::<lorica_command::MetricsReport>().await {
-                                                                    let _ = channel.recv::<Response>().await;
-                                                                    let ewma: std::collections::HashMap<String, f64> = report
-                                                                        .ewma_entries.iter()
-                                                                        .map(|e| (e.backend_address.clone(), e.score_us))
-                                                                        .collect();
-                                                                    let bans: Vec<(String, u64, u64)> = report
-                                                                        .ban_entries.iter()
-                                                                        .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
-                                                                        .collect();
-                                                                    let backend_conns: std::collections::HashMap<String, u64> = report
-                                                                        .backend_conn_entries.iter()
-                                                                        .map(|e| (e.backend_address.clone(), e.connections))
-                                                                        .collect();
-                                                                    agg_metrics
-                                                                        .update_worker(id, report.cache_hits, report.cache_misses, report.active_connections, bans, ewma, backend_conns)
-                                                                        .await;
-                                                                }
+                                                            // Request metrics
+                                                            let m_seq = seq.fetch_add(1, Ordering::Relaxed);
+                                                            let m_cmd = Command::new(CommandType::MetricsRequest, m_seq);
+                                                            if let Err(e) = channel.send(&m_cmd).await {
+                                                                warn!(worker_id = id, error = %e, "metrics request send failed");
+                                                            } else if let Ok(report) = channel.recv::<lorica_command::MetricsReport>().await {
+                                                                let _ = channel.recv::<Response>().await;
+                                                                let ewma: std::collections::HashMap<String, f64> = report
+                                                                    .ewma_entries.iter()
+                                                                    .map(|e| (e.backend_address.clone(), e.score_us))
+                                                                    .collect();
+                                                                let bans: Vec<(String, u64, u64)> = report
+                                                                    .ban_entries.iter()
+                                                                    .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
+                                                                    .collect();
+                                                                let backend_conns: std::collections::HashMap<String, u64> = report
+                                                                    .backend_conn_entries.iter()
+                                                                    .map(|e| (e.backend_address.clone(), e.connections))
+                                                                    .collect();
+                                                                agg_metrics
+                                                                    .update_worker(id, report.cache_hits, report.cache_misses, report.active_connections, bans, ewma, backend_conns)
+                                                                    .await;
                                                             }
-                                                            Err(e) => warn!(worker_id = id, error = %e, "heartbeat failed"),
                                                         }
+                                                        Err(e) => warn!(worker_id = id, error = %e, "restarted worker heartbeat recv failed"),
                                                     }
                                                 }
                                             }
