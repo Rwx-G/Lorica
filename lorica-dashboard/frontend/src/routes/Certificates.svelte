@@ -452,12 +452,25 @@
   }
 
   // Self-signed generation
+  let showSelfSignedConfirm = $state(false);
+
   function openSelfSigned() {
     if (selfSignedPref === 'never') return;
     if (selfSignedPref === null) {
       showSelfSignedPrefPrompt = true;
       return;
     }
+    if (selfSignedPref === 'once') {
+      showSelfSignedConfirm = true;
+      return;
+    }
+    selfSignedDomain = '';
+    selfSignedError = '';
+    showSelfSigned = true;
+  }
+
+  function confirmSelfSigned() {
+    showSelfSignedConfirm = false;
     selfSignedDomain = '';
     selfSignedError = '';
     showSelfSigned = true;
@@ -801,6 +814,17 @@
       </div>
     </div>
   </div>
+{/if}
+
+{#if showSelfSignedConfirm}
+  <ConfirmDialog
+    title="Generate Self-signed Certificate"
+    message="Self-signed certificates should only be used for development and testing. Continue?"
+    confirmLabel="Continue"
+    confirmStyle="primary"
+    onconfirm={confirmSelfSigned}
+    oncancel={() => showSelfSignedConfirm = false}
+  />
 {/if}
 
 <!-- Self-signed Generation Modal -->
