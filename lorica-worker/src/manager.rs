@@ -335,6 +335,7 @@ impl WorkerManager {
 
         // Recreate listening sockets if they were closed after initial spawn
         if self.listen_fds.is_empty() {
+            self.listen_addrs.clear();
             self.create_listen_sockets()?;
         }
         self.spawn_worker(id, next_count)?;
@@ -344,6 +345,7 @@ impl WorkerManager {
             unsafe { fd_passing::close_fd(fd) };
         }
         self.listen_fds.clear();
+        self.listen_addrs.clear();
 
         // Return the cmd_fd of the newly spawned worker
         let fd = self
