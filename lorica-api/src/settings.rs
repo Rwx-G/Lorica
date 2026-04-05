@@ -236,6 +236,18 @@ pub async fn test_notification(
 pub async fn notification_history(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Read from persistent log store (survives restarts)
+    if let Some(ref log_store) = state.log_store {
+        let events = log_store
+            .list_notification_history(200)
+            .map_err(|e| ApiError::Internal(e))?;
+        let total = events.len();
+        return Ok(json_data(serde_json::json!({
+            "events": events,
+            "total": total,
+        })));
+    }
+    // Fallback to in-memory history
     let events = if let Some(ref history) = state.notification_history {
         let h = history.lock().unwrap();
         h.iter().rev().cloned().collect::<Vec<_>>()

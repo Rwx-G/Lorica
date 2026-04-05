@@ -49,6 +49,18 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to initialize waf events schema: {e}"))?;
 
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS notification_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_type TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '{}',
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_notif_history_timestamp ON notification_history(timestamp);",
+        )
+        .map_err(|e| format!("failed to initialize notification history schema: {e}"))?;
+
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .map_err(|e| format!("failed to set access log pragmas: {e}"))?;
 
@@ -297,6 +309,91 @@ impl LogStore {
             params![to_delete],
         )
         .map_err(|e| format!("failed to enforce WAF event retention: {e}"))?;
+        Ok(to_delete as u64)
+    }
+
+    // ---- Notification History ----
+
+    /// Insert a notification event.
+    pub fn insert_notification_event(
+        &self,
+        event: &lorica_notify::AlertEvent,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let details_json = serde_json::to_string(&event.details).unwrap_or_default();
+        conn.execute(
+            "INSERT INTO notification_history (alert_type, summary, details, timestamp)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                event.alert_type.as_str(),
+                event.summary,
+                details_json,
+                event.timestamp,
+            ],
+        )
+        .map_err(|e| format!("failed to insert notification event: {e}"))?;
+        Ok(())
+    }
+
+    /// List recent notification events, newest first.
+    pub fn list_notification_history(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<lorica_notify::AlertEvent>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT alert_type, summary, details, timestamp
+                 FROM notification_history ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("failed to prepare notification history query: {e}"))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let alert_type_str: String = row.get(0)?;
+                let summary: String = row.get(1)?;
+                let details_json: String = row.get(2)?;
+                let timestamp: String = row.get(3)?;
+                Ok((alert_type_str, summary, details_json, timestamp))
+            })
+            .map_err(|e| format!("failed to query notification history: {e}"))?;
+        let mut events = Vec::new();
+        for r in rows {
+            let (alert_type_str, summary, details_json, timestamp) =
+                r.map_err(|e| format!("failed to read notification row: {e}"))?;
+            let alert_type = alert_type_str
+                .parse()
+                .unwrap_or(lorica_notify::AlertType::ConfigChanged);
+            let details: std::collections::HashMap<String, String> =
+                serde_json::from_str(&details_json).unwrap_or_default();
+            events.push(lorica_notify::AlertEvent {
+                alert_type,
+                summary,
+                details,
+                timestamp,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Prune old notification events, keeping at most `max_entries`.
+    pub fn enforce_notification_retention(&self, max_entries: u64) -> Result<u64, String> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notification_history",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("failed to count notification events: {e}"))?;
+        if count <= max_entries as i64 {
+            return Ok(0);
+        }
+        let to_delete = count - max_entries as i64;
+        conn.execute(
+            "DELETE FROM notification_history WHERE id IN (SELECT id FROM notification_history ORDER BY id ASC LIMIT ?1)",
+            params![to_delete],
+        )
+        .map_err(|e| format!("failed to enforce notification retention: {e}"))?;
         Ok(to_delete as u64)
     }
 }

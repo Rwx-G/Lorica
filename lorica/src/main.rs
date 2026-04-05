@@ -600,10 +600,11 @@ fn run_supervisor(cli: Cli) {
         };
         let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
 
-        // Bridge: alert_sender (broadcast) -> NotifyDispatcher (async dispatch)
-        let _alert_dispatcher = lorica_notify::spawn_alert_dispatcher(
+        // Bridge: alert_sender (broadcast) -> NotifyDispatcher (async dispatch) + DB persistence
+        let _alert_dispatcher = spawn_persisted_alert_dispatcher(
             &alert_sender,
             Arc::clone(&notify_dispatcher),
+            log_store.clone(),
         );
 
         // Bug 2 fix: Start probe scheduler in supervisor mode
@@ -1382,8 +1383,11 @@ fn run_single_process(cli: Cli) {
         };
         let notification_history = notify_dispatcher.history();
         let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
-        let _alert_dispatcher =
-            lorica_notify::spawn_alert_dispatcher(&alert_sender, Arc::clone(&notify_dispatcher));
+        let _alert_dispatcher = spawn_persisted_alert_dispatcher(
+            &alert_sender,
+            Arc::clone(&notify_dispatcher),
+            log_store.clone(),
+        );
 
         // Create SLA collector and start background flush task
         let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
@@ -1661,6 +1665,42 @@ async fn run_sla_purge(
         _ => {}
     }
     today
+}
+
+/// Spawn alert dispatcher that also persists events to the log store (SQLite).
+fn spawn_persisted_alert_dispatcher(
+    alert_sender: &lorica_notify::AlertSender,
+    dispatcher: Arc<Mutex<lorica_notify::NotifyDispatcher>>,
+    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = alert_sender.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    // Dispatch via channels (email, webhook, etc.)
+                    let d = dispatcher.lock().await;
+                    d.dispatch(&event).await;
+                    drop(d);
+
+                    // Persist to log store
+                    if let Some(ref store) = log_store {
+                        if let Err(e) = store.insert_notification_event(&event) {
+                            tracing::warn!(error = %e, "failed to persist notification event");
+                        }
+                        let _ = store.enforce_notification_retention(500);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        dropped = n,
+                        "alert dispatcher lagged, some notifications were dropped"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 fn build_notify_dispatcher(store: &lorica_config::ConfigStore) -> lorica_notify::NotifyDispatcher {
