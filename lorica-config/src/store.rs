@@ -26,6 +26,7 @@ const MIGRATION_V12: &str = include_str!("migrations/012_route_regex_rewrite.sql
 const MIGRATION_V13: &str = include_str!("migrations/013_waf_persistence.sql");
 const MIGRATION_V14: &str = include_str!("migrations/014_backend_tls_sni.sql");
 const MIGRATION_V15: &str = include_str!("migrations/015_probe_results.sql");
+const MIGRATION_V16: &str = include_str!("migrations/016_backend_tls_skip_verify.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -311,6 +312,15 @@ impl ConfigStore {
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![15],
+            )?;
+        }
+
+        if current_version < 16 {
+            tracing::info!("applying migration 016_backend_tls_skip_verify");
+            self.conn.execute_batch(MIGRATION_V16)?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![16],
             )?;
         }
 
@@ -667,8 +677,8 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT INTO backends (id, address, name, group_name, weight, health_status,
              health_check_enabled, health_check_interval_s, health_check_path,
-             lifecycle_state, active_connections, tls_upstream, h2_upstream, created_at, updated_at, tls_sni)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             lifecycle_state, active_connections, tls_upstream, h2_upstream, created_at, updated_at, tls_sni, tls_skip_verify)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 backend.id,
                 backend.address,
@@ -686,6 +696,7 @@ impl ConfigStore {
                 backend.created_at.to_rfc3339(),
                 backend.updated_at.to_rfc3339(),
                 backend.tls_sni.as_deref().unwrap_or(""),
+                backend.tls_skip_verify,
             ],
         )?;
         Ok(())
@@ -697,7 +708,7 @@ impl ConfigStore {
             .query_row(
                 "SELECT id, address, name, group_name, weight, health_status,
                  health_check_enabled, health_check_interval_s, health_check_path,
-                 lifecycle_state, active_connections, tls_upstream, created_at, updated_at, h2_upstream, tls_sni
+                 lifecycle_state, active_connections, tls_upstream, created_at, updated_at, h2_upstream, tls_sni, tls_skip_verify
                  FROM backends WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_backend(row)),
@@ -711,7 +722,7 @@ impl ConfigStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, address, name, group_name, weight, health_status,
              health_check_enabled, health_check_interval_s, health_check_path,
-             lifecycle_state, active_connections, tls_upstream, created_at, updated_at, h2_upstream, tls_sni
+             lifecycle_state, active_connections, tls_upstream, created_at, updated_at, h2_upstream, tls_sni, tls_skip_verify
              FROM backends ORDER BY address",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_backend(row)))?;
@@ -729,7 +740,7 @@ impl ConfigStore {
             "UPDATE backends SET address=?2, name=?3, group_name=?4, weight=?5,
              health_status=?6, health_check_enabled=?7, health_check_interval_s=?8,
              health_check_path=?9, lifecycle_state=?10, active_connections=?11,
-             tls_upstream=?12, h2_upstream=?13, updated_at=?14, tls_sni=?15 WHERE id=?1",
+             tls_upstream=?12, h2_upstream=?13, updated_at=?14, tls_sni=?15, tls_skip_verify=?16 WHERE id=?1",
             params![
                 backend.id,
                 backend.address,
@@ -746,6 +757,7 @@ impl ConfigStore {
                 backend.h2_upstream,
                 backend.updated_at.to_rfc3339(),
                 backend.tls_sni.as_deref().unwrap_or(""),
+                backend.tls_skip_verify,
             ],
         )?;
         if changed == 0 {
@@ -2290,6 +2302,7 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
                 Some(s)
             }
         },
+        tls_skip_verify: row.get::<_, bool>(16).unwrap_or(false),
     })
 }
 

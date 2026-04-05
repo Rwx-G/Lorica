@@ -1,0 +1,1 @@
+ALTER TABLE backends ADD COLUMN tls_skip_verify INTEGER NOT NULL DEFAULT 0;

@@ -24,6 +24,7 @@
   let formHealthCheckInterval = $state(10);
   let formHealthCheckPath = $state('');
   let formTlsUpstream = $state(false);
+  let formTlsSkipVerify = $state(false);
   let formTlsSni = $state('');
   let formH2Upstream = $state(false);
   let formError = $state('');
@@ -121,6 +122,7 @@
     formHealthCheckInterval = 10;
     formHealthCheckPath = '';
     formTlsUpstream = false;
+    formTlsSkipVerify = false;
     formTlsSni = '';
     formH2Upstream = false;
     formError = '';
@@ -138,6 +140,7 @@
     formHealthCheckInterval = b.health_check_interval_s;
     formHealthCheckPath = b.health_check_path ?? '';
     formTlsUpstream = b.tls_upstream;
+    formTlsSkipVerify = b.tls_skip_verify;
     formTlsSni = b.tls_sni ?? '';
     formH2Upstream = b.h2_upstream;
     formError = '';
@@ -164,6 +167,7 @@
         health_check_interval_s: formHealthCheckInterval,
         health_check_path: formHealthCheckPath || undefined,
         tls_upstream: formTlsUpstream,
+        tls_skip_verify: formTlsSkipVerify,
         tls_sni: formTlsSni || undefined,
         h2_upstream: formH2Upstream,
       };
@@ -184,6 +188,7 @@
         health_check_interval_s: formHealthCheckInterval,
         health_check_path: formHealthCheckPath || undefined,
         tls_upstream: formTlsUpstream,
+        tls_skip_verify: formTlsSkipVerify,
         tls_sni: formTlsSni || undefined,
         h2_upstream: formH2Upstream,
       };
@@ -379,6 +384,12 @@
         </div>
 
         {#if formTlsUpstream}
+          <div class="form-group">
+            <label class="checkbox-item">
+              <input type="checkbox" bind:checked={formTlsSkipVerify} />
+              Skip TLS verification (self-signed certificates)
+            </label>
+          </div>
           <div class="form-group">
             <label for="form-tls-sni">TLS SNI override</label>
             <input id="form-tls-sni" type="text" bind:value={formTlsSni} placeholder="Leave empty to use route hostname" />

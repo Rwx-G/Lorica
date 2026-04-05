@@ -407,6 +407,10 @@ pub struct Backend {
     pub lifecycle_state: LifecycleState,
     pub active_connections: i32,
     pub tls_upstream: bool,
+    /// Skip TLS certificate verification when connecting to this backend.
+    /// Use for self-signed certificates. Default false.
+    #[serde(default)]
+    pub tls_skip_verify: bool,
     /// Override the SNI sent to this backend during TLS handshake.
     /// When empty, the route hostname is used instead.
     #[serde(default)]

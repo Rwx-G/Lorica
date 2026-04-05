@@ -1144,6 +1144,12 @@ impl ProxyHttp for LoricaProxy {
             peer.options.set_http_version(2, 2);
         }
 
+        // Skip TLS certificate verification if configured (self-signed certs)
+        if backend.tls_skip_verify {
+            peer.options.verify_cert = false;
+            peer.options.verify_hostname = false;
+        }
+
         // Apply route-level timeouts to the peer options
         peer.options.connection_timeout =
             Some(Duration::from_secs(entry.route.connect_timeout_s as u64));
@@ -1572,6 +1578,7 @@ mod tests {
             lifecycle_state: LifecycleState::Normal,
             active_connections: 0,
             tls_upstream: false,
+            tls_skip_verify: false,
             tls_sni: None,
             h2_upstream: false,
             created_at: now,
