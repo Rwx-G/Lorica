@@ -61,7 +61,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 3.15 | backend_down notification | CLI | Backend goes down -> notification dispatched | 3.3 | OK |
 | | **4. ROUTES** | | | | |
 | 4.1 | Create route (minimal) | Dashboard | Hostname + backend -> created | 1.6 | OK |
-| 4.2 | Traffic flows through route | Proxy | `curl -H "Host: ..." http://lorica:8080` | 1.8 | |
+| 4.2 | Traffic flows through route | Proxy | `curl -H "Host: ..." http://lorica:8080` | 1.8 | OK |
 | 4.3 | Path prefix routing | Proxy | /api prefix only matches /api/* | 1.8 | |
 | 4.4 | Assign TLS certificate | Dashboard | Select cert, HTTPS works | 1.8 | OK |
 | 4.5 | Remove TLS certificate | Dashboard | Deselect cert, save -> cleared | - | OK |
@@ -117,12 +117,12 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 5.22 | Certificate hot-swap | Proxy | Upload new cert -> new connections get new cert | 2.3 | |
 | 5.23 | CertResolver hot-reload | Proxy | Upload cert via API -> TLS works immediately | - | |
 | 5.24 | Private key encrypted at rest | CLI | `sqlite3 lorica.db` -> binary blob, not PEM | 4.5 | |
-| 5.25 | HTTPS works in worker mode | Proxy | `--workers 6` + TLS cert -> HTTPS serves traffic | 2.1 | |
+| 5.25 | HTTPS works in worker mode | Proxy | `--workers 6` + TLS cert -> HTTPS serves traffic | 2.1 | OK |
 | | **6. SECURITY** | | | | |
 | 6.1 | WAF rules listed (27 rules) | Dashboard | Security > Rules tab -> 27 rules | 3.1 | OK |
-| 6.2 | WAF rule toggle | Dashboard | Disable/enable individual rule | 3.1 | |
-| 6.3 | WAF custom rule | Dashboard | Create custom regex rule | 3.1 | |
-| 6.4 | WAF detection mode | Proxy | waf_mode=detection -> logged, not blocked | 3.1 | |
+| 6.2 | WAF rule toggle | Dashboard | Disable/enable individual rule | 3.1 | OK |
+| 6.3 | WAF custom rule | Dashboard | Create custom regex rule | 3.1 | OK |
+| 6.4 | WAF detection mode | Proxy | waf_mode=detection -> logged, not blocked | 3.1 | OK |
 | 6.5 | WAF blocking mode | Proxy | waf_mode=blocking -> 403 | 3.1 | OK |
 | 6.6 | WAF: SQLi UNION SELECT (942100) | Proxy | `?q=UNION+SELECT+password+FROM+users` -> 403 | 3.1 | OK |
 | 6.7 | WAF: SQLi comment seq (942110) | Proxy | `?q=admin'--` -> 403 | 3.1 | OK |
@@ -154,7 +154,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 6.33 | WAF events filter by category | Dashboard | Filter dropdown works | 3.1 | |
 | 6.34 | WAF stats cards | Dashboard | Events by category, top attack | 3.1 | OK |
 | 6.35 | WAF < 0.5ms latency | API | Prometheus -> evaluation < 0.5ms | 3.1 | OK |
-| 6.36 | waf_alert notification | CLI | WAF blocks request -> notification | 3.3 | |
+| 6.36 | waf_alert notification | CLI | WAF blocks request -> notification | 3.3 | OK |
 | 6.37 | IP blocklist enable | Dashboard | Blocklist toggle ON -> ~80k IPs loaded | - | OK |
 | 6.38 | IP blocklist blocks IP | Proxy | Blocklisted IP via XFF -> 403 | - | OK |
 | 6.39 | IP blocklist refresh | Dashboard | Reload button -> fresh list | - | |
@@ -168,7 +168,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 6.47 | Rate limit headers | Proxy | X-RateLimit-Limit/Remaining/Reset | 7.2 | |
 | 6.48 | Rate limit burst | Proxy | Burst tolerance allows spikes | 7.2 | |
 | 6.49 | Auto-ban on repeated 429 | Proxy | N violations -> 403 (banned) | 7.3 | |
-| 6.50 | ip_banned notification | CLI | Auto-ban -> notification dispatched | 7.3 | |
+| 6.50 | ip_banned notification | CLI | Auto-ban -> notification dispatched | 7.3 | OK |
 | 6.51 | Manual unban | Dashboard | Click unban -> IP removed | 7.3 | |
 | 6.52 | Ban auto-expiry | Proxy | Wait ban_duration_s -> unbanned | 7.3 | |
 | 6.53 | Slowloris detection | Proxy | Slow headers -> 408 | 7.3 | |
@@ -239,7 +239,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 13.10 | Getting started guide toggle | Dashboard | Toggle helper visibility | - | OK |
 | 13.11 | Config export (TOML) | Dashboard | Download button -> file | 1.10 | |
 | 13.12 | Config import with diff | Dashboard | Upload TOML, preview, apply | 1.10 | |
-| 13.13 | Theme toggle (light/dark) | Dashboard | Persisted across sessions | 1.5 | |
+| 13.13 | Theme toggle (light/dark) | Dashboard | Persisted across sessions | 1.5 | OK |
 | | **14. PROMETHEUS METRICS** | | | | |
 | 14.1 | /metrics endpoint | API | `curl localhost:9443/metrics` | 4.2 | OK |
 | 14.2 | Request count by route/status | API | `lorica_requests_total` | 4.2 | |
@@ -252,8 +252,8 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | | **15. NOTIFICATIONS** | | | | |
 | 15.1 | cert_expiring dispatched | CLI | Approaching expiry -> stdout log | 3.3 | |
 | 15.2 | backend_down dispatched | CLI | Backend unreachable -> notification | 3.3 | OK |
-| 15.3 | waf_alert dispatched | CLI | WAF blocks -> notification | 3.3 | |
-| 15.4 | ip_banned dispatched | CLI | Auto-banned -> notification | 7.3 | |
+| 15.3 | waf_alert dispatched | CLI | WAF blocks -> notification | 3.3 | OK |
+| 15.4 | ip_banned dispatched | CLI | Auto-banned -> notification | 7.3 | OK |
 | 15.5 | sla_breached dispatched | CLI | SLA below target -> notification | 5.1 | OK |
 | 15.6 | Email channel delivery | CLI | SMTP notification received | 3.3 | |
 | 15.7 | Webhook channel delivery | CLI | HTTP POST received | 3.3 | |
