@@ -338,7 +338,7 @@ pub async fn toggle_blocklist(
 
 /// Fetch and load the blocklist from the remote URL.
 /// Shared between the manual reload endpoint and the background task.
-async fn fetch_and_load_blocklist(blocklist: &lorica_waf::IpBlocklist) -> Result<usize, String> {
+pub async fn fetch_and_load_blocklist(blocklist: &lorica_waf::IpBlocklist) -> Result<usize, String> {
     let url = lorica_waf::ip_blocklist::DEFAULT_BLOCKLIST_URL;
 
     let client = reqwest::Client::builder()

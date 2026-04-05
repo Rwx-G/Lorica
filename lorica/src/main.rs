@@ -492,6 +492,49 @@ fn run_supervisor(cli: Cli) {
         let waf_event_buffer = waf_engine.event_buffer();
         let waf_rule_count = waf_engine.rule_count();
 
+        // UDS WAF event stream: workers forward WAF events to the supervisor
+        let waf_sock_path = data_dir.join("waf.sock");
+        let _ = std::fs::remove_file(&waf_sock_path);
+        let waf_listener = tokio::net::UnixListener::bind(&waf_sock_path)
+            .expect("failed to bind WAF socket");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&waf_sock_path, std::fs::Permissions::from_mode(0o660));
+        }
+        let waf_event_sink = Arc::clone(&waf_event_buffer);
+        tokio::spawn(async move {
+            loop {
+                match waf_listener.accept().await {
+                    Ok((stream, _)) => {
+                        let sink = Arc::clone(&waf_event_sink);
+                        tokio::spawn(async move {
+                            let mut reader = tokio::io::BufReader::new(stream);
+                            let mut line = String::new();
+                            loop {
+                                line.clear();
+                                match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
+                                    Ok(0) => break,
+                                    Ok(_) => {
+                                        if let Ok(event) = serde_json::from_str::<lorica_waf::WafEvent>(&line) {
+                                            let mut buf = sink.lock().unwrap();
+                                            if buf.len() >= 500 {
+                                                buf.pop_front();
+                                            }
+                                            buf.push_back(event);
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "WAF socket accept failed");
+                    }
+                }
+            }
+        });
+
         // Restore WAF state from persisted settings
         {
             let s = store.lock().await;
@@ -979,16 +1022,93 @@ fn run_worker(
         sla_collector.load_configs(&s);
     });
 
-    // Worker background tasks: log forwarding via UDS + SLA flush to DB
+    // Create shared WAF engine for worker (shared between proxy and event forwarding)
+    let waf_engine = Arc::new(lorica_waf::WafEngine::new());
+
+    // Restore WAF state from persisted settings (same as supervisor/single-process)
+    {
+        let s = store.blocking_lock();
+        if let Ok(settings) = s.get_global_settings() {
+            if settings.ip_blocklist_enabled {
+                waf_engine.ip_blocklist().set_enabled(true);
+                info!("worker: IP blocklist restored as enabled");
+            }
+        }
+        if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
+            if !disabled_ids.is_empty() {
+                waf_engine.set_disabled_rules(&disabled_ids);
+                info!(count = disabled_ids.len(), "worker: WAF disabled rules restored");
+            }
+        }
+        if let Ok(custom_rules) = s.load_waf_custom_rules() {
+            for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
+                let category = cat
+                    .parse()
+                    .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
+                let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
+            }
+            if !custom_rules.is_empty() {
+                info!(count = custom_rules.len(), "worker: WAF custom rules restored");
+            }
+        }
+    }
+
+    // Worker background tasks: log forwarding + WAF event forwarding via UDS + SLA flush to DB
     let log_fwd_buffer = Arc::clone(&log_buffer);
     let sla_flush_collector = Arc::clone(&sla_collector);
     let sla_flush_store = Arc::clone(&store);
     let log_sock_path = PathBuf::from(&data_dir).join("log.sock");
+    let waf_fwd_engine = Arc::clone(&waf_engine);
+    let waf_sock_path_worker = PathBuf::from(&data_dir).join("waf.sock");
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("worker background runtime");
         rt.block_on(async move {
-            // Start SLA flush task (writes worker SLA buckets to shared SQLite DB every 60s)
             sla_flush_collector.start_flush_task(sla_flush_store, None);
+
+            // IP blocklist: initial load + periodic refresh (every 6h)
+            let blocklist_engine = Arc::clone(&waf_fwd_engine);
+            lorica_api::waf::spawn_blocklist_refresh(
+                blocklist_engine,
+                std::time::Duration::from_secs(6 * 3600),
+            );
+
+            // Forward WAF events to supervisor
+            tokio::spawn(async move {
+                let stream = loop {
+                    match tokio::net::UnixStream::connect(&waf_sock_path_worker).await {
+                        Ok(s) => break s,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                    }
+                };
+                let mut writer = tokio::io::BufWriter::new(stream);
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                let mut last_count = 0usize;
+                let event_buf = waf_fwd_engine.event_buffer();
+                loop {
+                    interval.tick().await;
+                    let events: Vec<lorica_waf::WafEvent> = {
+                        let buf = event_buf.lock().unwrap();
+                        if buf.len() == last_count {
+                            continue;
+                        }
+                        let new_events: Vec<_> = buf.iter().skip(last_count).cloned().collect();
+                        last_count = buf.len();
+                        new_events
+                    };
+                    for event in &events {
+                        if let Ok(json) = serde_json::to_string(event) {
+                            let line = format!("{json}\n");
+                            if tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
+                }
+            });
 
             // Connect to supervisor's log socket (retry until available)
             let stream = loop {
@@ -1008,7 +1128,7 @@ fn run_worker(
                                 .await
                                 .is_err()
                             {
-                                break; // supervisor disconnected
+                                break;
                             }
                             let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
                         }
@@ -1032,6 +1152,7 @@ fn run_worker(
     lorica_proxy.cache_misses = worker_cache_misses;
     lorica_proxy.ban_list = worker_ban_list;
     lorica_proxy.ewma_tracker = worker_ewma;
+    lorica_proxy.waf_engine = waf_engine;
 
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
         upstream_crl_file: upstream_crl_file.map(|s| s.to_string()),
