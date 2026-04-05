@@ -362,7 +362,7 @@ impl LogStore {
                 r.map_err(|e| format!("failed to read notification row: {e}"))?;
             let alert_type = alert_type_str
                 .parse()
-                .unwrap_or(lorica_notify::AlertType::ConfigChanged);
+                .unwrap_or(lorica_notify::events::AlertType::ConfigChanged);
             let details: std::collections::HashMap<String, String> =
                 serde_json::from_str(&details_json).unwrap_or_default();
             events.push(lorica_notify::AlertEvent {

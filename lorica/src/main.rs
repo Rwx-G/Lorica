@@ -647,6 +647,8 @@ fn run_supervisor(cli: Cli) {
         let api_log_buffer = Arc::clone(&log_buffer);
         let api_active_connections = Arc::clone(&active_connections);
         let api_log_store = log_store.clone();
+        let api_worker_metrics = Arc::clone(&worker_metrics);
+        let api_aggregated_metrics = Arc::clone(&aggregated_metrics);
         let management_port = cli.management_port;
         let api_handle = tokio::spawn(async move {
             let state = AppState {
@@ -656,7 +658,7 @@ fn run_supervisor(cli: Cli) {
                 active_connections: api_active_connections,
                 started_at: Instant::now(),
                 config_reload_tx: Some(config_reload_tx),
-                worker_metrics: Some(Arc::clone(&worker_metrics)),
+                worker_metrics: Some(api_worker_metrics),
                 waf_event_buffer: Some(waf_event_buffer),
                 waf_engine: Some(waf_engine),
                 waf_rule_count: Some(waf_rule_count),
@@ -671,7 +673,7 @@ fn run_supervisor(cli: Cli) {
                 cache_backend: None,
                 ewma_scores: None,
                 backend_connections: None,
-                aggregated_metrics: Some(Arc::clone(&aggregated_metrics)),
+                aggregated_metrics: Some(api_aggregated_metrics),
                 notification_history: {
                     let d = notify_dispatcher.lock().await;
                     Some(d.history())
