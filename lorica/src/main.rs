@@ -892,6 +892,35 @@ fn run_worker(
         Arc::new(dashmap::DashMap::new());
     let worker_ewma = Arc::new(lorica::proxy_wiring::EwmaTracker::new());
 
+    // Create shared WAF engine for worker (must be before command channel setup)
+    let waf_engine = Arc::new(lorica_waf::WafEngine::new());
+    {
+        let s = store.blocking_lock();
+        if let Ok(settings) = s.get_global_settings() {
+            if settings.ip_blocklist_enabled {
+                waf_engine.ip_blocklist().set_enabled(true);
+                info!("worker: IP blocklist restored as enabled");
+            }
+        }
+        if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
+            if !disabled_ids.is_empty() {
+                waf_engine.set_disabled_rules(&disabled_ids);
+                info!(count = disabled_ids.len(), "worker: WAF disabled rules restored");
+            }
+        }
+        if let Ok(custom_rules) = s.load_waf_custom_rules() {
+            for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
+                let category = cat
+                    .parse()
+                    .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
+                let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
+            }
+            if !custom_rules.is_empty() {
+                info!(count = custom_rules.len(), "worker: WAF custom rules restored");
+            }
+        }
+    }
+
     // Start the command channel listener in a background thread
     // (the proxy server's run_forever blocks the main thread)
     let cmd_store = Arc::clone(&store);
@@ -1039,37 +1068,6 @@ fn run_worker(
         let s = store.lock().await;
         sla_collector.load_configs(&s);
     });
-
-    // Create shared WAF engine for worker (shared between proxy and event forwarding)
-    let waf_engine = Arc::new(lorica_waf::WafEngine::new());
-
-    // Restore WAF state from persisted settings (same as supervisor/single-process)
-    {
-        let s = store.blocking_lock();
-        if let Ok(settings) = s.get_global_settings() {
-            if settings.ip_blocklist_enabled {
-                waf_engine.ip_blocklist().set_enabled(true);
-                info!("worker: IP blocklist restored as enabled");
-            }
-        }
-        if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
-            if !disabled_ids.is_empty() {
-                waf_engine.set_disabled_rules(&disabled_ids);
-                info!(count = disabled_ids.len(), "worker: WAF disabled rules restored");
-            }
-        }
-        if let Ok(custom_rules) = s.load_waf_custom_rules() {
-            for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
-                let category = cat
-                    .parse()
-                    .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
-                let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
-            }
-            if !custom_rules.is_empty() {
-                info!(count = custom_rules.len(), "worker: WAF custom rules restored");
-            }
-        }
-    }
 
     // Worker background tasks: log forwarding + WAF event forwarding via UDS + SLA flush to DB
     let log_fwd_buffer = Arc::clone(&log_buffer);
