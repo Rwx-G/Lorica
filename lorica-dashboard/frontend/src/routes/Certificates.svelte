@@ -63,8 +63,13 @@
   let selfSignedDomain = $state('');
   let selfSignedError = $state('');
   let selfSignedSubmitting = $state(false);
-  let selfSignedPref: 'never' | 'always' | 'once' | null = $state(null);
-  let selfSignedPrefId: string | null = $state(null);
+  const SS_PREF_KEY = 'lorica_self_signed_pref';
+  let selfSignedPref: 'never' | 'always' | 'once' | null = $state(
+    (() => {
+      const v = localStorage.getItem(SS_PREF_KEY);
+      return v === 'never' || v === 'always' || v === 'once' ? v : null;
+    })()
+  );
   let showSelfSignedPrefPrompt = $state(false);
 
   // ACME provisioning state
@@ -228,13 +233,7 @@
       warningDays = settingsRes.data.cert_warning_days;
       criticalDays = settingsRes.data.cert_critical_days;
     }
-    if (prefRes.data) {
-      const ssPref = prefRes.data.preferences.find((p) => p.preference_key === 'self_signed_cert');
-      if (ssPref) {
-        selfSignedPref = ssPref.value as 'never' | 'always' | 'once';
-        selfSignedPrefId = ssPref.id;
-      }
-    }
+    // Self-signed pref loaded from localStorage at init
     loading = false;
   }
 
@@ -467,9 +466,7 @@
   async function handleSelfSignedPref(choice: 'never' | 'always' | 'once') {
     selfSignedPref = choice;
     showSelfSignedPrefPrompt = false;
-    if (selfSignedPrefId) {
-      await api.updatePreference(selfSignedPrefId, choice);
-    }
+    localStorage.setItem(SS_PREF_KEY, choice);
     if (choice === 'never') return;
     selfSignedDomain = '';
     selfSignedError = '';

@@ -89,6 +89,15 @@
     }
   }
 
+  // Self-signed certificate preference (localStorage)
+  const SS_PREF_KEY = 'lorica_self_signed_pref';
+  let selfSignedPrefValue = $state<string | null>(localStorage.getItem(SS_PREF_KEY));
+
+  function resetSelfSignedPref() {
+    localStorage.removeItem(SS_PREF_KEY);
+    selfSignedPrefValue = null;
+  }
+
   // Export/Import
   let exporting = $state(false);
   let exportError = $state('');
@@ -712,6 +721,19 @@
           <button class="toggle" class:on={helperGuideVisible} onclick={toggleHelperGuide}>
             <span class="toggle-knob"></span>
           </button>
+        </label>
+      </div>
+
+      <div class="pref-row">
+        <div class="pref-info">
+          <code>self_signed_cert</code>
+          <span class="pref-hint">Self-signed certificate generation prompt preference</span>
+        </div>
+        <label class="toggle-label">
+          <span>{selfSignedPrefValue === 'always' ? 'Always allow' : selfSignedPrefValue === 'never' ? 'Never' : selfSignedPrefValue === 'once' ? 'Ask each time' : 'Not set'}</span>
+          {#if selfSignedPrefValue}
+            <button class="btn btn-small btn-cancel" onclick={resetSelfSignedPref}>Reset</button>
+          {/if}
         </label>
       </div>
 
