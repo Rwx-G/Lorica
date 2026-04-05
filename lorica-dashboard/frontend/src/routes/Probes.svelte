@@ -201,7 +201,9 @@
                 {/if}
               </td>
               <td class="actions">
-                <button class="btn-link" onclick={() => showHistory(p)}>History</button>
+                <button class="btn-icon" onclick={() => showHistory(p)} title="History">
+                  {@html historyIcon}
+                </button>
                 <button class="btn-icon" onclick={() => openEditForm(p)} title="Edit">
                   {@html editIcon}
                 </button>
@@ -299,7 +301,7 @@
   {#if historyProbe}
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) historyProbe = null; }} onkeydown={(e) => { if (e.key === 'Escape') historyProbe = null; }} role="dialog" aria-modal="true" tabindex="-1">
-      <div class="dialog dialog-wide" role="document">
+      <div class="modal modal-wide" role="document">
         <h3>Probe History - {historyProbe.method} {historyProbe.path}</h3>
         {#if historyLoading}
           <p class="loading">Loading...</p>
@@ -344,6 +346,7 @@
 </div>
 
 <script lang="ts" module>
+  const historyIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>';
   const editIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
   const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
 </script>
@@ -354,7 +357,7 @@
   .method-badge { display: inline-block; padding: 0.125rem 0.5rem; border-radius: var(--radius-full); font-size: var(--text-sm); font-weight: 600; background: var(--color-primary-subtle); color: var(--color-primary); font-family: var(--mono); }
   .status-on { color: var(--color-green); font-weight: 500; }
   .status-off { color: var(--color-text-muted); }
-  .dialog-wide { max-width: 700px; }
+  .modal-wide { max-width: 700px; }
   .badge-green { background: rgba(34, 197, 94, 0.1); color: var(--color-green); padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
   .badge-red { background: rgba(239, 68, 68, 0.1); color: var(--color-red); padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
   .error-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-xs); color: var(--color-text-muted); }
