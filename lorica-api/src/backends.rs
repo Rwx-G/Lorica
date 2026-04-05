@@ -213,6 +213,9 @@ pub async fn update_backend(
     }
     if let Some(hc) = body.health_check_enabled {
         backend.health_check_enabled = hc;
+        if !hc {
+            backend.health_status = lorica_config::models::HealthStatus::Unknown;
+        }
     }
     if let Some(interval) = body.health_check_interval_s {
         backend.health_check_interval_s = interval;
