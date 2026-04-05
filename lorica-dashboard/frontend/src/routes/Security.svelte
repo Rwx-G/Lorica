@@ -134,7 +134,11 @@
 
   async function toggleRule(ruleId: number, enabled: boolean) {
     await api.toggleWafRule(ruleId, enabled);
-    await loadData();
+    const rule = rules.find(r => r.id === ruleId);
+    if (rule) {
+      rule.enabled = enabled;
+      rulesEnabled = rules.filter(r => r.enabled).length;
+    }
   }
 
   async function toggleBlocklist() {
