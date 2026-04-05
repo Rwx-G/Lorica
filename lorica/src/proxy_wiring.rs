@@ -1407,7 +1407,11 @@ impl ProxyHttp for LoricaProxy {
 
         let backend_addr = ctx.backend_addr.as_deref().unwrap_or("-");
 
-        let error_str = e.map(|err| err.to_string());
+        let error_str = if ctx.waf_blocked {
+            Some("WAF blocked".to_string())
+        } else {
+            e.map(|err| err.to_string())
+        };
         let latency_ms = elapsed.as_millis() as u64;
 
         if let Some(ref err) = error_str {
