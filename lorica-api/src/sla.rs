@@ -269,11 +269,16 @@ pub async fn get_sla_overview(
     let from = now - Duration::hours(24);
 
     let mut overview = Vec::new();
+    let from_1h = now - Duration::hours(1);
     for route in &routes {
-        let summary = store
+        let summary_1h = store
+            .compute_sla_summary(&route.id, &from_1h, &now, "1h", "passive")
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        overview.push(summary_1h);
+        let summary_24h = store
             .compute_sla_summary(&route.id, &from, &now, "24h", "passive")
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        overview.push(summary);
+        overview.push(summary_24h);
     }
 
     Ok(json_data(overview))
