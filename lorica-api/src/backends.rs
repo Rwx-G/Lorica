@@ -153,7 +153,7 @@ pub async fn create_backend(
         health_status: lorica_config::models::HealthStatus::Unknown,
         health_check_enabled: body.health_check_enabled.unwrap_or(true),
         health_check_interval_s: body.health_check_interval_s.unwrap_or(10),
-        health_check_path: body.health_check_path.clone(),
+        health_check_path: body.health_check_path.clone().filter(|s| !s.is_empty()),
         lifecycle_state: lorica_config::models::LifecycleState::Normal,
         active_connections: 0,
         tls_upstream: body.tls_upstream.unwrap_or(false),
@@ -221,7 +221,11 @@ pub async fn update_backend(
         backend.health_check_interval_s = interval;
     }
     if let Some(path) = body.health_check_path {
-        backend.health_check_path = Some(path);
+        if path.is_empty() {
+            backend.health_check_path = None;
+        } else {
+            backend.health_check_path = Some(path);
+        }
     }
     if let Some(tls) = body.tls_upstream {
         backend.tls_upstream = tls;
