@@ -193,6 +193,13 @@ impl SlaCollector {
         bucket.record(latency_ms, is_success);
     }
 
+    /// Remove all in-memory buckets for a route (after clearing DB data).
+    pub fn clear_route(&self, route_id: &str) {
+        if let Ok(mut buckets) = self.buckets.lock() {
+            buckets.remove(route_id);
+        }
+    }
+
     /// Update the cached SLA config for a route.
     pub fn set_sla_config(&self, route_id: &str, config: SlaConfig) {
         if let Ok(mut configs) = self.sla_configs.lock() {
@@ -223,8 +230,7 @@ impl SlaCollector {
                 return config.is_success(status, latency_ms);
             }
         }
-        // Default: 2xx-3xx and < 500ms
-        (200..=399).contains(&status) && latency_ms <= 500
+        SlaConfig::default_for_route(route_id).is_success(status, latency_ms)
     }
 
     /// Flush all completed (past-minute) buckets to the database.
@@ -449,6 +455,8 @@ mod tests {
         let collector = SlaCollector::new();
         assert!(collector.is_success("any", 200, 100));
         assert!(collector.is_success("any", 301, 400));
+        assert!(collector.is_success("any", 404, 100)); // 4xx client errors are not backend failures
+        assert!(collector.is_success("any", 499, 100));
         assert!(!collector.is_success("any", 500, 100));
         assert!(!collector.is_success("any", 200, 600));
     }
