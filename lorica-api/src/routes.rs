@@ -347,6 +347,7 @@ pub async fn update_route(
     if let Some(certificate_id) = body.certificate_id {
         if certificate_id.is_empty() {
             route.certificate_id = None;
+            route.force_https = false;
         } else {
             route.certificate_id = Some(certificate_id);
         }

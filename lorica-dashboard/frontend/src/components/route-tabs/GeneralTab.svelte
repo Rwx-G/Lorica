@@ -94,7 +94,7 @@
   <div class="form-group" class:modified={isModified('certificate_id')}>
     <label for="certificate">TLS Certificate</label>
     {#if isImported('certificate_id')}<span class="imported-badge">imported</span>{/if}
-    <select id="certificate" bind:value={form.certificate_id}>
+    <select id="certificate" bind:value={form.certificate_id} onchange={() => { if (!form.certificate_id) form.force_https = false; }}>
       <option value="">None (no TLS)</option>
       {#each certificates as c (c.id)}
         <option value={c.id}>{c.domain}</option>
@@ -154,9 +154,10 @@
 
   <div class="form-group" class:modified={isModified('force_https')}>
     <label class="checkbox-item">
-      <input type="checkbox" bind:checked={form.force_https} />
+      <input type="checkbox" bind:checked={form.force_https} disabled={!form.certificate_id} />
       <span>Force HTTPS redirect</span>
     </label>
+    {#if !form.certificate_id}<span class="hint">Requires a certificate to be selected.</span>{/if}
     {#if isImported('force_https')}<span class="imported-badge">imported</span>{/if}
     {#if importedFields && importedFields.size > 0}<span class="hint">Nginx: return 301 https://... | Traefik: RedirectScheme middleware</span>{/if}
   </div>

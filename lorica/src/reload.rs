@@ -71,6 +71,7 @@ pub async fn reload_proxy_config(
 }
 
 /// Reload the TLS certificate resolver from the database.
+/// Only loads certificates that are actively referenced by at least one route.
 /// Called alongside `reload_proxy_config` when certificates change.
 pub async fn reload_cert_resolver(
     store: &Arc<Mutex<ConfigStore>>,
@@ -85,8 +86,21 @@ pub async fn reload_cert_resolver(
         }
     };
 
+    // Only load certificates referenced by at least one route
+    let active_cert_ids: std::collections::HashSet<String> = match s.list_routes() {
+        Ok(routes) => routes
+            .iter()
+            .filter_map(|r| r.certificate_id.clone())
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "failed to list routes for resolver reload");
+            return;
+        }
+    };
+
     let cert_data: Vec<CertData> = db_certs
         .iter()
+        .filter(|c| active_cert_ids.contains(&c.id))
         .map(|c| CertData {
             domain: c.domain.clone(),
             san_domains: c.san_domains.clone(),
