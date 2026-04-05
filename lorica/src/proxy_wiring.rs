@@ -402,6 +402,8 @@ pub struct RequestCtx {
     pub route_id: Option<String>,
     /// Whether WAF blocked this request.
     pub waf_blocked: bool,
+    /// Whether WAF detected (but allowed) a threat on this request.
+    pub waf_detected: bool,
     /// Snapshot of the matched route for use in later pipeline stages.
     pub route_snapshot: Option<Route>,
     /// Whether access logging is enabled for this route.
@@ -513,6 +515,7 @@ impl ProxyHttp for LoricaProxy {
             matched_path: None,
             route_id: None,
             waf_blocked: false,
+            waf_detected: false,
             route_snapshot: None,
             path_rewrite_regex: None,
             access_log_enabled: true,
@@ -948,6 +951,7 @@ impl ProxyHttp for LoricaProxy {
                         let _ = store.insert_waf_event(ev);
                     }
                 }
+                ctx.waf_detected = true;
                 Ok(false)
             }
             lorica_waf::WafVerdict::Pass => Ok(false),
@@ -1433,6 +1437,8 @@ impl ProxyHttp for LoricaProxy {
 
         let error_str = if ctx.waf_blocked {
             Some("WAF blocked".to_string())
+        } else if ctx.waf_detected {
+            Some("WAF detected".to_string())
         } else {
             e.map(|err| err.to_string())
         };
