@@ -566,7 +566,7 @@
         <div class="form-row">
           <label for="waf-ban-threshold">WAF Auto-ban Threshold</label>
           <input id="waf-ban-threshold" type="number" bind:value={settingsForm.waf_ban_threshold} min="0" max="1000" />
-          <span class="hint">Ban IP after this many WAF blocks (0 = disabled, default 5).</span>
+          <span class="hint">Ban IP after this many WAF blocks per worker (0 = disabled, default 3). With N workers, up to N x threshold requests may pass before the ban triggers.</span>
         </div>
         <div class="form-row">
           <label for="waf-ban-duration">WAF Ban Duration (seconds)</label>
