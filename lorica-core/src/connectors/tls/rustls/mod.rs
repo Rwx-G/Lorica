@@ -340,9 +340,11 @@ where
     if let Some(updated_config) = updated_config_opt.as_mut() {
         let verification_mode = if peer.sni().is_empty() {
             updated_config.enable_sni = false;
-            /* NOTE: technically we can still verify who signs the cert but turn it off to be
-            consistent with nginx's behavior */
-            Some(VerificationMode::SkipAll) // disable verification if sni does not exist
+            // No SNI: skip hostname check but still validate certificate chain
+            // (CA signature, expiration, revocation). A MITM with a self-signed
+            // cert is rejected; only certs from trusted CAs are accepted.
+            debug!("empty SNI: hostname verification disabled, chain validation active");
+            Some(VerificationMode::SkipHostname)
         } else if !peer.verify_cert() {
             Some(VerificationMode::SkipAll)
         } else if !peer.verify_hostname() {

@@ -40,6 +40,7 @@ Author: Rwx-G
 - Redact password hashes from config export; import now rejects redacted hashes with a clear error message
 - Add HTTP request smuggling test suite (CL.TE desync, TE obfuscation, duplicate CL, HTTP/1.0+TE rejection)
 - Use explicit Argon2id parameters (19 MiB, 2 iterations) instead of library defaults for password hashing
+- Empty SNI now validates certificate chain (CA, expiration, revocation) instead of skipping all TLS verification. Only hostname check is skipped when no SNI is available
 
 ## [0.1.3] - 2026-04-03
 
