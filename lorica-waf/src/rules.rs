@@ -24,10 +24,12 @@ pub enum RuleCategory {
     PathTraversal,
     CommandInjection,
     ProtocolViolation,
-    Ssrf,
+    SSRF,
     LogInjection,
-    Xxe,
+    XXE,
     IpBlocklist,
+    SSTI,
+    PrototypePollution,
 }
 
 impl RuleCategory {
@@ -38,10 +40,12 @@ impl RuleCategory {
             Self::PathTraversal => "path_traversal",
             Self::CommandInjection => "command_injection",
             Self::ProtocolViolation => "protocol_violation",
-            Self::Ssrf => "ssrf",
+            Self::SSRF => "SSRF",
             Self::LogInjection => "log_injection",
-            Self::Xxe => "xxe",
+            Self::XXE => "XXE",
             Self::IpBlocklist => "ip_blocklist",
+            Self::SSTI => "SSTI",
+            Self::PrototypePollution => "prototype_pollution",
         }
     }
 }
@@ -55,10 +59,12 @@ impl std::str::FromStr for RuleCategory {
             "path_traversal" => Ok(Self::PathTraversal),
             "command_injection" => Ok(Self::CommandInjection),
             "protocol_violation" => Ok(Self::ProtocolViolation),
-            "ssrf" => Ok(Self::Ssrf),
+            "SSRF" | "ssrf" => Ok(Self::SSRF),
             "log_injection" => Ok(Self::LogInjection),
-            "xxe" => Ok(Self::Xxe),
+            "XXE" | "xxe" => Ok(Self::XXE),
             "ip_blocklist" => Ok(Self::IpBlocklist),
+            "SSTI" | "ssti" => Ok(Self::SSTI),
+            "prototype_pollution" => Ok(Self::PrototypePollution),
             other => Err(format!("unknown rule category: {other}")),
         }
     }
@@ -248,7 +254,7 @@ impl RuleSet {
             WafRule {
                 id: 934100,
                 description: "SSRF via cloud metadata endpoint",
-                category: RuleCategory::Ssrf,
+                category: RuleCategory::SSRF,
                 pattern: Regex::new(
                     r"(?i)(169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200)",
                 ).unwrap(),
@@ -257,7 +263,7 @@ impl RuleSet {
             WafRule {
                 id: 934110,
                 description: "SSRF via localhost/loopback access",
-                category: RuleCategory::Ssrf,
+                category: RuleCategory::SSRF,
                 pattern: Regex::new(
                     r"(?i)(https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|0x7f))",
                 ).unwrap(),
@@ -266,7 +272,7 @@ impl RuleSet {
             WafRule {
                 id: 934120,
                 description: "SSRF via dangerous URI scheme",
-                category: RuleCategory::Ssrf,
+                category: RuleCategory::SSRF,
                 pattern: Regex::new(
                     r"(?i)(file|gopher|dict|ftp|ldap|tftp)://"
                 ).unwrap(),
@@ -275,7 +281,7 @@ impl RuleSet {
             WafRule {
                 id: 934130,
                 description: "SSRF via internal network range",
-                category: RuleCategory::Ssrf,
+                category: RuleCategory::SSRF,
                 pattern: Regex::new(
                     r"(?i)https?://(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})[:/]",
                 ).unwrap(),
@@ -304,7 +310,7 @@ impl RuleSet {
             WafRule {
                 id: 936100,
                 description: "XXE via DOCTYPE/ENTITY declaration",
-                category: RuleCategory::Xxe,
+                category: RuleCategory::XXE,
                 pattern: Regex::new(
                     r"(?i)<!\s*(DOCTYPE|ENTITY)[^>]*(SYSTEM|PUBLIC)",
                 ).unwrap(),
@@ -313,11 +319,108 @@ impl RuleSet {
             WafRule {
                 id: 936110,
                 description: "XXE via XML external entity reference",
-                category: RuleCategory::Xxe,
+                category: RuleCategory::XXE,
                 pattern: Regex::new(
                     r#"(?i)<!ENTITY\s+\S+\s+SYSTEM\s+['"]"#,
                 ).unwrap(),
                 severity: 5,
+            },
+            // --- SSTI (Server-Side Template Injection, 948xxx) ---
+            WafRule {
+                id: 948100,
+                description: "SSTI via Jinja2/Twig template syntax",
+                category: RuleCategory::SSTI,
+                pattern: Regex::new(
+                    r"(?i)\{\{.*?(__|config|request|self|cycler|joiner|lipsum|namespace)\b",
+                ).unwrap(),
+                severity: 5,
+            },
+            WafRule {
+                id: 948110,
+                description: "SSTI via ERB/JSP/EL expression",
+                category: RuleCategory::SSTI,
+                pattern: Regex::new(
+                    r"(?i)(#\{|<%=?|<\?=)\s*.*?(exec|system|Runtime|Process)",
+                ).unwrap(),
+                severity: 4,
+            },
+            // --- Prototype Pollution (949xxx) ---
+            WafRule {
+                id: 949100,
+                description: "Prototype pollution via __proto__ or constructor.prototype",
+                category: RuleCategory::PrototypePollution,
+                pattern: Regex::new(
+                    r#"(?i)(__proto__|constructor\s*\[\s*["']prototype["']\]|prototype\s*\.\s*(constructor|polluted))"#,
+                ).unwrap(),
+                severity: 4,
+            },
+            // --- Additional SSRF evasion ---
+            WafRule {
+                id: 934140,
+                description: "GraphQL introspection probe",
+                category: RuleCategory::SSRF,
+                pattern: Regex::new(
+                    r"(?i)\{\s*__schema\s*\{|\bintrospectionQuery\b|\b__type\s*\(",
+                ).unwrap(),
+                severity: 3,
+            },
+            WafRule {
+                id: 934150,
+                description: "SSRF via octal/hex/decimal IP encoding",
+                category: RuleCategory::SSRF,
+                pattern: Regex::new(
+                    r"(?i)https?://(0177\.0+\.0+\.0*1|0x7f[0-9a-f]*|2130706433|017700000001)\b",
+                ).unwrap(),
+                severity: 5,
+            },
+            // --- Additional Command Injection evasion ---
+            WafRule {
+                id: 932120,
+                description: "Command injection evasion via IFS or decode pipeline",
+                category: RuleCategory::CommandInjection,
+                pattern: Regex::new(
+                    r"(?i)\$\{IFS\}|\bIFS=|\b(printf|xxd|base64)\b\s+.*\|",
+                ).unwrap(),
+                severity: 4,
+            },
+            // --- Additional Protocol Violations ---
+            WafRule {
+                id: 920120,
+                description: "Header injection via trusted proxy headers",
+                category: RuleCategory::ProtocolViolation,
+                pattern: Regex::new(
+                    r"(?i)(X-Forwarded-Host|X-Original-URL|X-Rewrite-URL)\s*:.*[;&|<>]",
+                ).unwrap(),
+                severity: 3,
+            },
+            WafRule {
+                id: 920130,
+                description: "Open redirect via URL-encoded external redirect",
+                category: RuleCategory::ProtocolViolation,
+                pattern: Regex::new(
+                    r"(?i)(redirect|url|next|return|goto|dest)\s*=\s*https?%3a%2f%2f",
+                ).unwrap(),
+                severity: 3,
+            },
+            // --- Spring4Shell / Java EL (944xxx) ---
+            WafRule {
+                id: 944120,
+                description: "Java Expression Language / Spring4Shell RCE",
+                category: RuleCategory::LogInjection,
+                pattern: Regex::new(
+                    r"(?i)(class\.module\.classLoader|springframework\.beans\.factory|java\.lang\.Runtime)",
+                ).unwrap(),
+                severity: 5,
+            },
+            // --- Additional SQL Injection (modern DBs) ---
+            WafRule {
+                id: 942160,
+                description: "SQL injection via XML/JSON database functions",
+                category: RuleCategory::SqlInjection,
+                pattern: Regex::new(
+                    r"(?i)\b(extractvalue|updatexml|xmltype|json_keys|json_extract)\b\s*\(",
+                ).unwrap(),
+                severity: 4,
             },
         ];
 
@@ -361,9 +464,11 @@ mod tests {
         assert!(categories.contains(&RuleCategory::PathTraversal));
         assert!(categories.contains(&RuleCategory::CommandInjection));
         assert!(categories.contains(&RuleCategory::ProtocolViolation));
-        assert!(categories.contains(&RuleCategory::Ssrf));
+        assert!(categories.contains(&RuleCategory::SSRF));
         assert!(categories.contains(&RuleCategory::LogInjection));
-        assert!(categories.contains(&RuleCategory::Xxe));
+        assert!(categories.contains(&RuleCategory::XXE));
+        assert!(categories.contains(&RuleCategory::SSTI));
+        assert!(categories.contains(&RuleCategory::PrototypePollution));
     }
 
     // --- SQL Injection detection ---
@@ -627,8 +732,8 @@ mod tests {
             RuleCategory::ProtocolViolation.as_str(),
             "protocol_violation"
         );
-        assert_eq!(RuleCategory::Ssrf.as_str(), "ssrf");
+        assert_eq!(RuleCategory::SSRF.as_str(), "SSRF");
         assert_eq!(RuleCategory::LogInjection.as_str(), "log_injection");
-        assert_eq!(RuleCategory::Xxe.as_str(), "xxe");
+        assert_eq!(RuleCategory::XXE.as_str(), "XXE");
     }
 }

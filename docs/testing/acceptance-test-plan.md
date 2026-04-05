@@ -119,7 +119,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 5.24 | Private key encrypted at rest | CLI | `sqlite3 lorica.db` -> binary blob, not PEM | 4.5 | |
 | 5.25 | HTTPS works in worker mode | Proxy | `--workers 6` + TLS cert -> HTTPS serves traffic | 2.1 | OK |
 | | **6. SECURITY** | | | | |
-| 6.1 | WAF rules listed (27 rules) | Dashboard | Security > Rules tab -> 27 rules | 3.1 | OK |
+| 6.1 | WAF rules listed (37 rules) | Dashboard | Security > Rules tab -> 37 rules | 3.1 | OK |
 | 6.2 | WAF rule toggle | Dashboard | Disable/enable individual rule | 3.1 | OK |
 | 6.3 | WAF custom rule | Dashboard | Create custom regex rule | 3.1 | OK |
 | 6.4 | WAF detection mode | Proxy | waf_mode=detection -> logged, not blocked | 3.1 | OK |
