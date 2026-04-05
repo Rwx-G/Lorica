@@ -79,13 +79,25 @@ fn backend_to_response(b: &lorica_config::models::Backend, ewma_score: f64) -> B
 }
 
 /// Look up the EWMA score for a backend address from shared state.
-fn get_ewma_score(state: &crate::server::AppState, addr: &str) -> f64 {
-    state
+/// In single-process mode, reads from the direct ewma_scores map.
+/// In supervisor mode, reads from aggregated worker metrics.
+async fn get_ewma_score_async(state: &crate::server::AppState, addr: &str) -> f64 {
+    // Direct scores (single-process mode)
+    if let Some(score) = state
         .ewma_scores
         .as_ref()
         .and_then(|scores| scores.read().ok())
         .and_then(|map| map.get(addr).copied())
-        .unwrap_or(0.0)
+    {
+        return score;
+    }
+    // Aggregated from workers (supervisor mode)
+    if let Some(ref agg) = state.aggregated_metrics {
+        if let Some(score) = agg.merged_ewma_scores().await.get(addr).copied() {
+            return score;
+        }
+    }
+    0.0
 }
 
 /// GET /api/v1/backends
@@ -94,10 +106,11 @@ pub async fn list_backends(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     let backends = store.list_backends()?;
-    let responses: Vec<_> = backends
-        .iter()
-        .map(|b| backend_to_response(b, get_ewma_score(&state, &b.address)))
-        .collect();
+    let mut responses = Vec::with_capacity(backends.len());
+    for b in &backends {
+        let score = get_ewma_score_async(&state, &b.address).await;
+        responses.push(backend_to_response(b, score));
+    }
     Ok(json_data(serde_json::json!({ "backends": responses })))
 }
 
@@ -150,10 +163,8 @@ pub async fn get_backend(
     let backend = store
         .get_backend(&id)?
         .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
-    Ok(json_data(backend_to_response(
-        &backend,
-        get_ewma_score(&state, &backend.address),
-    )))
+    let score = get_ewma_score_async(&state, &backend.address).await;
+    Ok(json_data(backend_to_response(&backend, score)))
 }
 
 /// PUT /api/v1/backends/:id
@@ -202,10 +213,8 @@ pub async fn update_backend(
     store.update_backend(&backend)?;
     drop(store);
     state.notify_config_changed();
-    Ok(json_data(backend_to_response(
-        &backend,
-        get_ewma_score(&state, &backend.address),
-    )))
+    let score = get_ewma_score_async(&state, &backend.address).await;
+    Ok(json_data(backend_to_response(&backend, score)))
 }
 
 /// DELETE /api/v1/backends/:id
