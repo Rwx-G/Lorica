@@ -728,6 +728,8 @@ fn run_supervisor(cli: Cli) {
         let monitor_mgr = Arc::clone(&manager);
         let monitor_reload_tx = reload_bc_tx.clone();
         let monitor_seq = Arc::clone(&sequence);
+        let monitor_hb_metrics = Arc::clone(&worker_metrics);
+        let monitor_agg_metrics = Arc::clone(&aggregated_metrics);
         let monitor_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -748,12 +750,20 @@ fn run_supervisor(cli: Cli) {
 
                     match mgr.restart_worker(id) {
                         Ok(Some(new_fd)) => {
-                            // Spawn a new per-worker channel task for the restarted worker
-                            info!(worker_id = id, reason = log_msg, "worker restarted, reconnecting channel");
+                            // Get the new PID for metrics reporting
+                            let new_pid = mgr
+                                .worker_pids()
+                                .iter()
+                                .find(|(wid, _)| *wid == id)
+                                .map(|(_, pid)| pid.as_raw())
+                                .unwrap_or(0);
+                            info!(worker_id = id, new_pid, reason = log_msg, "worker restarted, reconnecting channel");
                             match unsafe { CommandChannel::from_raw_fd(new_fd.into_raw_fd()) } {
                                 Ok(mut channel) => {
                                     let mut rx = monitor_reload_tx.subscribe();
                                     let seq = Arc::clone(&monitor_seq);
+                                    let hb_metrics = Arc::clone(&monitor_hb_metrics);
+                                    let agg_metrics = Arc::clone(&monitor_agg_metrics);
                                     tokio::spawn(async move {
                                         let mut timer = tokio::time::interval(Duration::from_secs(5));
                                         timer.tick().await;
@@ -772,12 +782,39 @@ fn run_supervisor(cli: Cli) {
                                                     }
                                                 }
                                                 _ = timer.tick() => {
-                                                    let s = seq.fetch_add(1, Ordering::Relaxed);
-                                                    let cmd = Command::new(CommandType::Heartbeat, s);
+                                                    let hb_s = seq.fetch_add(1, Ordering::Relaxed);
+                                                    let cmd = Command::new(CommandType::Heartbeat, hb_s);
                                                     let start = Instant::now();
                                                     if channel.send(&cmd).await.is_ok() {
                                                         match channel.recv::<Response>().await {
-                                                            Ok(_) => info!(worker_id = id, latency_ms = start.elapsed().as_millis() as u64, "heartbeat ok"),
+                                                            Ok(_) => {
+                                                                let latency_ms = start.elapsed().as_millis() as u64;
+                                                                hb_metrics.record_heartbeat(id, new_pid, latency_ms).await;
+
+                                                                // Request metrics from restarted worker
+                                                                let m_seq = seq.fetch_add(1, Ordering::Relaxed);
+                                                                let m_cmd = Command::new(CommandType::MetricsRequest, m_seq);
+                                                                if let Err(e) = channel.send(&m_cmd).await {
+                                                                    warn!(worker_id = id, error = %e, "metrics request send failed");
+                                                                } else if let Ok(report) = channel.recv::<lorica_command::MetricsReport>().await {
+                                                                    let _ = channel.recv::<Response>().await;
+                                                                    let ewma: std::collections::HashMap<String, f64> = report
+                                                                        .ewma_entries.iter()
+                                                                        .map(|e| (e.backend_address.clone(), e.score_us))
+                                                                        .collect();
+                                                                    let bans: Vec<(String, u64, u64)> = report
+                                                                        .ban_entries.iter()
+                                                                        .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
+                                                                        .collect();
+                                                                    let backend_conns: std::collections::HashMap<String, u64> = report
+                                                                        .backend_conn_entries.iter()
+                                                                        .map(|e| (e.backend_address.clone(), e.connections))
+                                                                        .collect();
+                                                                    agg_metrics
+                                                                        .update_worker(id, report.cache_hits, report.cache_misses, report.active_connections, bans, ewma, backend_conns)
+                                                                        .await;
+                                                                }
+                                                            }
                                                             Err(e) => warn!(worker_id = id, error = %e, "heartbeat failed"),
                                                         }
                                                     }
