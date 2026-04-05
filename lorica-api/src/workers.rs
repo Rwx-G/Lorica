@@ -106,6 +106,126 @@ struct WorkersResponse {
     total: usize,
 }
 
+/// Aggregated proxy metrics from all worker processes.
+///
+/// Each worker periodically sends a MetricsReport via the command channel.
+/// The supervisor stores per-worker snapshots and computes aggregations on read.
+#[derive(Debug)]
+pub struct AggregatedMetrics {
+    inner: RwLock<HashMap<u32, WorkerSnapshot>>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerSnapshot {
+    cache_hits: u64,
+    cache_misses: u64,
+    active_connections: u64,
+    /// (ip, remaining_seconds, ban_duration_seconds)
+    ban_entries: Vec<(String, u64, u64)>,
+    /// backend_address -> score_us
+    ewma_scores: HashMap<String, f64>,
+}
+
+impl Default for AggregatedMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AggregatedMetrics {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Update metrics snapshot for a worker from its MetricsReport.
+    pub async fn update_worker(
+        &self,
+        worker_id: u32,
+        cache_hits: u64,
+        cache_misses: u64,
+        active_connections: u64,
+        ban_entries: Vec<(String, u64, u64)>,
+        ewma_scores: HashMap<String, f64>,
+    ) {
+        let mut map = self.inner.write().await;
+        map.insert(
+            worker_id,
+            WorkerSnapshot {
+                cache_hits,
+                cache_misses,
+                active_connections,
+                ban_entries,
+                ewma_scores,
+            },
+        );
+    }
+
+    /// Remove a worker's metrics (e.g. on crash).
+    pub async fn remove_worker(&self, worker_id: u32) {
+        self.inner.write().await.remove(&worker_id);
+    }
+
+    /// Sum of cache hits across all workers.
+    pub async fn total_cache_hits(&self) -> u64 {
+        self.inner.read().await.values().map(|w| w.cache_hits).sum()
+    }
+
+    /// Sum of cache misses across all workers.
+    pub async fn total_cache_misses(&self) -> u64 {
+        self.inner
+            .read()
+            .await
+            .values()
+            .map(|w| w.cache_misses)
+            .sum()
+    }
+
+    /// Sum of active connections across all workers.
+    pub async fn total_active_connections(&self) -> u64 {
+        self.inner
+            .read()
+            .await
+            .values()
+            .map(|w| w.active_connections)
+            .sum()
+    }
+
+    /// Union of ban lists from all workers. For duplicate IPs, keep the longest remaining ban.
+    pub async fn merged_ban_list(&self) -> Vec<(String, u64, u64)> {
+        let map = self.inner.read().await;
+        let mut merged: HashMap<String, (u64, u64)> = HashMap::new();
+        for w in map.values() {
+            for (ip, remaining, duration) in &w.ban_entries {
+                let entry = merged.entry(ip.clone()).or_insert((0, 0));
+                if *remaining > entry.0 {
+                    *entry = (*remaining, *duration);
+                }
+            }
+        }
+        merged
+            .into_iter()
+            .map(|(ip, (remaining, duration))| (ip, remaining, duration))
+            .collect()
+    }
+
+    /// Minimum EWMA score per backend across all workers (best latency wins).
+    pub async fn merged_ewma_scores(&self) -> HashMap<String, f64> {
+        let map = self.inner.read().await;
+        let mut merged: HashMap<String, f64> = HashMap::new();
+        for w in map.values() {
+            for (addr, score) in &w.ewma_scores {
+                let entry = merged.entry(addr.clone()).or_insert(f64::MAX);
+                if *score < *entry {
+                    *entry = *score;
+                }
+            }
+        }
+        merged
+    }
+}
+
 /// GET /api/v1/workers
 pub async fn get_workers(
     Extension(state): Extension<AppState>,

@@ -348,6 +348,9 @@ fn run_supervisor(cli: Cli) {
             }
         });
 
+        // Aggregated metrics from all workers (shared with API)
+        let aggregated_metrics = Arc::new(lorica_api::workers::AggregatedMetrics::new());
+
         // Spawn a per-worker task that handles both config reload and heartbeat
         // No shared Mutex - each worker has its own channel and task
         for (worker_id, worker_pid, raw_fd) in worker_fds {
@@ -361,6 +364,7 @@ fn run_supervisor(cli: Cli) {
             let mut reload_rx = reload_bc_tx.subscribe();
             let hb_seq = Arc::clone(&sequence);
             let hb_metrics = Arc::clone(&worker_metrics);
+            let agg_metrics = Arc::clone(&aggregated_metrics);
 
             tokio::spawn(async move {
                 let heartbeat_interval = Duration::from_secs(5);
@@ -406,7 +410,36 @@ fn run_supervisor(cli: Cli) {
                                 Ok(_) => {
                                     let latency_ms = start.elapsed().as_millis() as u64;
                                     hb_metrics.record_heartbeat(worker_id, worker_pid, latency_ms).await;
-                                    info!(worker_id, latency_ms, "heartbeat ok");
+
+                                    // Request metrics from this worker
+                                    let m_seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                                    let m_cmd = Command::new(CommandType::MetricsRequest, m_seq);
+                                    if let Err(e) = channel.send(&m_cmd).await {
+                                        warn!(worker_id, error = %e, "metrics request send failed");
+                                    } else if let Ok(report) = channel.recv::<lorica_command::MetricsReport>().await {
+                                        // Consume the Response::ok that follows the report
+                                        let _ = channel.recv::<Response>().await;
+                                        let ewma: std::collections::HashMap<String, f64> = report
+                                            .ewma_entries
+                                            .iter()
+                                            .map(|e| (e.backend_address.clone(), e.score_us))
+                                            .collect();
+                                        let bans: Vec<(String, u64, u64)> = report
+                                            .ban_entries
+                                            .iter()
+                                            .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
+                                            .collect();
+                                        agg_metrics
+                                            .update_worker(
+                                                worker_id,
+                                                report.cache_hits,
+                                                report.cache_misses,
+                                                report.active_connections,
+                                                bans,
+                                                ewma,
+                                            )
+                                            .await;
+                                    }
                                 }
                                 Err(e) => {
                                     warn!(worker_id, error = %e, "heartbeat response failed - worker may be unresponsive");
@@ -554,12 +587,13 @@ fn run_supervisor(cli: Cli) {
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
                 load_test_engine: Some(Arc::new(lorica_bench::LoadTestEngine::new())),
-                // cache/ban are per-worker process, not available in supervisor
+                // cache/ban are per-worker process; aggregated via command channel
                 cache_hits: None,
                 cache_misses: None,
                 ban_list: None,
                 cache_backend: None,
                 ewma_scores: None,
+                aggregated_metrics: Some(Arc::clone(&aggregated_metrics)),
                 notification_history: {
                     let d = notify_dispatcher.lock().await;
                     Some(d.history())
@@ -774,11 +808,23 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16, upstream_cr
         }
     });
 
+    // Pre-create metric Arcs so the command thread can read them
+    let worker_cache_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let worker_cache_misses = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let worker_ban_list: Arc<dashmap::DashMap<String, (std::time::Instant, u64)>> =
+        Arc::new(dashmap::DashMap::new());
+    let worker_ewma = Arc::new(lorica::proxy_wiring::EwmaTracker::new());
+
     // Start the command channel listener in a background thread
     // (the proxy server's run_forever blocks the main thread)
     let cmd_store = Arc::clone(&store);
     let cmd_config = Arc::clone(&proxy_config);
     let cmd_cert_resolver = Arc::clone(&cert_resolver);
+    let cmd_cache_hits = Arc::clone(&worker_cache_hits);
+    let cmd_cache_misses = Arc::clone(&worker_cache_misses);
+    let cmd_active_conns = Arc::clone(&active_connections);
+    let cmd_ban_list = Arc::clone(&worker_ban_list);
+    let cmd_ewma = worker_ewma.scores_ref();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create command channel runtime");
         rt.block_on(async move {
@@ -842,6 +888,51 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16, upstream_cr
                         std::process::exit(0);
                     }
                     CommandType::MetricsRequest => {
+                        use lorica_command::{MetricsReport, BanReportEntry, EwmaReportEntry};
+
+                        // Collect ban list entries (skip expired)
+                        let ban_entries: Vec<BanReportEntry> = cmd_ban_list
+                            .iter()
+                            .filter_map(|entry| {
+                                let (ip, (banned_at, duration_s)) = (entry.key(), entry.value());
+                                let elapsed = banned_at.elapsed().as_secs();
+                                if elapsed >= *duration_s {
+                                    return None; // expired
+                                }
+                                Some(BanReportEntry {
+                                    ip: ip.clone(),
+                                    remaining_seconds: duration_s - elapsed,
+                                    ban_duration_seconds: *duration_s,
+                                })
+                            })
+                            .collect();
+
+                        // Collect EWMA scores
+                        let ewma_entries: Vec<EwmaReportEntry> = cmd_ewma
+                            .read()
+                            .unwrap()
+                            .iter()
+                            .map(|(addr, score)| EwmaReportEntry {
+                                backend_address: addr.clone(),
+                                score_us: *score,
+                            })
+                            .collect();
+
+                        let mut report = MetricsReport::new(
+                            id,
+                            0, // total_requests not tracked yet
+                            cmd_active_conns.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                        report.cache_hits =
+                            cmd_cache_hits.load(std::sync::atomic::Ordering::Relaxed);
+                        report.cache_misses =
+                            cmd_cache_misses.load(std::sync::atomic::Ordering::Relaxed);
+                        report.ban_entries = ban_entries;
+                        report.ewma_entries = ewma_entries;
+
+                        if let Err(e) = channel.send(&report).await {
+                            warn!(error = %e, "failed to send metrics report");
+                        }
                         let resp = Response::ok(cmd.sequence);
                         if let Err(e) = channel.send(&resp).await {
                             warn!(error = %e, "failed to send metrics response");
@@ -900,13 +991,18 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16, upstream_cr
         });
     });
 
-    // Build the proxy service
-    let lorica_proxy = LoricaProxy::new(
+    // Build the proxy service with pre-created metric Arcs
+    let mut lorica_proxy = LoricaProxy::new(
         Arc::clone(&proxy_config),
         Arc::clone(&log_buffer),
         Arc::clone(&active_connections),
         Arc::clone(&sla_collector),
     );
+    // Replace the default Arcs with our pre-created ones (shared with command thread)
+    lorica_proxy.cache_hits = worker_cache_hits;
+    lorica_proxy.cache_misses = worker_cache_misses;
+    lorica_proxy.ban_list = worker_ban_list;
+    lorica_proxy.ewma_tracker = worker_ewma;
 
     let mut server_conf = lorica_core::server::configuration::ServerConf::default();
     server_conf.upstream_crl_file = upstream_crl_file.map(|s| s.to_string());
@@ -1198,6 +1294,7 @@ fn run_single_process(cli: Cli) {
                 ewma_scores: Some(proxy_ewma_scores),
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
+                aggregated_metrics: None, // single-process uses direct Arc references
             };
 
             // Spawn ACME certificate auto-renewal (check every 12h, renew at 30 days before expiry)

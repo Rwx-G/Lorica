@@ -59,6 +59,8 @@ pub struct AppState {
     pub notification_history: Option<Arc<std::sync::Mutex<VecDeque<lorica_notify::AlertEvent>>>>,
     /// Persistent access log store (SQLite). `None` in tests or worker mode.
     pub log_store: Option<Arc<crate::log_store::LogStore>>,
+    /// Aggregated proxy metrics from worker processes. `None` in single-process mode.
+    pub aggregated_metrics: Option<Arc<crate::workers::AggregatedMetrics>>,
 }
 
 impl AppState {

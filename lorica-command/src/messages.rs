@@ -139,10 +139,35 @@ impl Response {
     }
 }
 
+/// A single banned IP entry in a metrics report.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BanReportEntry {
+    /// Banned IP address.
+    #[prost(string, tag = "1")]
+    pub ip: String,
+    /// Seconds remaining before the ban expires.
+    #[prost(uint64, tag = "2")]
+    pub remaining_seconds: u64,
+    /// Total ban duration in seconds.
+    #[prost(uint64, tag = "3")]
+    pub ban_duration_seconds: u64,
+}
+
+/// A single backend EWMA latency entry in a metrics report.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct EwmaReportEntry {
+    /// Backend address (e.g. "10.0.0.1:8080").
+    #[prost(string, tag = "1")]
+    pub backend_address: String,
+    /// EWMA latency score in microseconds.
+    #[prost(double, tag = "2")]
+    pub score_us: f64,
+}
+
 /// Metrics data sent from worker to supervisor for aggregation.
 ///
-/// Workers periodically report their Prometheus counter values.
-/// The supervisor aggregates them into the global /metrics endpoint.
+/// Workers report their metrics on MetricsRequest.
+/// The supervisor aggregates them into the global /metrics and API endpoints.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct MetricsReport {
     /// Worker ID.
@@ -157,6 +182,18 @@ pub struct MetricsReport {
     /// Timestamp of the report.
     #[prost(uint64, tag = "4")]
     pub timestamp_ms: u64,
+    /// Cumulative cache hits.
+    #[prost(uint64, tag = "5")]
+    pub cache_hits: u64,
+    /// Cumulative cache misses.
+    #[prost(uint64, tag = "6")]
+    pub cache_misses: u64,
+    /// Active ban entries (non-expired).
+    #[prost(message, repeated, tag = "7")]
+    pub ban_entries: Vec<BanReportEntry>,
+    /// Per-backend EWMA latency scores.
+    #[prost(message, repeated, tag = "8")]
+    pub ewma_entries: Vec<EwmaReportEntry>,
 }
 
 impl MetricsReport {
@@ -170,6 +207,10 @@ impl MetricsReport {
             total_requests,
             active_connections,
             timestamp_ms,
+            cache_hits: 0,
+            cache_misses: 0,
+            ban_entries: Vec::new(),
+            ewma_entries: Vec::new(),
         }
     }
 }
@@ -240,6 +281,43 @@ mod tests {
         let encoded = cmd.encode_to_vec();
         let decoded = Command::decode(&encoded[..]).expect("decode failed");
         assert_eq!(decoded, cmd);
+    }
+
+    #[test]
+    fn test_metrics_report_prost_encode_decode() {
+        use prost::Message;
+
+        let report = MetricsReport {
+            worker_id: 1,
+            total_requests: 5000,
+            active_connections: 42,
+            timestamp_ms: 1234567890,
+            cache_hits: 3000,
+            cache_misses: 2000,
+            ban_entries: vec![
+                BanReportEntry {
+                    ip: "192.168.1.100".into(),
+                    remaining_seconds: 300,
+                    ban_duration_seconds: 600,
+                },
+            ],
+            ewma_entries: vec![
+                EwmaReportEntry {
+                    backend_address: "10.0.0.1:8080".into(),
+                    score_us: 1500.5,
+                },
+                EwmaReportEntry {
+                    backend_address: "10.0.0.2:8080".into(),
+                    score_us: 2300.0,
+                },
+            ],
+        };
+        let encoded = report.encode_to_vec();
+        let decoded = MetricsReport::decode(&encoded[..]).expect("decode failed");
+        assert_eq!(decoded, report);
+        assert_eq!(decoded.ban_entries.len(), 1);
+        assert_eq!(decoded.ewma_entries.len(), 2);
+        assert_eq!(decoded.cache_hits, 3000);
     }
 
     #[test]

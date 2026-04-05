@@ -46,16 +46,21 @@ pub async fn purge_route_cache(
 pub async fn get_cache_stats(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let hits = state
-        .cache_hits
-        .as_ref()
-        .map(|c| c.load(Ordering::Relaxed))
-        .unwrap_or(0);
-    let misses = state
-        .cache_misses
-        .as_ref()
-        .map(|c| c.load(Ordering::Relaxed))
-        .unwrap_or(0);
+    // Single-process: read directly from shared Arc. Multi-worker: read from aggregated metrics.
+    let (hits, misses) = if let Some(ref ch) = state.cache_hits {
+        (
+            ch.load(Ordering::Relaxed),
+            state
+                .cache_misses
+                .as_ref()
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0),
+        )
+    } else if let Some(ref agg) = state.aggregated_metrics {
+        (agg.total_cache_hits().await, agg.total_cache_misses().await)
+    } else {
+        (0, 0)
+    };
     let total = hits + misses;
     let hit_rate = if total > 0 {
         (hits as f64 / total as f64) * 100.0
@@ -77,13 +82,12 @@ pub async fn get_cache_stats(
 pub async fn list_bans(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let bans = match &state.ban_list {
-        Some(bl) => bl
-            .iter()
+    let bans = if let Some(ref bl) = state.ban_list {
+        // Single-process: read directly from shared DashMap
+        bl.iter()
             .filter_map(|entry| {
                 let (banned_at, duration_s) = entry.value();
                 let elapsed = banned_at.elapsed().as_secs();
-                // Only show non-expired bans
                 if elapsed < *duration_s {
                     Some(serde_json::json!({
                         "ip": entry.key(),
@@ -94,8 +98,22 @@ pub async fn list_bans(
                     None
                 }
             })
-            .collect::<Vec<_>>(),
-        None => Vec::new(),
+            .collect::<Vec<_>>()
+    } else if let Some(ref agg) = state.aggregated_metrics {
+        // Multi-worker: read from aggregated metrics
+        agg.merged_ban_list()
+            .await
+            .into_iter()
+            .map(|(ip, remaining, duration)| {
+                serde_json::json!({
+                    "ip": ip,
+                    "banned_seconds_ago": duration.saturating_sub(remaining),
+                    "remaining_seconds": remaining,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
     };
 
     Ok(json_data(serde_json::json!({

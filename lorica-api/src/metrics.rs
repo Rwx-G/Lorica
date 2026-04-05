@@ -196,12 +196,22 @@ pub fn set_system_metrics(cpu_percent: f64, memory_used_bytes: i64) {
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,
 /// system resources) from AppState before encoding.
 pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResponse {
-    // Refresh active connections
-    set_active_connections(
+    // Refresh active connections (aggregated from workers if available)
+    let active_conns = if let Some(ref agg) = state.aggregated_metrics {
+        agg.total_active_connections().await as i64
+    } else {
         state
             .active_connections
-            .load(std::sync::atomic::Ordering::Relaxed) as i64,
-    );
+            .load(std::sync::atomic::Ordering::Relaxed) as i64
+    };
+    set_active_connections(active_conns);
+
+    // Refresh aggregated EWMA scores from workers
+    if let Some(ref agg) = state.aggregated_metrics {
+        for (addr, score) in agg.merged_ewma_scores().await {
+            set_ewma_score(&addr, score);
+        }
+    }
 
     // Refresh backend health and cert expiry from the store
     if let Ok(store) = state.store.try_lock() {
