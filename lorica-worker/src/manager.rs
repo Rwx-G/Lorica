@@ -452,6 +452,7 @@ mod tests {
             log_level: "info".to_string(),
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: None,
+            https_port: 0,
         };
         let mut mgr = WorkerManager::new(config);
         mgr.create_listen_sockets().expect("create sockets failed");
@@ -467,6 +468,7 @@ mod tests {
             log_level: "info".to_string(),
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: Some("127.0.0.1:0".to_string()),
+            https_port: 443,
         };
         let mut mgr = WorkerManager::new(config);
         mgr.create_listen_sockets().expect("create sockets failed");
