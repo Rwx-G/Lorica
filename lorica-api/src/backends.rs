@@ -247,13 +247,72 @@ pub async fn update_backend(
 }
 
 /// DELETE /api/v1/backends/:id
+///
+/// Initiates graceful drain: sets lifecycle_state to Closing so no new
+/// requests are routed to this backend, then spawns a background task
+/// that waits for active connections to reach 0 (or a 60s timeout)
+/// before deleting the backend from the database.
 pub async fn delete_backend(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
-    store.delete_backend(&id)?;
+    let mut backend = store
+        .get_backend(&id)?
+        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+
+    // If already closing/closed, force delete immediately
+    if backend.lifecycle_state != lorica_config::models::LifecycleState::Normal {
+        store.delete_backend(&id)?;
+        drop(store);
+        state.notify_config_changed();
+        return Ok(json_data(serde_json::json!({"message": "backend deleted"})));
+    }
+
+    // Transition to Closing - proxy stops routing new requests to this backend
+    backend.lifecycle_state = lorica_config::models::LifecycleState::Closing;
+    backend.updated_at = Utc::now();
+    store.update_backend(&backend)?;
     drop(store);
     state.notify_config_changed();
-    Ok(json_data(serde_json::json!({"message": "backend deleted"})))
+
+    // Spawn background drain task
+    let drain_state = state.clone();
+    let drain_addr = backend.address.clone();
+    let drain_id = id.clone();
+    tokio::spawn(async move {
+        const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+
+        loop {
+            let conns = get_backend_connections_async(&drain_state, &drain_addr).await;
+            if conns <= 0 {
+                tracing::info!(backend_id = %drain_id, "backend drained, deleting");
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    backend_id = %drain_id,
+                    remaining_connections = conns,
+                    "drain timeout exceeded, force deleting backend"
+                );
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        // Delete from DB
+        let store = drain_state.store.lock().await;
+        if let Err(e) = store.delete_backend(&drain_id) {
+            tracing::warn!(backend_id = %drain_id, error = %e, "failed to delete drained backend");
+        }
+        drop(store);
+        drain_state.notify_config_changed();
+    });
+
+    Ok(json_data(serde_json::json!({
+        "message": "backend draining",
+        "lifecycle_state": "closing",
+    })))
 }
