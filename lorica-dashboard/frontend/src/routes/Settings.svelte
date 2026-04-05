@@ -354,7 +354,7 @@
     if (notifAlertCertExpiring) alertArr.push('cert_expiring');
     if (notifAlertWafAlert) alertArr.push('waf_alert');
     if (notifAlertConfigChanged) alertArr.push('config_changed');
-    if (notifAlertSlaBreached) alertArr.push('sla_breached');
+    if (notifAlertSlaBreached) { alertArr.push('sla_breached'); alertArr.push('sla_recovered'); }
     if (notifAlertIpBanned) alertArr.push('ip_banned');
 
     const body = { channel: notifChannel, enabled: notifEnabled, config: configStr, alert_types: alertArr };
@@ -725,7 +725,7 @@
               {#each notifHistory as ev}
                 <tr>
                   <td class="mono">{new Date(ev.timestamp).toLocaleString()}</td>
-                  <td><span class="badge badge-{ev.alert_type === 'sla_breached' || ev.alert_type === 'backend_down' ? 'red' : ev.alert_type === 'cert_expiring' ? 'orange' : 'blue'}">{ev.alert_type}</span></td>
+                  <td><span class="badge badge-{ev.alert_type === 'sla_breached' || ev.alert_type === 'backend_down' ? 'red' : ev.alert_type === 'sla_recovered' ? 'green' : ev.alert_type === 'cert_expiring' ? 'orange' : 'blue'}">{ev.alert_type}</span></td>
                   <td>{ev.summary}</td>
                 </tr>
               {/each}

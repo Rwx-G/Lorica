@@ -155,6 +155,9 @@ pub struct SlaCollector {
     buckets: Arc<Mutex<HashMap<String, Arc<RouteBucket>>>>,
     /// Per-route SLA configuration cache.
     sla_configs: Arc<Mutex<HashMap<String, SlaConfig>>>,
+    /// Per-route breach state for edge-triggered notifications.
+    /// `true` means the route is currently in breach.
+    breach_state: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 impl SlaCollector {
@@ -162,6 +165,7 @@ impl SlaCollector {
         Self {
             buckets: Arc::new(Mutex::new(HashMap::new())),
             sla_configs: Arc::new(Mutex::new(HashMap::new())),
+            breach_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -328,6 +332,9 @@ impl SlaCollector {
         })
     }
 
+    /// Check SLA thresholds and emit alerts only on state transitions:
+    /// - OK -> breached: emit SlaBreached
+    /// - breached -> OK: emit SlaRecovered
     fn check_thresholds(&self, store: &ConfigStore) -> Vec<AlertEvent> {
         let now = Utc::now();
         let one_hour_ago = now - chrono::Duration::hours(1);
@@ -335,6 +342,11 @@ impl SlaCollector {
 
         let configs = match store.list_sla_configs() {
             Ok(c) => c,
+            Err(_) => return alerts,
+        };
+
+        let mut breach_state = match self.breach_state.lock() {
+            Ok(s) => s,
             Err(_) => return alerts,
         };
 
@@ -350,8 +362,15 @@ impl SlaCollector {
                 Err(_) => continue,
             };
 
-            // Only alert if there's actual traffic and SLA is below target
-            if summary.total_requests > 0 && !summary.meets_target {
+            if summary.total_requests == 0 {
+                continue;
+            }
+
+            let was_breached = *breach_state.get(&config.route_id).unwrap_or(&false);
+            let is_breached = !summary.meets_target;
+
+            if is_breached && !was_breached {
+                // Transition OK -> breached
                 let event = AlertEvent::new(
                     AlertType::SlaBreached,
                     format!(
@@ -364,7 +383,23 @@ impl SlaCollector {
                 .with_detail("target_pct", format!("{:.1}", config.target_pct))
                 .with_detail("total_requests", summary.total_requests.to_string());
                 alerts.push(event);
+            } else if !is_breached && was_breached {
+                // Transition breached -> OK
+                let event = AlertEvent::new(
+                    AlertType::SlaRecovered,
+                    format!(
+                        "SLA recovered on route {}: {:.2}% (target: {:.1}%)",
+                        config.route_id, summary.sla_pct, config.target_pct
+                    ),
+                )
+                .with_detail("route_id", &config.route_id)
+                .with_detail("sla_pct", format!("{:.2}", summary.sla_pct))
+                .with_detail("target_pct", format!("{:.1}", config.target_pct))
+                .with_detail("total_requests", summary.total_requests.to_string());
+                alerts.push(event);
             }
+
+            breach_state.insert(config.route_id.clone(), is_breached);
         }
         alerts
     }
