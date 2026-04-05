@@ -507,8 +507,8 @@
         />
         <Card
           title="Cache Hit Rate"
-          value={cacheStats ? `${(cacheStats.hit_rate * 100).toFixed(1)}%` : '-'}
-          color={cacheStats && cacheStats.hit_rate >= 0.5 ? 'green' : 'default'}
+          value={cacheStats ? `${cacheStats.hit_rate.toFixed(1)}%` : '-'}
+          color={cacheStats && cacheStats.hit_rate >= 50 ? 'green' : 'default'}
         />
       </div>
     </div>
