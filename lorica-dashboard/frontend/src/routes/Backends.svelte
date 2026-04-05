@@ -379,10 +379,10 @@
         </div>
 
         {#if formTlsUpstream}
-          <div class="form-row">
+          <div class="form-group">
             <label for="form-tls-sni">TLS SNI override</label>
             <input id="form-tls-sni" type="text" bind:value={formTlsSni} placeholder="Leave empty to use route hostname" />
-            <span class="form-hint">Override the server name sent during TLS handshake to the backend</span>
+            <span class="hint">Override the server name sent during TLS handshake to the backend</span>
           </div>
         {/if}
 
