@@ -21,9 +21,9 @@ use lorica_error::ErrorType::InternalError;
 use lorica_error::{Error, OrErr, Result};
 use lorica_tls::load_certs_and_key_files;
 use lorica_tls::ClientCertVerifier;
+use lorica_tls::ResolvesServerCert;
 use lorica_tls::ServerConfig;
 use lorica_tls::{version, TlsAcceptor as RusTlsAcceptor};
-use lorica_tls::ResolvesServerCert;
 
 use crate::protocols::{ALPN, IO};
 
@@ -69,8 +69,7 @@ impl TlsSettings {
                 cert_path,
                 key_path,
             } => {
-                let Ok(Some((certs, key))) = load_certs_and_key_files(&cert_path, &key_path)
-                else {
+                let Ok(Some((certs, key))) = load_certs_and_key_files(&cert_path, &key_path) else {
                     panic!(
                         "Failed to load provided certificates \"{cert_path}\" or key \"{key_path}\".",
                     )

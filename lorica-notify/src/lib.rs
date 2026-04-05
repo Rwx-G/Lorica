@@ -65,7 +65,10 @@ pub fn spawn_alert_dispatcher(
                     d.dispatch(&event).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(dropped = n, "alert dispatcher lagged, some notifications were dropped");
+                    tracing::warn!(
+                        dropped = n,
+                        "alert dispatcher lagged, some notifications were dropped"
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }

@@ -108,9 +108,7 @@ impl ConfigStore {
             Some(key) => {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(stored)
-                    .map_err(|e| {
-                        ConfigError::Validation(format!("invalid base64 config: {e}"))
-                    })?;
+                    .map_err(|e| ConfigError::Validation(format!("invalid base64 config: {e}")))?;
                 let plaintext = key.decrypt(&decoded)?;
                 String::from_utf8(plaintext).map_err(|e| {
                     ConfigError::Validation(format!("decrypted config not UTF-8: {e}"))
@@ -1304,8 +1302,9 @@ impl ConfigStore {
 
     /// Save the list of disabled WAF rule IDs as a JSON array in global settings.
     pub fn save_waf_disabled_rules(&self, rule_ids: &[u32]) -> Result<()> {
-        let json = serde_json::to_string(rule_ids)
-            .map_err(|e| ConfigError::Validation(format!("failed to serialize disabled rules: {e}")))?;
+        let json = serde_json::to_string(rule_ids).map_err(|e| {
+            ConfigError::Validation(format!("failed to serialize disabled rules: {e}"))
+        })?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_disabled_rules', ?1)",
             params![json],
@@ -1315,20 +1314,32 @@ impl ConfigStore {
 
     /// Load the list of disabled WAF rule IDs from global settings.
     pub fn load_waf_disabled_rules(&self) -> Result<Vec<u32>> {
-        let json: Option<String> = self.conn.query_row(
-            "SELECT value FROM global_settings WHERE key = 'waf_disabled_rules'",
-            [],
-            |row| row.get(0),
-        ).optional()?;
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM global_settings WHERE key = 'waf_disabled_rules'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
         match json {
-            Some(s) => serde_json::from_str(&s)
-                .map_err(|e| ConfigError::Validation(format!("invalid waf_disabled_rules JSON: {e}"))),
+            Some(s) => serde_json::from_str(&s).map_err(|e| {
+                ConfigError::Validation(format!("invalid waf_disabled_rules JSON: {e}"))
+            }),
             None => Ok(Vec::new()),
         }
     }
 
     /// Save a WAF custom rule to the database.
-    pub fn save_waf_custom_rule(&self, id: u32, description: &str, category: &str, pattern: &str, severity: u8, enabled: bool) -> Result<()> {
+    pub fn save_waf_custom_rule(
+        &self,
+        id: u32,
+        description: &str,
+        category: &str,
+        pattern: &str,
+        severity: u8,
+        enabled: bool,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO waf_custom_rules (id, description, category, pattern, severity, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, description, category, pattern, severity as i32, enabled],
@@ -1338,7 +1349,8 @@ impl ConfigStore {
 
     /// Delete a WAF custom rule from the database.
     pub fn delete_waf_custom_rule(&self, id: u32) -> Result<()> {
-        self.conn.execute("DELETE FROM waf_custom_rules WHERE id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM waf_custom_rules WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -2152,7 +2164,11 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
         h2_upstream: row.get(14)?,
         tls_sni: {
             let s: String = row.get(15)?;
-            if s.is_empty() { None } else { Some(s) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         },
     })
 }

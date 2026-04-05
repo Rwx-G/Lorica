@@ -417,7 +417,10 @@ pub fn spawn_renewal_task(
                     sender.send(
                         lorica_notify::AlertEvent::new(
                             lorica_notify::events::AlertType::CertExpiring,
-                            format!("Certificate for {} expires in {} days", cert.domain, days_remaining),
+                            format!(
+                                "Certificate for {} expires in {} days",
+                                cert.domain, days_remaining
+                            ),
                         )
                         .with_detail("domain", cert.domain.clone())
                         .with_detail("days_remaining", days_remaining.to_string())
@@ -742,12 +745,8 @@ impl Route53DnsChallenger {
 #[async_trait::async_trait]
 impl DnsChallenger for Route53DnsChallenger {
     async fn create_txt_record(&self, domain: &str, value: &str) -> Result<(), String> {
-        self.change_record(
-            aws_sdk_route53::types::ChangeAction::Upsert,
-            domain,
-            value,
-        )
-        .await?;
+        self.change_record(aws_sdk_route53::types::ChangeAction::Upsert, domain, value)
+            .await?;
         self.created_values
             .lock()
             .unwrap()
@@ -767,19 +766,17 @@ impl DnsChallenger for Route53DnsChallenger {
             warn!(domain = %domain, "Route53 delete: no tracked value, skipping");
             return Ok(());
         }
-        self.change_record(
-            aws_sdk_route53::types::ChangeAction::Delete,
-            domain,
-            &value,
-        )
-        .await?;
+        self.change_record(aws_sdk_route53::types::ChangeAction::Delete, domain, &value)
+            .await?;
         info!(domain = %domain, "Route53 DNS TXT record deleted");
         Ok(())
     }
 }
 
 /// Build a `DnsChallenger` from a `DnsChallengeConfig`.
-pub async fn build_dns_challenger(config: &DnsChallengeConfig) -> Result<Box<dyn DnsChallenger>, String> {
+pub async fn build_dns_challenger(
+    config: &DnsChallengeConfig,
+) -> Result<Box<dyn DnsChallenger>, String> {
     config.validate()?;
     match config.provider.as_str() {
         "cloudflare" => Ok(Box::new(CloudflareDnsChallenger::new(
@@ -787,11 +784,14 @@ pub async fn build_dns_challenger(config: &DnsChallengeConfig) -> Result<Box<dyn
             config.api_token.clone(),
         ))),
         #[cfg(feature = "route53")]
-        "route53" => Ok(Box::new(Route53DnsChallenger::new(
-            config.zone_id.clone(),
-            config.api_token.clone(),
-            config.api_secret.clone().unwrap_or_default(),
-        ).await)),
+        "route53" => Ok(Box::new(
+            Route53DnsChallenger::new(
+                config.zone_id.clone(),
+                config.api_token.clone(),
+                config.api_secret.clone().unwrap_or_default(),
+            )
+            .await,
+        )),
         #[cfg(not(feature = "route53"))]
         "route53" => Err("route53 provider requires the 'route53' feature flag".into()),
         other => Err(format!("unsupported DNS provider: {other}")),
@@ -1184,8 +1184,7 @@ pub async fn provision_dns_manual(
         domain: body.domain,
         txt_record_name,
         txt_record_value: txt_value,
-        message: "Create a DNS TXT record with the above name and value, then call confirm."
-            .into(),
+        message: "Create a DNS TXT record with the above name and value, then call confirm.".into(),
     }))
 }
 
@@ -1308,15 +1307,12 @@ pub async fn provision_dns_manual_confirm(
                     .certificate()
                     .await
                     .map_err(|e| ApiError::Internal(format!("certificate download failed: {e}")))?;
-                break cert
-                    .ok_or_else(|| ApiError::Internal("no certificate returned".into()))?;
+                break cert.ok_or_else(|| ApiError::Internal("no certificate returned".into()))?;
             }
             OrderStatus::Processing => {
                 attempts += 1;
                 if attempts > 30 {
-                    return Err(ApiError::Internal(
-                        "certificate issuance timed out".into(),
-                    ));
+                    return Err(ApiError::Internal("certificate issuance timed out".into()));
                 }
                 order
                     .refresh()

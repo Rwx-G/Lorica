@@ -54,9 +54,7 @@ impl CommandChannel {
     /// After this call, the CommandChannel owns the fd and will close it on drop.
     pub unsafe fn from_raw_fd(fd: RawFd) -> Result<Self, ChannelError> {
         let std_stream = std::os::unix::net::UnixStream::from_raw_fd(fd);
-        std_stream
-            .set_nonblocking(true)
-            .map_err(ChannelError::Io)?;
+        std_stream.set_nonblocking(true).map_err(ChannelError::Io)?;
         let stream = UnixStream::from_std(std_stream).map_err(ChannelError::Io)?;
         Ok(Self {
             stream,
@@ -125,7 +123,11 @@ impl CommandChannel {
         let mut len_buf = [0u8; 8];
         match self.stream.try_read(&mut len_buf) {
             Ok(8) => {}
-            Ok(0) => return Err(ChannelError::Io(io::Error::from(io::ErrorKind::UnexpectedEof))),
+            Ok(0) => {
+                return Err(ChannelError::Io(io::Error::from(
+                    io::ErrorKind::UnexpectedEof,
+                )))
+            }
             Ok(_) => {
                 // Partial read of length header - read the rest
                 let read = self

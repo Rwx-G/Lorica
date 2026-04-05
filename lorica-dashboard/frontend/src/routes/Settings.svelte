@@ -93,9 +93,9 @@
   const SS_PREF_KEY = 'lorica_self_signed_pref';
   let selfSignedPrefValue = $state<string | null>(localStorage.getItem(SS_PREF_KEY));
 
-  function resetSelfSignedPref() {
-    localStorage.removeItem(SS_PREF_KEY);
-    selfSignedPrefValue = null;
+  function setSelfSignedPref(value: 'never' | 'always' | 'once') {
+    localStorage.setItem(SS_PREF_KEY, value);
+    selfSignedPrefValue = value;
   }
 
   // Export/Import
@@ -729,12 +729,11 @@
           <code>self_signed_cert</code>
           <span class="pref-hint">Self-signed certificate generation prompt preference</span>
         </div>
-        <label class="toggle-label">
-          <span>{selfSignedPrefValue === 'always' ? 'Always allow' : selfSignedPrefValue === 'never' ? 'Never' : selfSignedPrefValue === 'once' ? 'Ask each time' : 'Not set'}</span>
-          {#if selfSignedPrefValue}
-            <button class="btn btn-small btn-cancel" onclick={resetSelfSignedPref}>Reset</button>
-          {/if}
-        </label>
+        <div class="toggle-triple">
+          <button class:active={selfSignedPrefValue === 'never'} onclick={() => setSelfSignedPref('never')}>Never</button>
+          <button class:active={selfSignedPrefValue === 'once' || !selfSignedPrefValue} onclick={() => setSelfSignedPref('once')}>Ask</button>
+          <button class:active={selfSignedPrefValue === 'always'} onclick={() => setSelfSignedPref('always')}>Always</button>
+        </div>
       </div>
 
       {#if preferences.length === 0}
@@ -1431,6 +1430,37 @@
 
   .toggle.on .toggle-knob {
     transform: translateX(16px);
+  }
+
+  .toggle-triple {
+    display: inline-flex;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+
+  .toggle-triple button {
+    padding: 0.25rem 0.75rem;
+    font-size: var(--text-xs);
+    border: none;
+    background: var(--color-bg-input);
+    color: var(--color-text-muted);
+    cursor: pointer;
+    transition: background-color var(--transition-fast), color var(--transition-fast);
+  }
+
+  .toggle-triple button:not(:last-child) {
+    border-right: 1px solid var(--color-border);
+  }
+
+  .toggle-triple button.active {
+    background: var(--color-primary);
+    color: white;
+    font-weight: 600;
+  }
+
+  .toggle-triple button:hover:not(.active) {
+    background: var(--color-bg-hover);
   }
 
   .notif-fieldset {

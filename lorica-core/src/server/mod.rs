@@ -22,18 +22,18 @@ pub(crate) mod transfer_fd;
 use async_trait::async_trait;
 use daemon::daemonize;
 use daggy::NodeIndex;
-use lorica_timeout::fast_timeout;
 use log::{debug, error, info, warn};
-use parking_lot::Mutex;
 use lorica_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
+use lorica_timeout::fast_timeout;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::thread;
 use std::time::SystemTime;
 use tokio::signal::unix;
-use tokio::sync::{broadcast, watch};
-use tokio::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{broadcast, watch};
 use tokio::time::sleep;
+use tokio::time::Duration;
 
 use crate::prelude::background_service;
 use crate::server::bootstrap_services::{Bootstrap, BootstrapService};
@@ -295,7 +295,7 @@ impl Server {
         }
     }
 
-        /// Get the configured file descriptors for listening
+    /// Get the configured file descriptors for listening
     fn listen_fds(&self) -> Option<ListenFds> {
         self.bootstrap.lock().get_fds()
     }
@@ -340,12 +340,7 @@ impl Server {
 
             // Start the actual service, passing the ready notifier
             service
-                .start_service(
-                    fds,
-                    shutdown,
-                    listeners_per_fd,
-                    ready_notifier,
-                )
+                .start_service(fds, shutdown, listeners_per_fd, ready_notifier)
                 .await;
             info!("service '{}' exited.", service_name);
         });

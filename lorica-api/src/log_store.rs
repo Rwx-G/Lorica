@@ -119,7 +119,8 @@ impl LogStore {
         let limit = params.limit.unwrap_or(200).min(10_000);
 
         let count_sql = format!("SELECT COUNT(*) FROM access_logs {where_clause}");
-        let refs: Vec<&dyn rusqlite::types::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
         let total: usize = conn
             .query_row(&count_sql, refs.as_slice(), |row| row.get(0))
             .map_err(|e| format!("failed to count access logs: {e}"))?;

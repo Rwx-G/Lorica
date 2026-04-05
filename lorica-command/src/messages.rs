@@ -294,13 +294,11 @@ mod tests {
             timestamp_ms: 1234567890,
             cache_hits: 3000,
             cache_misses: 2000,
-            ban_entries: vec![
-                BanReportEntry {
-                    ip: "192.168.1.100".into(),
-                    remaining_seconds: 300,
-                    ban_duration_seconds: 600,
-                },
-            ],
+            ban_entries: vec![BanReportEntry {
+                ip: "192.168.1.100".into(),
+                remaining_seconds: 300,
+                ban_duration_seconds: 600,
+            }],
             ewma_entries: vec![
                 EwmaReportEntry {
                     backend_address: "10.0.0.1:8080".into(),

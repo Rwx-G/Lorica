@@ -352,13 +352,7 @@ where
         // Signal ready immediately
         ready_notifier.notify_ready();
 
-        S::start_service(
-            self,
-            fds,
-            shutdown,
-            listeners_per_fd,
-        )
-        .await
+        S::start_service(self, fds, shutdown, listeners_per_fd).await
     }
 
     fn name(&self) -> &str {

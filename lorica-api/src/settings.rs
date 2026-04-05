@@ -177,9 +177,8 @@ pub async fn test_notification(
 
     match nc.channel {
         lorica_config::models::NotificationChannel::Email => {
-            let config: lorica_notify::channels::EmailConfig =
-                serde_json::from_str(&nc.config)
-                    .map_err(|e| ApiError::BadRequest(format!("invalid email config: {e}")))?;
+            let config: lorica_notify::channels::EmailConfig = serde_json::from_str(&nc.config)
+                .map_err(|e| ApiError::BadRequest(format!("invalid email config: {e}")))?;
             lorica_notify::channels::email::send(&config, &test_event)
                 .await
                 .map_err(|e| ApiError::Internal(format!("email send failed: {e}")))?;

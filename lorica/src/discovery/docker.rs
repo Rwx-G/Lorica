@@ -81,12 +81,7 @@ impl DockerDiscovery {
             let (running, desired) = svc
                 .service_status
                 .as_ref()
-                .map(|s| {
-                    (
-                        s.running_tasks.unwrap_or(0),
-                        s.desired_tasks.unwrap_or(0),
-                    )
-                })
+                .map(|s| (s.running_tasks.unwrap_or(0), s.desired_tasks.unwrap_or(0)))
                 .unwrap_or((0, 0));
 
             let healthy = running > 0 && running >= desired;
@@ -154,10 +149,7 @@ impl DockerDiscovery {
                     }
                 }
             } else {
-                warn!(
-                    service = svc_name,
-                    "Docker Swarm service has no endpoint"
-                );
+                warn!(service = svc_name, "Docker Swarm service has no endpoint");
             }
         }
 

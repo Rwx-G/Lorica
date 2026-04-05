@@ -11,9 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use old_version::{Bucket as OldBucket, Continuum as OldContinuum};
 #[allow(unused_imports)]
 use lorica_ketama::{Bucket, Continuum, Version, DEFAULT_POINT_MULTIPLE};
+use old_version::{Bucket as OldBucket, Continuum as OldContinuum};
 use rand::{random, random_range, rng, seq::IteratorRandom};
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};

@@ -183,7 +183,11 @@ pub async fn health_check_loop(
 
             // HA and Custom: run active probes (HTTP if path set, else TCP)
             let probe = if let Some(ref path) = backend.health_check_path {
-                let scheme = if backend.tls_upstream { "https" } else { "http" };
+                let scheme = if backend.tls_upstream {
+                    "https"
+                } else {
+                    "http"
+                };
                 let url = format!("{scheme}://{}{path}", backend.address);
                 http_probe(&url).await
             } else {

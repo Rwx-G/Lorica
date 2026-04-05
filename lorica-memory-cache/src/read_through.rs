@@ -19,8 +19,8 @@ use super::{CacheStatus, MemoryCache};
 
 use async_trait::async_trait;
 use log::warn;
-use parking_lot::RwLock;
 use lorica_error::{Error, ErrorTrait};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;

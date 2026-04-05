@@ -41,8 +41,8 @@ use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use http::{header, version::Version, Method};
 use log::{debug, error, trace, warn};
-use once_cell::sync::Lazy;
 use lorica_http::{RequestHeader, ResponseHeader};
+use once_cell::sync::Lazy;
 use std::fmt::Debug;
 use std::str;
 use std::sync::{

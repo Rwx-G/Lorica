@@ -24,8 +24,8 @@ use std::io::BufReader;
 use std::path::Path;
 
 use log::warn;
-pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use lorica_error::{Error, ErrorType, OrErr, Result};
+pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 
 pub use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 pub use rustls::server::ResolvesServerCert;
@@ -37,7 +37,7 @@ pub use rustls::{
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
 pub use rustls_pki_types::{
-    CertificateRevocationListDer, CertificateDer, PrivateKeyDer, ServerName, UnixTime,
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
 };
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
@@ -178,15 +178,12 @@ pub fn load_pem_file_private_key(path: &String) -> Result<Vec<u8>> {
 }
 
 /// Load CRLs from a PEM or DER file. Supports files containing multiple CRLs.
-pub fn load_crls_from_file<P: AsRef<Path>>(path: P) -> Result<Vec<CertificateRevocationListDer<'static>>> {
+pub fn load_crls_from_file<P: AsRef<Path>>(
+    path: P,
+) -> Result<Vec<CertificateRevocationListDer<'static>>> {
     let mut reader = load_file(&path)?;
     let crls: Vec<CertificateRevocationListDer<'static>> = rustls_pemfile::crls(&mut reader)
-        .map(|item_res| {
-            item_res.or_err(
-                ErrorType::InvalidCert,
-                "Failed to load CRL from file",
-            )
-        })
+        .map(|item_res| item_res.or_err(ErrorType::InvalidCert, "Failed to load CRL from file"))
         .collect::<Result<Vec<_>>>()?;
 
     if crls.is_empty() {
@@ -248,7 +245,8 @@ MBFHMbCjYvz3MFZd10rdBXJn0gnJEnA/UeCub7A=\n\
         {
             // Write raw bytes (not valid CRL, but tests the DER fallback path)
             let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(b"\x30\x82\x00\x05\x00\x00\x00\x00\x00").unwrap();
+            f.write_all(b"\x30\x82\x00\x05\x00\x00\x00\x00\x00")
+                .unwrap();
         }
         let crls = load_crls_from_file(&path).unwrap();
         assert_eq!(crls.len(), 1);
@@ -260,7 +258,10 @@ MBFHMbCjYvz3MFZd10rdBXJn0gnJEnA/UeCub7A=\n\
         // Verify that WebPkiServerVerifier can be built with CRLs.
         // Requires platform CA certificates (skipped in minimal containers).
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("test_lorica_crl_verifier_{}.pem", std::process::id()));
+        let path = dir.join(format!(
+            "test_lorica_crl_verifier_{}.pem",
+            std::process::id()
+        ));
         {
             let mut f = std::fs::File::create(&path).unwrap();
             f.write_all(TEST_CRL_PEM.as_bytes()).unwrap();

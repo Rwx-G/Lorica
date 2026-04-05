@@ -55,11 +55,7 @@ pub fn create_socketpair() -> Result<(OwnedFd, OwnedFd), WorkerError> {
 ///
 /// The addresses are serialized as space-separated strings in the message payload.
 /// The FDs are sent via SCM_RIGHTS ancillary data.
-pub fn send_listener_fds(
-    sock: RawFd,
-    fds: &[RawFd],
-    addrs: &[String],
-) -> Result<(), WorkerError> {
+pub fn send_listener_fds(sock: RawFd, fds: &[RawFd], addrs: &[String]) -> Result<(), WorkerError> {
     if fds.len() != addrs.len() {
         return Err(WorkerError::FdAddrMismatch {
             fds: fds.len(),
@@ -134,9 +130,8 @@ pub fn create_tcp_listener(addr: &str) -> Result<(RawFd, String), WorkerError> {
         socket2::Domain::IPV6
     };
 
-    let socket =
-        socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-            .map_err(WorkerError::CreateSocket)?;
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .map_err(WorkerError::CreateSocket)?;
 
     socket
         .set_reuse_address(true)

@@ -154,7 +154,13 @@ fn main() {
             upstream_crl_file,
         }) => {
             init_logging(&log_level);
-            run_worker(id, cmd_fd, &data_dir, https_port, upstream_crl_file.as_deref());
+            run_worker(
+                id,
+                cmd_fd,
+                &data_dir,
+                https_port,
+                upstream_crl_file.as_deref(),
+            );
         }
         None => {
             init_logging(&cli.log_level);
@@ -726,7 +732,13 @@ fn run_supervisor(cli: Cli) {
 // Worker mode (Unix only): receives FDs from supervisor, runs proxy engine
 // ---------------------------------------------------------------------------
 
-fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16, upstream_crl_file: Option<&str>) {
+fn run_worker(
+    id: u32,
+    cmd_fd: i32,
+    data_dir: &str,
+    https_port: u16,
+    upstream_crl_file: Option<&str>,
+) {
     use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_core::server::Fds;
     use lorica_worker::fd_passing;
@@ -803,7 +815,11 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16, upstream_cr
             if let Err(e) = cert_resolver.reload(cert_data) {
                 warn!(error = %e, "worker failed to load certificates into resolver");
             } else {
-                info!(worker_id = id, domains = cert_resolver.domain_count(), "worker loaded TLS certificates");
+                info!(
+                    worker_id = id,
+                    domains = cert_resolver.domain_count(),
+                    "worker loaded TLS certificates"
+                );
             }
         }
     });
@@ -888,7 +904,7 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16, upstream_cr
                         std::process::exit(0);
                     }
                     CommandType::MetricsRequest => {
-                        use lorica_command::{MetricsReport, BanReportEntry, EwmaReportEntry};
+                        use lorica_command::{BanReportEntry, EwmaReportEntry, MetricsReport};
 
                         // Collect ban list entries (skip expired)
                         let ban_entries: Vec<BanReportEntry> = cmd_ban_list
@@ -978,7 +994,10 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16, upstream_cr
                     Ok(entry) => {
                         if let Ok(json) = serde_json::to_string(&entry) {
                             let line = format!("{json}\n");
-                            if tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes()).await.is_err() {
+                            if tokio::io::AsyncWriteExt::write_all(&mut writer, line.as_bytes())
+                                .await
+                                .is_err()
+                            {
                                 break; // supervisor disconnected
                             }
                             let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
@@ -1004,9 +1023,10 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16, upstream_cr
     lorica_proxy.ban_list = worker_ban_list;
     lorica_proxy.ewma_tracker = worker_ewma;
 
-    let mut server_conf = lorica_core::server::configuration::ServerConf::default();
-    server_conf.upstream_crl_file = upstream_crl_file.map(|s| s.to_string());
-    let server_conf = Arc::new(server_conf);
+    let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
+        upstream_crl_file: upstream_crl_file.map(|s| s.to_string()),
+        ..Default::default()
+    });
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
 
     // Register listeners - TCP for HTTP, TLS for HTTPS
@@ -1026,8 +1046,7 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16, upstream_cr
 
     info!(worker_id = id, "starting proxy engine");
 
-    let mut server =
-        lorica_core::server::Server::new(None).expect("failed to create proxy server");
+    let mut server = lorica_core::server::Server::new(None).expect("failed to create proxy server");
     server.set_listen_fds(fds);
     server.add_service(proxy_service);
     server.run_forever();
@@ -1157,8 +1176,11 @@ fn run_single_process(cli: Cli) {
             // Restore custom WAF rules
             if let Ok(custom_rules) = s.load_waf_custom_rules() {
                 for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
-                    let category = cat.parse().unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
-                    let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
+                    let category = cat
+                        .parse()
+                        .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
+                    let _ =
+                        waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
                 }
                 if !custom_rules.is_empty() {
                     info!(count = custom_rules.len(), "WAF custom rules restored");
@@ -1180,10 +1202,8 @@ fn run_single_process(cli: Cli) {
         };
         let notification_history = notify_dispatcher.history();
         let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
-        let _alert_dispatcher = lorica_notify::spawn_alert_dispatcher(
-            &alert_sender,
-            Arc::clone(&notify_dispatcher),
-        );
+        let _alert_dispatcher =
+            lorica_notify::spawn_alert_dispatcher(&alert_sender, Arc::clone(&notify_dispatcher));
 
         // Create SLA collector and start background flush task
         let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
@@ -1228,9 +1248,10 @@ fn run_single_process(cli: Cli) {
         let proxy_cache_misses = Arc::clone(&lorica_proxy.cache_misses);
         let proxy_ban_list = Arc::clone(&lorica_proxy.ban_list);
         let proxy_ewma_scores = lorica_proxy.ewma_tracker.scores_ref();
-        let mut server_conf = lorica_core::server::configuration::ServerConf::default();
-        server_conf.upstream_crl_file = cli.upstream_crl_file.clone();
-        let server_conf = Arc::new(server_conf);
+        let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
+            upstream_crl_file: cli.upstream_crl_file.clone(),
+            ..Default::default()
+        });
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
         let mut tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
         tcp_opts.so_reuseport = Some(true);
@@ -1253,7 +1274,11 @@ fn run_single_process(cli: Cli) {
                 Some(tls_tcp_opts),
                 tls_settings,
             );
-            info!(port = https_port, domains = cert_resolver.domain_count(), "HTTPS proxy listener configured with SNI resolver");
+            info!(
+                port = https_port,
+                domains = cert_resolver.domain_count(),
+                "HTTPS proxy listener configured with SNI resolver"
+            );
         }
 
         // Create config reload channel so API mutations can trigger proxy reload
@@ -1308,9 +1333,13 @@ fn run_single_process(cli: Cli) {
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
 
-            if let Err(e) =
-                lorica_api::server::start_server(management_port, state, session_store, rate_limiter)
-                    .await
+            if let Err(e) = lorica_api::server::start_server(
+                management_port,
+                state,
+                session_store,
+                rate_limiter,
+            )
+            .await
             {
                 error!(error = %e, "API server exited with error");
             }
@@ -1367,7 +1396,14 @@ fn run_single_process(cli: Cli) {
                 .unwrap_or(10)
         };
         let health_handle = tokio::spawn(async move {
-            health::health_check_loop(health_store, health_config, health_interval, Some(backend_conns), Some(health_alert_sender2)).await;
+            health::health_check_loop(
+                health_store,
+                health_config,
+                health_interval,
+                Some(backend_conns),
+                Some(health_alert_sender2),
+            )
+            .await;
         });
 
         // Run the proxy engine in a dedicated thread
@@ -1397,17 +1433,28 @@ fn build_notify_dispatcher(store: &lorica_config::ConfigStore) -> lorica_notify:
             let config_json = &nc.config;
             match nc.channel {
                 lorica_config::models::NotificationChannel::Email => {
-                    if let Ok(email_cfg) = serde_json::from_str::<lorica_notify::channels::EmailConfig>(config_json) {
+                    if let Ok(email_cfg) =
+                        serde_json::from_str::<lorica_notify::channels::EmailConfig>(config_json)
+                    {
                         dispatcher.add_email_channel(nc.id, email_cfg, nc.alert_types, nc.enabled);
                     }
                 }
                 lorica_config::models::NotificationChannel::Webhook => {
-                    if let Ok(webhook_cfg) = serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json) {
-                        dispatcher.add_webhook_channel(nc.id, webhook_cfg, nc.alert_types, nc.enabled);
+                    if let Ok(webhook_cfg) =
+                        serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
+                    {
+                        dispatcher.add_webhook_channel(
+                            nc.id,
+                            webhook_cfg,
+                            nc.alert_types,
+                            nc.enabled,
+                        );
                     }
                 }
                 lorica_config::models::NotificationChannel::Slack => {
-                    if let Ok(slack_cfg) = serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json) {
+                    if let Ok(slack_cfg) =
+                        serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
+                    {
                         dispatcher.add_slack_channel(nc.id, slack_cfg, nc.alert_types, nc.enabled);
                     }
                 }

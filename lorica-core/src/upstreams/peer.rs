@@ -46,7 +46,7 @@ pub use crate::protocols::tls::ALPN;
 /// response headers from when the proxy connection was first established.
 pub type ProxyDigestUserDataHook = Arc<
     dyn Fn(
-            &http::request::Parts,         // request headers
+            &http::request::Parts,        // request headers
             &lorica_http::ResponseHeader, // response headers
         ) -> Option<Box<dyn std::any::Any + Send + Sync>>
         + Send
@@ -228,7 +228,6 @@ pub trait Peer: Display + Clone {
             .proxy_digest_user_data_hook
             .as_ref()
     }
-
 }
 
 /// A simple TCP or TLS peer without many complicated settings.

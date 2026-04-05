@@ -56,10 +56,7 @@ pub struct UpdateBackendRequest {
     pub h2_upstream: Option<bool>,
 }
 
-fn backend_to_response(
-    b: &lorica_config::models::Backend,
-    ewma_score: f64,
-) -> BackendResponse {
+fn backend_to_response(b: &lorica_config::models::Backend, ewma_score: f64) -> BackendResponse {
     BackendResponse {
         id: b.id.clone(),
         address: b.address.clone(),
@@ -153,7 +150,10 @@ pub async fn get_backend(
     let backend = store
         .get_backend(&id)?
         .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
-    Ok(json_data(backend_to_response(&backend, get_ewma_score(&state, &backend.address))))
+    Ok(json_data(backend_to_response(
+        &backend,
+        get_ewma_score(&state, &backend.address),
+    )))
 }
 
 /// PUT /api/v1/backends/:id
@@ -202,7 +202,10 @@ pub async fn update_backend(
     store.update_backend(&backend)?;
     drop(store);
     state.notify_config_changed();
-    Ok(json_data(backend_to_response(&backend, get_ewma_score(&state, &backend.address))))
+    Ok(json_data(backend_to_response(
+        &backend,
+        get_ewma_score(&state, &backend.address),
+    )))
 }
 
 /// DELETE /api/v1/backends/:id

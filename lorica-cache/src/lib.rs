@@ -16,7 +16,6 @@
 
 #![allow(clippy::new_without_default)]
 
-use trace::Tag;
 use http::{method::Method, request::Parts as ReqHeader, response::Parts as RespHeader};
 use key::{CacheHashKey, CompactCacheKey, HashBinary};
 use lock::WritePermit;
@@ -27,6 +26,7 @@ use lorica_timeout::timeout;
 use std::time::{Duration, Instant, SystemTime};
 use storage::MissFinishType;
 use strum::IntoStaticStr;
+use trace::Tag;
 use trace::{CacheTraceCTX, Span};
 
 pub mod cache_control;

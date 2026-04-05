@@ -90,7 +90,6 @@ impl SocketAddr {
             Err(_e) => None,
         }
     }
-
 }
 
 impl std::fmt::Display for SocketAddr {

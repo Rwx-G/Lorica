@@ -15,8 +15,8 @@
 //! Error response generating utilities.
 
 use http::header;
-use once_cell::sync::Lazy;
 use lorica_http::ResponseHeader;
+use once_cell::sync::Lazy;
 
 use super::SERVER_NAME;
 

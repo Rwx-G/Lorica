@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use once_cell::sync::Lazy;
 #[cfg(feature = "s2n")]
 use lorica_core::tls::load_pem_file;
 #[cfg(feature = "rustls")]
@@ -22,6 +21,7 @@ use lorica_core::tls::{
     pkey::{PKey, Private},
     x509::X509,
 };
+use once_cell::sync::Lazy;
 use std::fs;
 
 #[cfg(feature = "openssl_derived")]

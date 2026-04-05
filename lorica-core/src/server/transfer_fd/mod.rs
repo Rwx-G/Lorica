@@ -21,13 +21,13 @@ use nix::sys::socket::{
 };
 #[cfg(target_os = "linux")]
 use nix::sys::stat;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
 use nix::NixPath;
 use std::collections::HashMap;
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{IoSlice, IoSliceMut};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use std::{thread, time};
@@ -352,8 +352,8 @@ where
 #[cfg(target_os = "linux")]
 mod tests {
     use super::*;
-    use std::os::unix::io::IntoRawFd;
     use log::{debug, error};
+    use std::os::unix::io::IntoRawFd;
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -463,8 +463,7 @@ mod tests {
 
         let child = thread::spawn(move || {
             let mut fds2 = Fds::new();
-            fds2.get_from_sock("/tmp/lorica_fds_receive2.sock")
-                .unwrap();
+            fds2.get_from_sock("/tmp/lorica_fds_receive2.sock").unwrap();
             assert!(*fds2.get(&key1).unwrap() > 0);
             assert!(*fds2.get(&key2).unwrap() > 0);
         });

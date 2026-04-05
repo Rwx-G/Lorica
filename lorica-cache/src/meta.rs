@@ -16,10 +16,10 @@
 
 pub use http::Extensions;
 use log::warn;
-use once_cell::sync::{Lazy, OnceCell};
 use lorica_error::{Error, ErrorType::*, OrErr, Result};
 use lorica_header_serde::HeaderSerde;
 use lorica_http::{HMap, ResponseHeader};
+use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::time::{Duration, SystemTime};

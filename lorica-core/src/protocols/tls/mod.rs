@@ -159,7 +159,6 @@ impl ALPN {
             ALPN::Custom(custom) => vec![custom.protocol().to_vec()],
         }
     }
-
 }
 
 #[cfg(test)]

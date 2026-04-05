@@ -43,17 +43,13 @@ impl K8sDiscovery {
         service_name: &str,
         target_port: u16,
     ) -> Result<Vec<DiscoveredEndpoint>, DiscoveryError> {
-        let endpoints_api: Api<Endpoints> =
-            Api::namespaced(self.client.clone(), namespace);
+        let endpoints_api: Api<Endpoints> = Api::namespaced(self.client.clone(), namespace);
 
-        let ep = endpoints_api
-            .get(service_name)
-            .await
-            .map_err(|e| {
-                DiscoveryError::Kubernetes(format!(
-                    "failed to get endpoints for {namespace}/{service_name}: {e}"
-                ))
-            })?;
+        let ep = endpoints_api.get(service_name).await.map_err(|e| {
+            DiscoveryError::Kubernetes(format!(
+                "failed to get endpoints for {namespace}/{service_name}: {e}"
+            ))
+        })?;
 
         let mut discovered = Vec::new();
 
@@ -82,10 +78,7 @@ impl K8sDiscovery {
 
                         let mut labels = std::collections::HashMap::new();
                         labels.insert("source".to_string(), "kubernetes".to_string());
-                        labels.insert(
-                            "namespace".to_string(),
-                            namespace.to_string(),
-                        );
+                        labels.insert("namespace".to_string(), namespace.to_string());
                         if let Some(ref target_ref) = addr.target_ref {
                             if let Some(ref name) = target_ref.name {
                                 labels.insert("pod".to_string(), name.clone());
@@ -118,10 +111,7 @@ impl K8sDiscovery {
 
                         let mut labels = std::collections::HashMap::new();
                         labels.insert("source".to_string(), "kubernetes".to_string());
-                        labels.insert(
-                            "namespace".to_string(),
-                            namespace.to_string(),
-                        );
+                        labels.insert("namespace".to_string(), namespace.to_string());
                         labels.insert("ready".to_string(), "false".to_string());
 
                         debug!(
@@ -160,8 +150,9 @@ impl K8sDiscovery {
         &self,
         namespace: &str,
         service_name: &str,
-    ) -> impl futures_util::Stream<Item = Result<kube::runtime::watcher::Event<Endpoints>, kube::runtime::watcher::Error>>
-    {
+    ) -> impl futures_util::Stream<
+        Item = Result<kube::runtime::watcher::Event<Endpoints>, kube::runtime::watcher::Error>,
+    > {
         let endpoints_api: Api<Endpoints> = Api::namespaced(self.client.clone(), namespace);
 
         let config = kube::runtime::watcher::Config::default()

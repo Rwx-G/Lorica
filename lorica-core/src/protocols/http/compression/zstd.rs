@@ -14,8 +14,8 @@
 
 use super::{Encode, COMPRESSION_ERROR};
 use bytes::Bytes;
-use parking_lot::Mutex;
 use lorica_error::{OrErr, Result};
+use parking_lot::Mutex;
 use std::io::Write;
 use std::time::{Duration, Instant};
 use zstd::stream::write::Encoder;

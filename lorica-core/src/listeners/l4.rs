@@ -19,13 +19,13 @@ use lorica_error::{
     ErrorType::{AcceptError, BindError},
     OrErr, Result,
 };
+use std::fs::Permissions;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixListener as StdUnixListener;
-use std::time::Duration;
-use std::fs::Permissions;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket};
 
 #[cfg(feature = "connection_filter")]
@@ -200,10 +200,15 @@ fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
         }
         ServerAddress::Tcp(_, _) => {
             let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-            std_listener.set_nonblocking(true)
-                .or_err_with(BindError, || format!("set_nonblocking failed on {address:?}"))?;
+            std_listener
+                .set_nonblocking(true)
+                .or_err_with(BindError, || {
+                    format!("set_nonblocking failed on {address:?}")
+                })?;
             Ok(TcpListener::from_std(std_listener)
-                .or_err_with(BindError, || format!("TcpListener::from_std failed on {address:?}"))?
+                .or_err_with(BindError, || {
+                    format!("TcpListener::from_std failed on {address:?}")
+                })?
                 .into())
         }
     }
@@ -335,7 +340,6 @@ impl ListenerEndpointBuilder {
             connection_filter,
         })
     }
-
 }
 
 impl ListenerEndpoint {

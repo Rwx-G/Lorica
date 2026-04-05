@@ -18,9 +18,9 @@ use super::EvictionManager;
 use crate::key::CompactCacheKey;
 
 use async_trait::async_trait;
+use lorica_error::{BError, ErrorType::*, OrErr, Result};
 use lru::LruCache;
 use parking_lot::RwLock;
-use lorica_error::{BError, ErrorType::*, OrErr, Result};
 use rand::Rng;
 use serde::de::SeqAccess;
 use serde::{Deserialize, Serialize};

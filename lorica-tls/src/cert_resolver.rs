@@ -28,7 +28,6 @@ use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use log::warn;
 use lorica_error::{Error, ErrorType, OrErr, Result};
 use rustls::crypto::aws_lc_rs::sign::any_supported_type;
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -81,6 +80,12 @@ impl fmt::Debug for CertResolver {
     }
 }
 
+impl Default for CertResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CertResolver {
     /// Create an empty resolver.
     pub fn new() -> Self {
@@ -121,8 +126,7 @@ impl CertResolver {
             entries.sort_by(|a, b| b.not_after_epoch.cmp(&a.not_after_epoch));
         }
 
-        self.inner
-            .store(Arc::new(CertResolverInner { certs: map }));
+        self.inner.store(Arc::new(CertResolverInner { certs: map }));
         Ok(())
     }
 
@@ -218,9 +222,7 @@ mod tests {
     // Self-signed test certificate for "test.example.com" generated at build time
     // is not practical, so we test the resolver logic with mock entries.
 
-    fn make_resolver_with_entries(
-        entries: Vec<(&str, i64)>,
-    ) -> CertResolver {
+    fn make_resolver_with_entries(entries: Vec<(&str, i64)>) -> CertResolver {
         let resolver = CertResolver::new();
 
         // We can't easily create real CertifiedKeys in tests without valid certs,

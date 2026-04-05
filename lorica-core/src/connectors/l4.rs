@@ -288,8 +288,8 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upstreams::peer::{BasicPeer, HttpPeer};
     use crate::upstreams::peer::Proxy;
+    use crate::upstreams::peer::{BasicPeer, HttpPeer};
     use lorica_error::ErrorType;
     use std::collections::BTreeMap;
     use std::path::PathBuf;

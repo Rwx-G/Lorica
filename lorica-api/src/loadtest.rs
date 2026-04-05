@@ -120,17 +120,39 @@ pub async fn update_config(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("load test config {id}")))?;
 
-    if let Some(v) = body.name { config.name = v; }
-    if let Some(v) = body.target_url { config.target_url = v; }
-    if let Some(v) = body.method { config.method = v; }
-    if let Some(v) = body.headers { config.headers = v; }
-    if let Some(v) = body.body { config.body = Some(v); }
-    if let Some(v) = body.concurrency { config.concurrency = v; }
-    if let Some(v) = body.requests_per_second { config.requests_per_second = v; }
-    if let Some(v) = body.duration_s { config.duration_s = v; }
-    if let Some(v) = body.error_threshold_pct { config.error_threshold_pct = v; }
-    if let Some(v) = body.schedule_cron { config.schedule_cron = Some(v); }
-    if let Some(v) = body.enabled { config.enabled = v; }
+    if let Some(v) = body.name {
+        config.name = v;
+    }
+    if let Some(v) = body.target_url {
+        config.target_url = v;
+    }
+    if let Some(v) = body.method {
+        config.method = v;
+    }
+    if let Some(v) = body.headers {
+        config.headers = v;
+    }
+    if let Some(v) = body.body {
+        config.body = Some(v);
+    }
+    if let Some(v) = body.concurrency {
+        config.concurrency = v;
+    }
+    if let Some(v) = body.requests_per_second {
+        config.requests_per_second = v;
+    }
+    if let Some(v) = body.duration_s {
+        config.duration_s = v;
+    }
+    if let Some(v) = body.error_threshold_pct {
+        config.error_threshold_pct = v;
+    }
+    if let Some(v) = body.schedule_cron {
+        config.schedule_cron = Some(v);
+    }
+    if let Some(v) = body.enabled {
+        config.enabled = v;
+    }
     config.updated_at = Utc::now();
 
     store

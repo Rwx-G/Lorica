@@ -156,7 +156,12 @@ impl WafEngine {
 
     /// Return the IDs of currently disabled rules.
     pub fn disabled_rule_ids(&self) -> Vec<u32> {
-        self.disabled_rules.read().unwrap().iter().copied().collect()
+        self.disabled_rules
+            .read()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Bulk-set which rules are disabled.
@@ -417,10 +422,7 @@ mod tests {
             WafMode::Detection,
             "/index.html",
             None,
-            &[
-                ("accept", "text/html"),
-                ("cookie", "session=abc123"),
-            ],
+            &[("accept", "text/html"), ("cookie", "session=abc123")],
             "example.com",
         );
         assert_eq!(verdict, WafVerdict::Pass);
@@ -683,7 +685,10 @@ mod tests {
                 "/api/v1/users/123/profile",
                 Some("page=1&limit=20&sort=name&order=asc"),
                 &[
-                    ("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"),
+                    (
+                        "user-agent",
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                    ),
                     ("accept", "application/json"),
                     ("cookie", "session=abcdef123456"),
                 ],

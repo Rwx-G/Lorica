@@ -15,8 +15,8 @@
 //! Generic connection pooling
 
 use log::{debug, warn};
-use parking_lot::{Mutex, RwLock};
 use lorica_timeout::{sleep, timeout};
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;

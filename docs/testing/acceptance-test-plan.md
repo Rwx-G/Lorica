@@ -93,11 +93,11 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.31 | Nginx import wizard | Dashboard | Paste nginx.conf -> resources created | - | |
 | 4.32 | Hot-reload on API change | Proxy | Edit route -> traffic reflects change immediately | 1.8, 2.2 | |
 | | **5. CERTIFICATES** | | | | |
-| 5.1 | Upload PEM certificate | Dashboard | Issuer/dates/SANs parsed correctly | 1.7 | |
-| 5.2 | Certificate detail view | Dashboard | Eye icon -> full metadata, chain, routes | 1.7 | |
-| 5.3 | Expiration thresholds config | Dashboard | Gear icon -> warning (30d) / critical (7d) | 1.7 | |
-| 5.4 | Expiry badge colors | Dashboard | <7d red, <30d orange, >30d green | 1.7 | |
-| 5.5 | Self-signed generation | Dashboard | "Self-signed" -> cert created | 1.7 | |
+| 5.1 | Upload PEM certificate | Dashboard | Issuer/dates/SANs parsed correctly | 1.7 | OK |
+| 5.2 | Certificate detail view | Dashboard | Eye icon -> full metadata, chain, routes | 1.7 | OK |
+| 5.3 | Expiration thresholds config | Dashboard | Gear icon -> warning (30d) / critical (7d) | 1.7 | OK |
+| 5.4 | Expiry badge colors | Dashboard | <7d red, <30d orange, >30d green | 1.7 | OK |
+| 5.5 | Self-signed generation | Dashboard | "Self-signed" -> cert created | 1.7 | OK |
 | 5.6 | Self-signed preference memory | Dashboard | Never/Once/Always prompt, persisted | 1.7 | |
 | 5.7 | ACME HTTP-01 provision | Dashboard | Let's Encrypt via HTTP-01 (port 80) | 4.1 | |
 | 5.8 | ACME DNS-01 automatic | Dashboard | Cloudflare/Route53 -> TXT auto-created | 4.1 | |
@@ -109,8 +109,8 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 5.14 | cert_expiring notification | CLI | Approaching expiry -> notification dispatched | 3.3 | |
 | 5.15 | Edit certificate (rename) | Dashboard | Edit -> change domain name | 1.7 | |
 | 5.16 | Edit certificate (replace PEM) | Dashboard | Edit -> new PEM, metadata re-parsed | 1.7 | |
-| 5.17 | Delete certificate (no routes) | Dashboard | Delete succeeds, toast shown | 1.7 | |
-| 5.18 | Delete certificate (with routes) | Dashboard | Error toast: "referenced by routes" | 1.7 | |
+| 5.17 | Delete certificate (no routes) | Dashboard | Delete succeeds, toast shown | 1.7 | OK |
+| 5.18 | Delete certificate (with routes) | Dashboard | Error toast: "referenced by routes" | 1.7 | OK |
 | 5.19 | SNI resolution: exact match | Proxy | SNI=example.com -> correct cert | 2.3 | |
 | 5.20 | SNI resolution: wildcard | Proxy | *.example.com matches sub.example.com | 2.3 | |
 | 5.21 | SNI resolution: SAN domains | Proxy | All SANs resolve correctly | 2.3 | |

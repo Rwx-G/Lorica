@@ -268,10 +268,10 @@ pub(crate) trait ConnFdReusable {
 
 use l4::socket::SocketAddr;
 use log::{debug, error};
-use std::path::Path;
 use nix::sys::socket::{getpeername, SockaddrStorage, UnixAddr};
-use std::os::unix::prelude::AsRawFd;
 use std::net::SocketAddr as InetSocketAddr;
+use std::os::unix::prelude::AsRawFd;
+use std::path::Path;
 
 use crate::protocols::tls::TlsRef;
 

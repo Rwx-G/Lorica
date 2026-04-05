@@ -25,8 +25,8 @@ use crate::trace::SpanHandle;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use parking_lot::RwLock;
 use lorica_error::*;
+use parking_lot::RwLock;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

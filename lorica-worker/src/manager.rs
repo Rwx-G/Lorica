@@ -327,7 +327,11 @@ impl WorkerManager {
             std::thread::sleep(delay);
         }
 
-        info!(worker_id = id, restart_count = next_count, "restarting worker");
+        info!(
+            worker_id = id,
+            restart_count = next_count,
+            "restarting worker"
+        );
 
         // Recreate listening sockets if they were closed after initial spawn
         if self.listen_fds.is_empty() {
@@ -359,18 +363,26 @@ impl WorkerManager {
     }
 
     fn shutdown_all_with_timeout(&self, drain_timeout: Duration) {
-        info!("sending SIGTERM to all workers (drain timeout: {}s)", drain_timeout.as_secs());
+        info!(
+            "sending SIGTERM to all workers (drain timeout: {}s)",
+            drain_timeout.as_secs()
+        );
         for handle in &self.workers {
             let _ = signal::kill(handle.pid, Signal::SIGTERM);
-            info!(worker_id = handle.id, pid = handle.pid.as_raw(), "sent SIGTERM to worker");
+            info!(
+                worker_id = handle.id,
+                pid = handle.pid.as_raw(),
+                "sent SIGTERM to worker"
+            );
         }
 
         // Wait for workers to drain active connections and exit
         let deadline = Instant::now() + drain_timeout;
         loop {
-            let all_dead = self.workers.iter().all(|h| {
-                signal::kill(h.pid, None).is_err()
-            });
+            let all_dead = self
+                .workers
+                .iter()
+                .all(|h| signal::kill(h.pid, None).is_err());
             if all_dead {
                 info!("all workers exited after draining connections");
                 return;

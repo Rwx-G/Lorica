@@ -231,10 +231,10 @@ impl AsyncRead for RawStreamWrapper {
                         .map_err(|errno| errno.into())
                     }) {
                         Ok(r) => {
-                            if let Some(ControlMessageOwned::ScmTimestampsns(rtime)) = r
-                                .cmsgs()
-                                .ok()
-                                .and_then(|mut c| c.find(|i| matches!(i, ControlMessageOwned::ScmTimestampsns(_))))
+                            if let Some(ControlMessageOwned::ScmTimestampsns(rtime)) =
+                                r.cmsgs().ok().and_then(|mut c| {
+                                    c.find(|i| matches!(i, ControlMessageOwned::ScmTimestampsns(_)))
+                                })
                             {
                                 // The returned timestamp is a real (i.e. not monotonic) timestamp
                                 // https://docs.kernel.org/networking/timestamping.html

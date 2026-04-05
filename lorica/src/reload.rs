@@ -97,7 +97,10 @@ pub async fn reload_cert_resolver(
         .collect();
 
     match cert_resolver.reload(cert_data) {
-        Ok(()) => info!(domains = cert_resolver.domain_count(), "TLS certificate resolver reloaded"),
+        Ok(()) => info!(
+            domains = cert_resolver.domain_count(),
+            "TLS certificate resolver reloaded"
+        ),
         Err(e) => warn!(error = %e, "failed to reload TLS certificate resolver"),
     }
 }

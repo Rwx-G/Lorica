@@ -24,17 +24,19 @@ use async_trait::async_trait;
 use lorica_api::logs::{LogBuffer, LogEntry};
 use lorica_bench::SlaCollector;
 use lorica_cache::cache_control::CacheControl;
-use lorica_cache::filters::resp_cacheable;
 use lorica_cache::eviction::simple_lru;
-use lorica_cache::{CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable};
-use lorica_http::ResponseHeader;
-use once_cell::sync::Lazy;
+use lorica_cache::filters::resp_cacheable;
+use lorica_cache::{
+    CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable,
+};
 use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route, WafMode};
 use lorica_core::protocols::Digest;
 use lorica_core::upstreams::peer::HttpPeer;
 use lorica_error::{Error, ErrorType, Result};
+use lorica_http::ResponseHeader;
 use lorica_proxy::{ProxyHttp, Session};
 use lorica_waf::WafEngine;
+use once_cell::sync::Lazy;
 use tracing::{info, warn};
 
 /// In-memory snapshot of a route and its backends for fast lookup.
@@ -122,27 +124,24 @@ impl ProxyConfig {
                 .as_ref()
                 .and_then(|cid| cert_map.get(cid).cloned());
 
-            let path_rewrite_regex = route
-                .path_rewrite_pattern
-                .as_ref()
-                .and_then(|p| {
-                    if p.is_empty() {
-                        None
-                    } else {
-                        match regex::Regex::new(p) {
-                            Ok(re) => Some(re),
-                            Err(e) => {
-                                tracing::warn!(
-                                    route_id = %route.id,
-                                    pattern = %p,
-                                    error = %e,
-                                    "invalid path_rewrite_pattern, skipping regex rewrite"
-                                );
-                                None
-                            }
+            let path_rewrite_regex = route.path_rewrite_pattern.as_ref().and_then(|p| {
+                if p.is_empty() {
+                    None
+                } else {
+                    match regex::Regex::new(p) {
+                        Ok(re) => Some(re),
+                        Err(e) => {
+                            tracing::warn!(
+                                route_id = %route.id,
+                                pattern = %p,
+                                error = %e,
+                                "invalid path_rewrite_pattern, skipping regex rewrite"
+                            );
+                            None
                         }
                     }
-                });
+                }
+            });
 
             let entry = RouteEntry {
                 route: route.clone(),
@@ -211,7 +210,10 @@ impl ProxyConfig {
     pub fn find_route<'a>(&'a self, host: &str, path: &str) -> Option<&'a RouteEntry> {
         // 1. Exact hostname match (O(1))
         if let Some(entries) = self.routes_by_host.get(host) {
-            if let Some(entry) = entries.iter().find(|e| path.starts_with(&e.route.path_prefix)) {
+            if let Some(entry) = entries
+                .iter()
+                .find(|e| path.starts_with(&e.route.path_prefix))
+            {
                 return Some(entry);
             }
         }
@@ -220,7 +222,10 @@ impl ProxyConfig {
         for (pattern, entries) in &self.wildcard_routes {
             let suffix = &pattern[1..]; // "*.example.com" -> ".example.com"
             if host.ends_with(suffix) && host.len() > suffix.len() {
-                if let Some(entry) = entries.iter().find(|e| path.starts_with(&e.route.path_prefix)) {
+                if let Some(entry) = entries
+                    .iter()
+                    .find(|e| path.starts_with(&e.route.path_prefix))
+                {
                     return Some(entry);
                 }
             }
@@ -288,9 +293,6 @@ pub struct EwmaTracker {
     /// EWMA score per backend address (microseconds).
     pub(crate) scores: Arc<std::sync::RwLock<HashMap<String, f64>>>,
 }
-
-/// Decay factor for EWMA (tau = 10 seconds).
-const EWMA_DECAY_NS: f64 = 10_000_000_000.0;
 
 impl EwmaTracker {
     pub fn new() -> Self {
@@ -520,11 +522,7 @@ impl ProxyHttp for LoricaProxy {
         }
     }
 
-    async fn request_filter(
-        &self,
-        session: &mut Session,
-        ctx: &mut Self::CTX,
-    ) -> Result<bool>
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool>
     where
         Self::CTX: Send + Sync,
     {
@@ -536,8 +534,12 @@ impl ProxyHttp for LoricaProxy {
                     let mut header = ResponseHeader::build(200, None)?;
                     header.insert_header("Content-Type", "text/plain")?;
                     header.insert_header("Content-Length", key_auth.len().to_string())?;
-                    session.write_response_header(Box::new(header), false).await?;
-                    session.write_response_body(Some(bytes::Bytes::from(key_auth)), true).await?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(key_auth)), true)
+                        .await?;
                     return Ok(true);
                 }
             }
@@ -552,7 +554,9 @@ impl ProxyHttp for LoricaProxy {
             let current = self.active_connections.load(Ordering::Relaxed);
             if current >= config.max_global_connections as u64 {
                 let header = lorica_http::ResponseHeader::build(503, None)?;
-                session.write_response_header(Box::new(header), true).await?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
                 return Ok(true);
             }
         }
@@ -590,7 +594,9 @@ impl ProxyHttp for LoricaProxy {
             };
             if banned {
                 let header = lorica_http::ResponseHeader::build(403, None)?;
-                session.write_response_header(Box::new(header), true).await?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
                 return Ok(true);
             }
         }
@@ -602,7 +608,9 @@ impl ProxyHttp for LoricaProxy {
                     "request blocked by IP blocklist"
                 );
                 let header = lorica_http::ResponseHeader::build(403, None)?;
-                session.write_response_header(Box::new(header), true).await?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
                 return Ok(true);
             }
         }
@@ -658,11 +666,7 @@ impl ProxyHttp for LoricaProxy {
             if scheme != "https" {
                 let redir_host = extract_host(req);
                 let redir_path = req.uri.path();
-                let redir_query = req
-                    .uri
-                    .query()
-                    .map(|q| format!("?{q}"))
-                    .unwrap_or_default();
+                let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
                 let location = format!("https://{redir_host}{redir_path}{redir_query}");
                 let mut header = lorica_http::ResponseHeader::build(301, None)?;
                 header.insert_header("Location", &location)?;
@@ -677,11 +681,7 @@ impl ProxyHttp for LoricaProxy {
         if let Some(ref target) = entry.route.redirect_hostname {
             if host != target.as_str() {
                 let redir_path = req.uri.path();
-                let redir_query = req
-                    .uri
-                    .query()
-                    .map(|q| format!("?{q}"))
-                    .unwrap_or_default();
+                let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
                 let scheme = req
                     .headers
                     .get("x-forwarded-proto")
@@ -822,10 +822,8 @@ impl ProxyHttp for LoricaProxy {
                         let violations = self.rate_violations.rate(&violation_key);
                         if violations > ban_threshold as f64 {
                             let ban_duration = entry.route.auto_ban_duration_s;
-                            self.ban_list.insert(
-                                ip.to_string(),
-                                (Instant::now(), ban_duration as u64),
-                            );
+                            self.ban_list
+                                .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
                             warn!(
                                 ip = %ip,
                                 violations = %violations,
@@ -854,7 +852,7 @@ impl ProxyHttp for LoricaProxy {
                         + 1;
                     let mut header = lorica_http::ResponseHeader::build(429, None)?;
                     header.insert_header("Retry-After", "1")?;
-                    header.insert_header("X-RateLimit-Reset", &reset_ts.to_string())?;
+                    header.insert_header("X-RateLimit-Reset", reset_ts.to_string())?;
                     session
                         .write_response_header(Box::new(header), true)
                         .await?;
@@ -876,13 +874,9 @@ impl ProxyHttp for LoricaProxy {
                 let name_str = name.as_str();
                 // Only inspect relevant headers (skip large/binary ones)
                 match name_str {
-                    "user-agent" | "referer" | "cookie" | "x-forwarded-for"
-                    | "content-type" | "authorization" | "origin" => {
-                        value.to_str().ok().map(|v| (name_str, v))
-                    }
-                    n if n.starts_with("x-") => {
-                        value.to_str().ok().map(|v| (name_str, v))
-                    }
+                    "user-agent" | "referer" | "cookie" | "x-forwarded-for" | "content-type"
+                    | "authorization" | "origin" => value.to_str().ok().map(|v| (name_str, v)),
+                    n if n.starts_with("x-") => value.to_str().ok().map(|v| (name_str, v)),
                     _ => None,
                 }
             })
@@ -893,7 +887,9 @@ impl ProxyHttp for LoricaProxy {
             WafMode::Blocking => lorica_waf::WafMode::Blocking,
         };
 
-        let verdict = self.waf_engine.evaluate(waf_mode, path, query, &headers, host);
+        let verdict = self
+            .waf_engine
+            .evaluate(waf_mode, path, query, &headers, host);
 
         match verdict {
             lorica_waf::WafVerdict::Blocked(ref events) => {
@@ -919,7 +915,9 @@ impl ProxyHttp for LoricaProxy {
                 ctx.matched_path = Some(path.to_string());
 
                 let header = lorica_http::ResponseHeader::build(403, None)?;
-                session.write_response_header(Box::new(header), true).await?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
                 Ok(true)
             }
             lorica_waf::WafVerdict::Detected(ref events) => {
@@ -971,14 +969,16 @@ impl ProxyHttp for LoricaProxy {
         session.cache.enable(
             &*CACHE_BACKEND,
             Some(&*CACHE_EVICTION),
-            None,  // no predictor
-            None,  // no cache lock
-            None,  // no option overrides
+            None, // no predictor
+            None, // no cache lock
+            None, // no option overrides
         );
 
         // Set max cacheable response size from route config
         if route.cache_max_bytes > 0 {
-            session.cache.set_max_file_size_bytes(route.cache_max_bytes as usize);
+            session
+                .cache
+                .set_max_file_size_bytes(route.cache_max_bytes as usize);
         }
 
         Ok(())
@@ -1109,9 +1109,7 @@ impl ProxyHttp for LoricaProxy {
         // Backend selection based on load balancing algorithm
         use lorica_config::models::LoadBalancing;
         let idx = match entry.route.load_balancing {
-            LoadBalancing::PeakEwma => {
-                self.ewma_tracker.select_best(&healthy_backends)
-            }
+            LoadBalancing::PeakEwma => self.ewma_tracker.select_best(&healthy_backends),
             LoadBalancing::Random => {
                 use std::collections::hash_map::DefaultHasher;
                 use std::hash::{Hash, Hasher};
@@ -1152,10 +1150,8 @@ impl ProxyHttp for LoricaProxy {
         // Apply route-level timeouts to the peer options
         peer.options.connection_timeout =
             Some(Duration::from_secs(entry.route.connect_timeout_s as u64));
-        peer.options.read_timeout =
-            Some(Duration::from_secs(entry.route.read_timeout_s as u64));
-        peer.options.write_timeout =
-            Some(Duration::from_secs(entry.route.send_timeout_s as u64));
+        peer.options.read_timeout = Some(Duration::from_secs(entry.route.read_timeout_s as u64));
+        peer.options.write_timeout = Some(Duration::from_secs(entry.route.send_timeout_s as u64));
 
         Ok(peer)
     }
@@ -1288,8 +1284,12 @@ impl ProxyHttp for LoricaProxy {
 
             // Increment cache counters for dashboard stats
             match cache_status {
-                "HIT" | "REVALIDATED" => { self.cache_hits.fetch_add(1, Ordering::Relaxed); }
-                "MISS" | "BYPASS" | "STALE" => { self.cache_misses.fetch_add(1, Ordering::Relaxed); }
+                "HIT" | "REVALIDATED" => {
+                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                "MISS" | "BYPASS" | "STALE" => {
+                    self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                }
                 _ => {}
             }
         }
@@ -1342,7 +1342,11 @@ impl ProxyHttp for LoricaProxy {
 
         // Rate limit response headers
         if let Some((limit, current)) = ctx.rate_limit_info {
-            let remaining = if current < limit as f64 { (limit as f64 - current) as u32 } else { 0 };
+            let remaining = if current < limit as f64 {
+                (limit as f64 - current) as u32
+            } else {
+                0
+            };
             let reset_ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1602,7 +1606,8 @@ mod tests {
         let backend = make_backend("b1", "10.0.0.1:8080");
         let links = vec![("r1".into(), "b1".into())];
 
-        let config = ProxyConfig::from_store(vec![route], vec![backend], vec![], links, vec![], 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![route], vec![backend], vec![], links, vec![], 0, 0);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].backends.len(), 1);
@@ -1625,7 +1630,8 @@ mod tests {
         let r2 = make_route("r2", "example.com", "/api", true);
         let r3 = make_route("r3", "example.com", "/api/v1", true);
 
-        let config = ProxyConfig::from_store(vec![r1, r2, r3], vec![], vec![], vec![], vec![], 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![r1, r2, r3], vec![], vec![], vec![], vec![], 0, 0);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].route.path_prefix, "/api/v1");
@@ -1651,7 +1657,10 @@ mod tests {
         let config = ProxyConfig::from_store(vec![route], vec![], vec![cert], vec![], vec![], 0, 0);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].certificate.is_some());
-        assert_eq!(entries[0].certificate.as_ref().unwrap().domain, "example.com");
+        assert_eq!(
+            entries[0].certificate.as_ref().unwrap().domain,
+            "example.com"
+        );
     }
 
     #[test]
@@ -1669,12 +1678,10 @@ mod tests {
         let route = make_route("r1", "example.com", "/", true);
         let b1 = make_backend("b1", "10.0.0.1:8080");
         let b2 = make_backend("b2", "10.0.0.2:8080");
-        let links = vec![
-            ("r1".into(), "b1".into()),
-            ("r1".into(), "b2".into()),
-        ];
+        let links = vec![("r1".into(), "b1".into()), ("r1".into(), "b2".into())];
 
-        let config = ProxyConfig::from_store(vec![route], vec![b1, b2], vec![], links, vec![], 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![route], vec![b1, b2], vec![], links, vec![], 0, 0);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries[0].backends.len(), 2);
     }
@@ -1791,7 +1798,10 @@ mod tests {
         let backends = vec![&b1, &b2];
 
         let selected = tracker.select_best(&backends);
-        assert_eq!(selected, 1, "Should prefer unscored backend for exploration");
+        assert_eq!(
+            selected, 1,
+            "Should prefer unscored backend for exploration"
+        );
     }
 
     #[test]
@@ -1871,12 +1881,16 @@ mod tests {
     fn test_proxy_config_custom_preset_added() {
         let custom = lorica_config::models::SecurityHeaderPreset {
             name: "api-only".to_string(),
-            headers: std::collections::HashMap::from([
-                ("X-Custom-Header".to_string(), "yes".to_string()),
-            ]),
+            headers: std::collections::HashMap::from([(
+                "X-Custom-Header".to_string(),
+                "yes".to_string(),
+            )]),
         };
         let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![custom], 0, 0);
-        let found = config.security_presets.iter().find(|p| p.name == "api-only");
+        let found = config
+            .security_presets
+            .iter()
+            .find(|p| p.name == "api-only");
         assert!(found.is_some());
         assert_eq!(found.unwrap().headers["X-Custom-Header"], "yes");
     }
@@ -1885,11 +1899,13 @@ mod tests {
     fn test_proxy_config_custom_preset_overrides_builtin() {
         let custom_strict = lorica_config::models::SecurityHeaderPreset {
             name: "strict".to_string(),
-            headers: std::collections::HashMap::from([
-                ("X-Frame-Options".to_string(), "SAMEORIGIN".to_string()),
-            ]),
+            headers: std::collections::HashMap::from([(
+                "X-Frame-Options".to_string(),
+                "SAMEORIGIN".to_string(),
+            )]),
         };
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![custom_strict], 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![custom_strict], 0, 0);
         let strict = config
             .security_presets
             .iter()
@@ -2331,7 +2347,10 @@ mod tests {
         if threshold > 0 && global_rps > threshold as f64 {
             effective *= 0.5;
         }
-        assert_eq!(effective, 100.0, "No halving when threshold is 0 (disabled)");
+        assert_eq!(
+            effective, 100.0,
+            "No halving when threshold is 0 (disabled)"
+        );
     }
 
     #[test]

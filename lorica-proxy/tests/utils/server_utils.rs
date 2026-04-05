@@ -19,7 +19,6 @@ use clap::Parser;
 use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY};
 use http::HeaderValue;
 use log::error;
-use once_cell::sync::Lazy;
 use lorica_cache::cache_control::CacheControl;
 use lorica_cache::hashtable::ConcurrentHashTable;
 use lorica_cache::key::HashBinary;
@@ -29,9 +28,7 @@ use lorica_cache::{
     set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
     NoCacheReason, RespCacheable,
 };
-use lorica_cache::{
-    CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeType, VarianceBuilder,
-};
+use lorica_cache::{CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeType, VarianceBuilder};
 use lorica_core::apps::{HttpServerApp, HttpServerOptions};
 use lorica_core::modules::http::compression::ResponseCompression;
 use lorica_core::protocols::{
@@ -44,6 +41,7 @@ use lorica_core::utils::tls::CertKey;
 use lorica_error::{Error, ErrorSource, ErrorType::*, Result};
 use lorica_http::{RequestHeader, ResponseHeader};
 use lorica_proxy::{FailToProxy, ProxyHttp, Session};
+use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
@@ -773,8 +771,7 @@ fn test_main() {
         "-c".into(),
         "tests/pingora_conf.yaml".into(),
     ];
-    let mut my_server =
-        lorica_core::server::Server::new(Some(Opt::parse_from_args(opts))).unwrap();
+    let mut my_server = lorica_core::server::Server::new(Some(Opt::parse_from_args(opts))).unwrap();
     my_server.bootstrap();
 
     let mut proxy_service_http =

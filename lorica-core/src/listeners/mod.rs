@@ -127,10 +127,7 @@ struct TransportStackBuilder {
 }
 
 impl TransportStackBuilder {
-    pub async fn build(
-        &mut self,
-        upgrade_listeners: Option<ListenFds>,
-    ) -> Result<TransportStack> {
+    pub async fn build(&mut self, upgrade_listeners: Option<ListenFds>) -> Result<TransportStack> {
         let mut builder = ListenerEndpoint::builder();
 
         builder.listen_addr(self.l4.clone());
@@ -306,9 +303,7 @@ impl Listeners {
         let mut stacks = Vec::with_capacity(self.stacks.len());
 
         for b in self.stacks.iter_mut() {
-            let new_stack = b
-                .build(upgrade_listeners.clone())
-                .await?;
+            let new_stack = b.build(upgrade_listeners.clone()).await?;
 
             stacks.push(new_stack);
         }
@@ -338,10 +333,7 @@ mod test {
         let mut listeners = Listeners::tcp(addr1);
         listeners.add_tcp(addr2);
 
-        let listeners = listeners
-            .build(None)
-            .await
-            .unwrap();
+        let listeners = listeners.build(None).await.unwrap();
 
         assert_eq!(listeners.len(), 2);
         for listener in listeners {
@@ -368,12 +360,7 @@ mod test {
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
         let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
         let mut listeners = Listeners::tls(addr, &cert_path, &key_path).unwrap();
-        let listener = listeners
-            .build(None)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
+        let listener = listeners.build(None).await.unwrap().pop().unwrap();
 
         tokio::spawn(async move {
             // just try to accept once

