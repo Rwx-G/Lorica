@@ -411,6 +411,6 @@
   .search-input:focus { outline: none; border-color: var(--color-primary); box-shadow: 0 0 0 3px var(--color-primary-subtle); }
   .sortable { cursor: pointer; user-select: none; }
   .sortable:hover { color: var(--color-text-heading); }
-  .checkbox-row { display: flex; flex-wrap: wrap; gap: var(--space-4) var(--space-6); margin-top: var(--space-2); }
+  .checkbox-row { display: flex; flex-wrap: wrap; gap: var(--space-4) var(--space-6); margin-top: var(--space-2); margin-bottom: var(--space-4); }
   .checkbox-row .checkbox-item { white-space: nowrap; }
 </style>
