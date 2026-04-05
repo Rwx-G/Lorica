@@ -33,6 +33,22 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to initialize access log schema: {e}"))?;
 
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS waf_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL,
+                severity INTEGER NOT NULL,
+                matched_field TEXT NOT NULL,
+                matched_value TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_waf_events_timestamp ON waf_events(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_waf_events_category ON waf_events(category);",
+        )
+        .map_err(|e| format!("failed to initialize waf events schema: {e}"))?;
+
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .map_err(|e| format!("failed to set access log pragmas: {e}"))?;
 
@@ -201,6 +217,87 @@ impl LogStore {
             .query_row("SELECT COUNT(*) FROM access_logs", [], |row| row.get(0))
             .map_err(|e| format!("failed to count access logs: {e}"))?;
         Ok(count as u64)
+    }
+
+    // ---- WAF Events ----
+
+    /// Insert a WAF event.
+    pub fn insert_waf_event(&self, event: &lorica_waf::WafEvent) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO waf_events (rule_id, description, category, severity, matched_field, matched_value, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                event.rule_id as i64,
+                event.description,
+                event.category.as_str(),
+                event.severity as i64,
+                event.matched_field,
+                event.matched_value,
+                event.timestamp,
+            ],
+        )
+        .map_err(|e| format!("failed to insert WAF event: {e}"))?;
+        Ok(())
+    }
+
+    /// Query WAF events, newest first.
+    pub fn list_waf_events(&self, limit: usize) -> Result<Vec<lorica_waf::WafEvent>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT rule_id, description, category, severity, matched_field, matched_value, timestamp
+                 FROM waf_events ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("failed to prepare WAF events query: {e}"))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let cat_str: String = row.get(2)?;
+                let category = cat_str
+                    .parse::<lorica_waf::RuleCategory>()
+                    .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
+                Ok(lorica_waf::WafEvent {
+                    rule_id: row.get::<_, i64>(0)? as u32,
+                    description: row.get(1)?,
+                    category,
+                    severity: row.get::<_, i64>(3)? as u8,
+                    matched_field: row.get(4)?,
+                    matched_value: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("failed to query WAF events: {e}"))?;
+        let mut events = Vec::new();
+        for r in rows {
+            events.push(r.map_err(|e| format!("failed to read WAF event row: {e}"))?);
+        }
+        Ok(events)
+    }
+
+    /// Clear all WAF events.
+    pub fn clear_waf_events(&self) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM waf_events", [])
+            .map_err(|e| format!("failed to clear WAF events: {e}"))?;
+        Ok(())
+    }
+
+    /// Purge old WAF events, keeping at most `max_entries`.
+    pub fn enforce_waf_retention(&self, max_entries: u64) -> Result<u64, String> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM waf_events", [], |row| row.get(0))
+            .map_err(|e| format!("failed to count WAF events: {e}"))?;
+        if count <= max_entries as i64 {
+            return Ok(0);
+        }
+        let to_delete = count - max_entries as i64;
+        conn.execute(
+            "DELETE FROM waf_events WHERE id IN (SELECT id FROM waf_events ORDER BY id ASC LIMIT ?1)",
+            params![to_delete],
+        )
+        .map_err(|e| format!("failed to enforce WAF event retention: {e}"))?;
+        Ok(to_delete as u64)
     }
 }
 

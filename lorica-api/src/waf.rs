@@ -57,25 +57,25 @@ pub async fn get_waf_events(
     Query(params): Query<WafEventsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = params.limit.unwrap_or(50).min(500);
+    let rule_count = state.waf_rule_count.unwrap_or(0);
 
-    let (events, rule_count) = if let Some(ref waf_buffer) = state.waf_event_buffer {
+    // Read from persistent store if available, fall back to in-memory buffer
+    let events = if let Some(ref store) = state.log_store {
+        store
+            .list_waf_events(limit)
+            .map_err(|e| ApiError::Internal(format!("waf event query failed: {e}")))?
+    } else if let Some(ref waf_buffer) = state.waf_event_buffer {
         let buf = waf_buffer.lock().unwrap();
-        let events: Vec<WafEvent> = buf
-            .iter()
-            .rev()
-            .filter(|e| {
-                if let Some(ref cat) = params.category {
-                    e.category.as_str() == cat.as_str()
-                } else {
-                    true
-                }
-            })
-            .take(limit)
-            .cloned()
-            .collect();
-        (events, state.waf_rule_count.unwrap_or(0))
+        buf.iter().rev().take(limit).cloned().collect()
     } else {
-        (vec![], 0)
+        vec![]
+    };
+
+    // Apply category filter if specified
+    let events: Vec<WafEvent> = if let Some(ref cat) = params.category {
+        events.into_iter().filter(|e| e.category.as_str() == cat.as_str()).collect()
+    } else {
+        events
     };
 
     let total = events.len();
@@ -184,6 +184,11 @@ pub async fn clear_waf_events(
     if let Some(ref waf_buffer) = state.waf_event_buffer {
         let mut buf = waf_buffer.lock().unwrap();
         buf.clear();
+    }
+    if let Some(ref store) = state.log_store {
+        store
+            .clear_waf_events()
+            .map_err(|e| ApiError::Internal(format!("failed to clear WAF events: {e}")))?;
     }
     Ok(json_data(serde_json::json!({"cleared": true})))
 }

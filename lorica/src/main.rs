@@ -686,6 +686,9 @@ fn run_supervisor(cli: Cli) {
                             tracing::warn!(error = %e, "probe result retention cleanup failed");
                         }
                     }
+                    if let Err(e) = retention_log_store.enforce_waf_retention(100_000) {
+                        tracing::warn!(error = %e, "WAF event retention cleanup failed");
+                    }
                     last_sla_purge_day =
                         run_sla_purge(&retention_config_store, last_sla_purge_day).await;
                 }
@@ -1500,6 +1503,9 @@ fn run_single_process(cli: Cli) {
                         if let Err(e) = s.purge_probe_results(1000) {
                             tracing::warn!(error = %e, "probe result retention cleanup failed");
                         }
+                    }
+                    if let Err(e) = retention_log_store.enforce_waf_retention(100_000) {
+                        tracing::warn!(error = %e, "WAF event retention cleanup failed");
                     }
                     last_sla_purge_day =
                         run_sla_purge(&retention_config_store, last_sla_purge_day).await;

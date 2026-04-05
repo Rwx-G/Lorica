@@ -608,11 +608,23 @@ impl ProxyHttp for LoricaProxy {
                     "request blocked by IP blocklist"
                 );
                 ctx.waf_blocked = true;
-                // Record as WAF event + Prometheus metric
+                // Record as WAF event + Prometheus metric + persist
                 let path = req.uri.path();
                 let host_val = extract_host(req);
                 self.waf_engine.record_blocklist_event(ip, host_val, path);
                 lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
+                if let Some(ref store) = self.log_store {
+                    let ev = lorica_waf::WafEvent {
+                        rule_id: 0,
+                        description: format!("IP {ip} blocked by IP blocklist"),
+                        category: lorica_waf::RuleCategory::IpBlocklist,
+                        severity: 5,
+                        matched_field: "client_ip".to_string(),
+                        matched_value: ip.to_string(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = store.insert_waf_event(&ev);
+                }
                 let header = lorica_http::ResponseHeader::build(403, None)?;
                 session
                     .write_response_header(Box::new(header), true)
@@ -901,6 +913,9 @@ impl ProxyHttp for LoricaProxy {
             lorica_waf::WafVerdict::Blocked(ref events) => {
                 for ev in events {
                     lorica_api::metrics::record_waf_event(ev.category.as_str(), "blocked");
+                    if let Some(ref store) = self.log_store {
+                        let _ = store.insert_waf_event(ev);
+                    }
                 }
                 // Dispatch waf_alert notification
                 if let (Some(ref sender), Some(ev)) = (&self.alert_sender, events.first()) {
@@ -929,6 +944,9 @@ impl ProxyHttp for LoricaProxy {
             lorica_waf::WafVerdict::Detected(ref events) => {
                 for ev in events {
                     lorica_api::metrics::record_waf_event(ev.category.as_str(), "detected");
+                    if let Some(ref store) = self.log_store {
+                        let _ = store.insert_waf_event(ev);
+                    }
                 }
                 Ok(false)
             }
