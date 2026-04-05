@@ -405,6 +405,8 @@ pub struct LoricaProxy {
     pub ban_list: Arc<DashMap<String, (Instant, u64)>>,
     /// Rate limit violation counter (per minute) for auto-ban decisions.
     pub rate_violations: Arc<lorica_limits::rate::Rate>,
+    /// Cumulative WAF block counter per IP for WAF auto-ban.
+    pub waf_violations: Arc<DashMap<String, AtomicU64>>,
     /// Per-route active connection counters for `max_connections` enforcement.
     pub route_connections: Arc<DashMap<String, Arc<AtomicU64>>>,
     /// Global request rate tracker for flood detection and dashboard metrics.
@@ -443,6 +445,7 @@ impl LoricaProxy {
             rate_limiter: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
             ban_list: Arc::new(DashMap::new()),
             rate_violations: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(60))),
+            waf_violations: Arc::new(DashMap::new()),
             route_connections: Arc::new(DashMap::new()),
             global_rate: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
             cache_hits: Arc::new(AtomicU64::new(0)),
@@ -920,10 +923,13 @@ impl ProxyHttp for LoricaProxy {
                     let config = self.config.load();
                     let threshold = config.waf_ban_threshold;
                     if threshold > 0 {
-                        let violation_key = format!("waf_violation:{}", ip);
-                        self.rate_violations.observe(&violation_key, 1);
-                        let violations = self.rate_violations.rate(&violation_key);
-                        if violations > threshold as f64 {
+                        let violations = self
+                            .waf_violations
+                            .entry(ip.to_string())
+                            .or_insert_with(|| AtomicU64::new(0))
+                            .fetch_add(1, Ordering::Relaxed)
+                            + 1;
+                        if violations >= threshold as u64 {
                             let ban_duration = config.waf_ban_duration_s;
                             self.ban_list.insert(
                                 ip.to_string(),

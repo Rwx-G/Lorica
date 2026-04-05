@@ -573,7 +573,7 @@ fn default_slowloris_threshold_ms() -> i32 {
 }
 
 fn default_waf_ban_threshold() -> i32 {
-    5
+    3
 }
 
 fn default_waf_ban_duration_s() -> i32 {
