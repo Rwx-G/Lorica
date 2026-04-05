@@ -112,7 +112,8 @@
       result = result.filter((r) =>
         r.hostname.toLowerCase().includes(q) ||
         r.path_prefix.toLowerCase().includes(q) ||
-        r.id.toLowerCase().includes(q)
+        r.id.toLowerCase().includes(q) ||
+        r.hostname_aliases.some((a) => a.toLowerCase().includes(q))
       );
     }
     if (sortColumn) {
@@ -186,7 +187,12 @@
         <tbody>
           {#each filteredRoutes as route (route.id)}
             <tr>
-              <td class="hostname">{route.hostname}</td>
+              <td class="hostname">
+                {route.hostname}
+                {#if route.hostname_aliases.length > 0}
+                  <span class="alias-badge" title={route.hostname_aliases.join(', ')}>+{route.hostname_aliases.length}</span>
+                {/if}
+              </td>
               <td class="mono">{route.path_prefix}</td>
               <td>
                 {#if route.backends.length === 0}
@@ -278,6 +284,22 @@
   .hostname {
     font-weight: 600;
     color: var(--color-text-heading);
+  }
+
+  .alias-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.4em;
+    height: 1.4em;
+    padding: 0 0.3em;
+    margin-left: var(--space-2);
+    border-radius: var(--radius-full, 9999px);
+    background: var(--color-primary-subtle);
+    color: var(--color-primary);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    cursor: help;
   }
 
   .backend-count {
