@@ -27,6 +27,8 @@ pub struct UpdateSettingsRequest {
     pub default_topology_type: Option<String>,
     pub max_global_connections: Option<i32>,
     pub flood_threshold_rps: Option<i32>,
+    pub waf_ban_threshold: Option<i32>,
+    pub waf_ban_duration_s: Option<i32>,
     pub access_log_retention: Option<i64>,
     pub sla_purge_enabled: Option<bool>,
     pub sla_purge_retention_days: Option<i32>,
@@ -97,6 +99,22 @@ pub async fn update_settings(
             ));
         }
         settings.flood_threshold_rps = threshold;
+    }
+    if let Some(threshold) = body.waf_ban_threshold {
+        if threshold < 0 {
+            return Err(ApiError::BadRequest(
+                "waf_ban_threshold must be >= 0".into(),
+            ));
+        }
+        settings.waf_ban_threshold = threshold;
+    }
+    if let Some(duration) = body.waf_ban_duration_s {
+        if duration < 0 {
+            return Err(ApiError::BadRequest(
+                "waf_ban_duration_s must be >= 0".into(),
+            ));
+        }
+        settings.waf_ban_duration_s = duration;
     }
     if let Some(retention) = body.access_log_retention {
         if retention < 0 {

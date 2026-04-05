@@ -504,6 +504,12 @@ pub struct GlobalSettings {
     /// halved to provide stricter protection. 0 = disabled (default).
     #[serde(default)]
     pub flood_threshold_rps: i32,
+    /// Number of WAF blocks before an IP is auto-banned. 0 = disabled (default 5).
+    #[serde(default = "default_waf_ban_threshold")]
+    pub waf_ban_threshold: i32,
+    /// Duration in seconds for WAF-triggered IP bans. Default 3600 (1h).
+    #[serde(default = "default_waf_ban_duration_s")]
+    pub waf_ban_duration_s: i32,
     /// User-defined security header presets, stored as JSON.
     /// These extend the builtin presets ("strict", "moderate", "none").
     /// If a custom preset shares a name with a builtin, the custom one wins.
@@ -566,6 +572,14 @@ fn default_slowloris_threshold_ms() -> i32 {
     5000
 }
 
+fn default_waf_ban_threshold() -> i32 {
+    5
+}
+
+fn default_waf_ban_duration_s() -> i32 {
+    3600
+}
+
 fn default_auto_ban_duration_s() -> i32 {
     3600
 }
@@ -626,6 +640,8 @@ impl Default for GlobalSettings {
             ip_blocklist_enabled: false,
             max_global_connections: 0,
             flood_threshold_rps: 0,
+            waf_ban_threshold: default_waf_ban_threshold(),
+            waf_ban_duration_s: default_waf_ban_duration_s(),
             custom_security_presets: Vec::new(),
             access_log_retention: default_access_log_retention(),
             sla_purge_enabled: false,

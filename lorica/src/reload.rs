@@ -47,6 +47,14 @@ pub async fn reload_proxy_config(
         .as_ref()
         .map(|s| s.flood_threshold_rps.max(0) as u32)
         .unwrap_or(0);
+    let waf_ban_threshold = settings
+        .as_ref()
+        .map(|s| s.waf_ban_threshold.max(0) as u32)
+        .unwrap_or(5);
+    let waf_ban_duration_s = settings
+        .as_ref()
+        .map(|s| s.waf_ban_duration_s.max(0) as u32)
+        .unwrap_or(3600);
 
     let links: Vec<(String, String)> = route_backends
         .into_iter()
@@ -61,6 +69,8 @@ pub async fn reload_proxy_config(
         custom_presets,
         max_global_connections,
         flood_threshold_rps,
+        waf_ban_threshold,
+        waf_ban_duration_s,
     );
 
     let route_count: usize = new_config.routes_by_host.values().map(|v| v.len()).sum();

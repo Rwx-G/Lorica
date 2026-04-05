@@ -339,6 +339,8 @@ export interface GlobalSettingsResponse {
   default_topology_type: string;
   max_global_connections: number;
   flood_threshold_rps: number;
+  waf_ban_threshold: number;
+  waf_ban_duration_s: number;
   access_log_retention: number;
   sla_purge_enabled: boolean;
   sla_purge_retention_days: number;
@@ -355,6 +357,8 @@ export interface UpdateSettingsRequest {
   default_topology_type?: string;
   max_global_connections?: number;
   flood_threshold_rps?: number;
+  waf_ban_threshold?: number;
+  waf_ban_duration_s?: number;
   access_log_retention?: number;
   sla_purge_enabled?: boolean;
   sla_purge_retention_days?: number;

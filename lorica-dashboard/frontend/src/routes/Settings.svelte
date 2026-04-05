@@ -13,7 +13,7 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, default_topology_type: 'single_vm', max_global_connections: 0, flood_threshold_rps: 0, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month' });
+  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, default_topology_type: 'single_vm', max_global_connections: 0, flood_threshold_rps: 0, waf_ban_threshold: 5, waf_ban_duration_s: 3600, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month' });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -562,6 +562,16 @@
           <label for="flood-threshold">Flood Detection Threshold (RPS)</label>
           <input id="flood-threshold" type="number" bind:value={settingsForm.flood_threshold_rps} min="0" max="1000000" />
           <span class="hint">0 = disabled. When exceeded, per-IP rate limits are halved.</span>
+        </div>
+        <div class="form-row">
+          <label for="waf-ban-threshold">WAF Auto-ban Threshold</label>
+          <input id="waf-ban-threshold" type="number" bind:value={settingsForm.waf_ban_threshold} min="0" max="1000" />
+          <span class="hint">Ban IP after this many WAF blocks (0 = disabled, default 5).</span>
+        </div>
+        <div class="form-row">
+          <label for="waf-ban-duration">WAF Ban Duration (seconds)</label>
+          <input id="waf-ban-duration" type="number" bind:value={settingsForm.waf_ban_duration_s} min="0" max="604800" />
+          <span class="hint">How long to ban (default 3600 = 1 hour, max 7 days).</span>
         </div>
         <div class="form-row">
           <label for="s-log-retention">Access Log Retention (entries)</label>

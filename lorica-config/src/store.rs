@@ -1248,6 +1248,16 @@ impl ConfigStore {
                         ConfigError::Validation("invalid flood_threshold_rps".into())
                     })?;
                 }
+                "waf_ban_threshold" => {
+                    settings.waf_ban_threshold = value.parse().map_err(|_| {
+                        ConfigError::Validation("invalid waf_ban_threshold".into())
+                    })?;
+                }
+                "waf_ban_duration_s" => {
+                    settings.waf_ban_duration_s = value.parse().map_err(|_| {
+                        ConfigError::Validation("invalid waf_ban_duration_s".into())
+                    })?;
+                }
                 "custom_security_presets" => {
                     settings.custom_security_presets =
                         serde_json::from_str(&value).map_err(|e| {
@@ -1315,6 +1325,14 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('flood_threshold_rps', ?1)",
             params![settings.flood_threshold_rps.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_ban_threshold', ?1)",
+            params![settings.waf_ban_threshold.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_ban_duration_s', ?1)",
+            params![settings.waf_ban_duration_s.to_string()],
         )?;
         let presets_json =
             serde_json::to_string(&settings.custom_security_presets).map_err(|e| {
