@@ -132,9 +132,15 @@ pub async fn get_system(
 
     // Proxy info
     let uptime = state.started_at.elapsed().as_secs();
-    let active_connections = state
+    let mut active_connections = state
         .active_connections
         .load(std::sync::atomic::Ordering::Relaxed);
+    // In supervisor mode, the local counter is 0; read from aggregated workers
+    if active_connections == 0 {
+        if let Some(ref agg) = state.aggregated_metrics {
+            active_connections = agg.total_active_connections().await;
+        }
+    }
 
     let response = SystemResponse {
         host: HostMetrics {
