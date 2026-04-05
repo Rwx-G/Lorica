@@ -1101,8 +1101,22 @@ impl ProxyHttp for LoricaProxy {
                 (hasher.finish() as usize) % healthy_backends.len()
             }
             _ => {
-                // Round-robin (default for RoundRobin and ConsistentHash)
-                entry.rr_counter.fetch_add(1, Ordering::Relaxed) % healthy_backends.len()
+                // Weighted round-robin (default for RoundRobin and ConsistentHash)
+                let total_weight: usize = healthy_backends
+                    .iter()
+                    .map(|b| (b.weight.max(1)) as usize)
+                    .sum();
+                let pos = entry.rr_counter.fetch_add(1, Ordering::Relaxed) % total_weight;
+                let mut acc = 0;
+                let mut selected = 0;
+                for (i, b) in healthy_backends.iter().enumerate() {
+                    acc += b.weight.max(1) as usize;
+                    if pos < acc {
+                        selected = i;
+                        break;
+                    }
+                }
+                selected
             }
         };
         let backend = healthy_backends[idx];
@@ -1703,6 +1717,68 @@ mod tests {
         let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries[0].rr_counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_weighted_round_robin_equal_weights() {
+        // With equal weights (100 each), behaves like plain round-robin
+        let b1 = make_backend("b1", "10.0.0.1:8080");
+        let b2 = make_backend("b2", "10.0.0.2:8080");
+        let backends = vec![&b1, &b2];
+        let total_weight: usize = backends.iter().map(|b| b.weight.max(1) as usize).sum();
+        assert_eq!(total_weight, 200);
+
+        // Positions 0-99 -> b1, 100-199 -> b2
+        let select = |pos: usize| -> usize {
+            let mut acc = 0;
+            for (i, b) in backends.iter().enumerate() {
+                acc += b.weight.max(1) as usize;
+                if pos < acc {
+                    return i;
+                }
+            }
+            0
+        };
+        assert_eq!(select(0), 0);
+        assert_eq!(select(99), 0);
+        assert_eq!(select(100), 1);
+        assert_eq!(select(199), 1);
+    }
+
+    #[test]
+    fn test_weighted_round_robin_unequal_weights() {
+        // b1 weight=300, b2 weight=100 -> 3:1 ratio
+        let mut b1 = make_backend("b1", "10.0.0.1:8080");
+        b1.weight = 300;
+        let mut b2 = make_backend("b2", "10.0.0.2:8080");
+        b2.weight = 100;
+        let backends = vec![&b1, &b2];
+        let total_weight: usize = backends.iter().map(|b| b.weight.max(1) as usize).sum();
+        assert_eq!(total_weight, 400);
+
+        let select = |pos: usize| -> usize {
+            let mut acc = 0;
+            for (i, b) in backends.iter().enumerate() {
+                acc += b.weight.max(1) as usize;
+                if pos < acc {
+                    return i;
+                }
+            }
+            0
+        };
+        // First 300 positions -> b1, last 100 -> b2
+        assert_eq!(select(0), 0);
+        assert_eq!(select(299), 0);
+        assert_eq!(select(300), 1);
+        assert_eq!(select(399), 1);
+
+        // Over 400 requests, b1 gets 300, b2 gets 100
+        let mut counts = [0usize; 2];
+        for i in 0..400 {
+            counts[select(i % total_weight)] += 1;
+        }
+        assert_eq!(counts[0], 300);
+        assert_eq!(counts[1], 100);
     }
 
     #[test]
