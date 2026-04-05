@@ -635,6 +635,12 @@ fn run_supervisor(cli: Cli) {
                             tracing::warn!(error = %e, "access log retention cleanup failed");
                         }
                     }
+                    {
+                        let s = retention_config_store.lock().await;
+                        if let Err(e) = s.purge_probe_results(1000) {
+                            tracing::warn!(error = %e, "probe result retention cleanup failed");
+                        }
+                    }
                 }
             });
         }
@@ -1361,6 +1367,12 @@ fn run_single_process(cli: Cli) {
                     if retention > 0 {
                         if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
                             tracing::warn!(error = %e, "access log retention cleanup failed");
+                        }
+                    }
+                    {
+                        let s = retention_config_store.lock().await;
+                        if let Err(e) = s.purge_probe_results(1000) {
+                            tracing::warn!(error = %e, "probe result retention cleanup failed");
                         }
                     }
                 }

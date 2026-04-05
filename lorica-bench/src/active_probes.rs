@@ -143,6 +143,21 @@ impl ProbeScheduler {
                     "probe executed"
                 );
 
+                // Persist individual probe result
+                {
+                    let s = store.lock().await;
+                    if let Err(e) = s.insert_probe_result(
+                        &probe.id,
+                        &result.route_id,
+                        result.status_code,
+                        result.latency_ms,
+                        result.success,
+                        result.error.as_deref(),
+                    ) {
+                        warn!(error = %e, probe_id = %probe.id, "failed to persist probe result");
+                    }
+                }
+
                 // Flush result as an "active" source bucket
                 let bucket_start = {
                     let now = Utc::now();

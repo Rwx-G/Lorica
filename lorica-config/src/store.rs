@@ -25,6 +25,7 @@ const MIGRATION_V11: &str = include_str!("migrations/011_backend_h2_upstream.sql
 const MIGRATION_V12: &str = include_str!("migrations/012_route_regex_rewrite.sql");
 const MIGRATION_V13: &str = include_str!("migrations/013_waf_persistence.sql");
 const MIGRATION_V14: &str = include_str!("migrations/014_backend_tls_sni.sql");
+const MIGRATION_V15: &str = include_str!("migrations/015_probe_results.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -301,6 +302,15 @@ impl ConfigStore {
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![14],
+            )?;
+        }
+
+        if current_version < 15 {
+            tracing::info!("applying migration 015_probe_results");
+            self.conn.execute_batch(MIGRATION_V15)?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![15],
             )?;
         }
 
@@ -1696,6 +1706,15 @@ impl ConfigStore {
         Ok(count)
     }
 
+    /// Delete all SLA buckets for a specific route.
+    pub fn delete_sla_buckets_for_route(&self, route_id: &str) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM sla_buckets WHERE route_id = ?1",
+            params![route_id],
+        )?;
+        Ok(count)
+    }
+
     /// Export SLA data as JSON for a route over a time range.
     pub fn export_sla_data(
         &self,
@@ -1832,6 +1851,84 @@ impl ConfigStore {
             probes.push(row??);
         }
         Ok(probes)
+    }
+
+    // ---- Probe Results ----
+
+    /// Insert a probe execution result.
+    pub fn insert_probe_result(
+        &self,
+        probe_id: &str,
+        route_id: &str,
+        status_code: u16,
+        latency_ms: u64,
+        success: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO probe_results (probe_id, route_id, status_code, latency_ms, success, error, executed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![probe_id, route_id, status_code as i64, latency_ms as i64, success, error, now],
+        )?;
+        Ok(())
+    }
+
+    /// Query probe execution history for a specific probe, newest first.
+    pub fn list_probe_results(&self, probe_id: &str, limit: usize) -> Result<Vec<ProbeResultRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, probe_id, route_id, status_code, latency_ms, success, error, executed_at
+             FROM probe_results WHERE probe_id = ?1
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![probe_id, limit as i64], |row| {
+            Ok(ProbeResultRow {
+                id: row.get(0)?,
+                probe_id: row.get(1)?,
+                route_id: row.get(2)?,
+                status_code: row.get::<_, i64>(3)? as u16,
+                latency_ms: row.get::<_, i64>(4)? as u64,
+                success: row.get(5)?,
+                error: row.get(6)?,
+                executed_at: row.get(7)?,
+            })
+        })?;
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r?);
+        }
+        Ok(results)
+    }
+
+    /// Purge old probe results, keeping at most `max_per_probe` entries per probe.
+    pub fn purge_probe_results(&self, max_per_probe: u64) -> Result<u64> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT probe_id FROM probe_results")?;
+        let probe_ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut total_deleted = 0u64;
+        for pid in &probe_ids {
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM probe_results WHERE probe_id = ?1",
+                params![pid],
+                |row| row.get(0),
+            )?;
+            if count > max_per_probe as i64 {
+                let to_delete = count - max_per_probe as i64;
+                self.conn.execute(
+                    "DELETE FROM probe_results WHERE probe_id = ?1 AND id IN (
+                        SELECT id FROM probe_results WHERE probe_id = ?1 ORDER BY id ASC LIMIT ?2
+                    )",
+                    params![pid, to_delete],
+                )?;
+                total_deleted += to_delete as u64;
+            }
+        }
+        Ok(total_deleted)
     }
 
     // ---- Load Test Configuration ----

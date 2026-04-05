@@ -630,6 +630,9 @@ export const api = {
   updateSlaConfig: (routeId: string, body: UpdateSlaConfigRequest) =>
     request<SlaConfigResponse>('PUT', `/sla/routes/${routeId}/config`, body),
 
+  clearRouteSla: (routeId: string) =>
+    request<{ route_id: string; deleted_buckets: number }>('DELETE', `/sla/routes/${routeId}/data`),
+
   exportSla: (routeId: string, format: 'json' | 'csv' = 'json') => {
     const url = `${BASE}/sla/routes/${routeId}/export?format=${format}`;
     return fetch(url, { credentials: 'same-origin' });
@@ -650,6 +653,9 @@ export const api = {
 
   deleteProbe: (id: string) =>
     request<{ deleted: string }>('DELETE', `/probes/${id}`),
+
+  probeHistory: (id: string, limit = 100) =>
+    request<{ results: ProbeResultResponse[]; total: number }>('GET', `/probes/${id}/history?limit=${limit}`),
 
   // Load Testing
   listLoadTestConfigs: () =>
@@ -895,6 +901,17 @@ export interface UpdateProbeRequest {
   interval_s?: number;
   timeout_ms?: number;
   enabled?: boolean;
+}
+
+export interface ProbeResultResponse {
+  id: number;
+  probe_id: string;
+  route_id: string;
+  status_code: number;
+  latency_ms: number;
+  success: boolean;
+  error: string | null;
+  executed_at: string;
 }
 
 // --- Load Testing ---

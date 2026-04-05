@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use axum::extract::Path;
+use axum::extract::{Path, Query};
 use axum::Extension;
 use axum::Json;
 use chrono::Utc;
@@ -174,6 +174,36 @@ pub async fn delete_probe(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     state.notify_config_changed();
     Ok(json_data(serde_json::json!({"deleted": id})))
+}
+
+/// GET /api/v1/probes/:id/history
+/// Returns execution history for a specific probe.
+#[derive(Deserialize)]
+pub struct ProbeHistoryQuery {
+    pub limit: Option<usize>,
+}
+
+pub async fn probe_history(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<ProbeHistoryQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.store.lock().await;
+    store
+        .get_probe_config(&id)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("probe {id}")))?;
+
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let results = store
+        .list_probe_results(&id, limit)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let total = results.len();
+    Ok(json_data(serde_json::json!({
+        "results": results,
+        "total": total,
+    })))
 }
 
 /// GET /api/v1/sla/routes/:id/active

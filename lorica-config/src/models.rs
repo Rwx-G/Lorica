@@ -715,6 +715,18 @@ pub struct ProbeConfig {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeResultRow {
+    pub id: i64,
+    pub probe_id: String,
+    pub route_id: String,
+    pub status_code: u16,
+    pub latency_ms: u64,
+    pub success: bool,
+    pub error: Option<String>,
+    pub executed_at: String,
+}
+
 // --- Load Test Models ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

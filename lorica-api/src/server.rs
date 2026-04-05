@@ -254,6 +254,10 @@ pub fn build_router(
             get(crate::sla::export_sla_data),
         )
         .route(
+            "/api/v1/sla/routes/:id/data",
+            delete(crate::sla::clear_route_sla),
+        )
+        .route(
             "/api/v1/sla/routes/:id/active",
             get(crate::probes::get_active_sla),
         )
@@ -262,6 +266,10 @@ pub fn build_router(
         .route(
             "/api/v1/probes/route/:route_id",
             get(crate::probes::list_probes_for_route),
+        )
+        .route(
+            "/api/v1/probes/:id/history",
+            get(crate::probes::probe_history),
         )
         .route("/api/v1/probes/:id", put(crate::probes::update_probe))
         .route("/api/v1/probes/:id", delete(crate::probes::delete_probe))

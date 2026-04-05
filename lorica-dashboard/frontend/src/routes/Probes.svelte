@@ -3,6 +3,7 @@
   import {
     api,
     type ProbeConfigResponse,
+    type ProbeResultResponse,
     type RouteResponse,
     type CreateProbeRequest,
     type UpdateProbeRequest,
@@ -28,6 +29,10 @@
   let formSubmitting = $state(false);
 
   let deletingProbe: ProbeConfigResponse | null = $state(null);
+
+  let historyProbe: ProbeConfigResponse | null = $state(null);
+  let historyResults: ProbeResultResponse[] = $state([]);
+  let historyLoading = $state(false);
 
   const methods = ['GET', 'HEAD', 'POST'];
 
@@ -132,6 +137,14 @@
     deletingProbe = null;
     await loadData();
   }
+
+  async function showHistory(probe: ProbeConfigResponse) {
+    historyProbe = probe;
+    historyLoading = true;
+    const res = await api.probeHistory(probe.id, 50);
+    historyResults = res.data?.results ?? [];
+    historyLoading = false;
+  }
 </script>
 
 <div class="probes-page">
@@ -188,6 +201,7 @@
                 {/if}
               </td>
               <td class="actions">
+                <button class="btn-link" onclick={() => showHistory(p)}>History</button>
                 <button class="btn-icon" onclick={() => openEditForm(p)} title="Edit">
                   {@html editIcon}
                 </button>
@@ -281,6 +295,52 @@
       </div>
     </div>
   {/if}
+
+  {#if historyProbe}
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) historyProbe = null; }} onkeydown={(e) => { if (e.key === 'Escape') historyProbe = null; }} role="dialog" aria-modal="true" tabindex="-1">
+      <div class="dialog dialog-wide" role="document">
+        <h3>Probe History - {historyProbe.method} {historyProbe.path}</h3>
+        {#if historyLoading}
+          <p class="loading">Loading...</p>
+        {:else if historyResults.length === 0}
+          <p class="empty-text">No execution history yet.</p>
+        {:else}
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Status</th>
+                  <th>Latency</th>
+                  <th>Result</th>
+                  <th>Error</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each historyResults as r}
+                  <tr>
+                    <td>{new Date(r.executed_at).toLocaleString()}</td>
+                    <td>{r.status_code}</td>
+                    <td>{r.latency_ms} ms</td>
+                    <td>
+                      <span class="badge {r.success ? 'badge-green' : 'badge-red'}">
+                        {r.success ? 'OK' : 'FAIL'}
+                      </span>
+                    </td>
+                    <td class="error-cell">{r.error ?? '-'}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+        <div class="actions">
+          <button class="btn btn-cancel" onclick={() => historyProbe = null}>Close</button>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <script lang="ts" module>
@@ -294,4 +354,8 @@
   .method-badge { display: inline-block; padding: 0.125rem 0.5rem; border-radius: var(--radius-full); font-size: var(--text-sm); font-weight: 600; background: var(--color-primary-subtle); color: var(--color-primary); font-family: var(--mono); }
   .status-on { color: var(--color-green); font-weight: 500; }
   .status-off { color: var(--color-text-muted); }
+  .dialog-wide { max-width: 700px; }
+  .badge-green { background: rgba(34, 197, 94, 0.1); color: var(--color-green); padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
+  .badge-red { background: rgba(239, 68, 68, 0.1); color: var(--color-red); padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
+  .error-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-xs); color: var(--color-text-muted); }
 </style>
