@@ -102,6 +102,24 @@ impl WafEngine {
         &self.ip_blocklist
     }
 
+    /// Record an IP blocklist block as a WAF event.
+    pub fn record_blocklist_event(&self, ip: &str, _host: &str, _path: &str) {
+        let event = WafEvent {
+            rule_id: 0,
+            description: format!("IP {ip} blocked by IP blocklist"),
+            category: crate::RuleCategory::IpBlocklist,
+            severity: 5,
+            matched_field: "client_ip".to_string(),
+            matched_value: ip.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let mut buf = self.event_buffer.lock().unwrap();
+        if buf.len() >= self.max_events {
+            buf.pop_front();
+        }
+        buf.push_back(event);
+    }
+
     /// Return a reference to the event buffer for dashboard consumption.
     pub fn event_buffer(&self) -> Arc<Mutex<VecDeque<WafEvent>>> {
         Arc::clone(&self.event_buffer)

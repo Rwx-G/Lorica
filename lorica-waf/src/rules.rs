@@ -27,6 +27,7 @@ pub enum RuleCategory {
     Ssrf,
     LogInjection,
     Xxe,
+    IpBlocklist,
 }
 
 impl RuleCategory {
@@ -40,6 +41,7 @@ impl RuleCategory {
             Self::Ssrf => "ssrf",
             Self::LogInjection => "log_injection",
             Self::Xxe => "xxe",
+            Self::IpBlocklist => "ip_blocklist",
         }
     }
 }
@@ -56,6 +58,7 @@ impl std::str::FromStr for RuleCategory {
             "ssrf" => Ok(Self::Ssrf),
             "log_injection" => Ok(Self::LogInjection),
             "xxe" => Ok(Self::Xxe),
+            "ip_blocklist" => Ok(Self::IpBlocklist),
             other => Err(format!("unknown rule category: {other}")),
         }
     }

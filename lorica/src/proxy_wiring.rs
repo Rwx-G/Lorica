@@ -607,6 +607,12 @@ impl ProxyHttp for LoricaProxy {
                     ip = %ip,
                     "request blocked by IP blocklist"
                 );
+                ctx.waf_blocked = true;
+                // Record as WAF event + Prometheus metric
+                let path = req.uri.path();
+                let host_val = extract_host(req);
+                self.waf_engine.record_blocklist_event(ip, host_val, path);
+                lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
                 let header = lorica_http::ResponseHeader::build(403, None)?;
                 session
                     .write_response_header(Box::new(header), true)
