@@ -588,7 +588,7 @@
               <td>{formatDate(cert.not_after)}</td>
               <td>
                 {#if true}
-                  {@const daysLeft = Math.ceil((new Date(cert.not_after).getTime() - Date.now()) / (1000 * 60 * 60 * 24))}
+                  {@const daysLeft = Math.floor((new Date(cert.not_after).getTime() - Date.now()) / (1000 * 60 * 60 * 24))}
                   <span class="days-left" style="color: {daysLeft < 7 ? 'var(--color-red)' : daysLeft <= 30 ? 'var(--color-orange, #fb923c)' : 'var(--color-green)'}; font-weight: 700; font-size: 1rem;">
                     {daysLeft}d
                   </span>
