@@ -160,7 +160,7 @@
   {:else}
     <!-- Overview cards -->
     <div class="overview-grid">
-      {#each overview as s}
+      {#each overview.filter(s => s.window === '24h') as s}
         {@const hostname = getRouteHostname(s.route_id)}
         <button
           class="sla-card"
