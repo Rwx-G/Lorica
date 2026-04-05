@@ -153,6 +153,28 @@ pub struct BanReportEntry {
     pub ban_duration_seconds: u64,
 }
 
+/// Per-route/status HTTP request count entry.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RequestCountEntry {
+    #[prost(string, tag = "1")]
+    pub route_id: String,
+    #[prost(uint32, tag = "2")]
+    pub status_code: u32,
+    #[prost(uint64, tag = "3")]
+    pub count: u64,
+}
+
+/// Per-category/action WAF event count entry.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WafCountEntry {
+    #[prost(string, tag = "1")]
+    pub category: String,
+    #[prost(string, tag = "2")]
+    pub action: String,
+    #[prost(uint64, tag = "3")]
+    pub count: u64,
+}
+
 /// A single backend active connection count in a metrics report.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct BackendConnEntry {
@@ -208,6 +230,12 @@ pub struct MetricsReport {
     /// Per-backend active connection counts.
     #[prost(message, repeated, tag = "9")]
     pub backend_conn_entries: Vec<BackendConnEntry>,
+    /// Per-route/status HTTP request counts (cumulative).
+    #[prost(message, repeated, tag = "10")]
+    pub request_entries: Vec<RequestCountEntry>,
+    /// Per-category/action WAF event counts (cumulative).
+    #[prost(message, repeated, tag = "11")]
+    pub waf_entries: Vec<WafCountEntry>,
 }
 
 impl MetricsReport {
@@ -226,6 +254,8 @@ impl MetricsReport {
             ban_entries: Vec::new(),
             ewma_entries: Vec::new(),
             backend_conn_entries: Vec::new(),
+            request_entries: Vec::new(),
+            waf_entries: Vec::new(),
         }
     }
 }

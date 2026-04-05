@@ -126,6 +126,10 @@ struct WorkerSnapshot {
     ewma_scores: HashMap<String, f64>,
     /// backend_address -> active connections
     backend_connections: HashMap<String, u64>,
+    /// (route_id, status_code) -> cumulative count
+    request_counts: Vec<(String, u32, u64)>,
+    /// (category, action) -> cumulative count
+    waf_counts: Vec<(String, String, u64)>,
 }
 
 impl Default for AggregatedMetrics {
@@ -151,6 +155,8 @@ impl AggregatedMetrics {
         ban_entries: Vec<(String, u64, u64)>,
         ewma_scores: HashMap<String, f64>,
         backend_connections: HashMap<String, u64>,
+        request_counts: Vec<(String, u32, u64)>,
+        waf_counts: Vec<(String, String, u64)>,
     ) {
         let mut map = self.inner.write().await;
         map.insert(
@@ -162,6 +168,8 @@ impl AggregatedMetrics {
                 ban_entries,
                 ewma_scores,
                 backend_connections,
+                request_counts,
+                waf_counts,
             },
         );
     }
@@ -236,6 +244,30 @@ impl AggregatedMetrics {
                 if *score < *entry {
                     *entry = *score;
                 }
+            }
+        }
+        merged
+    }
+
+    /// Sum of HTTP request counts across all workers, grouped by (route_id, status_code).
+    pub async fn merged_request_counts(&self) -> HashMap<(String, u32), u64> {
+        let map = self.inner.read().await;
+        let mut merged: HashMap<(String, u32), u64> = HashMap::new();
+        for w in map.values() {
+            for (route_id, status, count) in &w.request_counts {
+                *merged.entry((route_id.clone(), *status)).or_insert(0) += count;
+            }
+        }
+        merged
+    }
+
+    /// Sum of WAF event counts across all workers, grouped by (category, action).
+    pub async fn merged_waf_counts(&self) -> HashMap<(String, String), u64> {
+        let map = self.inner.read().await;
+        let mut merged: HashMap<(String, String), u64> = HashMap::new();
+        for w in map.values() {
+            for (category, action, count) in &w.waf_counts {
+                *merged.entry((category.clone(), action.clone())).or_insert(0) += count;
             }
         }
         merged

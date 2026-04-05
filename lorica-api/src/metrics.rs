@@ -194,6 +194,58 @@ pub fn set_system_metrics(cpu_percent: f64, memory_used_bytes: i64) {
     SYSTEM_MEMORY_USED_BYTES.set(memory_used_bytes);
 }
 
+/// Collect current HTTP request counter values (for worker metric reports).
+pub fn collect_request_counts() -> Vec<(String, u32, u64)> {
+    let families = HTTP_REQUESTS_TOTAL.collect();
+    let mut result = Vec::new();
+    for family in &families {
+        for metric in family.get_metric() {
+            let labels = metric.get_label();
+            let route_id = labels
+                .iter()
+                .find(|l| l.get_name() == "route_id")
+                .map(|l| l.get_value().to_string())
+                .unwrap_or_default();
+            let status_code = labels
+                .iter()
+                .find(|l| l.get_name() == "status_code")
+                .map(|l| l.get_value().parse::<u32>().unwrap_or(0))
+                .unwrap_or(0);
+            let count = metric.get_counter().get_value() as u64;
+            if count > 0 {
+                result.push((route_id, status_code, count));
+            }
+        }
+    }
+    result
+}
+
+/// Collect current WAF event counter values (for worker metric reports).
+pub fn collect_waf_counts() -> Vec<(String, String, u64)> {
+    let families = WAF_EVENTS_TOTAL.collect();
+    let mut result = Vec::new();
+    for family in &families {
+        for metric in family.get_metric() {
+            let labels = metric.get_label();
+            let category = labels
+                .iter()
+                .find(|l| l.get_name() == "category")
+                .map(|l| l.get_value().to_string())
+                .unwrap_or_default();
+            let action = labels
+                .iter()
+                .find(|l| l.get_name() == "action")
+                .map(|l| l.get_value().to_string())
+                .unwrap_or_default();
+            let count = metric.get_counter().get_value() as u64;
+            if count > 0 {
+                result.push((category, action, count));
+            }
+        }
+    }
+    result
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,
@@ -256,6 +308,43 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
             [(header::CONTENT_TYPE, "text/plain".to_string())],
             format!("metrics encoding failed: {e}").into_bytes(),
         );
+    }
+
+    // In supervisor mode, append aggregated worker request/WAF counters
+    // (workers have their own Prometheus registries, so the supervisor's
+    // counters are empty for these metrics)
+    if let Some(ref agg) = state.aggregated_metrics {
+        let req_counts = agg.merged_request_counts().await;
+        if !req_counts.is_empty() {
+            buffer.extend_from_slice(
+                b"# HELP lorica_http_requests_total Total HTTP requests proxied\n\
+                  # TYPE lorica_http_requests_total counter\n",
+            );
+            for ((route_id, status), count) in &req_counts {
+                buffer.extend_from_slice(
+                    format!(
+                        "lorica_http_requests_total{{route_id=\"{route_id}\",status_code=\"{status}\"}} {count}\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+
+        let waf_counts = agg.merged_waf_counts().await;
+        if !waf_counts.is_empty() {
+            buffer.extend_from_slice(
+                b"# HELP lorica_waf_events_total Total WAF events\n\
+                  # TYPE lorica_waf_events_total counter\n",
+            );
+            for ((category, action), count) in &waf_counts {
+                buffer.extend_from_slice(
+                    format!(
+                        "lorica_waf_events_total{{category=\"{category}\",action=\"{action}\"}} {count}\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
     }
 
     ([(header::CONTENT_TYPE, content_type)], buffer)

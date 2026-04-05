@@ -460,6 +460,16 @@ fn run_supervisor(cli: Cli) {
                                             .iter()
                                             .map(|e| (e.backend_address.clone(), e.connections))
                                             .collect();
+                                        let req_counts: Vec<(String, u32, u64)> = report
+                                            .request_entries
+                                            .iter()
+                                            .map(|e| (e.route_id.clone(), e.status_code, e.count))
+                                            .collect();
+                                        let waf_counts: Vec<(String, String, u64)> = report
+                                            .waf_entries
+                                            .iter()
+                                            .map(|e| (e.category.clone(), e.action.clone(), e.count))
+                                            .collect();
                                         agg_metrics
                                             .update_worker(
                                                 worker_id,
@@ -469,6 +479,8 @@ fn run_supervisor(cli: Cli) {
                                                 bans,
                                                 ewma,
                                                 backend_conns,
+                                                req_counts,
+                                                waf_counts,
                                             )
                                             .await;
                                     }
@@ -828,8 +840,16 @@ fn run_supervisor(cli: Cli) {
                                                                     .backend_conn_entries.iter()
                                                                     .map(|e| (e.backend_address.clone(), e.connections))
                                                                     .collect();
+                                                                let req_counts: Vec<(String, u32, u64)> = report
+                                                                    .request_entries.iter()
+                                                                    .map(|e| (e.route_id.clone(), e.status_code, e.count))
+                                                                    .collect();
+                                                                let waf_counts: Vec<(String, String, u64)> = report
+                                                                    .waf_entries.iter()
+                                                                    .map(|e| (e.category.clone(), e.action.clone(), e.count))
+                                                                    .collect();
                                                                 agg_metrics
-                                                                    .update_worker(id, report.cache_hits, report.cache_misses, report.active_connections, bans, ewma, backend_conns)
+                                                                    .update_worker(id, report.cache_hits, report.cache_misses, report.active_connections, bans, ewma, backend_conns, req_counts, waf_counts)
                                                                     .await;
                                                             }
                                                         }
@@ -1131,6 +1151,18 @@ fn run_worker(
                             .map(|(addr, conns)| lorica_command::BackendConnEntry {
                                 backend_address: addr,
                                 connections: conns,
+                            })
+                            .collect();
+                        report.request_entries = lorica_api::metrics::collect_request_counts()
+                            .into_iter()
+                            .map(|(route_id, status_code, count)| {
+                                lorica_command::RequestCountEntry { route_id, status_code, count }
+                            })
+                            .collect();
+                        report.waf_entries = lorica_api::metrics::collect_waf_counts()
+                            .into_iter()
+                            .map(|(category, action, count)| {
+                                lorica_command::WafCountEntry { category, action, count }
                             })
                             .collect();
 
