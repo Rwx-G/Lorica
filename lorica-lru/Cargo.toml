@@ -17,9 +17,9 @@ name = "lorica_lru"
 path = "src/lib.rs"
 
 [dependencies]
-hashbrown = "0"
-parking_lot = "0"
-arrayvec = "0"
+hashbrown = "0.12"
+parking_lot = "0.12"
+arrayvec = "0.7"
 rand = "0.8"
 
 [dev-dependencies]

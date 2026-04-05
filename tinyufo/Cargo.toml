@@ -18,15 +18,15 @@ path = "src/lib.rs"
 [dependencies]
 ahash = { workspace = true }
 flurry = "0.5"
-crossbeam-queue = "0"
-crossbeam-skiplist = "0"
+crossbeam-queue = "0.3"
+crossbeam-skiplist = "0.1"
 
 [dev-dependencies]
 rand = "0.9"
 lru = { workspace = true }
 rand_distr = "0.5"
-moka = { version = "0", features = ["sync"] }
-dhat = "0"
+moka = { version = "0.12", features = ["sync"] }
+dhat = "0.3"
 quick_cache = "0.6"
 triomphe = "<=0.1.11" # 0.1.12 requires Rust 1.76
 
