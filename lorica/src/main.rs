@@ -65,6 +65,12 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_HTTPS_PORT)]
     https_port: u16,
 
+    /// Path to a CRL (Certificate Revocation List) file in PEM or DER format.
+    /// When set, upstream server certificates are checked against this CRL.
+    /// Requires a service restart after updating the CRL file.
+    #[arg(long)]
+    upstream_crl_file: Option<String>,
+
     /// Number of worker processes (default: number of CPU cores, 0 = single-process mode)
     #[arg(long, default_value_t = 0)]
     workers: usize,
@@ -96,6 +102,10 @@ enum Commands {
         /// Log level
         #[arg(long, default_value = "info")]
         log_level: String,
+
+        /// Path to upstream CRL file (passed from supervisor)
+        #[arg(long)]
+        upstream_crl_file: Option<String>,
     },
 }
 
@@ -141,9 +151,10 @@ fn main() {
             data_dir,
             https_port,
             log_level,
+            upstream_crl_file,
         }) => {
             init_logging(&log_level);
-            run_worker(id, cmd_fd, &data_dir, https_port);
+            run_worker(id, cmd_fd, &data_dir, https_port, upstream_crl_file.as_deref());
         }
         None => {
             init_logging(&cli.log_level);
@@ -185,6 +196,7 @@ fn run_supervisor(cli: Cli) {
         http_addr: format!("0.0.0.0:{}", cli.http_port),
         https_addr: Some(format!("0.0.0.0:{}", cli.https_port)),
         https_port: cli.https_port,
+        upstream_crl_file: cli.upstream_crl_file.clone(),
     };
 
     // Fork workers BEFORE creating any threads/runtime
@@ -641,7 +653,7 @@ fn run_supervisor(cli: Cli) {
 // Worker mode (Unix only): receives FDs from supervisor, runs proxy engine
 // ---------------------------------------------------------------------------
 
-fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16) {
+fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16, upstream_crl_file: Option<&str>) {
     use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_core::server::Fds;
     use lorica_worker::fd_passing;
@@ -857,7 +869,9 @@ fn run_worker(id: u32, cmd_fd: i32, data_dir: &str, https_port: u16) {
         Arc::clone(&sla_collector),
     );
 
-    let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
+    let mut server_conf = lorica_core::server::configuration::ServerConf::default();
+    server_conf.upstream_crl_file = upstream_crl_file.map(|s| s.to_string());
+    let server_conf = Arc::new(server_conf);
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
 
     // Register listeners - TCP for HTTP, TLS for HTTPS
@@ -1070,7 +1084,9 @@ fn run_single_process(cli: Cli) {
         let proxy_cache_misses = Arc::clone(&lorica_proxy.cache_misses);
         let proxy_ban_list = Arc::clone(&lorica_proxy.ban_list);
         let proxy_ewma_scores = lorica_proxy.ewma_tracker.scores_ref();
-        let server_conf = Arc::new(lorica_core::server::configuration::ServerConf::default());
+        let mut server_conf = lorica_core::server::configuration::ServerConf::default();
+        server_conf.upstream_crl_file = cli.upstream_crl_file.clone();
+        let server_conf = Arc::new(server_conf);
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
         let mut tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
         tcp_opts.so_reuseport = Some(true);

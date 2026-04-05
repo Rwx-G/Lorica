@@ -53,6 +53,8 @@ pub struct WorkerConfig {
     pub https_addr: Option<String>,
     /// HTTPS port number for workers to identify TLS listeners.
     pub https_port: u16,
+    /// Path to upstream CRL file (passed to worker via CLI).
+    pub upstream_crl_file: Option<String>,
 }
 
 impl WorkerConfig {
@@ -211,7 +213,7 @@ impl WorkerManager {
                 let exe = std::env::current_exe().map_err(WorkerError::CurrentExe)?;
                 let exe_str = exe.to_string_lossy().to_string();
 
-                let args_strings = vec![
+                let mut args_strings = vec![
                     exe_str.clone(),
                     "worker".to_string(),
                     "--id".to_string(),
@@ -225,6 +227,10 @@ impl WorkerManager {
                     "--log-level".to_string(),
                     self.config.log_level.clone(),
                 ];
+                if let Some(ref crl) = self.config.upstream_crl_file {
+                    args_strings.push("--upstream-crl-file".to_string());
+                    args_strings.push(crl.clone());
+                }
 
                 let c_args: Vec<CString> = args_strings
                     .iter()
@@ -438,6 +444,7 @@ mod tests {
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: None,
             https_port: 0,
+            upstream_crl_file: None,
         };
         let mgr = WorkerManager::new(config);
         assert_eq!(mgr.worker_count(), 0);
@@ -453,6 +460,7 @@ mod tests {
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: None,
             https_port: 0,
+            upstream_crl_file: None,
         };
         let mut mgr = WorkerManager::new(config);
         mgr.create_listen_sockets().expect("create sockets failed");
@@ -469,6 +477,7 @@ mod tests {
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: Some("127.0.0.1:0".to_string()),
             https_port: 443,
+            upstream_crl_file: None,
         };
         let mut mgr = WorkerManager::new(config);
         mgr.create_listen_sockets().expect("create sockets failed");
