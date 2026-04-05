@@ -494,6 +494,7 @@ mod tests {
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: None,
             https_port: 0,
+            upstream_crl_file: None,
         };
         let mgr = WorkerManager::new(config);
         let events = mgr.check_workers();

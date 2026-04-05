@@ -30,6 +30,7 @@ bstr = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 tokio-stream = { workspace = true }
 futures = "0.3"
+arc-swap = "1"
 async-trait = { workspace = true }
 httparse = { workspace = true }
 bytes = { workspace = true }

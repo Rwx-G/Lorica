@@ -30,6 +30,10 @@ impl Connector {
         }
     }
 
+    pub fn reload_crl(&self) -> Result<()> {
+        self.transport.reload_crl()
+    }
+
     pub async fn get_http_session<P: Peer + Send + Sync + 'static>(
         &self,
         peer: &P,

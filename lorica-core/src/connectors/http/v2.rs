@@ -288,6 +288,10 @@ impl Connector {
         }
     }
 
+    pub fn reload_crl(&self) -> lorica_error::Result<()> {
+        self.transport.reload_crl()
+    }
+
     pub fn transport(&self) -> &TransportConnector {
         &self.transport
     }

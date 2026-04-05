@@ -58,6 +58,12 @@ where
         }
     }
 
+    /// Reload the upstream CRL from disk for both HTTP/1.1 and HTTP/2 connectors.
+    pub fn reload_crl(&self) -> lorica_error::Result<()> {
+        self.h1.reload_crl()?;
+        self.h2.reload_crl()
+    }
+
     /// Get an [HttpSession] to the given server.
     ///
     /// The second return value indicates whether the session is connected via a reused stream.

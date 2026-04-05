@@ -168,6 +168,16 @@ impl TransportConnector {
         }
     }
 
+    /// Reload the upstream CRL from disk. New connections will use the updated CRL.
+    pub fn reload_crl(&self) -> lorica_error::Result<()> {
+        self.tls_ctx.ctx.reload_crl()
+    }
+
+    /// Check if the CRL file changed on disk and reload if needed.
+    pub fn check_and_reload_crl(&self) -> lorica_error::Result<bool> {
+        self.tls_ctx.ctx.check_and_reload_crl()
+    }
+
     /// Connect to the given server [Peer]
     ///
     /// No connection is reused.

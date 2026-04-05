@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use log::debug;
 use lorica_error::{
     Error,
@@ -21,10 +22,11 @@ use lorica_error::{
     OrErr, Result,
 };
 use lorica_tls::{
-    load_ca_file_into_store, load_certs_and_key_files, load_platform_certs_incl_env_into_store,
-    version, CertificateDer, CertificateError, ClientConfig as RusTlsClientConfig,
-    DigitallySignedStruct, KeyLogFile, PrivateKeyDer, RootCertStore, RusTlsError, ServerName,
-    SignatureScheme, TlsConnector as RusTlsConnector, UnixTime, WebPkiServerVerifier,
+    load_ca_file_into_store, load_certs_and_key_files, load_crls_from_file,
+    load_platform_certs_incl_env_into_store, version, CertificateDer, CertificateError,
+    ClientConfig as RusTlsClientConfig, DigitallySignedStruct, KeyLogFile, PrivateKeyDer,
+    RootCertStore, RusTlsError, ServerName, SignatureScheme, TlsConnector as RusTlsConnector,
+    UnixTime, WebPkiServerVerifier,
 };
 
 // Uses custom certificate verification from rustls's 'danger' module.
@@ -51,9 +53,18 @@ impl Connector {
     }
 }
 
+/// Interval between CRL file change checks (seconds).
+const CRL_CHECK_INTERVAL_SECS: u64 = 60;
+
 pub struct TlsConnector {
-    config: Arc<RusTlsClientConfig>,
+    config: ArcSwap<RusTlsClientConfig>,
     ca_certs: Arc<RootCertStore>,
+    crl_file: Option<String>,
+    debug_ssl_keylog: bool,
+    /// Last known mtime of the CRL file, used for hot-reload detection.
+    crl_mtime: std::sync::Mutex<Option<std::time::SystemTime>>,
+    /// Last time we checked the CRL file for changes.
+    last_crl_check: std::sync::Mutex<std::time::Instant>,
 }
 
 impl TlsConnector {
@@ -125,12 +136,100 @@ impl TlsConnector {
             }
         }
 
+        let crl_file = options.as_ref().and_then(|o| o.crl_file.clone());
+        let debug_ssl_keylog = options.as_ref().is_some_and(|o| o.debug_ssl_keylog);
+        let crl_mtime = crl_file.as_ref().and_then(|p| {
+            std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
+        });
+
         Ok(Connector {
             ctx: Arc::new(TlsConnector {
-                config: Arc::new(config),
+                config: ArcSwap::new(Arc::new(config)),
                 ca_certs: Arc::new(ca_certs),
+                crl_file,
+                debug_ssl_keylog,
+                crl_mtime: std::sync::Mutex::new(crl_mtime),
+                last_crl_check: std::sync::Mutex::new(std::time::Instant::now()),
             }),
         })
+    }
+}
+
+impl TlsConnector {
+    /// Reload the CRL from disk and rebuild the TLS client config.
+    /// New connections will use the updated CRL; existing connections are unaffected.
+    pub fn reload_crl(&self) -> Result<()> {
+        let Some(ref crl_path) = self.crl_file else {
+            return Ok(()); // No CRL configured, nothing to reload
+        };
+
+        let crls = load_crls_from_file(crl_path)?;
+        debug!("reloaded {} CRL(s) from {}", crls.len(), crl_path);
+
+        let verifier = WebPkiServerVerifier::builder(Arc::clone(&self.ca_certs))
+            .with_crls(crls)
+            .build()
+            .or_err(InvalidCert, "Failed to rebuild server verifier with CRLs")?;
+
+        let mut new_config =
+            RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+                .with_webpki_verifier(verifier)
+                .with_no_client_auth();
+
+        if self.debug_ssl_keylog {
+            new_config.key_log = Arc::new(KeyLogFile::new());
+        }
+
+        self.config.store(Arc::new(new_config));
+
+        // Update stored mtime
+        if let Ok(meta) = std::fs::metadata(crl_path) {
+            if let Ok(mtime) = meta.modified() {
+                *self.crl_mtime.lock().unwrap() = Some(mtime);
+            }
+        }
+
+        debug!("CRL hot-reloaded successfully");
+        Ok(())
+    }
+
+    /// Check if the CRL file has been modified and reload if needed.
+    /// Returns true if a reload was performed.
+    pub fn check_and_reload_crl(&self) -> Result<bool> {
+        let Some(ref crl_path) = self.crl_file else {
+            return Ok(false);
+        };
+
+        let current_mtime = match std::fs::metadata(crl_path) {
+            Ok(meta) => meta.modified().ok(),
+            Err(_) => return Ok(false), // File gone, nothing to do
+        };
+
+        let stored_mtime = *self.crl_mtime.lock().unwrap();
+        if current_mtime != stored_mtime {
+            self.reload_crl()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Rate-limited CRL check: only stat() the file every CRL_CHECK_INTERVAL_SECS.
+    /// Safe to call on every connection with negligible overhead.
+    pub fn maybe_reload_crl(&self) {
+        if self.crl_file.is_none() {
+            return;
+        }
+        let mut last_check = self.last_crl_check.lock().unwrap();
+        if last_check.elapsed().as_secs() < CRL_CHECK_INTERVAL_SECS {
+            return;
+        }
+        *last_check = std::time::Instant::now();
+        drop(last_check); // Release lock before doing I/O
+
+        if let Err(e) = self.check_and_reload_crl() {
+            log::warn!("CRL reload failed: {e}");
+        }
     }
 }
 
@@ -144,7 +243,10 @@ where
     T: IO,
     P: Peer + Send + Sync,
 {
-    let config = &tls_ctx.config;
+    // Check if CRL file changed on disk (rate-limited to every 60s)
+    tls_ctx.maybe_reload_crl();
+
+    let config = tls_ctx.config.load();
 
     // Build per-peer CA store if provided
     let peer_ca_store: Option<Arc<RootCertStore>> = if let Some(ca_list) = peer.get_ca() {
@@ -227,7 +329,7 @@ where
         if let Some(updated_config) = updated_config_opt.as_mut() {
             updated_config.alpn_protocols = alpn_protocols;
         } else {
-            let mut updated_config = RusTlsClientConfig::clone(config);
+            let mut updated_config = RusTlsClientConfig::clone(&config);
             updated_config.alpn_protocols = alpn_protocols;
             updated_config_opt = Some(updated_config);
         }
@@ -279,7 +381,7 @@ where
         if let Some(cfg) = updated_config_opt.as_mut() {
             apply_no_verify(cfg);
         } else {
-            let mut tmp = RusTlsClientConfig::clone(config);
+            let mut tmp = RusTlsClientConfig::clone(&config);
             apply_no_verify(&mut tmp);
             updated_config_opt = Some(tmp);
         }
@@ -288,7 +390,7 @@ where
     let tls_conn = if let Some(cfg) = updated_config_opt {
         RusTlsConnector::from(Arc::new(cfg))
     } else {
-        RusTlsConnector::from(Arc::clone(config))
+        RusTlsConnector::from(Arc::clone(&config))
     };
 
     let connect_future = handshake(&tls_conn, &domain, stream);

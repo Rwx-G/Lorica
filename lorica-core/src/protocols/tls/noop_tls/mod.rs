@@ -47,6 +47,16 @@ pub mod connectors {
     #[derive(Clone)]
     pub struct TlsConnector;
 
+    impl TlsConnector {
+        pub fn reload_crl(&self) -> Result<()> {
+            Ok(())
+        }
+
+        pub fn check_and_reload_crl(&self) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
     pub struct TlsSettings;
 
     impl Connector {
