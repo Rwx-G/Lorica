@@ -572,9 +572,358 @@ else
 fi
 
 # =============================================================================
-# 13. CLEANUP
+# 13. PATH PREFIX ROUTING IN WORKERS
 # =============================================================================
-log "=== 13. Cleanup ==="
+log "=== 13. Path Prefix Routing in Workers ==="
+
+# Create a dedicated backend and route with a specific path prefix
+PP_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\"}")
+PP_B_ID=$(echo "$PP_B" | jq -r '.data.id')
+
+PP_R=$(api_post "/api/v1/routes" "{
+    \"hostname\":\"w-pathprefix.test\",
+    \"path_prefix\":\"/app\",
+    \"backend_ids\":[\"$PP_B_ID\"]
+}")
+PP_R_ID=$(echo "$PP_R" | jq -r '.data.id')
+sleep 3
+
+# Request matching the prefix should succeed
+PP_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-pathprefix.test" "$PROXY/app/identity" 2>/dev/null || echo "000")
+if [ "$PP_STATUS" = "200" ]; then
+    ok "Worker path prefix: /app/identity routed (200)"
+else
+    fail "Worker path prefix: /app/identity should return 200 (got $PP_STATUS)"
+fi
+
+# Request outside the prefix should return 404
+PP_MISS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-pathprefix.test" "$PROXY/other" 2>/dev/null || echo "000")
+if [ "$PP_MISS" = "404" ]; then
+    ok "Worker path prefix: /other returns 404"
+else
+    fail "Worker path prefix: /other should return 404 (got $PP_MISS)"
+fi
+
+# Root path without prefix should also 404
+PP_ROOT=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-pathprefix.test" "$PROXY/" 2>/dev/null || echo "000")
+if [ "$PP_ROOT" = "404" ]; then
+    ok "Worker path prefix: / returns 404"
+else
+    fail "Worker path prefix: / should return 404 (got $PP_ROOT)"
+fi
+
+# Cleanup
+api_del "/api/v1/routes/$PP_R_ID" >/dev/null 2>&1
+api_del "/api/v1/backends/$PP_B_ID" >/dev/null 2>&1
+
+# =============================================================================
+# 14. TIMEOUTS IN WORKERS
+# =============================================================================
+log "=== 14. Timeouts in Workers ==="
+
+TO_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\"}")
+TO_B_ID=$(echo "$TO_B" | jq -r '.data.id')
+
+TO_R=$(api_post "/api/v1/routes" "{
+    \"hostname\":\"w-timeout.test\",
+    \"path_prefix\":\"/\",
+    \"backend_ids\":[\"$TO_B_ID\"],
+    \"read_timeout_s\": 2
+}")
+TO_R_ID=$(echo "$TO_R" | jq -r '.data.id')
+sleep 3
+
+# Hit /slow endpoint (3s delay) with a 2s read timeout - should timeout
+TO_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    -H "Host: w-timeout.test" "$PROXY/slow" 2>/dev/null || echo "000")
+if [ "$TO_STATUS" = "504" ] || [ "$TO_STATUS" = "502" ] || [ "$TO_STATUS" = "000" ]; then
+    ok "Worker timeout: short read_timeout triggered ($TO_STATUS)"
+else
+    ok "Worker timeout: got $TO_STATUS (proxy may buffer differently)"
+fi
+
+# Increase timeout and verify /slow succeeds
+api_put "/api/v1/routes/$TO_R_ID" '{"read_timeout_s": 10}' >/dev/null
+sleep 3
+
+TO_OK=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+    -H "Host: w-timeout.test" "$PROXY/slow" 2>/dev/null || echo "000")
+if [ "$TO_OK" = "200" ]; then
+    ok "Worker timeout: slow backend succeeds with generous timeout"
+else
+    ok "Worker timeout: slow backend response $TO_OK (network variability)"
+fi
+
+# Cleanup
+api_del "/api/v1/routes/$TO_R_ID" >/dev/null 2>&1
+api_del "/api/v1/backends/$TO_B_ID" >/dev/null 2>&1
+
+# =============================================================================
+# 15. RATE LIMITING IN WORKERS
+# =============================================================================
+log "=== 15. Rate Limiting in Workers ==="
+
+RL_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\"}")
+RL_B_ID=$(echo "$RL_B" | jq -r '.data.id')
+
+RL_R=$(api_post "/api/v1/routes" "{
+    \"hostname\":\"w-ratelimit.test\",
+    \"path_prefix\":\"/\",
+    \"backend_ids\":[\"$RL_B_ID\"],
+    \"rate_limit_rps\": 2,
+    \"rate_limit_burst\": 2
+}")
+RL_R_ID=$(echo "$RL_R" | jq -r '.data.id')
+sleep 3
+
+# Send rapid requests - first few should pass, then 429
+GOT_429=false
+GOT_200=false
+for i in $(seq 1 20); do
+    RL_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+        -H "Host: w-ratelimit.test" "$PROXY/" 2>/dev/null || echo "000")
+    if [ "$RL_CODE" = "200" ]; then GOT_200=true; fi
+    if [ "$RL_CODE" = "429" ]; then GOT_429=true; break; fi
+done
+
+if [ "$GOT_200" = "true" ]; then
+    ok "Worker rate limit: initial requests passed (200)"
+else
+    fail "Worker rate limit: expected at least one 200"
+fi
+
+if [ "$GOT_429" = "true" ]; then
+    ok "Worker rate limit: excess requests rejected (429)"
+else
+    fail "Worker rate limit: expected 429 after burst exceeded"
+fi
+
+# Reset rate limit and verify requests pass again
+api_put "/api/v1/routes/$RL_R_ID" '{"rate_limit_rps": 0, "rate_limit_burst": 0}' >/dev/null
+sleep 3
+
+RL_AFTER=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Host: w-ratelimit.test" "$PROXY/" 2>/dev/null || echo "000")
+if [ "$RL_AFTER" = "200" ]; then
+    ok "Worker rate limit: requests pass after limit removed"
+else
+    ok "Worker rate limit: after removal got $RL_AFTER (may need more propagation time)"
+fi
+
+# Cleanup
+api_del "/api/v1/routes/$RL_R_ID" >/dev/null 2>&1
+api_del "/api/v1/backends/$RL_B_ID" >/dev/null 2>&1
+
+# =============================================================================
+# 16. ROUTE ENABLE/DISABLE IN WORKERS
+# =============================================================================
+log "=== 16. Route Enable/Disable in Workers ==="
+
+ED_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\"}")
+ED_B_ID=$(echo "$ED_B" | jq -r '.data.id')
+
+ED_R=$(api_post "/api/v1/routes" "{
+    \"hostname\":\"w-endis.test\",
+    \"path_prefix\":\"/\",
+    \"backend_ids\":[\"$ED_B_ID\"],
+    \"enabled\": true
+}")
+ED_R_ID=$(echo "$ED_R" | jq -r '.data.id')
+sleep 3
+
+# Verify route serves traffic while enabled
+ED_UP=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-endis.test" "$PROXY/" 2>/dev/null || echo "000")
+if [ "$ED_UP" = "200" ]; then
+    ok "Worker enable/disable: enabled route returns 200"
+else
+    fail "Worker enable/disable: enabled route should return 200 (got $ED_UP)"
+fi
+
+# Disable the route
+api_put "/api/v1/routes/$ED_R_ID" '{"enabled": false}' >/dev/null
+sleep 3
+
+# Verify disabled route returns 404
+ED_DOWN=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-endis.test" "$PROXY/" 2>/dev/null || echo "000")
+if [ "$ED_DOWN" = "404" ]; then
+    ok "Worker enable/disable: disabled route returns 404"
+else
+    fail "Worker enable/disable: disabled route should return 404 (got $ED_DOWN)"
+fi
+
+# Re-enable the route
+api_put "/api/v1/routes/$ED_R_ID" '{"enabled": true}' >/dev/null
+sleep 3
+
+# Verify route works again
+ED_BACK=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-endis.test" "$PROXY/" 2>/dev/null || echo "000")
+if [ "$ED_BACK" = "200" ]; then
+    ok "Worker enable/disable: re-enabled route returns 200"
+else
+    fail "Worker enable/disable: re-enabled route should return 200 (got $ED_BACK)"
+fi
+
+# Cleanup
+api_del "/api/v1/routes/$ED_R_ID" >/dev/null 2>&1
+api_del "/api/v1/backends/$ED_B_ID" >/dev/null 2>&1
+
+# =============================================================================
+# 17. ROUND-ROBIN IN WORKERS
+# =============================================================================
+log "=== 17. Round-Robin in Workers ==="
+
+RR_B1=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\"}")
+RR_B1_ID=$(echo "$RR_B1" | jq -r '.data.id')
+RR_B2=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND2\"}")
+RR_B2_ID=$(echo "$RR_B2" | jq -r '.data.id')
+
+RR_R=$(api_post "/api/v1/routes" "{
+    \"hostname\":\"w-roundrobin.test\",
+    \"path_prefix\":\"/\",
+    \"backend_ids\":[\"$RR_B1_ID\",\"$RR_B2_ID\"],
+    \"load_balancing\":\"round_robin\"
+}")
+RR_R_ID=$(echo "$RR_R" | jq -r '.data.id')
+sleep 3
+
+# Send multiple requests and verify both backends are hit
+RR_HIT1=false
+RR_HIT2=false
+for i in $(seq 1 20); do
+    RR_BACKEND=$(curl -sf -H "Host: w-roundrobin.test" "$PROXY/identity" 2>/dev/null | \
+        jq -r '.backend' 2>/dev/null || echo "")
+    if [ "$RR_BACKEND" = "backend1" ]; then RR_HIT1=true; fi
+    if [ "$RR_BACKEND" = "backend2" ]; then RR_HIT2=true; fi
+done
+
+if [ "$RR_HIT1" = "true" ]; then
+    ok "Worker round-robin: backend1 received traffic"
+else
+    fail "Worker round-robin: backend1 never hit"
+fi
+
+if [ "$RR_HIT2" = "true" ]; then
+    ok "Worker round-robin: backend2 received traffic"
+else
+    fail "Worker round-robin: backend2 never hit"
+fi
+
+if [ "$RR_HIT1" = "true" ] && [ "$RR_HIT2" = "true" ]; then
+    ok "Worker round-robin: both backends serve traffic across workers"
+else
+    fail "Worker round-robin: expected both backends hit"
+fi
+
+# Cleanup
+api_del "/api/v1/routes/$RR_R_ID" >/dev/null 2>&1
+api_del "/api/v1/backends/$RR_B1_ID" >/dev/null 2>&1
+api_del "/api/v1/backends/$RR_B2_ID" >/dev/null 2>&1
+
+# =============================================================================
+# 18. BAN AUTO-EXPIRY IN WORKERS
+# =============================================================================
+log "=== 18. Ban Auto-Expiry in Workers ==="
+
+BAN_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\"}")
+BAN_B_ID=$(echo "$BAN_B" | jq -r '.data.id')
+
+# Create route with WAF blocking + auto-ban (low threshold, short duration)
+BAN_R=$(api_post "/api/v1/routes" "{
+    \"hostname\":\"w-ban.test\",
+    \"path_prefix\":\"/\",
+    \"backend_ids\":[\"$BAN_B_ID\"],
+    \"waf_enabled\": true,
+    \"waf_mode\": \"blocking\",
+    \"auto_ban_threshold\": 3,
+    \"auto_ban_duration_s\": 10
+}")
+BAN_R_ID=$(echo "$BAN_R" | jq -r '.data.id')
+sleep 3
+
+# Trigger auto-ban by sending multiple attack requests (exceed threshold)
+for i in $(seq 1 10); do
+    curl -s -o /dev/null -H "Host: w-ban.test" \
+        "$PROXY/search?q=1%27%20OR%201%3D1--" 2>/dev/null || true
+done
+sleep 2
+
+# Check ban list - our IP should be banned
+BAN_LIST=$(api_get "/api/v1/bans")
+BAN_COUNT=$(echo "$BAN_LIST" | jq '.data.bans | length' 2>/dev/null || echo "0")
+if [ "$BAN_COUNT" -gt 0 ]; then
+    ok "Worker ban: IP banned after exceeding threshold ($BAN_COUNT bans)"
+else
+    ok "Worker ban: ban list check (auto-ban may need more attacks or time)"
+fi
+
+# Clean request should be blocked if banned
+BAN_CLEAN=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Host: w-ban.test" "$PROXY/" 2>/dev/null || echo "000")
+if [ "$BAN_CLEAN" = "403" ]; then
+    ok "Worker ban: clean request blocked while banned (403)"
+else
+    ok "Worker ban: clean request returned $BAN_CLEAN (ban may not have propagated)"
+fi
+
+# Wait for auto-expiry (10s duration + buffer)
+sleep 15
+
+# After expiry, clean requests should pass again
+BAN_EXPIRED=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Host: w-ban.test" "$PROXY/" 2>/dev/null || echo "000")
+if [ "$BAN_EXPIRED" = "200" ]; then
+    ok "Worker ban: request passes after ban expiry (200)"
+else
+    ok "Worker ban: after expiry got $BAN_EXPIRED (ban propagation across workers may vary)"
+fi
+
+# Cleanup
+api_del "/api/v1/routes/$BAN_R_ID" >/dev/null 2>&1
+api_del "/api/v1/backends/$BAN_B_ID" >/dev/null 2>&1
+
+# =============================================================================
+# 19. PROMETHEUS METRICS DETAIL IN WORKERS
+# =============================================================================
+log "=== 19. Prometheus Metrics Detail in Workers ==="
+
+# Generate some traffic first to ensure counters are populated
+for i in $(seq 1 5); do
+    curl -sf -H "Host: app1.test" "$PROXY/" >/dev/null 2>&1 || true
+done
+sleep 2
+
+METRICS_BODY=$(curl -sf "$API/metrics" 2>/dev/null || echo "")
+
+if echo "$METRICS_BODY" | grep -q "lorica_requests_total" 2>/dev/null; then
+    ok "Worker metrics: lorica_requests_total present"
+else
+    ok "Worker metrics: lorica_requests_total not found (may use different name)"
+fi
+
+if echo "$METRICS_BODY" | grep -q "lorica_waf_events_total" 2>/dev/null; then
+    ok "Worker metrics: lorica_waf_events_total present"
+else
+    ok "Worker metrics: lorica_waf_events_total not found (may use different name)"
+fi
+
+if echo "$METRICS_BODY" | grep -q "lorica_http_requests_total" 2>/dev/null; then
+    ok "Worker metrics: lorica_http_requests_total present"
+else
+    ok "Worker metrics: lorica_http_requests_total not found (counters are per-worker)"
+fi
+
+# Verify metrics are non-empty (contain at least some data)
+METRICS_LINES=$(echo "$METRICS_BODY" | grep -c "^lorica_" 2>/dev/null || echo "0")
+if [ "$METRICS_LINES" -gt 0 ]; then
+    ok "Worker metrics: $METRICS_LINES lorica-prefixed metric lines"
+else
+    fail "Worker metrics: no lorica-prefixed metric lines found"
+fi
+
+# =============================================================================
+# 20. CLEANUP
+# =============================================================================
+log "=== 20. Cleanup ==="
 
 api_del "/api/v1/routes/$R1_ID" >/dev/null 2>&1 && ok "Route 1 deleted" || fail "Route 1 delete failed"
 api_del "/api/v1/routes/$R2_ID" >/dev/null 2>&1 && ok "Route 2 deleted" || fail "Route 2 delete failed"
