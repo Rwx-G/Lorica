@@ -2231,6 +2231,14 @@ if [ -n "$SESSION" ]; then
     api_del "/api/v1/routes/$BAN_ROUTE_ID" >/dev/null 2>&1 || true
     api_del "/api/v1/backends/$BAN_B_ID" >/dev/null 2>&1 || true
 
+    # Clear all bans and disable WAF auto-ban for remaining tests
+    BANS_TO_CLEAR=$(api_get "/api/v1/bans" 2>/dev/null || echo '{"data":{"bans":[]}}')
+    for CLEAR_IP in $(echo "$BANS_TO_CLEAR" | jq -r '.data.bans[]?.ip // empty' 2>/dev/null); do
+        api_del "/api/v1/bans/$CLEAR_IP" >/dev/null 2>&1 || true
+    done
+    api_put "/api/v1/settings" '{"waf_ban_threshold":0}' >/dev/null 2>&1 || true
+    sleep 2
+
 # =============================================================================
 # 45. PROMETHEUS METRICS DETAIL (14.2, 14.3, 14.7)
 # =============================================================================
