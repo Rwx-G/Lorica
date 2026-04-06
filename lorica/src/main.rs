@@ -108,6 +108,12 @@ enum Commands {
         #[arg(long)]
         upstream_crl_file: Option<String>,
     },
+    /// Rotate the encryption key (re-encrypts all secrets in the database)
+    RotateKey {
+        /// Path to the new encryption key file (32 bytes, generated if missing)
+        #[arg(long)]
+        new_key_file: String,
+    },
 }
 
 fn init_logging(log_level: &str) {
@@ -162,6 +168,36 @@ fn main() {
                 https_port,
                 upstream_crl_file.as_deref(),
             );
+        }
+        Some(Commands::RotateKey { new_key_file }) => {
+            use lorica_config::crypto::EncryptionKey;
+            use lorica_config::store::ConfigStore;
+
+            let data_dir = PathBuf::from(&cli.data_dir);
+            let key_path = data_dir.join("encryption.key");
+            let old_key = EncryptionKey::load_or_create(&key_path)
+                .expect("failed to load current encryption key");
+
+            let new_key_path = PathBuf::from(&new_key_file);
+            let new_key = EncryptionKey::load_or_create(&new_key_path)
+                .expect("failed to load/create new encryption key");
+
+            let db_path = data_dir.join("lorica.db");
+            let store =
+                ConfigStore::open(&db_path, Some(old_key)).expect("failed to open database");
+
+            let count = store
+                .rotate_encryption_key(&new_key)
+                .expect("key rotation failed");
+
+            println!("Key rotation complete: {count} secrets re-encrypted");
+            println!(
+                "IMPORTANT: Replace {} with {}",
+                key_path.display(),
+                new_key_path.display()
+            );
+            println!("  mv {} {}.backup", key_path.display(), key_path.display());
+            println!("  mv {} {}", new_key_path.display(), key_path.display());
         }
         None => {
             init_logging(&cli.log_level);

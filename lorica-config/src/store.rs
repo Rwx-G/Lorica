@@ -2184,6 +2184,65 @@ impl ConfigStore {
             None => Ok(None),
         }
     }
+
+    // ---- Key Rotation ----
+
+    /// Re-encrypt all secrets (certificate private keys and notification configs)
+    /// from the current encryption key to a new one. Runs in a single transaction.
+    pub fn rotate_encryption_key(&self, new_key: &EncryptionKey) -> Result<u32> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| ConfigError::Validation(format!("failed to begin transaction: {e}")))?;
+
+        let mut count = 0u32;
+
+        // Re-encrypt certificate private keys (key_pem is BLOB)
+        let mut stmt = tx.prepare("SELECT id, key_pem FROM certificates")?;
+        let certs: Vec<(String, Vec<u8>)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        for (id, encrypted_key_pem) in &certs {
+            let plaintext = self.decrypt_key_pem(encrypted_key_pem)?;
+            let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
+            tx.execute(
+                "UPDATE certificates SET key_pem = ?1 WHERE id = ?2",
+                params![re_encrypted, id],
+            )?;
+            count += 1;
+        }
+
+        // Re-encrypt notification configs (config is TEXT, base64-encoded)
+        let mut stmt = tx.prepare("SELECT id, config FROM notification_configs")?;
+        let configs: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        for (id, encrypted_config) in &configs {
+            let plaintext = self.decrypt_config(encrypted_config)?;
+            let re_encrypted = new_key.encrypt(plaintext.as_bytes())?;
+            let re_encoded = base64::engine::general_purpose::STANDARD.encode(&re_encrypted);
+            tx.execute(
+                "UPDATE notification_configs SET config = ?1 WHERE id = ?2",
+                params![re_encoded, id],
+            )?;
+            count += 1;
+        }
+
+        tx.commit()
+            .map_err(|e| ConfigError::Validation(format!("failed to commit transaction: {e}")))?;
+
+        Ok(count)
+    }
 }
 
 // ---- Row mapping helpers ----

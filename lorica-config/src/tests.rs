@@ -1389,4 +1389,23 @@ cert_critical_days = 3
         assert!(toml_str.contains("**REDACTED**"));
         assert!(!toml_str.contains(&cert.key_pem));
     }
+
+    #[test]
+    fn test_encryption_key_rotation() {
+        use crate::crypto::EncryptionKey;
+
+        let key1 = EncryptionKey::generate().unwrap();
+        let key2 = EncryptionKey::generate().unwrap();
+
+        let store = ConfigStore::open_in_memory_with_key(key1).unwrap();
+
+        let cert = make_certificate();
+        store.create_certificate(&cert).unwrap();
+
+        let nc = make_notification_config();
+        store.create_notification_config(&nc).unwrap();
+
+        let count = store.rotate_encryption_key(&key2).unwrap();
+        assert_eq!(count, 2);
+    }
 }
