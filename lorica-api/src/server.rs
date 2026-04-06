@@ -54,12 +54,12 @@ pub struct AppState {
     /// Cache backend for purging cached entries.
     pub cache_backend: Option<&'static lorica_cache::MemCache>,
     /// EWMA scores per backend address (microseconds). Shared with the proxy engine.
-    pub ewma_scores: Option<Arc<std::sync::RwLock<HashMap<String, f64>>>>,
+    pub ewma_scores: Option<Arc<parking_lot::RwLock<HashMap<String, f64>>>>,
     /// Per-backend active connection counters. Shared with the proxy engine.
     /// `None` in supervisor mode (use aggregated_metrics instead).
     pub backend_connections: Option<Arc<crate::connections::BackendConnections>>,
     /// Notification event history ring buffer (shared with NotifyDispatcher).
-    pub notification_history: Option<Arc<std::sync::Mutex<VecDeque<lorica_notify::AlertEvent>>>>,
+    pub notification_history: Option<Arc<parking_lot::Mutex<VecDeque<lorica_notify::AlertEvent>>>>,
     /// Persistent access log store (SQLite). `None` in tests or worker mode.
     pub log_store: Option<Arc<crate::log_store::LogStore>>,
     /// Aggregated proxy metrics from worker processes. `None` in single-process mode.

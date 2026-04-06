@@ -267,7 +267,7 @@ pub async fn notification_history(
     }
     // Fallback to in-memory history
     let events = if let Some(ref history) = state.notification_history {
-        let h = history.lock().unwrap();
+        let h = history.lock();
         h.iter().rev().cloned().collect::<Vec<_>>()
     } else {
         vec![]

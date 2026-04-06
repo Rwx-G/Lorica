@@ -376,8 +376,8 @@ fn run_supervisor(cli: Cli) {
         let aggregated_metrics = Arc::new(lorica_api::workers::AggregatedMetrics::new());
 
         // Track per-worker task handles so we can abort stale tasks on restart
-        let worker_task_handles: Arc<std::sync::Mutex<std::collections::HashMap<u32, tokio::task::JoinHandle<()>>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let worker_task_handles: Arc<parking_lot::Mutex<std::collections::HashMap<u32, tokio::task::JoinHandle<()>>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
         // Spawn a per-worker task that handles both config reload and heartbeat
         // No shared Mutex - each worker has its own channel and task
@@ -517,7 +517,7 @@ fn run_supervisor(cli: Cli) {
                     }
                 }
             });
-            worker_task_handles.lock().unwrap().insert(worker_id, handle);
+            worker_task_handles.lock().insert(worker_id, handle);
         }
 
         // Bug 1 fix: Create a ProxyConfig for health checks in supervisor mode.
@@ -856,7 +856,7 @@ fn run_supervisor(cli: Cli) {
                     };
 
                     // Abort the old heartbeat/reload task for this worker
-                    if let Some(old_handle) = monitor_task_handles.lock().unwrap().remove(&id) {
+                    if let Some(old_handle) = monitor_task_handles.lock().remove(&id) {
                         old_handle.abort();
                         info!(worker_id = id, "aborted stale worker task");
                     }
@@ -955,7 +955,7 @@ fn run_supervisor(cli: Cli) {
                                             }
                                         }
                                     });
-                                    monitor_task_handles.lock().unwrap().insert(id, new_handle);
+                                    monitor_task_handles.lock().insert(id, new_handle);
                                 }
                                 Err(e) => error!(worker_id = id, error = %e, "failed to create channel for restarted worker"),
                             }
@@ -1256,9 +1256,8 @@ fn run_worker(
                         // Collect EWMA scores
                         let ewma_entries: Vec<EwmaReportEntry> = cmd_ewma
                             .read()
-                            .unwrap()
                             .iter()
-                            .map(|(addr, score)| EwmaReportEntry {
+                            .map(|(addr, score): (&String, &f64)| EwmaReportEntry {
                                 backend_address: addr.clone(),
                                 score_us: *score,
                             })

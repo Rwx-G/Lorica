@@ -51,6 +51,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 futures-util = "0.3"
 arc-swap = "1"
 dashmap = "5"
+parking_lot = "0.12"
 async-trait = { workspace = true }
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }

@@ -109,8 +109,7 @@ async fn get_ewma_score_async(state: &crate::server::AppState, addr: &str) -> f6
     if let Some(score) = state
         .ewma_scores
         .as_ref()
-        .and_then(|scores| scores.read().ok())
-        .and_then(|map| map.get(addr).copied())
+        .and_then(|scores| scores.read().get(addr).copied())
     {
         return score;
     }

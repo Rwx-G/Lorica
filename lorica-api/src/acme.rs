@@ -666,7 +666,7 @@ pub struct Route53DnsChallenger {
     hosted_zone_id: String,
     client: aws_sdk_route53::Client,
     /// Track created TXT values so DELETE can provide the exact value.
-    created_values: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    created_values: parking_lot::Mutex<std::collections::HashMap<String, String>>,
 }
 
 #[cfg(feature = "route53")]
@@ -688,7 +688,7 @@ impl Route53DnsChallenger {
         Self {
             hosted_zone_id,
             client,
-            created_values: std::sync::Mutex::new(std::collections::HashMap::new()),
+            created_values: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -749,7 +749,6 @@ impl DnsChallenger for Route53DnsChallenger {
             .await?;
         self.created_values
             .lock()
-            .unwrap()
             .insert(domain.to_string(), value.to_string());
         info!(domain = %domain, "Route53 DNS TXT record created");
         Ok(())
@@ -759,7 +758,6 @@ impl DnsChallenger for Route53DnsChallenger {
         let value = self
             .created_values
             .lock()
-            .unwrap()
             .remove(domain)
             .unwrap_or_default();
         if value.is_empty() {

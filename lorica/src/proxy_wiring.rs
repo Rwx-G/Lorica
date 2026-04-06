@@ -254,7 +254,7 @@ pub use lorica_api::connections::BackendConnections;
 #[derive(Debug, Default)]
 pub struct EwmaTracker {
     /// EWMA score per backend address (microseconds).
-    pub(crate) scores: Arc<std::sync::RwLock<HashMap<String, f64>>>,
+    pub(crate) scores: Arc<parking_lot::RwLock<HashMap<String, f64>>>,
 }
 
 impl EwmaTracker {
@@ -264,7 +264,7 @@ impl EwmaTracker {
 
     /// Update the EWMA score for a backend with a new latency sample.
     pub fn record(&self, addr: &str, latency_us: f64) {
-        let mut scores = self.scores.write().unwrap();
+        let mut scores = self.scores.write();
         let current = scores.get(addr).copied().unwrap_or(0.0);
         // Exponential decay: new_score = alpha * sample + (1-alpha) * old_score
         // With alpha ~0.3 for responsive adaptation
@@ -279,7 +279,7 @@ impl EwmaTracker {
         if backends.is_empty() {
             return 0;
         }
-        let scores = self.scores.read().unwrap();
+        let scores = self.scores.read();
         let mut best_idx = 0;
         let mut best_score = f64::MAX;
         for (i, b) in backends.iter().enumerate() {
@@ -295,16 +295,11 @@ impl EwmaTracker {
 
     /// Get the EWMA score for a backend (for dashboard display).
     pub fn get_score(&self, addr: &str) -> f64 {
-        self.scores
-            .read()
-            .unwrap()
-            .get(addr)
-            .copied()
-            .unwrap_or(0.0)
+        self.scores.read().get(addr).copied().unwrap_or(0.0)
     }
 
     /// Return a shared reference to the scores map (for passing to API state).
-    pub fn scores_ref(&self) -> Arc<std::sync::RwLock<HashMap<String, f64>>> {
+    pub fn scores_ref(&self) -> Arc<parking_lot::RwLock<HashMap<String, f64>>> {
         Arc::clone(&self.scores)
     }
 }

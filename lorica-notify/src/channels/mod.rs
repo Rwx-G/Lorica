@@ -18,8 +18,10 @@ pub mod stdout;
 pub mod webhook;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use crate::events::AlertEvent;
 use tracing::{info, warn};
@@ -119,7 +121,7 @@ impl NotifyDispatcher {
 
     /// Return the number of suppressed notifications.
     pub fn suppressed_count(&self) -> usize {
-        *self.suppressed_count.lock().unwrap()
+        *self.suppressed_count.lock()
     }
 
     /// Return a reference to the event history buffer.
@@ -190,7 +192,7 @@ impl NotifyDispatcher {
 
         // Store in history
         {
-            let mut hist = self.history.lock().unwrap();
+            let mut hist = self.history.lock();
             if hist.len() >= self.max_history {
                 hist.pop_front();
             }
@@ -218,7 +220,7 @@ impl NotifyDispatcher {
                     alert_type = alert_str,
                     "notification suppressed by rate limiter"
                 );
-                *self.suppressed_count.lock().unwrap() += 1;
+                *self.suppressed_count.lock() += 1;
                 continue;
             }
 
@@ -282,19 +284,19 @@ impl NotifyDispatcher {
 
     /// Return recent notification history.
     pub fn recent_history(&self, limit: usize) -> Vec<AlertEvent> {
-        let hist = self.history.lock().unwrap();
+        let hist = self.history.lock();
         hist.iter().rev().take(limit).cloned().collect()
     }
 
     /// Return the total number of events in history.
     pub fn history_count(&self) -> usize {
-        self.history.lock().unwrap().len()
+        self.history.lock().len()
     }
 
     /// Check if a channel has exceeded its rate limit.
     fn is_rate_limited(&self, channel_id: &str) -> bool {
         let now = Instant::now();
-        let mut times = self.send_times.lock().unwrap();
+        let mut times = self.send_times.lock();
         let entry = times.entry(channel_id.to_string()).or_default();
 
         // Evict expired entries
@@ -310,7 +312,7 @@ impl NotifyDispatcher {
 
     /// Record a successful send for rate limiting.
     fn record_send(&self, channel_id: &str) {
-        let mut times = self.send_times.lock().unwrap();
+        let mut times = self.send_times.lock();
         let entry = times.entry(channel_id.to_string()).or_default();
         entry.push_back(Instant::now());
     }
