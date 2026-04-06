@@ -28,8 +28,8 @@ done
 
 log "Waiting for Lorica (workers mode)..."
 for i in $(seq 1 120); do
-    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/" 2>/dev/null || echo "000")
-    if [ "$HTTP_CODE" != "000" ]; then break; fi
+    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/" 2>/dev/null || true)
+    if [ "$HTTP_CODE" != "000" ] && [ -n "$HTTP_CODE" ]; then break; fi
     sleep 2
 done
 
@@ -58,7 +58,7 @@ LOGIN_HEADERS=$(mktemp)
 LOGIN_HTTP=$(curl -s -o /tmp/login_body.json -w '%{http_code}' -D "$LOGIN_HEADERS" \
     "$API/api/v1/auth/login" -X POST \
     -H "Content-Type: application/json" \
-    -d "$LOGIN_JSON" 2>/dev/null || echo "000")
+    -d "$LOGIN_JSON" 2>/dev/null || true)
 
 SESSION_COOKIE=$(grep -i "Set-Cookie:" "$LOGIN_HEADERS" 2>/dev/null | \
     grep -o 'lorica_session=[^;]*' | head -1 || echo "")
@@ -247,7 +247,7 @@ else
 fi
 
 # Test 404 for unknown host
-STATUS_404=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: unknown.local" "$PROXY/" 2>/dev/null || echo "000")
+STATUS_404=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: unknown.local" "$PROXY/" 2>/dev/null || true)
 if [ "$STATUS_404" = "404" ]; then
     ok "Worker: unknown host returns 404"
 else
@@ -260,7 +260,7 @@ assert_json_exists "$IDENTITY" ".backend" "Worker: /identity returns backend fie
 assert_json_exists "$IDENTITY" ".requests" "Worker: /identity returns requests field"
 
 # Test /healthz passes through to backend
-HEALTHZ_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: app1.test" "$PROXY/healthz" 2>/dev/null || echo "000")
+HEALTHZ_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: app1.test" "$PROXY/healthz" 2>/dev/null || true)
 if [ "$HEALTHZ_STATUS" = "200" ]; then
     ok "Worker: /healthz passes through to backend"
 else
@@ -313,7 +313,7 @@ log "=== 6. WAF in Worker Mode ==="
 # Ensure WAF is in detection mode first, verify detection works
 SQLI_DET_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Host: app1.test" \
-    "$PROXY/search?q=1%20UNION%20SELECT%20*%20FROM%20users" 2>/dev/null || echo "000")
+    "$PROXY/search?q=1%20UNION%20SELECT%20*%20FROM%20users" 2>/dev/null || true)
 if [ "$SQLI_DET_STATUS" = "200" ]; then
     ok "Worker WAF: detection mode passes SQLi through"
 else
@@ -327,7 +327,7 @@ sleep 2
 # SQL injection should be blocked
 SQLI_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Host: app1.test" \
-    "$PROXY/search?q=1%27%20OR%201%3D1--" 2>/dev/null || echo "000")
+    "$PROXY/search?q=1%27%20OR%201%3D1--" 2>/dev/null || true)
 if [ "$SQLI_STATUS" = "403" ]; then
     ok "Worker WAF: SQLi blocked (403)"
 else
@@ -337,7 +337,7 @@ fi
 # XSS should be blocked
 XSS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Host: app1.test" \
-    "$PROXY/page?x=%3Cscript%3Ealert(1)%3C/script%3E" 2>/dev/null || echo "000")
+    "$PROXY/page?x=%3Cscript%3Ealert(1)%3C/script%3E" 2>/dev/null || true)
 if [ "$XSS_STATUS" = "403" ]; then
     ok "Worker WAF: XSS blocked (403)"
 else
@@ -346,7 +346,7 @@ fi
 
 # Normal request should still pass through
 CLEAN_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Host: app1.test" "$PROXY/" 2>/dev/null || echo "000")
+    -H "Host: app1.test" "$PROXY/" 2>/dev/null || true)
 if [ "$CLEAN_STATUS" = "200" ]; then
     ok "Worker WAF: normal request passes (200)"
 else
@@ -356,7 +356,7 @@ fi
 # Route without WAF should not block
 NOWAF_SQLI=$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Host: nowaf.test" \
-    "$PROXY/search?q=1%27%20OR%201%3D1--" 2>/dev/null || echo "000")
+    "$PROXY/search?q=1%27%20OR%201%3D1--" 2>/dev/null || true)
 if [ "$NOWAF_SQLI" = "200" ]; then
     ok "Worker WAF: no-WAF route passes SQLi through"
 else
@@ -511,7 +511,7 @@ fi
 # =============================================================================
 log "=== 10. Prometheus Metrics ==="
 
-METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics" 2>/dev/null || echo "000")
+METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics" 2>/dev/null || true)
 if [ "$METRICS_STATUS" = "200" ]; then
     ok "Prometheus /metrics accessible in worker mode"
 else
@@ -589,7 +589,7 @@ PP_R_ID=$(echo "$PP_R" | jq -r '.data.id')
 sleep 3
 
 # Request matching the prefix should succeed
-PP_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-pathprefix.test" "$PROXY/app/identity" 2>/dev/null || echo "000")
+PP_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-pathprefix.test" "$PROXY/app/identity" 2>/dev/null || true)
 if [ "$PP_STATUS" = "200" ]; then
     ok "Worker path prefix: /app/identity routed (200)"
 else
@@ -597,7 +597,7 @@ else
 fi
 
 # Request outside the prefix should return 404
-PP_MISS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-pathprefix.test" "$PROXY/other" 2>/dev/null || echo "000")
+PP_MISS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-pathprefix.test" "$PROXY/other" 2>/dev/null || true)
 if [ "$PP_MISS" = "404" ]; then
     ok "Worker path prefix: /other returns 404"
 else
@@ -605,7 +605,7 @@ else
 fi
 
 # Root path without prefix should also 404
-PP_ROOT=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-pathprefix.test" "$PROXY/" 2>/dev/null || echo "000")
+PP_ROOT=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-pathprefix.test" "$PROXY/" 2>/dev/null || true)
 if [ "$PP_ROOT" = "404" ]; then
     ok "Worker path prefix: / returns 404"
 else
@@ -635,7 +635,7 @@ sleep 3
 
 # Hit /slow endpoint (3s delay) with a 2s read timeout - should timeout
 TO_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-    -H "Host: w-timeout.test" "$PROXY/slow" 2>/dev/null || echo "000")
+    -H "Host: w-timeout.test" "$PROXY/slow" 2>/dev/null || true)
 if [ "$TO_STATUS" = "504" ] || [ "$TO_STATUS" = "502" ] || [ "$TO_STATUS" = "000" ]; then
     ok "Worker timeout: short read_timeout triggered ($TO_STATUS)"
 else
@@ -647,7 +647,7 @@ api_put "/api/v1/routes/$TO_R_ID" '{"read_timeout_s": 10}' >/dev/null
 sleep 3
 
 TO_OK=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
-    -H "Host: w-timeout.test" "$PROXY/slow" 2>/dev/null || echo "000")
+    -H "Host: w-timeout.test" "$PROXY/slow" 2>/dev/null || true)
 if [ "$TO_OK" = "200" ]; then
     ok "Worker timeout: slow backend succeeds with generous timeout"
 else
@@ -681,7 +681,7 @@ GOT_429=false
 GOT_200=false
 for i in $(seq 1 20); do
     RL_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-        -H "Host: w-ratelimit.test" "$PROXY/" 2>/dev/null || echo "000")
+        -H "Host: w-ratelimit.test" "$PROXY/" 2>/dev/null || true)
     if [ "$RL_CODE" = "200" ]; then GOT_200=true; fi
     if [ "$RL_CODE" = "429" ]; then GOT_429=true; break; fi
 done
@@ -703,7 +703,7 @@ api_put "/api/v1/routes/$RL_R_ID" '{"rate_limit_rps": 0, "rate_limit_burst": 0}'
 sleep 3
 
 RL_AFTER=$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Host: w-ratelimit.test" "$PROXY/" 2>/dev/null || echo "000")
+    -H "Host: w-ratelimit.test" "$PROXY/" 2>/dev/null || true)
 if [ "$RL_AFTER" = "200" ]; then
     ok "Worker rate limit: requests pass after limit removed"
 else
@@ -732,7 +732,7 @@ ED_R_ID=$(echo "$ED_R" | jq -r '.data.id')
 sleep 3
 
 # Verify route serves traffic while enabled
-ED_UP=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-endis.test" "$PROXY/" 2>/dev/null || echo "000")
+ED_UP=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-endis.test" "$PROXY/" 2>/dev/null || true)
 if [ "$ED_UP" = "200" ]; then
     ok "Worker enable/disable: enabled route returns 200"
 else
@@ -744,7 +744,7 @@ api_put "/api/v1/routes/$ED_R_ID" '{"enabled": false}' >/dev/null
 sleep 3
 
 # Verify disabled route returns 404
-ED_DOWN=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-endis.test" "$PROXY/" 2>/dev/null || echo "000")
+ED_DOWN=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-endis.test" "$PROXY/" 2>/dev/null || true)
 if [ "$ED_DOWN" = "404" ]; then
     ok "Worker enable/disable: disabled route returns 404"
 else
@@ -756,7 +756,7 @@ api_put "/api/v1/routes/$ED_R_ID" '{"enabled": true}' >/dev/null
 sleep 3
 
 # Verify route works again
-ED_BACK=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-endis.test" "$PROXY/" 2>/dev/null || echo "000")
+ED_BACK=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: w-endis.test" "$PROXY/" 2>/dev/null || true)
 if [ "$ED_BACK" = "200" ]; then
     ok "Worker enable/disable: re-enabled route returns 200"
 else
@@ -858,7 +858,7 @@ fi
 
 # Clean request should be blocked if banned
 BAN_CLEAN=$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Host: w-ban.test" "$PROXY/" 2>/dev/null || echo "000")
+    -H "Host: w-ban.test" "$PROXY/" 2>/dev/null || true)
 if [ "$BAN_CLEAN" = "403" ]; then
     ok "Worker ban: clean request blocked while banned (403)"
 else
@@ -870,7 +870,7 @@ sleep 15
 
 # After expiry, clean requests should pass again
 BAN_EXPIRED=$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Host: w-ban.test" "$PROXY/" 2>/dev/null || echo "000")
+    -H "Host: w-ban.test" "$PROXY/" 2>/dev/null || true)
 if [ "$BAN_EXPIRED" = "200" ]; then
     ok "Worker ban: request passes after ban expiry (200)"
 else

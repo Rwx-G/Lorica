@@ -19,7 +19,7 @@ assert_status() {
     local method="$1" url="$2" expected="$3" label="$4"
     shift 4
     local status
-    status=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" -X "$method" "$@" "$url" 2>/dev/null || echo "000")
+    status=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" -X "$method" "$@" "$url" 2>/dev/null || true)
     if [ "$status" = "$expected" ]; then
         ok "$label (HTTP $status)"
     else

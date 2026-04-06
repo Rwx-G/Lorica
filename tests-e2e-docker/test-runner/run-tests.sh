@@ -35,8 +35,8 @@ done
 log "Waiting for Lorica API..."
 for i in $(seq 1 120); do
     # Use dashboard endpoint to check readiness (no auth needed, no rate limiting)
-    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/" 2>/dev/null || echo "000")
-    if [ "$HTTP_CODE" != "000" ]; then
+    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/" 2>/dev/null || true)
+    if [ "$HTTP_CODE" != "000" ] && [ -n "$HTTP_CODE" ]; then
         break
     fi
     sleep 2
@@ -94,7 +94,7 @@ LOGIN_HEADERS=$(mktemp)
 LOGIN_HTTP=$(curl -s -o /tmp/login_body.json -w '%{http_code}' -D "$LOGIN_HEADERS" \
     "$API/api/v1/auth/login" -X POST \
     -H "Content-Type: application/json" \
-    -d "$LOGIN_JSON" 2>/dev/null || echo "000")
+    -d "$LOGIN_JSON" 2>/dev/null || true)
 
 # Extract session cookie from Set-Cookie header directly
 SESSION_COOKIE=$(grep -i "Set-Cookie:" "$LOGIN_HEADERS" 2>/dev/null | \
@@ -113,7 +113,7 @@ if [ "$LOGIN_HTTP" = "200" ] && [ -n "$SESSION_COOKIE" ]; then
         CHANGE_HTTP=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
             "$API/api/v1/auth/password" -X PUT \
             -H "Content-Type: application/json" \
-            -d "$CHANGE_JSON" 2>/dev/null || echo "000")
+            -d "$CHANGE_JSON" 2>/dev/null || true)
         if [ "$CHANGE_HTTP" = "200" ]; then
             ok "First-run password changed"
             # Re-login with new password
@@ -142,7 +142,7 @@ rm -f "$LOGIN_HEADERS" /tmp/login_body.json
 # =============================================================================
 log "=== 2. Dashboard ==="
 
-DASH_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/" 2>/dev/null || echo "000")
+DASH_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/" 2>/dev/null || true)
 if [ "$DASH_STATUS" = "200" ]; then
     ok "Dashboard serves index.html"
 else
@@ -307,7 +307,7 @@ if [ -n "$SESSION" ]; then
     fi
 
     # Test 404 for unknown host
-    STATUS_404=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: unknown.local" "$PROXY/" 2>/dev/null || echo "000")
+    STATUS_404=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: unknown.local" "$PROXY/" 2>/dev/null || true)
     if [ "$STATUS_404" = "404" ]; then
         ok "Unknown host returns 404"
     else
@@ -368,7 +368,7 @@ if [ -n "$SESSION" ]; then
     # SQL injection attempt (detection mode - should pass through)
     SQLI_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
         -H "Host: test.local" \
-        "$PROXY/search?q=1%20UNION%20SELECT%20*%20FROM%20users" 2>/dev/null || echo "000")
+        "$PROXY/search?q=1%20UNION%20SELECT%20*%20FROM%20users" 2>/dev/null || true)
     if [ "$SQLI_STATUS" = "200" ]; then
         ok "WAF detection mode passes SQL injection through"
     else
@@ -412,7 +412,7 @@ if [ -n "$SESSION" ]; then
     # SQL injection should now be blocked with 403
     BLOCK_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
         -H "Host: test.local" \
-        "$PROXY/search?q=1%27%20OR%201%3D1--" 2>/dev/null || echo "000")
+        "$PROXY/search?q=1%27%20OR%201%3D1--" 2>/dev/null || true)
     if [ "$BLOCK_STATUS" = "403" ]; then
         ok "WAF blocking mode returns 403 for SQL injection"
     else
@@ -422,7 +422,7 @@ if [ -n "$SESSION" ]; then
     # XSS should be blocked
     XSS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
         -H "Host: test.local" \
-        "$PROXY/page?x=%3Cscript%3Ealert(1)%3C/script%3E" 2>/dev/null || echo "000")
+        "$PROXY/page?x=%3Cscript%3Ealert(1)%3C/script%3E" 2>/dev/null || true)
     if [ "$XSS_STATUS" = "403" ]; then
         ok "WAF blocking mode returns 403 for XSS"
     else
@@ -431,7 +431,7 @@ if [ -n "$SESSION" ]; then
 
     # Clean request should still pass
     CLEAN_STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-        -H "Host: test.local" "$PROXY/" 2>/dev/null || echo "000")
+        -H "Host: test.local" "$PROXY/" 2>/dev/null || true)
     if [ "$CLEAN_STATUS" = "200" ]; then
         ok "Clean request passes through WAF blocking mode"
     else
@@ -441,7 +441,7 @@ if [ -n "$SESSION" ]; then
     # No-WAF route should not block
     NOWAF_SQLI=$(curl -s -o /dev/null -w '%{http_code}' \
         -H "Host: nowaf.local" \
-        "$PROXY/search?q=1%27%20OR%201%3D1--" 2>/dev/null || echo "000")
+        "$PROXY/search?q=1%27%20OR%201%3D1--" 2>/dev/null || true)
     if [ "$NOWAF_SQLI" = "200" ]; then
         ok "Route without WAF passes SQL injection through"
     else
@@ -489,7 +489,7 @@ if [ -n "$SESSION" ]; then
         -b "$SESSION" -X PUT \
         -H "Content-Type: application/json" \
         -d '{"enabled":false}' \
-        "$API/api/v1/waf/rules/999999" 2>/dev/null || echo "000")
+        "$API/api/v1/waf/rules/999999" 2>/dev/null || true)
     if [ "$NOTFOUND_STATUS" = "404" ]; then
         ok "Non-existent rule returns 404"
     else
@@ -699,7 +699,7 @@ if [ -n "$SESSION" ]; then
     # certs, not for adding the first cert at runtime.
     PROXY_HTTPS="${LORICA_PROXY_HTTPS:-https://lorica:8443}"
     HTTPS_STATUS=$(curl -sk -o /dev/null -w '%{http_code}' \
-        -H "Host: test.local" "$PROXY_HTTPS/" --max-time 3 2>/dev/null || echo "000")
+        -H "Host: test.local" "$PROXY_HTTPS/" --max-time 3 2>/dev/null || true)
     if [ "$HTTPS_STATUS" = "200" ]; then
         ok "HTTPS request succeeds (TLS listener was pre-loaded)"
 
@@ -772,7 +772,7 @@ if [ -n "$SESSION" ]; then
 
     # Verify no 502 errors (dead backend should be excluded from rotation)
     FO_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: failover.local" "$PROXY/" 2>/dev/null || echo "000")
+        -H "Host: failover.local" "$PROXY/" 2>/dev/null || true)
     if [ "$FO_STATUS" = "200" ]; then
         ok "No 502 errors during failover (healthy backend serves)"
     else
@@ -821,7 +821,7 @@ if [ -n "$SESSION" ]; then
         # TLS upstream may fail if Lorica can't verify the self-signed cert.
         # Check if it's a connection error (502) vs routing error.
         TLS_UP_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-            -H "Host: tls-upstream.local" "$PROXY/" 2>/dev/null || echo "000")
+            -H "Host: tls-upstream.local" "$PROXY/" 2>/dev/null || true)
         if [ "$TLS_UP_STATUS" = "502" ]; then
             # 502 = Lorica connected but TLS handshake failed (self-signed cert rejected)
             # This is expected behavior - Lorica verifies upstream certs by default
@@ -845,7 +845,7 @@ if [ -n "$SESSION" ]; then
     log "=== 19. Prometheus Metrics ==="
 
     # /metrics endpoint should be accessible without auth
-    METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics" 2>/dev/null || echo "000")
+    METRICS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$API/metrics" 2>/dev/null || true)
     if [ "$METRICS_STATUS" = "200" ]; then
         ok "Prometheus /metrics endpoint accessible (no auth)"
     else
@@ -894,7 +894,7 @@ if [ -n "$SESSION" ]; then
     EWMA_OK=0
     for i in $(seq 1 10); do
         HTTP=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-            -H "Host: app1.local" "$PROXY/" 2>/dev/null || echo "000")
+            -H "Host: app1.local" "$PROXY/" 2>/dev/null || true)
         if [ "$HTTP" = "200" ]; then
             EWMA_OK=$((EWMA_OK+1))
         fi
@@ -991,7 +991,7 @@ if [ -n "$SESSION" ]; then
 
     # JSON export
     EXPORT_JSON_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
-        "$API/api/v1/sla/routes/$R1_ID/export?format=json" 2>/dev/null || echo "000")
+        "$API/api/v1/sla/routes/$R1_ID/export?format=json" 2>/dev/null || true)
     if [ "$EXPORT_JSON_STATUS" = "200" ]; then
         ok "SLA export (JSON) returns 200"
     else
@@ -1179,7 +1179,7 @@ if [ -n "$SESSION" ]; then
     # SSE stream endpoint (just test that it connects)
     SSE_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
         -b "$SESSION" -H "Accept: text/event-stream" \
-        "$API/api/v1/loadtest/stream" 2>/dev/null || echo "000")
+        "$API/api/v1/loadtest/stream" 2>/dev/null || true)
     if [ "$SSE_STATUS" = "200" ]; then
         ok "Load test SSE stream endpoint returns 200"
     else
@@ -1199,7 +1199,7 @@ if [ -n "$SESSION" ]; then
         # Try to start another while running - should get conflict
         LT_CONFLICT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
             -X POST -H "Content-Type: application/json" -d '{}' \
-            "$API/api/v1/loadtest/start/$LT_ID" 2>/dev/null || echo "000")
+            "$API/api/v1/loadtest/start/$LT_ID" 2>/dev/null || true)
         if [ "$LT_CONFLICT_STATUS" = "409" ]; then
             ok "Concurrent load test rejected with 409 Conflict"
         else
@@ -1323,7 +1323,7 @@ if [ -n "$SESSION" ]; then
     sleep 2
 
     TIMEOUT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-        -H "Host: app1.local" "$PROXY/slow" 2>/dev/null || echo "000")
+        -H "Host: app1.local" "$PROXY/slow" 2>/dev/null || true)
     if [ "$TIMEOUT_STATUS" = "504" ] || [ "$TIMEOUT_STATUS" = "502" ] || [ "$TIMEOUT_STATUS" = "000" ]; then
         ok "Read timeout triggered on slow backend ($TIMEOUT_STATUS)"
     else
@@ -1337,7 +1337,7 @@ if [ -n "$SESSION" ]; then
     sleep 2
 
     SLOW_OK_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-        -H "Host: app1.local" "$PROXY/slow" 2>/dev/null || echo "000")
+        -H "Host: app1.local" "$PROXY/slow" 2>/dev/null || true)
     if [ "$SLOW_OK_STATUS" = "200" ]; then
         ok "Slow backend succeeds with generous timeout"
     else
@@ -1350,7 +1350,7 @@ if [ -n "$SESSION" ]; then
     api_put "/api/v1/routes/$R1_ID" '{"force_https": true, "read_timeout_s": 60}' >/dev/null
     sleep 2
     HTTPS_REDIR=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: app1.local" "$PROXY/" 2>/dev/null || echo "000")
+        -H "Host: app1.local" "$PROXY/" 2>/dev/null || true)
     if [ "$HTTPS_REDIR" = "301" ]; then
         ok "Force HTTPS returns 301 redirect"
     else
@@ -1378,7 +1378,7 @@ if [ -n "$SESSION" ]; then
     api_put "/api/v1/routes/$R1_ID" '{"hostname_aliases": ["alias-test.local"], "security_headers": "moderate", "response_headers": {}}' >/dev/null
     sleep 2
     ALIAS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: alias-test.local" "$PROXY/" 2>/dev/null || echo "000")
+        -H "Host: alias-test.local" "$PROXY/" 2>/dev/null || true)
     if [ "$ALIAS_STATUS" = "200" ]; then
         ok "Hostname alias routing works (alias-test.local -> app1 route)"
     else
@@ -1390,7 +1390,7 @@ if [ -n "$SESSION" ]; then
     sleep 2
     BODY_LIMIT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
         -H "Host: app1.local" -H "Content-Length: 10000" \
-        -X POST -d "x" "$PROXY/" 2>/dev/null || echo "000")
+        -X POST -d "x" "$PROXY/" 2>/dev/null || true)
     if [ "$BODY_LIMIT_STATUS" = "413" ]; then
         ok "Body size limit returns 413"
     else
@@ -1400,7 +1400,7 @@ if [ -n "$SESSION" ]; then
 
     # WAF blocklist endpoints
     BL_STATUS_HTTP=$(curl -s -o /tmp/bl_body.json -w '%{http_code}' -b "$SESSION" \
-        "$API/api/v1/waf/blocklist" 2>/dev/null || echo "000")
+        "$API/api/v1/waf/blocklist" 2>/dev/null || true)
     if [ "$BL_STATUS_HTTP" = "200" ]; then
         ok "WAF blocklist status endpoint returns 200"
     elif [ "$BL_STATUS_HTTP" = "400" ]; then
@@ -1444,7 +1444,7 @@ if [ -n "$SESSION" ]; then
 
     # Logout
     LOGOUT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
-        -X POST "$API/api/v1/auth/logout" 2>/dev/null || echo "000")
+        -X POST "$API/api/v1/auth/logout" 2>/dev/null || true)
     if [ "$LOGOUT_STATUS" = "200" ]; then
         ok "Logout endpoint returns 200"
     else
@@ -1522,7 +1522,7 @@ if [ -n "$SESSION" ]; then
     log "=== 29. Cache Endpoints ==="
 
     CACHE_STATS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
-        "$API/api/v1/cache/stats" 2>/dev/null || echo "000")
+        "$API/api/v1/cache/stats" 2>/dev/null || true)
     if [ "$CACHE_STATS_STATUS" = "200" ]; then
         ok "Cache stats endpoint returns 200"
     else
@@ -1538,7 +1538,7 @@ if [ -n "$SESSION" ]; then
 
     # Purge
     PURGE_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
-        -X DELETE "$API/api/v1/cache/routes/$R1_ID" 2>/dev/null || echo "000")
+        -X DELETE "$API/api/v1/cache/routes/$R1_ID" 2>/dev/null || true)
     if [ "$PURGE_STATUS" = "200" ]; then
         ok "Cache purge endpoint returns 200"
     else
@@ -1551,7 +1551,7 @@ if [ -n "$SESSION" ]; then
     log "=== 30. Bans API ==="
 
     BANS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
-        "$API/api/v1/bans" 2>/dev/null || echo "000")
+        "$API/api/v1/bans" 2>/dev/null || true)
     if [ "$BANS_STATUS" = "200" ]; then
         ok "Bans list endpoint returns 200"
     else
@@ -1592,7 +1592,7 @@ if [ -n "$SESSION" ]; then
 
     WS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
         -H "Host: app1.local" -H "Upgrade: websocket" -H "Connection: Upgrade" \
-        "$PROXY/" 2>/dev/null || echo "000")
+        "$PROXY/" 2>/dev/null || true)
     if [ "$WS_STATUS" = "403" ]; then
         ok "WebSocket upgrade blocked (403) when disabled"
     else
@@ -1610,7 +1610,7 @@ if [ -n "$SESSION" ]; then
     BAD_BACKEND_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
         -X POST -H "Content-Type: application/json" \
         -d '{"address":"192.168.1.1"}' \
-        "$API/api/v1/backends" 2>/dev/null || echo "000")
+        "$API/api/v1/backends" 2>/dev/null || true)
     if [ "$BAD_BACKEND_STATUS" = "400" ]; then
         ok "Backend without port rejected (400)"
     else
@@ -1620,7 +1620,7 @@ if [ -n "$SESSION" ]; then
     BAD_PORT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
         -X POST -H "Content-Type: application/json" \
         -d '{"address":"192.168.1.1:abc"}' \
-        "$API/api/v1/backends" 2>/dev/null || echo "000")
+        "$API/api/v1/backends" 2>/dev/null || true)
     if [ "$BAD_PORT_STATUS" = "400" ]; then
         ok "Backend with invalid port rejected (400)"
     else
@@ -1659,7 +1659,7 @@ if [ -n "$SESSION" ]; then
     GRPC_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
         -H "Host: h2.local" \
         -H "Content-Type: application/grpc-web+proto" \
-        -X POST "$PROXY/" 2>/dev/null || echo "000")
+        -X POST "$PROXY/" 2>/dev/null || true)
     if [ "$GRPC_STATUS" = "200" ]; then
         ok "gRPC-web request proxied via H2 backend (HTTP $GRPC_STATUS)"
     else
@@ -1693,7 +1693,7 @@ if [ -n "$SESSION" ]; then
 
     # /api/test should match the route (200)
     PP_MATCH=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: pathprefix.test" "$PROXY/api/test" 2>/dev/null || echo "000")
+        -H "Host: pathprefix.test" "$PROXY/api/test" 2>/dev/null || true)
     if [ "$PP_MATCH" = "200" ]; then
         ok "Path prefix /api/test matches route with prefix /api"
     else
@@ -1702,7 +1702,7 @@ if [ -n "$SESSION" ]; then
 
     # /other should NOT match (404)
     PP_NOMATCH=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: pathprefix.test" "$PROXY/other" 2>/dev/null || echo "000")
+        -H "Host: pathprefix.test" "$PROXY/other" 2>/dev/null || true)
     if [ "$PP_NOMATCH" = "404" ]; then
         ok "Path /other does not match route with prefix /api (404)"
     else
@@ -1791,7 +1791,7 @@ if [ -n "$SESSION" ]; then
 
     # Primary hostname should work
     HA_PRIMARY=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: primary.test" "$PROXY/echo" 2>/dev/null || echo "000")
+        -H "Host: primary.test" "$PROXY/echo" 2>/dev/null || true)
     if [ "$HA_PRIMARY" = "200" ]; then
         ok "Primary hostname reaches backend"
     else
@@ -1800,7 +1800,7 @@ if [ -n "$SESSION" ]; then
 
     # Alias hostname should reach the same backend
     HA_ALIAS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: alias1.test" "$PROXY/echo" 2>/dev/null || echo "000")
+        -H "Host: alias1.test" "$PROXY/echo" 2>/dev/null || true)
     if [ "$HA_ALIAS" = "200" ]; then
         ok "Alias hostname alias1.test reaches backend"
     else
@@ -1809,7 +1809,7 @@ if [ -n "$SESSION" ]; then
 
     # Second alias should also work
     HA_ALIAS2=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: alias2.test" "$PROXY/echo" 2>/dev/null || echo "000")
+        -H "Host: alias2.test" "$PROXY/echo" 2>/dev/null || true)
     if [ "$HA_ALIAS2" = "200" ]; then
         ok "Alias hostname alias2.test reaches backend"
     else
@@ -1897,7 +1897,7 @@ if [ -n "$SESSION" ]; then
 
     # /slow (3 second response) should timeout
     TO_SLOW=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-        -H "Host: timeout.test" "$PROXY/slow" 2>/dev/null || echo "000")
+        -H "Host: timeout.test" "$PROXY/slow" 2>/dev/null || true)
     if [ "$TO_SLOW" = "504" ] || [ "$TO_SLOW" = "502" ]; then
         ok "Short timeout triggers on slow backend ($TO_SLOW)"
     else
@@ -1906,7 +1906,7 @@ if [ -n "$SESSION" ]; then
 
     # Normal request should still work
     TO_NORMAL=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: timeout.test" "$PROXY/echo" 2>/dev/null || echo "000")
+        -H "Host: timeout.test" "$PROXY/echo" 2>/dev/null || true)
     if [ "$TO_NORMAL" = "200" ]; then
         ok "Normal request succeeds with short timeout"
     else
@@ -1942,7 +1942,7 @@ if [ -n "$SESSION" ]; then
     # Send POST with body > 100 bytes -> 413
     LARGE_BODY=$(head -c 200 /dev/urandom | base64 | head -c 200)
     MB_LARGE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: bodysize.test" -X POST -d "$LARGE_BODY" "$PROXY/echo" 2>/dev/null || echo "000")
+        -H "Host: bodysize.test" -X POST -d "$LARGE_BODY" "$PROXY/echo" 2>/dev/null || true)
     if [ "$MB_LARGE" = "413" ]; then
         ok "Large body (>100 bytes) rejected with 413"
     else
@@ -1951,7 +1951,7 @@ if [ -n "$SESSION" ]; then
 
     # Send POST with body < 100 bytes -> 200
     MB_SMALL=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: bodysize.test" -X POST -d "small" "$PROXY/echo" 2>/dev/null || echo "000")
+        -H "Host: bodysize.test" -X POST -d "small" "$PROXY/echo" 2>/dev/null || true)
     if [ "$MB_SMALL" = "200" ]; then
         ok "Small body (<100 bytes) accepted (200)"
     else
@@ -2040,7 +2040,7 @@ if [ -n "$SESSION" ]; then
     for i in $(seq 1 5); do
         RL_RESP_HEADERS=$(mktemp)
         RL_STATUS=$(curl -s -o /dev/null -D "$RL_RESP_HEADERS" -w '%{http_code}' --max-time 5 \
-            -H "Host: ratelimit.test" "$PROXY/echo" 2>/dev/null || echo "000")
+            -H "Host: ratelimit.test" "$PROXY/echo" 2>/dev/null || true)
         if [ "$RL_STATUS" = "200" ]; then
             RL_200=$((RL_200+1))
         elif [ "$RL_STATUS" = "429" ]; then
@@ -2138,7 +2138,7 @@ if [ -n "$SESSION" ]; then
 
     # Cache purge
     PURGE_CA=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" \
-        -X DELETE "$API/api/v1/cache/routes/$CA_ROUTE_ID" 2>/dev/null || echo "000")
+        -X DELETE "$API/api/v1/cache/routes/$CA_ROUTE_ID" 2>/dev/null || true)
     if [ "$PURGE_CA" = "200" ]; then
         ok "Cache purge for route returned 200"
     else
@@ -2269,7 +2269,7 @@ if [ -n "$SESSION" ]; then
 
     # Verify traffic works
     ED_ON=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: endisable.test" "$PROXY/echo" 2>/dev/null || echo "000")
+        -H "Host: endisable.test" "$PROXY/echo" 2>/dev/null || true)
     if [ "$ED_ON" = "200" ]; then
         ok "Enabled route serves traffic (200)"
     else
@@ -2282,7 +2282,7 @@ if [ -n "$SESSION" ]; then
 
     # Verify traffic returns 404
     ED_OFF=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: endisable.test" "$PROXY/echo" 2>/dev/null || echo "000")
+        -H "Host: endisable.test" "$PROXY/echo" 2>/dev/null || true)
     if [ "$ED_OFF" = "404" ]; then
         ok "Disabled route returns 404"
     else
@@ -2294,7 +2294,7 @@ if [ -n "$SESSION" ]; then
     sleep 2
 
     ED_BACK=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: endisable.test" "$PROXY/echo" 2>/dev/null || echo "000")
+        -H "Host: endisable.test" "$PROXY/echo" 2>/dev/null || true)
     if [ "$ED_BACK" = "200" ]; then
         ok "Re-enabled route serves traffic again (200)"
     else
@@ -2321,7 +2321,7 @@ else
 
     # Still test proxy returns 404 when no routes configured
     sleep 5
-    STATUS_NO_ROUTE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: test.local" "$PROXY/" 2>/dev/null || echo "000")
+    STATUS_NO_ROUTE=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: test.local" "$PROXY/" 2>/dev/null || true)
     if [ "$STATUS_NO_ROUTE" = "404" ]; then
         ok "Proxy returns 404 when no routes configured"
     else
