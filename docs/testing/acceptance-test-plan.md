@@ -71,8 +71,8 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.9 | Hostname aliases | Proxy | Alias traffic reaches same backend | 6.3 | |
 | 4.10 | Proxy headers (set) | Proxy | Custom header received by backend | 6.1 | |
 | 4.11 | Proxy headers (remove) | Proxy | Header removed from backend request | 6.1 | |
-| 4.12 | Response headers (set) | Proxy | Custom header received by client | 6.2 | |
-| 4.13 | Security header preset (strict) | Proxy | HSTS, X-Frame-Options, CSP in response | 6.2 | |
+| 4.12 | Response headers (set) | Proxy | Custom header received by client | 6.2 | OK |
+| 4.13 | Security header preset (strict) | Proxy | HSTS, X-Frame-Options, CSP in response | 6.2 | OK |
 | 4.14 | Security header preset (custom) | Dashboard | Create custom preset, assign to route | 6.2 | |
 | 4.15 | Path rewrite: strip/add prefix | Proxy | /api/users -> /v2/users | 6.2 | |
 | 4.16 | Path rewrite: regex | Proxy | Capture groups work | - | |
@@ -91,7 +91,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.29 | Delete route | Dashboard | Confirm dialog, removed | 1.6 | OK |
 | 4.30 | Search/filter/sort | Dashboard | Search hostname, sort health/enabled | 1.6 | |
 | 4.31 | Nginx import wizard | Dashboard | Paste nginx.conf -> resources created | - | |
-| 4.32 | Hot-reload on API change | Proxy | Edit route -> traffic reflects change immediately | 1.8, 2.2 | |
+| 4.32 | Hot-reload on API change | Proxy | Edit route -> traffic reflects change immediately | 1.8, 2.2 | OK |
 | | **5. CERTIFICATES** | | | | |
 | 5.1 | Upload PEM certificate | Dashboard | Issuer/dates/SANs parsed correctly | 1.7 | OK |
 | 5.2 | Certificate detail view | Dashboard | Eye icon -> full metadata, chain, routes | 1.7 | OK |
@@ -111,7 +111,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 5.16 | Edit certificate (replace PEM) | Dashboard | Edit -> new PEM, metadata re-parsed | 1.7 | |
 | 5.17 | Delete certificate (no routes) | Dashboard | Delete succeeds, toast shown | 1.7 | OK |
 | 5.18 | Delete certificate (with routes) | Dashboard | Error toast: "referenced by routes" | 1.7 | OK |
-| 5.19 | SNI resolution: exact match | Proxy | SNI=example.com -> correct cert | 2.3 | |
+| 5.19 | SNI resolution: exact match | Proxy | SNI=example.com -> correct cert | 2.3 | OK |
 | 5.20 | SNI resolution: wildcard | Proxy | *.example.com matches sub.example.com | 2.3 | |
 | 5.21 | SNI resolution: SAN domains | Proxy | All SANs resolve correctly | 2.3 | |
 | 5.22 | Certificate hot-swap | Proxy | Upload new cert -> new connections get new cert | 2.3 | |
@@ -216,7 +216,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 11.2 | Log filtering | Dashboard | Filter by status, route | 1.9 | |
 | 11.3 | Log entry details | Dashboard | Method, path, status, latency, backend, IP | 1.8 | |
 | 11.4 | WebSocket streaming | Dashboard | Logs via WS (not polling) | 1.9 | |
-| 11.5 | Worker mode logs forwarded | Dashboard | All workers' logs visible | - | |
+| 11.5 | Worker mode logs forwarded | Dashboard | All workers' logs visible | - | OK |
 | | **12. SYSTEM** | | | | |
 | 12.1 | Version displayed | Dashboard | Lorica version shown | 1.9 | OK |
 | 12.2 | Uptime displayed | Dashboard | Correct uptime | 1.9 | OK |
@@ -255,7 +255,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 15.3 | waf_alert dispatched | CLI | WAF blocks -> notification | 3.3 | OK |
 | 15.4 | ip_banned dispatched | CLI | Auto-banned -> notification | 7.3 | OK |
 | 15.5 | sla_breached dispatched | CLI | SLA below target -> notification | 5.1 | OK |
-| 15.6 | Email channel delivery | CLI | SMTP notification received | 3.3 | |
+| 15.6 | Email channel delivery | CLI | SMTP notification received | 3.3 | OK |
 | 15.7 | Webhook channel delivery | CLI | HTTP POST received | 3.3 | |
 | | **16. WORKER MODE** | | | | |
 | 16.1 | Config reload propagated | Proxy | Edit route -> all workers update | 2.2 | OK |
