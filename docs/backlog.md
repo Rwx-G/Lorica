@@ -13,7 +13,7 @@ Items identified during QA traceability audit (2026-04-01) and acceptance testin
 
 | Source | Description | References |
 |--------|-------------|------------|
-| Security audit | **Mutex poisoning**: `std::sync::Mutex::lock().unwrap()` in LogStore, EwmaTracker, and notification history will panic if a previous holder panicked. Consider `parking_lot::Mutex` (no poisoning) or `.unwrap_or_else(\|e\| e.into_inner())`. | `log_store.rs`, `proxy_wiring.rs` |
+| Security audit | **Mutex poisoning (remaining)**: EwmaTracker and notification_history still use `std::sync::Mutex/RwLock`. LogStore and WafEngine migrated to `parking_lot`. Consider migrating the remaining ones. | `proxy_wiring.rs`, `settings.rs` |
 
 ## Low Priority
 
