@@ -5,7 +5,7 @@
 # Covers: API, proxy routing, WAF, health checks, hot reload, log forwarding
 # =============================================================================
 
-set -euo pipefail
+set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/helpers.sh"

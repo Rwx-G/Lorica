@@ -10,10 +10,10 @@ log()   { echo -e "\033[1;34m[TEST]\033[0m $*"; }
 ok()    { PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); echo -e "\033[1;32m  PASS\033[0m $*"; }
 fail()  { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo -e "\033[1;31m  FAIL\033[0m $*"; }
 
-api_get()  { curl -sf -b "$SESSION" "$API$1" 2>/dev/null; }
-api_post() { curl -sf -b "$SESSION" -X POST -H "Content-Type: application/json" -d "$2" "$API$1" 2>/dev/null; }
-api_put()  { curl -sf -b "$SESSION" -X PUT -H "Content-Type: application/json" -d "$2" "$API$1" 2>/dev/null; }
-api_del()  { curl -sf -b "$SESSION" -X DELETE "$API$1" 2>/dev/null; }
+api_get()  { curl -s -b "$SESSION" "$API$1" 2>/dev/null || true; }
+api_post() { curl -s -b "$SESSION" -X POST -H "Content-Type: application/json" -d "$2" "$API$1" 2>/dev/null || true; }
+api_put()  { curl -s -b "$SESSION" -X PUT -H "Content-Type: application/json" -d "$2" "$API$1" 2>/dev/null || true; }
+api_del()  { curl -s -b "$SESSION" -X DELETE "$API$1" 2>/dev/null || true; }
 
 assert_status() {
     local method="$1" url="$2" expected="$3" label="$4"
