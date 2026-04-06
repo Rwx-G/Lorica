@@ -869,7 +869,9 @@ impl ProxyHttp for LoricaProxy {
                 // Only inspect relevant headers (skip large/binary ones)
                 match name_str {
                     "user-agent" | "referer" | "cookie" | "x-forwarded-for" | "content-type"
-                    | "authorization" | "origin" => value.to_str().ok().map(|v| (name_str, v)),
+                    | "content-length" | "authorization" | "origin" | "transfer-encoding" => {
+                        value.to_str().ok().map(|v| (name_str, v))
+                    }
                     n if n.starts_with("x-") => value.to_str().ok().map(|v| (name_str, v)),
                     _ => None,
                 }
