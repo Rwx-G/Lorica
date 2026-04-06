@@ -13,7 +13,7 @@ Items identified during QA traceability audit (2026-04-01) and acceptance testin
 
 | Source | Description | References |
 |--------|-------------|------------|
-| Security audit | **Mutex poisoning (remaining)**: EwmaTracker and notification_history still use `std::sync::Mutex/RwLock`. LogStore and WafEngine migrated to `parking_lot`. Consider migrating the remaining ones. | `proxy_wiring.rs`, `settings.rs` |
+| *(empty - all medium items resolved)* | | |
 
 ## Low Priority
 
