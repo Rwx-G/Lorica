@@ -258,7 +258,7 @@ pub async fn notification_history(
     if let Some(ref log_store) = state.log_store {
         let events = log_store
             .list_notification_history(200)
-            .map_err(|e| ApiError::Internal(e))?;
+            .map_err(ApiError::Internal)?;
         let total = events.len();
         return Ok(json_data(serde_json::json!({
             "events": events,

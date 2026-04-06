@@ -146,6 +146,7 @@ impl AggregatedMetrics {
     }
 
     /// Update metrics snapshot for a worker from its MetricsReport.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_worker(
         &self,
         worker_id: u32,
