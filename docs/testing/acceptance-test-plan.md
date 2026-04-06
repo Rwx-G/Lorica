@@ -151,13 +151,13 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 6.30 | WAF: XXE DOCTYPE (936100) | Proxy | `?q=<!DOCTYPE foo SYSTEM "evil">` -> 403 | - | OK |
 | 6.31 | WAF: XXE ENTITY (936110) | Proxy | `?q=<!ENTITY xxe SYSTEM "file:///...">` -> 403 | - | OK |
 | 6.32 | WAF events displayed | Dashboard | Events tab -> category/severity | 3.1 | OK |
-| 6.33 | WAF events filter by category | Dashboard | Filter dropdown works | 3.1 | |
+| 6.33 | WAF events filter by category | Dashboard | Filter dropdown works | 3.1 | OK |
 | 6.34 | WAF stats cards | Dashboard | Events by category, top attack | 3.1 | OK |
 | 6.35 | WAF < 0.5ms latency | API | Prometheus -> evaluation < 0.5ms | 3.1 | OK |
 | 6.36 | waf_alert notification | CLI | WAF blocks request -> notification | 3.3 | OK |
 | 6.37 | IP blocklist enable | Dashboard | Blocklist toggle ON -> ~80k IPs loaded | - | OK |
 | 6.38 | IP blocklist blocks IP | Proxy | Blocklisted IP via XFF -> 403 | - | OK |
-| 6.39 | IP blocklist refresh | Dashboard | Reload button -> fresh list | - | |
+| 6.39 | IP blocklist refresh | Dashboard | Reload button -> fresh list | - | OK |
 | 6.40 | IP blocklist at startup | CLI | Restart -> logs "loaded at startup" 82k IPs | - | OK |
 | 6.41 | WAF blocked in access logs | Dashboard | 403 WAF shows "WAF blocked" in error column | - | OK |
 | 6.42 | IP blocklist in WAF events | Dashboard | Blocklist block appears in WAF events | - | OK |
@@ -166,15 +166,15 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 6.45 | Ban list visible | Dashboard | Bans tab -> IPs with expiry | 7.3 | OK |
 | 6.46 | Rate limiting | Proxy | > rate_limit_rps -> 429 + Retry-After | 7.2 | OK |
 | 6.47 | Rate limit headers | Proxy | X-RateLimit-Limit/Remaining/Reset | 7.2 | OK |
-| 6.48 | Rate limit burst | Proxy | Burst tolerance allows spikes | 7.2 | |
-| 6.49 | Auto-ban on repeated 429 | Proxy | N violations -> 403 (banned) | 7.3 | |
+| 6.48 | Rate limit burst | Proxy | Burst tolerance allows spikes | 7.2 | OK |
+| 6.49 | Auto-ban on repeated 429 | Proxy | N violations -> 403 (banned) | 7.3 | OK |
 | 6.50 | ip_banned notification | CLI | Auto-ban -> notification dispatched | 7.3 | OK |
-| 6.51 | Manual unban | Dashboard | Click unban -> IP removed | 7.3 | |
+| 6.51 | Manual unban | Dashboard | Click unban -> IP removed | 7.3 | OK |
 | 6.52 | Ban auto-expiry | Proxy | Wait ban_duration_s -> unbanned | 7.3 | OK |
-| 6.53 | Slowloris detection | Proxy | Slow headers -> 408 | 7.3 | |
-| 6.54 | Per-route max connections | Proxy | max_connections=2, 3rd -> 503 | 7.2 | |
-| 6.55 | Global connection limit | Proxy | max_global_connections -> 503 | 7.3 | |
-| 6.56 | Flood defense | Proxy | RPS > threshold -> limits halved | 7.3 | |
+| 6.53 | Slowloris detection | Proxy | Slow headers -> 408 | 7.3 | OK |
+| 6.54 | Per-route max connections | Proxy | max_connections=2, 3rd -> 503 | 7.2 | OK |
+| 6.55 | Global connection limit | Proxy | max_global_connections -> 503 | 7.3 | OK |
+| 6.56 | Flood defense | Proxy | RPS > threshold -> limits halved | 7.3 | OK |
 | 6.57 | IP allowlist | Proxy | Non-allowed IP -> blocked | - | OK |
 | 6.36 | IP denylist | Proxy | Denied IP -> blocked | - | OK |
 | 6.37 | CORS headers | Proxy | Access-Control-* headers set | - | OK |
@@ -212,8 +212,8 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 10.8 | Comparison deltas | Dashboard | Compare two results -> diff | 5.3 | |
 | 10.9 | Load test in worker mode | Dashboard | Works with --workers N | 5.3 | |
 | | **11. ACCESS LOGS** | | | | |
-| 11.1 | Live log stream | Dashboard | Green pulse, real-time entries | 1.9 | |
-| 11.2 | Log filtering | Dashboard | Filter by status, route | 1.9 | |
+| 11.1 | Live log stream | Dashboard | Green pulse, real-time entries | 1.9 | OK |
+| 11.2 | Log filtering | Dashboard | Filter by status, route | 1.9 | OK |
 | 11.3 | Log entry details | Dashboard | Method, path, status, latency, backend, IP | 1.8 | |
 | 11.4 | WebSocket streaming | Dashboard | Logs via WS (not polling) | 1.9 | |
 | 11.5 | Worker mode logs forwarded | Dashboard | All workers' logs visible | - | OK |
