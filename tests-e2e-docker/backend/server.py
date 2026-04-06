@@ -41,6 +41,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/slow":
             time.sleep(3)
             self._json_response(200, {"backend": BACKEND_ID, "slow": True})
+        elif self.path.startswith("/echo"):
+            self._echo_response()
         elif self.path == "/error":
             self._json_response(500, {"error": "intentional error"})
         else:
@@ -53,15 +55,68 @@ class Handler(BaseHTTPRequestHandler):
             })
 
     def do_POST(self):
+        if self.path.startswith("/echo"):
+            self._echo_response()
+            return
+
         global request_count
         request_count += 1
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else ""
+
+        received_headers = {}
+        for key, value in self.headers.items():
+            received_headers[key.lower()] = value
+
         self._json_response(200, {
             "backend": BACKEND_ID,
             "method": "POST",
             "path": self.path,
             "body_length": len(body),
+            "received_headers": received_headers,
+        })
+
+    def do_HEAD(self):
+        if self.path.startswith("/echo"):
+            self._echo_response()
+        else:
+            self.do_GET()
+
+    def do_PUT(self):
+        if self.path.startswith("/echo"):
+            self._echo_response()
+        else:
+            self.do_POST()
+
+    def do_DELETE(self):
+        if self.path.startswith("/echo"):
+            self._echo_response()
+        else:
+            self._json_response(200, {"deleted": True, "backend": BACKEND_ID})
+
+    def _echo_response(self):
+        global request_count
+        request_count += 1
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else ""
+
+        received_headers = {}
+        for key, value in self.headers.items():
+            received_headers[key.lower()] = value
+
+        query = ""
+        path = self.path
+        if "?" in self.path:
+            path, query = self.path.split("?", 1)
+
+        self._json_response(200, {
+            "method": self.command,
+            "path": path,
+            "query": query,
+            "received_headers": received_headers,
+            "body": body,
+            "backend": BACKEND_ID,
+            "tls": TLS_ENABLED,
         })
 
     def _json_response(self, status, data):

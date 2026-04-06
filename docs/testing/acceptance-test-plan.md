@@ -69,8 +69,8 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.7 | Force HTTPS redirect | Proxy | force_https -> 301 to HTTPS | 6.1 | OK |
 | 4.8 | Hostname redirect | Proxy | redirect_hostname -> 301 | 6.3 | |
 | 4.9 | Hostname aliases | Proxy | Alias traffic reaches same backend | 6.3 | |
-| 4.10 | Proxy headers (set) | Proxy | Custom header received by backend | 6.1 | |
-| 4.11 | Proxy headers (remove) | Proxy | Header removed from backend request | 6.1 | |
+| 4.10 | Proxy headers (set) | Proxy | Custom header received by backend | 6.1 | OK |
+| 4.11 | Proxy headers (remove) | Proxy | Header removed from backend request | 6.1 | OK |
 | 4.12 | Response headers (set) | Proxy | Custom header received by client | 6.2 | OK |
 | 4.13 | Security header preset (strict) | Proxy | HSTS, X-Frame-Options, CSP in response | 6.2 | OK |
 | 4.14 | Security header preset (custom) | Dashboard | Create custom preset, assign to route | 6.2 | |

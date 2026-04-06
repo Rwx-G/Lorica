@@ -10,60 +10,13 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/helpers.sh"
+
 API="${LORICA_API}"
 PROXY="${LORICA_PROXY}"
 BACKEND1="${BACKEND1_ADDR}"
 BACKEND2="${BACKEND2_ADDR}"
-
-PASS=0
-FAIL=0
-TOTAL=0
-SESSION=""
-
-# --- Helpers ---
-
-log()   { echo -e "\033[1;34m[TEST]\033[0m $*"; }
-ok()    { PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); echo -e "\033[1;32m  PASS\033[0m $*"; }
-fail()  { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo -e "\033[1;31m  FAIL\033[0m $*"; }
-
-api_get()  { curl -sf -b "$SESSION" "$API$1" 2>/dev/null; }
-api_post() { curl -sf -b "$SESSION" -X POST -H "Content-Type: application/json" -d "$2" "$API$1" 2>/dev/null; }
-api_put()  { curl -sf -b "$SESSION" -X PUT -H "Content-Type: application/json" -d "$2" "$API$1" 2>/dev/null; }
-api_del()  { curl -sf -b "$SESSION" -X DELETE "$API$1" 2>/dev/null; }
-
-assert_status() {
-    local method="$1" url="$2" expected="$3" label="$4"
-    shift 4
-    local status
-    status=$(curl -s -o /dev/null -w '%{http_code}' -b "$SESSION" -X "$method" "$@" "$url" 2>/dev/null || echo "000")
-    if [ "$status" = "$expected" ]; then
-        ok "$label (HTTP $status)"
-    else
-        fail "$label (expected $expected, got $status)"
-    fi
-}
-
-assert_json() {
-    local json="$1" path="$2" expected="$3" label="$4"
-    local actual
-    actual=$(echo "$json" | jq -r "$path" 2>/dev/null || echo "PARSE_ERROR")
-    if [ "$actual" = "$expected" ]; then
-        ok "$label"
-    else
-        fail "$label (expected '$expected', got '$actual')"
-    fi
-}
-
-assert_json_gt() {
-    local json="$1" path="$2" min="$3" label="$4"
-    local actual
-    actual=$(echo "$json" | jq -r "$path" 2>/dev/null || echo "0")
-    if [ "$actual" -gt "$min" ] 2>/dev/null; then
-        ok "$label (=$actual)"
-    else
-        fail "$label (expected >$min, got '$actual')"
-    fi
-}
 
 # --- Wait for services ---
 
@@ -357,6 +310,52 @@ if [ -n "$SESSION" ]; then
     else
         fail "Unknown host should return 404 (got $STATUS_404)"
     fi
+
+# =============================================================================
+# 6b. PROXY HEADER VERIFICATION (echo backend)
+# =============================================================================
+    log "=== 6b. Proxy Header Verification (echo backend) ==="
+
+    ECHO_JSON=$(proxy_echo "test.local")
+    assert_json_exists "$ECHO_JSON" ".received_headers[\"x-real-ip\"]" "X-Real-IP header set"
+    assert_json_exists "$ECHO_JSON" ".received_headers[\"x-forwarded-for\"]" "X-Forwarded-For header set"
+    assert_json "$ECHO_JSON" ".received_headers[\"x-forwarded-proto\"]" "http" "X-Forwarded-Proto = http"
+    assert_json_exists "$ECHO_JSON" ".received_headers[\"host\"]" "Host header forwarded"
+    ECHO_BACKEND=$(echo "$ECHO_JSON" | jq -r '.backend' 2>/dev/null || echo "")
+    if [ "$ECHO_BACKEND" = "backend1" ] || [ "$ECHO_BACKEND" = "backend2" ]; then
+        ok "Echo reached a backend ($ECHO_BACKEND)"
+    else
+        fail "Echo should reach backend1 or backend2 (got '$ECHO_BACKEND')"
+    fi
+    assert_json "$ECHO_JSON" ".path" "/echo" "Path received correctly"
+
+    # Test with custom query string
+    ECHO_JSON=$(proxy_echo "test.local" "/echo?foo=bar&baz=123")
+    assert_json "$ECHO_JSON" ".query" "foo=bar&baz=123" "Query string forwarded"
+
+    # Test POST with body
+    ECHO_JSON=$(curl -sf -H "Host: test.local" -X POST -d "test body content" "${PROXY}/echo" 2>/dev/null)
+    assert_json "$ECHO_JSON" ".method" "POST" "POST method forwarded"
+    assert_json "$ECHO_JSON" ".body" "test body content" "POST body forwarded"
+
+    # Test custom proxy headers (set)
+    api_put "/api/v1/routes/$R1_ID" '{"proxy_headers": {"X-Custom-Test": "lorica-e2e"}}' >/dev/null
+    sleep 1
+
+    ECHO_JSON=$(proxy_echo "test.local")
+    assert_json "$ECHO_JSON" ".received_headers[\"x-custom-test\"]" "lorica-e2e" "Custom proxy header forwarded"
+
+    # Test response headers
+    RESP=$(proxy_echo_with_headers "test.local")
+    RESP_HEADERS=$(echo "$RESP" | sed '/^\r*$/q')
+    assert_header_present "$RESP_HEADERS" "X-Backend-Id" "Backend X-Backend-Id response header"
+
+    # Test security response headers (if security preset is applied)
+    assert_header_present "$RESP_HEADERS" "X-Content-Type-Options" "X-Content-Type-Options response header"
+
+    # Clean up custom proxy headers
+    api_put "/api/v1/routes/$R1_ID" '{"proxy_headers": {}}' >/dev/null
+    sleep 1
 
 # =============================================================================
 # 7. WAF - DETECTION MODE
