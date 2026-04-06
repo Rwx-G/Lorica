@@ -6,6 +6,8 @@ use crate::error::{ConfigError, Result};
 use crate::models::*;
 use crate::store::ConfigStore;
 
+const REDACTED: &str = "**REDACTED**";
+
 const EXPORT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize)]
@@ -28,8 +30,36 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
         .list_admin_users()?
         .into_iter()
         .map(|mut u| {
-            u.password_hash = "**REDACTED**".into();
+            u.password_hash = REDACTED.into();
             u
+        })
+        .collect();
+
+    let notification_configs: Vec<NotificationConfig> = store
+        .list_notification_configs()?
+        .into_iter()
+        .map(|mut nc| {
+            if nc.channel == NotificationChannel::Email {
+                if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&nc.config) {
+                    if val
+                        .get("smtp_password")
+                        .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                    {
+                        val["smtp_password"] = serde_json::json!(REDACTED);
+                    }
+                    nc.config = serde_json::to_string(&val).unwrap_or(nc.config);
+                }
+            }
+            nc
+        })
+        .collect();
+
+    let certificates: Vec<Certificate> = store
+        .list_certificates()?
+        .into_iter()
+        .map(|mut c| {
+            c.key_pem = REDACTED.into();
+            c
         })
         .collect();
 
@@ -39,8 +69,8 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
         routes: store.list_routes()?,
         backends: store.list_backends()?,
         route_backends: store.list_route_backends()?,
-        certificates: store.list_certificates()?,
-        notification_configs: store.list_notification_configs()?,
+        certificates,
+        notification_configs,
         user_preferences: store.list_user_preferences()?,
         admin_users,
     };

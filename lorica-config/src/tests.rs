@@ -1049,7 +1049,7 @@ cert_critical_days = 3
         temp.create_certificate(&modified).unwrap();
         let toml_str = export_to_toml(&temp).unwrap();
 
-        let import_data = parse_toml(&toml_str).unwrap();
+        let import_data = crate::import::parse_toml_for_preview(&toml_str).unwrap();
         let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
 
         assert_eq!(diff.certificates.modified.len(), 1);
@@ -1384,16 +1384,9 @@ cert_critical_days = 3
         let cert = make_certificate();
         store1.create_certificate(&cert).unwrap();
 
-        // Export produces decrypted key_pem in TOML
+        // Export redacts key_pem
         let toml_str = export_to_toml(&store1).unwrap();
-        assert!(toml_str.contains(&cert.key_pem));
-
-        // Import into another encrypted store works
-        let store2 = ConfigStore::open_in_memory_with_key(key).unwrap();
-        let data = parse_toml(&toml_str).unwrap();
-        import_to_store(&store2, &data).unwrap();
-
-        let fetched = store2.get_certificate(&cert.id).unwrap().unwrap();
-        assert_eq!(fetched.key_pem, cert.key_pem);
+        assert!(toml_str.contains("**REDACTED**"));
+        assert!(!toml_str.contains(&cert.key_pem));
     }
 }

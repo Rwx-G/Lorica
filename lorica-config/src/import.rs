@@ -34,8 +34,16 @@ pub fn parse_toml(content: &str) -> Result<ImportData> {
     Ok(data)
 }
 
-/// Validate import data for consistency.
-fn validate(data: &ImportData) -> Result<()> {
+/// Parse TOML for preview/diff only - skips redaction validation.
+pub fn parse_toml_for_preview(content: &str) -> Result<ImportData> {
+    let data: ImportData = toml::from_str(content)
+        .map_err(|e| ConfigError::Serialization(format!("TOML parse failed: {e}")))?;
+    validate_structure(&data)?;
+    Ok(data)
+}
+
+/// Validate structural consistency (used by both import and preview).
+fn validate_structure(data: &ImportData) -> Result<()> {
     if data.version == 0 {
         return Err(ConfigError::Validation(
             "export version must be >= 1".into(),
@@ -58,6 +66,13 @@ fn validate(data: &ImportData) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Validate import data for consistency (rejects redacted data).
+fn validate(data: &ImportData) -> Result<()> {
+    validate_structure(data)?;
+
     // Reject redacted password hashes (from exports)
     for user in &data.admin_users {
         if user.password_hash == "**REDACTED**" {
@@ -65,6 +80,28 @@ fn validate(data: &ImportData) -> Result<()> {
                 "admin user '{}' has a redacted password hash (from export); \
                  set a real password hash or remove the user from the import file",
                 user.username
+            )));
+        }
+    }
+
+    // Reject redacted SMTP passwords in notification configs
+    for nc in &data.notification_configs {
+        if nc.channel == NotificationChannel::Email && nc.config.contains("**REDACTED**") {
+            return Err(ConfigError::Validation(format!(
+                "notification config '{}' has a redacted SMTP password (from export); \
+                 set a real password or remove the config from the import file",
+                nc.id
+            )));
+        }
+    }
+
+    // Reject redacted certificate private keys
+    for cert in &data.certificates {
+        if cert.key_pem == "**REDACTED**" {
+            return Err(ConfigError::Validation(format!(
+                "certificate '{}' has a redacted private key (from export); \
+                 provide the real key or remove the certificate from the import file",
+                cert.id
             )));
         }
     }

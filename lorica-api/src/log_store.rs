@@ -61,8 +61,10 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to initialize notification history schema: {e}"))?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-            .map_err(|e| format!("failed to set access log pragmas: {e}"))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        )
+        .map_err(|e| format!("failed to set access log pragmas: {e}"))?;
 
         Ok(Self {
             conn: Mutex::new(conn),

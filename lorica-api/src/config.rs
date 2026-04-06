@@ -82,7 +82,7 @@ pub async fn import_preview(
         )));
     }
 
-    let import_data = lorica_config::import::parse_toml(&body.toml_content)
+    let import_data = lorica_config::import::parse_toml_for_preview(&body.toml_content)
         .map_err(|e| ApiError::BadRequest(format!("invalid TOML: {e}")))?;
 
     let store = state.store.lock().await;

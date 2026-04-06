@@ -933,6 +933,7 @@ impl ProxyHttp for LoricaProxy {
                             let ban_duration = config.waf_ban_duration_s;
                             self.ban_list
                                 .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
+                            self.waf_violations.remove(ip.as_str());
                             warn!(
                                 ip = %ip,
                                 violations = %violations,
