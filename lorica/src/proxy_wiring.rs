@@ -861,22 +861,21 @@ impl ProxyHttp for LoricaProxy {
         }
 
         // Collect headers for inspection
-        let headers: Vec<(&str, &str)> = req
-            .headers
-            .iter()
-            .filter_map(|(name, value)| {
-                let name_str = name.as_str();
-                // Only inspect relevant headers (skip large/binary ones)
-                match name_str {
-                    "user-agent" | "referer" | "cookie" | "x-forwarded-for" | "content-type"
-                    | "content-length" | "authorization" | "origin" | "transfer-encoding" => {
-                        value.to_str().ok().map(|v| (name_str, v))
+        let headers: Vec<(&str, &str)> =
+            req.headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    let name_str = name.as_str();
+                    // Only inspect relevant headers (skip large/binary ones)
+                    match name_str {
+                        "user-agent" | "referer" | "cookie" | "x-forwarded-for"
+                        | "content-type" | "content-length" | "authorization" | "origin"
+                        | "transfer-encoding" => value.to_str().ok().map(|v| (name_str, v)),
+                        n if n.starts_with("x-") => value.to_str().ok().map(|v| (name_str, v)),
+                        _ => None,
                     }
-                    n if n.starts_with("x-") => value.to_str().ok().map(|v| (name_str, v)),
-                    _ => None,
-                }
-            })
-            .collect();
+                })
+                .collect();
 
         let waf_mode = match entry.route.waf_mode {
             WafMode::Detection => lorica_waf::WafMode::Detection,

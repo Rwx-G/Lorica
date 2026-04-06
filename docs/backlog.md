@@ -18,6 +18,20 @@ Items identified during QA traceability audit (2026-04-01) and acceptance testin
 
 | Source | Description | References |
 |--------|-------------|------------|
-| Code audit | **Stale `#[allow(dead_code)]`** on `RouteEntry` - may no longer be needed after recent refactors. | `proxy_wiring.rs:44` |
-| Code audit | **`request_counts` and `waf_counts` DashMaps** grow with each unique (route_id, status) pair. Bounded by config but never cleared. Consider periodic reset if metrics are forwarded to Prometheus. | `proxy_wiring.rs:419-421` |
-| Acceptance test | **HTTP request smuggling rule (920100)** untestable via curl - rejected at protocol level before WAF evaluation. Consider if the rule adds value or should be removed. | `rules.rs:236` |
+| *(empty - all low items resolved)* | | |
+
+## Resolved
+
+| Item | Resolution |
+|------|------------|
+| `#[allow(dead_code)]` on RouteEntry | Already removed by prior refactor |
+| `request_counts`/`waf_counts` DashMaps | Accepted: bounded by config (routes * status codes), low risk |
+| Rule 920100 unreachable | Fixed: added `content-length` and `transfer-encoding` to WAF header inspection list |
+| Mutex poisoning | Migrated to `parking_lot::Mutex/RwLock` across all crates |
+| WAF config propagation | Already functional via ConfigReload command channel |
+| WAF auto-ban per-worker | Fixed: global counter via supervisor + BanIp command broadcast |
+| WAF events in detection mode | Working via waf.sock forwarding + supervisor persistence |
+| Encryption key rotation | Implemented: `lorica rotate-key --new-key-file` CLI |
+| Export secret leak | Fixed: SMTP passwords and private keys redacted in exports |
+| Memory leak waf_violations | Fixed: entries removed on ban |
+| SQLite busy_timeout | Fixed: PRAGMA busy_timeout=5000 on access-log.db |
