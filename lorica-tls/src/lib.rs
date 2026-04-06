@@ -257,6 +257,7 @@ MBFHMbCjYvz3MFZd10rdBXJn0gnJEnA/UeCub7A=\n\
     fn test_crl_verifier_construction() {
         // Verify that WebPkiServerVerifier can be built with CRLs.
         // Requires platform CA certificates (skipped in minimal containers).
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "test_lorica_crl_verifier_{}.pem",

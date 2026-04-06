@@ -354,6 +354,9 @@ mod tests {
                     score_us: 2300.0,
                 },
             ],
+            backend_conn_entries: Vec::new(),
+            request_entries: Vec::new(),
+            waf_entries: Vec::new(),
         };
         let encoded = report.encode_to_vec();
         let decoded = MetricsReport::decode(&encoded[..]).expect("decode failed");

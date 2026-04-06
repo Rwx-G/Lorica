@@ -39,6 +39,7 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         backend_connections: None,
         notification_history: None,
         log_store: None,
+        aggregated_metrics: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
@@ -670,6 +671,13 @@ async fn test_config_export_import() {
     )
     .unwrap();
     assert!(toml_content.contains("version = 1"));
+
+    // Strip admin_users section (contains redacted password hash from export)
+    let toml_content: String = toml_content
+        .lines()
+        .take_while(|line| !line.starts_with("[[admin_users]]"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Import the same config back
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1549,6 +1557,13 @@ async fn test_import_preview_empty_diff() {
             .to_vec(),
     )
     .unwrap();
+
+    // Strip admin_users section (contains redacted password hash from export)
+    let toml_content: String = toml_content
+        .lines()
+        .take_while(|line| !line.starts_with("[[admin_users]]"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Preview with same content - should be empty diff
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -2761,6 +2776,7 @@ fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         backend_connections: None,
         notification_history: None,
         log_store: None,
+        aggregated_metrics: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
@@ -2792,6 +2808,7 @@ fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         backend_connections: None,
         notification_history: None,
         log_store: None,
+        aggregated_metrics: None,
     };
     let session_store = SessionStore::new();
     let rate_limiter = RateLimiter::new();
