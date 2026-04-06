@@ -62,32 +62,32 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | | **4. ROUTES** | | | | |
 | 4.1 | Create route (minimal) | Dashboard | Hostname + backend -> created | 1.6 | OK |
 | 4.2 | Traffic flows through route | Proxy | `curl -H "Host: ..." http://lorica:8080` | 1.8 | OK |
-| 4.3 | Path prefix routing | Proxy | /api prefix only matches /api/* | 1.8 | |
+| 4.3 | Path prefix routing | Proxy | /api prefix only matches /api/* | 1.8 | OK |
 | 4.4 | Assign TLS certificate | Dashboard | Select cert, HTTPS works | 1.8 | OK |
 | 4.5 | Remove TLS certificate | Dashboard | Deselect cert, save -> cleared | - | OK |
 | 4.6 | Route drawer: tabs work | Dashboard | General/Timeouts/Security/Headers/CORS/Caching/Protection | - | OK |
 | 4.7 | Force HTTPS redirect | Proxy | force_https -> 301 to HTTPS | 6.1 | OK |
-| 4.8 | Hostname redirect | Proxy | redirect_hostname -> 301 | 6.3 | |
-| 4.9 | Hostname aliases | Proxy | Alias traffic reaches same backend | 6.3 | |
+| 4.8 | Hostname redirect | Proxy | redirect_hostname -> 301 | 6.3 | OK |
+| 4.9 | Hostname aliases | Proxy | Alias traffic reaches same backend | 6.3 | OK |
 | 4.10 | Proxy headers (set) | Proxy | Custom header received by backend | 6.1 | OK |
 | 4.11 | Proxy headers (remove) | Proxy | Header removed from backend request | 6.1 | OK |
 | 4.12 | Response headers (set) | Proxy | Custom header received by client | 6.2 | OK |
 | 4.13 | Security header preset (strict) | Proxy | HSTS, X-Frame-Options, CSP in response | 6.2 | OK |
 | 4.14 | Security header preset (custom) | Dashboard | Create custom preset, assign to route | 6.2 | |
-| 4.15 | Path rewrite: strip/add prefix | Proxy | /api/users -> /v2/users | 6.2 | |
-| 4.16 | Path rewrite: regex | Proxy | Capture groups work | - | |
-| 4.17 | Timeouts (connect/read/send) | Proxy | Low timeout + slow backend -> error | 6.1 | |
-| 4.18 | Max request body size | Proxy | Exceed limit -> 413 | 6.1 | |
+| 4.15 | Path rewrite: strip/add prefix | Proxy | /api/users -> /v2/users | 6.2 | OK |
+| 4.16 | Path rewrite: regex | Proxy | Capture groups work | - | OK |
+| 4.17 | Timeouts (connect/read/send) | Proxy | Low timeout + slow backend -> error | 6.1 | OK |
+| 4.18 | Max request body size | Proxy | Exceed limit -> 413 | 6.1 | OK |
 | 4.19 | WebSocket passthrough | Proxy | websocket_enabled -> WS works | 6.1 | |
 | 4.20 | Access log toggle | Proxy | Disable -> no log for this route | 6.2 | |
 | 4.21 | Per-route compression | Proxy | compression_enabled -> gzip response | - | |
 | 4.22 | Retry attempts | Proxy | First backend fails -> retry next | - | |
-| 4.23 | Load balancing: round-robin | Proxy | Even distribution | 1.8 | |
+| 4.23 | Load balancing: round-robin | Proxy | Even distribution | 1.8 | OK |
 | 4.24 | Load balancing: Peak EWMA | Proxy | Lowest-latency backend preferred | 4.3 | |
 | 4.25 | Load balancing: consistent hash | Proxy | Same client -> same backend | - | |
 | 4.26 | Load balancing: random | Proxy | Random distribution | - | |
 | 4.27 | Topology type | Dashboard | SingleVM/HA/Custom adapts health behavior | 3.2 | |
-| 4.28 | Route enable/disable | Dashboard | Disabled -> 404 for that hostname | 1.6 | |
+| 4.28 | Route enable/disable | Dashboard | Disabled -> 404 for that hostname | 1.6 | OK |
 | 4.29 | Delete route | Dashboard | Confirm dialog, removed | 1.6 | OK |
 | 4.30 | Search/filter/sort | Dashboard | Search hostname, sort health/enabled | 1.6 | |
 | 4.31 | Nginx import wizard | Dashboard | Paste nginx.conf -> resources created | - | |
@@ -164,13 +164,13 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 6.43 | WAF events persisted | CLI | Restart -> WAF events survive in SQLite | - | OK |
 | 6.44 | WAF auto-ban on repeated blocks | Proxy | 20 WAF blocks from same IP -> IP banned | - | OK |
 | 6.45 | Ban list visible | Dashboard | Bans tab -> IPs with expiry | 7.3 | OK |
-| 6.46 | Rate limiting | Proxy | > rate_limit_rps -> 429 + Retry-After | 7.2 | |
+| 6.46 | Rate limiting | Proxy | > rate_limit_rps -> 429 + Retry-After | 7.2 | OK |
 | 6.47 | Rate limit headers | Proxy | X-RateLimit-Limit/Remaining/Reset | 7.2 | |
 | 6.48 | Rate limit burst | Proxy | Burst tolerance allows spikes | 7.2 | |
 | 6.49 | Auto-ban on repeated 429 | Proxy | N violations -> 403 (banned) | 7.3 | |
 | 6.50 | ip_banned notification | CLI | Auto-ban -> notification dispatched | 7.3 | OK |
 | 6.51 | Manual unban | Dashboard | Click unban -> IP removed | 7.3 | |
-| 6.52 | Ban auto-expiry | Proxy | Wait ban_duration_s -> unbanned | 7.3 | |
+| 6.52 | Ban auto-expiry | Proxy | Wait ban_duration_s -> unbanned | 7.3 | OK |
 | 6.53 | Slowloris detection | Proxy | Slow headers -> 408 | 7.3 | |
 | 6.54 | Per-route max connections | Proxy | max_connections=2, 3rd -> 503 | 7.2 | |
 | 6.55 | Global connection limit | Proxy | max_global_connections -> 503 | 7.3 | |
@@ -181,10 +181,10 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | | **7. CACHING** | | | | |
 | 7.1 | Enable cache on route | Dashboard | cache_enabled=true, cache_ttl_s=60 | 7.1 | OK |
 | 7.2 | Cache HIT | Proxy | 1st MISS, 2nd HIT (X-Cache) | 7.1 | OK |
-| 7.3 | Cache bypass (Authorization) | Proxy | Authorization header -> BYPASS | 7.1 | |
-| 7.4 | Cache bypass (Cookie) | Proxy | Cookie header -> BYPASS | 7.1 | |
-| 7.5 | Cache respects Cache-Control | Proxy | no-cache -> not cached | 7.1 | |
-| 7.6 | Cache purge | API | DELETE /cache/routes/:id -> cleared | 7.1 | |
+| 7.3 | Cache bypass (Authorization) | Proxy | Authorization header -> BYPASS | 7.1 | OK |
+| 7.4 | Cache bypass (Cookie) | Proxy | Cookie header -> BYPASS | 7.1 | OK |
+| 7.5 | Cache respects Cache-Control | Proxy | no-cache -> not cached | 7.1 | OK |
+| 7.6 | Cache purge | API | DELETE /cache/routes/:id -> cleared | 7.1 | OK |
 | 7.7 | Cache stats | Dashboard | Hit rate in Overview + API | 7.1 | OK |
 | 7.8 | Cache TTL expiry | Proxy | After TTL -> MISS again | 7.1 | |
 | | **8. SLA AND PERFORMANCE** | | | | |
@@ -242,12 +242,12 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 13.13 | Theme toggle (light/dark) | Dashboard | Persisted across sessions | 1.5 | OK |
 | | **14. PROMETHEUS METRICS** | | | | |
 | 14.1 | /metrics endpoint | API | `curl localhost:9443/metrics` | 4.2 | OK |
-| 14.2 | Request count by route/status | API | `lorica_requests_total` | 4.2 | |
-| 14.3 | Latency histogram | API | `lorica_request_duration_seconds_bucket` | 4.2 | |
+| 14.2 | Request count by route/status | API | `lorica_requests_total` | 4.2 | OK |
+| 14.3 | Latency histogram | API | `lorica_request_duration_seconds_bucket` | 4.2 | OK |
 | 14.4 | Active connections gauge | API | `lorica_active_connections` | 4.2 | OK |
 | 14.5 | Backend health gauge | API | `lorica_backend_healthy` | 4.2 | OK |
 | 14.6 | Certificate expiry days | API | `lorica_certificate_expiry_days` | 4.2 | OK |
-| 14.7 | WAF events counter | API | `lorica_waf_events_total` | 4.2 | |
+| 14.7 | WAF events counter | API | `lorica_waf_events_total` | 4.2 | OK |
 | 14.8 | System CPU/memory | API | `lorica_cpu_usage`, `lorica_memory_bytes` | 4.2 | OK |
 | | **15. NOTIFICATIONS** | | | | |
 | 15.1 | cert_expiring dispatched | CLI | Approaching expiry -> stdout log | 3.3 | |
