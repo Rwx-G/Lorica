@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use chrono::Datelike;
 use clap::{Parser, Subcommand};
 use lorica_api::logs::LogBuffer;
 use lorica_api::middleware::auth::SessionStore;
@@ -27,7 +28,6 @@ use lorica_api::server::AppState;
 use lorica_api::system::SystemCache;
 use lorica_config::ConfigStore;
 use tokio::sync::Mutex;
-use chrono::Datelike;
 use tracing::{error, info, warn};
 
 use lorica::proxy_wiring::{LoricaProxy, ProxyConfig};
@@ -1020,7 +1020,10 @@ fn run_worker(
         if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
             if !disabled_ids.is_empty() {
                 waf_engine.set_disabled_rules(&disabled_ids);
-                info!(count = disabled_ids.len(), "worker: WAF disabled rules restored");
+                info!(
+                    count = disabled_ids.len(),
+                    "worker: WAF disabled rules restored"
+                );
             }
         }
         if let Ok(custom_rules) = s.load_waf_custom_rules() {
@@ -1031,7 +1034,10 @@ fn run_worker(
                 let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
             }
             if !custom_rules.is_empty() {
-                info!(count = custom_rules.len(), "worker: WAF custom rules restored");
+                info!(
+                    count = custom_rules.len(),
+                    "worker: WAF custom rules restored"
+                );
             }
         }
     }
@@ -1095,7 +1101,9 @@ fn run_worker(
                             // Reload custom rules
                             cmd_waf_engine.clear_custom_rules();
                             if let Ok(custom_rules) = s.load_waf_custom_rules() {
-                                for (rule_id, desc, cat, pattern, severity, _enabled) in &custom_rules {
+                                for (rule_id, desc, cat, pattern, severity, _enabled) in
+                                    &custom_rules
+                                {
                                     let category = cat
                                         .parse()
                                         .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
@@ -1194,7 +1202,8 @@ fn run_worker(
                         report.request_entries = cmd_request_counts
                             .iter()
                             .map(|entry| {
-                                let ((route_id, status_code), counter) = (entry.key(), entry.value());
+                                let ((route_id, status_code), counter) =
+                                    (entry.key(), entry.value());
                                 lorica_command::RequestCountEntry {
                                     route_id: route_id.clone(),
                                     status_code: *status_code as u32,
@@ -1763,10 +1772,7 @@ fn run_single_process(cli: Cli) {
 /// Build a NotifyDispatcher from database notification configs.
 /// Run the SLA data purge if enabled and the schedule matches today.
 /// Returns the day-of-month on which the last purge ran (used as guard to run once per day).
-async fn run_sla_purge(
-    store: &Arc<Mutex<lorica_config::ConfigStore>>,
-    last_purge_day: u32,
-) -> u32 {
+async fn run_sla_purge(store: &Arc<Mutex<lorica_config::ConfigStore>>, last_purge_day: u32) -> u32 {
     let today = chrono::Utc::now().day();
     if today == last_purge_day {
         return last_purge_day;

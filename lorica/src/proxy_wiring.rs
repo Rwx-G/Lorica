@@ -931,10 +931,8 @@ impl ProxyHttp for LoricaProxy {
                             + 1;
                         if violations >= threshold as u64 {
                             let ban_duration = config.waf_ban_duration_s;
-                            self.ban_list.insert(
-                                ip.to_string(),
-                                (Instant::now(), ban_duration as u64),
-                            );
+                            self.ban_list
+                                .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
                             warn!(
                                 ip = %ip,
                                 violations = %violations,
@@ -945,7 +943,10 @@ impl ProxyHttp for LoricaProxy {
                                 sender.send(
                                     lorica_notify::AlertEvent::new(
                                         lorica_notify::events::AlertType::IpBanned,
-                                        format!("IP {} auto-banned for repeated WAF violations", ip),
+                                        format!(
+                                            "IP {} auto-banned for repeated WAF violations",
+                                            ip
+                                        ),
                                     )
                                     .with_detail("ip", ip.to_string())
                                     .with_detail("violations", violations.to_string())
@@ -1689,8 +1690,17 @@ mod tests {
         let backend = make_backend("b1", "10.0.0.1:8080");
         let links = vec![("r1".into(), "b1".into())];
 
-        let config =
-            ProxyConfig::from_store(vec![route], vec![backend], vec![], links, vec![], 0, 0, 0, 0);
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![backend],
+            vec![],
+            links,
+            vec![],
+            0,
+            0,
+            0,
+            0,
+        );
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].backends.len(), 1);
@@ -1702,7 +1712,8 @@ mod tests {
         let r1 = make_route("r1", "example.com", "/", true);
         let r2 = make_route("r2", "disabled.com", "/", false);
 
-        let config = ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
         assert!(config.routes_by_host.contains_key("example.com"));
         assert!(!config.routes_by_host.contains_key("disabled.com"));
     }
@@ -1726,7 +1737,8 @@ mod tests {
     fn test_from_store_route_without_backends() {
         let route = make_route("r1", "example.com", "/", true);
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].backends.is_empty());
     }
@@ -1737,7 +1749,8 @@ mod tests {
         route.certificate_id = Some("c1".into());
         let cert = make_certificate("c1", "example.com");
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![cert], vec![], vec![], 0, 0, 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![route], vec![], vec![cert], vec![], vec![], 0, 0, 0, 0);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].certificate.is_some());
         assert_eq!(
@@ -1751,7 +1764,8 @@ mod tests {
         let mut route = make_route("r1", "example.com", "/", true);
         route.certificate_id = Some("nonexistent".into());
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].certificate.is_none());
     }
@@ -1774,7 +1788,8 @@ mod tests {
         let r1 = make_route("r1", "foo.com", "/", true);
         let r2 = make_route("r2", "bar.com", "/", true);
 
-        let config = ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
         assert_eq!(config.routes_by_host.len(), 2);
         assert!(config.routes_by_host.contains_key("foo.com"));
         assert!(config.routes_by_host.contains_key("bar.com"));
@@ -1785,7 +1800,8 @@ mod tests {
         let route = make_route("r1", "example.com", "/", true);
         let links = vec![("r1".into(), "nonexistent-backend".into())];
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], links, vec![], 0, 0, 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![route], vec![], vec![], links, vec![], 0, 0, 0, 0);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].backends.is_empty());
     }
@@ -1794,7 +1810,8 @@ mod tests {
     fn test_from_store_rr_counter_starts_at_zero() {
         let route = make_route("r1", "example.com", "/", true);
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries[0].rr_counter.load(Ordering::Relaxed), 0);
     }
@@ -1982,7 +1999,8 @@ mod tests {
         let mut route = make_route("r1", "example.com", "/", true);
         route.hostname_aliases = vec!["www.example.com".into(), "alias.example.com".into()];
 
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
         assert!(config.routes_by_host.contains_key("example.com"));
         assert!(config.routes_by_host.contains_key("www.example.com"));
         assert!(config.routes_by_host.contains_key("alias.example.com"));
@@ -2067,7 +2085,8 @@ mod tests {
     #[test]
     fn test_wildcard_hostname_matching() {
         let route = make_route("r1", "*.example.com", "/", true);
-        let config = ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
 
         // Should match subdomains
         assert!(config.find_route("foo.example.com", "/").is_some());
@@ -2084,7 +2103,8 @@ mod tests {
     fn test_exact_match_takes_precedence_over_wildcard() {
         let r1 = make_route("r1", "*.example.com", "/", true);
         let r2 = make_route("r2", "specific.example.com", "/", true);
-        let config = ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
+        let config =
+            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
 
         let entry = config.find_route("specific.example.com", "/").unwrap();
         assert_eq!(entry.route.id, "r2"); // exact match wins

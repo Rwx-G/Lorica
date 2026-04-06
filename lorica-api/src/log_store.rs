@@ -379,11 +379,9 @@ impl LogStore {
     pub fn enforce_notification_retention(&self, max_entries: u64) -> Result<u64, String> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM notification_history",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM notification_history", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| format!("failed to count notification events: {e}"))?;
         if count <= max_entries as i64 {
             return Ok(0);

@@ -33,8 +33,7 @@ static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 /// HTTP request counter. Labels: route_id, status_code.
 static HTTP_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let counter = IntCounterVec::new(
-        prometheus::opts!("http_requests_total", "Total HTTP requests proxied")
-            .namespace("lorica"),
+        prometheus::opts!("http_requests_total", "Total HTTP requests proxied").namespace("lorica"),
         &["route_id", "status_code"],
     )
     .unwrap();
@@ -63,8 +62,11 @@ static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
 /// Active proxy connections gauge.
 static ACTIVE_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
     let gauge = IntGauge::with_opts(
-        prometheus::Opts::new("active_connections", "Current number of active proxy connections")
-            .namespace("lorica"),
+        prometheus::Opts::new(
+            "active_connections",
+            "Current number of active proxy connections",
+        )
+        .namespace("lorica"),
     )
     .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).ok();

@@ -73,7 +73,10 @@ pub async fn get_waf_events(
 
     // Apply category filter if specified
     let events: Vec<WafEvent> = if let Some(ref cat) = params.category {
-        events.into_iter().filter(|e| e.category.as_str() == cat.as_str()).collect()
+        events
+            .into_iter()
+            .filter(|e| e.category.as_str() == cat.as_str())
+            .collect()
     } else {
         events
     };
@@ -349,7 +352,9 @@ pub async fn toggle_blocklist(
 
 /// Fetch and load the blocklist from the remote URL.
 /// Shared between the manual reload endpoint and the background task.
-pub async fn fetch_and_load_blocklist(blocklist: &lorica_waf::IpBlocklist) -> Result<usize, String> {
+pub async fn fetch_and_load_blocklist(
+    blocklist: &lorica_waf::IpBlocklist,
+) -> Result<usize, String> {
     let url = lorica_waf::ip_blocklist::DEFAULT_BLOCKLIST_URL;
 
     let client = reqwest::Client::builder()

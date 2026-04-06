@@ -267,7 +267,9 @@ impl AggregatedMetrics {
         let mut merged: HashMap<(String, String), u64> = HashMap::new();
         for w in map.values() {
             for (category, action, count) in &w.waf_counts {
-                *merged.entry((category.clone(), action.clone())).or_insert(0) += count;
+                *merged
+                    .entry((category.clone(), action.clone()))
+                    .or_insert(0) += count;
             }
         }
         merged

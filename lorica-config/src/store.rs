@@ -1249,9 +1249,9 @@ impl ConfigStore {
                     })?;
                 }
                 "waf_ban_threshold" => {
-                    settings.waf_ban_threshold = value.parse().map_err(|_| {
-                        ConfigError::Validation("invalid waf_ban_threshold".into())
-                    })?;
+                    settings.waf_ban_threshold = value
+                        .parse()
+                        .map_err(|_| ConfigError::Validation("invalid waf_ban_threshold".into()))?;
                 }
                 "waf_ban_duration_s" => {
                     settings.waf_ban_duration_s = value.parse().map_err(|_| {
