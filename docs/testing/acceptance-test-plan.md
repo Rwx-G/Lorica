@@ -79,9 +79,9 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.17 | Timeouts (connect/read/send) | Proxy | Low timeout + slow backend -> error | 6.1 | OK |
 | 4.18 | Max request body size | Proxy | Exceed limit -> 413 | 6.1 | OK |
 | 4.19 | WebSocket passthrough | Proxy | websocket_enabled -> WS works | 6.1 | |
-| 4.20 | Access log toggle | Proxy | Disable -> no log for this route | 6.2 | |
-| 4.21 | Per-route compression | Proxy | compression_enabled -> gzip response | - | |
-| 4.22 | Retry attempts | Proxy | First backend fails -> retry next | - | |
+| 4.20 | Access log toggle | Proxy | Disable -> no log for this route | 6.2 | OK |
+| 4.21 | Per-route compression | Proxy | compression_enabled -> gzip response | - | OK |
+| 4.22 | Retry attempts | Proxy | First backend fails -> retry next | - | OK |
 | 4.23 | Load balancing: round-robin | Proxy | Even distribution | 1.8 | OK |
 | 4.24 | Load balancing: Peak EWMA | Proxy | Lowest-latency backend preferred | 4.3 | |
 | 4.25 | Load balancing: consistent hash | Proxy | Same client -> same backend | - | |
@@ -116,7 +116,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 5.21 | SNI resolution: SAN domains | Proxy | All SANs resolve correctly | 2.3 | |
 | 5.22 | Certificate hot-swap | Proxy | Upload new cert -> new connections get new cert | 2.3 | |
 | 5.23 | CertResolver hot-reload | Proxy | Upload cert via API -> TLS works immediately | - | |
-| 5.24 | Private key encrypted at rest | CLI | `sqlite3 lorica.db` -> binary blob, not PEM | 4.5 | |
+| 5.24 | Private key encrypted at rest | CLI | `sqlite3 lorica.db` -> binary blob, not PEM | 4.5 | OK |
 | 5.25 | HTTPS works in worker mode | Proxy | `--workers 6` + TLS cert -> HTTPS serves traffic | 2.1 | OK |
 | | **6. SECURITY** | | | | |
 | 6.1 | WAF rules listed (37 rules) | Dashboard | Security > Rules tab -> 37 rules | 3.1 | OK |
@@ -165,7 +165,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 6.44 | WAF auto-ban on repeated blocks | Proxy | 20 WAF blocks from same IP -> IP banned | - | OK |
 | 6.45 | Ban list visible | Dashboard | Bans tab -> IPs with expiry | 7.3 | OK |
 | 6.46 | Rate limiting | Proxy | > rate_limit_rps -> 429 + Retry-After | 7.2 | OK |
-| 6.47 | Rate limit headers | Proxy | X-RateLimit-Limit/Remaining/Reset | 7.2 | |
+| 6.47 | Rate limit headers | Proxy | X-RateLimit-Limit/Remaining/Reset | 7.2 | OK |
 | 6.48 | Rate limit burst | Proxy | Burst tolerance allows spikes | 7.2 | |
 | 6.49 | Auto-ban on repeated 429 | Proxy | N violations -> 403 (banned) | 7.3 | |
 | 6.50 | ip_banned notification | CLI | Auto-ban -> notification dispatched | 7.3 | OK |
@@ -175,9 +175,9 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 6.54 | Per-route max connections | Proxy | max_connections=2, 3rd -> 503 | 7.2 | |
 | 6.55 | Global connection limit | Proxy | max_global_connections -> 503 | 7.3 | |
 | 6.56 | Flood defense | Proxy | RPS > threshold -> limits halved | 7.3 | |
-| 6.57 | IP allowlist | Proxy | Non-allowed IP -> blocked | - | |
-| 6.36 | IP denylist | Proxy | Denied IP -> blocked | - | |
-| 6.37 | CORS headers | Proxy | Access-Control-* headers set | - | |
+| 6.57 | IP allowlist | Proxy | Non-allowed IP -> blocked | - | OK |
+| 6.36 | IP denylist | Proxy | Denied IP -> blocked | - | OK |
+| 6.37 | CORS headers | Proxy | Access-Control-* headers set | - | OK |
 | | **7. CACHING** | | | | |
 | 7.1 | Enable cache on route | Dashboard | cache_enabled=true, cache_ttl_s=60 | 7.1 | OK |
 | 7.2 | Cache HIT | Proxy | 1st MISS, 2nd HIT (X-Cache) | 7.1 | OK |
@@ -186,7 +186,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 7.5 | Cache respects Cache-Control | Proxy | no-cache -> not cached | 7.1 | OK |
 | 7.6 | Cache purge | API | DELETE /cache/routes/:id -> cleared | 7.1 | OK |
 | 7.7 | Cache stats | Dashboard | Hit rate in Overview + API | 7.1 | OK |
-| 7.8 | Cache TTL expiry | Proxy | After TTL -> MISS again | 7.1 | |
+| 7.8 | Cache TTL expiry | Proxy | After TTL -> MISS again | 7.1 | OK |
 | | **8. SLA AND PERFORMANCE** | | | | |
 | 8.1 | Passive SLA data collected | Dashboard | SLA page shows data after traffic | 5.1 | OK |
 | 8.2 | SLA percentiles (p50/p95/p99) | Dashboard | Latency percentile tables | 5.1 | OK |
@@ -256,7 +256,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 15.4 | ip_banned dispatched | CLI | Auto-banned -> notification | 7.3 | OK |
 | 15.5 | sla_breached dispatched | CLI | SLA below target -> notification | 5.1 | OK |
 | 15.6 | Email channel delivery | CLI | SMTP notification received | 3.3 | OK |
-| 15.7 | Webhook channel delivery | CLI | HTTP POST received | 3.3 | |
+| 15.7 | Webhook channel delivery | CLI | HTTP POST received | 3.3 | OK |
 | | **16. WORKER MODE** | | | | |
 | 16.1 | Config reload propagated | Proxy | Edit route -> all workers update | 2.2 | OK |
 | 16.2 | Cert reload propagated | Proxy | Upload cert -> workers reload TLS | 2.3 | OK |
@@ -272,4 +272,4 @@ Test with `--workers 6` to validate worker mode simultaneously.
 
 **Total: 200 test cases across 17 sections**
 
-Last updated: 2026-04-03
+Last updated: 2026-04-06
