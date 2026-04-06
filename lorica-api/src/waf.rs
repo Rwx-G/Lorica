@@ -65,7 +65,7 @@ pub async fn get_waf_events(
             .list_waf_events(limit)
             .map_err(|e| ApiError::Internal(format!("waf event query failed: {e}")))?
     } else if let Some(ref waf_buffer) = state.waf_event_buffer {
-        let buf = waf_buffer.lock().unwrap();
+        let buf = waf_buffer.lock();
         buf.iter().rev().take(limit).cloned().collect()
     } else {
         vec![]
@@ -95,7 +95,7 @@ pub async fn get_waf_stats(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (total_events, by_category, rule_count) =
         if let Some(ref waf_buffer) = state.waf_event_buffer {
-            let buf = waf_buffer.lock().unwrap();
+            let buf = waf_buffer.lock();
             let total = buf.len();
 
             let mut counts = std::collections::HashMap::new();
@@ -186,7 +186,7 @@ pub async fn clear_waf_events(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if let Some(ref waf_buffer) = state.waf_event_buffer {
-        let mut buf = waf_buffer.lock().unwrap();
+        let mut buf = waf_buffer.lock();
         buf.clear();
     }
     if let Some(ref store) = state.log_store {

@@ -405,7 +405,8 @@ pub struct LoricaProxy {
     pub ban_list: Arc<DashMap<String, (Instant, u64)>>,
     /// Rate limit violation counter (per minute) for auto-ban decisions.
     pub rate_violations: Arc<lorica_limits::rate::Rate>,
-    /// Cumulative WAF block counter per IP for WAF auto-ban.
+    /// Cumulative WAF block counter per IP for WAF auto-ban (single-process fallback).
+    /// In multi-worker mode the supervisor counts globally and broadcasts BanIp commands.
     pub waf_violations: Arc<DashMap<String, AtomicU64>>,
     /// Per-route active connection counters for `max_connections` enforcement.
     pub route_connections: Arc<DashMap<String, Arc<AtomicU64>>>,
@@ -601,6 +602,7 @@ impl ProxyHttp for LoricaProxy {
                         matched_field: "client_ip".to_string(),
                         matched_value: ip.to_string(),
                         timestamp: chrono::Utc::now().to_rfc3339(),
+                        client_ip: ip.to_string(),
                     };
                     let _ = store.insert_waf_event(&ev);
                 }
@@ -884,9 +886,14 @@ impl ProxyHttp for LoricaProxy {
             WafMode::Blocking => lorica_waf::WafMode::Blocking,
         };
 
-        let verdict = self
-            .waf_engine
-            .evaluate(waf_mode, path, query, &headers, host);
+        let verdict = self.waf_engine.evaluate(
+            waf_mode,
+            path,
+            query,
+            &headers,
+            host,
+            check_ip.as_deref().unwrap_or("-"),
+        );
 
         match verdict {
             lorica_waf::WafVerdict::Blocked(ref events) => {
@@ -918,7 +925,11 @@ impl ProxyHttp for LoricaProxy {
                 ctx.matched_host = Some(host.to_string());
                 ctx.matched_path = Some(path.to_string());
 
-                // WAF auto-ban: ban IP after repeated WAF blocks
+                // WAF auto-ban: local per-process fallback for single-process mode.
+                // In multi-worker mode the supervisor counts violations globally
+                // across all workers and broadcasts BanIp commands. The local
+                // counter here serves as a fallback that still works in
+                // single-process deployments.
                 if let Some(ref ip) = check_ip {
                     let config = self.config.load();
                     let threshold = config.waf_ban_threshold;
@@ -938,7 +949,7 @@ impl ProxyHttp for LoricaProxy {
                                 ip = %ip,
                                 violations = %violations,
                                 ban_duration_s = %ban_duration,
-                                "IP auto-banned for repeated WAF violations"
+                                "IP auto-banned for repeated WAF violations (local counter)"
                             );
                             if let Some(ref sender) = self.alert_sender {
                                 sender.send(

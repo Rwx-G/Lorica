@@ -14,11 +14,11 @@ fuzz_target!(|data: &[u8]| {
         };
 
         // Fuzz both detection and blocking modes
-        let _ = engine.evaluate(WafMode::Detection, path, query, &[], "fuzz.local");
-        let _ = engine.evaluate(WafMode::Blocking, path, query, &[], "fuzz.local");
+        let _ = engine.evaluate(WafMode::Detection, path, query, &[], "fuzz.local", "0.0.0.0");
+        let _ = engine.evaluate(WafMode::Blocking, path, query, &[], "fuzz.local", "0.0.0.0");
 
         // Also fuzz with headers
         let headers = vec![("user-agent", input), ("x-custom", input)];
-        let _ = engine.evaluate(WafMode::Blocking, "/", Some(input), &headers, "fuzz.local");
+        let _ = engine.evaluate(WafMode::Blocking, "/", Some(input), &headers, "fuzz.local", "0.0.0.0");
     }
 });

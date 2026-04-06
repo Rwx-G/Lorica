@@ -32,7 +32,7 @@ pub struct AppState {
     /// Per-worker heartbeat metrics. `None` in single-process mode.
     pub worker_metrics: Option<Arc<WorkerMetrics>>,
     /// WAF event ring buffer. `None` if WAF engine not initialized.
-    pub waf_event_buffer: Option<Arc<std::sync::Mutex<VecDeque<lorica_waf::WafEvent>>>>,
+    pub waf_event_buffer: Option<Arc<parking_lot::Mutex<VecDeque<lorica_waf::WafEvent>>>>,
     /// WAF engine reference for rule management. `None` if not initialized.
     pub waf_engine: Option<Arc<lorica_waf::WafEngine>>,
     /// Number of loaded WAF rules.

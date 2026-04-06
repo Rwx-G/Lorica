@@ -356,6 +356,8 @@ fn run_supervisor(cli: Cli) {
 
         // Broadcast channel: API config changes fan out to all per-worker tasks
         let (reload_bc_tx, _) = broadcast::channel::<u64>(16);
+        // Broadcast channel: supervisor sends BanIp commands to all per-worker tasks
+        let (ban_bc_tx, _) = broadcast::channel::<(String, u64)>(64);
         // Clone for the API's watch-based reload signal
         let reload_bc_tx_clone = reload_bc_tx.clone();
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
@@ -388,6 +390,7 @@ fn run_supervisor(cli: Cli) {
                 }
             };
             let mut reload_rx = reload_bc_tx.subscribe();
+            let mut ban_rx = ban_bc_tx.subscribe();
             let hb_seq = Arc::clone(&sequence);
             let hb_metrics = Arc::clone(&worker_metrics);
             let agg_metrics = Arc::clone(&aggregated_metrics);
@@ -400,6 +403,27 @@ fn run_supervisor(cli: Cli) {
 
                 loop {
                     tokio::select! {
+                        // BanIp command from supervisor's global WAF counter
+                        Ok((ip, duration_s)) = ban_rx.recv() => {
+                            let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                            let cmd = Command::ban_ip(seq, &ip, duration_s);
+                            if let Err(e) = channel.send(&cmd).await {
+                                warn!(worker_id, error = %e, "BanIp send failed");
+                                continue;
+                            }
+                            match channel.recv::<Response>().await {
+                                Ok(resp) => match resp.typed_status() {
+                                    lorica_command::ResponseStatus::Ok => {
+                                        info!(worker_id, ip = %ip, "worker applied BanIp");
+                                    }
+                                    lorica_command::ResponseStatus::Error => {
+                                        error!(worker_id, message = %resp.message, "worker BanIp failed");
+                                    }
+                                    _ => {}
+                                },
+                                Err(e) => warn!(worker_id, error = %e, "BanIp response failed"),
+                            }
+                        }
                         // Config reload triggered by API
                         Ok(seq) = reload_rx.recv() => {
                             let cmd = Command::new(CommandType::ConfigReload, seq);
@@ -542,6 +566,11 @@ fn run_supervisor(cli: Cli) {
         let waf_event_sink = Arc::clone(&waf_event_buffer);
         let waf_log_store = log_store.clone();
         let waf_alert_sender = alert_sender.clone();
+        // Global WAF violation counter: counts blocked events per IP across all workers
+        let waf_global_violations: Arc<dashmap::DashMap<String, std::sync::atomic::AtomicU64>> =
+            Arc::new(dashmap::DashMap::new());
+        let waf_ban_tx = ban_bc_tx.clone();
+        let waf_ban_store = Arc::clone(&store);
         tokio::spawn(async move {
             loop {
                 match waf_listener.accept().await {
@@ -549,6 +578,9 @@ fn run_supervisor(cli: Cli) {
                         let sink = Arc::clone(&waf_event_sink);
                         let store = waf_log_store.clone();
                         let alert_tx = waf_alert_sender.clone();
+                        let violations = Arc::clone(&waf_global_violations);
+                        let ban_tx = waf_ban_tx.clone();
+                        let ban_store = Arc::clone(&waf_ban_store);
                         tokio::spawn(async move {
                             let mut reader = tokio::io::BufReader::new(stream);
                             let mut line = String::new();
@@ -571,7 +603,49 @@ fn run_supervisor(cli: Cli) {
                                                 .with_detail("category", event.category.as_str().to_string())
                                                 .with_detail("severity", event.severity.to_string()),
                                             );
-                                            let mut buf = sink.lock().unwrap();
+
+                                            // Global WAF auto-ban: count blocked events per client IP
+                                            if !event.client_ip.is_empty() && event.client_ip != "-" {
+                                                let s = ban_store.lock().await;
+                                                let (threshold, duration_s) = s.get_global_settings()
+                                                    .map(|gs| (gs.waf_ban_threshold as u64, gs.waf_ban_duration_s as u64))
+                                                    .unwrap_or((0, 600));
+                                                drop(s);
+
+                                                if threshold > 0 {
+                                                    let count = violations
+                                                        .entry(event.client_ip.clone())
+                                                        .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
+                                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                                        + 1;
+                                                    if count >= threshold {
+                                                        violations.remove(&event.client_ip);
+                                                        warn!(
+                                                            ip = %event.client_ip,
+                                                            violations = %count,
+                                                            ban_duration_s = %duration_s,
+                                                            "global WAF auto-ban: IP banned for repeated violations"
+                                                        );
+                                                        // Broadcast BanIp to all workers
+                                                        let _ = ban_tx.send((event.client_ip.clone(), duration_s));
+                                                        // Dispatch ip_banned alert
+                                                        alert_tx.send(
+                                                            lorica_notify::AlertEvent::new(
+                                                                lorica_notify::events::AlertType::IpBanned,
+                                                                format!(
+                                                                    "IP {} auto-banned for repeated WAF violations",
+                                                                    event.client_ip
+                                                                ),
+                                                            )
+                                                            .with_detail("ip", event.client_ip.clone())
+                                                            .with_detail("violations", count.to_string())
+                                                            .with_detail("ban_duration_s", duration_s.to_string()),
+                                                        );
+                                                    }
+                                                }
+                                            }
+
+                                            let mut buf = sink.lock();
                                             if buf.len() >= 500 {
                                                 buf.pop_front();
                                             }
@@ -758,6 +832,7 @@ fn run_supervisor(cli: Cli) {
         let manager = Arc::new(std::sync::Mutex::new(manager));
         let monitor_mgr = Arc::clone(&manager);
         let monitor_reload_tx = reload_bc_tx.clone();
+        let monitor_ban_tx = ban_bc_tx.clone();
         let monitor_seq = Arc::clone(&sequence);
         let monitor_hb_metrics = Arc::clone(&worker_metrics);
         let monitor_agg_metrics = Arc::clone(&aggregated_metrics);
@@ -799,6 +874,7 @@ fn run_supervisor(cli: Cli) {
                             match unsafe { CommandChannel::from_raw_fd(new_fd.into_raw_fd()) } {
                                 Ok(mut channel) => {
                                     let mut rx = monitor_reload_tx.subscribe();
+                                    let mut ban_rx = monitor_ban_tx.subscribe();
                                     let seq = Arc::clone(&monitor_seq);
                                     let hb_metrics = Arc::clone(&monitor_hb_metrics);
                                     let agg_metrics = Arc::clone(&monitor_agg_metrics);
@@ -808,6 +884,14 @@ fn run_supervisor(cli: Cli) {
                                         timer.tick().await;
                                         loop {
                                             tokio::select! {
+                                                // BanIp command from supervisor
+                                                Ok((ip, duration_s)) = ban_rx.recv() => {
+                                                    let s = seq.fetch_add(1, Ordering::Relaxed);
+                                                    let cmd = Command::ban_ip(s, &ip, duration_s);
+                                                    if channel.send(&cmd).await.is_ok() {
+                                                        let _ = channel.recv::<Response>().await;
+                                                    }
+                                                }
                                                 Ok(s) = rx.recv() => {
                                                     let cmd = Command::new(CommandType::ConfigReload, s);
                                                     if channel.send(&cmd).await.is_ok() {
@@ -1231,6 +1315,23 @@ fn run_worker(
                             warn!(error = %e, "failed to send metrics response");
                         }
                     }
+                    CommandType::BanIp => {
+                        let ip = cmd.ban_ip.clone();
+                        let duration_s = cmd.ban_duration_s;
+                        if !ip.is_empty() {
+                            cmd_ban_list.insert(ip.clone(), (Instant::now(), duration_s));
+                            info!(
+                                worker_id = id,
+                                ip = %ip,
+                                ban_duration_s = %duration_s,
+                                "applied BanIp from supervisor"
+                            );
+                        }
+                        let resp = Response::ok(cmd.sequence);
+                        if let Err(e) = channel.send(&resp).await {
+                            warn!(error = %e, "failed to send BanIp response");
+                        }
+                    }
                     CommandType::Unspecified => {
                         warn!(worker_id = id, "received unspecified command");
                     }
@@ -1280,7 +1381,7 @@ fn run_worker(
                 loop {
                     interval.tick().await;
                     let events: Vec<lorica_waf::WafEvent> = {
-                        let buf = event_buf.lock().unwrap();
+                        let buf = event_buf.lock();
                         if buf.len() == last_count {
                             continue;
                         }

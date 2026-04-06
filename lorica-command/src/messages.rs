@@ -28,6 +28,7 @@ pub enum CommandType {
     Heartbeat = 2,
     Shutdown = 3,
     MetricsRequest = 4,
+    BanIp = 5,
 }
 
 impl CommandType {
@@ -37,6 +38,7 @@ impl CommandType {
             2 => Self::Heartbeat,
             3 => Self::Shutdown,
             4 => Self::MetricsRequest,
+            5 => Self::BanIp,
             _ => Self::Unspecified,
         }
     }
@@ -72,6 +74,12 @@ pub struct Command {
     pub sequence: u64,
     #[prost(uint64, tag = "3")]
     pub timestamp_ms: u64,
+    /// IP address to ban (only used with BanIp command type).
+    #[prost(string, tag = "4")]
+    pub ban_ip: ::prost::alloc::string::String,
+    /// Ban duration in seconds (only used with BanIp command type).
+    #[prost(uint64, tag = "5")]
+    pub ban_duration_s: u64,
 }
 
 impl Command {
@@ -85,6 +93,23 @@ impl Command {
             command_type: command_type as i32,
             sequence,
             timestamp_ms,
+            ban_ip: String::new(),
+            ban_duration_s: 0,
+        }
+    }
+
+    /// Create a BanIp command with the specified IP and duration.
+    pub fn ban_ip(sequence: u64, ip: impl Into<String>, duration_s: u64) -> Self {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            command_type: CommandType::BanIp as i32,
+            sequence,
+            timestamp_ms,
+            ban_ip: ip.into(),
+            ban_duration_s: duration_s,
         }
     }
 
@@ -279,6 +304,8 @@ mod tests {
             CommandType::ConfigReload,
             CommandType::Heartbeat,
             CommandType::Shutdown,
+            CommandType::MetricsRequest,
+            CommandType::BanIp,
         ] {
             assert_eq!(CommandType::from_i32(ct as i32), ct);
         }
@@ -323,6 +350,23 @@ mod tests {
         use prost::Message;
 
         let cmd = Command::new(CommandType::Heartbeat, 99);
+        let encoded = cmd.encode_to_vec();
+        let decoded = Command::decode(&encoded[..]).expect("decode failed");
+        assert_eq!(decoded, cmd);
+    }
+
+    #[test]
+    fn test_ban_ip_command() {
+        use prost::Message;
+
+        let cmd = Command::ban_ip(42, "192.168.1.100", 3600);
+        assert_eq!(cmd.typed_command(), CommandType::BanIp);
+        assert_eq!(cmd.sequence, 42);
+        assert_eq!(cmd.ban_ip, "192.168.1.100");
+        assert_eq!(cmd.ban_duration_s, 3600);
+        assert!(cmd.timestamp_ms > 0);
+
+        // Verify protobuf roundtrip
         let encoded = cmd.encode_to_vec();
         let decoded = Command::decode(&encoded[..]).expect("decode failed");
         assert_eq!(decoded, cmd);

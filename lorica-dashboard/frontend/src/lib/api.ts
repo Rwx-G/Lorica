@@ -722,6 +722,7 @@ export interface WafEvent {
   matched_field: string;
   matched_value: string;
   timestamp: string;
+  client_ip?: string;
 }
 
 export interface WafEventsResponse {

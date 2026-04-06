@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
+
+use parking_lot::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -43,6 +45,9 @@ pub struct WafEvent {
     pub matched_field: String,
     pub matched_value: String,
     pub timestamp: String,
+    /// Client IP that triggered the event (set by the proxy layer).
+    #[serde(default)]
+    pub client_ip: String,
 }
 
 /// WAF operating mode for a specific evaluation.
@@ -112,8 +117,9 @@ impl WafEngine {
             matched_field: "client_ip".to_string(),
             matched_value: ip.to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
+            client_ip: ip.to_string(),
         };
-        let mut buf = self.event_buffer.lock().unwrap();
+        let mut buf = self.event_buffer.lock();
         if buf.len() >= self.max_events {
             buf.pop_front();
         }
@@ -132,13 +138,13 @@ impl WafEngine {
 
     /// Return the number of currently enabled rules.
     pub fn enabled_rule_count(&self) -> usize {
-        let disabled = self.disabled_rules.read().unwrap();
+        let disabled = self.disabled_rules.read();
         self.ruleset.len() - disabled.len()
     }
 
     /// List all rules with their enabled/disabled status.
     pub fn list_rules(&self) -> Vec<RuleSummary> {
-        let disabled = self.disabled_rules.read().unwrap();
+        let disabled = self.disabled_rules.read();
         self.ruleset
             .rules()
             .iter()
@@ -155,7 +161,7 @@ impl WafEngine {
     /// Disable a specific rule by ID. Returns false if rule ID not found.
     pub fn disable_rule(&self, rule_id: u32) -> bool {
         if self.ruleset.rules().iter().any(|r| r.id == rule_id) {
-            self.disabled_rules.write().unwrap().insert(rule_id);
+            self.disabled_rules.write().insert(rule_id);
             true
         } else {
             false
@@ -165,7 +171,7 @@ impl WafEngine {
     /// Enable a previously disabled rule by ID. Returns false if rule ID not found.
     pub fn enable_rule(&self, rule_id: u32) -> bool {
         if self.ruleset.rules().iter().any(|r| r.id == rule_id) {
-            self.disabled_rules.write().unwrap().remove(&rule_id);
+            self.disabled_rules.write().remove(&rule_id);
             true
         } else {
             false
@@ -174,17 +180,12 @@ impl WafEngine {
 
     /// Return the IDs of currently disabled rules.
     pub fn disabled_rule_ids(&self) -> Vec<u32> {
-        self.disabled_rules
-            .read()
-            .unwrap()
-            .iter()
-            .copied()
-            .collect()
+        self.disabled_rules.read().iter().copied().collect()
     }
 
     /// Bulk-set which rules are disabled.
     pub fn set_disabled_rules(&self, rule_ids: &[u32]) {
-        let mut disabled = self.disabled_rules.write().unwrap();
+        let mut disabled = self.disabled_rules.write();
         disabled.clear();
         for &id in rule_ids {
             if self.ruleset.rules().iter().any(|r| r.id == id) {
@@ -211,13 +212,13 @@ impl WafEngine {
             severity,
             enabled: true,
         };
-        self.custom_rules.write().unwrap().push((rule, regex));
+        self.custom_rules.write().push((rule, regex));
         Ok(())
     }
 
     /// Remove a custom rule by ID.
     pub fn remove_custom_rule(&self, id: u32) -> bool {
-        let mut rules = self.custom_rules.write().unwrap();
+        let mut rules = self.custom_rules.write();
         let before = rules.len();
         rules.retain(|(r, _)| r.id != id);
         rules.len() < before
@@ -225,14 +226,13 @@ impl WafEngine {
 
     /// Remove all custom rules.
     pub fn clear_custom_rules(&self) {
-        self.custom_rules.write().unwrap().clear();
+        self.custom_rules.write().clear();
     }
 
     /// List all custom rules.
     pub fn list_custom_rules(&self) -> Vec<CustomRule> {
         self.custom_rules
             .read()
-            .unwrap()
             .iter()
             .map(|(r, _)| r.clone())
             .collect()
@@ -249,6 +249,7 @@ impl WafEngine {
         query: Option<&str>,
         headers: &[(&str, &str)],
         host: &str,
+        client_ip: &str,
     ) -> WafVerdict {
         let start = Instant::now();
         let mut events = Vec::new();
@@ -273,8 +274,12 @@ impl WafEngine {
         let elapsed = start.elapsed();
 
         if !events.is_empty() {
+            // Stamp each event with the client IP
+            for ev in &mut events {
+                ev.client_ip = client_ip.to_string();
+            }
             // Store events in the ring buffer
-            let mut buf = self.event_buffer.lock().unwrap();
+            let mut buf = self.event_buffer.lock();
             for event in &events {
                 if buf.len() >= self.max_events {
                     buf.pop_front();
@@ -323,7 +328,7 @@ impl WafEngine {
 
     /// Scan a single field against all enabled rules.
     fn scan_field(&self, field: &str, value: &str, timestamp: &str, events: &mut Vec<WafEvent>) {
-        let disabled = self.disabled_rules.read().unwrap();
+        let disabled = self.disabled_rules.read();
         for rule in self.ruleset.rules() {
             if disabled.contains(&rule.id) {
                 continue;
@@ -344,12 +349,13 @@ impl WafEngine {
                     matched_field: field.to_string(),
                     matched_value,
                     timestamp: timestamp.to_string(),
+                    client_ip: String::new(),
                 });
             }
         }
 
         // Also check custom rules
-        let custom = self.custom_rules.read().unwrap();
+        let custom = self.custom_rules.read();
         for (rule, regex) in custom.iter() {
             if !rule.enabled {
                 continue;
@@ -367,6 +373,7 @@ impl WafEngine {
                     matched_field: field.to_string(),
                     matched_value,
                     timestamp: timestamp.to_string(),
+                    client_ip: String::new(),
                 });
             }
         }
@@ -399,13 +406,13 @@ impl WafEngine {
 
     /// Return recent WAF events from the ring buffer.
     pub fn recent_events(&self, limit: usize) -> Vec<WafEvent> {
-        let buf = self.event_buffer.lock().unwrap();
+        let buf = self.event_buffer.lock();
         buf.iter().rev().take(limit).cloned().collect()
     }
 
     /// Return the total number of events in the ring buffer.
     pub fn event_count(&self) -> usize {
-        self.event_buffer.lock().unwrap().len()
+        self.event_buffer.lock().len()
     }
 }
 
@@ -434,6 +441,7 @@ mod tests {
             Some("page=1&limit=20"),
             &[("user-agent", "Mozilla/5.0")],
             "example.com",
+            "10.0.0.1",
         );
         assert_eq!(verdict, WafVerdict::Pass);
     }
@@ -447,6 +455,7 @@ mod tests {
             None,
             &[("accept", "text/html"), ("cookie", "session=abc123")],
             "example.com",
+            "10.0.0.1",
         );
         assert_eq!(verdict, WafVerdict::Pass);
     }
@@ -462,6 +471,7 @@ mod tests {
             Some("q=1%20UNION%20SELECT%20*%20FROM%20users"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
         match verdict {
             WafVerdict::Detected(events) => {
@@ -483,6 +493,7 @@ mod tests {
             Some("q=1'+OR+1=1--"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
         match verdict {
             WafVerdict::Blocked(events) => {
@@ -504,6 +515,7 @@ mod tests {
             None,
             &[("x-custom", "'; DROP TABLE users--")],
             "example.com",
+            "10.0.0.1",
         );
         match verdict {
             WafVerdict::Blocked(events) => {
@@ -526,6 +538,7 @@ mod tests {
             Some("body=%3Cscript%3Ealert(1)%3C/script%3E"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
         match verdict {
             WafVerdict::Blocked(events) => {
@@ -544,6 +557,7 @@ mod tests {
             Some("input=<img+onerror=alert(1)+src=x>"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
         match verdict {
             WafVerdict::Detected(events) => {
@@ -564,6 +578,7 @@ mod tests {
             None,
             &[],
             "example.com",
+            "10.0.0.1",
         );
         match verdict {
             WafVerdict::Blocked(events) => {
@@ -584,6 +599,7 @@ mod tests {
             Some("path=%2e%2e/%2e%2e/etc/passwd"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
         match verdict {
             WafVerdict::Blocked(events) => {
@@ -606,6 +622,7 @@ mod tests {
             Some("cmd=;+cat+/etc/passwd"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
         match verdict {
             WafVerdict::Blocked(events) => {
@@ -630,6 +647,7 @@ mod tests {
             Some("q=1'+OR+1=1--"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
 
         assert!(e.event_count() > 0);
@@ -646,6 +664,7 @@ mod tests {
             Some("key=value"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
         assert_eq!(e.event_count(), 0);
     }
@@ -679,6 +698,7 @@ mod tests {
             Some("q=<script>alert(1)</script>"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
         assert!(matches!(verdict, WafVerdict::Detected(_)));
     }
@@ -692,6 +712,7 @@ mod tests {
             Some("q=<script>alert(1)</script>"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
         assert!(matches!(verdict, WafVerdict::Blocked(_)));
     }
@@ -716,6 +737,7 @@ mod tests {
                     ("cookie", "session=abcdef123456"),
                 ],
                 "example.com",
+                "10.0.0.1",
             );
         }
         let elapsed = start.elapsed();
@@ -775,6 +797,7 @@ mod tests {
             Some("q=1 UNION SELECT * FROM users"),
             &[],
             "example.com",
+            "10.0.0.1",
         );
 
         // Should still be blocked by the stacked queries rule (942150)
@@ -802,5 +825,51 @@ mod tests {
         // Re-enable all
         e.set_disabled_rules(&[]);
         assert_eq!(e.enabled_rule_count(), e.rule_count());
+    }
+
+    // --- Client IP propagation ---
+
+    #[test]
+    fn test_client_ip_set_on_events() {
+        let e = engine();
+        let verdict = e.evaluate(
+            WafMode::Blocking,
+            "/search",
+            Some("q=1'+OR+1=1--"),
+            &[],
+            "example.com",
+            "10.20.30.40",
+        );
+        match verdict {
+            WafVerdict::Blocked(events) => {
+                assert!(!events.is_empty());
+                for ev in &events {
+                    assert_eq!(ev.client_ip, "10.20.30.40");
+                }
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+
+        // Also check the events in the ring buffer have client_ip set
+        let recent = e.recent_events(10);
+        for ev in &recent {
+            assert_eq!(ev.client_ip, "10.20.30.40");
+        }
+    }
+
+    #[test]
+    fn test_waf_event_serde_default_client_ip() {
+        // Verify backward compatibility: deserializing old JSON without client_ip
+        let json = r#"{
+            "rule_id": 942100,
+            "description": "test",
+            "category": "sql_injection",
+            "severity": 5,
+            "matched_field": "query",
+            "matched_value": "test",
+            "timestamp": "2026-01-01T00:00:00Z"
+        }"#;
+        let event: WafEvent = serde_json::from_str(json).expect("deserialization failed");
+        assert_eq!(event.client_ip, "");
     }
 }

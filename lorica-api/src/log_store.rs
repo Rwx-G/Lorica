@@ -1,5 +1,6 @@
 use std::path::Path;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use rusqlite::{params, Connection};
 
@@ -73,7 +74,7 @@ impl LogStore {
 
     /// Insert a log entry.
     pub fn insert(&self, entry: &LogEntry) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO access_logs (timestamp, method, path, host, status, latency_ms, backend, error)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -94,7 +95,7 @@ impl LogStore {
 
     /// Query entries with filtering. Returns newest first.
     pub fn query(&self, params: &LogsQuery) -> Result<(Vec<LogEntry>, usize), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
 
         let mut conditions = Vec::new();
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -197,7 +198,7 @@ impl LogStore {
 
     /// Delete entries older than the retention limit, keeping at most `max_entries` rows.
     pub fn enforce_retention(&self, max_entries: u64) -> Result<u64, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM access_logs", [], |row| row.get(0))
             .map_err(|e| format!("failed to count access logs: {e}"))?;
@@ -218,7 +219,7 @@ impl LogStore {
 
     /// Clear all entries.
     pub fn clear(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM access_logs", [])
             .map_err(|e| format!("failed to clear access logs: {e}"))?;
         Ok(())
@@ -226,7 +227,7 @@ impl LogStore {
 
     /// Get total entry count.
     pub fn count(&self) -> Result<u64, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM access_logs", [], |row| row.get(0))
             .map_err(|e| format!("failed to count access logs: {e}"))?;
@@ -237,7 +238,7 @@ impl LogStore {
 
     /// Insert a WAF event.
     pub fn insert_waf_event(&self, event: &lorica_waf::WafEvent) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO waf_events (rule_id, description, category, severity, matched_field, matched_value, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -257,7 +258,7 @@ impl LogStore {
 
     /// Query WAF events, newest first.
     pub fn list_waf_events(&self, limit: usize) -> Result<Vec<lorica_waf::WafEvent>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT rule_id, description, category, severity, matched_field, matched_value, timestamp
@@ -278,6 +279,7 @@ impl LogStore {
                     matched_field: row.get(4)?,
                     matched_value: row.get(5)?,
                     timestamp: row.get(6)?,
+                    client_ip: String::new(),
                 })
             })
             .map_err(|e| format!("failed to query WAF events: {e}"))?;
@@ -290,7 +292,7 @@ impl LogStore {
 
     /// Clear all WAF events.
     pub fn clear_waf_events(&self) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM waf_events", [])
             .map_err(|e| format!("failed to clear WAF events: {e}"))?;
         Ok(())
@@ -298,7 +300,7 @@ impl LogStore {
 
     /// Purge old WAF events, keeping at most `max_entries`.
     pub fn enforce_waf_retention(&self, max_entries: u64) -> Result<u64, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM waf_events", [], |row| row.get(0))
             .map_err(|e| format!("failed to count WAF events: {e}"))?;
@@ -321,7 +323,7 @@ impl LogStore {
         &self,
         event: &lorica_notify::AlertEvent,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let details_json = serde_json::to_string(&event.details).unwrap_or_default();
         conn.execute(
             "INSERT INTO notification_history (alert_type, summary, details, timestamp)
@@ -342,7 +344,7 @@ impl LogStore {
         &self,
         limit: usize,
     ) -> Result<Vec<lorica_notify::AlertEvent>, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT alert_type, summary, details, timestamp
@@ -379,7 +381,7 @@ impl LogStore {
 
     /// Prune old notification events, keeping at most `max_entries`.
     pub fn enforce_notification_retention(&self, max_entries: u64) -> Result<u64, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM notification_history", [], |row| {
                 row.get(0)
