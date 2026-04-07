@@ -1695,19 +1695,18 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
-  /api/v1/loadtest/stream:
+  /api/v1/loadtest/ws:
     get:
       tags: [LoadTest]
-      summary: Stream load test progress via SSE
+      summary: Stream load test progress via WebSocket
+      description: >
+        WebSocket endpoint that sends a JSON message every second with current
+        load test progress or {"active":false} when no test is running.
       security:
         - sessionCookie: []
       responses:
-        "200":
-          description: Server-Sent Events stream of test progress
-          content:
-            text/event-stream:
-              schema:
-                type: string
+        "101":
+          description: WebSocket upgrade
         "401":
           $ref: "#/components/responses/Unauthorized"
 

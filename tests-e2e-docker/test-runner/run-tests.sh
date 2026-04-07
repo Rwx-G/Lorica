@@ -1184,14 +1184,17 @@ if [ -n "$SESSION" ]; then
         fail "Load test comparison should return current"
     fi
 
-    # SSE stream endpoint (just test that it connects)
-    SSE_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
-        -b "$SESSION" -H "Accept: text/event-stream" \
-        "$API/api/v1/loadtest/stream" 2>/dev/null || true)
-    if [ "$SSE_STATUS" = "200" ]; then
-        ok "Load test SSE stream endpoint returns 200"
+    # WebSocket stream endpoint (just test that upgrade is accepted)
+    WS_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+        -b "$SESSION" \
+        -H "Upgrade: websocket" -H "Connection: Upgrade" \
+        -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+        -H "Sec-WebSocket-Version: 13" \
+        "$API/api/v1/loadtest/ws" 2>/dev/null || true)
+    if [ "$WS_STATUS" = "101" ]; then
+        ok "Load test WebSocket endpoint returns 101 (upgrade)"
     else
-        ok "Load test SSE stream endpoint responded ($SSE_STATUS - may timeout, OK)"
+        ok "Load test WebSocket endpoint responded ($WS_STATUS - may timeout, OK)"
     fi
 
     # Cannot start a test if one is running (conflict prevention)

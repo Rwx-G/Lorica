@@ -341,7 +341,7 @@ All endpoints are served on the management port (default `9443`) over HTTPS. Pro
 | `POST` | `/api/v1/loadtest/start/:config_id` | Start test (requires confirm) |
 | `POST` | `/api/v1/loadtest/start/:config_id/confirm` | Confirm and execute |
 | `GET` | `/api/v1/loadtest/status` | Current test status |
-| `GET` | `/api/v1/loadtest/stream` | SSE real-time results |
+| `GET` | `/api/v1/loadtest/ws` | WebSocket real-time progress |
 | `POST` | `/api/v1/loadtest/abort` | Abort running test |
 | `GET` | `/api/v1/loadtest/results/:config_id` | Test results |
 | `GET` | `/api/v1/loadtest/results/:config_id/compare` | Compare runs |

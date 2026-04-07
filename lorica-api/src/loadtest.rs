@@ -15,17 +15,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::Path;
-use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse;
 use axum::Extension;
 use axum::Json;
 use chrono::Utc;
-use futures_util::stream;
+use futures_util::{SinkExt, StreamExt};
 use lorica_bench::load_test;
 use lorica_config::models::LoadTestConfig;
 use lorica_config::store::new_id;
 use serde::Deserialize;
-use std::convert::Infallible;
 use std::time::Duration;
 
 use crate::error::{json_data, json_data_with_status, ApiError};
@@ -379,38 +379,57 @@ pub async fn compare_results(
     Ok(json_data(comparison))
 }
 
-/// GET /api/v1/loadtest/stream
-/// Server-Sent Events stream of load test progress (1 event/second).
-pub async fn stream_status(
+/// GET /api/v1/loadtest/ws - WebSocket endpoint for real-time load test progress.
+///
+/// Sends a JSON message every second with current progress or `{"active":false}`
+/// when no test is running.
+pub async fn loadtest_ws(
+    ws: WebSocketUpgrade,
     Extension(state): Extension<AppState>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+) -> impl IntoResponse {
     let engine = state.load_test_engine.clone();
+    ws.on_upgrade(move |socket| handle_loadtest_stream(socket, engine))
+}
 
-    let stream = stream::unfold((), move |()| {
-        let engine = engine.clone();
-        async move {
+async fn handle_loadtest_stream(
+    socket: WebSocket,
+    engine: Option<Arc<lorica_bench::LoadTestEngine>>,
+) {
+    let (mut sender, mut receiver) = socket.split();
+
+    // Send progress updates every second
+    let send_task = tokio::spawn(async move {
+        loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
 
-            let event = match &engine {
+            let json = match &engine {
                 Some(e) => match e.progress().await {
-                    Some(progress) => {
-                        let json = serde_json::to_string(&progress).unwrap_or_default();
-                        Event::default().data(json).event("progress")
-                    }
-                    None => Event::default().data(r#"{"active":false}"#).event("idle"),
+                    Some(progress) => serde_json::to_string(&progress).unwrap_or_default(),
+                    None => r#"{"active":false}"#.to_string(),
                 },
-                None => Event::default().data(r#"{"active":false}"#).event("idle"),
+                None => r#"{"active":false}"#.to_string(),
             };
 
-            Some((Ok(event), ()))
+            if sender.send(Message::Text(json)).await.is_err() {
+                break; // Client disconnected
+            }
         }
     });
 
-    Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    )
+    // Consume incoming messages (ping/pong, close) but don't process them
+    let recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+        }
+    });
+
+    // Wait for either task to finish
+    tokio::select! {
+        _ = send_task => {}
+        _ = recv_task => {}
+    }
 }
 
 /// POST /api/v1/loadtest/configs/:id/clone

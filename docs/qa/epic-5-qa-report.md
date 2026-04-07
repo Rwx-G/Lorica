@@ -121,7 +121,7 @@ None - all backend functionality is complete and tested.
 - Build dashboard SLA charts and comparison views (frontend epic)
 
 ### Resolved (post-epic)
-- ~~Add WebSocket/SSE real-time streaming for load test results~~ - SSE endpoint added at `/api/v1/loadtest/stream`
+- ~~Add WebSocket/SSE real-time streaming for load test results~~ - WebSocket endpoint at `/api/v1/loadtest/ws`
 - ~~Implement cron-based scheduled load test execution~~ - Cron scheduler with 5-field expression support
 - ~~Resolve probe target addresses from route backend configuration~~ - Probes now query DB for healthy backends
 - ~~Add CSV export format alongside JSON~~ - Export endpoint accepts `format=csv` parameter

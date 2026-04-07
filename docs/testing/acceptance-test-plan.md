@@ -206,11 +206,11 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 10.2 | Run load test | Dashboard | Real-time SSE progress | 5.3 | |
 | 10.3 | Safe limit confirmation | Dashboard | Exceed limits -> confirmation popup | 5.3 | |
 | 10.4 | Auto-abort on errors | Dashboard | >10% 5xx -> auto-aborted | 5.3 | |
-| 10.5 | Abort button | Dashboard | Click abort -> stopped | 5.3 | |
+| 10.5 | Abort button | Dashboard | Click abort -> stopped | 5.3 | OK |
 | 10.6 | Historical results | Dashboard | Previous results listed | 5.3 | OK |
 | 10.7 | Clone test config | Dashboard | Clone button -> duplicate | 5.3 | OK |
-| 10.8 | Comparison deltas | Dashboard | Compare two results -> diff | 5.3 | |
-| 10.9 | Load test in worker mode | Dashboard | Works with --workers N | 5.3 | |
+| 10.8 | Comparison deltas | Dashboard | Compare two results -> diff | 5.3 | OK |
+| 10.9 | Load test in worker mode | Dashboard | Works with --workers N | 5.3 | OK |
 | | **11. ACCESS LOGS** | | | | OK |
 | 11.1 | Live log stream | Dashboard | Green pulse, real-time entries | 1.9 | OK |
 | 11.2 | Log filtering | Dashboard | Filter by status, route | 1.9 | OK |

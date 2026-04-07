@@ -22,7 +22,7 @@
 
   // Live test state
   let progress: LoadTestProgress | null = $state(null);
-  let sseSource: EventSource | null = $state(null);
+  let wsConn: WebSocket | null = $state(null);
 
   // Results
   let selectedConfigId = $state('');
@@ -72,31 +72,37 @@
 
   onMount(() => {
     loadData();
-    connectSSE();
+    connectWS();
   });
 
   onDestroy(() => {
-    if (sseSource) sseSource.close();
+    if (wsConn) wsConn.close();
   });
 
-  function connectSSE() {
-    const es = new EventSource('/api/v1/loadtest/stream');
-    es.addEventListener('progress', (e) => {
-      try { progress = JSON.parse(e.data); } catch {}
-    });
-    es.addEventListener('idle', () => {
-      if (progress?.active) {
-        progress = null;
-        // Reload results when test finishes
-        if (selectedConfigId) loadResults(selectedConfigId);
-      } else {
-        progress = null;
-      }
-    });
-    es.onerror = () => {
-      progress = null;
+  function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${location.host}/api/v1/loadtest/ws`);
+    ws.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data.active === false) {
+          if (progress?.active) {
+            progress = null;
+            if (selectedConfigId) loadResults(selectedConfigId);
+          } else {
+            progress = null;
+          }
+        } else {
+          progress = data;
+        }
+      } catch { /* ignore malformed messages */ }
     };
-    sseSource = es;
+    ws.onerror = () => { progress = null; };
+    ws.onclose = () => {
+      wsConn = null;
+      setTimeout(connectWS, 3000);
+    };
+    wsConn = ws;
   }
 
   function openCreateForm() {
