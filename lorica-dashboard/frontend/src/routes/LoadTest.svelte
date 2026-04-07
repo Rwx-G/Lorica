@@ -164,13 +164,15 @@
       return;
     }
 
-    // Build target URL pointing to 127.0.0.1 with the actual proxy ports.
-    // The Host header tells the proxy which route to use.
-    const proto = selectedRoute.certificate_id ? 'https' : 'http';
-    const port = selectedRoute.certificate_id ? proxyHttpsPort : proxyHttpPort;
+    // Build target URL using the route hostname with the correct port.
+    // The load test engine resolves the hostname to 127.0.0.1 internally,
+    // ensuring correct SNI for TLS while keeping traffic local.
+    const hasHttps = selectedRoute.certificate_id || selectedRoute.force_https;
+    const proto = hasHttps ? 'https' : 'http';
+    const port = hasHttps ? proxyHttpsPort : proxyHttpPort;
     const suffix = formPathSuffix.startsWith('/') ? formPathSuffix : `/${formPathSuffix}`;
-    const targetUrl = `${proto}://127.0.0.1:${port}${suffix}`;
-    const headers: Record<string, string> = { Host: selectedRoute.hostname };
+    const targetUrl = `${proto}://${selectedRoute.hostname}:${port}${suffix}`;
+    const headers: Record<string, string> = {};
 
     formSubmitting = true;
     formError = '';

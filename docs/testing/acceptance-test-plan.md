@@ -240,7 +240,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 13.11 | Config export (TOML) | Dashboard | Download button -> file | 1.10 | |
 | 13.12 | Config import with diff | Dashboard | Upload TOML, preview, apply | 1.10 | |
 | 13.13 | Theme toggle (light/dark) | Dashboard | Persisted across sessions | 1.5 | OK |
-| | **14. PROMETHEUS METRICS** | | | | |
+| | **14. PROMETHEUS METRICS** | | | | OK |
 | 14.1 | /metrics endpoint | API | `curl localhost:9443/metrics` | 4.2 | OK |
 | 14.2 | Request count by route/status | API | `lorica_requests_total` | 4.2 | OK |
 | 14.3 | Latency histogram | API | `lorica_request_duration_seconds_bucket` | 4.2 | OK |

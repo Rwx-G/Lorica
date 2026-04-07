@@ -269,6 +269,24 @@ impl LoadTestEngine {
         let duration = Duration::from_secs(config.duration_s.max(1) as u64);
         let error_threshold = config.error_threshold_pct;
 
+        // Build a per-run client that resolves the target hostname to 127.0.0.1.
+        // This ensures HTTPS requests use the correct SNI (hostname) while the
+        // traffic stays local (loopback). Without this, https://127.0.0.1 would
+        // send SNI=127.0.0.1 which doesn't match any certificate.
+        let run_client = {
+            let mut builder = reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .pool_max_idle_per_host(200);
+            if let Ok(url) = reqwest::Url::parse(&config.target_url) {
+                if let Some(host) = url.host_str() {
+                    let port = url.port_or_known_default().unwrap_or(80);
+                    let dest = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                    builder = builder.resolve(host, dest);
+                }
+            }
+            builder.build().unwrap_or_else(|_| self.http_client.clone())
+        };
+
         info!(
             name = %config.name,
             target = %config.target_url,
@@ -317,7 +335,7 @@ impl LoadTestEngine {
         };
 
         for _ in 0..config.concurrency.max(1) {
-            let client = self.http_client.clone();
+            let client = run_client.clone();
             let url = config.target_url.clone();
             let method = config.method.clone();
             let body = config.body.clone();
