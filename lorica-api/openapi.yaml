@@ -2096,6 +2096,10 @@ components:
           type: boolean
         enabled:
           type: boolean
+        redirect_to:
+          type: string
+          nullable: true
+          description: If set, respond with 301 redirect to this URL instead of proxying. Original path is appended.
         created_at:
           type: string
           format: date-time
@@ -2124,6 +2128,9 @@ components:
           type: string
           enum: [round_robin, consistent_hash, random, peak_ewma]
           default: round_robin
+        redirect_to:
+          type: string
+          description: If set, respond with 301 redirect to this URL instead of proxying.
 
     UpdateRouteRequest:
       type: object
@@ -2145,6 +2152,9 @@ components:
           enum: [round_robin, consistent_hash, random, peak_ewma]
         enabled:
           type: boolean
+        redirect_to:
+          type: string
+          description: If set, respond with 301 redirect to this URL instead of proxying.
 
     Backend:
       type: object

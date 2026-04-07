@@ -71,6 +71,7 @@
     path_prefix: 'Path prefix',
     hostname_aliases: 'Hostname aliases',
     force_https: 'Force HTTPS',
+    redirect_to: 'Redirect to',
     backend_addresses: 'Backend addresses',
     certificate_needed: 'Certificate needed',
     proxy_headers: 'Proxy headers',
@@ -98,6 +99,7 @@
     path_prefix: 'location',
     hostname_aliases: 'server_name (aliases)',
     force_https: 'return 301 https://',
+    redirect_to: 'return 301 https://other',
     backend_addresses: 'proxy_pass / upstream',
     certificate_needed: 'ssl_certificate',
     proxy_headers: 'proxy_set_header',
@@ -260,7 +262,7 @@
     proxy_cache_valid: 'cache_ttl_s',
     limit_req: 'rate_limit_rps',
     rewrite: 'path_rewrite',
-    return: 'force_https (redirect)',
+    return: 'force_https / redirect_to',
     location: 'path_prefix',
   };
 
@@ -346,6 +348,7 @@
       path_prefix: route.path_prefix || '/',
       backend_ids: backendIds,
       force_https: route.force_https,
+      redirect_to: route.redirect_to ?? '',
       connect_timeout_s: route.connect_timeout_s,
       read_timeout_s: route.read_timeout_s,
       send_timeout_s: route.send_timeout_s,

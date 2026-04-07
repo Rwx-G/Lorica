@@ -22,6 +22,7 @@ pub struct RouteResponse {
     pub enabled: bool,
     pub force_https: bool,
     pub redirect_hostname: Option<String>,
+    pub redirect_to: Option<String>,
     pub hostname_aliases: Vec<String>,
     pub proxy_headers: HashMap<String, String>,
     pub response_headers: HashMap<String, String>,
@@ -69,6 +70,7 @@ pub struct CreateRouteRequest {
     pub waf_mode: Option<String>,
     pub force_https: Option<bool>,
     pub redirect_hostname: Option<String>,
+    pub redirect_to: Option<String>,
     pub hostname_aliases: Option<Vec<String>>,
     pub proxy_headers: Option<HashMap<String, String>>,
     pub response_headers: Option<HashMap<String, String>>,
@@ -115,6 +117,7 @@ pub struct UpdateRouteRequest {
     pub enabled: Option<bool>,
     pub force_https: Option<bool>,
     pub redirect_hostname: Option<String>,
+    pub redirect_to: Option<String>,
     pub hostname_aliases: Option<Vec<String>>,
     pub proxy_headers: Option<HashMap<String, String>>,
     pub response_headers: Option<HashMap<String, String>>,
@@ -165,6 +168,7 @@ fn route_to_response(
         enabled: route.enabled,
         force_https: route.force_https,
         redirect_hostname: route.redirect_hostname.clone(),
+        redirect_to: route.redirect_to.clone(),
         hostname_aliases: route.hostname_aliases.clone(),
         proxy_headers: route.proxy_headers.clone(),
         response_headers: route.response_headers.clone(),
@@ -251,6 +255,7 @@ pub async fn create_route(
         enabled: true,
         force_https: body.force_https.unwrap_or(false),
         redirect_hostname: body.redirect_hostname,
+        redirect_to: body.redirect_to,
         hostname_aliases: body.hostname_aliases.unwrap_or_default(),
         proxy_headers: body.proxy_headers.unwrap_or_default(),
         response_headers: body.response_headers.unwrap_or_default(),
@@ -361,6 +366,13 @@ pub async fn update_route(
     }
     if let Some(redirect_hostname) = body.redirect_hostname {
         route.redirect_hostname = Some(redirect_hostname);
+    }
+    if let Some(redirect_to) = body.redirect_to {
+        if redirect_to.is_empty() {
+            route.redirect_to = None;
+        } else {
+            route.redirect_to = Some(redirect_to);
+        }
     }
     if let Some(hostname_aliases) = body.hostname_aliases {
         route.hostname_aliases = hostname_aliases;

@@ -716,6 +716,20 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
+        // Redirect to external URL
+        if let Some(ref target) = entry.route.redirect_to {
+            let redir_path = req.uri.path();
+            let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+            let base = target.trim_end_matches('/');
+            let location = format!("{base}{redir_path}{redir_query}");
+            let mut header = lorica_http::ResponseHeader::build(301, None)?;
+            header.insert_header("Location", &location)?;
+            session
+                .write_response_header(Box::new(header), true)
+                .await?;
+            return Ok(true);
+        }
+
         // Per-route IP allowlist/denylist
         if let Some(ref ip) = check_ip {
             if !entry.route.ip_allowlist.is_empty()
@@ -1636,6 +1650,7 @@ mod tests {
             enabled,
             force_https: false,
             redirect_hostname: None,
+            redirect_to: None,
             hostname_aliases: Vec::new(),
             proxy_headers: std::collections::HashMap::new(),
             response_headers: std::collections::HashMap::new(),

@@ -248,8 +248,8 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 14.6 | Certificate expiry days | API | `lorica_certificate_expiry_days` | 4.2 | OK |
 | 14.7 | WAF events counter | API | `lorica_waf_events_total` | 4.2 | OK |
 | 14.8 | System CPU/memory | API | `lorica_cpu_usage`, `lorica_memory_bytes` | 4.2 | OK |
-| | **15. NOTIFICATIONS** | | | | |
-| 15.1 | cert_expiring dispatched | CLI | Approaching expiry -> stdout log | 3.3 | |
+| | **15. NOTIFICATIONS** | | | | OK |
+| 15.1 | cert_expiring dispatched | CLI | Approaching expiry -> stdout log | 3.3 | OK |
 | 15.2 | backend_down dispatched | CLI | Backend unreachable -> notification | 3.3 | OK |
 | 15.3 | waf_alert dispatched | CLI | WAF blocks -> notification | 3.3 | OK |
 | 15.4 | ip_banned dispatched | CLI | Auto-banned -> notification | 7.3 | OK |

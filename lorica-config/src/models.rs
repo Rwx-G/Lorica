@@ -281,6 +281,8 @@ pub struct Route {
     #[serde(default)]
     pub redirect_hostname: Option<String>,
     #[serde(default)]
+    pub redirect_to: Option<String>,
+    #[serde(default)]
     pub hostname_aliases: Vec<String>,
     #[serde(default)]
     pub proxy_headers: HashMap<String, String>,

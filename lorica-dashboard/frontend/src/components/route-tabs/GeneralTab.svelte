@@ -142,6 +142,16 @@
     {#if importedFields && importedFields.size > 0}<span class="hint">Nginx: return 301 https://... | Traefik: RedirectScheme middleware</span>{/if}
   </div>
 
+  <div class="form-group" class:modified={isModified('redirect_to')}>
+    <label for="redirect-to">Redirect to</label>
+    {#if isImported('redirect_to')}<span class="imported-badge">imported</span>{/if}
+    <input id="redirect-to" type="text" bind:value={form.redirect_to} placeholder="e.g. https://stackoverkill.io" />
+    <span class="hint">If set, responds with 301 redirect instead of proxying. Original path is appended.</span>
+    {#if form.redirect_to}
+      <span class="hint" style="color: var(--color-orange, #f59e0b);">Backends will not be used - all requests will be redirected.</span>
+    {/if}
+  </div>
+
   <div class="form-group" class:modified={isModified('redirect_hostname')}>
     <label for="redirect-hostname">Redirect hostname</label>
     {#if isImported('redirect_hostname')}<span class="imported-badge">imported</span>{/if}

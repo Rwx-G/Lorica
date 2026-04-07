@@ -85,6 +85,7 @@ export interface RouteResponse {
   enabled: boolean;
   force_https: boolean;
   redirect_hostname: string | null;
+  redirect_to: string | null;
   hostname_aliases: string[];
   proxy_headers: Record<string, string>;
   response_headers: Record<string, string>;
@@ -131,6 +132,7 @@ export interface CreateRouteRequest {
   waf_mode?: string;
   force_https?: boolean;
   redirect_hostname?: string;
+  redirect_to?: string;
   hostname_aliases?: string[];
   proxy_headers?: Record<string, string>;
   response_headers?: Record<string, string>;
@@ -176,6 +178,7 @@ export interface UpdateRouteRequest {
   enabled?: boolean;
   force_https?: boolean;
   redirect_hostname?: string;
+  redirect_to?: string;
   hostname_aliases?: string[];
   proxy_headers?: Record<string, string>;
   response_headers?: Record<string, string>;

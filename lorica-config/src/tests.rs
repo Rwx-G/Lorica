@@ -22,6 +22,7 @@ mod tests {
             enabled: true,
             force_https: false,
             redirect_hostname: None,
+            redirect_to: None,
             hostname_aliases: Vec::new(),
             proxy_headers: std::collections::HashMap::new(),
             response_headers: std::collections::HashMap::new(),

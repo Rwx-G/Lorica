@@ -79,6 +79,7 @@ export interface LoricaRouteImport {
   add_path_prefix: string | null;
   path_rewrite_pattern: string | null;
   path_rewrite_replacement: string | null;
+  redirect_to: string | null;
   rate_limit_rps: number | null;
   rate_limit_burst: number | null;
   cache_enabled: boolean;
@@ -293,9 +294,28 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
   },
 
   return: (v, r) => {
-    if (v.startsWith('301 https://') || v.startsWith('302 https://')) {
-      r.force_https = true;
-      r.importedFields.add('force_https');
+    const match301 = v.match(/^30[12]\s+(https?:\/\/.+)/);
+    if (match301) {
+      let target = match301[1].replace(/\$request_uri\s*$/, '').replace(/;$/, '').trim();
+      // Determine if this is a same-host force_https or a different-host redirect_to
+      try {
+        const url = new URL(target);
+        const currentHostnames = [r.hostname, ...r.hostname_aliases].filter(Boolean);
+        if (url.protocol === 'https:' && currentHostnames.includes(url.hostname) && url.pathname === '/') {
+          r.force_https = true;
+          r.importedFields.add('force_https');
+        } else {
+          // Strip trailing slash from target for clean append
+          r.redirect_to = target.replace(/\/$/, '') || target;
+          r.importedFields.add('redirect_to');
+        }
+      } catch {
+        // If URL parsing fails, treat as force_https if it looks like same-host HTTPS
+        if (v.startsWith('301 https://') || v.startsWith('302 https://')) {
+          r.force_https = true;
+          r.importedFields.add('force_https');
+        }
+      }
     }
   },
 
@@ -724,6 +744,7 @@ function createDefaultRoute(): LoricaRouteImport {
     add_path_prefix: null,
     path_rewrite_pattern: null,
     path_rewrite_replacement: null,
+    redirect_to: null,
     rate_limit_rps: null,
     rate_limit_burst: null,
     cache_enabled: false,

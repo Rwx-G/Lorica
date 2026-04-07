@@ -11,6 +11,7 @@ export interface RouteFormState {
   enabled: boolean;
   force_https: boolean;
   redirect_hostname: string;
+  redirect_to: string;
   hostname_aliases: string;
   websocket_enabled: boolean;
   access_log_enabled: boolean;
@@ -56,6 +57,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   enabled: true,
   force_https: false,
   redirect_hostname: '',
+  redirect_to: '',
   hostname_aliases: '',
   websocket_enabled: true,
   access_log_enabled: true,
@@ -93,7 +95,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
 // Tab field mappings for dot indicators
 export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   general: [
-    'hostname', 'path_prefix', 'force_https', 'redirect_hostname',
+    'hostname', 'path_prefix', 'force_https', 'redirect_hostname', 'redirect_to',
     'hostname_aliases', 'websocket_enabled', 'access_log_enabled',
     'compression_enabled', 'waf_enabled',
   ],
@@ -158,6 +160,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     enabled: route.enabled,
     force_https: route.force_https,
     redirect_hostname: route.redirect_hostname ?? '',
+    redirect_to: route.redirect_to ?? '',
     hostname_aliases: route.hostname_aliases.join(', '),
     websocket_enabled: route.websocket_enabled,
     access_log_enabled: route.access_log_enabled,
@@ -197,6 +200,7 @@ function buildAdvancedFields(form: RouteFormState) {
   return {
     force_https: form.force_https,
     redirect_hostname: form.redirect_hostname || undefined,
+    redirect_to: form.redirect_to || undefined,
     hostname_aliases: csvToArray(form.hostname_aliases).length > 0 ? csvToArray(form.hostname_aliases) : undefined,
     websocket_enabled: form.websocket_enabled,
     access_log_enabled: form.access_log_enabled,
