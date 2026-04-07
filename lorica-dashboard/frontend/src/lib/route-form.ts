@@ -350,6 +350,7 @@ function validateIpList(text: string): string {
 
 export function validateHostname(value: string): string {
   if (!value.trim()) return 'Hostname is required';
+  if (value.trim() === '_') return ''; // catch-all hostname
   if (!HOSTNAME_PATTERN.test(value.trim())) return 'Invalid hostname';
   return '';
 }

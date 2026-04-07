@@ -11,6 +11,9 @@ Author: Rwx-G
 
 ### Added
 
+- Path rules: ordered sub-path overrides within a single route. Each rule can override backends, cache settings, response headers, rate limits, or return a direct HTTP status. First match wins, supports prefix and exact match types. Dashboard includes a Path Rules tab with reorder, collapsible override sections
+- Route `return_status` field: respond with a specific HTTP status code (e.g. 403, 404) without proxying. Combines with `redirect_to` for custom redirect status codes
+- Catch-all hostname `_`: routes with hostname `_` act as a last-resort fallback when no exact or wildcard match is found
 - Route `redirect_to` field: when set, the route responds with a 301 redirect to the specified URL instead of proxying to backends. The original request path and query string are appended automatically. Enables www-to-non-www redirects, domain migrations, etc.
 - Background certificate expiry check task that monitors ALL certificates (ACME and manual) every 12 hours and dispatches `CertExpiring` notifications when certificates are within the `cert_warning_days` or `cert_critical_days` thresholds from global settings. Critical-level alerts use a "CRITICAL:" prefix in the message
 - Encryption key rotation via `lorica rotate-key --new-key-file <path>` CLI command. Re-encrypts all certificate private keys and notification configs in a single transaction when rotating the encryption key

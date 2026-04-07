@@ -2100,6 +2100,15 @@ components:
           type: string
           nullable: true
           description: If set, respond with 301 redirect to this URL instead of proxying. Original path is appended.
+        return_status:
+          type: integer
+          nullable: true
+          description: If set, respond with this HTTP status code directly without proxying.
+        path_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/PathRule'
+          description: Ordered list of sub-path overrides. First matching rule wins.
         created_at:
           type: string
           format: date-time
@@ -2131,6 +2140,13 @@ components:
         redirect_to:
           type: string
           description: If set, respond with 301 redirect to this URL instead of proxying.
+        return_status:
+          type: integer
+          description: If set, respond with this HTTP status code directly.
+        path_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/PathRule'
 
     UpdateRouteRequest:
       type: object
@@ -2155,6 +2171,50 @@ components:
         redirect_to:
           type: string
           description: If set, respond with 301 redirect to this URL instead of proxying.
+        return_status:
+          type: integer
+          description: If set, respond with this HTTP status code directly.
+        path_rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/PathRule'
+
+    PathRule:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+          description: Path to match (e.g. /admin, /api/v1/)
+        match_type:
+          type: string
+          enum: [prefix, exact]
+          default: prefix
+        backend_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        cache_enabled:
+          type: boolean
+        cache_ttl_s:
+          type: integer
+        response_headers:
+          type: object
+          additionalProperties:
+            type: string
+        response_headers_remove:
+          type: array
+          items:
+            type: string
+        rate_limit_rps:
+          type: integer
+        rate_limit_burst:
+          type: integer
+        redirect_to:
+          type: string
+        return_status:
+          type: integer
 
     Backend:
       type: object
