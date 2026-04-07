@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import type { RouteResponse, BackendResponse, CertificateResponse } from '../lib/api';
+  import type { RouteResponse, BackendResponse, CertificateResponse, SecurityHeaderPreset } from '../lib/api';
   import { api } from '../lib/api';
   import {
     type RouteFormState,
@@ -36,6 +36,7 @@
   let form: RouteFormState = $state({ ...ROUTE_DEFAULTS });
   let formError = $state('');
   let formSubmitting = $state(false);
+  let customPresets: SecurityHeaderPreset[] = $state([]);
   let activeTab = $state('general');
   let initialFormJson = $state('');
 
@@ -63,6 +64,12 @@
         formError = '';
         formSubmitting = false;
         activeTab = 'general';
+        // Fetch custom security header presets
+        api.getSettings().then((res) => {
+          if (res.data) {
+            customPresets = res.data.custom_security_presets ?? [];
+          }
+        });
       });
     }
   });
@@ -182,7 +189,7 @@
         {:else if activeTab === 'timeouts'}
           <TimeoutsTab bind:form={form} {importedFields} />
         {:else if activeTab === 'security'}
-          <SecurityTab bind:form={form} {importedFields} />
+          <SecurityTab bind:form={form} {importedFields} {customPresets} />
         {:else if activeTab === 'headers'}
           <HeadersTab bind:form={form} {importedFields} />
         {:else if activeTab === 'cors'}

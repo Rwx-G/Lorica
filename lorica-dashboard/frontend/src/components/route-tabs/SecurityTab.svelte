@@ -2,12 +2,15 @@
   import type { RouteFormState } from '../../lib/route-form';
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
 
+  import type { SecurityHeaderPreset } from '../../lib/api';
+
   interface Props {
     form: RouteFormState;
     importedFields?: Set<string>;
+    customPresets?: SecurityHeaderPreset[];
   }
 
-  let { form = $bindable(), importedFields }: Props = $props();
+  let { form = $bindable(), importedFields, customPresets = [] }: Props = $props();
 
   function isModified(field: keyof RouteFormState): boolean {
     return ROUTE_DEFAULTS[field] !== form[field];
@@ -26,6 +29,9 @@
       <option value="strict">Strict</option>
       <option value="moderate">Moderate</option>
       <option value="none">None</option>
+      {#each customPresets as preset}
+        <option value={preset.name}>{preset.name} (custom)</option>
+      {/each}
     </select>
     <span class="hint">Nginx: add_header Strict-Transport-Security... | Traefik: Headers middleware</span>
   </div>

@@ -115,19 +115,29 @@
   );
 
   // Collapsible sections
-  let expandedSections = $state<Record<string, boolean>>({
+  const SECTIONS_KEY = 'lorica_settings_sections';
+  const defaultSections: Record<string, boolean> = {
     appearance: true,
     global: true,
     notifications: true,
-    presets: false,
-    history: false,
-    preferences: false,
-    export: false,
-    ban_rules: false,
-  });
+    presets: true,
+    history: true,
+    preferences: true,
+    export: true,
+    ban_rules: true,
+  };
+  let expandedSections = $state<Record<string, boolean>>((() => {
+    try {
+      const saved = localStorage.getItem(SECTIONS_KEY);
+      return saved ? { ...defaultSections, ...JSON.parse(saved) } : { ...defaultSections };
+    } catch {
+      return { ...defaultSections };
+    }
+  })());
 
   function toggleSection(key: string) {
     expandedSections[key] = !expandedSections[key];
+    localStorage.setItem(SECTIONS_KEY, JSON.stringify(expandedSections));
   }
 
   let loading = $state(true);
