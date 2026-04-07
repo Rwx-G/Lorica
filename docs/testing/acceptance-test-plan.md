@@ -86,12 +86,11 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.24 | Load balancing: Peak EWMA | Proxy | Lowest-latency backend preferred | 4.3 | OK |
 | 4.25 | Load balancing: consistent hash | Proxy | Same client -> same backend | - | OK |
 | 4.26 | Load balancing: random | Proxy | Random distribution | - | OK |
-| 4.27 | Topology type | Dashboard | SingleVM/HA/Custom adapts health behavior | 3.2 | |
-| 4.28 | Route enable/disable | Dashboard | Disabled -> 404 for that hostname | 1.6 | OK |
-| 4.29 | Delete route | Dashboard | Confirm dialog, removed | 1.6 | OK |
-| 4.30 | Search/filter/sort | Dashboard | Search hostname, sort health/enabled | 1.6 | OK |
-| 4.31 | Nginx import wizard | Dashboard | Paste nginx.conf -> resources created | - | |
-| 4.32 | Hot-reload on API change | Proxy | Edit route -> traffic reflects change immediately | 1.8, 2.2 | OK |
+| 4.27 | Route enable/disable | Dashboard | Disabled -> 404 for that hostname | 1.6 | OK |
+| 4.28 | Delete route | Dashboard | Confirm dialog, removed | 1.6 | OK |
+| 4.29 | Search/filter/sort | Dashboard | Search hostname, sort health/enabled | 1.6 | OK |
+| 4.30 | Nginx import wizard | Dashboard | Paste nginx.conf -> resources created | - | |
+| 4.31 | Hot-reload on API change | Proxy | Edit route -> traffic reflects change immediately | 1.8, 2.2 | OK |
 | | **5. CERTIFICATES** | | | | |
 | 5.1 | Upload PEM certificate | Dashboard | Issuer/dates/SANs parsed correctly | 1.7 | OK |
 | 5.2 | Certificate detail view | Dashboard | Eye icon -> full metadata, chain, routes | 1.7 | OK |
@@ -226,14 +225,14 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 12.6 | Worker health status | Dashboard | Healthy/Unresponsive dot indicator | 2.1 | OK |
 | 12.7 | Worker heartbeat latency | Dashboard | Latency in ms | 2.2 | OK |
 | 12.8 | Auto-refresh (5s) | Dashboard | Metrics update automatically | 1.9 | OK |
-| | **13. SETTINGS** | | | | |
+| | **13. SETTINGS** | | | | OK |
 | 13.1 | Global settings | Dashboard | Flood threshold, max connections | 1.10 | OK |
 | 13.2 | Notification channel: SMTP | Dashboard | Configure email, test button | 3.3 | OK |
-| 13.3 | Notification channel: Webhook | Dashboard | Configure webhook, test button | 3.3 | |
+| 13.3 | Notification channel: Webhook | Dashboard | Configure webhook, test button | 3.3 | OK |
 | 13.4 | Notification test | Dashboard | "Test" -> dispatched | 3.3 | OK |
 | 13.5 | Alert type filtering | Dashboard | Enable/disable per alert type | 3.3 | OK |
 | 13.6 | Notification history | Dashboard | History table shows recent events | 3.3 | OK |
-| 13.7 | Notification rate limiting | CLI | Burst -> rate limited (10/60s) | 3.3 | |
+| 13.7 | Notification rate limiting | CLI | Burst -> rate limited (10/60s) | 3.3 | OK |
 | 13.8 | Security header presets | Dashboard | Builtins + custom presets | 6.2 | OK |
 | 13.9 | Preference memory | Dashboard | Stored preferences, delete option | 1.10 | OK |
 | 13.10 | Getting started guide toggle | Dashboard | Toggle helper visibility | - | OK |
@@ -266,9 +265,6 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 16.6 | Heartbeat monitoring | Dashboard | Latency <100ms | 2.2 | OK |
 | 16.7 | SO_REUSEPORT active | CLI | `ss -tlnp` multiple processes same port | - | OK |
 | 16.8 | TLS termination in workers | Proxy | HTTPS serves traffic with --workers N | 2.1 | OK |
-| | **17. SERVICE DISCOVERY (optional)** | | | | |
-| 17.1 | Docker Swarm discovery | API | `docker` feature -> backends auto-discovered | 3.2 | |
-| 17.2 | Kubernetes discovery | API | `kubernetes` feature -> pods discovered | 3.2 | |
 
 **Total: 200 test cases across 17 sections**
 

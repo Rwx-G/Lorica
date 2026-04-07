@@ -11,6 +11,7 @@ Author: Rwx-G
 
 ### Added
 
+- Background certificate expiry check task that monitors ALL certificates (ACME and manual) every 12 hours and dispatches `CertExpiring` notifications when certificates are within the `cert_warning_days` or `cert_critical_days` thresholds from global settings. Critical-level alerts use a "CRITICAL:" prefix in the message
 - Encryption key rotation via `lorica rotate-key --new-key-file <path>` CLI command. Re-encrypts all certificate private keys and notification configs in a single transaction when rotating the encryption key
 - Global WAF auto-ban counter managed by the supervisor instead of per-worker counters. In multi-worker mode the supervisor aggregates WAF block events from all workers via waf.sock and broadcasts BanIp commands when the threshold is reached, fixing the issue where N workers required N*threshold requests to trigger a ban. Single-process mode retains a local fallback counter
 - Notification form: structured fields per channel type (SMTP, Webhook, Slack) replacing raw JSON textarea

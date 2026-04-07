@@ -1801,6 +1801,13 @@ fn run_single_process(cli: Cli) {
                 Some(alert_sender.clone()),
             );
 
+            // Spawn certificate expiry check for ALL certs (ACME + manual), every 12h
+            let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
+                state.clone(),
+                std::time::Duration::from_secs(12 * 3600),
+                alert_sender.clone(),
+            );
+
             let session_store = SessionStore::new();
             let rate_limiter = RateLimiter::new();
 

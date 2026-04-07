@@ -593,6 +593,11 @@
                 {#if cert.san_domains.length > 0}
                   <span class="san-count" title={cert.san_domains.join(', ')}>+{cert.san_domains.length} SAN</span>
                 {/if}
+                {#if cert.is_acme}
+                  <span class="cert-source-badge acme">ACME{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
+                {:else}
+                  <span class="cert-source-badge manual">Manual</span>
+                {/if}
               </td>
               <td class="issuer">{cert.issuer}</td>
               <td>{formatDate(cert.not_after)}</td>
@@ -1065,6 +1070,27 @@
 
   .link-btn:hover {
     text-decoration: underline;
+  }
+
+  .cert-source-badge {
+    display: inline-block;
+    padding: 0.0625rem 0.375rem;
+    border-radius: 9999px;
+    font-size: 0.625rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    margin-left: 0.375rem;
+    vertical-align: middle;
+  }
+
+  .cert-source-badge.acme {
+    background: rgba(34, 197, 94, 0.15);
+    color: var(--color-green);
+  }
+
+  .cert-source-badge.manual {
+    background: rgba(148, 163, 184, 0.15);
+    color: var(--color-text-muted);
   }
 
   .san-count {

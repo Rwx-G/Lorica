@@ -456,6 +456,95 @@ pub fn spawn_renewal_task(
     })
 }
 
+/// Check all certificates for upcoming expiration and dispatch alerts.
+///
+/// This is a pure logic function (no loop, no sleep) so it can be unit-tested.
+/// It reads `cert_warning_days` and `cert_critical_days` from `GlobalSettings`
+/// and sends `CertExpiring` alerts for every certificate within those thresholds.
+pub async fn check_cert_expiry(
+    state: &AppState,
+    alert_sender: &lorica_notify::AlertSender,
+) {
+    let (certs, settings) = {
+        let store = state.store.lock().await;
+        let certs = match store.list_certificates() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "cert expiry check: failed to list certificates");
+                return;
+            }
+        };
+        let settings = match store.get_global_settings() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "cert expiry check: failed to load global settings");
+                return;
+            }
+        };
+        (certs, settings)
+    };
+
+    let warning_days = i64::from(settings.cert_warning_days);
+    let critical_days = i64::from(settings.cert_critical_days);
+    let now = chrono::Utc::now();
+
+    for cert in &certs {
+        let days_remaining = (cert.not_after - now).num_days();
+
+        if days_remaining > warning_days {
+            continue;
+        }
+
+        let summary = if days_remaining <= critical_days {
+            format!(
+                "CRITICAL: Certificate for {} expires in {} days",
+                cert.domain, days_remaining
+            )
+        } else {
+            format!(
+                "Certificate for {} expires in {} days",
+                cert.domain, days_remaining
+            )
+        };
+
+        info!(
+            domain = %cert.domain,
+            days_remaining = days_remaining,
+            is_acme = cert.is_acme,
+            "cert expiry check: certificate approaching expiry"
+        );
+
+        alert_sender.send(
+            lorica_notify::AlertEvent::new(
+                lorica_notify::events::AlertType::CertExpiring,
+                summary,
+            )
+            .with_detail("domain", cert.domain.clone())
+            .with_detail("days_remaining", days_remaining.to_string())
+            .with_detail("cert_id", cert.id.clone())
+            .with_detail("is_acme", cert.is_acme.to_string()),
+        );
+    }
+}
+
+/// Spawn a background task that periodically checks ALL certificates for expiration.
+///
+/// Unlike `spawn_renewal_task` which only handles ACME auto-renew certs, this task
+/// alerts on every certificate (ACME or manual) that is within the warning/critical
+/// thresholds defined in `GlobalSettings`.
+pub fn spawn_cert_expiry_check_task(
+    state: AppState,
+    check_interval: std::time::Duration,
+    alert_sender: lorica_notify::AlertSender,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(check_interval).await;
+            check_cert_expiry(&state, &alert_sender).await;
+        }
+    })
+}
+
 /// POST /api/v1/certificates/:id/renew - manually trigger ACME renewal for a certificate
 pub async fn renew_certificate(
     Extension(state): Extension<AppState>,
@@ -1576,5 +1665,138 @@ mod tests {
             created_at: Instant::now(),
         };
         assert!(pending.created_at.elapsed() < PENDING_DNS_MAX_AGE);
+    }
+
+    #[tokio::test]
+    async fn test_check_cert_expiry_dispatches_alerts() {
+        use lorica_config::models::{Certificate, GlobalSettings};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let store = lorica_config::ConfigStore::open_in_memory().unwrap();
+
+        // Set warning=14, critical=3
+        let mut settings = GlobalSettings::default();
+        settings.cert_warning_days = 14;
+        settings.cert_critical_days = 3;
+        store.update_global_settings(&settings).unwrap();
+
+        let now = chrono::Utc::now();
+
+        // Cert expiring in 10 days (warning level)
+        let warning_cert = Certificate {
+            id: "cert-warn".into(),
+            domain: "warn.example.com".into(),
+            san_domains: vec![],
+            fingerprint: "aaa".into(),
+            cert_pem: "---CERT---".into(),
+            key_pem: "---KEY---".into(),
+            issuer: "manual".into(),
+            not_before: now - chrono::Duration::days(80),
+            not_after: now + chrono::Duration::days(10),
+            is_acme: false,
+            acme_auto_renew: false,
+            created_at: now - chrono::Duration::days(80),
+        };
+
+        // Cert expiring in 2 days (critical level)
+        let critical_cert = Certificate {
+            id: "cert-crit".into(),
+            domain: "crit.example.com".into(),
+            san_domains: vec![],
+            fingerprint: "bbb".into(),
+            cert_pem: "---CERT---".into(),
+            key_pem: "---KEY---".into(),
+            issuer: "manual".into(),
+            not_before: now - chrono::Duration::days(88),
+            not_after: now + chrono::Duration::days(2),
+            is_acme: false,
+            acme_auto_renew: false,
+            created_at: now - chrono::Duration::days(88),
+        };
+
+        // Cert expiring in 30 days (no alert)
+        let safe_cert = Certificate {
+            id: "cert-safe".into(),
+            domain: "safe.example.com".into(),
+            san_domains: vec![],
+            fingerprint: "ccc".into(),
+            cert_pem: "---CERT---".into(),
+            key_pem: "---KEY---".into(),
+            issuer: "Let's Encrypt".into(),
+            not_before: now - chrono::Duration::days(60),
+            not_after: now + chrono::Duration::days(30),
+            is_acme: true,
+            acme_auto_renew: true,
+            created_at: now - chrono::Duration::days(60),
+        };
+
+        store.create_certificate(&warning_cert).unwrap();
+        store.create_certificate(&critical_cert).unwrap();
+        store.create_certificate(&safe_cert).unwrap();
+
+        let state = crate::server::AppState {
+            store: Arc::new(Mutex::new(store)),
+            log_buffer: Arc::new(crate::logs::LogBuffer::new(100)),
+            system_cache: Arc::new(Mutex::new(crate::system::SystemCache::new())),
+            active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            started_at: Instant::now(),
+            http_port: 8080,
+            https_port: 8443,
+            config_reload_tx: None,
+            worker_metrics: None,
+            waf_event_buffer: None,
+            waf_engine: None,
+            waf_rule_count: None,
+            acme_challenge_store: None,
+            pending_dns_challenges: Arc::new(DashMap::new()),
+            sla_collector: None,
+            load_test_engine: None,
+            cache_hits: None,
+            cache_misses: None,
+            ban_list: None,
+            cache_backend: None,
+            ewma_scores: None,
+            backend_connections: None,
+            notification_history: None,
+            log_store: None,
+            aggregated_metrics: None,
+        };
+
+        let alert_sender = lorica_notify::AlertSender::new(64);
+        let mut rx = alert_sender.subscribe();
+
+        check_cert_expiry(&state, &alert_sender).await;
+
+        // Collect all alerts
+        let mut alerts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            alerts.push(event);
+        }
+
+        // Should have exactly 2 alerts (warning + critical), not 3 (safe cert is >14 days)
+        assert_eq!(alerts.len(), 2, "expected 2 alerts, got {}", alerts.len());
+
+        // Find the critical alert
+        let crit = alerts
+            .iter()
+            .find(|a| a.summary.contains("CRITICAL"))
+            .expect("should have a CRITICAL alert");
+        assert!(crit.summary.contains("crit.example.com"));
+        assert_eq!(
+            crit.details.get("cert_id").unwrap(),
+            "cert-crit"
+        );
+
+        // Find the warning alert
+        let warn = alerts
+            .iter()
+            .find(|a| !a.summary.contains("CRITICAL"))
+            .expect("should have a warning alert");
+        assert!(warn.summary.contains("warn.example.com"));
+        assert_eq!(
+            warn.details.get("cert_id").unwrap(),
+            "cert-warn"
+        );
     }
 }
