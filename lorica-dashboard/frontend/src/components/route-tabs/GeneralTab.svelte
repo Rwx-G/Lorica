@@ -24,11 +24,9 @@
   ];
 
   const topologyOptions = [
-    { value: 'single_vm', label: 'Single VM' },
-    { value: 'ha', label: 'High Availability' },
+    { value: 'standard', label: 'Standard' },
     { value: 'docker_swarm', label: 'Docker Swarm' },
     { value: 'kubernetes', label: 'Kubernetes' },
-    { value: 'custom', label: 'Custom' },
   ];
 
   function handleHostnameBlur() {

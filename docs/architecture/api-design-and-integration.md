@@ -61,7 +61,7 @@
       "certificate_id": "uuid",
       "load_balancing": "round_robin",
       "waf_enabled": false,
-      "topology_type": "single_vm",
+      "topology_type": "standard",
       "enabled": true,
       "health_summary": {"healthy": 2, "degraded": 0, "down": 0}
     }
@@ -79,7 +79,7 @@
   "backend_ids": ["uuid1"],
   "certificate_id": "uuid",
   "load_balancing": "round_robin",
-  "topology_type": "single_vm"
+  "topology_type": "standard"
 }
 ```
 - **Response:** Created route object (201)

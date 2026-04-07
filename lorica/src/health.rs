@@ -143,18 +143,18 @@ pub async fn health_check_loop(
 
             // Determine effective topology for this backend.
             // A backend may be associated with multiple routes; use the most
-            // demanding topology (HA > Custom > SingleVM).
+            // demanding topology (Kubernetes > DockerSwarm > Standard).
             let effective_topology = {
                 let store = store.lock().await;
                 resolve_backend_topology(&store, &backend.id)
             };
 
-            // SingleVM: still run health checks to detect unreachable backends.
+            // Standard: still run health checks to detect unreachable backends.
             // The topology type affects service discovery, not health monitoring.
-            if effective_topology == TopologyType::SingleVm {
+            if effective_topology == TopologyType::Standard {
                 debug!(
                     backend = %backend.address,
-                    topology = "single_vm",
+                    topology = "standard",
                     "running health check (all topologies with health_check_enabled)"
                 );
             }
@@ -246,12 +246,12 @@ pub async fn health_check_loop(
 /// Resolve the effective topology for a backend by checking its associated routes.
 ///
 /// If a backend is associated with multiple routes, the most demanding topology wins:
-/// HA > Custom > DockerSwarm/Kubernetes > SingleVM.
+/// DockerSwarm/Kubernetes > Standard.
 /// Falls back to the global default if no routes reference this backend.
 fn resolve_backend_topology(store: &ConfigStore, backend_id: &str) -> TopologyType {
     let route_ids = match store.list_routes_for_backend(backend_id) {
         Ok(ids) => ids,
-        Err(_) => return TopologyType::SingleVm,
+        Err(_) => return TopologyType::Standard,
     };
 
     if route_ids.is_empty() {
@@ -259,10 +259,10 @@ fn resolve_backend_topology(store: &ConfigStore, backend_id: &str) -> TopologyTy
         return store
             .get_global_settings()
             .map(|s| s.default_topology_type)
-            .unwrap_or(TopologyType::SingleVm);
+            .unwrap_or(TopologyType::Standard);
     }
 
-    let mut best = TopologyType::SingleVm;
+    let mut best = TopologyType::Standard;
     for route_id in &route_ids {
         if let Ok(Some(route)) = store.get_route(route_id) {
             best = topology_priority_max(best, route.topology_type);
@@ -275,11 +275,9 @@ fn resolve_backend_topology(store: &ConfigStore, backend_id: &str) -> TopologyTy
 fn topology_priority_max(a: TopologyType, b: TopologyType) -> TopologyType {
     fn priority(t: &TopologyType) -> u8 {
         match t {
-            TopologyType::SingleVm => 0,
+            TopologyType::Standard => 0,
             TopologyType::DockerSwarm => 1,
-            TopologyType::Kubernetes => 1,
-            TopologyType::Custom => 2,
-            TopologyType::Ha => 3,
+            TopologyType::Kubernetes => 2,
         }
     }
     if priority(&b) > priority(&a) {
@@ -386,24 +384,24 @@ mod tests {
     #[test]
     fn test_topology_priority_max() {
         assert_eq!(
-            topology_priority_max(TopologyType::SingleVm, TopologyType::Ha),
-            TopologyType::Ha
+            topology_priority_max(TopologyType::Standard, TopologyType::DockerSwarm),
+            TopologyType::DockerSwarm
         );
         assert_eq!(
-            topology_priority_max(TopologyType::Ha, TopologyType::SingleVm),
-            TopologyType::Ha
+            topology_priority_max(TopologyType::DockerSwarm, TopologyType::Standard),
+            TopologyType::DockerSwarm
         );
         assert_eq!(
-            topology_priority_max(TopologyType::Custom, TopologyType::Ha),
-            TopologyType::Ha
+            topology_priority_max(TopologyType::DockerSwarm, TopologyType::Kubernetes),
+            TopologyType::Kubernetes
         );
         assert_eq!(
-            topology_priority_max(TopologyType::SingleVm, TopologyType::Custom),
-            TopologyType::Custom
+            topology_priority_max(TopologyType::Standard, TopologyType::Kubernetes),
+            TopologyType::Kubernetes
         );
         assert_eq!(
-            topology_priority_max(TopologyType::SingleVm, TopologyType::SingleVm),
-            TopologyType::SingleVm
+            topology_priority_max(TopologyType::Standard, TopologyType::Standard),
+            TopologyType::Standard
         );
     }
 

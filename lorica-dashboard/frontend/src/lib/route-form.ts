@@ -52,7 +52,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   backend_ids: [],
   certificate_id: '',
   load_balancing: 'round_robin',
-  topology_type: 'single_vm',
+  topology_type: 'standard',
   waf_enabled: false,
   waf_mode: 'detection',
   enabled: true,

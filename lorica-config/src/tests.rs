@@ -18,7 +18,7 @@ mod tests {
             load_balancing: LoadBalancing::RoundRobin,
             waf_enabled: false,
             waf_mode: WafMode::Detection,
-            topology_type: TopologyType::SingleVm,
+            topology_type: TopologyType::Standard,
             enabled: true,
             force_https: false,
             redirect_hostname: None,
@@ -390,7 +390,7 @@ mod tests {
             default_health_check_interval_s: 30,
             cert_warning_days: 14,
             cert_critical_days: 3,
-            default_topology_type: TopologyType::Ha,
+            default_topology_type: TopologyType::Standard,
             ..GlobalSettings::default()
         };
         store.update_global_settings(&new_settings).unwrap();
@@ -485,7 +485,7 @@ mod tests {
             default_health_check_interval_s: 30,
             cert_warning_days: 14,
             cert_critical_days: 3,
-            default_topology_type: TopologyType::Ha,
+            default_topology_type: TopologyType::Standard,
             ..GlobalSettings::default()
         };
         store1.update_global_settings(&settings).unwrap();
@@ -574,7 +574,7 @@ certificate_id = "nonexistent-cert"
 load_balancing = "round_robin"
 waf_enabled = false
 waf_mode = "detection"
-topology_type = "single_vm"
+topology_type = "standard"
 enabled = true
 created_at = "2026-01-01T00:00:00Z"
 updated_at = "2026-01-01T00:00:00Z"
@@ -871,7 +871,7 @@ path_prefix = "/"
 load_balancing = "round_robin"
 waf_enabled = false
 waf_mode = "detection"
-topology_type = "single_vm"
+topology_type = "standard"
 enabled = true
 created_at = "2026-01-01T00:00:00Z"
 updated_at = "2026-01-01T00:00:00Z"

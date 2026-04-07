@@ -2096,7 +2096,7 @@ components:
           type: boolean
         topology_type:
           type: string
-          enum: [single_vm, ha, docker_swarm, kubernetes, custom]
+          enum: [standard, docker_swarm, kubernetes]
         enabled:
           type: boolean
         created_at:
@@ -2129,8 +2129,8 @@ components:
           default: round_robin
         topology_type:
           type: string
-          enum: [single_vm, ha, docker_swarm, kubernetes, custom]
-          default: single_vm
+          enum: [standard, docker_swarm, kubernetes]
+          default: standard
 
     UpdateRouteRequest:
       type: object
@@ -2152,7 +2152,7 @@ components:
           enum: [round_robin, consistent_hash, random, peak_ewma]
         topology_type:
           type: string
-          enum: [single_vm, ha, docker_swarm, kubernetes, custom]
+          enum: [standard, docker_swarm, kubernetes]
         enabled:
           type: boolean
 

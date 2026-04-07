@@ -73,7 +73,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.11 | Proxy headers (remove) | Proxy | Header removed from backend request | 6.1 | OK |
 | 4.12 | Response headers (set) | Proxy | Custom header received by client | 6.2 | OK |
 | 4.13 | Security header preset (strict) | Proxy | HSTS, X-Frame-Options, CSP in response | 6.2 | OK |
-| 4.14 | Security header preset (custom) | Dashboard | Create custom preset, assign to route | 6.2 | |
+| 4.14 | Security header preset (custom) | Dashboard | Create custom preset, assign to route | 6.2 | OK |
 | 4.15 | Path rewrite: strip/add prefix | Proxy | /api/users -> /v2/users | 6.2 | OK |
 | 4.16 | Path rewrite: regex | Proxy | Capture groups work | - | OK |
 | 4.17 | Timeouts (connect/read/send) | Proxy | Low timeout + slow backend -> error | 6.1 | OK |
@@ -234,11 +234,11 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 13.5 | Alert type filtering | Dashboard | Enable/disable per alert type | 3.3 | OK |
 | 13.6 | Notification history | Dashboard | History table shows recent events | 3.3 | OK |
 | 13.7 | Notification rate limiting | CLI | Burst -> rate limited (10/60s) | 3.3 | |
-| 13.8 | Security header presets | Dashboard | Builtins + custom presets | 6.2 | |
-| 13.9 | Preference memory | Dashboard | Stored preferences, delete option | 1.10 | |
+| 13.8 | Security header presets | Dashboard | Builtins + custom presets | 6.2 | OK |
+| 13.9 | Preference memory | Dashboard | Stored preferences, delete option | 1.10 | OK |
 | 13.10 | Getting started guide toggle | Dashboard | Toggle helper visibility | - | OK |
-| 13.11 | Config export (TOML) | Dashboard | Download button -> file | 1.10 | |
-| 13.12 | Config import with diff | Dashboard | Upload TOML, preview, apply | 1.10 | |
+| 13.11 | Config export (TOML) | Dashboard | Download button -> file | 1.10 | OK |
+| 13.12 | Config import with diff | Dashboard | Upload TOML, preview, apply | 1.10 | OK |
 | 13.13 | Theme toggle (light/dark) | Dashboard | Persisted across sessions | 1.5 | OK |
 | | **14. PROMETHEUS METRICS** | | | | OK |
 | 14.1 | /metrics endpoint | API | `curl localhost:9443/metrics` | 4.2 | OK |

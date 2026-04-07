@@ -239,7 +239,7 @@ pub async fn create_route(
     let topo = body
         .topology_type
         .as_deref()
-        .unwrap_or("single_vm")
+        .unwrap_or("standard")
         .parse::<lorica_config::models::TopologyType>()
         .map_err(ApiError::BadRequest)?;
 

@@ -69,21 +69,17 @@ impl FromStr for WafMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TopologyType {
-    SingleVm,
-    Ha,
+    Standard,
     DockerSwarm,
     Kubernetes,
-    Custom,
 }
 
 impl TopologyType {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::SingleVm => "single_vm",
-            Self::Ha => "ha",
+            Self::Standard => "standard",
             Self::DockerSwarm => "docker_swarm",
             Self::Kubernetes => "kubernetes",
-            Self::Custom => "custom",
         }
     }
 }
@@ -92,11 +88,9 @@ impl FromStr for TopologyType {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "single_vm" => Ok(Self::SingleVm),
-            "ha" => Ok(Self::Ha),
+            "standard" | "single_vm" | "ha" | "custom" => Ok(Self::Standard),
             "docker_swarm" => Ok(Self::DockerSwarm),
             "kubernetes" => Ok(Self::Kubernetes),
-            "custom" => Ok(Self::Custom),
             other => Err(format!("unknown topology type: {other}")),
         }
     }
@@ -593,7 +587,7 @@ fn default_cert_critical_days() -> i32 {
 }
 
 fn default_topology_type() -> TopologyType {
-    TopologyType::SingleVm
+    TopologyType::Standard
 }
 
 fn default_max_active_probes() -> i32 {
@@ -632,7 +626,7 @@ impl Default for GlobalSettings {
             default_health_check_interval_s: 10,
             cert_warning_days: 30,
             cert_critical_days: 7,
-            default_topology_type: TopologyType::SingleVm,
+            default_topology_type: TopologyType::Standard,
             max_active_probes: 50,
             loadtest_max_concurrency: 100,
             loadtest_max_duration_s: 60,
@@ -869,14 +863,20 @@ mod tests {
     #[test]
     fn test_topology_type_round_trip() {
         for (s, variant) in [
-            ("single_vm", TopologyType::SingleVm),
-            ("ha", TopologyType::Ha),
+            ("standard", TopologyType::Standard),
             ("docker_swarm", TopologyType::DockerSwarm),
             ("kubernetes", TopologyType::Kubernetes),
-            ("custom", TopologyType::Custom),
         ] {
             assert_eq!(s.parse::<TopologyType>().unwrap(), variant);
             assert_eq!(variant.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn test_topology_type_backward_compat() {
+        // Old values should parse to Standard
+        for alias in ["single_vm", "ha", "custom"] {
+            assert_eq!(alias.parse::<TopologyType>().unwrap(), TopologyType::Standard);
         }
     }
 
@@ -1115,7 +1115,7 @@ mod tests {
             "load_balancing": "round_robin",
             "waf_enabled": false,
             "waf_mode": "detection",
-            "topology_type": "single_vm",
+            "topology_type": "standard",
             "enabled": true,
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
@@ -1150,7 +1150,7 @@ mod tests {
         assert_eq!(settings.loadtest_max_concurrency, 100);
         assert_eq!(settings.loadtest_max_duration_s, 60);
         assert_eq!(settings.loadtest_max_rps, 1000);
-        assert_eq!(settings.default_topology_type, TopologyType::SingleVm);
+        assert_eq!(settings.default_topology_type, TopologyType::Standard);
     }
 
     #[test]
