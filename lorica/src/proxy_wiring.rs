@@ -1418,11 +1418,20 @@ impl ProxyHttp for LoricaProxy {
             .map(|existing| format!("{existing}, {client_ip}"))
             .unwrap_or_else(|| client_ip.clone());
 
-        let proto = req
-            .headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("http");
+        // Detect TLS via session digest (same as force_https), then fall back to
+        // incoming X-Forwarded-Proto header (for proxied requests).
+        let is_tls = session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .is_some();
+        let proto = if is_tls {
+            "https"
+        } else {
+            req.headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("http")
+        };
 
         let host_val = extract_host(req).to_string();
 
