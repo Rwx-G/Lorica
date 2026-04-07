@@ -260,10 +260,30 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
     const parts = v.split(/\s+/);
     const key = parts[0];
     const rest = parts.slice(1).join(' ');
-    if (key) {
-      r.proxy_headers[key] = rest;
-      r.importedFields.add('proxy_headers');
+    if (!key) return;
+    // Skip headers whose values are Nginx variables that Lorica handles natively.
+    // Lorica automatically forwards Host, X-Real-IP, X-Forwarded-For, X-Forwarded-Proto.
+    // Importing literal "$http_host" would break upstream requests.
+    const nativelyHandled: Record<string, string[]> = {
+      'Host': ['$host', '$http_host'],
+      'X-Real-IP': ['$remote_addr', '$http_cf_connecting_ip'],
+      'X-Forwarded-For': ['$proxy_add_x_forwarded_for'],
+      'X-Forwarded-Proto': ['$scheme', 'https', 'http'],
+      'X-Forwarded-Host': ['$host', '$http_host'],
+      'X-Forwarded-Port': ['$server_port'],
+      'Connection': ['""', '"Upgrade"', 'upgrade', '$connection_upgrade', '"upgrade"', '""'],
+      'Upgrade': ['$http_upgrade'],
+    };
+    const skipVars = nativelyHandled[key];
+    if (skipVars && skipVars.some(sv => rest.trim().toLowerCase() === sv.toLowerCase())) {
+      return; // Lorica handles this header automatically
     }
+    // Skip any header value that is purely an Nginx variable
+    if (/^\$\w+$/.test(rest.trim())) {
+      return; // Pure Nginx variable, not a static value
+    }
+    r.proxy_headers[key] = rest;
+    r.importedFields.add('proxy_headers');
   },
 
   proxy_hide_header: (v, r) => {
