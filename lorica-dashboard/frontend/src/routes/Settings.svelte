@@ -244,6 +244,7 @@
     } else {
       customPresets = res.data?.custom_security_presets ?? updated;
       showPresetForm = false;
+      showToast(presetEditing !== null ? 'Preset updated' : 'Preset created', 'success');
     }
     presetSaving = false;
   }

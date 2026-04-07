@@ -33,6 +33,7 @@ pub struct UpdateSettingsRequest {
     pub sla_purge_enabled: Option<bool>,
     pub sla_purge_retention_days: Option<i32>,
     pub sla_purge_schedule: Option<String>,
+    pub custom_security_presets: Option<Vec<lorica_config::models::SecurityHeaderPreset>>,
 }
 
 /// PUT /api/v1/settings
@@ -145,6 +146,9 @@ pub async fn update_settings(
             ));
         }
         settings.sla_purge_schedule = schedule.clone();
+    }
+    if let Some(presets) = body.custom_security_presets {
+        settings.custom_security_presets = presets;
     }
 
     store.update_global_settings(&settings)?;
