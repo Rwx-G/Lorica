@@ -117,6 +117,10 @@
     cache_ttl_s: 'proxy_cache_valid',
   };
 
+  function escapeRegex(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
   function reset() {
     step = 1;
     configText = '';
@@ -137,11 +141,12 @@
 
   // Step 1 -> Step 2: parse and analyze
   async function parseAndAnalyze() {
-    // Prepend any include content
+    // Inline-replace include directives with their pasted content
     let fullText = configText;
     for (const inc of unresolvedIncludes) {
       if (inc.content.trim()) {
-        fullText = inc.content + '\n' + fullText;
+        const pattern = new RegExp(`^\\s*include\\s+${escapeRegex(inc.path)}\\s*;`, 'gm');
+        fullText = fullText.replace(pattern, inc.content);
       }
     }
 
@@ -186,25 +191,26 @@
 
   // Step 2: re-parse with includes
   async function reparseWithIncludes() {
+    // Inline-replace include directives with their pasted content
     let fullText = configText;
     for (const inc of unresolvedIncludes) {
       if (inc.content.trim()) {
-        fullText = inc.content + '\n' + fullText;
+        const pattern = new RegExp(`^\\s*include\\s+${escapeRegex(inc.path)}\\s*;`, 'gm');
+        fullText = fullText.replace(pattern, inc.content);
       }
     }
 
     parseResult = parseNginxConfig(fullText);
     importRoutes = convertToLoricaRoutes(parseResult);
 
-    // Re-check includes
-    const newIncludes = parseResult.diagnostics
+    // Re-check includes - preserve previously entered content for still-unresolved ones
+    const oldContentByPath = new Map(unresolvedIncludes.map((inc) => [inc.path, inc.content]));
+    unresolvedIncludes = parseResult.diagnostics
       .filter((d) => d.directive === 'include' && d.level === 'error')
-      .map((d) => ({
-        line: d.line,
-        path: d.message.replace('Unresolved include: ', '').replace('. Paste file contents to resolve.', ''),
-        content: '',
-      }));
-    unresolvedIncludes = newIncludes;
+      .map((d) => {
+        const path = d.message.replace('Unresolved include: ', '').replace('. Paste file contents to resolve.', '');
+        return { line: d.line, path, content: oldContentByPath.get(path) ?? '' };
+      });
 
     // Re-check backends
     const allAddresses = new Set<string>();
