@@ -156,12 +156,13 @@
       return;
     }
 
-    // Build target URL pointing to the local proxy
+    // Build target URL using the route hostname directly.
+    // The load test runs on the Lorica server where the hostname resolves
+    // to the local proxy (via DNS or /etc/hosts).
     const proto = selectedRoute.certificate_id ? 'https' : 'http';
-    const port = selectedRoute.certificate_id ? 8443 : 8080;
     const suffix = formPathSuffix.startsWith('/') ? formPathSuffix : `/${formPathSuffix}`;
-    const targetUrl = `${proto}://127.0.0.1:${port}${suffix}`;
-    const headers: Record<string, string> = { Host: selectedRoute.hostname };
+    const targetUrl = `${proto}://${selectedRoute.hostname}${suffix}`;
+    const headers: Record<string, string> = {};
 
     formSubmitting = true;
     formError = '';
