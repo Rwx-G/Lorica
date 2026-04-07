@@ -538,6 +538,7 @@ pub fn spawn_cert_expiry_check_task(
     alert_sender: lorica_notify::AlertSender,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        check_cert_expiry(&state, &alert_sender).await;
         loop {
             tokio::time::sleep(check_interval).await;
             check_cert_expiry(&state, &alert_sender).await;
