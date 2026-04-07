@@ -27,6 +27,9 @@ pub struct LogEntry {
     /// Whether the client IP was extracted from X-Forwarded-For header.
     #[serde(default)]
     pub is_xff: bool,
+    /// The direct TCP peer IP when XFF is used (the forwarding proxy's IP).
+    #[serde(default)]
+    pub xff_proxy_ip: String,
     /// Request source identifier (e.g., "loadtest" from X-Lorica-Source header).
     #[serde(default)]
     pub source: String,
@@ -315,6 +318,7 @@ mod tests {
                 error: None,
                 client_ip: String::new(),
                 is_xff: false,
+                xff_proxy_ip: String::new(),
                 source: String::new(),
             })
             .await;
@@ -343,6 +347,7 @@ mod tests {
                 error: None,
                 client_ip: String::new(),
                 is_xff: false,
+                xff_proxy_ip: String::new(),
                 source: String::new(),
             })
             .await;
@@ -371,6 +376,7 @@ mod tests {
             error: None,
             client_ip: String::new(),
             is_xff: false,
+            xff_proxy_ip: String::new(),
             source: String::new(),
         })
         .await;

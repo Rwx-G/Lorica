@@ -370,6 +370,8 @@ pub struct RequestCtx {
     pub client_ip: Option<String>,
     /// Whether the client IP was extracted from X-Forwarded-For header.
     pub is_xff: bool,
+    /// The direct TCP peer IP when XFF is used (the forwarding proxy's IP).
+    pub xff_proxy_ip: Option<String>,
     /// Request source (from X-Lorica-Source header, e.g., "loadtest").
     pub source: String,
     /// Per-route connection counter for max_connections enforcement.
@@ -495,6 +497,7 @@ impl ProxyHttp for LoricaProxy {
             access_log_enabled: true,
             client_ip: None,
             is_xff: false,
+            xff_proxy_ip: None,
             source: String::new(),
             route_conn_counter: None,
             rate_limit_info: None,
@@ -551,6 +554,7 @@ impl ProxyHttp for LoricaProxy {
         // Prefer X-Forwarded-For if present (client behind another proxy)
         let req = session.req_header();
         let has_xff = req.headers.get("x-forwarded-for").is_some();
+        let direct_ip = client_ip.clone();
         let check_ip = req
             .headers
             .get("x-forwarded-for")
@@ -561,6 +565,7 @@ impl ProxyHttp for LoricaProxy {
         // Store client IP and source in context for access logging
         ctx.client_ip = check_ip.clone();
         ctx.is_xff = has_xff && check_ip.is_some();
+        ctx.xff_proxy_ip = if ctx.is_xff { direct_ip } else { None };
         ctx.source = req
             .headers
             .get("x-lorica-source")
@@ -1563,6 +1568,7 @@ impl ProxyHttp for LoricaProxy {
                 error: error_str,
                 client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
                 is_xff: ctx.is_xff,
+                xff_proxy_ip: ctx.xff_proxy_ip.as_deref().unwrap_or("").to_string(),
                 source: ctx.source.clone(),
             };
             if let Some(ref store) = self.log_store {

@@ -267,7 +267,7 @@
                 {:else}
                   {entry.client_ip || '-'}
                   {#if entry.is_xff}
-                    <span class="xff-indicator" title="IP from X-Forwarded-For (proxy forwarded)">(i)</span>
+                    <span class="xff-indicator" title="IP from X-Forwarded-For{entry.xff_proxy_ip ? ` - forwarded by ${entry.xff_proxy_ip}` : ''}">(i)</span>
                   {/if}
                 {/if}
               </td>

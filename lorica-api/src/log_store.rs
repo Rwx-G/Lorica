@@ -29,17 +29,21 @@ impl LogStore {
                 backend TEXT NOT NULL,
                 error TEXT,
                 client_ip TEXT NOT NULL DEFAULT '',
-                is_xff INTEGER NOT NULL DEFAULT 0
+                is_xff INTEGER NOT NULL DEFAULT 0,
+                xff_proxy_ip TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON access_logs(timestamp);
             CREATE INDEX IF NOT EXISTS idx_access_logs_host ON access_logs(host);",
         )
         .map_err(|e| format!("failed to initialize access log schema: {e}"))?;
 
-        // Migrate: add client_ip and is_xff columns if missing (existing databases)
+        // Migrate: add columns if missing (existing databases)
         let _ = conn.execute_batch(
             "ALTER TABLE access_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT '';
-             ALTER TABLE access_logs ADD COLUMN is_xff INTEGER NOT NULL DEFAULT 0;",
+             ALTER TABLE access_logs ADD COLUMN is_xff INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE access_logs ADD COLUMN xff_proxy_ip TEXT NOT NULL DEFAULT '';
+             ALTER TABLE access_logs ADD COLUMN source TEXT NOT NULL DEFAULT '';",
         );
 
         // Migrate: add client_ip column to waf_events if missing
@@ -89,8 +93,8 @@ impl LogStore {
     pub fn insert(&self, entry: &LogEntry) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO access_logs (timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO access_logs (timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff, xff_proxy_ip, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 entry.timestamp,
                 entry.method,
@@ -102,6 +106,8 @@ impl LogStore {
                 entry.error,
                 entry.client_ip,
                 entry.is_xff as i64,
+                entry.xff_proxy_ip,
+                entry.source,
             ],
         )
         .map_err(|e| format!("failed to insert access log entry: {e}"))?;
@@ -172,7 +178,7 @@ impl LogStore {
             .map_err(|e| format!("failed to count access logs: {e}"))?;
 
         let query_sql = format!(
-            "SELECT id, timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff \
+            "SELECT id, timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff, xff_proxy_ip, source \
              FROM access_logs {where_clause} ORDER BY id DESC LIMIT ?",
         );
         let mut query_bind: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -200,6 +206,8 @@ impl LogStore {
                     error: row.get(8)?,
                     client_ip: row.get(9)?,
                     is_xff: row.get::<_, i64>(10)? != 0,
+                    xff_proxy_ip: row.get::<_, String>(11).unwrap_or_default(),
+                    source: row.get::<_, String>(12).unwrap_or_default(),
                 })
             })
             .map_err(|e| format!("failed to query access logs: {e}"))?;

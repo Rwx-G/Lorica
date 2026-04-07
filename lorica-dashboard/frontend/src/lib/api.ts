@@ -280,6 +280,7 @@ export interface LogEntry {
   error: string | null;
   client_ip: string;
   is_xff: boolean;
+  xff_proxy_ip: string;
   source: string;
 }
 

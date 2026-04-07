@@ -203,9 +203,9 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 9.5 | Delete probe | Dashboard | Probe removed | 5.2 | OK |
 | | **10. LOAD TESTING** | | | | |
 | 10.1 | Create load test config | Dashboard | Concurrency, RPS, duration, URL | 5.3 | OK |
-| 10.2 | Run load test | Dashboard | Real-time SSE progress | 5.3 | |
+| 10.2 | Run load test | Dashboard | Real-time SSE progress | 5.3 | OK |
 | 10.3 | Safe limit confirmation | Dashboard | Exceed limits -> confirmation popup | 5.3 | |
-| 10.4 | Auto-abort on errors | Dashboard | >10% 5xx -> auto-aborted | 5.3 | |
+| 10.4 | Auto-abort on errors | Dashboard | >10% 5xx -> auto-aborted | 5.3 | OK |
 | 10.5 | Abort button | Dashboard | Click abort -> stopped | 5.3 | OK |
 | 10.6 | Historical results | Dashboard | Previous results listed | 5.3 | OK |
 | 10.7 | Clone test config | Dashboard | Clone button -> duplicate | 5.3 | OK |

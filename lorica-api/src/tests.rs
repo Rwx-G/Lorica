@@ -959,6 +959,7 @@ async fn test_logs_endpoint_with_entries() {
                 error: None,
                 client_ip: String::new(),
                 is_xff: false,
+                xff_proxy_ip: String::new(),
                 source: String::new(),
             })
             .await;
@@ -1003,6 +1004,7 @@ async fn test_logs_endpoint_filtering() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
+                xff_proxy_ip: String::new(),
                 source: String::new(),
         })
         .await;
@@ -1020,6 +1022,7 @@ async fn test_logs_endpoint_filtering() {
             error: Some("internal error".into()),
             client_ip: String::new(),
             is_xff: false,
+                xff_proxy_ip: String::new(),
                 source: String::new(),
         })
         .await;
@@ -1078,6 +1081,7 @@ async fn test_clear_logs_endpoint() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
+                xff_proxy_ip: String::new(),
                 source: String::new(),
         })
         .await;
@@ -1132,6 +1136,7 @@ async fn test_logs_endpoint_status_range() {
                 error: None,
                 client_ip: String::new(),
                 is_xff: false,
+                xff_proxy_ip: String::new(),
                 source: String::new(),
             })
             .await;
@@ -1174,6 +1179,7 @@ async fn test_logs_endpoint_time_range() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
+                xff_proxy_ip: String::new(),
                 source: String::new(),
         })
         .await;
@@ -1191,6 +1197,7 @@ async fn test_logs_endpoint_time_range() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
+                xff_proxy_ip: String::new(),
                 source: String::new(),
         })
         .await;
@@ -1234,6 +1241,7 @@ async fn test_logs_endpoint_limit_and_after_id() {
                 error: None,
                 client_ip: String::new(),
                 is_xff: false,
+                xff_proxy_ip: String::new(),
                 source: String::new(),
             })
             .await;
