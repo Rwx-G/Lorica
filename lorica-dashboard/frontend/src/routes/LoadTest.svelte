@@ -253,10 +253,11 @@
 
   async function handleDelete() {
     if (!deletingConfig) return;
-    await api.deleteLoadTestConfig(deletingConfig.id);
+    const deletedId = deletingConfig.id;
+    await api.deleteLoadTestConfig(deletedId);
     showToast('Test config deleted', 'success');
     deletingConfig = null;
-    if (selectedConfigId === deletingConfig?.id) {
+    if (selectedConfigId === deletedId) {
       selectedConfigId = '';
       results = [];
       comparison = null;
