@@ -58,6 +58,21 @@ export interface NginxParseResult {
   diagnostics: NginxDiagnostic[];
 }
 
+/** A path rule derived from an Nginx location block. */
+export interface PathRuleImport {
+  path: string;
+  match_type: 'prefix' | 'exact';
+  backend_addresses?: string[];
+  cache_enabled?: boolean;
+  cache_ttl_s?: number;
+  response_headers?: Record<string, string>;
+  response_headers_remove?: string[];
+  rate_limit_rps?: number;
+  rate_limit_burst?: number;
+  redirect_to?: string;
+  return_status?: number;
+}
+
 /** A Lorica route derived from parsed Nginx config. */
 export interface LoricaRouteImport {
   hostname: string;
@@ -85,6 +100,8 @@ export interface LoricaRouteImport {
   rate_limit_burst: number | null;
   cache_enabled: boolean;
   cache_ttl_s: number;
+  path_rules: PathRuleImport[];
+  return_status: number | null;
   /** Tracks which fields were explicitly imported (vs defaults). */
   importedFields: Set<string>;
 }
@@ -295,6 +312,15 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
   },
 
   return: (v, r) => {
+    // Handle bare status codes: "return 403", "return 404"
+    const bareStatus = v.match(/^(\d{3})\s*$/);
+    if (bareStatus) {
+      const status = parseInt(bareStatus[1], 10);
+      r.return_status = status;
+      r.importedFields.add('return_status');
+      return;
+    }
+
     const match301 = v.match(/^30[12]\s+(https?:\/\/.+)/);
     if (match301) {
       let target = match301[1].replace(/\$request_uri\s*$/, '').replace(/;$/, '').trim();
@@ -636,6 +662,17 @@ export function parseNginxConfig(text: string): NginxParseResult {
         continue;
       }
 
+      // Warn about unsupported 'if' blocks
+      if (nameLower === 'if') {
+        diagnostics.push({
+          level: 'warning',
+          line: effectiveLine,
+          message: 'Conditional "if" block not supported. Verify behavior after import.',
+        });
+        blockStack.push({ type: 'other', name: nameLower, startLine: effectiveLine });
+        continue;
+      }
+
       // Skip block types we do not specifically handle
       if (value.endsWith('{') || value === '{') {
         blockStack.push({ type: 'other', name: nameLower, startLine: effectiveLine });
@@ -691,6 +728,18 @@ export function parseNginxConfig(text: string): NginxParseResult {
           currentServer.listen.push(value);
           if (value.includes('ssl')) {
             currentServer.ssl = true;
+          }
+          // Check for non-standard ports
+          const portMatch = value.match(/(\d+)/);
+          if (portMatch) {
+            const port = parseInt(portMatch[1], 10);
+            if (port !== 80 && port !== 443) {
+              diagnostics.push({
+                level: 'warning',
+                line: effectiveLine,
+                message: `Non-standard port ${port} detected. Lorica listens on 80/443 only. Consider using a subdomain on port 443 instead.`,
+              });
+            }
           }
         } else if (nameLower === 'server_name') {
           currentServer.serverNames = value.split(/\s+/).filter(Boolean);
@@ -751,6 +800,8 @@ function createDefaultRoute(): LoricaRouteImport {
     rate_limit_burst: null,
     cache_enabled: false,
     cache_ttl_s: 0,
+    path_rules: [],
+    return_status: null,
     importedFields: new Set<string>(),
   };
 }
@@ -989,10 +1040,123 @@ export function mergeRelatedRoutes(routes: LoricaRouteImport[]): LoricaRouteImpo
 }
 
 /**
+ * Resolve upstream references in a list of backend addresses.
+ *
+ * If an address matches an upstream name, replace it with
+ * the upstream's server list.
+ *
+ * @param addresses - Backend addresses (may contain upstream names)
+ * @param upstreams - Parsed upstream blocks
+ * @returns Resolved address list
+ */
+function resolveBackendAddresses(addresses: string[], upstreams: NginxUpstream[]): string[] {
+  const upstreamMap = new Map(upstreams.map(u => [u.name, u]));
+  const resolved: string[] = [];
+  for (const addr of addresses) {
+    const upstream = upstreamMap.get(addr);
+    if (upstream) {
+      resolved.push(...upstream.servers);
+    } else {
+      resolved.push(addr);
+    }
+  }
+  return resolved;
+}
+
+/**
+ * Convert an Nginx location block into a PathRuleImport.
+ *
+ * Applies the location's directives to a temporary route, then detects
+ * what differs from the parent route to produce a minimal path rule.
+ *
+ * @param location - The Nginx location block
+ * @param parentRoute - The parent route (from server-level directives)
+ * @param diagnostics - Diagnostic accumulator
+ * @param upstreams - Parsed upstream blocks
+ * @returns A path rule, or null if the location has no meaningful overrides
+ */
+function locationToPathRule(
+  location: NginxLocation,
+  parentRoute: LoricaRouteImport,
+  diagnostics: NginxDiagnostic[],
+  upstreams: NginxUpstream[],
+): PathRuleImport | null {
+  // Build a temporary route to apply directives and detect what changed
+  const tempRoute = createDefaultRoute();
+  // Copy parent route's default values for comparison
+  tempRoute.backend_addresses = [...parentRoute.backend_addresses];
+
+  for (const dir of location.directives) {
+    applyDirective(dir, tempRoute, diagnostics);
+  }
+
+  // Determine match type from location path
+  const isExact = location.path.startsWith('= ');
+  const cleanPath = isExact ? location.path.substring(2).trim() : location.path;
+
+  const rule: PathRuleImport = {
+    path: cleanPath || '/',
+    match_type: isExact ? 'exact' : 'prefix',
+  };
+
+  // Detect what's different from parent route
+  // Backend override: if proxy_pass points to different upstream
+  if (tempRoute.importedFields.has('backend_addresses')) {
+    const resolvedAddrs = resolveBackendAddresses(tempRoute.backend_addresses, upstreams);
+    const parentAddrs = resolveBackendAddresses(parentRoute.backend_addresses, upstreams);
+    if (JSON.stringify(resolvedAddrs) !== JSON.stringify(parentAddrs)) {
+      rule.backend_addresses = resolvedAddrs;
+    }
+  }
+
+  // Cache override
+  if (tempRoute.importedFields.has('cache_enabled') || tempRoute.importedFields.has('cache_ttl_s')) {
+    rule.cache_enabled = tempRoute.cache_enabled;
+    if (tempRoute.cache_ttl_s > 0) rule.cache_ttl_s = tempRoute.cache_ttl_s;
+  }
+
+  // Response headers override
+  if (tempRoute.importedFields.has('response_headers') && Object.keys(tempRoute.response_headers).length > 0) {
+    rule.response_headers = tempRoute.response_headers;
+  }
+
+  // Rate limiting override
+  if (tempRoute.importedFields.has('rate_limit_rps')) {
+    rule.rate_limit_rps = tempRoute.rate_limit_rps ?? undefined;
+  }
+  if (tempRoute.importedFields.has('rate_limit_burst')) {
+    rule.rate_limit_burst = tempRoute.rate_limit_burst ?? undefined;
+  }
+
+  // Check for return status (return 403, return 404, etc.)
+  if (tempRoute.importedFields.has('return_status') && tempRoute.return_status != null) {
+    rule.return_status = tempRoute.return_status;
+  }
+
+  // Check for redirects
+  if (tempRoute.importedFields.has('force_https') && tempRoute.force_https) {
+    rule.redirect_to = `https://${parentRoute.hostname}`;
+    rule.return_status = 301;
+  }
+  if (tempRoute.importedFields.has('redirect_to') && tempRoute.redirect_to) {
+    rule.redirect_to = tempRoute.redirect_to;
+    rule.return_status = 301;
+  }
+
+  // Skip empty rules that have no meaningful overrides
+  const hasOverride = rule.backend_addresses || rule.cache_enabled != null ||
+    rule.response_headers || rule.rate_limit_rps != null ||
+    rule.redirect_to || rule.return_status;
+
+  return hasOverride ? rule : null;
+}
+
+/**
  * Convert a parsed Nginx config into Lorica route imports.
  *
- * Each server+location combination produces one route. Server-level
- * directives are applied first, then location-level directives override.
+ * Each server block produces one route. Non-root locations within
+ * a server block become path rules on that route. Server-level
+ * directives and root location directives are applied to the route.
  * Upstream references in proxy_pass are resolved to actual server addresses.
  *
  * @param result - Output from parseNginxConfig
@@ -1003,46 +1167,46 @@ export function convertToLoricaRoutes(result: NginxParseResult): LoricaRouteImpo
   const diagnostics = result.diagnostics;
 
   for (const server of result.servers) {
-    if (server.locations.length === 0) {
-      // Server with no locations: create a single route from server directives
-      const route = createDefaultRoute();
+    const route = createDefaultRoute();
 
-      if (server.ssl) {
-        route.certificate_needed = true;
-        route.importedFields.add('certificate_needed');
+    // Apply server-level SSL flag
+    if (server.ssl) {
+      route.certificate_needed = true;
+      route.importedFields.add('certificate_needed');
+    }
+
+    // Apply server-level directives
+    for (const dir of server.directives) {
+      applyDirective(dir, route, diagnostics);
+    }
+
+    if (server.locations.length === 0) {
+      // No locations: simple route
+      resolveUpstreams(route, result.upstreams);
+      routes.push(route);
+    } else {
+      // Find root location "/" and non-root locations
+      const rootLoc = server.locations.find(l => l.path === '/' || l.path === '');
+      const subLocs = server.locations.filter(l => l !== rootLoc);
+
+      // Apply root location directives to the route itself
+      if (rootLoc) {
+        for (const dir of rootLoc.directives) {
+          applyDirective(dir, route, diagnostics);
+        }
       }
 
-      for (const dir of server.directives) {
-        applyDirective(dir, route, diagnostics);
+      // Convert non-root locations to path rules
+      for (const loc of subLocs) {
+        const rule = locationToPathRule(loc, route, diagnostics, result.upstreams);
+        if (rule) {
+          route.path_rules.push(rule);
+          route.importedFields.add('path_rules');
+        }
       }
 
       resolveUpstreams(route, result.upstreams);
       routes.push(route);
-    } else {
-      // One route per location
-      for (const location of server.locations) {
-        const route = createDefaultRoute();
-        route.path_prefix = location.path;
-        route.importedFields.add('path_prefix');
-
-        if (server.ssl) {
-          route.certificate_needed = true;
-          route.importedFields.add('certificate_needed');
-        }
-
-        // Apply server-level directives first
-        for (const dir of server.directives) {
-          applyDirective(dir, route, diagnostics);
-        }
-
-        // Apply location-level directives (override server-level)
-        for (const dir of location.directives) {
-          applyDirective(dir, route, diagnostics);
-        }
-
-        resolveUpstreams(route, result.upstreams);
-        routes.push(route);
-      }
     }
   }
 

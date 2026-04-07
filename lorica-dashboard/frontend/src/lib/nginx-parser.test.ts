@@ -4,6 +4,7 @@ import {
   convertToLoricaRoutes,
   mergeRelatedRoutes,
   type LoricaRouteImport,
+  type PathRuleImport,
 } from './nginx-parser';
 
 /** Helper: create a minimal route for merge testing. */
@@ -34,6 +35,8 @@ function makeRoute(overrides: Partial<LoricaRouteImport> = {}): LoricaRouteImpor
     rate_limit_burst: null,
     cache_enabled: false,
     cache_ttl_s: 0,
+    path_rules: [],
+    return_status: null,
     importedFields: new Set<string>(),
     ...overrides,
   };
@@ -168,5 +171,198 @@ server {
     const result = mergeRelatedRoutes([route]);
     expect(result).toHaveLength(1);
     expect(result[0]).toBe(route);
+  });
+});
+
+describe('convertToLoricaRoutes - path rules', () => {
+  it('multi-location server produces 1 route with path rules', () => {
+    const config = `
+server {
+    listen 443 ssl;
+    server_name app.example.com;
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+    }
+    location /api {
+        proxy_pass http://127.0.0.1:4000;
+    }
+    location /static {
+        proxy_cache my_cache;
+        proxy_cache_valid 200 10m;
+        proxy_pass http://127.0.0.1:3000;
+    }
+}
+`;
+    const parsed = parseNginxConfig(config);
+    const routes = convertToLoricaRoutes(parsed);
+
+    expect(routes).toHaveLength(1);
+    expect(routes[0].hostname).toBe('app.example.com');
+    expect(routes[0].backend_addresses).toEqual(['127.0.0.1:3000']);
+    expect(routes[0].path_rules).toHaveLength(2);
+
+    // /api path rule should have different backend
+    const apiRule = routes[0].path_rules.find(r => r.path === '/api');
+    expect(apiRule).toBeDefined();
+    expect(apiRule!.backend_addresses).toEqual(['127.0.0.1:4000']);
+    expect(apiRule!.match_type).toBe('prefix');
+
+    // /static path rule should have cache
+    const staticRule = routes[0].path_rules.find(r => r.path === '/static');
+    expect(staticRule).toBeDefined();
+    expect(staticRule!.cache_enabled).toBe(true);
+    expect(staticRule!.cache_ttl_s).toBe(600);
+  });
+
+  it('return 403 in location creates return_status path rule', () => {
+    const config = `
+server {
+    listen 80;
+    server_name example.com;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+    }
+    location /admin {
+        return 403;
+    }
+}
+`;
+    const parsed = parseNginxConfig(config);
+    const routes = convertToLoricaRoutes(parsed);
+
+    expect(routes).toHaveLength(1);
+    expect(routes[0].path_rules).toHaveLength(1);
+    expect(routes[0].path_rules[0].path).toBe('/admin');
+    expect(routes[0].path_rules[0].return_status).toBe(403);
+  });
+
+  it('different proxy_pass creates backend override path rule', () => {
+    const config = `
+server {
+    listen 80;
+    server_name example.com;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+    }
+    location /api {
+        proxy_pass http://127.0.0.1:9090;
+    }
+}
+`;
+    const parsed = parseNginxConfig(config);
+    const routes = convertToLoricaRoutes(parsed);
+
+    expect(routes).toHaveLength(1);
+    expect(routes[0].backend_addresses).toEqual(['127.0.0.1:8080']);
+    expect(routes[0].path_rules).toHaveLength(1);
+    expect(routes[0].path_rules[0].path).toBe('/api');
+    expect(routes[0].path_rules[0].backend_addresses).toEqual(['127.0.0.1:9090']);
+  });
+
+  it('warns on if blocks', () => {
+    const config = `
+server {
+    listen 80;
+    server_name example.com;
+    if ($http_user_agent ~* "bot") {
+        return 403;
+    }
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+    }
+}
+`;
+    const parsed = parseNginxConfig(config);
+    const ifWarnings = parsed.diagnostics.filter(
+      d => d.level === 'warning' && d.message.includes('if')
+    );
+    expect(ifWarnings.length).toBeGreaterThanOrEqual(1);
+    expect(ifWarnings[0].message).toContain('not supported');
+  });
+
+  it('warns on non-standard listen ports', () => {
+    const config = `
+server {
+    listen 8080;
+    server_name example.com;
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+    }
+}
+`;
+    const parsed = parseNginxConfig(config);
+    const portWarnings = parsed.diagnostics.filter(
+      d => d.level === 'warning' && d.message.includes('Non-standard port')
+    );
+    expect(portWarnings).toHaveLength(1);
+    expect(portWarnings[0].message).toContain('8080');
+  });
+
+  it('does not warn on standard ports 80 and 443', () => {
+    const config = `
+server {
+    listen 80;
+    listen 443 ssl;
+    server_name example.com;
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+    }
+}
+`;
+    const parsed = parseNginxConfig(config);
+    const portWarnings = parsed.diagnostics.filter(
+      d => d.level === 'warning' && d.message.includes('Non-standard port')
+    );
+    expect(portWarnings).toHaveLength(0);
+  });
+
+  it('root location directives apply to the route itself', () => {
+    const config = `
+server {
+    listen 80;
+    server_name example.com;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_read_timeout 60s;
+    }
+}
+`;
+    const parsed = parseNginxConfig(config);
+    const routes = convertToLoricaRoutes(parsed);
+
+    expect(routes).toHaveLength(1);
+    expect(routes[0].backend_addresses).toEqual(['127.0.0.1:8080']);
+    expect(routes[0].read_timeout_s).toBe(60);
+    expect(routes[0].path_rules).toHaveLength(0);
+  });
+
+  it('server with no locations still works', () => {
+    const config = `
+server {
+    listen 80;
+    server_name example.com;
+    return 301 https://example.com$request_uri;
+}
+`;
+    const parsed = parseNginxConfig(config);
+    const routes = convertToLoricaRoutes(parsed);
+
+    expect(routes).toHaveLength(1);
+    expect(routes[0].force_https).toBe(true);
+  });
+
+  it('handles bare return status on route level', () => {
+    const config = `
+server {
+    listen 80;
+    server_name example.com;
+    return 404;
+}
+`;
+    const parsed = parseNginxConfig(config);
+    const routes = convertToLoricaRoutes(parsed);
+
+    expect(routes).toHaveLength(1);
+    expect(routes[0].return_status).toBe(404);
   });
 });

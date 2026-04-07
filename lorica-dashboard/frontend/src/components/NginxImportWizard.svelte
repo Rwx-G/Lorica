@@ -7,6 +7,7 @@
     type NginxParseResult,
     type NginxDiagnostic,
     type LoricaRouteImport,
+    type PathRuleImport,
   } from '../lib/nginx-parser';
   import { showToast } from '../lib/toast';
 
@@ -92,6 +93,8 @@
     rate_limit_burst: 'Rate limit burst',
     cache_enabled: 'Cache enabled',
     cache_ttl_s: 'Cache TTL (s)',
+    path_rules: 'Path rules',
+    return_status: 'Return status',
   };
 
   // Map from Nginx directive names to display strings for the preview
@@ -119,6 +122,8 @@
     rate_limit_burst: 'limit_req burst=',
     cache_enabled: 'proxy_cache',
     cache_ttl_s: 'proxy_cache_valid',
+    path_rules: 'location (sub-paths)',
+    return_status: 'return (status)',
   };
 
   function escapeRegex(s: string): string {
@@ -179,11 +184,16 @@
       existingBackends = res.data.backends;
     }
 
-    // Build backend check list from all routes
+    // Build backend check list from all routes (including path rule backends)
     const allAddresses = new Set<string>();
     for (const route of importRoutes) {
       for (const addr of route.backend_addresses) {
         allAddresses.add(addr);
+      }
+      for (const rule of route.path_rules ?? []) {
+        for (const addr of rule.backend_addresses ?? []) {
+          allAddresses.add(addr);
+        }
       }
     }
 
@@ -230,11 +240,16 @@
         return { line: d.line, path, content: oldContentByPath.get(path) ?? '' };
       });
 
-    // Re-check backends
+    // Re-check backends (including path rule backends)
     const allAddresses = new Set<string>();
     for (const route of importRoutes) {
       for (const addr of route.backend_addresses) {
         allAddresses.add(addr);
+      }
+      for (const rule of route.path_rules ?? []) {
+        for (const addr of rule.backend_addresses ?? []) {
+          allAddresses.add(addr);
+        }
       }
     }
 
@@ -316,6 +331,9 @@
     const val = (route as Record<string, unknown>)[field];
     if (val === null || val === undefined) return '-';
     if (typeof val === 'boolean') return val ? 'Yes' : 'No';
+    if (field === 'path_rules' && Array.isArray(val)) {
+      return val.length > 0 ? `${val.length} rule(s)` : '-';
+    }
     if (Array.isArray(val)) return val.length > 0 ? val.join(', ') : '-';
     if (typeof val === 'object' && val !== null) {
       if (val instanceof Set) return '-';
@@ -370,6 +388,22 @@
       proxy_headers_remove: route.proxy_headers_remove.join(', '),
       response_headers: Object.entries(route.response_headers).map(([k, v]) => `${k}=${v}`).join('\n'),
       response_headers_remove: route.response_headers_remove.join(', '),
+      path_rules: (route.path_rules ?? []).map((pr: PathRuleImport) => ({
+        path: pr.path,
+        match_type: pr.match_type ?? 'prefix',
+        backend_ids: (pr.backend_addresses ?? []).map(a => backendIdMap.get(a)).filter((id): id is string => !!id),
+        cache_enabled: pr.cache_enabled ?? null,
+        cache_ttl_s: pr.cache_ttl_s ?? null,
+        response_headers: pr.response_headers
+          ? Object.entries(pr.response_headers).map(([k, v]) => `${k}=${v}`).join('\n')
+          : '',
+        response_headers_remove: '',
+        rate_limit_rps: pr.rate_limit_rps != null ? String(pr.rate_limit_rps) : '',
+        rate_limit_burst: pr.rate_limit_burst != null ? String(pr.rate_limit_burst) : '',
+        redirect_to: pr.redirect_to ?? '',
+        return_status: pr.return_status != null ? String(pr.return_status) : '',
+      })),
+      return_status: route.return_status != null ? String(route.return_status) : '',
     };
 
     return formStateToCreateRequest(form);
@@ -667,6 +701,21 @@
                   {/if}
                 {/each}
               </div>
+              {#if route.path_rules && route.path_rules.length > 0}
+                <div class="preview-path-rules">
+                  <h5>Path Rules ({route.path_rules.length})</h5>
+                  {#each route.path_rules as rule}
+                    <div class="path-rule-preview">
+                      <code>{rule.match_type === 'exact' ? '= ' : ''}{rule.path}</code>
+                      {#if rule.backend_addresses}<span class="rule-override">backends: {rule.backend_addresses.join(', ')}</span>{/if}
+                      {#if rule.cache_enabled}<span class="rule-override">cache: {rule.cache_ttl_s}s</span>{/if}
+                      {#if rule.return_status}<span class="rule-override">return {rule.return_status}</span>{/if}
+                      {#if rule.redirect_to}<span class="rule-override">redirect: {rule.redirect_to}</span>{/if}
+                      {#if rule.rate_limit_rps}<span class="rule-override">rate limit: {rule.rate_limit_rps} rps</span>{/if}
+                    </div>
+                  {/each}
+                </div>
+              {/if}
               <p class="step-hint">Fields are read-only here. You can edit them in the Route Drawer after import.</p>
             {/if}
 
@@ -1268,6 +1317,48 @@
     font-family: var(--mono);
     font-size: var(--text-xs);
     word-break: break-all;
+  }
+
+  /* Path rules preview */
+  .preview-path-rules {
+    margin-top: var(--space-3);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-3);
+  }
+
+  .preview-path-rules h5 {
+    margin: 0 0 var(--space-2) 0;
+    font-size: var(--text-sm);
+    color: var(--color-text-heading);
+  }
+
+  .path-rule-preview {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-1) var(--space-2);
+    font-size: var(--text-sm);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .path-rule-preview:last-child {
+    border-bottom: none;
+  }
+
+  .path-rule-preview code {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    background: var(--color-bg-input);
+    padding: 0.125rem 0.375rem;
+    border-radius: var(--radius-sm);
+    min-width: 6rem;
+  }
+
+  .rule-override {
+    font-size: var(--text-xs);
+    color: var(--color-text-muted);
+    font-family: var(--mono);
   }
 
   /* Results */
