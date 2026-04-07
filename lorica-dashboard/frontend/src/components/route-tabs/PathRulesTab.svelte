@@ -106,6 +106,14 @@
               <option value="exact">Exact</option>
             </select>
           </div>
+          <div class="rule-overrides-summary">
+            {#if rule.backend_ids.length > 0}<span class="override-pill">backends</span>{/if}
+            {#if rule.cache_enabled != null}<span class="override-pill">cache</span>{/if}
+            {#if rule.response_headers}<span class="override-pill">headers</span>{/if}
+            {#if rule.rate_limit_rps}<span class="override-pill">rate limit</span>{/if}
+            {#if rule.redirect_to}<span class="override-pill">redirect</span>{/if}
+            {#if rule.return_status}<span class="override-pill">return {rule.return_status}</span>{/if}
+          </div>
           <div class="rule-header-right">
             <button class="btn-icon" title="Move up" disabled={index === 0} onclick={() => moveUp(index)}>
               {@html upIcon}
@@ -310,6 +318,25 @@
     justify-content: space-between;
     padding: 0.5rem 0.75rem;
     gap: 0.5rem;
+  }
+
+  .rule-overrides-summary {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    flex-wrap: wrap;
+  }
+
+  .override-pill {
+    display: inline-block;
+    padding: 0.0625rem 0.375rem;
+    border-radius: 9999px;
+    font-size: 0.625rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    background: rgba(59, 130, 246, 0.15);
+    color: var(--color-primary);
+    white-space: nowrap;
   }
 
   .rule-header-left {
