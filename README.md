@@ -157,7 +157,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 - **Active Probes** - CRUD for synthetic health probes with route selection, HTTP method/path/status/interval/timeout
 - **Access Logs** - scrollable real-time log stream via WebSocket with green pulsing indicator
 - **System** - worker table with PID, health, heartbeat latency; CPU/memory/disk gauges
-- **Settings** - notification channels, security header presets, topology config, config export/import with diff preview
+- **Settings** - notification channels, security header presets, config export/import with diff preview
 - **Theme** - light/dark mode toggle
 
 ## Architecture

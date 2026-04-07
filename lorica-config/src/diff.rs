@@ -233,13 +233,6 @@ fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> Setting
             new_value: incoming.cert_critical_days.to_string(),
         });
     }
-    if current.default_topology_type != incoming.default_topology_type {
-        changes.push(SettingChange {
-            key: "default_topology_type".to_string(),
-            old_value: current.default_topology_type.as_str().to_string(),
-            new_value: incoming.default_topology_type.as_str().to_string(),
-        });
-    }
     if current.ip_blocklist_enabled != incoming.ip_blocklist_enabled {
         changes.push(SettingChange {
             key: "ip_blocklist_enabled".to_string(),
@@ -271,7 +264,6 @@ fn route_eq(a: &Route, b: &Route) -> bool {
         && a.load_balancing == b.load_balancing
         && a.waf_enabled == b.waf_enabled
         && a.waf_mode == b.waf_mode
-        && a.topology_type == b.topology_type
         && a.enabled == b.enabled
         && a.path_rewrite_pattern == b.path_rewrite_pattern
         && a.path_rewrite_replacement == b.path_rewrite_replacement

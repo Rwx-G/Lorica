@@ -1764,29 +1764,6 @@ async fn test_create_route_invalid_load_balancing_returns_400() {
 }
 
 #[tokio::test]
-async fn test_create_route_invalid_topology_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
-    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
-
-    let router = app(state, session_store, rate_limiter);
-    let body = serde_json::json!({
-        "hostname": "example.com",
-        "topology_type": "nonexistent"
-    });
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/routes")
-        .header("Content-Type", "application/json")
-        .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-
-    let response = router.oneshot(req).await.unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
 async fn test_update_route_nonexistent_returns_404() {
     let (state, session_store, rate_limiter) = test_state();
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
@@ -2211,7 +2188,7 @@ certificate_id = "nonexistent-cert"
 load_balancing = "round_robin"
 waf_enabled = false
 waf_mode = "detection"
-topology_type = "standard"
+
 enabled = true
 created_at = "2026-01-01T00:00:00Z"
 updated_at = "2026-01-01T00:00:00Z"

@@ -36,7 +36,6 @@
 //!
 //! If looking to build a (reverse) proxy, see [`lorica-proxy`](https://docs.rs/lorica-proxy) crate.
 
-pub mod discovery;
 pub mod proxy_wiring;
 pub mod reload;
 

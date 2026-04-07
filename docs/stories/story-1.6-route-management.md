@@ -49,7 +49,7 @@ so that I can manage my proxy configuration visually.
 - Created `StatusBadge.svelte` component for health indicators (green/orange/red/unknown)
 - Created `ConfirmDialog.svelte` component for delete confirmation
 - Created `Routes.svelte` with full CRUD: list table, create/edit modal form, delete dialog
-- Form includes backend multi-select, certificate dropdown, load balancing and topology selectors
+- Form includes backend multi-select, certificate dropdown, load balancing selector
 - Health status derived from associated backends' health
 - Wired Routes into Dashboard.svelte replacing Placeholder
 - All type checks pass (0 errors, 0 warnings)

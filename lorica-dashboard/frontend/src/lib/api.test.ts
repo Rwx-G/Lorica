@@ -9,7 +9,6 @@ const mockRoute = {
   certificate_id: null,
   load_balancing: 'round_robin',
   waf_enabled: false,
-  topology_type: 'standard',
   enabled: true,
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',

@@ -227,7 +227,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 12.7 | Worker heartbeat latency | Dashboard | Latency in ms | 2.2 | OK |
 | 12.8 | Auto-refresh (5s) | Dashboard | Metrics update automatically | 1.9 | OK |
 | | **13. SETTINGS** | | | | |
-| 13.1 | Global settings | Dashboard | Flood threshold, max connections, topology | 1.10 | OK |
+| 13.1 | Global settings | Dashboard | Flood threshold, max connections | 1.10 | OK |
 | 13.2 | Notification channel: SMTP | Dashboard | Configure email, test button | 3.3 | OK |
 | 13.3 | Notification channel: Webhook | Dashboard | Configure webhook, test button | 3.3 | |
 | 13.4 | Notification test | Dashboard | "Test" -> dispatched | 3.3 | OK |

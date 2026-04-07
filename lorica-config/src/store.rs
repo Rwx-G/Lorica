@@ -413,7 +413,7 @@ impl ConfigStore {
 
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
-             waf_enabled, waf_mode, topology_type, enabled,
+             waf_enabled, waf_mode, enabled,
              force_https, redirect_hostname, hostname_aliases,
              proxy_headers, response_headers, security_headers,
              connect_timeout_s, read_timeout_s, send_timeout_s,
@@ -430,10 +430,10 @@ impl ConfigStore {
              max_connections, slowloris_threshold_ms,
              auto_ban_threshold, auto_ban_duration_s,
              created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22,
-                     ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33,
-                     ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                     ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
+                     ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
             params![
                 route.id,
                 route.hostname,
@@ -442,7 +442,6 @@ impl ConfigStore {
                 route.load_balancing.as_str(),
                 route.waf_enabled,
                 route.waf_mode.as_str(),
-                route.topology_type.as_str(),
                 route.enabled,
                 route.force_https,
                 route.redirect_hostname,
@@ -490,7 +489,7 @@ impl ConfigStore {
         self.conn
             .query_row(
                 "SELECT id, hostname, path_prefix, certificate_id, load_balancing,
-                 waf_enabled, waf_mode, topology_type, enabled,
+                 waf_enabled, waf_mode, enabled,
                  force_https, redirect_hostname, hostname_aliases,
                  proxy_headers, response_headers, security_headers,
                  connect_timeout_s, read_timeout_s, send_timeout_s,
@@ -519,7 +518,7 @@ impl ConfigStore {
     pub fn list_routes(&self) -> Result<Vec<Route>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, hostname, path_prefix, certificate_id, load_balancing,
-             waf_enabled, waf_mode, topology_type, enabled,
+             waf_enabled, waf_mode, enabled,
              force_https, redirect_hostname, hostname_aliases,
              proxy_headers, response_headers, security_headers,
              connect_timeout_s, read_timeout_s, send_timeout_s,
@@ -573,22 +572,22 @@ impl ConfigStore {
 
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,
-             load_balancing=?5, waf_enabled=?6, waf_mode=?7, topology_type=?8,
-             enabled=?9, force_https=?10, redirect_hostname=?11,
-             hostname_aliases=?12, proxy_headers=?13, response_headers=?14,
-             security_headers=?15, connect_timeout_s=?16, read_timeout_s=?17,
-             send_timeout_s=?18, strip_path_prefix=?19, add_path_prefix=?20,
-             path_rewrite_pattern=?21, path_rewrite_replacement=?22,
-             access_log_enabled=?23, proxy_headers_remove=?24,
-             response_headers_remove=?25, max_request_body_bytes=?26,
-             websocket_enabled=?27, rate_limit_rps=?28, rate_limit_burst=?29,
-             ip_allowlist=?30, ip_denylist=?31,
-             cors_allowed_origins=?32, cors_allowed_methods=?33, cors_max_age_s=?34,
-             compression_enabled=?35, retry_attempts=?36,
-             cache_enabled=?37, cache_ttl_s=?38, cache_max_bytes=?39,
-             max_connections=?40, slowloris_threshold_ms=?41,
-             auto_ban_threshold=?42, auto_ban_duration_s=?43,
-             updated_at=?44 WHERE id=?1",
+             load_balancing=?5, waf_enabled=?6, waf_mode=?7,
+             enabled=?8, force_https=?9, redirect_hostname=?10,
+             hostname_aliases=?11, proxy_headers=?12, response_headers=?13,
+             security_headers=?14, connect_timeout_s=?15, read_timeout_s=?16,
+             send_timeout_s=?17, strip_path_prefix=?18, add_path_prefix=?19,
+             path_rewrite_pattern=?20, path_rewrite_replacement=?21,
+             access_log_enabled=?22, proxy_headers_remove=?23,
+             response_headers_remove=?24, max_request_body_bytes=?25,
+             websocket_enabled=?26, rate_limit_rps=?27, rate_limit_burst=?28,
+             ip_allowlist=?29, ip_denylist=?30,
+             cors_allowed_origins=?31, cors_allowed_methods=?32, cors_max_age_s=?33,
+             compression_enabled=?34, retry_attempts=?35,
+             cache_enabled=?36, cache_ttl_s=?37, cache_max_bytes=?38,
+             max_connections=?39, slowloris_threshold_ms=?40,
+             auto_ban_threshold=?41, auto_ban_duration_s=?42,
+             updated_at=?43 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -597,7 +596,6 @@ impl ConfigStore {
                 route.load_balancing.as_str(),
                 route.waf_enabled,
                 route.waf_mode.as_str(),
-                route.topology_type.as_str(),
                 route.enabled,
                 route.force_https,
                 route.redirect_hostname,
@@ -1230,11 +1228,6 @@ impl ConfigStore {
                         ConfigError::Validation("invalid cert_critical_days".into())
                     })?;
                 }
-                "default_topology_type" => {
-                    settings.default_topology_type = value.parse().map_err(|_| {
-                        ConfigError::Validation("invalid default_topology_type".into())
-                    })?;
-                }
                 "ip_blocklist_enabled" => {
                     settings.ip_blocklist_enabled = value == "true" || value == "1";
                 }
@@ -1309,10 +1302,6 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_critical_days', ?1)",
             params![settings.cert_critical_days.to_string()],
-        )?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('default_topology_type', ?1)",
-            params![settings.default_topology_type.as_str()],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('ip_blocklist_enabled', ?1)",
@@ -2261,43 +2250,43 @@ fn parse_optional_datetime(s: Option<String>) -> Result<Option<DateTime<Utc>>> {
 }
 
 fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
-    let hostname_aliases_json: String = row.get(11)?;
+    let hostname_aliases_json: String = row.get(10)?;
     let hostname_aliases: Vec<String> = serde_json::from_str(&hostname_aliases_json)
         .map_err(|e| ConfigError::Validation(format!("invalid hostname_aliases JSON: {e}")))?;
 
-    let proxy_headers_json: String = row.get(12)?;
+    let proxy_headers_json: String = row.get(11)?;
     let proxy_headers: std::collections::HashMap<String, String> =
         serde_json::from_str(&proxy_headers_json)
             .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers JSON: {e}")))?;
 
-    let response_headers_json: String = row.get(13)?;
+    let response_headers_json: String = row.get(12)?;
     let response_headers: std::collections::HashMap<String, String> =
         serde_json::from_str(&response_headers_json)
             .map_err(|e| ConfigError::Validation(format!("invalid response_headers JSON: {e}")))?;
 
-    let proxy_headers_remove_json: String = row.get(23)?;
+    let proxy_headers_remove_json: String = row.get(22)?;
     let proxy_headers_remove: Vec<String> = serde_json::from_str(&proxy_headers_remove_json)
         .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers_remove JSON: {e}")))?;
 
-    let response_headers_remove_json: String = row.get(24)?;
+    let response_headers_remove_json: String = row.get(23)?;
     let response_headers_remove: Vec<String> = serde_json::from_str(&response_headers_remove_json)
         .map_err(|e| {
             ConfigError::Validation(format!("invalid response_headers_remove JSON: {e}"))
         })?;
 
-    let ip_allowlist_json: String = row.get(29)?;
+    let ip_allowlist_json: String = row.get(28)?;
     let ip_allowlist: Vec<String> = serde_json::from_str(&ip_allowlist_json)
         .map_err(|e| ConfigError::Validation(format!("invalid ip_allowlist JSON: {e}")))?;
 
-    let ip_denylist_json: String = row.get(30)?;
+    let ip_denylist_json: String = row.get(29)?;
     let ip_denylist: Vec<String> = serde_json::from_str(&ip_denylist_json)
         .map_err(|e| ConfigError::Validation(format!("invalid ip_denylist JSON: {e}")))?;
 
-    let cors_allowed_origins_json: String = row.get(31)?;
+    let cors_allowed_origins_json: String = row.get(30)?;
     let cors_allowed_origins: Vec<String> = serde_json::from_str(&cors_allowed_origins_json)
         .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_origins JSON: {e}")))?;
 
-    let cors_allowed_methods_json: String = row.get(32)?;
+    let cors_allowed_methods_json: String = row.get(31)?;
     let cors_allowed_methods: Vec<String> = serde_json::from_str(&cors_allowed_methods_json)
         .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_methods JSON: {e}")))?;
 
@@ -2310,45 +2299,43 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             .map_err(ConfigError::Validation)?,
         waf_enabled: row.get(5)?,
         waf_mode: WafMode::from_str(&row.get::<_, String>(6)?).map_err(ConfigError::Validation)?,
-        topology_type: TopologyType::from_str(&row.get::<_, String>(7)?)
-            .map_err(ConfigError::Validation)?,
-        enabled: row.get(8)?,
-        force_https: row.get(9)?,
-        redirect_hostname: row.get(10)?,
+        enabled: row.get(7)?,
+        force_https: row.get(8)?,
+        redirect_hostname: row.get(9)?,
         hostname_aliases,
         proxy_headers,
         response_headers,
-        security_headers: row.get(14)?,
-        connect_timeout_s: row.get(15)?,
-        read_timeout_s: row.get(16)?,
-        send_timeout_s: row.get(17)?,
-        strip_path_prefix: row.get(18)?,
-        add_path_prefix: row.get(19)?,
-        path_rewrite_pattern: row.get(20)?,
-        path_rewrite_replacement: row.get(21)?,
-        access_log_enabled: row.get(22)?,
+        security_headers: row.get(13)?,
+        connect_timeout_s: row.get(14)?,
+        read_timeout_s: row.get(15)?,
+        send_timeout_s: row.get(16)?,
+        strip_path_prefix: row.get(17)?,
+        add_path_prefix: row.get(18)?,
+        path_rewrite_pattern: row.get(19)?,
+        path_rewrite_replacement: row.get(20)?,
+        access_log_enabled: row.get(21)?,
         proxy_headers_remove,
         response_headers_remove,
-        max_request_body_bytes: row.get::<_, Option<i64>>(25)?.map(|v| v as u64),
-        websocket_enabled: row.get(26)?,
-        rate_limit_rps: row.get::<_, Option<i32>>(27)?.map(|v| v as u32),
-        rate_limit_burst: row.get::<_, Option<i32>>(28)?.map(|v| v as u32),
+        max_request_body_bytes: row.get::<_, Option<i64>>(24)?.map(|v| v as u64),
+        websocket_enabled: row.get(25)?,
+        rate_limit_rps: row.get::<_, Option<i32>>(26)?.map(|v| v as u32),
+        rate_limit_burst: row.get::<_, Option<i32>>(27)?.map(|v| v as u32),
         ip_allowlist,
         ip_denylist,
         cors_allowed_origins,
         cors_allowed_methods,
-        cors_max_age_s: row.get(33)?,
-        compression_enabled: row.get(34)?,
-        retry_attempts: row.get::<_, Option<i32>>(35)?.map(|v| v as u32),
-        cache_enabled: row.get(36)?,
-        cache_ttl_s: row.get(37)?,
-        cache_max_bytes: row.get(38)?,
-        max_connections: row.get::<_, Option<i32>>(39)?.map(|v| v as u32),
-        slowloris_threshold_ms: row.get(40)?,
-        auto_ban_threshold: row.get::<_, Option<i32>>(41)?.map(|v| v as u32),
-        auto_ban_duration_s: row.get(42)?,
-        created_at: parse_datetime(&row.get::<_, String>(43)?)?,
-        updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
+        cors_max_age_s: row.get(32)?,
+        compression_enabled: row.get(33)?,
+        retry_attempts: row.get::<_, Option<i32>>(34)?.map(|v| v as u32),
+        cache_enabled: row.get(35)?,
+        cache_ttl_s: row.get(36)?,
+        cache_max_bytes: row.get(37)?,
+        max_connections: row.get::<_, Option<i32>>(38)?.map(|v| v as u32),
+        slowloris_threshold_ms: row.get(39)?,
+        auto_ban_threshold: row.get::<_, Option<i32>>(40)?.map(|v| v as u32),
+        auto_ban_duration_s: row.get(41)?,
+        created_at: parse_datetime(&row.get::<_, String>(42)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(43)?)?,
     })
 }
 

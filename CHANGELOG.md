@@ -142,7 +142,6 @@ Author: Rwx-G
 - SNI-based certificate hot-swap (`lorica-tls`) with wildcard support (`*.example.com`). Multiple certificates per domain sorted by expiration. Atomic swap via `arc-swap` with zero downtime. Integrated through rustls `ResolvesServerCert` trait
 - Backend lifecycle management with per-backend active connection tracking (atomic counters), graceful drain on removal (Normal/Closing/Closed states), and load balancer exclusion of draining backends
 - TCP and HTTP health checks with configurable interval. Backends marked degraded (>2s latency) or down (unreachable) and excluded from rotation. HTTP probes via `health_check_path` expecting 2xx within timeout
-- Topology-aware health check behavior: SingleVM (passive only), HA/Custom (active TCP/HTTP probes), DockerSwarm/Kubernetes (service discovery integration). Multi-route priority resolution and global default topology in settings
 - WebSocket log streaming via `GET /api/v1/logs/ws` with LogBuffer broadcast and frontend auto-connect with polling fallback
 
 **Security (Epics 3, 7)**
@@ -240,7 +239,7 @@ Author: Rwx-G
 
 - `X-RateLimit-Reset` header now returns a real Unix timestamp (current time + 1s) instead of a hardcoded "1", in both 429 responses and normal rate-limited responses
 - Settings update (`PUT /api/v1/settings`) now triggers proxy config reload so changes take effect immediately
-- Config import diff now detects changes to `default_topology_type` and `flood_threshold_rps` settings
+- Config import diff now detects changes to `flood_threshold_rps` settings
 - Database concurrency - added `PRAGMA busy_timeout=5000` and idempotent migration inserts (`INSERT OR IGNORE`) to prevent race conditions with multiple worker processes
 - Cache purge endpoint (`DELETE /api/v1/cache/routes/:id`) was a stub - now clears all cached entries and resets hit/miss counters
 

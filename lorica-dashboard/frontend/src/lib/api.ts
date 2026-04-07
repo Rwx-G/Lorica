@@ -82,7 +82,6 @@ export interface RouteResponse {
   load_balancing: string;
   waf_enabled: boolean;
   waf_mode: string;
-  topology_type: string;
   enabled: boolean;
   force_https: boolean;
   redirect_hostname: string | null;
@@ -128,7 +127,6 @@ export interface CreateRouteRequest {
   backend_ids?: string[];
   certificate_id?: string;
   load_balancing?: string;
-  topology_type?: string;
   waf_enabled?: boolean;
   waf_mode?: string;
   force_https?: boolean;
@@ -173,7 +171,6 @@ export interface UpdateRouteRequest {
   backend_ids?: string[];
   certificate_id?: string;
   load_balancing?: string;
-  topology_type?: string;
   waf_enabled?: boolean;
   waf_mode?: string;
   enabled?: boolean;
@@ -340,7 +337,6 @@ export interface GlobalSettingsResponse {
   default_health_check_interval_s: number;
   cert_warning_days: number;
   cert_critical_days: number;
-  default_topology_type: string;
   max_global_connections: number;
   flood_threshold_rps: number;
   waf_ban_threshold: number;
@@ -358,7 +354,6 @@ export interface UpdateSettingsRequest {
   default_health_check_interval_s?: number;
   cert_warning_days?: number;
   cert_critical_days?: number;
-  default_topology_type?: string;
   max_global_connections?: number;
   flood_threshold_rps?: number;
   waf_ban_threshold?: number;

@@ -15,7 +15,6 @@
 - `load_balancing`: TEXT - Algorithm: `round_robin`, `consistent_hash`, `random`, `peak_ewma`
 - `waf_enabled`: BOOLEAN - Whether WAF is active for this route
 - `waf_mode`: TEXT - `detection` or `blocking` (when WAF enabled)
-- `topology_type`: TEXT - `standard`, `docker_swarm`, `kubernetes`
 - `enabled`: BOOLEAN - Whether the route is active
 - `created_at`: TIMESTAMP
 - `updated_at`: TIMESTAMP

@@ -6,7 +6,6 @@ export interface RouteFormState {
   backend_ids: string[];
   certificate_id: string;
   load_balancing: string;
-  topology_type: string;
   waf_enabled: boolean;
   waf_mode: string;
   enabled: boolean;
@@ -52,7 +51,6 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   backend_ids: [],
   certificate_id: '',
   load_balancing: 'round_robin',
-  topology_type: 'standard',
   waf_enabled: false,
   waf_mode: 'detection',
   enabled: true,
@@ -155,7 +153,6 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     backend_ids: [...route.backends],
     certificate_id: route.certificate_id ?? '',
     load_balancing: route.load_balancing,
-    topology_type: route.topology_type,
     waf_enabled: route.waf_enabled,
     waf_mode: route.waf_mode ?? 'detection',
     enabled: route.enabled,
@@ -242,7 +239,6 @@ export function formStateToCreateRequest(form: RouteFormState): CreateRouteReque
     backend_ids: form.backend_ids.length > 0 ? form.backend_ids : undefined,
     certificate_id: form.certificate_id || undefined,
     load_balancing: form.load_balancing,
-    topology_type: form.topology_type,
     waf_enabled: form.waf_enabled,
     waf_mode: form.waf_mode,
     ...buildAdvancedFields(form),
@@ -256,7 +252,6 @@ export function formStateToUpdateRequest(form: RouteFormState): UpdateRouteReque
     backend_ids: form.backend_ids,
     certificate_id: form.certificate_id !== undefined ? form.certificate_id : undefined,
     load_balancing: form.load_balancing,
-    topology_type: form.topology_type,
     waf_enabled: form.waf_enabled,
     waf_mode: form.waf_mode,
     enabled: form.enabled,

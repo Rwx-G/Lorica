@@ -2,7 +2,7 @@
 # =============================================================================
 # Lorica E2E Test Suite
 # Tests all features: auth, routing, WAF, health checks, API, dashboard,
-# topology, Prometheus metrics, Peak EWMA, SLA monitoring, active probes,
+# Prometheus metrics, Peak EWMA, SLA monitoring, active probes,
 # load testing, route config (headers, timeouts, redirect, rewrite, security),
 # config export/import, rate limiting, CORS, cache, bans, compression,
 # WebSocket blocking, backend validation, path prefix routing, hostname
@@ -165,17 +165,9 @@ if [ -n "$SESSION" ]; then
 
     SETTINGS=$(api_get "/api/v1/settings")
     assert_json "$SETTINGS" ".data.log_level" "info" "Default log level is info"
-    assert_json "$SETTINGS" ".data.default_topology_type" "standard" "Default topology is standard"
     assert_json_gt "$SETTINGS" ".data.default_health_check_interval_s" "0" "Health check interval > 0"
     assert_json "$SETTINGS" ".data.max_global_connections" "0" "Default max global connections is 0 (unlimited)"
     assert_json "$SETTINGS" ".data.flood_threshold_rps" "0" "Default flood threshold is 0 (disabled)"
-
-    # Update default topology
-    UPDATED=$(api_put "/api/v1/settings" '{"default_topology_type":"docker_swarm"}')
-    assert_json "$UPDATED" ".data.default_topology_type" "docker_swarm" "Topology updated to docker_swarm"
-
-    # Reset
-    api_put "/api/v1/settings" '{"default_topology_type":"standard"}' >/dev/null
 
     # Max global connections setting
     MAXCONN=$(api_put "/api/v1/settings" '{"max_global_connections":50000}')
@@ -242,7 +234,7 @@ if [ -n "$SESSION" ]; then
         \"path_prefix\":\"/\",
         \"backend_ids\":[\"$B1_ID\",\"$B2_ID\"],
         \"load_balancing\":\"round_robin\",
-        \"topology_type\":\"standard\",
+
         \"waf_enabled\":true,
         \"waf_mode\":\"detection\"
     }")
@@ -250,7 +242,6 @@ if [ -n "$SESSION" ]; then
     assert_json "$R1" ".data.hostname" "test.local" "Route created for test.local"
     assert_json "$R1" ".data.waf_enabled" "true" "WAF enabled on route"
     assert_json "$R1" ".data.waf_mode" "detection" "WAF in detection mode"
-    assert_json "$R1" ".data.topology_type" "standard" "Route topology is standard"
 
     # Update to blocking mode
     R1_UPD=$(api_put "/api/v1/routes/$R1_ID" '{"waf_mode":"blocking"}')
@@ -742,8 +733,7 @@ if [ -n "$SESSION" ]; then
         \"hostname\":\"failover.local\",
         \"path_prefix\":\"/\",
         \"backend_ids\":[\"$DEAD_B_ID\",\"$B1_ID\"],
-        \"load_balancing\":\"round_robin\",
-        \"topology_type\":\"standard\"
+        \"load_balancing\":\"round_robin\"
     }")
     FO_ROUTE_ID=$(echo "$FO_ROUTE" | jq -r '.data.id')
     ok "Failover route created with 1 dead + 1 healthy backend"
@@ -3275,7 +3265,7 @@ if [ -n "$SESSION" ]; then
         \"path_prefix\":\"/\",
         \"backend_ids\":[\"$EWMA_B1_ID\",\"$EWMA_B2_ID\"],
         \"load_balancing\":\"peak_ewma\",
-        \"topology_type\":\"standard\",
+
         \"waf_enabled\":false
     }")
     EWMA_ROUTE_ID=$(echo "$EWMA_ROUTE" | jq -r '.data.id')
@@ -3333,7 +3323,7 @@ if [ -n "$SESSION" ]; then
         \"path_prefix\":\"/\",
         \"backend_ids\":[\"$CH_B1_ID\",\"$CH_B2_ID\"],
         \"load_balancing\":\"consistent_hash\",
-        \"topology_type\":\"standard\",
+
         \"waf_enabled\":false
     }")
     CH_ROUTE_ID=$(echo "$CH_ROUTE" | jq -r '.data.id')
@@ -3389,7 +3379,7 @@ if [ -n "$SESSION" ]; then
         \"path_prefix\":\"/\",
         \"backend_ids\":[\"$RND_B1_ID\",\"$RND_B2_ID\"],
         \"load_balancing\":\"random\",
-        \"topology_type\":\"standard\",
+
         \"waf_enabled\":false
     }")
     RND_ROUTE_ID=$(echo "$RND_ROUTE" | jq -r '.data.id')

@@ -13,7 +13,7 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, default_topology_type: 'standard', max_global_connections: 0, flood_threshold_rps: 0, waf_ban_threshold: 5, waf_ban_duration_s: 3600, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month' });
+  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, max_global_connections: 0, flood_threshold_rps: 0, waf_ban_threshold: 5, waf_ban_duration_s: 3600, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month' });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -582,14 +582,6 @@
         <div class="form-row">
           <label for="cert-crit">Certificate Critical Threshold (days)</label>
           <input id="cert-crit" type="number" bind:value={settingsForm.cert_critical_days} min="1" max="365" />
-        </div>
-        <div class="form-row">
-          <label for="default-topo">Default Topology Type</label>
-          <select id="default-topo" bind:value={settingsForm.default_topology_type}>
-            <option value="standard">Standard</option>
-            <option value="docker_swarm">Docker Swarm</option>
-            <option value="kubernetes">Kubernetes</option>
-          </select>
         </div>
         <div class="form-row">
           <label for="max-global-conn">Max Global Connections</label>

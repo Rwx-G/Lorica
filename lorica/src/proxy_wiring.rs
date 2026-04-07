@@ -1633,7 +1633,6 @@ mod tests {
             load_balancing: LoadBalancing::RoundRobin,
             waf_enabled: false,
             waf_mode: WafMode::Detection,
-            topology_type: TopologyType::Standard,
             enabled,
             force_https: false,
             redirect_hostname: None,

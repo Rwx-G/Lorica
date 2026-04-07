@@ -24,7 +24,6 @@ pub struct UpdateSettingsRequest {
     pub default_health_check_interval_s: Option<i32>,
     pub cert_warning_days: Option<i32>,
     pub cert_critical_days: Option<i32>,
-    pub default_topology_type: Option<String>,
     pub max_global_connections: Option<i32>,
     pub flood_threshold_rps: Option<i32>,
     pub waf_ban_threshold: Option<i32>,
@@ -79,11 +78,6 @@ pub async fn update_settings(
             ));
         }
         settings.cert_critical_days = days;
-    }
-    if let Some(ref topo) = body.default_topology_type {
-        settings.default_topology_type = topo
-            .parse::<lorica_config::models::TopologyType>()
-            .map_err(ApiError::BadRequest)?;
     }
     if let Some(max_conn) = body.max_global_connections {
         if max_conn < 0 {

@@ -127,7 +127,7 @@
         done: true,
         label: 'Review system settings',
         summary: 'Workers, notifications, global limits, and more.',
-        detail: 'The Settings page lets you configure notification channels (email, webhook) for alerts like backend down or certificate expiring. Global settings include max connections, flood defense threshold, and default topology. The System page shows worker health, CPU/memory, and process metrics.',
+        detail: 'The Settings page lets you configure notification channels (email, webhook) for alerts like backend down or certificate expiring. Global settings include max connections and flood defense threshold. The System page shows worker health, CPU/memory, and process metrics.',
         route: '/settings',
       },
     ];

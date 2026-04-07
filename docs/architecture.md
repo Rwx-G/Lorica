@@ -131,7 +131,6 @@ This document supplements the Pingora framework architecture by defining how new
 - `load_balancing`: TEXT - Algorithm: `round_robin`, `consistent_hash`, `random`, `peak_ewma`
 - `waf_enabled`: BOOLEAN - Whether WAF is active for this route
 - `waf_mode`: TEXT - `detection` or `blocking` (when WAF enabled)
-- `topology_type`: TEXT - `standard`, `docker_swarm`, `kubernetes`
 - `enabled`: BOOLEAN - Whether the route is active
 - `created_at`: TIMESTAMP
 - `updated_at`: TIMESTAMP
@@ -469,7 +468,6 @@ graph TB
       "certificate_id": "uuid",
       "load_balancing": "round_robin",
       "waf_enabled": false,
-      "topology_type": "standard",
       "enabled": true,
       "health_summary": {"healthy": 2, "degraded": 0, "down": 0}
     }
@@ -487,7 +485,6 @@ graph TB
   "backend_ids": ["uuid1"],
   "certificate_id": "uuid",
   "load_balancing": "round_robin",
-  "topology_type": "standard"
 }
 ```
 - **Response:** Created route object (201)

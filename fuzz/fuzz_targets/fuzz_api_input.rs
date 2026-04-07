@@ -9,7 +9,6 @@ fuzz_target!(|data: &[u8]| {
         // Fuzz model parsing
         let _ = serde_json::from_str::<lorica_config::models::GlobalSettings>(input);
         let _ = input.parse::<lorica_config::models::LoadBalancing>();
-        let _ = input.parse::<lorica_config::models::TopologyType>();
         let _ = input.parse::<lorica_config::models::WafMode>();
         let _ = input.parse::<lorica_config::models::HealthStatus>();
     }

@@ -68,36 +68,6 @@ impl FromStr for WafMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TopologyType {
-    Standard,
-    DockerSwarm,
-    Kubernetes,
-}
-
-impl TopologyType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::DockerSwarm => "docker_swarm",
-            Self::Kubernetes => "kubernetes",
-        }
-    }
-}
-
-impl FromStr for TopologyType {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "standard" | "single_vm" | "ha" | "custom" => Ok(Self::Standard),
-            "docker_swarm" => Ok(Self::DockerSwarm),
-            "kubernetes" => Ok(Self::Kubernetes),
-            other => Err(format!("unknown topology type: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum HealthStatus {
     Healthy,
     Degraded,
@@ -305,7 +275,6 @@ pub struct Route {
     pub load_balancing: LoadBalancing,
     pub waf_enabled: bool,
     pub waf_mode: WafMode,
-    pub topology_type: TopologyType,
     pub enabled: bool,
     #[serde(default)]
     pub force_https: bool,
@@ -476,8 +445,6 @@ pub struct GlobalSettings {
     pub cert_warning_days: i32,
     #[serde(default = "default_cert_critical_days")]
     pub cert_critical_days: i32,
-    #[serde(default = "default_topology_type")]
-    pub default_topology_type: TopologyType,
     #[serde(default = "default_max_active_probes")]
     pub max_active_probes: i32,
     #[serde(default = "default_loadtest_max_concurrency")]
@@ -586,10 +553,6 @@ fn default_cert_critical_days() -> i32 {
     7
 }
 
-fn default_topology_type() -> TopologyType {
-    TopologyType::Standard
-}
-
 fn default_max_active_probes() -> i32 {
     50
 }
@@ -626,7 +589,6 @@ impl Default for GlobalSettings {
             default_health_check_interval_s: 10,
             cert_warning_days: 30,
             cert_critical_days: 7,
-            default_topology_type: TopologyType::Standard,
             max_active_probes: 50,
             loadtest_max_concurrency: 100,
             loadtest_max_duration_s: 60,
@@ -856,33 +818,6 @@ mod tests {
     #[test]
     fn test_waf_mode_unknown() {
         assert!("permissive".parse::<WafMode>().is_err());
-    }
-
-    // ---- TopologyType ----
-
-    #[test]
-    fn test_topology_type_round_trip() {
-        for (s, variant) in [
-            ("standard", TopologyType::Standard),
-            ("docker_swarm", TopologyType::DockerSwarm),
-            ("kubernetes", TopologyType::Kubernetes),
-        ] {
-            assert_eq!(s.parse::<TopologyType>().unwrap(), variant);
-            assert_eq!(variant.as_str(), s);
-        }
-    }
-
-    #[test]
-    fn test_topology_type_backward_compat() {
-        // Old values should parse to Standard
-        for alias in ["single_vm", "ha", "custom"] {
-            assert_eq!(alias.parse::<TopologyType>().unwrap(), TopologyType::Standard);
-        }
-    }
-
-    #[test]
-    fn test_topology_type_unknown() {
-        assert!("bare_metal".parse::<TopologyType>().is_err());
     }
 
     // ---- HealthStatus ----
@@ -1115,7 +1050,6 @@ mod tests {
             "load_balancing": "round_robin",
             "waf_enabled": false,
             "waf_mode": "detection",
-            "topology_type": "standard",
             "enabled": true,
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
@@ -1150,7 +1084,6 @@ mod tests {
         assert_eq!(settings.loadtest_max_concurrency, 100);
         assert_eq!(settings.loadtest_max_duration_s, 60);
         assert_eq!(settings.loadtest_max_rps, 1000);
-        assert_eq!(settings.default_topology_type, TopologyType::Standard);
     }
 
     #[test]

@@ -2094,9 +2094,6 @@ components:
           enum: [round_robin, consistent_hash, random, peak_ewma]
         waf_enabled:
           type: boolean
-        topology_type:
-          type: string
-          enum: [standard, docker_swarm, kubernetes]
         enabled:
           type: boolean
         created_at:
@@ -2127,10 +2124,6 @@ components:
           type: string
           enum: [round_robin, consistent_hash, random, peak_ewma]
           default: round_robin
-        topology_type:
-          type: string
-          enum: [standard, docker_swarm, kubernetes]
-          default: standard
 
     UpdateRouteRequest:
       type: object
@@ -2150,9 +2143,6 @@ components:
         load_balancing:
           type: string
           enum: [round_robin, consistent_hash, random, peak_ewma]
-        topology_type:
-          type: string
-          enum: [standard, docker_swarm, kubernetes]
         enabled:
           type: boolean
 

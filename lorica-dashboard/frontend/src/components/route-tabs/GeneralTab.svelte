@@ -23,12 +23,6 @@
     { value: 'peak_ewma', label: 'Peak EWMA' },
   ];
 
-  const topologyOptions = [
-    { value: 'standard', label: 'Standard' },
-    { value: 'docker_swarm', label: 'Docker Swarm' },
-    { value: 'kubernetes', label: 'Kubernetes' },
-  ];
-
   function handleHostnameBlur() {
     hostnameError = validateHostname(form.hostname);
   }
@@ -100,26 +94,14 @@
     </select>
   </div>
 
-  <div class="form-row">
-    <div class="form-group" class:modified={isModified('load_balancing')}>
-      <label for="lb">Load Balancing</label>
-      {#if isImported('load_balancing')}<span class="imported-badge">imported</span>{/if}
-      <select id="lb" bind:value={form.load_balancing}>
-        {#each loadBalancingOptions as opt}
-          <option value={opt.value}>{opt.label}</option>
-        {/each}
-      </select>
-    </div>
-
-    <div class="form-group" class:modified={isModified('topology_type')}>
-      <label for="topo">Topology</label>
-      {#if isImported('topology_type')}<span class="imported-badge">imported</span>{/if}
-      <select id="topo" bind:value={form.topology_type}>
-        {#each topologyOptions as opt}
-          <option value={opt.value}>{opt.label}</option>
-        {/each}
-      </select>
-    </div>
+  <div class="form-group" class:modified={isModified('load_balancing')}>
+    <label for="lb">Load Balancing</label>
+    {#if isImported('load_balancing')}<span class="imported-badge">imported</span>{/if}
+    <select id="lb" bind:value={form.load_balancing}>
+      {#each loadBalancingOptions as opt}
+        <option value={opt.value}>{opt.label}</option>
+      {/each}
+    </select>
   </div>
 
   <div class="form-group" class:modified={isModified('waf_enabled')}>
@@ -232,12 +214,6 @@
   .form-group select:focus {
     outline: none;
     border-color: var(--color-primary);
-  }
-
-  .form-row {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 1rem;
   }
 
   .checkbox-list {
