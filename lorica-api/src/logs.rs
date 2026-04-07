@@ -27,6 +27,9 @@ pub struct LogEntry {
     /// Whether the client IP was extracted from X-Forwarded-For header.
     #[serde(default)]
     pub is_xff: bool,
+    /// Request source identifier (e.g., "loadtest" from X-Lorica-Source header).
+    #[serde(default)]
+    pub source: String,
 }
 
 /// Thread-safe in-memory ring buffer for access logs with real-time broadcast.
@@ -312,6 +315,7 @@ mod tests {
                 error: None,
                 client_ip: String::new(),
                 is_xff: false,
+                source: String::new(),
             })
             .await;
         }
@@ -339,6 +343,7 @@ mod tests {
                 error: None,
                 client_ip: String::new(),
                 is_xff: false,
+                source: String::new(),
             })
             .await;
         }
@@ -366,6 +371,7 @@ mod tests {
             error: None,
             client_ip: String::new(),
             is_xff: false,
+            source: String::new(),
         })
         .await;
 

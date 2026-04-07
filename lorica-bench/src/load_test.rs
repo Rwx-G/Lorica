@@ -363,6 +363,7 @@ impl LoadTestEngine {
                         _ => client.get(&url),
                     };
 
+                    request = request.header("X-Lorica-Source", "loadtest");
                     for (key, value) in &headers {
                         request = request.header(key.as_str(), value.as_str());
                     }

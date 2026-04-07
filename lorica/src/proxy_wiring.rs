@@ -370,6 +370,8 @@ pub struct RequestCtx {
     pub client_ip: Option<String>,
     /// Whether the client IP was extracted from X-Forwarded-For header.
     pub is_xff: bool,
+    /// Request source (from X-Lorica-Source header, e.g., "loadtest").
+    pub source: String,
     /// Per-route connection counter for max_connections enforcement.
     /// Stored here so the counter is decremented in `logging()` when the request ends.
     pub route_conn_counter: Option<Arc<AtomicU64>>,
@@ -493,6 +495,7 @@ impl ProxyHttp for LoricaProxy {
             access_log_enabled: true,
             client_ip: None,
             is_xff: false,
+            source: String::new(),
             route_conn_counter: None,
             rate_limit_info: None,
             retry_count: 0,
@@ -555,9 +558,15 @@ impl ProxyHttp for LoricaProxy {
             .map(|xff| xff.split(',').next().unwrap_or(xff).trim().to_string())
             .or(client_ip);
 
-        // Store client IP in context for access logging
+        // Store client IP and source in context for access logging
         ctx.client_ip = check_ip.clone();
         ctx.is_xff = has_xff && check_ip.is_some();
+        ctx.source = req
+            .headers
+            .get("x-lorica-source")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
 
         // Ban list check (before any other processing for banned IPs)
         if let Some(ref ip) = check_ip {
@@ -1554,6 +1563,7 @@ impl ProxyHttp for LoricaProxy {
                 error: error_str,
                 client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
                 is_xff: ctx.is_xff,
+                source: ctx.source.clone(),
             };
             if let Some(ref store) = self.log_store {
                 if let Err(e) = store.insert(&entry) {

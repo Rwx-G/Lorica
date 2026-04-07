@@ -260,9 +260,15 @@
                 <span class="method-badge">{entry.method}</span>
               </td>
               <td class="mono ip-col">
-                {entry.client_ip || '-'}
-                {#if entry.is_xff}
-                  <span class="xff-indicator" title="IP from X-Forwarded-For (proxy forwarded)">(i)</span>
+                {#if entry.source === 'loadtest'}
+                  <span class="source-badge loadtest" title="Request from Lorica load test engine">Load Test</span>
+                {:else if entry.client_ip === '127.0.0.1' && !entry.is_xff}
+                  <span class="source-badge internal" title="Request from localhost (health check or internal)">Internal</span>
+                {:else}
+                  {entry.client_ip || '-'}
+                  {#if entry.is_xff}
+                    <span class="xff-indicator" title="IP from X-Forwarded-For (proxy forwarded)">(i)</span>
+                  {/if}
                 {/if}
               </td>
               <td class="host-col">{entry.host}</td>
@@ -400,6 +406,25 @@
     color: var(--color-primary);
     margin-left: 0.25rem;
     cursor: help;
+  }
+
+  .source-badge {
+    display: inline-block;
+    font-size: 0.625rem;
+    font-weight: 600;
+    padding: 0.1rem 0.375rem;
+    border-radius: 9999px;
+    cursor: help;
+  }
+
+  .source-badge.loadtest {
+    background: rgba(245, 158, 11, 0.15);
+    color: var(--color-orange);
+  }
+
+  .source-badge.internal {
+    background: rgba(148, 163, 184, 0.15);
+    color: var(--color-text-muted);
   }
 
   .host-col {
