@@ -751,6 +751,13 @@
               {/each}
             </div>
 
+            {#if importRoutes.some((r) => r.certificate_needed)}
+              <div class="cert-notice">
+                <strong>TLS certificates needed</strong>
+                <p>The imported route(s) had SSL certificates configured in Nginx. Upload or provision the certificates in the Certificates page, then assign them to the imported route(s) in the Route Drawer to enable HTTPS.</p>
+              </div>
+            {/if}
+
             <div class="step-actions">
               <button class="btn btn-primary" onclick={handleFinish}>Close</button>
             </div>
@@ -1414,5 +1421,23 @@
   .result-error {
     color: var(--color-red);
     font-size: var(--text-xs);
+  }
+
+  .cert-notice {
+    padding: var(--space-3) var(--space-4);
+    border-radius: var(--radius-md);
+    background: var(--color-primary-subtle);
+    border: 1px solid var(--color-primary);
+    font-size: var(--text-sm);
+    margin-top: var(--space-3);
+  }
+
+  .cert-notice strong {
+    color: var(--color-primary);
+  }
+
+  .cert-notice p {
+    margin: var(--space-1) 0 0;
+    color: var(--color-text-muted);
   }
 </style>
