@@ -73,6 +73,34 @@ export interface StatusResponse {
   certificates_expiring_soon: number;
 }
 
+export interface PathRuleResponse {
+  path: string;
+  match_type: string;
+  backend_ids?: string[];
+  cache_enabled?: boolean;
+  cache_ttl_s?: number;
+  response_headers?: Record<string, string>;
+  response_headers_remove?: string[];
+  rate_limit_rps?: number;
+  rate_limit_burst?: number;
+  redirect_to?: string;
+  return_status?: number;
+}
+
+export interface PathRuleRequest {
+  path: string;
+  match_type?: string;
+  backend_ids?: string[];
+  cache_enabled?: boolean;
+  cache_ttl_s?: number;
+  response_headers?: Record<string, string>;
+  response_headers_remove?: string[];
+  rate_limit_rps?: number;
+  rate_limit_burst?: number;
+  redirect_to?: string;
+  return_status?: number;
+}
+
 export interface RouteResponse {
   id: string;
   hostname: string;
@@ -118,6 +146,8 @@ export interface RouteResponse {
   slowloris_threshold_ms: number;
   auto_ban_threshold: number | null;
   auto_ban_duration_s: number;
+  path_rules: PathRuleResponse[];
+  return_status: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -165,6 +195,8 @@ export interface CreateRouteRequest {
   slowloris_threshold_ms?: number;
   auto_ban_threshold?: number;
   auto_ban_duration_s?: number;
+  path_rules?: PathRuleRequest[];
+  return_status?: number;
 }
 
 export interface UpdateRouteRequest {
@@ -211,6 +243,8 @@ export interface UpdateRouteRequest {
   slowloris_threshold_ms?: number;
   auto_ban_threshold?: number;
   auto_ban_duration_s?: number;
+  path_rules?: PathRuleRequest[];
+  return_status?: number;
 }
 
 export interface BackendResponse {

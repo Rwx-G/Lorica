@@ -268,6 +268,8 @@ fn route_eq(a: &Route, b: &Route) -> bool {
         && a.redirect_to == b.redirect_to
         && a.path_rewrite_pattern == b.path_rewrite_pattern
         && a.path_rewrite_replacement == b.path_rewrite_replacement
+        && a.path_rules.len() == b.path_rules.len()
+        && a.return_status == b.return_status
 }
 
 fn backend_eq(a: &Backend, b: &Backend) -> bool {

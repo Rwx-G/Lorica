@@ -583,6 +583,8 @@ mod tests {
             slowloris_threshold_ms: 5000,
             auto_ban_threshold: None,
             auto_ban_duration_s: 3600,
+            path_rules: vec![],
+            return_status: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -670,6 +672,8 @@ mod tests {
             slowloris_threshold_ms: 5000,
             auto_ban_threshold: None,
             auto_ban_duration_s: 3600,
+            path_rules: vec![],
+            return_status: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -772,6 +776,8 @@ mod tests {
             slowloris_threshold_ms: 5000,
             auto_ban_threshold: None,
             auto_ban_duration_s: 3600,
+            path_rules: vec![],
+            return_status: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -859,6 +865,8 @@ mod tests {
             slowloris_threshold_ms: 5000,
             auto_ban_threshold: None,
             auto_ban_duration_s: 3600,
+            path_rules: vec![],
+            return_status: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -929,6 +937,8 @@ mod tests {
             slowloris_threshold_ms: 5000,
             auto_ban_threshold: None,
             auto_ban_duration_s: 3600,
+            path_rules: vec![],
+            return_status: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

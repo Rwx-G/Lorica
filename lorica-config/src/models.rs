@@ -189,6 +189,73 @@ impl FromStr for PreferenceValue {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathMatchType {
+    Prefix,
+    Exact,
+}
+
+impl Default for PathMatchType {
+    fn default() -> Self {
+        Self::Prefix
+    }
+}
+
+impl PathMatchType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Prefix => "prefix",
+            Self::Exact => "exact",
+        }
+    }
+}
+
+impl FromStr for PathMatchType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "prefix" => Ok(Self::Prefix),
+            "exact" => Ok(Self::Exact),
+            other => Err(format!("unknown path match type: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PathRule {
+    pub path: String,
+    #[serde(default)]
+    pub match_type: PathMatchType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_s: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers_remove: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_rps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_burst: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_status: Option<u16>,
+}
+
+impl PathRule {
+    pub fn matches(&self, request_path: &str) -> bool {
+        match self.match_type {
+            PathMatchType::Prefix => request_path.starts_with(&self.path),
+            PathMatchType::Exact => request_path == self.path,
+        }
+    }
+}
+
 // --- Security Header Presets ---
 
 /// A named collection of HTTP security headers that can be applied to routes.
@@ -349,8 +416,43 @@ pub struct Route {
     pub auto_ban_threshold: Option<u32>,
     #[serde(default = "default_auto_ban_duration_s")]
     pub auto_ban_duration_s: i32,
+    #[serde(default)]
+    pub path_rules: Vec<PathRule>,
+    #[serde(default)]
+    pub return_status: Option<u16>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Route {
+    pub fn with_path_rule_overrides(&self, rule: &PathRule) -> Route {
+        let mut r = self.clone();
+        if let Some(ref h) = rule.response_headers {
+            r.response_headers = h.clone();
+        }
+        if let Some(ref h) = rule.response_headers_remove {
+            r.response_headers_remove = h.clone();
+        }
+        if let Some(v) = rule.cache_enabled {
+            r.cache_enabled = v;
+        }
+        if let Some(v) = rule.cache_ttl_s {
+            r.cache_ttl_s = v;
+        }
+        if let Some(v) = rule.rate_limit_rps {
+            r.rate_limit_rps = Some(v);
+        }
+        if let Some(v) = rule.rate_limit_burst {
+            r.rate_limit_burst = Some(v);
+        }
+        if rule.redirect_to.is_some() {
+            r.redirect_to = rule.redirect_to.clone();
+        }
+        if rule.return_status.is_some() {
+            r.return_status = rule.return_status;
+        }
+        r
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1098,5 +1200,124 @@ mod tests {
         let deserialized: SecurityHeaderPreset = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, "custom");
         assert_eq!(deserialized.headers["X-Custom"], "value");
+    }
+
+    // ---- PathMatchType ----
+
+    #[test]
+    fn test_path_match_type_round_trip() {
+        for (s, variant) in [
+            ("prefix", PathMatchType::Prefix),
+            ("exact", PathMatchType::Exact),
+        ] {
+            assert_eq!(s.parse::<PathMatchType>().unwrap(), variant);
+            assert_eq!(variant.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn test_path_match_type_unknown() {
+        assert!("regex".parse::<PathMatchType>().is_err());
+    }
+
+    // ---- PathRule ----
+
+    #[test]
+    fn test_path_rule_matches_prefix() {
+        let rule = PathRule {
+            path: "/api/".to_string(),
+            match_type: PathMatchType::Prefix,
+            ..Default::default()
+        };
+        assert!(rule.matches("/api/users"));
+        assert!(rule.matches("/api/"));
+        assert!(!rule.matches("/other"));
+    }
+
+    #[test]
+    fn test_path_rule_matches_exact() {
+        let rule = PathRule {
+            path: "/health".to_string(),
+            match_type: PathMatchType::Exact,
+            ..Default::default()
+        };
+        assert!(rule.matches("/health"));
+        assert!(!rule.matches("/health/check"));
+        assert!(!rule.matches("/healthz"));
+    }
+
+    // ---- Route::with_path_rule_overrides ----
+
+    #[test]
+    fn test_route_with_path_rule_overrides_applies_some_fields() {
+        let now = chrono::Utc::now();
+        let route = Route {
+            id: "r1".to_string(),
+            hostname: "example.com".to_string(),
+            path_prefix: "/".to_string(),
+            certificate_id: None,
+            load_balancing: LoadBalancing::RoundRobin,
+            waf_enabled: false,
+            waf_mode: WafMode::Detection,
+            enabled: true,
+            force_https: false,
+            redirect_hostname: None,
+            redirect_to: None,
+            hostname_aliases: vec![],
+            proxy_headers: HashMap::new(),
+            response_headers: HashMap::new(),
+            security_headers: "moderate".to_string(),
+            connect_timeout_s: 5,
+            read_timeout_s: 60,
+            send_timeout_s: 60,
+            strip_path_prefix: None,
+            add_path_prefix: None,
+            path_rewrite_pattern: None,
+            path_rewrite_replacement: None,
+            access_log_enabled: true,
+            proxy_headers_remove: vec![],
+            response_headers_remove: vec![],
+            max_request_body_bytes: None,
+            websocket_enabled: true,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            ip_allowlist: vec![],
+            ip_denylist: vec![],
+            cors_allowed_origins: vec![],
+            cors_allowed_methods: vec![],
+            cors_max_age_s: None,
+            compression_enabled: false,
+            retry_attempts: None,
+            cache_enabled: false,
+            cache_ttl_s: 300,
+            cache_max_bytes: 52428800,
+            max_connections: None,
+            slowloris_threshold_ms: 5000,
+            auto_ban_threshold: None,
+            auto_ban_duration_s: 3600,
+            path_rules: vec![],
+            return_status: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let rule = PathRule {
+            path: "/api/".to_string(),
+            match_type: PathMatchType::Prefix,
+            cache_enabled: Some(true),
+            cache_ttl_s: Some(60),
+            rate_limit_rps: Some(100),
+            return_status: Some(503),
+            ..Default::default()
+        };
+
+        let overridden = route.with_path_rule_overrides(&rule);
+        assert!(overridden.cache_enabled);
+        assert_eq!(overridden.cache_ttl_s, 60);
+        assert_eq!(overridden.rate_limit_rps, Some(100));
+        assert_eq!(overridden.return_status, Some(503));
+        // Fields not in the rule remain unchanged
+        assert_eq!(overridden.hostname, "example.com");
+        assert!(!overridden.force_https);
     }
 }

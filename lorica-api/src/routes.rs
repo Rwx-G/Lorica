@@ -10,6 +10,45 @@ use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
 
 #[derive(Serialize)]
+pub struct PathRuleResponse {
+    pub path: String,
+    pub match_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_s: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_headers_remove: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_rps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_burst: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_status: Option<u16>,
+}
+
+#[derive(Deserialize)]
+pub struct PathRuleRequest {
+    pub path: String,
+    pub match_type: Option<String>,
+    pub backend_ids: Option<Vec<String>>,
+    pub cache_enabled: Option<bool>,
+    pub cache_ttl_s: Option<i32>,
+    pub response_headers: Option<HashMap<String, String>>,
+    pub response_headers_remove: Option<Vec<String>>,
+    pub rate_limit_rps: Option<u32>,
+    pub rate_limit_burst: Option<u32>,
+    pub redirect_to: Option<String>,
+    pub return_status: Option<u16>,
+}
+
+#[derive(Serialize)]
 pub struct RouteResponse {
     pub id: String,
     pub hostname: String,
@@ -55,6 +94,9 @@ pub struct RouteResponse {
     pub slowloris_threshold_ms: i32,
     pub auto_ban_threshold: Option<u32>,
     pub auto_ban_duration_s: i32,
+    pub path_rules: Vec<PathRuleResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_status: Option<u16>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -103,6 +145,8 @@ pub struct CreateRouteRequest {
     pub slowloris_threshold_ms: Option<i32>,
     pub auto_ban_threshold: Option<u32>,
     pub auto_ban_duration_s: Option<i32>,
+    pub path_rules: Option<Vec<PathRuleRequest>>,
+    pub return_status: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +194,8 @@ pub struct UpdateRouteRequest {
     pub slowloris_threshold_ms: Option<i32>,
     pub auto_ban_threshold: Option<u32>,
     pub auto_ban_duration_s: Option<i32>,
+    pub path_rules: Option<Vec<PathRuleRequest>>,
+    pub return_status: Option<u16>,
 }
 
 fn route_to_response(
@@ -201,6 +247,24 @@ fn route_to_response(
         slowloris_threshold_ms: route.slowloris_threshold_ms,
         auto_ban_threshold: route.auto_ban_threshold,
         auto_ban_duration_s: route.auto_ban_duration_s,
+        path_rules: route
+            .path_rules
+            .iter()
+            .map(|pr| PathRuleResponse {
+                path: pr.path.clone(),
+                match_type: pr.match_type.as_str().to_string(),
+                backend_ids: pr.backend_ids.clone(),
+                cache_enabled: pr.cache_enabled,
+                cache_ttl_s: pr.cache_ttl_s,
+                response_headers: pr.response_headers.clone(),
+                response_headers_remove: pr.response_headers_remove.clone(),
+                rate_limit_rps: pr.rate_limit_rps,
+                rate_limit_burst: pr.rate_limit_burst,
+                redirect_to: pr.redirect_to.clone(),
+                return_status: pr.return_status,
+            })
+            .collect(),
+        return_status: route.return_status,
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -242,6 +306,40 @@ pub async fn create_route(
         .unwrap_or("detection")
         .parse::<lorica_config::models::WafMode>()
         .map_err(ApiError::BadRequest)?;
+
+    let path_rules = if let Some(ref prs) = body.path_rules {
+        let mut rules = Vec::with_capacity(prs.len());
+        for pr in prs {
+            if !pr.path.starts_with('/') {
+                return Err(ApiError::BadRequest(format!(
+                    "path_rule path must start with '/': {}",
+                    pr.path
+                )));
+            }
+            let match_type = pr
+                .match_type
+                .as_deref()
+                .unwrap_or("prefix")
+                .parse::<lorica_config::models::PathMatchType>()
+                .map_err(ApiError::BadRequest)?;
+            rules.push(lorica_config::models::PathRule {
+                path: pr.path.clone(),
+                match_type,
+                backend_ids: pr.backend_ids.clone(),
+                cache_enabled: pr.cache_enabled,
+                cache_ttl_s: pr.cache_ttl_s,
+                response_headers: pr.response_headers.clone(),
+                response_headers_remove: pr.response_headers_remove.clone(),
+                rate_limit_rps: pr.rate_limit_rps,
+                rate_limit_burst: pr.rate_limit_burst,
+                redirect_to: pr.redirect_to.clone(),
+                return_status: pr.return_status,
+            });
+        }
+        rules
+    } else {
+        Vec::new()
+    };
 
     let now = Utc::now();
     let route = lorica_config::models::Route {
@@ -290,6 +388,8 @@ pub async fn create_route(
         slowloris_threshold_ms: body.slowloris_threshold_ms.unwrap_or(5000),
         auto_ban_threshold: body.auto_ban_threshold,
         auto_ban_duration_s: body.auto_ban_duration_s.unwrap_or(3600),
+        path_rules,
+        return_status: body.return_status,
         created_at: now,
         updated_at: now,
     };
@@ -485,6 +585,40 @@ pub async fn update_route(
     }
     if let Some(auto_ban_duration_s) = body.auto_ban_duration_s {
         route.auto_ban_duration_s = auto_ban_duration_s;
+    }
+    if let Some(ref prs) = body.path_rules {
+        let mut rules = Vec::with_capacity(prs.len());
+        for pr in prs {
+            if !pr.path.starts_with('/') {
+                return Err(ApiError::BadRequest(format!(
+                    "path_rule path must start with '/': {}",
+                    pr.path
+                )));
+            }
+            let match_type = pr
+                .match_type
+                .as_deref()
+                .unwrap_or("prefix")
+                .parse::<lorica_config::models::PathMatchType>()
+                .map_err(ApiError::BadRequest)?;
+            rules.push(lorica_config::models::PathRule {
+                path: pr.path.clone(),
+                match_type,
+                backend_ids: pr.backend_ids.clone(),
+                cache_enabled: pr.cache_enabled,
+                cache_ttl_s: pr.cache_ttl_s,
+                response_headers: pr.response_headers.clone(),
+                response_headers_remove: pr.response_headers_remove.clone(),
+                rate_limit_rps: pr.rate_limit_rps,
+                rate_limit_burst: pr.rate_limit_burst,
+                redirect_to: pr.redirect_to.clone(),
+                return_status: pr.return_status,
+            });
+        }
+        route.path_rules = rules;
+    }
+    if let Some(return_status) = body.return_status {
+        route.return_status = Some(return_status);
     }
     route.updated_at = Utc::now();
 

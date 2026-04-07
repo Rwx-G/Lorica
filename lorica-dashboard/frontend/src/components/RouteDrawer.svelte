@@ -20,6 +20,7 @@
   import CorsTab from './route-tabs/CorsTab.svelte';
   import CachingTab from './route-tabs/CachingTab.svelte';
   import ProtectionTab from './route-tabs/ProtectionTab.svelte';
+  import PathRulesTab from './route-tabs/PathRulesTab.svelte';
 
   interface Props {
     open: boolean;
@@ -48,6 +49,7 @@
     { id: 'cors', label: 'CORS' },
     { id: 'caching', label: 'Caching' },
     { id: 'protection', label: 'Protection' },
+    { id: 'path_rules', label: 'Path Rules' },
   ];
 
   // Reset form when drawer opens - untrack body so form/editing changes
@@ -198,6 +200,8 @@
           <CachingTab bind:form={form} {importedFields} />
         {:else if activeTab === 'protection'}
           <ProtectionTab bind:form={form} {importedFields} />
+        {:else if activeTab === 'path_rules'}
+          <PathRulesTab bind:form={form} {backends} {importedFields} />
         {/if}
       </div>
 

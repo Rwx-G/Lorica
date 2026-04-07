@@ -1,4 +1,18 @@
-import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest } from './api';
+import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest } from './api';
+
+export interface PathRuleFormState {
+  path: string;
+  match_type: string;
+  backend_ids: string[];
+  cache_enabled: boolean | null;
+  cache_ttl_s: number | null;
+  response_headers: string;
+  response_headers_remove: string;
+  rate_limit_rps: string;
+  rate_limit_burst: string;
+  redirect_to: string;
+  return_status: string;
+}
 
 export interface RouteFormState {
   hostname: string;
@@ -44,6 +58,8 @@ export interface RouteFormState {
   slowloris_threshold_ms: number;
   auto_ban_threshold: string;
   auto_ban_duration_s: number;
+  path_rules: PathRuleFormState[];
+  return_status: string;
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -90,6 +106,8 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   slowloris_threshold_ms: 5000,
   auto_ban_threshold: '',
   auto_ban_duration_s: 3600,
+  path_rules: [],
+  return_status: '',
 };
 
 // Tab field mappings for dot indicators
@@ -97,7 +115,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   general: [
     'hostname', 'path_prefix', 'force_https', 'redirect_hostname', 'redirect_to',
     'hostname_aliases', 'websocket_enabled', 'access_log_enabled',
-    'compression_enabled', 'waf_enabled',
+    'compression_enabled', 'waf_enabled', 'return_status',
   ],
   timeouts: [
     'connect_timeout_s', 'read_timeout_s', 'send_timeout_s',
@@ -121,6 +139,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'max_connections', 'slowloris_threshold_ms',
     'auto_ban_threshold', 'auto_ban_duration_s',
   ],
+  path_rules: ['path_rules'],
 };
 
 function recordToText(rec: Record<string, string>): string {
@@ -193,7 +212,39 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     slowloris_threshold_ms: route.slowloris_threshold_ms,
     auto_ban_threshold: route.auto_ban_threshold != null ? String(route.auto_ban_threshold) : '',
     auto_ban_duration_s: route.auto_ban_duration_s,
+    path_rules: (route.path_rules ?? []).map((r) => ({
+      path: r.path,
+      match_type: r.match_type ?? 'prefix',
+      backend_ids: r.backend_ids ?? [],
+      cache_enabled: r.cache_enabled ?? null,
+      cache_ttl_s: r.cache_ttl_s ?? null,
+      response_headers: r.response_headers ? recordToText(r.response_headers) : '',
+      response_headers_remove: r.response_headers_remove ? r.response_headers_remove.join(', ') : '',
+      rate_limit_rps: r.rate_limit_rps != null ? String(r.rate_limit_rps) : '',
+      rate_limit_burst: r.rate_limit_burst != null ? String(r.rate_limit_burst) : '',
+      redirect_to: r.redirect_to ?? '',
+      return_status: r.return_status != null ? String(r.return_status) : '',
+    })),
+    return_status: route.return_status != null ? String(route.return_status) : '',
   };
+}
+
+function pathRuleFormToRequest(rules: PathRuleFormState[]): PathRuleRequest[] | undefined {
+  if (rules.length === 0) return undefined;
+  return rules.map((r) => {
+    const req: PathRuleRequest = { path: r.path };
+    if (r.match_type) req.match_type = r.match_type;
+    if (r.backend_ids.length > 0) req.backend_ids = r.backend_ids;
+    if (r.cache_enabled != null) req.cache_enabled = r.cache_enabled;
+    if (r.cache_ttl_s != null) req.cache_ttl_s = r.cache_ttl_s;
+    if (r.response_headers.trim()) req.response_headers = textToRecord(r.response_headers);
+    if (csvToArray(r.response_headers_remove).length > 0) req.response_headers_remove = csvToArray(r.response_headers_remove);
+    if (r.rate_limit_rps) req.rate_limit_rps = Number(r.rate_limit_rps);
+    if (r.rate_limit_burst) req.rate_limit_burst = Number(r.rate_limit_burst);
+    if (r.redirect_to) req.redirect_to = r.redirect_to;
+    if (r.return_status) req.return_status = Number(r.return_status);
+    return req;
+  });
 }
 
 function buildAdvancedFields(form: RouteFormState) {
@@ -233,6 +284,8 @@ function buildAdvancedFields(form: RouteFormState) {
     slowloris_threshold_ms: form.slowloris_threshold_ms,
     auto_ban_threshold: form.auto_ban_threshold ? Number(form.auto_ban_threshold) : undefined,
     auto_ban_duration_s: form.auto_ban_duration_s,
+    path_rules: pathRuleFormToRequest(form.path_rules),
+    return_status: form.return_status ? Number(form.return_status) : undefined,
   };
 }
 
@@ -266,6 +319,10 @@ export function formStateToUpdateRequest(form: RouteFormState): UpdateRouteReque
 export function getModifiedFields(form: RouteFormState): Set<string> {
   const modified = new Set<string>();
   for (const key of Object.keys(ROUTE_DEFAULTS) as (keyof RouteFormState)[]) {
+    if (key === 'path_rules') {
+      if (form.path_rules.length > 0) modified.add(key);
+      continue;
+    }
     const defaultVal = ROUTE_DEFAULTS[key];
     const currentVal = form[key];
     if (Array.isArray(defaultVal) && Array.isArray(currentVal)) {

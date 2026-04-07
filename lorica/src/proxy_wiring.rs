@@ -50,6 +50,9 @@ pub struct RouteEntry {
     pub rr_counter: Arc<AtomicUsize>,
     /// Precompiled regex for path rewriting (None if not configured).
     pub path_rewrite_regex: Option<regex::Regex>,
+    /// Resolved backends per path rule (parallel to route.path_rules).
+    /// None = inherit route backends, Some = override with these backends.
+    pub path_rule_backends: Vec<Option<Vec<Backend>>>,
 }
 
 /// In-memory configuration snapshot used by the proxy.
@@ -130,6 +133,18 @@ impl ProxyConfig {
                 .as_ref()
                 .and_then(|cid| cert_map.get(cid).cloned());
 
+            let path_rule_backends: Vec<Option<Vec<Backend>>> = route
+                .path_rules
+                .iter()
+                .map(|rule| {
+                    rule.backend_ids.as_ref().map(|ids| {
+                        ids.iter()
+                            .filter_map(|id| backend_map.get(id).cloned())
+                            .collect()
+                    })
+                })
+                .collect();
+
             let path_rewrite_regex = route.path_rewrite_pattern.as_ref().and_then(|p| {
                 if p.is_empty() {
                     None
@@ -155,6 +170,7 @@ impl ProxyConfig {
                 certificate,
                 rr_counter: Arc::new(AtomicUsize::new(0)),
                 path_rewrite_regex,
+                path_rule_backends,
             };
 
             routes_by_host
@@ -236,6 +252,16 @@ impl ProxyConfig {
                 {
                     return Some(entry);
                 }
+            }
+        }
+
+        // 3. Catch-all hostname "_" (last resort)
+        if let Some(entries) = self.routes_by_host.get("_") {
+            if let Some(entry) = entries
+                .iter()
+                .find(|e| path.starts_with(&e.route.path_prefix))
+            {
+                return Some(entry);
             }
         }
 
@@ -383,6 +409,8 @@ pub struct RequestCtx {
     pub rate_limit_info: Option<(u32, f64)>,
     /// Retry counter for upstream connection failures.
     pub retry_count: u32,
+    /// Backends overridden by a matched path rule (None = use route backends).
+    pub matched_backends: Option<Vec<Backend>>,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -502,6 +530,7 @@ impl ProxyHttp for LoricaProxy {
             route_conn_counter: None,
             rate_limit_info: None,
             retry_count: 0,
+            matched_backends: None,
         }
     }
 
@@ -716,8 +745,46 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Redirect to external URL
-        if let Some(ref target) = entry.route.redirect_to {
+        // Path rule matching (first match wins, overrides route config)
+        for (i, rule) in entry.route.path_rules.iter().enumerate() {
+            if rule.matches(path) {
+                let effective = entry.route.with_path_rule_overrides(rule);
+                ctx.route_snapshot = Some(effective);
+                if rule.backend_ids.is_some() {
+                    if let Some(ref backends) = entry.path_rule_backends[i] {
+                        ctx.matched_backends = Some(backends.clone());
+                    }
+                }
+                break;
+            }
+        }
+
+        // Direct status response (return_status)
+        if let Some(status) = ctx.route_snapshot.as_ref().and_then(|r| r.return_status) {
+            if let Some(ref target) = ctx.route_snapshot.as_ref().and_then(|r| r.redirect_to.clone())
+            {
+                // return_status + redirect_to = redirect with specific status code
+                let redir_path = req.uri.path();
+                let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                let base = target.trim_end_matches('/');
+                let location = format!("{base}{redir_path}{redir_query}");
+                let mut header = lorica_http::ResponseHeader::build(status as u16, None)?;
+                header.insert_header("Location", &location)?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+            } else {
+                // return_status alone = direct response with empty body
+                let header = lorica_http::ResponseHeader::build(status as u16, None)?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+            }
+            return Ok(true);
+        }
+
+        // Redirect to external URL (read from snapshot, path rules may have overridden it)
+        if let Some(ref target) = ctx.route_snapshot.as_ref().and_then(|r| r.redirect_to.clone()) {
             let redir_path = req.uri.path();
             let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
             let base = target.trim_end_matches('/');
@@ -1185,9 +1252,13 @@ impl ProxyHttp for LoricaProxy {
             ctx.access_log_enabled = entry.route.access_log_enabled;
         }
 
-        // Filter healthy backends
-        let healthy_backends: Vec<&Backend> = entry
-            .backends
+        // Filter healthy backends (use path-rule override if set)
+        let backends_source = if let Some(ref overridden) = ctx.matched_backends {
+            overridden
+        } else {
+            &entry.backends
+        };
+        let healthy_backends: Vec<&Backend> = backends_source
             .iter()
             .filter(|b| {
                 b.health_status != HealthStatus::Down && b.lifecycle_state == LifecycleState::Normal
@@ -1683,6 +1754,8 @@ mod tests {
             slowloris_threshold_ms: 5000,
             auto_ban_threshold: None,
             auto_ban_duration_s: 3600,
+            path_rules: vec![],
+            return_status: None,
             created_at: now,
             updated_at: now,
         }
@@ -2584,5 +2657,113 @@ mod tests {
             rate, 0.0,
             "Rate should decay to 0 after 2 intervals of silence"
         );
+    }
+
+    // ---- Catch-all Hostname ----
+
+    #[test]
+    fn test_catch_all_hostname() {
+        let route = make_route("r_catch", "_", "/", true);
+        let config =
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
+
+        // Catch-all "_" should match any hostname
+        assert!(config.find_route("anything.example.com", "/").is_some());
+        assert!(config.find_route("other.org", "/api").is_some());
+
+        let entry = config.find_route("random-host.net", "/").unwrap();
+        assert_eq!(entry.route.id, "r_catch");
+    }
+
+    #[test]
+    fn test_catch_all_after_exact() {
+        let exact = make_route("r_exact", "app.example.com", "/", true);
+        let catch_all = make_route("r_catch", "_", "/", true);
+        let config = ProxyConfig::from_store(
+            vec![exact, catch_all],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+            0,
+            0,
+        );
+
+        // Exact hostname takes precedence
+        let entry = config.find_route("app.example.com", "/").unwrap();
+        assert_eq!(entry.route.id, "r_exact");
+
+        // Unknown hostname falls through to catch-all
+        let entry = config.find_route("unknown.org", "/").unwrap();
+        assert_eq!(entry.route.id, "r_catch");
+    }
+
+    // ---- Path Rule Matching ----
+
+    #[test]
+    fn test_path_rule_matching() {
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.path_rules = vec![
+            PathRule {
+                path: "/api/v2".into(),
+                match_type: PathMatchType::Prefix,
+                backend_ids: None,
+                cache_enabled: Some(false),
+                cache_ttl_s: None,
+                response_headers: None,
+                response_headers_remove: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                redirect_to: None,
+                return_status: None,
+            },
+            PathRule {
+                path: "/health".into(),
+                match_type: PathMatchType::Exact,
+                backend_ids: None,
+                cache_enabled: None,
+                cache_ttl_s: None,
+                response_headers: None,
+                response_headers_remove: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                redirect_to: None,
+                return_status: Some(200),
+            },
+        ];
+
+        let config =
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0);
+
+        let entry = config.find_route("example.com", "/api/v2/users").unwrap();
+        assert_eq!(entry.route.id, "r1");
+
+        // Verify first path rule matches prefix
+        let matched = entry
+            .route
+            .path_rules
+            .iter()
+            .find(|r| r.matches("/api/v2/users"));
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().path, "/api/v2");
+
+        // Verify exact match rule
+        let matched = entry
+            .route
+            .path_rules
+            .iter()
+            .find(|r| r.matches("/health"));
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().return_status, Some(200));
+
+        // Verify exact match does not match prefix
+        let matched = entry
+            .route
+            .path_rules
+            .iter()
+            .find(|r| r.matches("/health/check"));
+        assert!(matched.is_none());
     }
 }

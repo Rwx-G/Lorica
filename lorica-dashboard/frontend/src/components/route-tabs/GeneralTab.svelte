@@ -152,6 +152,13 @@
     {/if}
   </div>
 
+  <div class="form-group" class:modified={isModified('return_status')}>
+    <label for="return-status">Return status</label>
+    {#if isImported('return_status')}<span class="imported-badge">imported</span>{/if}
+    <input id="return-status" type="number" min="100" max="599" bind:value={form.return_status} placeholder="e.g. 403, 404" />
+    <span class="hint">If set, responds with this HTTP status instead of proxying. Combine with Redirect to for 301/302.</span>
+  </div>
+
   <div class="form-group" class:modified={isModified('redirect_hostname')}>
     <label for="redirect-hostname">Redirect hostname</label>
     {#if isImported('redirect_hostname')}<span class="imported-badge">imported</span>{/if}
@@ -210,6 +217,7 @@
   .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 
   .form-group input[type="text"],
+  .form-group input[type="number"],
   .form-group select {
     width: 100%;
     padding: 0.5rem 0.75rem;
@@ -221,6 +229,7 @@
   }
 
   .form-group input[type="text"]:focus,
+  .form-group input[type="number"]:focus,
   .form-group select:focus {
     outline: none;
     border-color: var(--color-primary);
