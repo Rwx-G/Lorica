@@ -93,28 +93,46 @@ pub async fn get_waf_events(
 pub async fn get_waf_stats(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (total_events, by_category, rule_count) =
-        if let Some(ref waf_buffer) = state.waf_event_buffer {
-            let buf = waf_buffer.lock();
-            let total = buf.len();
+    let rule_count = state.waf_rule_count.unwrap_or(0);
 
-            let mut counts = std::collections::HashMap::new();
-            for event in buf.iter() {
-                *counts
-                    .entry(event.category.as_str().to_string())
-                    .or_insert(0usize) += 1;
+    // Read from persistent store if available, fall back to in-memory buffer
+    let (total_events, by_category) = if let Some(ref store) = state.log_store {
+        match store.list_waf_events(10000) {
+            Ok(events) => {
+                let total = events.len();
+                let mut counts = std::collections::HashMap::new();
+                for event in &events {
+                    *counts
+                        .entry(event.category.as_str().to_string())
+                        .or_insert(0usize) += 1;
+                }
+                let mut by_cat: Vec<CategoryCount> = counts
+                    .into_iter()
+                    .map(|(category, count)| CategoryCount { category, count })
+                    .collect();
+                by_cat.sort_by(|a, b| b.count.cmp(&a.count));
+                (total, by_cat)
             }
-
-            let mut by_cat: Vec<CategoryCount> = counts
-                .into_iter()
-                .map(|(category, count)| CategoryCount { category, count })
-                .collect();
-            by_cat.sort_by(|a, b| b.count.cmp(&a.count));
-
-            (total, by_cat, state.waf_rule_count.unwrap_or(0))
-        } else {
-            (0, vec![], 0)
-        };
+            Err(_) => (0, vec![]),
+        }
+    } else if let Some(ref waf_buffer) = state.waf_event_buffer {
+        let buf = waf_buffer.lock();
+        let total = buf.len();
+        let mut counts = std::collections::HashMap::new();
+        for event in buf.iter() {
+            *counts
+                .entry(event.category.as_str().to_string())
+                .or_insert(0usize) += 1;
+        }
+        let mut by_cat: Vec<CategoryCount> = counts
+            .into_iter()
+            .map(|(category, count)| CategoryCount { category, count })
+            .collect();
+        by_cat.sort_by(|a, b| b.count.cmp(&a.count));
+        (total, by_cat)
+    } else {
+        (0, vec![])
+    };
 
     Ok(json_data(WafStatsResponse {
         total_events,

@@ -38,13 +38,12 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to initialize access log schema: {e}"))?;
 
-        // Migrate: add columns if missing (existing databases)
-        let _ = conn.execute_batch(
-            "ALTER TABLE access_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT '';
-             ALTER TABLE access_logs ADD COLUMN is_xff INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE access_logs ADD COLUMN xff_proxy_ip TEXT NOT NULL DEFAULT '';
-             ALTER TABLE access_logs ADD COLUMN source TEXT NOT NULL DEFAULT '';",
-        );
+        // Migrate: add columns if missing (existing databases).
+        // Each ALTER is separate because execute_batch stops at first error.
+        let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN is_xff INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN xff_proxy_ip TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN source TEXT NOT NULL DEFAULT ''", []);
 
         // Migrate: add client_ip column to waf_events if missing
         let _ = conn

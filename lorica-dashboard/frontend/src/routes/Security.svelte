@@ -229,7 +229,7 @@
   function formatTime(ts: string): string {
     try {
       const d = new Date(ts);
-      return d.toLocaleTimeString();
+      return d.toLocaleString();
     } catch {
       return ts;
     }
