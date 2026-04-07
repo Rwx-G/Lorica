@@ -709,6 +709,7 @@
                       <code>{rule.match_type === 'exact' ? '= ' : ''}{rule.path}</code>
                       {#if rule.backend_addresses}<span class="rule-override">backends: {rule.backend_addresses.join(', ')}</span>{/if}
                       {#if rule.cache_enabled}<span class="rule-override">cache: {rule.cache_ttl_s}s</span>{/if}
+                      {#if rule.response_headers}<span class="rule-override">headers: {Object.entries(rule.response_headers).map(([k, v]) => `${k}: ${v}`).join('; ')}</span>{/if}
                       {#if rule.return_status}<span class="rule-override">return {rule.return_status}</span>{/if}
                       {#if rule.redirect_to}<span class="rule-override">redirect: {rule.redirect_to}</span>{/if}
                       {#if rule.rate_limit_rps}<span class="rule-override">rate limit: {rule.rate_limit_rps} rps</span>{/if}
