@@ -8,7 +8,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 
 | # | Test | Method | Expected | Story | Status |
 |---|------|--------|----------|-------|--------|
-| | **0. INSTALLATION AND STARTUP** | | | | |
+| | **0. INSTALLATION AND STARTUP** | | | | OK |
 | 0.1 | Install .deb package | CLI | `dpkg -i` succeeds, service enabled | 4.4 | OK |
 | 0.2 | Service starts, admin password in journal | CLI | `journalctl -u lorica` shows password | 1.2, 1.4 | OK |
 | 0.3 | Binary shows version | CLI | `lorica --version` -> 0.1.3 | 1.2 | OK |
@@ -19,7 +19,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 0.8 | LimitNOFILE=65536 | CLI | `/proc/$(pgrep lorica)/limits` shows 65536 | 4.5 | OK |
 | 0.9 | Workers spawned | CLI | `ps aux` shows 6 worker processes | 2.1 | OK |
 | 0.10 | Log socket created | CLI | `/var/lib/lorica/log.sock` exists | - | OK |
-| | **1. AUTHENTICATION** | | | | |
+| | **1. AUTHENTICATION** | | | | OK |
 | 1.1 | Open dashboard in browser | Dashboard | Login page at `http://localhost:9443` | 1.5 | OK |
 | 1.2 | Login with initial admin password | Dashboard | Redirected to "Change Password" | 1.4 | OK |
 | 1.3 | Change password (weak) | Dashboard | Error: password too short/weak | 1.4 | OK |
@@ -31,7 +31,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 1.9 | Session expiry | Dashboard | Idle timeout -> redirected to login | 4.5 | OK |
 | 1.10 | Logout | Dashboard | Click "Sign out" -> login page | 1.5 | OK |
 | 1.11 | Graceful disconnect on restart | Dashboard | Restart Lorica -> error message, redirect to login | - | OK |
-| | **2. OVERVIEW** | | | | |
+| | **2. OVERVIEW** | | | | OK |
 | 2.1 | Getting started guide visible | Dashboard | Banner with 10 setup steps | - | OK |
 | 2.2 | Steps expand/collapse animated | Dashboard | Click chevron, smooth open/close | - | OK |
 | 2.3 | "Go" buttons navigate | Dashboard | Each "Go" -> correct page | - | OK |
@@ -43,7 +43,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 2.9 | Auto-refresh (30s) | Dashboard | "Last update" timestamp updates | 1.9 | OK |
 | 2.10 | Color: orange for 0 routes | Dashboard | 0 routes/backends/certs -> orange | - | OK |
 | 2.11 | Color: green for healthy | Dashboard | Backends healthy > 0 -> green | - | OK |
-| | **3. BACKENDS** | | | | |
+| | **3. BACKENDS** | | | | OK |
 | 3.1 | Create backend | Dashboard | Add with address, name, group | 1.6 | OK |
 | 3.2 | Health check TCP | Proxy | Reachable port -> healthy (green) | 1.8 | OK |
 | 3.3 | Health check HTTP | Proxy | health_check_path -> healthy if 2xx | 1.8 | OK |
@@ -118,7 +118,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 5.23 | CertResolver hot-reload | Proxy | Upload cert via API -> TLS works immediately | - | |
 | 5.24 | Private key encrypted at rest | CLI | `sqlite3 lorica.db` -> binary blob, not PEM | 4.5 | OK |
 | 5.25 | HTTPS works in worker mode | Proxy | `--workers 6` + TLS cert -> HTTPS serves traffic | 2.1 | OK |
-| | **6. SECURITY** | | | | |
+| | **6. SECURITY** | | | | OK |
 | 6.1 | WAF rules listed (37 rules) | Dashboard | Security > Rules tab -> 37 rules | 3.1 | OK |
 | 6.2 | WAF rule toggle | Dashboard | Disable/enable individual rule | 3.1 | OK |
 | 6.3 | WAF custom rule | Dashboard | Create custom regex rule | 3.1 | OK |
@@ -178,7 +178,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 6.57 | IP allowlist | Proxy | Non-allowed IP -> blocked | - | OK |
 | 6.36 | IP denylist | Proxy | Denied IP -> blocked | - | OK |
 | 6.37 | CORS headers | Proxy | Access-Control-* headers set | - | OK |
-| | **7. CACHING** | | | | |
+| | **7. CACHING** | | | | OK |
 | 7.1 | Enable cache on route | Dashboard | cache_enabled=true, cache_ttl_s=60 | 7.1 | OK |
 | 7.2 | Cache HIT | Proxy | 1st MISS, 2nd HIT (X-Cache) | 7.1 | OK |
 | 7.3 | Cache bypass (Authorization) | Proxy | Authorization header -> BYPASS | 7.1 | OK |
@@ -187,7 +187,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 7.6 | Cache purge | API | DELETE /cache/routes/:id -> cleared | 7.1 | OK |
 | 7.7 | Cache stats | Dashboard | Hit rate in Overview + API | 7.1 | OK |
 | 7.8 | Cache TTL expiry | Proxy | After TTL -> MISS again | 7.1 | OK |
-| | **8. SLA AND PERFORMANCE** | | | | |
+| | **8. SLA AND PERFORMANCE** | | | | OK |
 | 8.1 | Passive SLA data collected | Dashboard | SLA page shows data after traffic | 5.1 | OK |
 | 8.2 | SLA percentiles (p50/p95/p99) | Dashboard | Latency percentile tables | 5.1 | OK |
 | 8.3 | SLA rolling windows | Dashboard | 1h, 24h, 7d, 30d | 5.1 | OK |
@@ -195,29 +195,29 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 8.5 | SLA breach alert | CLI | Below target -> notification | 5.1 | OK |
 | 8.6 | SLA export (CSV/JSON) | Dashboard | Export button -> file download | 5.1 | OK |
 | 8.7 | SLA data in Overview | Dashboard | Avg SLA, latency, breaches | 5.1 | OK |
-| | **9. ACTIVE PROBES** | | | | |
+| | **9. ACTIVE PROBES** | | | | OK |
 | 9.1 | Create probe | Dashboard | Route, method, path, interval, status | 5.2 | OK |
 | 9.2 | Probe executes | Dashboard | Results appear (latency, success) | 5.2 | OK |
 | 9.3 | Enable/disable probe | Dashboard | Toggle on/off | 5.2 | OK |
 | 9.4 | Active vs passive SLA | Dashboard | Side-by-side comparison | 5.2 | OK |
 | 9.5 | Delete probe | Dashboard | Probe removed | 5.2 | OK |
 | | **10. LOAD TESTING** | | | | |
-| 10.1 | Create load test config | Dashboard | Concurrency, RPS, duration, URL | 5.3 | |
+| 10.1 | Create load test config | Dashboard | Concurrency, RPS, duration, URL | 5.3 | OK |
 | 10.2 | Run load test | Dashboard | Real-time SSE progress | 5.3 | |
 | 10.3 | Safe limit confirmation | Dashboard | Exceed limits -> confirmation popup | 5.3 | |
 | 10.4 | Auto-abort on errors | Dashboard | >10% 5xx -> auto-aborted | 5.3 | |
 | 10.5 | Abort button | Dashboard | Click abort -> stopped | 5.3 | |
-| 10.6 | Historical results | Dashboard | Previous results listed | 5.3 | |
-| 10.7 | Clone test config | Dashboard | Clone button -> duplicate | 5.3 | |
+| 10.6 | Historical results | Dashboard | Previous results listed | 5.3 | OK |
+| 10.7 | Clone test config | Dashboard | Clone button -> duplicate | 5.3 | OK |
 | 10.8 | Comparison deltas | Dashboard | Compare two results -> diff | 5.3 | |
 | 10.9 | Load test in worker mode | Dashboard | Works with --workers N | 5.3 | |
-| | **11. ACCESS LOGS** | | | | |
+| | **11. ACCESS LOGS** | | | | OK |
 | 11.1 | Live log stream | Dashboard | Green pulse, real-time entries | 1.9 | OK |
 | 11.2 | Log filtering | Dashboard | Filter by status, route | 1.9 | OK |
-| 11.3 | Log entry details | Dashboard | Method, path, status, latency, backend, IP | 1.8 | |
-| 11.4 | WebSocket streaming | Dashboard | Logs via WS (not polling) | 1.9 | |
+| 11.3 | Log entry details | Dashboard | Method, path, status, latency, backend, IP | 1.8 | OK |
+| 11.4 | WebSocket streaming | Dashboard | Logs via WS (not polling) | 1.9 | OK |
 | 11.5 | Worker mode logs forwarded | Dashboard | All workers' logs visible | - | OK |
-| | **12. SYSTEM** | | | | |
+| | **12. SYSTEM** | | | | OK |
 | 12.1 | Version displayed | Dashboard | Lorica version shown | 1.9 | OK |
 | 12.2 | Uptime displayed | Dashboard | Correct uptime | 1.9 | OK |
 | 12.3 | CPU/Memory/Disk gauges | Dashboard | Color thresholds (green/orange/red) | 1.9 | OK |
@@ -257,7 +257,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 15.5 | sla_breached dispatched | CLI | SLA below target -> notification | 5.1 | OK |
 | 15.6 | Email channel delivery | CLI | SMTP notification received | 3.3 | OK |
 | 15.7 | Webhook channel delivery | CLI | HTTP POST received | 3.3 | OK |
-| | **16. WORKER MODE** | | | | |
+| | **16. WORKER MODE** | | | | OK |
 | 16.1 | Config reload propagated | Proxy | Edit route -> all workers update | 2.2 | OK |
 | 16.2 | Cert reload propagated | Proxy | Upload cert -> workers reload TLS | 2.3 | OK |
 | 16.3 | Worker crash + restart | CLI | `kill -9` worker -> restart <1s | 2.1 | OK |

@@ -118,18 +118,17 @@
     editingConfig = config;
     formName = config.name;
 
-    // Parse route + path from the existing config's Host header
-    const hostHeader = config.headers?.Host ?? '';
-    const matched = routes.find((r) => r.hostname === hostHeader);
-    formRouteId = matched?.id ?? '';
-
-    // Extract path suffix from the target_url
+    // Parse route + path from the target URL hostname or Host header
+    let targetHost = config.headers?.Host ?? '';
     try {
       const u = new URL(config.target_url);
+      if (!targetHost) targetHost = u.hostname;
       formPathSuffix = u.pathname || '/';
     } catch {
       formPathSuffix = '/';
     }
+    const matched = routes.find((r) => r.hostname === targetHost);
+    formRouteId = matched?.id ?? '';
 
     formMethod = config.method;
     formConcurrency = config.concurrency;
