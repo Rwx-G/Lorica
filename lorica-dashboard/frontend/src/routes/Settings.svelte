@@ -110,7 +110,9 @@
   let importSuccess = $state('');
 
   // Theme
-  let theme = $state<'dark' | 'light'>('light');
+  let theme = $state<'dark' | 'light'>(
+    (document.documentElement.getAttribute('data-theme') as 'dark' | 'light') || 'light'
+  );
 
   let loading = $state(true);
   let error = $state('');
@@ -722,7 +724,7 @@
       {#if notifHistory.length === 0}
         <p class="empty-text">No notification events yet.</p>
       {:else}
-        <div class="table-wrap">
+        <div class="form-card notif-history-scroll">
           <table>
             <thead>
               <tr>
@@ -1107,6 +1109,11 @@
     border: 1px solid var(--color-border);
     border-radius: 0.75rem;
     padding: 1.25rem;
+  }
+
+  .notif-history-scroll {
+    max-height: 400px;
+    overflow-y: auto;
   }
 
   .form-row {
