@@ -359,7 +359,9 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
     const timePart = parts[parts.length - 1];
     if (timePart) {
       r.cache_ttl_s = parseNginxTime(timePart);
+      r.cache_enabled = true;
       r.importedFields.add('cache_ttl_s');
+      r.importedFields.add('cache_enabled');
     }
   },
 
@@ -1083,8 +1085,7 @@ function locationToPathRule(
 ): PathRuleImport | null {
   // Build a temporary route to apply directives and detect what changed
   const tempRoute = createDefaultRoute();
-  // Copy parent route's default values for comparison
-  tempRoute.backend_addresses = [...parentRoute.backend_addresses];
+  // Do NOT copy parent backends - let applyDirective populate from scratch
 
   for (const dir of location.directives) {
     applyDirective(dir, tempRoute, diagnostics);
@@ -1100,8 +1101,8 @@ function locationToPathRule(
   };
 
   // Detect what's different from parent route
-  // Backend override: if proxy_pass points to different upstream
-  if (tempRoute.importedFields.has('backend_addresses')) {
+  // Backend override: if proxy_pass in location points to a different upstream than parent
+  if (tempRoute.importedFields.has('backend_addresses') && tempRoute.backend_addresses.length > 0) {
     const resolvedAddrs = resolveBackendAddresses(tempRoute.backend_addresses, upstreams);
     const parentAddrs = resolveBackendAddresses(parentRoute.backend_addresses, upstreams);
     if (JSON.stringify(resolvedAddrs) !== JSON.stringify(parentAddrs)) {
