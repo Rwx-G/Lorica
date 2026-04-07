@@ -153,9 +153,16 @@
     parseResult = parseNginxConfig(fullText);
     importRoutes = convertToLoricaRoutes(parseResult);
 
-    // Extract unresolved includes from diagnostics
+    // Extract unresolved includes from diagnostics (deduplicate by path)
+    const seenPaths = new Set<string>();
     unresolvedIncludes = parseResult.diagnostics
       .filter((d) => d.directive === 'include' && d.level === 'error')
+      .filter((d) => {
+        const path = d.message.replace('Unresolved include: ', '').replace('. Paste file contents to resolve.', '');
+        if (seenPaths.has(path)) return false;
+        seenPaths.add(path);
+        return true;
+      })
       .map((d) => ({
         line: d.line,
         path: d.message.replace('Unresolved include: ', '').replace('. Paste file contents to resolve.', ''),
@@ -203,10 +210,17 @@
     parseResult = parseNginxConfig(fullText);
     importRoutes = convertToLoricaRoutes(parseResult);
 
-    // Re-check includes - preserve previously entered content for still-unresolved ones
+    // Re-check includes - deduplicate by path, preserve previously entered content
     const oldContentByPath = new Map(unresolvedIncludes.map((inc) => [inc.path, inc.content]));
+    const reSeenPaths = new Set<string>();
     unresolvedIncludes = parseResult.diagnostics
       .filter((d) => d.directive === 'include' && d.level === 'error')
+      .filter((d) => {
+        const path = d.message.replace('Unresolved include: ', '').replace('. Paste file contents to resolve.', '');
+        if (reSeenPaths.has(path)) return false;
+        reSeenPaths.add(path);
+        return true;
+      })
       .map((d) => {
         const path = d.message.replace('Unresolved include: ', '').replace('. Paste file contents to resolve.', '');
         return { line: d.line, path, content: oldContentByPath.get(path) ?? '' };
