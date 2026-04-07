@@ -323,6 +323,7 @@
           <thead>
             <tr>
               <th>Time</th>
+              <th>Client IP</th>
               <th>Rule</th>
               <th>Category</th>
               <th>Severity</th>
@@ -335,6 +336,7 @@
             {#each events as event}
               <tr>
                 <td class="mono">{formatTime(event.timestamp)}</td>
+                <td class="mono">{event.client_ip || '-'}</td>
                 <td class="mono">{event.rule_id}</td>
                 <td><span class="category-badge">{categoryLabel(event.category)}</span></td>
                 <td><span class={severityClass(event.severity)}>{event.severity}/5</span></td>

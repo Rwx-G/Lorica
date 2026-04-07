@@ -21,6 +21,12 @@ pub struct LogEntry {
     pub latency_ms: u64,
     pub backend: String,
     pub error: Option<String>,
+    /// Client IP address (from socket or X-Forwarded-For).
+    #[serde(default)]
+    pub client_ip: String,
+    /// Whether the client IP was extracted from X-Forwarded-For header.
+    #[serde(default)]
+    pub is_xff: bool,
 }
 
 /// Thread-safe in-memory ring buffer for access logs with real-time broadcast.
@@ -304,6 +310,8 @@ mod tests {
                 latency_ms: 10,
                 backend: "10.0.0.1:8080".into(),
                 error: None,
+                client_ip: String::new(),
+                is_xff: false,
             })
             .await;
         }
@@ -329,6 +337,8 @@ mod tests {
                 latency_ms: 10,
                 backend: "10.0.0.1:8080".into(),
                 error: None,
+                client_ip: String::new(),
+                is_xff: false,
             })
             .await;
         }
@@ -354,6 +364,8 @@ mod tests {
             latency_ms: 5,
             backend: "10.0.0.1:8080".into(),
             error: None,
+            client_ip: String::new(),
+            is_xff: false,
         })
         .await;
 

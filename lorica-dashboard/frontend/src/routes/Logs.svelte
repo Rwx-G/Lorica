@@ -243,6 +243,7 @@
           <tr>
             <th>Time</th>
             <th>Method</th>
+            <th>Client IP</th>
             <th>Host</th>
             <th>Path</th>
             <th>Status</th>
@@ -257,6 +258,12 @@
               <td class="mono time-col">{formatTimestamp(entry.timestamp)}</td>
               <td class="method-col">
                 <span class="method-badge">{entry.method}</span>
+              </td>
+              <td class="mono ip-col">
+                {entry.client_ip || '-'}
+                {#if entry.is_xff}
+                  <span class="xff-indicator" title="IP from X-Forwarded-For (proxy forwarded)">(i)</span>
+                {/if}
               </td>
               <td class="host-col">{entry.host}</td>
               <td class="mono path-col" title={entry.path}>{entry.path}</td>
@@ -380,6 +387,19 @@
     font-family: var(--mono);
     background: var(--color-primary-subtle);
     color: var(--color-primary);
+  }
+
+  .ip-col {
+    white-space: nowrap;
+  }
+
+  .xff-indicator {
+    display: inline-block;
+    font-size: 0.625rem;
+    font-weight: 700;
+    color: var(--color-primary);
+    margin-left: 0.25rem;
+    cursor: help;
   }
 
   .host-col {

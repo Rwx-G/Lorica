@@ -366,6 +366,10 @@ pub struct RequestCtx {
     pub route_snapshot: Option<Route>,
     /// Whether access logging is enabled for this route.
     pub access_log_enabled: bool,
+    /// Client IP address (from socket or X-Forwarded-For).
+    pub client_ip: Option<String>,
+    /// Whether the client IP was extracted from X-Forwarded-For header.
+    pub is_xff: bool,
     /// Per-route connection counter for max_connections enforcement.
     /// Stored here so the counter is decremented in `logging()` when the request ends.
     pub route_conn_counter: Option<Arc<AtomicU64>>,
@@ -487,6 +491,8 @@ impl ProxyHttp for LoricaProxy {
             route_snapshot: None,
             path_rewrite_regex: None,
             access_log_enabled: true,
+            client_ip: None,
+            is_xff: false,
             route_conn_counter: None,
             rate_limit_info: None,
             retry_count: 0,
@@ -541,12 +547,17 @@ impl ProxyHttp for LoricaProxy {
 
         // Prefer X-Forwarded-For if present (client behind another proxy)
         let req = session.req_header();
+        let has_xff = req.headers.get("x-forwarded-for").is_some();
         let check_ip = req
             .headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .map(|xff| xff.split(',').next().unwrap_or(xff).trim().to_string())
             .or(client_ip);
+
+        // Store client IP in context for access logging
+        ctx.client_ip = check_ip.clone();
+        ctx.is_xff = has_xff && check_ip.is_some();
 
         // Ban list check (before any other processing for banned IPs)
         if let Some(ref ip) = check_ip {
@@ -1541,6 +1552,8 @@ impl ProxyHttp for LoricaProxy {
                 latency_ms,
                 backend: backend_addr.to_string(),
                 error: error_str,
+                client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
+                is_xff: ctx.is_xff,
             };
             if let Some(ref store) = self.log_store {
                 if let Err(e) = store.insert(&entry) {

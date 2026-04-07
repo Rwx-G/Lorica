@@ -278,6 +278,8 @@ export interface LogEntry {
   latency_ms: number;
   backend: string;
   error: string | null;
+  client_ip: string;
+  is_xff: boolean;
 }
 
 export interface LogsResponse {

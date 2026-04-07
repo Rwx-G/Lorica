@@ -27,12 +27,24 @@ impl LogStore {
                 status INTEGER NOT NULL,
                 latency_ms INTEGER NOT NULL,
                 backend TEXT NOT NULL,
-                error TEXT
+                error TEXT,
+                client_ip TEXT NOT NULL DEFAULT '',
+                is_xff INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON access_logs(timestamp);
             CREATE INDEX IF NOT EXISTS idx_access_logs_host ON access_logs(host);",
         )
         .map_err(|e| format!("failed to initialize access log schema: {e}"))?;
+
+        // Migrate: add client_ip and is_xff columns if missing (existing databases)
+        let _ = conn.execute_batch(
+            "ALTER TABLE access_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT '';
+             ALTER TABLE access_logs ADD COLUMN is_xff INTEGER NOT NULL DEFAULT 0;",
+        );
+
+        // Migrate: add client_ip column to waf_events if missing
+        let _ = conn
+            .execute_batch("ALTER TABLE waf_events ADD COLUMN client_ip TEXT NOT NULL DEFAULT '';");
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS waf_events (
@@ -43,7 +55,8 @@ impl LogStore {
                 severity INTEGER NOT NULL,
                 matched_field TEXT NOT NULL,
                 matched_value TEXT NOT NULL,
-                timestamp TEXT NOT NULL
+                timestamp TEXT NOT NULL,
+                client_ip TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_waf_events_timestamp ON waf_events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_waf_events_category ON waf_events(category);",
@@ -76,8 +89,8 @@ impl LogStore {
     pub fn insert(&self, entry: &LogEntry) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO access_logs (timestamp, method, path, host, status, latency_ms, backend, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO access_logs (timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 entry.timestamp,
                 entry.method,
@@ -87,6 +100,8 @@ impl LogStore {
                 entry.latency_ms,
                 entry.backend,
                 entry.error,
+                entry.client_ip,
+                entry.is_xff as i64,
             ],
         )
         .map_err(|e| format!("failed to insert access log entry: {e}"))?;
@@ -157,7 +172,7 @@ impl LogStore {
             .map_err(|e| format!("failed to count access logs: {e}"))?;
 
         let query_sql = format!(
-            "SELECT id, timestamp, method, path, host, status, latency_ms, backend, error \
+            "SELECT id, timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff \
              FROM access_logs {where_clause} ORDER BY id DESC LIMIT ?",
         );
         let mut query_bind: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -183,6 +198,8 @@ impl LogStore {
                     latency_ms: row.get::<_, i64>(6)? as u64,
                     backend: row.get(7)?,
                     error: row.get(8)?,
+                    client_ip: row.get(9)?,
+                    is_xff: row.get::<_, i64>(10)? != 0,
                 })
             })
             .map_err(|e| format!("failed to query access logs: {e}"))?;
@@ -240,8 +257,8 @@ impl LogStore {
     pub fn insert_waf_event(&self, event: &lorica_waf::WafEvent) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO waf_events (rule_id, description, category, severity, matched_field, matched_value, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO waf_events (rule_id, description, category, severity, matched_field, matched_value, timestamp, client_ip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 event.rule_id as i64,
                 event.description,
@@ -250,6 +267,7 @@ impl LogStore {
                 event.matched_field,
                 event.matched_value,
                 event.timestamp,
+                event.client_ip,
             ],
         )
         .map_err(|e| format!("failed to insert WAF event: {e}"))?;
@@ -261,7 +279,7 @@ impl LogStore {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT rule_id, description, category, severity, matched_field, matched_value, timestamp
+                "SELECT rule_id, description, category, severity, matched_field, matched_value, timestamp, client_ip
                  FROM waf_events ORDER BY id DESC LIMIT ?1",
             )
             .map_err(|e| format!("failed to prepare WAF events query: {e}"))?;
@@ -279,7 +297,7 @@ impl LogStore {
                     matched_field: row.get(4)?,
                     matched_value: row.get(5)?,
                     timestamp: row.get(6)?,
-                    client_ip: String::new(),
+                    client_ip: row.get::<_, String>(7).unwrap_or_default(),
                 })
             })
             .map_err(|e| format!("failed to query WAF events: {e}"))?;

@@ -955,6 +955,8 @@ async fn test_logs_endpoint_with_entries() {
                 latency_ms: 10,
                 backend: "10.0.0.1:8080".into(),
                 error: None,
+                client_ip: String::new(),
+                is_xff: false,
             })
             .await;
     }
@@ -996,6 +998,8 @@ async fn test_logs_endpoint_filtering() {
             latency_ms: 10,
             backend: "10.0.0.1:8080".into(),
             error: None,
+            client_ip: String::new(),
+            is_xff: false,
         })
         .await;
     state
@@ -1010,6 +1014,8 @@ async fn test_logs_endpoint_filtering() {
             latency_ms: 50,
             backend: "10.0.0.2:8080".into(),
             error: Some("internal error".into()),
+            client_ip: String::new(),
+            is_xff: false,
         })
         .await;
 
@@ -1065,6 +1071,8 @@ async fn test_clear_logs_endpoint() {
             latency_ms: 5,
             backend: "10.0.0.1:8080".into(),
             error: None,
+            client_ip: String::new(),
+            is_xff: false,
         })
         .await;
 
@@ -1116,6 +1124,8 @@ async fn test_logs_endpoint_status_range() {
                 latency_ms: 5,
                 backend: "10.0.0.1:80".into(),
                 error: None,
+                client_ip: String::new(),
+                is_xff: false,
             })
             .await;
     }
@@ -1155,6 +1165,8 @@ async fn test_logs_endpoint_time_range() {
             latency_ms: 5,
             backend: "10.0.0.1:80".into(),
             error: None,
+            client_ip: String::new(),
+            is_xff: false,
         })
         .await;
     state
@@ -1169,6 +1181,8 @@ async fn test_logs_endpoint_time_range() {
             latency_ms: 5,
             backend: "10.0.0.1:80".into(),
             error: None,
+            client_ip: String::new(),
+            is_xff: false,
         })
         .await;
 
@@ -1209,6 +1223,8 @@ async fn test_logs_endpoint_limit_and_after_id() {
                 latency_ms: 5,
                 backend: "10.0.0.1:80".into(),
                 error: None,
+                client_ip: String::new(),
+                is_xff: false,
             })
             .await;
     }
