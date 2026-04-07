@@ -231,6 +231,63 @@
     });
   }
 
+  // Nginx directive -> Lorica parameter mapping for annotations
+  const LORICA_ANNOTATION: Record<string, string> = {
+    server_name: 'hostname',
+    proxy_pass: 'backend',
+    ssl_certificate: 'certificate',
+    ssl_certificate_key: 'certificate (key)',
+    proxy_set_header: 'proxy_headers',
+    add_header: 'response_headers',
+    proxy_read_timeout: 'read_timeout_s',
+    proxy_send_timeout: 'send_timeout_s',
+    proxy_connect_timeout: 'connect_timeout_s',
+    client_max_body_size: 'max_body_mb',
+    proxy_cache_valid: 'cache_ttl_s',
+    limit_req: 'rate_limit_rps',
+    rewrite: 'path_rewrite',
+    return: 'force_https (redirect)',
+    location: 'path_prefix',
+  };
+
+  // Build the resolved config text with include replacements shown
+  let resolvedConfigLines: { text: string; annotation: string; kind: 'normal' | 'replaced' | 'directive' }[] = $derived.by(() => {
+    if (!configText.trim()) return [];
+    const includeMap = new Map(unresolvedIncludes.map((inc) => [inc.path, inc.content]));
+    const lines = configText.split('\n');
+    const result: { text: string; annotation: string; kind: 'normal' | 'replaced' | 'directive' }[] = [];
+
+    for (const line of lines) {
+      const includeMatch = line.match(/^\s*include\s+(.+?)\s*;/);
+      if (includeMatch) {
+        const path = includeMatch[1];
+        const content = includeMap.get(path);
+        if (content?.trim()) {
+          result.push({ text: `# include ${path} -> resolved:`, annotation: '', kind: 'replaced' });
+          for (const subLine of content.split('\n')) {
+            const ann = getAnnotation(subLine);
+            result.push({ text: subLine, annotation: ann, kind: ann ? 'directive' : 'normal' });
+          }
+          continue;
+        }
+      }
+      const ann = getAnnotation(line);
+      result.push({ text: line, annotation: ann, kind: ann ? 'directive' : 'normal' });
+    }
+    return result;
+  });
+
+  function getAnnotation(line: string): string {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed === '{' || trimmed === '}') return '';
+    for (const [directive, loricaParam] of Object.entries(LORICA_ANNOTATION)) {
+      if (trimmed.startsWith(directive + ' ') || trimmed.startsWith(directive + '\t')) {
+        return loricaParam;
+      }
+    }
+    return '';
+  }
+
   function goToPreview() {
     previewTab = 0;
     step = 3;
@@ -454,6 +511,24 @@
                   </div>
                 {/each}
                 <button class="btn btn-secondary" onclick={reparseWithIncludes}>Re-parse</button>
+              </div>
+            {/if}
+
+            <!-- Resolved config view -->
+            {#if resolvedConfigLines.length > 0}
+              <div class="section">
+                <h4>Resolved configuration</h4>
+                <div class="resolved-config">
+                  {#each resolvedConfigLines as line, i}
+                    <div class="resolved-line" class:resolved-replaced={line.kind === 'replaced'} class:resolved-directive={line.kind === 'directive'}>
+                      <span class="resolved-lineno">{i + 1}</span>
+                      <span class="resolved-text">{line.text}</span>
+                      {#if line.annotation}
+                        <span class="resolved-annotation">{line.annotation}</span>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
               </div>
             {/if}
 
@@ -1032,6 +1107,62 @@
     outline: none;
     border-color: var(--color-primary);
     box-shadow: 0 0 0 3px var(--color-primary-subtle);
+  }
+
+  /* Resolved config */
+  .resolved-config {
+    max-height: 24rem;
+    overflow-y: auto;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-bg-input);
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    line-height: 1.6;
+  }
+
+  .resolved-line {
+    display: flex;
+    align-items: baseline;
+    padding: 0 var(--space-2);
+    min-height: 1.5em;
+  }
+
+  .resolved-line:hover {
+    background: var(--color-bg-hover);
+  }
+
+  .resolved-lineno {
+    min-width: 2.5rem;
+    text-align: right;
+    padding-right: var(--space-2);
+    color: var(--color-text-muted);
+    opacity: 0.5;
+    user-select: none;
+  }
+
+  .resolved-text {
+    flex: 1;
+    white-space: pre;
+  }
+
+  .resolved-annotation {
+    margin-left: auto;
+    padding-left: var(--space-4);
+    color: var(--color-primary);
+    font-weight: 600;
+    font-size: var(--text-xs);
+    white-space: nowrap;
+    opacity: 0.9;
+  }
+
+  .resolved-replaced .resolved-text {
+    color: var(--color-green);
+    font-style: italic;
+  }
+
+  .resolved-directive .resolved-text {
+    color: var(--color-text);
   }
 
   /* Preview tabs */
