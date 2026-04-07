@@ -465,7 +465,7 @@ pub async fn update_route(
         route.force_https = force_https;
     }
     if let Some(redirect_hostname) = body.redirect_hostname {
-        route.redirect_hostname = Some(redirect_hostname);
+        route.redirect_hostname = if redirect_hostname.is_empty() { None } else { Some(redirect_hostname) };
     }
     if let Some(redirect_to) = body.redirect_to {
         if redirect_to.is_empty() {
@@ -496,10 +496,10 @@ pub async fn update_route(
         route.send_timeout_s = send_timeout_s;
     }
     if let Some(strip_path_prefix) = body.strip_path_prefix {
-        route.strip_path_prefix = Some(strip_path_prefix);
+        route.strip_path_prefix = if strip_path_prefix.is_empty() { None } else { Some(strip_path_prefix) };
     }
     if let Some(add_path_prefix) = body.add_path_prefix {
-        route.add_path_prefix = Some(add_path_prefix);
+        route.add_path_prefix = if add_path_prefix.is_empty() { None } else { Some(add_path_prefix) };
     }
     if let Some(ref pattern) = body.path_rewrite_pattern {
         if pattern.is_empty() {
@@ -533,16 +533,16 @@ pub async fn update_route(
         route.response_headers_remove = response_headers_remove;
     }
     if let Some(max_request_body_bytes) = body.max_request_body_bytes {
-        route.max_request_body_bytes = Some(max_request_body_bytes);
+        route.max_request_body_bytes = if max_request_body_bytes == 0 { None } else { Some(max_request_body_bytes) };
     }
     if let Some(websocket_enabled) = body.websocket_enabled {
         route.websocket_enabled = websocket_enabled;
     }
     if let Some(rate_limit_rps) = body.rate_limit_rps {
-        route.rate_limit_rps = Some(rate_limit_rps);
+        route.rate_limit_rps = if rate_limit_rps == 0 { None } else { Some(rate_limit_rps) };
     }
     if let Some(rate_limit_burst) = body.rate_limit_burst {
-        route.rate_limit_burst = Some(rate_limit_burst);
+        route.rate_limit_burst = if rate_limit_burst == 0 { None } else { Some(rate_limit_burst) };
     }
     if let Some(ip_allowlist) = body.ip_allowlist {
         route.ip_allowlist = ip_allowlist;
@@ -557,13 +557,13 @@ pub async fn update_route(
         route.cors_allowed_methods = cors_allowed_methods;
     }
     if let Some(cors_max_age_s) = body.cors_max_age_s {
-        route.cors_max_age_s = Some(cors_max_age_s);
+        route.cors_max_age_s = if cors_max_age_s == 0 { None } else { Some(cors_max_age_s) };
     }
     if let Some(compression_enabled) = body.compression_enabled {
         route.compression_enabled = compression_enabled;
     }
     if let Some(retry_attempts) = body.retry_attempts {
-        route.retry_attempts = Some(retry_attempts);
+        route.retry_attempts = if retry_attempts == 0 { None } else { Some(retry_attempts) };
     }
     if let Some(cache_enabled) = body.cache_enabled {
         route.cache_enabled = cache_enabled;
@@ -575,13 +575,13 @@ pub async fn update_route(
         route.cache_max_bytes = cache_max_bytes;
     }
     if let Some(max_connections) = body.max_connections {
-        route.max_connections = Some(max_connections);
+        route.max_connections = if max_connections == 0 { None } else { Some(max_connections) };
     }
     if let Some(slowloris_threshold_ms) = body.slowloris_threshold_ms {
         route.slowloris_threshold_ms = slowloris_threshold_ms;
     }
     if let Some(auto_ban_threshold) = body.auto_ban_threshold {
-        route.auto_ban_threshold = Some(auto_ban_threshold);
+        route.auto_ban_threshold = if auto_ban_threshold == 0 { None } else { Some(auto_ban_threshold) };
     }
     if let Some(auto_ban_duration_s) = body.auto_ban_duration_s {
         route.auto_ban_duration_s = auto_ban_duration_s;
@@ -618,7 +618,7 @@ pub async fn update_route(
         route.path_rules = rules;
     }
     if let Some(return_status) = body.return_status {
-        route.return_status = Some(return_status);
+        route.return_status = if return_status == 0 { None } else { Some(return_status) };
     }
     route.updated_at = Utc::now();
 

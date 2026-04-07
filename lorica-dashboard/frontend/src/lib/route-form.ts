@@ -247,45 +247,49 @@ function pathRuleFormToRequest(rules: PathRuleFormState[]): PathRuleRequest[] | 
   });
 }
 
-function buildAdvancedFields(form: RouteFormState) {
+function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
+  // For updates, empty clearable fields must send explicit empty values
+  // (not undefined) so the API clears them. For creates, undefined = use defaults.
+  const empty = <T>(val: T): T | undefined => isUpdate ? val : undefined;
+
   return {
     force_https: form.force_https,
-    redirect_hostname: form.redirect_hostname || undefined,
-    redirect_to: form.redirect_to || undefined,
-    hostname_aliases: csvToArray(form.hostname_aliases).length > 0 ? csvToArray(form.hostname_aliases) : undefined,
+    redirect_hostname: form.redirect_hostname || (isUpdate ? '' : undefined),
+    redirect_to: form.redirect_to || (isUpdate ? '' : undefined),
+    hostname_aliases: csvToArray(form.hostname_aliases).length > 0 ? csvToArray(form.hostname_aliases) : empty([]),
     websocket_enabled: form.websocket_enabled,
     access_log_enabled: form.access_log_enabled,
     connect_timeout_s: form.connect_timeout_s,
     read_timeout_s: form.read_timeout_s,
     send_timeout_s: form.send_timeout_s,
-    strip_path_prefix: form.strip_path_prefix || undefined,
-    add_path_prefix: form.add_path_prefix || undefined,
-    path_rewrite_pattern: form.path_rewrite_pattern || undefined,
-    path_rewrite_replacement: form.path_rewrite_replacement || undefined,
+    strip_path_prefix: form.strip_path_prefix || (isUpdate ? '' : undefined),
+    add_path_prefix: form.add_path_prefix || (isUpdate ? '' : undefined),
+    path_rewrite_pattern: form.path_rewrite_pattern || (isUpdate ? '' : undefined),
+    path_rewrite_replacement: form.path_rewrite_replacement || (isUpdate ? '' : undefined),
     security_headers: form.security_headers,
-    max_request_body_bytes: form.max_body_mb ? Math.round(Number(form.max_body_mb) * 1024 * 1024) : undefined,
-    rate_limit_rps: form.rate_limit_rps ? Number(form.rate_limit_rps) : undefined,
-    rate_limit_burst: form.rate_limit_burst ? Number(form.rate_limit_burst) : undefined,
-    ip_allowlist: linesToArray(form.ip_allowlist).length > 0 ? linesToArray(form.ip_allowlist) : undefined,
-    ip_denylist: linesToArray(form.ip_denylist).length > 0 ? linesToArray(form.ip_denylist) : undefined,
-    proxy_headers: form.proxy_headers.trim() ? textToRecord(form.proxy_headers) : undefined,
-    proxy_headers_remove: csvToArray(form.proxy_headers_remove).length > 0 ? csvToArray(form.proxy_headers_remove) : undefined,
-    response_headers: form.response_headers.trim() ? textToRecord(form.response_headers) : undefined,
-    response_headers_remove: csvToArray(form.response_headers_remove).length > 0 ? csvToArray(form.response_headers_remove) : undefined,
-    cors_allowed_origins: csvToArray(form.cors_allowed_origins).length > 0 ? csvToArray(form.cors_allowed_origins) : undefined,
-    cors_allowed_methods: csvToArray(form.cors_allowed_methods).length > 0 ? csvToArray(form.cors_allowed_methods) : undefined,
-    cors_max_age_s: form.cors_max_age_s ? Number(form.cors_max_age_s) : undefined,
+    max_request_body_bytes: form.max_body_mb ? Math.round(Number(form.max_body_mb) * 1024 * 1024) : empty(0),
+    rate_limit_rps: form.rate_limit_rps ? Number(form.rate_limit_rps) : empty(0),
+    rate_limit_burst: form.rate_limit_burst ? Number(form.rate_limit_burst) : empty(0),
+    ip_allowlist: linesToArray(form.ip_allowlist).length > 0 ? linesToArray(form.ip_allowlist) : empty([]),
+    ip_denylist: linesToArray(form.ip_denylist).length > 0 ? linesToArray(form.ip_denylist) : empty([]),
+    proxy_headers: form.proxy_headers.trim() ? textToRecord(form.proxy_headers) : empty({}),
+    proxy_headers_remove: csvToArray(form.proxy_headers_remove).length > 0 ? csvToArray(form.proxy_headers_remove) : empty([]),
+    response_headers: form.response_headers.trim() ? textToRecord(form.response_headers) : empty({}),
+    response_headers_remove: csvToArray(form.response_headers_remove).length > 0 ? csvToArray(form.response_headers_remove) : empty([]),
+    cors_allowed_origins: csvToArray(form.cors_allowed_origins).length > 0 ? csvToArray(form.cors_allowed_origins) : empty([]),
+    cors_allowed_methods: csvToArray(form.cors_allowed_methods).length > 0 ? csvToArray(form.cors_allowed_methods) : empty([]),
+    cors_max_age_s: form.cors_max_age_s ? Number(form.cors_max_age_s) : empty(0),
     compression_enabled: form.compression_enabled,
-    retry_attempts: form.retry_attempts ? Number(form.retry_attempts) : undefined,
+    retry_attempts: form.retry_attempts ? Number(form.retry_attempts) : empty(0),
     cache_enabled: form.cache_enabled,
     cache_ttl_s: form.cache_ttl_s,
     cache_max_bytes: form.cache_max_mb * 1048576,
-    max_connections: form.max_connections ? Number(form.max_connections) : undefined,
+    max_connections: form.max_connections ? Number(form.max_connections) : empty(0),
     slowloris_threshold_ms: form.slowloris_threshold_ms,
-    auto_ban_threshold: form.auto_ban_threshold ? Number(form.auto_ban_threshold) : undefined,
+    auto_ban_threshold: form.auto_ban_threshold ? Number(form.auto_ban_threshold) : empty(0),
     auto_ban_duration_s: form.auto_ban_duration_s,
-    path_rules: pathRuleFormToRequest(form.path_rules),
-    return_status: form.return_status ? Number(form.return_status) : undefined,
+    path_rules: pathRuleFormToRequest(form.path_rules) ?? (isUpdate ? [] : undefined),
+    return_status: form.return_status ? Number(form.return_status) : empty(0),
   };
 }
 
@@ -312,7 +316,7 @@ export function formStateToUpdateRequest(form: RouteFormState): UpdateRouteReque
     waf_enabled: form.waf_enabled,
     waf_mode: form.waf_mode,
     enabled: form.enabled,
-    ...buildAdvancedFields(form),
+    ...buildAdvancedFields(form, true),
   };
 }
 
