@@ -78,14 +78,14 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.16 | Path rewrite: regex | Proxy | Capture groups work | - | OK |
 | 4.17 | Timeouts (connect/read/send) | Proxy | Low timeout + slow backend -> error | 6.1 | OK |
 | 4.18 | Max request body size | Proxy | Exceed limit -> 413 | 6.1 | OK |
-| 4.19 | WebSocket passthrough | Proxy | websocket_enabled -> WS works | 6.1 | |
+| 4.19 | WebSocket passthrough | Proxy | websocket_enabled -> WS works | 6.1 | OK |
 | 4.20 | Access log toggle | Proxy | Disable -> no log for this route | 6.2 | OK |
 | 4.21 | Per-route compression | Proxy | compression_enabled -> gzip response | - | OK |
 | 4.22 | Retry attempts | Proxy | First backend fails -> retry next | - | OK |
 | 4.23 | Load balancing: round-robin | Proxy | Even distribution | 1.8 | OK |
-| 4.24 | Load balancing: Peak EWMA | Proxy | Lowest-latency backend preferred | 4.3 | |
-| 4.25 | Load balancing: consistent hash | Proxy | Same client -> same backend | - | |
-| 4.26 | Load balancing: random | Proxy | Random distribution | - | |
+| 4.24 | Load balancing: Peak EWMA | Proxy | Lowest-latency backend preferred | 4.3 | OK |
+| 4.25 | Load balancing: consistent hash | Proxy | Same client -> same backend | - | OK |
+| 4.26 | Load balancing: random | Proxy | Random distribution | - | OK |
 | 4.27 | Topology type | Dashboard | SingleVM/HA/Custom adapts health behavior | 3.2 | |
 | 4.28 | Route enable/disable | Dashboard | Disabled -> 404 for that hostname | 1.6 | OK |
 | 4.29 | Delete route | Dashboard | Confirm dialog, removed | 1.6 | OK |

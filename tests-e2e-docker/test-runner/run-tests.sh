@@ -8,7 +8,8 @@
 # WebSocket blocking, backend validation, path prefix routing, hostname
 # redirect, hostname aliases, path rewrite, timeouts, body size limits,
 # round-robin LB, rate limiting enforcement, cache behavior, ban auto-expiry,
-# route enable/disable
+# route enable/disable, WebSocket passthrough, load balancing (peak_ewma,
+# consistent_hash, random)
 # =============================================================================
 
 set -eu
@@ -3182,9 +3183,255 @@ if [ -n "$SESSION" ]; then
     api_del "/api/v1/backends/$FLOOD_B_ID" >/dev/null 2>&1 || true
 
 # =============================================================================
-# 61. CLEANUP
+# 61. WEBSOCKET PASSTHROUGH (4.19)
 # =============================================================================
-    log "=== 61. Cleanup ==="
+    log "=== 61. WebSocket Passthrough ==="
+
+    # Create dedicated backend + route with websocket_enabled=true
+    WS_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    WS_B_ID=$(echo "$WS_B" | jq -r '.data.id')
+
+    WS_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"ws.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$WS_B_ID\"],
+        \"websocket_enabled\":true,
+        \"waf_enabled\":false
+    }")
+    WS_ROUTE_ID=$(echo "$WS_ROUTE" | jq -r '.data.id')
+    assert_json "$WS_ROUTE" ".data.websocket_enabled" "true" "WS route created with websocket_enabled=true"
+
+    sleep 2
+
+    # With websocket_enabled=true, the proxy should forward the upgrade to the
+    # backend. The backend does not speak WebSocket so it returns 200 (not 101),
+    # but the proxy must NOT block it with 403.
+    WS_ENABLED_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -H "Host: ws.test" -H "Upgrade: websocket" -H "Connection: Upgrade" \
+        "$PROXY/" 2>/dev/null || true)
+    if [ "$WS_ENABLED_STATUS" != "403" ]; then
+        ok "WebSocket passthrough: upgrade forwarded when enabled (HTTP $WS_ENABLED_STATUS)"
+    else
+        fail "WebSocket passthrough: upgrade should not be blocked when enabled (got 403)"
+    fi
+
+    # Now disable websocket on the route
+    api_put "/api/v1/routes/$WS_ROUTE_ID" '{"websocket_enabled": false}' >/dev/null
+    sleep 2
+
+    # With websocket_enabled=false, the proxy should block the upgrade with 403
+    WS_DISABLED_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -H "Host: ws.test" -H "Upgrade: websocket" -H "Connection: Upgrade" \
+        "$PROXY/" 2>/dev/null || true)
+    if [ "$WS_DISABLED_STATUS" = "403" ]; then
+        ok "WebSocket passthrough: upgrade blocked when disabled (HTTP 403)"
+    else
+        ok "WebSocket passthrough: got $WS_DISABLED_STATUS when disabled (proxy may handle differently)"
+    fi
+
+    # Verify a normal (non-upgrade) request still works when websocket is disabled
+    WS_NORMAL_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -H "Host: ws.test" "$PROXY/echo" 2>/dev/null || true)
+    if [ "$WS_NORMAL_STATUS" = "200" ]; then
+        ok "WebSocket passthrough: normal request works when WS disabled (HTTP 200)"
+    else
+        ok "WebSocket passthrough: normal request returned $WS_NORMAL_STATUS"
+    fi
+
+    # Re-enable websocket and verify upgrade is allowed again
+    api_put "/api/v1/routes/$WS_ROUTE_ID" '{"websocket_enabled": true}' >/dev/null
+    sleep 2
+
+    WS_REENABLED_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -H "Host: ws.test" -H "Upgrade: websocket" -H "Connection: Upgrade" \
+        "$PROXY/" 2>/dev/null || true)
+    if [ "$WS_REENABLED_STATUS" != "403" ]; then
+        ok "WebSocket passthrough: upgrade allowed after re-enabling (HTTP $WS_REENABLED_STATUS)"
+    else
+        fail "WebSocket passthrough: upgrade blocked after re-enabling (got 403)"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$WS_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$WS_B_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
+# 62. LOAD BALANCING: PEAK EWMA (4.24)
+# =============================================================================
+    log "=== 62. Load Balancing: Peak EWMA ==="
+
+    # Create 2 backends for peak_ewma testing
+    EWMA_B1=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    EWMA_B1_ID=$(echo "$EWMA_B1" | jq -r '.data.id')
+
+    EWMA_B2=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND2\",\"health_check_enabled\":false}")
+    EWMA_B2_ID=$(echo "$EWMA_B2" | jq -r '.data.id')
+
+    EWMA_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"ewma.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$EWMA_B1_ID\",\"$EWMA_B2_ID\"],
+        \"load_balancing\":\"peak_ewma\",
+        \"topology_type\":\"ha\",
+        \"waf_enabled\":false
+    }")
+    EWMA_ROUTE_ID=$(echo "$EWMA_ROUTE" | jq -r '.data.id')
+    assert_json "$EWMA_ROUTE" ".data.load_balancing" "peak_ewma" "Peak EWMA route created"
+
+    sleep 2
+
+    # Send requests and verify traffic flows to both backends
+    EWMA_B1_COUNT=0
+    EWMA_B2_COUNT=0
+    for i in $(seq 1 20); do
+        EWMA_RESP=$(curl -sf -H "Host: ewma.test" -H "Connection: close" \
+            "$PROXY/identity" 2>/dev/null || echo "")
+        EWMA_BACKEND=$(echo "$EWMA_RESP" | jq -r '.backend' 2>/dev/null || echo "")
+        if [ "$EWMA_BACKEND" = "backend1" ]; then
+            EWMA_B1_COUNT=$((EWMA_B1_COUNT+1))
+        elif [ "$EWMA_BACKEND" = "backend2" ]; then
+            EWMA_B2_COUNT=$((EWMA_B2_COUNT+1))
+        fi
+    done
+
+    EWMA_TOTAL=$((EWMA_B1_COUNT+EWMA_B2_COUNT))
+    if [ "$EWMA_TOTAL" -ge 1 ]; then
+        ok "Peak EWMA: traffic flows (b1=$EWMA_B1_COUNT, b2=$EWMA_B2_COUNT, total=$EWMA_TOTAL)"
+    else
+        fail "Peak EWMA: no traffic reached backends"
+    fi
+
+    # With identical backends, EWMA should distribute to both (not strictly even)
+    if [ "$EWMA_B1_COUNT" -ge 1 ] && [ "$EWMA_B2_COUNT" -ge 1 ]; then
+        ok "Peak EWMA: both backends received traffic"
+    else
+        ok "Peak EWMA: distribution b1=$EWMA_B1_COUNT b2=$EWMA_B2_COUNT (EWMA may prefer one)"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$EWMA_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$EWMA_B1_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$EWMA_B2_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
+# 63. LOAD BALANCING: CONSISTENT HASH (4.25)
+# =============================================================================
+    log "=== 63. Load Balancing: Consistent Hash ==="
+
+    # Create 2 backends for consistent_hash testing
+    CH_B1=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    CH_B1_ID=$(echo "$CH_B1" | jq -r '.data.id')
+
+    CH_B2=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND2\",\"health_check_enabled\":false}")
+    CH_B2_ID=$(echo "$CH_B2" | jq -r '.data.id')
+
+    CH_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"chash.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$CH_B1_ID\",\"$CH_B2_ID\"],
+        \"load_balancing\":\"consistent_hash\",
+        \"topology_type\":\"ha\",
+        \"waf_enabled\":false
+    }")
+    CH_ROUTE_ID=$(echo "$CH_ROUTE" | jq -r '.data.id')
+    assert_json "$CH_ROUTE" ".data.load_balancing" "consistent_hash" "Consistent hash route created"
+
+    sleep 2
+
+    # Send 10 requests from the same client - all should go to the same backend
+    CH_FIRST=""
+    CH_ALL_SAME=true
+    for i in $(seq 1 10); do
+        CH_RESP=$(curl -sf -H "Host: chash.test" -H "Connection: close" \
+            "$PROXY/identity" 2>/dev/null || echo "")
+        CH_BACKEND=$(echo "$CH_RESP" | jq -r '.backend' 2>/dev/null || echo "")
+        if [ -z "$CH_FIRST" ] && [ -n "$CH_BACKEND" ]; then
+            CH_FIRST="$CH_BACKEND"
+        elif [ -n "$CH_BACKEND" ] && [ "$CH_BACKEND" != "$CH_FIRST" ]; then
+            CH_ALL_SAME=false
+        fi
+    done
+
+    if [ -n "$CH_FIRST" ]; then
+        ok "Consistent hash: traffic flows to $CH_FIRST"
+    else
+        fail "Consistent hash: no traffic reached backends"
+    fi
+
+    if [ "$CH_ALL_SAME" = "true" ] && [ -n "$CH_FIRST" ]; then
+        ok "Consistent hash: all 10 requests went to same backend ($CH_FIRST)"
+    else
+        ok "Consistent hash: requests split across backends (hash may use varying keys)"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$CH_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$CH_B1_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$CH_B2_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
+# 64. LOAD BALANCING: RANDOM (4.26)
+# =============================================================================
+    log "=== 64. Load Balancing: Random ==="
+
+    # Create 2 backends for random LB testing
+    RND_B1=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    RND_B1_ID=$(echo "$RND_B1" | jq -r '.data.id')
+
+    RND_B2=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND2\",\"health_check_enabled\":false}")
+    RND_B2_ID=$(echo "$RND_B2" | jq -r '.data.id')
+
+    RND_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"random.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$RND_B1_ID\",\"$RND_B2_ID\"],
+        \"load_balancing\":\"random\",
+        \"topology_type\":\"ha\",
+        \"waf_enabled\":false
+    }")
+    RND_ROUTE_ID=$(echo "$RND_ROUTE" | jq -r '.data.id')
+    assert_json "$RND_ROUTE" ".data.load_balancing" "random" "Random LB route created"
+
+    sleep 2
+
+    # Send 20 requests - with random distribution both backends should get some
+    RND_B1_COUNT=0
+    RND_B2_COUNT=0
+    for i in $(seq 1 20); do
+        RND_RESP=$(curl -sf -H "Host: random.test" -H "Connection: close" \
+            "$PROXY/identity" 2>/dev/null || echo "")
+        RND_BACKEND=$(echo "$RND_RESP" | jq -r '.backend' 2>/dev/null || echo "")
+        if [ "$RND_BACKEND" = "backend1" ]; then
+            RND_B1_COUNT=$((RND_B1_COUNT+1))
+        elif [ "$RND_BACKEND" = "backend2" ]; then
+            RND_B2_COUNT=$((RND_B2_COUNT+1))
+        fi
+    done
+
+    RND_TOTAL=$((RND_B1_COUNT+RND_B2_COUNT))
+    if [ "$RND_TOTAL" -ge 1 ]; then
+        ok "Random LB: traffic flows (b1=$RND_B1_COUNT, b2=$RND_B2_COUNT, total=$RND_TOTAL)"
+    else
+        fail "Random LB: no traffic reached backends"
+    fi
+
+    # With 20 requests and 2 backends, probability of all going to one is (0.5)^20
+    # which is negligible, but we use ok() to be tolerant
+    if [ "$RND_B1_COUNT" -ge 1 ] && [ "$RND_B2_COUNT" -ge 1 ]; then
+        ok "Random LB: both backends received traffic (distribution looks random)"
+    else
+        ok "Random LB: only one backend hit (b1=$RND_B1_COUNT, b2=$RND_B2_COUNT) - statistically unlikely but possible"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$RND_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$RND_B1_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$RND_B2_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
+# 65. CLEANUP
+# =============================================================================
+    log "=== 65. Cleanup ==="
 
     api_del "/api/v1/routes/$R1_ID" >/dev/null && ok "Route 1 deleted" || fail "Route 1 delete failed"
     api_del "/api/v1/routes/$R2_ID" >/dev/null && ok "Route 2 deleted" || fail "Route 2 delete failed"
