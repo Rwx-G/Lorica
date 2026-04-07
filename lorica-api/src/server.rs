@@ -26,6 +26,10 @@ pub struct AppState {
     pub system_cache: Arc<Mutex<SystemCache>>,
     pub active_connections: Arc<AtomicU64>,
     pub started_at: Instant,
+    /// HTTP proxy port (for load test URL construction).
+    pub http_port: u16,
+    /// HTTPS proxy port (for load test URL construction).
+    pub https_port: u16,
     /// Sender that signals the proxy engine to reload its configuration.
     /// Incremented on each mutation. `None` in tests or when no proxy is running.
     pub config_reload_tx: Option<watch::Sender<u64>>,

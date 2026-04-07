@@ -15,6 +15,8 @@
 
   let configs: LoadTestConfigResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
+  let proxyHttpPort = $state(8080);
+  let proxyHttpsPort = $state(8443);
   let error = $state('');
   let loading = $state(true);
 
@@ -59,6 +61,12 @@
     if (res.data) configs = res.data;
     if (res.error) error = res.error.message;
     routes = (routesRes.data?.routes ?? []).filter((r) => r.enabled);
+    // Fetch proxy ports from system API
+    const sysRes = await api.getSystem();
+    if (sysRes.data) {
+      proxyHttpPort = sysRes.data.proxy?.http_port ?? 8080;
+      proxyHttpsPort = sysRes.data.proxy?.https_port ?? 8443;
+    }
     loading = false;
   }
 
@@ -156,13 +164,13 @@
       return;
     }
 
-    // Build target URL using the route hostname directly.
-    // The load test runs on the Lorica server where the hostname resolves
-    // to the local proxy (via DNS or /etc/hosts).
+    // Build target URL pointing to 127.0.0.1 with the actual proxy ports.
+    // The Host header tells the proxy which route to use.
     const proto = selectedRoute.certificate_id ? 'https' : 'http';
+    const port = selectedRoute.certificate_id ? proxyHttpsPort : proxyHttpPort;
     const suffix = formPathSuffix.startsWith('/') ? formPathSuffix : `/${formPathSuffix}`;
-    const targetUrl = `${proto}://${selectedRoute.hostname}${suffix}`;
-    const headers: Record<string, string> = {};
+    const targetUrl = `${proto}://127.0.0.1:${port}${suffix}`;
+    const headers: Record<string, string> = { Host: selectedRoute.hostname };
 
     formSubmitting = true;
     formError = '';

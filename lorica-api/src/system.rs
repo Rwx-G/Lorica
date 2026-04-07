@@ -49,6 +49,10 @@ pub struct ProxyInfo {
     pub uptime_seconds: u64,
     /// Number of active proxy connections (from config backends).
     pub active_connections: u64,
+    /// HTTP proxy listen port.
+    pub http_port: u16,
+    /// HTTPS proxy listen port.
+    pub https_port: u16,
 }
 
 /// Cached system info to avoid expensive re-creation on every request.
@@ -161,6 +165,8 @@ pub async fn get_system(
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds: uptime,
             active_connections,
+            http_port: state.http_port,
+            https_port: state.https_port,
         },
     };
 
