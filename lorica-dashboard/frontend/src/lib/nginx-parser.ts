@@ -1046,6 +1046,54 @@ export function mergeRelatedRoutes(routes: LoricaRouteImport[]): LoricaRouteImpo
     }
   }
 
+  // --- Pass 3: Merge non-www redirect routes into www routes (reverse direction) ---
+  // A non-www route: hostname is X and has redirect_to pointing to www.X
+  for (let i = 0; i < routes.length; i++) {
+    if (removedIndices.has(i)) continue;
+    const route = routes[i];
+    const host = route.hostname.toLowerCase();
+
+    if (host.startsWith('www.')) continue; // already handled in pass 2
+
+    // Check if this route redirects to www.X
+    if (!route.redirect_to) continue;
+    const target = route.redirect_to.toLowerCase();
+    const wwwDomain = `www.${host}`;
+    const isNonWwwRedirect =
+      target === `https://${wwwDomain}` ||
+      target === `http://${wwwDomain}` ||
+      target === wwwDomain;
+
+    if (!isNonWwwRedirect) continue;
+
+    // Find the www.X primary route
+    const wwwRoutes = byHostname.get(wwwDomain);
+    if (!wwwRoutes) continue;
+
+    for (const primary of wwwRoutes) {
+      if (removedIndices.has(routes.indexOf(primary))) continue;
+      if (primary.path_prefix !== route.path_prefix) continue;
+      if (primary.backend_addresses.length === 0 && !primary.redirect_to) continue;
+
+      // Merge: add X as alias, set redirect_hostname to www.X
+      const bareHost = route.hostname;
+      if (!primary.hostname_aliases.includes(bareHost) && bareHost.toLowerCase() !== primary.hostname.toLowerCase()) {
+        primary.hostname_aliases.push(bareHost);
+        primary.importedFields.add('hostname_aliases');
+      }
+      for (const alias of route.hostname_aliases) {
+        if (!primary.hostname_aliases.includes(alias) && alias.toLowerCase() !== primary.hostname.toLowerCase()) {
+          primary.hostname_aliases.push(alias);
+        }
+      }
+      primary.redirect_hostname = primary.hostname;
+      primary.importedFields.add('redirect_hostname');
+
+      removedIndices.add(i);
+      break;
+    }
+  }
+
   return routes.filter((_, i) => !removedIndices.has(i));
 }
 
