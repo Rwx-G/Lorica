@@ -80,6 +80,7 @@ export interface LoricaRouteImport {
   path_rewrite_pattern: string | null;
   path_rewrite_replacement: string | null;
   redirect_to: string | null;
+  redirect_hostname: string | null;
   rate_limit_rps: number | null;
   rate_limit_burst: number | null;
   cache_enabled: boolean;
@@ -745,6 +746,7 @@ function createDefaultRoute(): LoricaRouteImport {
     path_rewrite_pattern: null,
     path_rewrite_replacement: null,
     redirect_to: null,
+    redirect_hostname: null,
     rate_limit_rps: null,
     rate_limit_burst: null,
     cache_enabled: false,
@@ -864,6 +866,129 @@ function resolveUpstreams(
 }
 
 /**
+ * Merge related routes that represent the same logical site.
+ *
+ * Handles two common Nginx patterns:
+ * 1. HTTP-to-HTTPS redirect: a server block with `return 301 https://...`
+ *    and no backends is merged into the corresponding HTTPS route.
+ * 2. www-to-bare redirect: a server block for `www.X` that redirects to `X`
+ *    is merged into the `X` route as a hostname alias with redirect_hostname.
+ *
+ * @param routes - Array of routes produced by per-server-block conversion
+ * @returns Deduplicated array with merged configuration
+ */
+export function mergeRelatedRoutes(routes: LoricaRouteImport[]): LoricaRouteImport[] {
+  // Index routes by hostname for fast lookup
+  const byHostname = new Map<string, LoricaRouteImport[]>();
+  for (const r of routes) {
+    const key = r.hostname.toLowerCase();
+    if (!byHostname.has(key)) byHostname.set(key, []);
+    byHostname.get(key)!.push(r);
+  }
+
+  // --- Pass 1: Merge HTTP redirect-only routes into HTTPS routes ---
+  // A "redirect-only" route has force_https=true, no backends, and no redirect_to.
+  const removedIndices = new Set<number>();
+
+  for (const [hostname, group] of byHostname) {
+    if (group.length < 2) continue;
+
+    for (const redirectRoute of group) {
+      if (!redirectRoute.force_https) continue;
+      if (redirectRoute.backend_addresses.length > 0) continue;
+      if (redirectRoute.redirect_to) continue;
+
+      // Find a primary route with the same hostname + path_prefix that has backends
+      for (const primary of group) {
+        if (primary === redirectRoute) continue;
+        if (primary.path_prefix !== redirectRoute.path_prefix) continue;
+        if (primary.backend_addresses.length === 0) continue;
+
+        // Merge: set force_https on the primary, absorb aliases
+        primary.force_https = true;
+        primary.importedFields.add('force_https');
+        for (const alias of redirectRoute.hostname_aliases) {
+          if (!primary.hostname_aliases.includes(alias) && alias.toLowerCase() !== hostname) {
+            primary.hostname_aliases.push(alias);
+          }
+        }
+        if (primary.hostname_aliases.length > 0) {
+          primary.importedFields.add('hostname_aliases');
+        }
+
+        // Mark the redirect-only route for removal
+        removedIndices.add(routes.indexOf(redirectRoute));
+        break;
+      }
+    }
+  }
+
+  // --- Pass 2: Merge www redirect routes into bare domain routes ---
+  // A www redirect route: hostname is www.X and has redirect_to pointing to X
+  for (let i = 0; i < routes.length; i++) {
+    if (removedIndices.has(i)) continue;
+    const route = routes[i];
+    const host = route.hostname.toLowerCase();
+
+    if (!host.startsWith('www.')) continue;
+    const bareDomain = host.slice(4);
+
+    // Check if this route is a redirect to the bare domain
+    const isWwwRedirect = (() => {
+      if (route.redirect_to) {
+        // redirect_to could be "https://X", "http://X", or just "X"
+        const target = route.redirect_to.toLowerCase();
+        if (
+          target === `https://${bareDomain}` ||
+          target === `http://${bareDomain}` ||
+          target === bareDomain
+        ) {
+          return true;
+        }
+      }
+      // Also detect force_https routes for www.X with no backends and no redirect_to
+      // (these are essentially www->bare redirects when paired with a bare domain route)
+      if (route.force_https && route.backend_addresses.length === 0 && !route.redirect_to) {
+        return true;
+      }
+      return false;
+    })();
+
+    if (!isWwwRedirect) continue;
+
+    // Find the bare domain primary route
+    const bareRoutes = byHostname.get(bareDomain);
+    if (!bareRoutes) continue;
+
+    for (const primary of bareRoutes) {
+      if (removedIndices.has(routes.indexOf(primary))) continue;
+      if (primary.path_prefix !== route.path_prefix) continue;
+      if (primary.backend_addresses.length === 0 && !primary.redirect_to) continue;
+
+      // Merge: add www.X as alias, set redirect_hostname
+      const wwwHost = route.hostname; // preserve original casing
+      if (!primary.hostname_aliases.includes(wwwHost) && wwwHost.toLowerCase() !== primary.hostname.toLowerCase()) {
+        primary.hostname_aliases.push(wwwHost);
+        primary.importedFields.add('hostname_aliases');
+      }
+      // Also absorb any aliases from the www route
+      for (const alias of route.hostname_aliases) {
+        if (!primary.hostname_aliases.includes(alias) && alias.toLowerCase() !== primary.hostname.toLowerCase()) {
+          primary.hostname_aliases.push(alias);
+        }
+      }
+      primary.redirect_hostname = primary.hostname;
+      primary.importedFields.add('redirect_hostname');
+
+      removedIndices.add(i);
+      break;
+    }
+  }
+
+  return routes.filter((_, i) => !removedIndices.has(i));
+}
+
+/**
  * Convert a parsed Nginx config into Lorica route imports.
  *
  * Each server+location combination produces one route. Server-level
@@ -921,5 +1046,5 @@ export function convertToLoricaRoutes(result: NginxParseResult): LoricaRouteImpo
     }
   }
 
-  return routes;
+  return mergeRelatedRoutes(routes);
 }
