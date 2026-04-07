@@ -253,11 +253,19 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
   },
 
   add_header: (v, r) => {
-    const parts = v.split(/\s+/);
-    const key = parts[0];
-    const rest = parts.slice(1).join(' ').replace(/^"|"$/g, '');
+    // Parse: add_header Name "value with spaces" [always]
+    // The value may be quoted and contain semicolons
+    const trimmed = v.trim().replace(/\s+always\s*$/, '');
+    const spaceIdx = trimmed.indexOf(' ');
+    if (spaceIdx === -1) return;
+    const key = trimmed.substring(0, spaceIdx);
+    let val = trimmed.substring(spaceIdx + 1).trim();
+    // Strip surrounding quotes
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
     if (key) {
-      r.response_headers[key] = rest;
+      r.response_headers[key] = val;
       r.importedFields.add('response_headers');
       if (isSecurityHeader(key)) {
         r.security_headers = 'strict';
@@ -370,6 +378,25 @@ interface BlockFrame {
 }
 
 /**
+ * Check if a character appears outside of quoted strings.
+ *
+ * @param line - The line to check
+ * @param ch - The character to look for
+ * @returns true if ch appears outside quotes
+ */
+function hasUnquotedChar(line: string, ch: string): boolean {
+  let inDouble = false;
+  let inSingle = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"' && !inSingle) inDouble = !inDouble;
+    else if (c === "'" && !inDouble) inSingle = !inSingle;
+    else if (c === ch && !inDouble && !inSingle) return true;
+  }
+  return false;
+}
+
+/**
  * Strip inline comments from a line.
  *
  * Handles the case where `#` appears inside a quoted string (keeps it).
@@ -394,7 +421,9 @@ function stripComment(line: string): string {
 
 /**
  * Split a line into individual statements on semicolons, keeping
- * brace-only segments separate.
+ * brace-only segments separate. Respects quoted strings so that
+ * semicolons inside quotes (e.g. HSTS directives) are not treated
+ * as statement terminators.
  *
  * @param line - Cleaned config line
  * @returns Array of statement strings
@@ -402,12 +431,20 @@ function stripComment(line: string): string {
 function splitStatements(line: string): string[] {
   const results: string[] = [];
   let current = '';
+  let inDouble = false;
+  let inSingle = false;
   for (const ch of line) {
-    if (ch === ';') {
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      current += ch;
+    } else if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      current += ch;
+    } else if (!inDouble && !inSingle && ch === ';') {
       const trimmed = current.trim();
       if (trimmed) results.push(trimmed);
       current = '';
-    } else if (ch === '{' || ch === '}') {
+    } else if (!inDouble && !inSingle && (ch === '{' || ch === '}')) {
       const trimmed = current.trim();
       if (trimmed) results.push(trimmed);
       results.push(ch);
@@ -495,9 +532,9 @@ export function parseNginxConfig(text: string): NginxParseResult {
       lineToProcess = cleaned;
     }
 
-    // Check if line is complete (has semicolon or brace)
-    const hasSemicolon = lineToProcess.includes(';');
-    const hasBrace = lineToProcess.includes('{') || lineToProcess.includes('}');
+    // Check if line is complete (has semicolon or brace outside quotes)
+    const hasSemicolon = hasUnquotedChar(lineToProcess, ';');
+    const hasBrace = hasUnquotedChar(lineToProcess, '{') || hasUnquotedChar(lineToProcess, '}');
     if (!hasSemicolon && !hasBrace) {
       pendingLine = lineToProcess;
       if (!pendingLineNumber) pendingLineNumber = lineNumber;
@@ -696,9 +733,60 @@ function createDefaultRoute(): LoricaRouteImport {
 }
 
 /**
+ * Nginx directives that Lorica handles differently or that are not relevant.
+ * These are silently ignored (no diagnostic) because they are well-known
+ * Nginx directives, not typos or unknown config.
+ */
+const SILENTLY_IGNORED_DIRECTIVES = new Set([
+  'listen',
+  'http2',
+  'ssl',
+  'ssl_dhparam',
+  'ssl_protocols',
+  'ssl_ciphers',
+  'ssl_prefer_server_ciphers',
+  'ssl_session_cache',
+  'ssl_session_timeout',
+  'ssl_session_tickets',
+  'ssl_stapling',
+  'ssl_stapling_verify',
+  'ssl_trusted_certificate',
+  'proxy_http_version',
+  'proxy_buffering',
+  'proxy_buffer_size',
+  'proxy_buffers',
+  'proxy_busy_buffers_size',
+  'keepalive',
+  'keepalive_timeout',
+  'keepalive_requests',
+  'access_log',
+  'error_log',
+  'gzip',
+  'gzip_types',
+  'gzip_vary',
+  'gzip_proxied',
+  'gzip_comp_level',
+  'gzip_min_length',
+  'sendfile',
+  'tcp_nopush',
+  'tcp_nodelay',
+  'resolver',
+  'charset',
+  'server_tokens',
+  'root',
+  'index',
+  'try_files',
+  'error_page',
+  'expires',
+  'etag',
+  'if_modified_since',
+]);
+
+/**
  * Apply a directive to a route using the DIRECTIVE_MAP.
  *
- * Unknown directives generate an info-level diagnostic.
+ * Known-but-irrelevant directives are silently skipped.
+ * Truly unknown directives generate an info-level diagnostic.
  *
  * @param directive - The parsed directive
  * @param route - The route being built
@@ -712,6 +800,8 @@ function applyDirective(
   const handler = DIRECTIVE_MAP[directive.name];
   if (handler) {
     handler(directive.value, route, diagnostics, directive.line);
+  } else if (SILENTLY_IGNORED_DIRECTIVES.has(directive.name)) {
+    // Known Nginx directive - Lorica handles this differently, skip silently
   } else {
     diagnostics.push({
       level: 'info',
