@@ -59,10 +59,43 @@ pub struct CreateLoadTestConfig {
     pub schedule_cron: Option<String>,
 }
 
+/// Validate that the load test target URL points to localhost only.
+/// This prevents using the load test engine to attack external hosts.
+fn validate_target_url(url: &str) -> Result<(), ApiError> {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| {
+            ApiError::BadRequest("target URL must start with http:// or https://".into())
+        })?;
+
+    let authority = without_scheme.split('/').next().unwrap_or("");
+    let host = if authority.starts_with('[') {
+        // IPv6: [::1]:8080
+        authority
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[')
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+
+    if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return Err(ApiError::BadRequest(
+            "load test target must point to the local proxy (127.0.0.1 or localhost)".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 pub async fn create_config(
     Extension(state): Extension<AppState>,
     Json(body): Json<CreateLoadTestConfig>,
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
+    validate_target_url(&body.target_url)?;
+
     let now = Utc::now();
     let config = LoadTestConfig {
         id: new_id(),
@@ -114,6 +147,10 @@ pub async fn update_config(
     Path(id): Path<String>,
     Json(body): Json<UpdateLoadTestConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(ref url) = body.target_url {
+        validate_target_url(url)?;
+    }
+
     let store = state.store.lock().await;
     let mut config = store
         .get_load_test_config(&id)
@@ -384,4 +421,32 @@ pub async fn clone_config(
         axum::http::StatusCode::CREATED,
         cloned,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_target_url_allows_localhost() {
+        assert!(validate_target_url("http://127.0.0.1:8080/").is_ok());
+        assert!(validate_target_url("https://127.0.0.1:8443/api/health").is_ok());
+        assert!(validate_target_url("http://localhost:8080/").is_ok());
+        assert!(validate_target_url("https://localhost:8443/path").is_ok());
+        assert!(validate_target_url("http://[::1]:8080/").is_ok());
+    }
+
+    #[test]
+    fn validate_target_url_rejects_external() {
+        assert!(validate_target_url("http://10.0.0.1:8080/").is_err());
+        assert!(validate_target_url("https://example.com/").is_err());
+        assert!(validate_target_url("http://192.168.1.1/").is_err());
+        assert!(validate_target_url("http://0.0.0.0:8080/").is_err());
+    }
+
+    #[test]
+    fn validate_target_url_rejects_bad_scheme() {
+        assert!(validate_target_url("ftp://127.0.0.1/").is_err());
+        assert!(validate_target_url("127.0.0.1:8080/").is_err());
+    }
 }

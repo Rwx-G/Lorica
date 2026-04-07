@@ -22,6 +22,10 @@ Author: Rwx-G
 - Worker metrics aggregation: cache hits/misses, active connections, ban list, and EWMA scores are now aggregated from workers to supervisor via command channel and displayed in the dashboard and Prometheus `/metrics` endpoint in multi-worker mode
 - CRL (Certificate Revocation List) support for upstream TLS connections via `--upstream-crl-file` CLI flag. When set, server certificates are checked against the CRL (PEM or DER format). Propagated to worker processes in multi-worker mode. CRL file changes are detected automatically every 60 seconds and hot-reloaded without restart
 
+### Security
+
+- Load test target URL restricted to localhost (127.0.0.1, localhost, ::1) to prevent the engine from being used to attack external hosts. The dashboard now uses a route selector with path suffix instead of a free-text URL field
+
 ### Changed
 
 - Post-install message now lists all CLI flags and notes dashboard is localhost-only

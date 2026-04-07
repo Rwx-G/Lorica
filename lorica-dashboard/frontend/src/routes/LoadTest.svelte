@@ -8,11 +8,13 @@
     type LoadTestComparison,
     type CreateLoadTestRequest,
     type UpdateLoadTestRequest,
+    type RouteResponse,
   } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { showToast } from '../lib/toast';
 
   let configs: LoadTestConfigResponse[] = $state([]);
+  let routes: RouteResponse[] = $state([]);
   let error = $state('');
   let loading = $state(true);
 
@@ -30,7 +32,8 @@
   let showForm = $state(false);
   let editingConfig: LoadTestConfigResponse | null = $state(null);
   let formName = $state('');
-  let formTargetUrl = $state('');
+  let formRouteId = $state('');
+  let formPathSuffix = $state('/');
   let formMethod = $state('GET');
   let formConcurrency = $state(10);
   let formRps = $state(100);
@@ -49,9 +52,13 @@
   async function loadData() {
     loading = true;
     error = '';
-    const res = await api.listLoadTestConfigs();
+    const [res, routesRes] = await Promise.all([
+      api.listLoadTestConfigs(),
+      api.listRoutes(),
+    ]);
     if (res.data) configs = res.data;
     if (res.error) error = res.error.message;
+    routes = (routesRes.data?.routes ?? []).filter((r) => r.enabled);
     loading = false;
   }
 
@@ -87,7 +94,8 @@
   function openCreateForm() {
     editingConfig = null;
     formName = '';
-    formTargetUrl = '';
+    formRouteId = '';
+    formPathSuffix = '/';
     formMethod = 'GET';
     formConcurrency = 10;
     formRps = 100;
@@ -101,7 +109,20 @@
   function openEditForm(config: LoadTestConfigResponse) {
     editingConfig = config;
     formName = config.name;
-    formTargetUrl = config.target_url;
+
+    // Parse route + path from the existing config's Host header
+    const hostHeader = config.headers?.Host ?? '';
+    const matched = routes.find((r) => r.hostname === hostHeader);
+    formRouteId = matched?.id ?? '';
+
+    // Extract path suffix from the target_url
+    try {
+      const u = new URL(config.target_url);
+      formPathSuffix = u.pathname || '/';
+    } catch {
+      formPathSuffix = '/';
+    }
+
     formMethod = config.method;
     formConcurrency = config.concurrency;
     formRps = config.requests_per_second;
@@ -114,10 +135,7 @@
 
   function validate(): string {
     if (!formName.trim()) return 'Name is required';
-    if (!formTargetUrl.trim()) return 'Target URL is required';
-    if (!formTargetUrl.trim().startsWith('http://') && !formTargetUrl.trim().startsWith('https://')) {
-      return 'Target URL must start with http:// or https://';
-    }
+    if (!formRouteId) return 'Select a route';
     if (formConcurrency < 1 || formConcurrency > 10000) return 'Concurrency must be between 1 and 10000';
     if (formRps < 1 || formRps > 100000) return 'Requests/sec must be between 1 and 100000';
     if (formDuration < 5 || formDuration > 3600) return 'Duration must be between 5 and 3600 seconds';
@@ -131,14 +149,29 @@
       formError = err;
       return;
     }
+
+    const selectedRoute = routes.find((r) => r.id === formRouteId);
+    if (!selectedRoute) {
+      formError = 'Select a route';
+      return;
+    }
+
+    // Build target URL pointing to the local proxy
+    const proto = selectedRoute.certificate_id ? 'https' : 'http';
+    const port = selectedRoute.certificate_id ? 8443 : 8080;
+    const suffix = formPathSuffix.startsWith('/') ? formPathSuffix : `/${formPathSuffix}`;
+    const targetUrl = `${proto}://127.0.0.1:${port}${suffix}`;
+    const headers: Record<string, string> = { Host: selectedRoute.hostname };
+
     formSubmitting = true;
     formError = '';
 
     if (editingConfig) {
       const body: UpdateLoadTestRequest = {
         name: formName,
-        target_url: formTargetUrl,
+        target_url: targetUrl,
         method: formMethod,
+        headers,
         concurrency: formConcurrency,
         requests_per_second: formRps,
         duration_s: formDuration,
@@ -152,8 +185,9 @@
     } else {
       const body: CreateLoadTestRequest = {
         name: formName,
-        target_url: formTargetUrl,
+        target_url: targetUrl,
         method: formMethod,
+        headers,
         concurrency: formConcurrency,
         requests_per_second: formRps,
         duration_s: formDuration,
@@ -230,6 +264,13 @@
     if (val === null) return '-';
     const sign = val >= 0 ? '+' : '';
     return `${sign}${val.toFixed(1)}%`;
+  }
+
+  function formatTarget(config: LoadTestConfigResponse): string {
+    const host = config.headers?.Host;
+    let path = '';
+    try { path = new URL(config.target_url).pathname; } catch { /* ignore */ }
+    return host ? `${host}${path}` : config.target_url;
   }
 
   function deltaColor(val: number | null, invertGood: boolean = false): string {
@@ -315,7 +356,7 @@
               <td>
                 <button class="link-btn" onclick={() => loadResults(c.id)}>{c.name}</button>
               </td>
-              <td class="mono small">{c.target_url}</td>
+              <td class="mono small">{formatTarget(c)}</td>
               <td>{c.concurrency}</td>
               <td>{c.requests_per_second}</td>
               <td>{c.duration_s}s</td>
@@ -461,8 +502,18 @@
         </div>
 
         <div class="form-group">
-          <label>Target URL <span class="required">*</span></label>
-          <input type="text" bind:value={formTargetUrl} placeholder="http://10.0.0.1:8080/api/health" />
+          <label>Route <span class="required">*</span></label>
+          <select bind:value={formRouteId}>
+            <option value="">Select a route...</option>
+            {#each routes as route}
+              <option value={route.id}>{route.hostname}{route.path_prefix !== '/' ? route.path_prefix : ''}</option>
+            {/each}
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Path</label>
+          <input type="text" bind:value={formPathSuffix} placeholder="/" />
+          <span class="hint">Path suffix appended to the route (e.g., /api/health)</span>
         </div>
 
         <div class="form-row">
