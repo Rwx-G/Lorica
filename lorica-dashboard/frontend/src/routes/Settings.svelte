@@ -114,6 +114,22 @@
     (document.documentElement.getAttribute('data-theme') as 'dark' | 'light') || 'light'
   );
 
+  // Collapsible sections
+  let expandedSections = $state<Record<string, boolean>>({
+    appearance: true,
+    global: true,
+    notifications: true,
+    presets: false,
+    history: false,
+    preferences: false,
+    export: false,
+    ban_rules: false,
+  });
+
+  function toggleSection(key: string) {
+    expandedSections[key] = !expandedSections[key];
+  }
+
   let loading = $state(true);
   let error = $state('');
 
@@ -506,19 +522,30 @@
   {:else}
     <!-- Theme -->
     <section class="section">
-      <div class="section-header">
+      <button class="collapsible-header" class:open={expandedSections.appearance} onclick={() => toggleSection('appearance')}>
         <h2>Appearance</h2>
-        <button class="btn btn-secondary" onclick={toggleTheme}>
-          {theme === 'dark' ? 'Switch to Light' : 'Switch to Dark'}
-        </button>
-      </div>
-      <p class="section-hint">Current theme: {theme}.</p>
+        <span class="chevron" class:expanded={expandedSections.appearance}></span>
+      </button>
+      {#if expandedSections.appearance}
+        <div class="section-body">
+          <p class="section-hint">Current theme: {theme}.</p>
+          <div class="actions">
+            <button class="btn btn-secondary" onclick={toggleTheme}>
+              {theme === 'dark' ? 'Switch to Light' : 'Switch to Dark'}
+            </button>
+          </div>
+        </div>
+      {/if}
     </section>
 
     <!-- Global Settings -->
     <section class="section">
-      <h2>Global Configuration</h2>
-      <div class="form-card">
+      <button class="collapsible-header" class:open={expandedSections.global} onclick={() => toggleSection('global')}>
+        <h2>Global Configuration</h2>
+        <span class="chevron" class:expanded={expandedSections.global}></span>
+      </button>
+      {#if expandedSections.global}
+      <div class="section-body">
         <div class="form-row">
           <label for="mgmt-port">Management Port</label>
           <input id="mgmt-port" type="number" bind:value={settingsForm.management_port} min="1" max="65535" disabled />
@@ -616,313 +643,355 @@
         {#if settingsMsg}
           <div class="form-success">{settingsMsg}</div>
         {/if}
-        <div class="form-actions">
+        <div class="actions">
           <button class="btn btn-primary" onclick={saveSettings} disabled={settingsSaving}>
             {settingsSaving ? 'Saving...' : 'Save Settings'}
           </button>
         </div>
       </div>
+      {/if}
     </section>
 
     <!-- Security Header Presets -->
     <section class="section">
-      <div class="section-header">
+      <button class="collapsible-header" class:open={expandedSections.presets} onclick={() => toggleSection('presets')}>
         <h2>Security Header Presets</h2>
-        <button class="btn btn-primary" onclick={openPresetCreate}>Add Preset</button>
-      </div>
-      <p class="section-hint">Custom presets appear alongside builtin presets (strict, moderate, none) in the route security headers dropdown.</p>
+        <span class="chevron" class:expanded={expandedSections.presets}></span>
+      </button>
+      {#if expandedSections.presets}
+        <div class="section-body">
+          <p class="section-hint">Custom presets appear alongside builtin presets (strict, moderate, none) in the route security headers dropdown.</p>
 
-      <!-- Builtin presets (read-only) -->
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Headers</th>
-              <th>Type</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each builtinPresets as bp}
-              <tr>
-                <td><code>{bp.name}</code></td>
-                <td class="preset-desc">{bp.description}</td>
-                <td><span class="badge badge-builtin">builtin</span></td>
-                <td>-</td>
-              </tr>
-            {/each}
-            {#each customPresets as cp, idx}
-              <tr>
-                <td><code>{cp.name}</code></td>
-                <td class="preset-desc">{Object.keys(cp.headers).length} header{Object.keys(cp.headers).length !== 1 ? 's' : ''}</td>
-                <td><span class="badge badge-custom">custom</span></td>
-                <td class="actions-cell">
-                  <button class="btn-link" onclick={() => openPresetEdit(idx)}>Edit</button>
-                  <button class="btn-link danger" onclick={() => deletingPresetIdx = idx}>Delete</button>
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
+          <!-- Builtin presets (read-only) -->
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Headers</th>
+                  <th>Type</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each builtinPresets as bp}
+                  <tr>
+                    <td><code>{bp.name}</code></td>
+                    <td class="preset-desc">{bp.description}</td>
+                    <td><span class="badge badge-builtin">builtin</span></td>
+                    <td>-</td>
+                  </tr>
+                {/each}
+                {#each customPresets as cp, idx}
+                  <tr>
+                    <td><code>{cp.name}</code></td>
+                    <td class="preset-desc">{Object.keys(cp.headers).length} header{Object.keys(cp.headers).length !== 1 ? 's' : ''}</td>
+                    <td><span class="badge badge-custom">custom</span></td>
+                    <td class="actions-cell">
+                      <button class="btn-link" onclick={() => openPresetEdit(idx)}>Edit</button>
+                      <button class="btn-link danger" onclick={() => deletingPresetIdx = idx}>Delete</button>
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" onclick={openPresetCreate}>Add Preset</button>
+          </div>
+        </div>
+      {/if}
     </section>
 
     <!-- Ban configuration note -->
     <section class="section">
-      <h2>Ban Rules</h2>
-      <p class="section-hint">Ban rules (slowloris protection, auto-ban threshold and duration) are configured per-route in the Routes page under Advanced Configuration > Protection.</p>
+      <button class="collapsible-header" class:open={expandedSections.ban_rules} onclick={() => toggleSection('ban_rules')}>
+        <h2>Ban Rules</h2>
+        <span class="chevron" class:expanded={expandedSections.ban_rules}></span>
+      </button>
+      {#if expandedSections.ban_rules}
+        <div class="section-body">
+          <p class="section-hint">Ban rules (slowloris protection, auto-ban threshold and duration) are configured per-route in the Routes page under Advanced Configuration > Protection.</p>
+        </div>
+      {/if}
     </section>
 
     <!-- Notification Preferences -->
     <section class="section">
-      <div class="section-header">
+      <button class="collapsible-header" class:open={expandedSections.notifications} onclick={() => toggleSection('notifications')}>
         <h2>Notification Channels</h2>
-        <button class="btn btn-primary" onclick={openNotifCreate}>Add Channel</button>
-      </div>
-      <p class="section-hint">Stdout logging is always enabled. Configure additional channels below.</p>
+        <span class="chevron" class:expanded={expandedSections.notifications}></span>
+      </button>
+      {#if expandedSections.notifications}
+        <div class="section-body">
+          <p class="section-hint">Stdout logging is always enabled. Configure additional channels below.</p>
 
-      {#if notifications.length === 0}
-        <p class="empty-text">No notification channels configured.</p>
-      {:else}
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Channel</th>
-                <th>Enabled</th>
-                <th>Alert Types</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {#each notifications as nc}
-                <tr>
-                  <td class="capitalize">{nc.channel}</td>
-                  <td>
-                    <span class="status-dot" class:enabled={nc.enabled} class:disabled={!nc.enabled}></span>
-                    {nc.enabled ? 'Yes' : 'No'}
-                  </td>
-                  <td>{nc.alert_types.join(', ') || '-'}</td>
-                  <td class="actions-cell">
-                    <button class="btn-link" onclick={() => handleTestNotif(nc.id)} disabled={testingNotif === nc.id}>Test</button>
-                    <button class="btn-link" onclick={() => openNotifEdit(nc)}>Edit</button>
-                    <button class="btn-link danger" onclick={() => deletingNotif = nc}>Delete</button>
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
+          {#if notifications.length === 0}
+            <p class="empty-text">No notification channels configured.</p>
+          {:else}
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Channel</th>
+                    <th>Enabled</th>
+                    <th>Alert Types</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each notifications as nc}
+                    <tr>
+                      <td class="capitalize">{nc.channel}</td>
+                      <td>
+                        <span class="status-dot" class:enabled={nc.enabled} class:disabled={!nc.enabled}></span>
+                        {nc.enabled ? 'Yes' : 'No'}
+                      </td>
+                      <td>{nc.alert_types.join(', ') || '-'}</td>
+                      <td class="actions-cell">
+                        <button class="btn-link" onclick={() => handleTestNotif(nc.id)} disabled={testingNotif === nc.id}>Test</button>
+                        <button class="btn-link" onclick={() => openNotifEdit(nc)}>Edit</button>
+                        <button class="btn-link danger" onclick={() => deletingNotif = nc}>Delete</button>
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {/if}
+          <div class="actions">
+            <button class="btn btn-primary" onclick={openNotifCreate}>Add Channel</button>
+          </div>
         </div>
       {/if}
     </section>
 
     <!-- Notification History -->
     <section class="section">
-      <h2>Notification History</h2>
-      <p class="section-hint">Recent alert events dispatched by Lorica (last 100).</p>
+      <button class="collapsible-header" class:open={expandedSections.history} onclick={() => toggleSection('history')}>
+        <h2>Notification History</h2>
+        <span class="chevron" class:expanded={expandedSections.history}></span>
+      </button>
+      {#if expandedSections.history}
+        <div class="section-body">
+          <p class="section-hint">Recent alert events dispatched by Lorica (last 100).</p>
 
-      {#if notifHistory.length === 0}
-        <p class="empty-text">No notification events yet.</p>
-      {:else}
-        <div class="form-card notif-history-scroll">
-          <table>
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Type</th>
-                <th>Summary</th>
-              </tr>
-            </thead>
-            <tbody>
-              {#each notifHistory as ev}
-                <tr>
-                  <td class="mono">{new Date(ev.timestamp).toLocaleString()}</td>
-                  <td><span class="badge badge-{ev.alert_type === 'sla_breached' || ev.alert_type === 'backend_down' ? 'red' : ev.alert_type === 'sla_recovered' ? 'green' : ev.alert_type === 'cert_expiring' ? 'orange' : 'blue'}">{ev.alert_type}</span></td>
-                  <td>{ev.summary}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
+          {#if notifHistory.length === 0}
+            <p class="empty-text">No notification events yet.</p>
+          {:else}
+            <div class="notif-history-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Type</th>
+                    <th>Summary</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each notifHistory as ev}
+                    <tr>
+                      <td class="mono">{new Date(ev.timestamp).toLocaleString()}</td>
+                      <td><span class="badge badge-{ev.alert_type === 'sla_breached' || ev.alert_type === 'backend_down' ? 'red' : ev.alert_type === 'sla_recovered' ? 'green' : ev.alert_type === 'cert_expiring' ? 'orange' : 'blue'}">{ev.alert_type}</span></td>
+                      <td>{ev.summary}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {/if}
         </div>
       {/if}
     </section>
 
     <!-- Preference Memory -->
     <section class="section">
-      <h2>Preference Memory</h2>
-      <p class="section-hint">Stored decisions for prompts and UI preferences.</p>
+      <button class="collapsible-header" class:open={expandedSections.preferences} onclick={() => toggleSection('preferences')}>
+        <h2>Preference Memory</h2>
+        <span class="chevron" class:expanded={expandedSections.preferences}></span>
+      </button>
+      {#if expandedSections.preferences}
+        <div class="section-body">
+          <p class="section-hint">Stored decisions for prompts and UI preferences.</p>
 
-      <div class="pref-row">
-        <div class="pref-info">
-          <code>getting_started_guide</code>
-          <span class="pref-hint">Show the getting started guide on the Overview page</span>
-        </div>
-        <label class="toggle-label">
-          <span>{helperGuideVisible ? 'Visible' : 'Hidden'}</span>
-          <button class="toggle" class:on={helperGuideVisible} onclick={toggleHelperGuide}>
-            <span class="toggle-knob"></span>
-          </button>
-        </label>
-      </div>
+          <div class="pref-row">
+            <div class="pref-info">
+              <code>getting_started_guide</code>
+              <span class="pref-hint">Show the getting started guide on the Overview page</span>
+            </div>
+            <label class="toggle-label">
+              <span>{helperGuideVisible ? 'Visible' : 'Hidden'}</span>
+              <button class="toggle" class:on={helperGuideVisible} onclick={toggleHelperGuide}>
+                <span class="toggle-knob"></span>
+              </button>
+            </label>
+          </div>
 
-      <div class="pref-row">
-        <div class="pref-info">
-          <code>self_signed_cert</code>
-          <span class="pref-hint">Self-signed certificate generation prompt preference</span>
-        </div>
-        <div class="toggle-triple">
-          <button class:active={selfSignedPrefValue === 'never'} onclick={() => setSelfSignedPref('never')}>Never</button>
-          <button class:active={selfSignedPrefValue === 'once' || !selfSignedPrefValue} onclick={() => setSelfSignedPref('once')}>Ask</button>
-          <button class:active={selfSignedPrefValue === 'always'} onclick={() => setSelfSignedPref('always')}>Always</button>
-        </div>
-      </div>
+          <div class="pref-row">
+            <div class="pref-info">
+              <code>self_signed_cert</code>
+              <span class="pref-hint">Self-signed certificate generation prompt preference</span>
+            </div>
+            <div class="toggle-triple">
+              <button class:active={selfSignedPrefValue === 'never'} onclick={() => setSelfSignedPref('never')}>Never</button>
+              <button class:active={selfSignedPrefValue === 'once' || !selfSignedPrefValue} onclick={() => setSelfSignedPref('once')}>Ask</button>
+              <button class:active={selfSignedPrefValue === 'always'} onclick={() => setSelfSignedPref('always')}>Always</button>
+            </div>
+          </div>
 
-      {#if preferences.length === 0}
-        <p class="empty-text">No other stored preferences.</p>
-      {:else}
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Key</th>
-                <th>Value</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {#each preferences as pref}
-                <tr>
-                  <td><code>{pref.preference_key}</code></td>
-                  <td>
-                    <select
-                      value={pref.value}
-                      onchange={(e) => changePrefValue(pref, (e.target as HTMLSelectElement).value)}
-                    >
-                      <option value="never">never</option>
-                      <option value="always">always</option>
-                      <option value="once">once</option>
-                    </select>
-                  </td>
-                  <td class="actions-cell">
-                    <button class="btn-link danger" onclick={() => deletingPref = pref}>Delete</button>
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
+          {#if preferences.length === 0}
+            <p class="empty-text">No other stored preferences.</p>
+          {:else}
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Key</th>
+                    <th>Value</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each preferences as pref}
+                    <tr>
+                      <td><code>{pref.preference_key}</code></td>
+                      <td>
+                        <select
+                          value={pref.value}
+                          onchange={(e) => changePrefValue(pref, (e.target as HTMLSelectElement).value)}
+                        >
+                          <option value="never">never</option>
+                          <option value="always">always</option>
+                          <option value="once">once</option>
+                        </select>
+                      </td>
+                      <td class="actions-cell">
+                        <button class="btn-link danger" onclick={() => deletingPref = pref}>Delete</button>
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {/if}
         </div>
       {/if}
     </section>
 
     <!-- Export/Import -->
     <section class="section">
-      <h2>Configuration Export / Import</h2>
-
-      <div class="export-import-grid">
-        <!-- Export -->
-        <div class="form-card">
-          <h3>Export</h3>
-          <p class="section-hint">Download the full configuration as a TOML file.</p>
-          {#if exportError}
-            <div class="form-error">{exportError}</div>
-          {/if}
-          <button class="btn btn-primary" onclick={handleExport} disabled={exporting}>
-            {exporting ? 'Exporting...' : 'Download TOML'}
-          </button>
-        </div>
-
-        <!-- Import -->
-        <div class="form-card">
-          <h3>Import</h3>
-          <p class="section-hint">Upload a TOML file to preview and apply changes.</p>
-          {#if !importDiff}
-            <div class="form-row">
-              <label for="import-file">TOML File</label>
-              <input id="import-file" type="file" accept=".toml,text/plain" onchange={handleFileSelect} />
-            </div>
-            {#if importToml}
-              <p class="file-info">File loaded: {importFile?.name} ({importToml.length} bytes)</p>
-            {/if}
-            {#if importError}
-              <div class="form-error">{importError}</div>
-            {/if}
-            {#if importSuccess}
-              <div class="form-success">{importSuccess}</div>
-            {/if}
-            <button class="btn btn-primary" onclick={previewImport} disabled={!importToml || importPreviewing}>
-              {importPreviewing ? 'Analyzing...' : 'Preview Changes'}
-            </button>
-          {/if}
-        </div>
-      </div>
-
-      <!-- Diff preview -->
-      {#if importDiff}
-        <div class="diff-preview">
-          <h3>Import Preview</h3>
-          {#if !diffHasChanges(importDiff)}
-            <p class="empty-text">No changes detected - the imported configuration is identical to the current one.</p>
-          {:else}
-            {@const sections = [
-              { label: 'Routes', diff: importDiff.routes },
-              { label: 'Backends', diff: importDiff.backends },
-              { label: 'Certificates', diff: importDiff.certificates },
-              { label: 'Route-Backend Links', diff: importDiff.route_backends },
-              { label: 'Notification Configs', diff: importDiff.notification_configs },
-              { label: 'User Preferences', diff: importDiff.user_preferences },
-              { label: 'Admin Users', diff: importDiff.admin_users },
-            ]}
-            {#each sections as sec}
-              {#if sec.diff.added.length > 0 || sec.diff.modified.length > 0 || sec.diff.removed.length > 0}
-                <div class="diff-section">
-                  <h4>{sec.label}</h4>
-                  {#if sec.diff.added.length > 0}
-                    <ul class="diff-list diff-added">
-                      {#each sec.diff.added as item}
-                        <li>+ {item}</li>
-                      {/each}
-                    </ul>
-                  {/if}
-                  {#if sec.diff.modified.length > 0}
-                    <ul class="diff-list diff-modified">
-                      {#each sec.diff.modified as item}
-                        <li>~ {item}</li>
-                      {/each}
-                    </ul>
-                  {/if}
-                  {#if sec.diff.removed.length > 0}
-                    <ul class="diff-list diff-removed">
-                      {#each sec.diff.removed as item}
-                        <li>- {item}</li>
-                      {/each}
-                    </ul>
-                  {/if}
-                </div>
+      <button class="collapsible-header" class:open={expandedSections.export} onclick={() => toggleSection('export')}>
+        <h2>Configuration Export / Import</h2>
+        <span class="chevron" class:expanded={expandedSections.export}></span>
+      </button>
+      {#if expandedSections.export}
+        <div class="section-body">
+          <div class="export-import-grid">
+            <!-- Export -->
+            <div class="form-card">
+              <h3>Export</h3>
+              <p class="section-hint">Download the full configuration as a TOML file.</p>
+              {#if exportError}
+                <div class="form-error">{exportError}</div>
               {/if}
-            {/each}
-            {#if importDiff.global_settings.changes.length > 0}
-              <div class="diff-section">
-                <h4>Global Settings</h4>
-                <ul class="diff-list diff-modified">
-                  {#each importDiff.global_settings.changes as ch}
-                    <li>~ {ch.key}: {ch.old_value} -> {ch.new_value}</li>
-                  {/each}
-                </ul>
-              </div>
-            {/if}
-          {/if}
-          {#if importError}
-            <div class="form-error">{importError}</div>
-          {/if}
-          <div class="diff-actions">
-            <button class="btn btn-cancel" onclick={cancelImport}>Cancel</button>
-            {#if diffHasChanges(importDiff)}
-              <button class="btn btn-primary" onclick={applyImport} disabled={importApplying}>
-                {importApplying ? 'Applying...' : 'Apply Import'}
+              <button class="btn btn-primary" onclick={handleExport} disabled={exporting}>
+                {exporting ? 'Exporting...' : 'Download TOML'}
               </button>
-            {/if}
+            </div>
+
+            <!-- Import -->
+            <div class="form-card">
+              <h3>Import</h3>
+              <p class="section-hint">Upload a TOML file to preview and apply changes.</p>
+              {#if !importDiff}
+                <div class="form-row">
+                  <label for="import-file">TOML File</label>
+                  <input id="import-file" type="file" accept=".toml,text/plain" onchange={handleFileSelect} />
+                </div>
+                {#if importToml}
+                  <p class="file-info">File loaded: {importFile?.name} ({importToml.length} bytes)</p>
+                {/if}
+                {#if importError}
+                  <div class="form-error">{importError}</div>
+                {/if}
+                {#if importSuccess}
+                  <div class="form-success">{importSuccess}</div>
+                {/if}
+                <button class="btn btn-primary" onclick={previewImport} disabled={!importToml || importPreviewing}>
+                  {importPreviewing ? 'Analyzing...' : 'Preview Changes'}
+                </button>
+              {/if}
+            </div>
           </div>
+
+          <!-- Diff preview -->
+          {#if importDiff}
+            <div class="diff-preview">
+              <h3>Import Preview</h3>
+              {#if !diffHasChanges(importDiff)}
+                <p class="empty-text">No changes detected - the imported configuration is identical to the current one.</p>
+              {:else}
+                {@const sections = [
+                  { label: 'Routes', diff: importDiff.routes },
+                  { label: 'Backends', diff: importDiff.backends },
+                  { label: 'Certificates', diff: importDiff.certificates },
+                  { label: 'Route-Backend Links', diff: importDiff.route_backends },
+                  { label: 'Notification Configs', diff: importDiff.notification_configs },
+                  { label: 'User Preferences', diff: importDiff.user_preferences },
+                  { label: 'Admin Users', diff: importDiff.admin_users },
+                ]}
+                {#each sections as sec}
+                  {#if sec.diff.added.length > 0 || sec.diff.modified.length > 0 || sec.diff.removed.length > 0}
+                    <div class="diff-section">
+                      <h4>{sec.label}</h4>
+                      {#if sec.diff.added.length > 0}
+                        <ul class="diff-list diff-added">
+                          {#each sec.diff.added as item}
+                            <li>+ {item}</li>
+                          {/each}
+                        </ul>
+                      {/if}
+                      {#if sec.diff.modified.length > 0}
+                        <ul class="diff-list diff-modified">
+                          {#each sec.diff.modified as item}
+                            <li>~ {item}</li>
+                          {/each}
+                        </ul>
+                      {/if}
+                      {#if sec.diff.removed.length > 0}
+                        <ul class="diff-list diff-removed">
+                          {#each sec.diff.removed as item}
+                            <li>- {item}</li>
+                          {/each}
+                        </ul>
+                      {/if}
+                    </div>
+                  {/if}
+                {/each}
+                {#if importDiff.global_settings.changes.length > 0}
+                  <div class="diff-section">
+                    <h4>Global Settings</h4>
+                    <ul class="diff-list diff-modified">
+                      {#each importDiff.global_settings.changes as ch}
+                        <li>~ {ch.key}: {ch.old_value} -> {ch.new_value}</li>
+                      {/each}
+                    </ul>
+                  </div>
+                {/if}
+              {/if}
+              {#if importError}
+                <div class="form-error">{importError}</div>
+              {/if}
+              <div class="diff-actions">
+                <button class="btn btn-cancel" onclick={cancelImport}>Cancel</button>
+                {#if diffHasChanges(importDiff)}
+                  <button class="btn btn-primary" onclick={applyImport} disabled={importApplying}>
+                    {importApplying ? 'Applying...' : 'Apply Import'}
+                  </button>
+                {/if}
+              </div>
+            </div>
+          {/if}
         </div>
       {/if}
     </section>
@@ -1086,17 +1155,62 @@
   .settings-page { max-width: none; }
 
   .section {
-    margin-bottom: 2rem;
+    margin-bottom: 1.5rem;
   }
 
-  .section-header {
+  .collapsible-header {
     display: flex;
-    align-items: center;
     justify-content: space-between;
+    align-items: center;
+    width: 100%;
+    padding: var(--space-3) var(--space-4);
+    background: var(--color-bg-input);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: background-color var(--transition-fast);
+    font-family: inherit;
   }
 
-  .section-header h2 {
+  .collapsible-header:hover {
+    background: var(--color-bg-hover);
+  }
+
+  .collapsible-header.open {
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+    border-bottom-color: transparent;
+  }
+
+  .collapsible-header h2 {
     margin: 0;
+    font-size: 0.875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+    color: var(--color-text-heading);
+  }
+
+  .chevron {
+    display: inline-block;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-right: 2px solid var(--color-text-muted);
+    border-bottom: 2px solid var(--color-text-muted);
+    transform: rotate(45deg);
+    transition: transform 0.2s ease;
+    flex-shrink: 0;
+  }
+
+  .chevron.expanded {
+    transform: rotate(-135deg);
+  }
+
+  .section-body {
+    background: var(--color-bg-card);
+    border: 1px solid var(--color-border);
+    border-top: none;
+    border-radius: 0 0 var(--radius-md) var(--radius-md);
+    padding: var(--space-4);
   }
 
   .section-hint {
@@ -1161,10 +1275,6 @@
     font-size: 0.75rem;
     color: var(--color-text-muted);
     margin-top: 0.25rem;
-  }
-
-  .form-actions {
-    margin-top: 0.5rem;
   }
 
   .form-error {
@@ -1376,6 +1486,11 @@
     justify-content: flex-end;
     gap: 0.75rem;
     margin-top: 1rem;
+  }
+
+  .section-body .btn-primary,
+  .section-body .btn-secondary {
+    min-width: 140px;
   }
 
 

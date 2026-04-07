@@ -89,7 +89,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.27 | Topology type | Dashboard | SingleVM/HA/Custom adapts health behavior | 3.2 | |
 | 4.28 | Route enable/disable | Dashboard | Disabled -> 404 for that hostname | 1.6 | OK |
 | 4.29 | Delete route | Dashboard | Confirm dialog, removed | 1.6 | OK |
-| 4.30 | Search/filter/sort | Dashboard | Search hostname, sort health/enabled | 1.6 | |
+| 4.30 | Search/filter/sort | Dashboard | Search hostname, sort health/enabled | 1.6 | OK |
 | 4.31 | Nginx import wizard | Dashboard | Paste nginx.conf -> resources created | - | |
 | 4.32 | Hot-reload on API change | Proxy | Edit route -> traffic reflects change immediately | 1.8, 2.2 | OK |
 | | **5. CERTIFICATES** | | | | |
