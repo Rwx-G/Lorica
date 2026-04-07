@@ -324,6 +324,14 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
     const match301 = v.match(/^30[12]\s+(https?:\/\/.+)/);
     if (match301) {
       let target = match301[1].replace(/\$request_uri\s*$/, '').replace(/;$/, '').trim();
+
+      // Nginx variables ($host, $server_name, $http_host) = same host -> force_https
+      if (/\$host|\$server_name|\$http_host/.test(target)) {
+        r.force_https = true;
+        r.importedFields.add('force_https');
+        return;
+      }
+
       // Determine if this is a same-host force_https or a different-host redirect_to
       try {
         const url = new URL(target);
