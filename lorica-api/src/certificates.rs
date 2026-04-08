@@ -76,6 +76,7 @@ fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateRespon
         acme_auto_renew: c.acme_auto_renew,
         created_at: c.created_at.to_rfc3339(),
         acme_method: c.acme_method.clone(),
+        acme_dns_provider_id: c.acme_dns_provider_id.clone(),
     }
 }
 
