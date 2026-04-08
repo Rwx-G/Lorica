@@ -91,6 +91,14 @@ impl SessionStore {
             .map(|s| s.expires_at)
     }
 
+    /// Remove all sessions for a user except the given session ID.
+    pub async fn remove_all_for_user_except(&self, user_id: &str, keep_session_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|sid, session| {
+            session.user_id != user_id || sid == keep_session_id
+        });
+    }
+
     /// Remove all expired sessions from memory.
     pub async fn purge_expired(&self) -> usize {
         let now = Utc::now();

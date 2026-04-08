@@ -120,10 +120,24 @@ pub async fn logout(
     )
 }
 
+/// Extract the current session ID from request headers.
+fn extract_current_session_id(headers: &http::HeaderMap) -> Option<String> {
+    let cookie_header = headers.get(http::header::COOKIE)?.to_str().ok()?;
+    for cookie in cookie_header.split(';') {
+        let cookie = cookie.trim();
+        if let Some(value) = cookie.strip_prefix("lorica_session=") {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 /// PUT /api/v1/auth/password
 pub async fn change_password(
     Extension(state): Extension<AppState>,
+    Extension(session_store): Extension<SessionStore>,
     Extension(session): Extension<Session>,
+    headers: http::HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     if body.new_password.len() < 8 {
@@ -161,6 +175,12 @@ pub async fn change_password(
     store
         .update_admin_user(&updated_user)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Invalidate all sessions for this user except the current one
+    let current_session_id = extract_current_session_id(&headers).unwrap_or_default();
+    session_store
+        .remove_all_for_user_except(&session.user_id, &current_session_id)
+        .await;
 
     Ok(json_data(PasswordChangedResponse {
         message: "Password updated".into(),
