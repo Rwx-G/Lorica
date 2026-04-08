@@ -48,13 +48,16 @@ pub struct PasswordChangedResponse {
 
 /// POST /api/v1/auth/login
 pub async fn login(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
     Extension(rate_limiter): Extension<RateLimiter>,
     Json(body): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let rate_key = format!("login:{}", addr.ip());
+    let client_ip = connect_info
+        .map(|ci| ci.0.ip().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let rate_key = format!("login:{client_ip}");
     if !rate_limiter.check(&rate_key).await {
         return Err(ApiError::RateLimited);
     }

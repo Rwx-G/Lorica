@@ -360,10 +360,9 @@ pub fn build_router(
         .merge(dashboard_routes)
         .layer(
             CorsLayer::new()
-                .allow_origin(AllowOrigin::mirror_request())
+                .allow_origin(Any) // API is localhost-only, same-origin with dashboard
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-                .allow_headers(Any)
-                .allow_credentials(true),
+                .allow_headers(Any),
         )
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
         .layer(axum::Extension(state))
