@@ -896,7 +896,7 @@
     background: var(--color-bg-hover);
   }
 
-  :global(.collapsible-header).open {
+  :global(.collapsible-header.open) {
     border-radius: var(--radius-md) var(--radius-md) 0 0;
     border-bottom-color: transparent;
   }
@@ -921,7 +921,7 @@
     flex-shrink: 0;
   }
 
-  :global(.chevron).expanded {
+  :global(.chevron.expanded) {
     transform: rotate(-135deg);
   }
 
@@ -1104,7 +1104,7 @@
   }
 
   /* Table action buttons */
-  :global(.btn-table-)action {
+  :global(.btn-table-action) {
     padding: 0.25rem 0.5rem;
     border-radius: var(--radius-sm);
     font-size: var(--text-xs);
@@ -1115,16 +1115,16 @@
     transition: all 0.15s;
     white-space: nowrap;
   }
-  :global(.btn-table-)action:disabled {
+  :global(.btn-table-action:disabled) {
     opacity: 0.5;
     cursor: not-allowed;
   }
-  :global(.btn-table-)edit { color: var(--color-primary); border-color: var(--color-primary); }
-  :global(.btn-table-)edit:hover:not(:disabled) { background: var(--color-primary-subtle); }
-  :global(.btn-table-)delete { color: var(--color-red); border-color: var(--color-red); }
-  :global(.btn-table-)delete:hover:not(:disabled) { background: var(--color-red-subtle); }
-  :global(.btn-table-)test { color: var(--color-green); border-color: var(--color-green); }
-  :global(.btn-table-)test:hover:not(:disabled) { background: var(--color-green-subtle); }
+  :global(.btn-table-edit) { color: var(--color-primary); border-color: var(--color-primary); }
+  :global(.btn-table-edit:hover:not(:disabled)) { background: var(--color-primary-subtle); }
+  :global(.btn-table-delete) { color: var(--color-red); border-color: var(--color-red); }
+  :global(.btn-table-delete:hover:not(:disabled)) { background: var(--color-red-subtle); }
+  :global(.btn-table-test) { color: var(--color-green); border-color: var(--color-green); }
+  :global(.btn-table-test:hover:not(:disabled)) { background: var(--color-green-subtle); }
 
   /* Settings tables - consistent column widths */
   :global(.settings-table) { width: 100%; table-layout: fixed; }
