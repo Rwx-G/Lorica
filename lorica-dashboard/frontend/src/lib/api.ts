@@ -280,6 +280,7 @@ export interface CertificateResponse {
   acme_auto_renew: boolean;
   created_at: string;
   acme_method?: string;
+  acme_dns_provider_id?: string;
 }
 
 export interface CertificateDetailResponse extends CertificateResponse {
@@ -297,6 +298,9 @@ export interface UpdateCertificateRequest {
   domain?: string;
   cert_pem?: string;
   key_pem?: string;
+  acme_method?: string;
+  acme_dns_provider_id?: string;
+  acme_auto_renew?: boolean;
 }
 
 export interface GenerateSelfSignedRequest {

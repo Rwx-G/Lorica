@@ -40,6 +40,9 @@ pub struct UpdateCertificateRequest {
     pub domain: Option<String>,
     pub cert_pem: Option<String>,
     pub key_pem: Option<String>,
+    pub acme_method: Option<String>,
+    pub acme_dns_provider_id: Option<String>,
+    pub acme_auto_renew: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -312,6 +315,15 @@ pub async fn update_certificate(
     }
     if let Some(key_pem) = body.key_pem {
         cert.key_pem = key_pem;
+    }
+    if let Some(method) = body.acme_method {
+        cert.acme_method = if method.is_empty() { None } else { Some(method) };
+    }
+    if let Some(provider_id) = body.acme_dns_provider_id {
+        cert.acme_dns_provider_id = if provider_id.is_empty() { None } else { Some(provider_id) };
+    }
+    if let Some(auto_renew) = body.acme_auto_renew {
+        cert.acme_auto_renew = auto_renew;
     }
 
     store.update_certificate(&cert)?;

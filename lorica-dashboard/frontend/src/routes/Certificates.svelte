@@ -48,6 +48,9 @@
   let editKeyPem = $state('');
   let editError = $state('');
   let editSubmitting = $state(false);
+  let editDnsProviderId = $state('');
+  let editAcmeMethod = $state('');
+  let editAutoRenew = $state(false);
 
   // Detail view state
   let detailCert: CertificateDetailResponse | null = $state(null);
@@ -372,6 +375,9 @@
     editCertPem = '';
     editKeyPem = '';
     editError = '';
+    editAcmeMethod = cert.acme_method ?? '';
+    editDnsProviderId = cert.acme_dns_provider_id ?? '';
+    editAutoRenew = cert.acme_auto_renew;
     showEditForm = true;
   }
 
@@ -409,8 +415,14 @@
     if (editDomain !== editingCert.domain) body.domain = editDomain;
     if (editCertPem.trim()) body.cert_pem = editCertPem;
     if (editKeyPem.trim()) body.key_pem = editKeyPem;
+    if (editingCert.is_acme) {
+      const origMethod = editingCert.acme_method ?? '';
+      if (editAcmeMethod !== origMethod) body.acme_method = editAcmeMethod || undefined;
+      if (editDnsProviderId !== (editingCert.acme_dns_provider_id ?? '')) body.acme_dns_provider_id = editDnsProviderId || '';
+      if (editAutoRenew !== editingCert.acme_auto_renew) body.acme_auto_renew = editAutoRenew;
+    }
 
-    if (!body.domain && !body.cert_pem && !body.key_pem) {
+    if (Object.keys(body).length === 0) {
       editError = 'No changes to save';
       editSubmitting = false;
       return;
@@ -755,6 +767,39 @@
         <label for="edit-key">Replace Private Key PEM (optional)</label>
         <textarea id="edit-key" bind:value={editKeyPem} placeholder="Leave empty to keep current key" rows="4"></textarea>
       </div>
+
+      {#if editingCert?.is_acme}
+        <div class="form-group">
+          <label for="edit-acme-method">ACME Method</label>
+          <select id="edit-acme-method" bind:value={editAcmeMethod}>
+            <option value="http01">HTTP-01</option>
+            <option value="dns01-ovh">DNS-01 (OVH)</option>
+            <option value="dns01-cloudflare">DNS-01 (Cloudflare)</option>
+            <option value="dns01-route53">DNS-01 (Route53)</option>
+            <option value="dns01-manual">DNS-01 (Manual)</option>
+          </select>
+        </div>
+
+        {#if editAcmeMethod.startsWith('dns01-') && editAcmeMethod !== 'dns01-manual'}
+          <div class="form-group">
+            <label for="edit-dns-provider">DNS Provider</label>
+            <select id="edit-dns-provider" bind:value={editDnsProviderId}>
+              <option value="">-- Select provider --</option>
+              {#each dnsProviders as p}
+                <option value={p.id}>{p.name} ({p.provider_type})</option>
+              {/each}
+            </select>
+            <span class="hint">Select the DNS provider for auto-renewal. Configure providers in Settings.</span>
+          </div>
+        {/if}
+
+        <div class="form-group">
+          <label>
+            <input type="checkbox" bind:checked={editAutoRenew} />
+            Auto-renew
+          </label>
+        </div>
+      {/if}
 
       <div class="form-actions">
         <button class="btn btn-cancel" onclick={closeEditForm}>Cancel</button>
