@@ -761,11 +761,12 @@ fn run_supervisor(cli: Cli) {
         }
         sla_collector.start_flush_task(Arc::clone(&store), Some(Arc::clone(&notify_dispatcher)));
 
-        // Reload proxy config, probe scheduler, and SLA configs on config changes
+        // Reload proxy config, probe scheduler, SLA configs, and notification dispatcher on config changes
         let reload_store = Arc::clone(&store);
         let reload_config = Arc::clone(&proxy_config);
         let reload_probe_scheduler = Arc::clone(&probe_scheduler);
         let reload_sla_collector = Arc::clone(&sla_collector);
+        let reload_notify_dispatcher = Arc::clone(&notify_dispatcher);
         let mut reload_rx = reload_bc_tx.subscribe();
         tokio::spawn(async move {
             while reload_rx.recv().await.is_ok() {
@@ -776,6 +777,10 @@ fn run_supervisor(cli: Cli) {
                 {
                     let s = reload_store.lock().await;
                     reload_sla_collector.load_configs(&s);
+                    // Rebuild notification dispatcher with updated channel configs
+                    let new_dispatcher = build_notify_dispatcher(&s);
+                    let mut d = reload_notify_dispatcher.lock().await;
+                    *d = new_dispatcher;
                 }
             }
         });

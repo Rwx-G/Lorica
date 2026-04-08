@@ -1536,17 +1536,21 @@ async fn check_txt_record(record_name: &str, expected_value: &str, dns_server: O
     if let Some(server) = dns_server {
         args.push(format!("@{server}"));
     }
-    match tokio::process::Command::new("dig")
-        .args(&args)
-        .output()
-        .await
-    {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.contains(expected_value)
+    let expected = expected_value.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        match std::process::Command::new("dig")
+            .args(&args)
+            .output()
+        {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout.contains(&expected)
+            }
+            Err(_) => false,
         }
-        Err(_) => false,
-    }
+    })
+    .await;
+    result.unwrap_or(false)
 }
 
 /// POST /api/v1/acme/provision-dns-manual/confirm - Step 2 of manual DNS-01 flow.
