@@ -989,6 +989,16 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Reassign all routes referencing `old_cert_id` to `new_cert_id`.
+    /// Returns the number of routes updated.
+    pub fn reassign_certificate(&self, old_cert_id: &str, new_cert_id: &str) -> Result<usize> {
+        let updated = self.conn.execute(
+            "UPDATE routes SET certificate_id = ?1, updated_at = datetime('now') WHERE certificate_id = ?2",
+            params![new_cert_id, old_cert_id],
+        )?;
+        Ok(updated)
+    }
+
     /// Delete a certificate by ID. Returns `NotFound` if the ID does not exist.
     pub fn delete_certificate(&self, id: &str) -> Result<()> {
         let changed = self

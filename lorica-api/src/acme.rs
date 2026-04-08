@@ -537,11 +537,28 @@ pub fn spawn_renewal_task(
                     contact_email: None,
                 };
 
-                // Renew with all domains (primary + SANs)
+                // Renew with all domains (primary + SANs), deduplicated
                 let mut all_domains = vec![cert.domain.clone()];
-                all_domains.extend(cert.san_domains.iter().cloned());
+                for d in &cert.san_domains {
+                    if !all_domains.contains(d) {
+                        all_domains.push(d.clone());
+                    }
+                }
                 match renew_with_method(&state, cert, &config, &all_domains).await {
                     Ok(new_cert_id) => {
+                        // Reassign routes from old cert to new cert
+                        let store = state.store.lock().await;
+                        if let Ok(reassigned) = store.reassign_certificate(&cert.id, &new_cert_id) {
+                            if reassigned > 0 {
+                                info!(old_id = %cert.id, new_id = %new_cert_id, routes = reassigned, "routes reassigned to renewed certificate");
+                            }
+                        }
+                        // Delete old certificate
+                        if let Err(e) = store.delete_certificate(&cert.id) {
+                            warn!(old_id = %cert.id, error = %e, "failed to delete old certificate after renewal");
+                        }
+                        drop(store);
+                        state.notify_config_changed();
                         info!(
                             domain = %cert.domain,
                             old_cert_id = %cert.id,
@@ -678,13 +695,31 @@ pub async fn renew_certificate(
         contact_email: None,
     };
 
-    // Renew with all domains (primary + SANs)
+    // Renew with all domains (primary + SANs), deduplicated
     let mut all_domains = vec![cert.domain.clone()];
-    all_domains.extend(cert.san_domains.iter().cloned());
+    for d in &cert.san_domains {
+        if !all_domains.contains(d) {
+            all_domains.push(d.clone());
+        }
+    }
 
     let new_cert_id = renew_with_method(&state, &cert, &config, &all_domains)
         .await
         .map_err(|e| ApiError::Internal(format!("ACME renewal failed: {e}")))?;
+
+    // Reassign routes and delete old cert
+    {
+        let store = state.store.lock().await;
+        if let Ok(reassigned) = store.reassign_certificate(&cert.id, &new_cert_id) {
+            if reassigned > 0 {
+                tracing::info!(old_id = %cert.id, new_id = %new_cert_id, routes = reassigned, "routes reassigned to renewed certificate");
+            }
+        }
+        if let Err(e) = store.delete_certificate(&cert.id) {
+            tracing::warn!(old_id = %cert.id, error = %e, "failed to delete old certificate after renewal");
+        }
+    }
+    state.notify_config_changed();
 
     tracing::info!(
         domain = %cert.domain,
