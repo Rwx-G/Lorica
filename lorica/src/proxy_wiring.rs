@@ -1893,8 +1893,12 @@ impl ProxyHttp for LoricaProxy {
             .fetch_add(1, Ordering::Relaxed);
 
         // Record SLA metrics for passive monitoring
+        // Exclude WebSocket upgrades (status 101) as their connection duration
+        // is not representative of HTTP request latency
         if let Some(ref route_id) = ctx.route_id {
-            self.sla_collector.record(route_id, status, latency_ms);
+            if status != 101 {
+                self.sla_collector.record(route_id, status, latency_ms);
+            }
         }
 
         // Update EWMA latency tracker for Peak EWMA load balancing
