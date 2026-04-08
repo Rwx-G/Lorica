@@ -236,6 +236,9 @@
     parseResult = parseNginxConfig(fullText);
     importRoutes = convertToLoricaRoutes(parseResult);
 
+    // Update configText with resolved includes so the resolved config view stays accurate
+    configText = fullText;
+
     // Re-check includes - deduplicate by path, preserve previously entered content
     const oldContentByPath = new Map(unresolvedIncludes.map((inc) => [inc.path, inc.content]));
     const reSeenPaths = new Set<string>();
