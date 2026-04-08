@@ -59,7 +59,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 3.13 | Active connections counter | Dashboard | Connections visible per backend | 2.4 | OK |
 | 3.14 | Search/filter/sort | Dashboard | Search name/group/address, sort | 1.6 | OK |
 | 3.15 | backend_down notification | CLI | Backend goes down -> notification dispatched | 3.3 | OK |
-| | **4. ROUTES** | | | | |
+| | **4. ROUTES** | | | | OK |
 | 4.1 | Create route (minimal) | Dashboard | Hostname + backend -> created | 1.6 | OK |
 | 4.2 | Traffic flows through route | Proxy | `curl -H "Host: ..." http://lorica:8080` | 1.8 | OK |
 | 4.3 | Path prefix routing | Proxy | /api prefix only matches /api/* | 1.8 | OK |
@@ -89,7 +89,7 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 4.27 | Route enable/disable | Dashboard | Disabled -> 404 for that hostname | 1.6 | OK |
 | 4.28 | Delete route | Dashboard | Confirm dialog, removed | 1.6 | OK |
 | 4.29 | Search/filter/sort | Dashboard | Search hostname, sort health/enabled | 1.6 | OK |
-| 4.30 | Nginx import wizard | Dashboard | Paste nginx.conf -> resources created | - | |
+| 4.30 | Nginx import wizard | Dashboard | Paste nginx.conf -> resources created | - | OK |
 | 4.31 | Hot-reload on API change | Proxy | Edit route -> traffic reflects change immediately | 1.8, 2.2 | OK |
 | | **5. CERTIFICATES** | | | | |
 | 5.1 | Upload PEM certificate | Dashboard | Issuer/dates/SANs parsed correctly | 1.7 | OK |
@@ -98,14 +98,14 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 5.4 | Expiry badge colors | Dashboard | <7d red, <30d orange, >30d green | 1.7 | OK |
 | 5.5 | Self-signed generation | Dashboard | "Self-signed" -> cert created | 1.7 | OK |
 | 5.6 | Self-signed preference memory | Dashboard | Never/Once/Always prompt, persisted | 1.7 | OK |
-| 5.7 | ACME HTTP-01 provision | Dashboard | Let's Encrypt via HTTP-01 (port 80) | 4.1 | |
+| 5.7 | ACME HTTP-01 provision | Dashboard | Let's Encrypt via HTTP-01 (port 80) | 4.1 | OK |
 | 5.8 | ACME DNS-01 automatic | Dashboard | Cloudflare/Route53 -> TXT auto-created | 4.1 | |
 | 5.9 | ACME DNS-01 manual | Dashboard | Get TXT record, create manually, confirm | 4.1 | |
-| 5.10 | ACME staging vs production | Dashboard | Staging checkbox -> test server | 4.1 | |
-| 5.11 | Certificate shows ACME flag | Dashboard | is_acme + auto_renew in detail | 4.1 | |
+| 5.10 | ACME staging vs production | Dashboard | Staging checkbox -> test server | 4.1 | OK |
+| 5.11 | Certificate shows ACME flag | Dashboard | is_acme + auto_renew in detail | 4.1 | OK |
 | 5.12 | Manual renew button | Dashboard | Click renew icon on ACME cert | 4.1 | |
 | 5.13 | Auto-renewal task | CLI | Logs: "ACME certificate approaching expiry" | 4.1 | |
-| 5.14 | cert_expiring notification | CLI | Approaching expiry -> notification dispatched | 3.3 | |
+| 5.14 | cert_expiring notification | CLI | Approaching expiry -> notification dispatched | 3.3 | OK |
 | 5.15 | Edit certificate (rename) | Dashboard | Edit -> change domain name | 1.7 | |
 | 5.16 | Edit certificate (replace PEM) | Dashboard | Edit -> new PEM, metadata re-parsed | 1.7 | |
 | 5.17 | Delete certificate (no routes) | Dashboard | Delete succeeds, toast shown | 1.7 | OK |
@@ -113,8 +113,8 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 5.19 | SNI resolution: exact match | Proxy | SNI=example.com -> correct cert | 2.3 | OK |
 | 5.20 | SNI resolution: wildcard | Proxy | *.example.com matches sub.example.com | 2.3 | |
 | 5.21 | SNI resolution: SAN domains | Proxy | All SANs resolve correctly | 2.3 | |
-| 5.22 | Certificate hot-swap | Proxy | Upload new cert -> new connections get new cert | 2.3 | |
-| 5.23 | CertResolver hot-reload | Proxy | Upload cert via API -> TLS works immediately | - | |
+| 5.22 | Certificate hot-swap | Proxy | Upload new cert -> new connections get new cert | 2.3 | OK |
+| 5.23 | CertResolver hot-reload | Proxy | Upload cert via API -> TLS works immediately | - | OK |
 | 5.24 | Private key encrypted at rest | CLI | `sqlite3 lorica.db` -> binary blob, not PEM | 4.5 | OK |
 | 5.25 | HTTPS works in worker mode | Proxy | `--workers 6` + TLS cert -> HTTPS serves traffic | 2.1 | OK |
 | | **6. SECURITY** | | | | OK |
@@ -266,6 +266,6 @@ Test with `--workers 6` to validate worker mode simultaneously.
 | 16.7 | SO_REUSEPORT active | CLI | `ss -tlnp` multiple processes same port | - | OK |
 | 16.8 | TLS termination in workers | Proxy | HTTPS serves traffic with --workers N | 2.1 | OK |
 
-**Total: 200 test cases across 17 sections**
+**Total: 240 test cases across 17 sections (232 OK, 8 remaining)**
 
-Last updated: 2026-04-06
+Last updated: 2026-04-08
