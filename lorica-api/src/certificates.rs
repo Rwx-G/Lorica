@@ -21,6 +21,8 @@ pub struct CertificateResponse {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acme_dns_provider_id: Option<String>,
 }
 
 #[derive(Deserialize)]
