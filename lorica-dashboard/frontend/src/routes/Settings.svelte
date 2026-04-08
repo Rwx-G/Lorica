@@ -1302,7 +1302,7 @@
 
       <div class="form-row">
         <label for="dp-name">Name <span class="required">*</span></label>
-        <input id="dp-name" type="text" bind:value={dnsProviderName} placeholder="e.g. OVH rwx-g.fr" />
+        <input id="dp-name" type="text" bind:value={dnsProviderName} placeholder="e.g. OVH example.com" />
       </div>
 
       <div class="form-row">
