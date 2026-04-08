@@ -131,21 +131,21 @@ describe('mergeRelatedRoutes', () => {
     expect(result).toHaveLength(2);
   });
 
-  it('handles the real stackoverkill.io 3-server-block case', () => {
+  it('handles the real app.example.com 3-server-block case', () => {
     const config = `
 server {
     listen 80;
-    server_name stackoverkill.io www.stackoverkill.io;
-    return 301 https://stackoverkill.io$request_uri;
+    server_name app.example.com www.app.example.com;
+    return 301 https://app.example.com$request_uri;
 }
 server {
     listen 443 ssl;
-    server_name www.stackoverkill.io;
-    return 301 https://stackoverkill.io$request_uri;
+    server_name www.app.example.com;
+    return 301 https://app.example.com$request_uri;
 }
 server {
     listen 443 ssl;
-    server_name stackoverkill.io;
+    server_name app.example.com;
     location / {
         proxy_pass http://127.0.0.1:3000;
     }
@@ -155,11 +155,11 @@ server {
     const routes = convertToLoricaRoutes(parsed);
 
     expect(routes).toHaveLength(1);
-    expect(routes[0].hostname).toBe('stackoverkill.io');
+    expect(routes[0].hostname).toBe('app.example.com');
     expect(routes[0].force_https).toBe(true);
     expect(routes[0].backend_addresses).toEqual(['127.0.0.1:3000']);
-    expect(routes[0].hostname_aliases).toContain('www.stackoverkill.io');
-    expect(routes[0].redirect_hostname).toBe('stackoverkill.io');
+    expect(routes[0].hostname_aliases).toContain('www.app.example.com');
+    expect(routes[0].redirect_hostname).toBe('app.example.com');
   });
 
   it('preserves single route without modification', () => {
