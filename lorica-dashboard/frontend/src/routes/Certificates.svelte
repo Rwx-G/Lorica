@@ -1017,7 +1017,7 @@
             </label>
             <label class="radio-item">
               <input type="radio" bind:group={acmeMode} value="dns01" />
-              DNS-01 Automatic (Cloudflare or Route53)
+              DNS-01 Automatic (Cloudflare, Route53, OVH)
             </label>
             <label class="radio-item">
               <input type="radio" bind:group={acmeMode} value="dns01-manual" />
