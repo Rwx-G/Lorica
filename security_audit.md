@@ -37,6 +37,8 @@ The `evaluate()` method only inspects the URI path, query string, and selected h
 **Mitigating factor:** The WAF protects proxied traffic, not the admin API (which is localhost-only and auth-protected).
 **Recommendation:** Document as a known limitation for v1.0.0 and plan body scanning for a future release.
 
+**Resolution:** Added `evaluate_body()` to WafEngine and integrated it via `request_body_filter` in the proxy. Text bodies up to 1 MB are buffered and scanned; binary payloads are skipped. Known limitation documented in `docs/security.md`.
+
 ### H2. Single-pass URL decoding allows double-encoding bypass
 
 **File:** `lorica-waf/src/engine.rs:383-405`
@@ -108,6 +110,8 @@ After a password change, existing sessions remain valid. If an attacker has stol
 The body size check uses the `Content-Length` header. `Transfer-Encoding: chunked` requests bypass this entirely because they have no `Content-Length`. A streaming body could grow indefinitely without being rejected.
 
 **Recommendation:** Also enforce byte counting during transfer for chunked requests.
+
+**Resolution:** Added byte counting in `request_body_filter` that accumulates received chunk sizes and returns 413 when the route's `max_request_body_bytes` is exceeded.
 
 ### M5. Login rate limiter uses a global key instead of per-IP - FIXED
 
@@ -269,18 +273,18 @@ The DNS server address from user input is passed to the `dig` command. While `.a
 |---|--------|--------|--------|
 | 4 | Invalidate sessions on password change | 30 min | DONE |
 | 5 | Add CSP + security headers on dashboard | 30 min | DONE |
-| 6 | Document WAF limitation (no body scanning) in security docs | 15 min | TODO |
-| 7 | Add `deny.toml` for `cargo-deny` | 30 min | TODO |
+| 6 | Document WAF limitation (no body scanning) in security docs | 15 min | DONE |
+| 7 | Add `deny.toml` for `cargo-deny` | 30 min | DONE |
 
 ### WAF and proxy improvements
 
 | # | Action | Effort | Status |
 |---|--------|--------|--------|
-| 8 | WAF body scanning | 1-2 days | TODO |
-| 9 | Recursive URL decoding in WAF | 2 hours | TODO |
+| 8 | WAF body scanning | 1-2 days | DONE |
+| 9 | Recursive URL decoding in WAF | 2 hours | DONE |
 | 10 | Per-IP login rate limiting | 1 hour | DONE |
-| 11 | Chunked transfer body size enforcement | 2 hours | TODO |
-| 12 | Add `#![deny(unsafe_code)]` to pure-logic crates | 1 hour | TODO |
+| 11 | Chunked transfer body size enforcement | 2 hours | DONE |
+| 12 | Add `#![deny(unsafe_code)]` to pure-logic crates | 1 hour | DONE |
 
 ### Additional fixes applied
 
@@ -293,4 +297,4 @@ The DNS server address from user input is passed to the `dig` command. While `.a
 
 ## Conclusion
 
-Lorica v1.0.0 demonstrates a strong security foundation. The core architecture follows defense-in-depth principles: localhost-only admin API, Argon2id authentication, AES-256-GCM encryption at rest, comprehensive systemd hardening, and a 39-rule WAF engine. The 3 high-severity findings are WAF coverage gaps (body scanning and double-encoding) and a CI configuration issue - none are directly exploitable remote vulnerabilities. All 12 action items must be resolved before the v1.0.0 release.
+Lorica v1.0.0 demonstrates a strong security foundation. The core architecture follows defense-in-depth principles: localhost-only admin API, Argon2id authentication, AES-256-GCM encryption at rest, comprehensive systemd hardening, and a 39-rule WAF engine. All 14 action items have been resolved. The WAF now scans request bodies (text up to 1 MB), uses recursive URL decoding, and enforces body size limits on chunked transfers.
