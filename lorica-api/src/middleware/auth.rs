@@ -159,13 +159,8 @@ impl SessionStore {
     /// Remove a session.
     pub async fn remove(&self, session_id: &str) {
         self.sessions.lock().await.remove(session_id);
-
-        let db = self.db.clone();
-        let sid = session_id.to_string();
-        tokio::spawn(async move {
-            let store = db.lock().await;
-            let _ = store.delete_session(&sid);
-        });
+        let store = self.db.lock().await;
+        let _ = store.delete_session(session_id);
     }
 
     /// Renew a session's expiry (sliding window).
