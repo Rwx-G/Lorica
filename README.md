@@ -34,7 +34,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 ### :lock: Security
 
-- **WAF engine** - 28 OWASP CRS-inspired rules (SQLi, XSS, path traversal, command injection, SSRF, Log4Shell, XXE, CRLF)
+- **WAF engine** - 39 OWASP CRS-inspired rules (SQLi, XSS, path traversal, command injection, SSRF, Log4Shell, XXE, CRLF)
 - **IP blocklist** - auto-fetched from Data-Shield IPv4 Blocklist (~80,000 entries, O(1) lookup, updated every 6h)
 - **Rate limiting** - per-route, per-client-IP with configurable RPS and burst tolerance
 - **Auto-ban** - IPs that repeatedly exceed rate limits are banned automatically (configurable threshold and duration)
@@ -141,7 +141,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 <p align="center">
   <img src="docs/screenshots/security.png" alt="Security - WAF Rules" width="100%">
-  <br><em>28 WAF rules with per-rule toggle, covering SQLi, XSS, SSRF, Log4Shell, XXE, and more</em>
+  <br><em>39 WAF rules with per-rule toggle, covering SQLi, XSS, SSRF, Log4Shell, XXE, and more</em>
 </p>
 
 <p align="center">
@@ -155,7 +155,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 - **Routes** - create/edit routes with host matching, path prefixes, load balancing, WAF mode, rate limits, caching, timeouts, security headers, CORS, and 25 other per-route settings
 - **Backends** - manage backend addresses, weights, health check type (TCP/HTTP), TLS upstream, active connections
 - **Certificates** - upload PEM certificates, view expiry dates, provision via ACME/Let's Encrypt (HTTP-01, DNS-01)
-- **Security** - WAF event table with category filtering, 28 rule toggles, IP ban list with unban button
+- **Security** - WAF event table with category filtering, 39 rule toggles, IP ban list with unban button
 - **SLA** - per-route passive/active SLA side-by-side, latency percentile tables, config editor, CSV/JSON export
 - **Load Tests** - test config management with clone, one-click execution, real-time SSE progress panel, historical results
 - **Active Probes** - CRUD for synthetic health probes with route selection, HTTP method/path/status/interval/timeout
@@ -403,7 +403,7 @@ cargo build --release
 ### Running tests
 
 ```bash
-# All Rust unit tests (655 tests across 25 crates)
+# All Rust unit tests (871 tests across 25 crates)
 cargo test
 
 # Product crate tests only (280 tests)
@@ -412,7 +412,7 @@ cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lori
 # Frontend tests (52 Vitest tests)
 cd lorica-dashboard/frontend && npx vitest run
 
-# E2E tests (170+ assertions across 35 sections, Docker required)
+# E2E tests (350+ assertions across 65+ sections, Docker required)
 cd tests-e2e-docker && ./run.sh --build
 ```
 

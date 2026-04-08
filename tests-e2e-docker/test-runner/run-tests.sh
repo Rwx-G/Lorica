@@ -1098,7 +1098,7 @@ if [ -n "$SESSION" ]; then
 
     # Create a load test config
     LT_CREATE=$(api_post "/api/v1/loadtest/configs" \
-        "{\"name\":\"E2E Test\",\"target_url\":\"http://$BACKEND1/healthz\",\"method\":\"GET\",\"concurrency\":2,\"requests_per_second\":10,\"duration_s\":5,\"error_threshold_pct\":50}")
+        "{\"name\":\"E2E Test\",\"target_url\":\"http://127.0.0.1:8080/healthz\",\"method\":\"GET\",\"concurrency\":2,\"requests_per_second\":10,\"duration_s\":5,\"error_threshold_pct\":50}")
     LT_ID=$(echo "$LT_CREATE" | jq -r '.data.id' 2>/dev/null || echo "")
     if [ -n "$LT_ID" ] && [ "$LT_ID" != "null" ]; then
         ok "Load test config created (id=$LT_ID)"

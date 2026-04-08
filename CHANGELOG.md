@@ -29,7 +29,7 @@ Author: Rwx-G
 
 **Security**
 
-- WAF engine with 28 OWASP CRS-inspired rules: SQLi, XSS, path traversal, command injection, SSRF (cloud metadata, localhost, internal networks, dangerous URI schemes), Log4Shell/JNDI, XXE, CRLF injection. Detection or blocking mode. Sub-0.5ms evaluation latency
+- WAF engine with 39 OWASP CRS-inspired rules: SQLi, XSS, path traversal, command injection, SSRF (cloud metadata, localhost, internal networks, dangerous URI schemes), Log4Shell/JNDI, XXE, CRLF injection. Detection or blocking mode. Sub-0.5ms evaluation latency
 - Custom WAF rules persisted in SQLite, configurable per-rule enable/disable at runtime
 - IP blocklist auto-fetched from Data-Shield IPv4 Blocklist (~80,000 entries, O(1) lookup, refreshed every 6h)
 - Per-route rate limiting with configurable RPS, burst tolerance, and proper `X-RateLimit-*` response headers
@@ -69,7 +69,7 @@ Author: Rwx-G
 - Routes CRUD with 25+ settings across 7 tabs, path rules tab with reorder and collapsible overrides
 - Backends CRUD with address, weight, health check (TCP/HTTP), TLS upstream, HTTP/2 toggle, active connections
 - Certificates management with ACME (HTTP-01, DNS-01) and manual upload, manual renewal button
-- Security page with WAF event table, category filtering, 28 rule toggles, IP ban list with unban
+- Security page with WAF event table, category filtering, 39 rule toggles, IP ban list with unban
 - SLA page with passive/active side-by-side comparison, latency percentile tables, config editor, CSV/JSON export
 - Load test page with config management, clone, one-click execution, real-time SSE progress, historical results with comparison
 - Active probes CRUD with route selection and enable/disable toggle
@@ -137,7 +137,7 @@ Author: Rwx-G
 
 **Testing**
 
-- 655 Rust unit tests across 25 crates and 52 frontend Vitest tests
+- 871 Rust unit tests across 25 crates (442 product + 429 forked Pingora), 350+ E2E Docker assertions across standalone and worker modes
 - Docker Compose E2E test suite with 170+ assertions across 35 sections
 - Fuzz testing targets for WAF evaluation and API input
 - Reproducible benchmark suite using oha in Docker (single-process, multi-worker, WAF, cache scenarios)
