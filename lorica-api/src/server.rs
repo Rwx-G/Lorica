@@ -9,6 +9,8 @@ use dashmap::DashMap;
 use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
+use http::Method;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tokio::sync::{watch, Mutex};
 use tracing::info;
 
@@ -356,6 +358,13 @@ pub fn build_router(
         .merge(metrics_routes)
         .merge(protected_routes)
         .merge(dashboard_routes)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::mirror_request())
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+                .allow_headers(Any)
+                .allow_credentials(true),
+        )
         .layer(axum::Extension(state))
         .layer(axum::Extension(session_store))
         .layer(axum::Extension(rate_limiter))
