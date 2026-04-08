@@ -23,7 +23,7 @@ pub struct Session {
 }
 
 /// Session store backed by SQLite with an in-memory cache for fast lookups.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionStore {
     pub(crate) sessions: Arc<Mutex<HashMap<String, Session>>>,
     db: Arc<Mutex<ConfigStore>>,
