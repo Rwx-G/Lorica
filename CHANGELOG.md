@@ -12,6 +12,7 @@ Author: Rwx-G
 ### Fixed
 
 - Log warning when a backend has `tls_skip_verify` enabled to alert operators that upstream TLS certificate validation is disabled
+- Add `aria-label` to all icon-only buttons across the dashboard for screen reader accessibility
 
 ## [1.0.0] - 2026-04-08
 

@@ -201,13 +201,13 @@
                 {/if}
               </td>
               <td class="actions">
-                <button class="btn-icon" onclick={() => showHistory(p)} title="History">
+                <button class="btn-icon" onclick={() => showHistory(p)} title="History" aria-label="History">
                   {@html historyIcon}
                 </button>
-                <button class="btn-icon" onclick={() => openEditForm(p)} title="Edit">
+                <button class="btn-icon" onclick={() => openEditForm(p)} title="Edit" aria-label="Edit">
                   {@html editIcon}
                 </button>
-                <button class="btn-icon btn-icon-danger" onclick={() => (deletingProbe = p)} title="Delete">
+                <button class="btn-icon btn-icon-danger" onclick={() => (deletingProbe = p)} title="Delete" aria-label="Delete">
                   {@html trashIcon}
                 </button>
               </td>

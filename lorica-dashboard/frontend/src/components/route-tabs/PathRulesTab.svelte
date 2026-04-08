@@ -115,16 +115,16 @@
             {#if rule.return_status}<span class="override-pill">return {rule.return_status}</span>{/if}
           </div>
           <div class="rule-header-right">
-            <button class="btn-icon" title="Move up" disabled={index === 0} onclick={() => moveUp(index)}>
+            <button class="btn-icon" title="Move up" aria-label="Move up" disabled={index === 0} onclick={() => moveUp(index)}>
               {@html upIcon}
             </button>
-            <button class="btn-icon" title="Move down" disabled={index === form.path_rules.length - 1} onclick={() => moveDown(index)}>
+            <button class="btn-icon" title="Move down" aria-label="Move down" disabled={index === form.path_rules.length - 1} onclick={() => moveDown(index)}>
               {@html downIcon}
             </button>
-            <button class="btn-icon btn-expand" title={expandedIndex === index ? 'Collapse' : 'Expand'} onclick={() => toggleExpand(index)}>
+            <button class="btn-icon btn-expand" title={expandedIndex === index ? 'Collapse' : 'Expand'} aria-label={expandedIndex === index ? 'Collapse' : 'Expand'} onclick={() => toggleExpand(index)}>
               {@html expandedIndex === index ? collapseIcon : expandIcon}
             </button>
-            <button class="btn-icon btn-delete" title="Remove" onclick={() => removeRule(index)}>
+            <button class="btn-icon btn-delete" title="Remove" aria-label="Remove" onclick={() => removeRule(index)}>
               {@html deleteIcon}
             </button>
           </div>

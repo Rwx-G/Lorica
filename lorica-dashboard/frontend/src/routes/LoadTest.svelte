@@ -382,13 +382,13 @@
                 <button class="btn btn-small btn-run" onclick={() => handleStart(c.id)} disabled={!!progress?.active} title={progress?.active ? 'Another test is already running' : 'Run this test'}>
                   Run
                 </button>
-                <button class="btn-icon" onclick={() => openEditForm(c)} title="Edit">
+                <button class="btn-icon" onclick={() => openEditForm(c)} title="Edit" aria-label="Edit">
                   {@html editIcon}
                 </button>
-                <button class="btn-icon" onclick={() => handleClone(c.id, c.name)} title="Clone">
+                <button class="btn-icon" onclick={() => handleClone(c.id, c.name)} title="Clone" aria-label="Clone">
                   {@html cloneIcon}
                 </button>
-                <button class="btn-icon btn-icon-danger" onclick={() => (deletingConfig = c)} title="Delete">
+                <button class="btn-icon btn-icon-danger" onclick={() => (deletingConfig = c)} title="Delete" aria-label="Delete">
                   {@html trashIcon}
                 </button>
               </td>

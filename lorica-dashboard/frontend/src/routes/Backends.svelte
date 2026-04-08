@@ -300,10 +300,10 @@
               <td class="mono">{b.active_connections}</td>
               <td class="mono">{b.ewma_score_us > 0 ? `${(b.ewma_score_us / 1000).toFixed(1)}ms` : '-'}</td>
               <td class="actions">
-                <button class="btn-icon" onclick={() => openEditForm(b)} title="Edit">
+                <button class="btn-icon" onclick={() => openEditForm(b)} title="Edit" aria-label="Edit">
                   {@html editIcon}
                 </button>
-                <button class="btn-icon btn-icon-danger" onclick={() => (deletingBackend = b)} title="Delete">
+                <button class="btn-icon btn-icon-danger" onclick={() => (deletingBackend = b)} title="Delete" aria-label="Delete">
                   {@html trashIcon}
                 </button>
               </td>

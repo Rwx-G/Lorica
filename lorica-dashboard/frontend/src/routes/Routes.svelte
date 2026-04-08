@@ -222,10 +222,10 @@
                 </span>
               </td>
               <td class="actions">
-                <button class="btn-icon" title="Edit" onclick={() => openEditForm(route)}>
+                <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => openEditForm(route)}>
                   {@html editIcon}
                 </button>
-                <button class="btn-icon btn-icon-danger" title="Delete" onclick={() => { deletingRoute = route; }}>
+                <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => { deletingRoute = route; }}>
                   {@html trashIcon}
                 </button>
               </td>

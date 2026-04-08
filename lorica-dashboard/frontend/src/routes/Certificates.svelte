@@ -677,18 +677,18 @@
                 {/if}
               </td>
               <td class="actions">
-                <button class="btn-icon" title="View details" onclick={() => openDetail(cert)}>
+                <button class="btn-icon" title="View details" aria-label="View details" onclick={() => openDetail(cert)}>
                   {@html eyeIcon}
                 </button>
-                <button class="btn-icon" title="Edit" onclick={() => openEditForm(cert)}>
+                <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => openEditForm(cert)}>
                   {@html editIcon}
                 </button>
                 {#if cert.is_acme}
-                  <button class="btn-icon" title="Renew" onclick={() => handleRenew(cert)} disabled={renewingId === cert.id}>
+                  <button class="btn-icon" title="Renew" aria-label="Renew certificate" onclick={() => handleRenew(cert)} disabled={renewingId === cert.id}>
                     {@html renewIcon}
                   </button>
                 {/if}
-                <button class="btn-icon btn-icon-danger" title="Delete" onclick={() => openDelete(cert)}>
+                <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => openDelete(cert)}>
                   {@html trashIcon}
                 </button>
               </td>

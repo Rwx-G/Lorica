@@ -417,7 +417,7 @@
                 <td>{rule.description}</td>
                 <td class="mono matched-value" title={rule.pattern}>{rule.pattern}</td>
                 <td>
-                  <button class="btn-icon btn-icon-danger" onclick={() => (deletingCustomRule = rule)} title="Delete">
+                  <button class="btn-icon btn-icon-danger" onclick={() => (deletingCustomRule = rule)} title="Delete" aria-label="Delete">
                     {@html trashIcon}
                   </button>
                 </td>
