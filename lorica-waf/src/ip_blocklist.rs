@@ -223,6 +223,76 @@ invalid-line
     }
 
     #[test]
+    fn test_cidr_entries_are_skipped() {
+        // CIDR notation is not supported; entries like "10.0.0.0/8" are skipped
+        let bl = IpBlocklist::new();
+        let text = "10.0.0.0/8\n192.168.1.1";
+        let count = bl.load_from_text(text);
+        assert_eq!(count, 1);
+        assert!(bl.is_blocked_str("192.168.1.1"));
+        assert!(!bl.is_blocked_str("10.0.0.1"));
+    }
+
+    #[test]
+    fn test_ipv4_and_ipv6_mixed() {
+        let bl = IpBlocklist::new();
+        let text = "192.168.1.1\n::1\nfe80::1\n10.0.0.1\n2001:db8::1";
+        let count = bl.load_from_text(text);
+        assert_eq!(count, 5);
+        assert!(bl.is_blocked_str("192.168.1.1"));
+        assert!(bl.is_blocked_str("10.0.0.1"));
+        assert!(bl.is_blocked_str("::1"));
+        assert!(bl.is_blocked_str("fe80::1"));
+        assert!(bl.is_blocked_str("2001:db8::1"));
+    }
+
+    #[test]
+    fn test_lookup_miss() {
+        let bl = IpBlocklist::new();
+        bl.load_from_text("1.2.3.4\n5.6.7.8");
+        assert!(!bl.is_blocked_str("9.9.9.9"));
+        assert!(!bl.is_blocked_str("255.255.255.255"));
+        assert!(!bl.is_blocked_str("::2"));
+    }
+
+    #[test]
+    fn test_enable_disable_toggle() {
+        let bl = IpBlocklist::new();
+        bl.load_from_text("1.2.3.4");
+        assert!(bl.is_enabled());
+        assert!(bl.is_blocked_str("1.2.3.4"));
+
+        bl.set_enabled(false);
+        assert!(!bl.is_enabled());
+        assert!(!bl.is_blocked_str("1.2.3.4"));
+
+        bl.set_enabled(true);
+        assert!(bl.is_enabled());
+        assert!(bl.is_blocked_str("1.2.3.4"));
+    }
+
+    #[test]
+    fn test_empty_blocklist_not_enabled() {
+        let bl = IpBlocklist::new();
+        assert!(!bl.is_enabled());
+        assert_eq!(bl.len(), 0);
+        assert!(bl.is_empty());
+        assert!(!bl.is_blocked_str("1.2.3.4"));
+        // IpAddr lookup should also return false
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(!bl.is_blocked(&ip));
+    }
+
+    #[test]
+    fn test_invalid_entries_skipped_gracefully() {
+        let bl = IpBlocklist::new();
+        let text = "not-an-ip\n999.999.999.999\nabc::xyz\n1.2.3.4\nhello world";
+        let count = bl.load_from_text(text);
+        assert_eq!(count, 1);
+        assert!(bl.is_blocked_str("1.2.3.4"));
+    }
+
+    #[test]
     fn test_large_list_performance() {
         let bl = IpBlocklist::new();
         // Generate 100k IPs
