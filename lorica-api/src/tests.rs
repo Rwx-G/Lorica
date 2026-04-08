@@ -14,10 +14,11 @@ use crate::server::{build_router, AppState};
 use crate::system::SystemCache;
 use crate::workers::WorkerMetrics;
 
-fn test_state() -> (AppState, SessionStore, RateLimiter) {
+async fn test_state() -> (AppState, SessionStore, RateLimiter) {
     let store = lorica_config::ConfigStore::open_in_memory().unwrap();
+    let store = Arc::new(Mutex::new(store));
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        store: Arc::clone(&store),
         log_buffer: Arc::new(LogBuffer::new(1000)),
         system_cache: Arc::new(Mutex::new(SystemCache::new())),
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -43,7 +44,7 @@ fn test_state() -> (AppState, SessionStore, RateLimiter) {
         log_store: None,
         aggregated_metrics: None,
     };
-    let session_store = SessionStore::new();
+    let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
     (state, session_store, rate_limiter)
 }
@@ -106,7 +107,7 @@ async fn setup_admin_and_login(
 
 #[tokio::test]
 async fn test_login_success() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
 
     let password = {
         let store = state.store.lock().await;
@@ -140,7 +141,7 @@ async fn test_login_success() {
 
 #[tokio::test]
 async fn test_login_invalid_credentials() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
 
     {
         let store = state.store.lock().await;
@@ -173,7 +174,7 @@ async fn test_login_invalid_credentials() {
 
 #[tokio::test]
 async fn test_unauthenticated_request_returns_401() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let router = app(state, session_store, rate_limiter);
 
     let req = Request::builder()
@@ -188,7 +189,7 @@ async fn test_unauthenticated_request_returns_401() {
 
 #[tokio::test]
 async fn test_change_password() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let _cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let known_password = "test_password_123";
@@ -238,7 +239,7 @@ async fn test_change_password() {
 
 #[tokio::test]
 async fn test_rate_limiting() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
 
     {
         let store = state.store.lock().await;
@@ -273,7 +274,7 @@ async fn test_rate_limiting() {
 
 #[tokio::test]
 async fn test_routes_crud() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create route
@@ -384,7 +385,7 @@ async fn test_routes_crud() {
 
 #[tokio::test]
 async fn test_backends_crud() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create backend
@@ -468,7 +469,7 @@ async fn test_backends_crud() {
 
 #[tokio::test]
 async fn test_certificates_crud() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create certificate
@@ -545,7 +546,7 @@ async fn test_certificates_crud() {
 
 #[tokio::test]
 async fn test_certificate_delete_blocked_by_route() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create certificate
@@ -606,7 +607,7 @@ async fn test_certificate_delete_blocked_by_route() {
 
 #[tokio::test]
 async fn test_status_endpoint() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -633,7 +634,7 @@ async fn test_status_endpoint() {
 
 #[tokio::test]
 async fn test_config_export_import() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create a backend first
@@ -722,7 +723,7 @@ async fn test_ensure_admin_user_noop_if_exists() {
 
 #[tokio::test]
 async fn test_json_error_format() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -750,7 +751,7 @@ async fn test_json_error_format() {
 
 #[tokio::test]
 async fn test_logout() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Logout
@@ -782,7 +783,7 @@ async fn test_logout() {
 
 #[tokio::test]
 async fn test_certificate_update() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create certificate
@@ -842,7 +843,7 @@ async fn test_certificate_update() {
 
 #[tokio::test]
 async fn test_generate_self_signed_certificate() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -915,7 +916,7 @@ async fn test_generate_self_signed_certificate() {
 
 #[tokio::test]
 async fn test_logs_endpoint_empty() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -939,7 +940,7 @@ async fn test_logs_endpoint_empty() {
 
 #[tokio::test]
 async fn test_logs_endpoint_with_entries() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Push some log entries
@@ -986,7 +987,7 @@ async fn test_logs_endpoint_with_entries() {
 
 #[tokio::test]
 async fn test_logs_endpoint_filtering() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
@@ -1063,7 +1064,7 @@ async fn test_logs_endpoint_filtering() {
 
 #[tokio::test]
 async fn test_clear_logs_endpoint() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
@@ -1117,7 +1118,7 @@ async fn test_clear_logs_endpoint() {
 
 #[tokio::test]
 async fn test_logs_endpoint_status_range() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
@@ -1161,7 +1162,7 @@ async fn test_logs_endpoint_status_range() {
 
 #[tokio::test]
 async fn test_logs_endpoint_time_range() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
@@ -1222,7 +1223,7 @@ async fn test_logs_endpoint_time_range() {
 
 #[tokio::test]
 async fn test_logs_endpoint_limit_and_after_id() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     use crate::logs::LogEntry;
@@ -1285,7 +1286,7 @@ async fn test_logs_endpoint_limit_and_after_id() {
 
 #[tokio::test]
 async fn test_system_endpoint() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1316,7 +1317,7 @@ async fn test_system_endpoint() {
 
 #[tokio::test]
 async fn test_get_settings_defaults() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1341,7 +1342,7 @@ async fn test_get_settings_defaults() {
 
 #[tokio::test]
 async fn test_update_settings() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1372,7 +1373,7 @@ async fn test_update_settings() {
 
 #[tokio::test]
 async fn test_update_settings_invalid_log_level() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1394,7 +1395,7 @@ async fn test_update_settings_invalid_log_level() {
 
 #[tokio::test]
 async fn test_notification_crud() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create
@@ -1500,7 +1501,7 @@ async fn test_notification_crud() {
 
 #[tokio::test]
 async fn test_preference_list_update_delete() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create preference directly via store
@@ -1571,7 +1572,7 @@ async fn test_preference_list_update_delete() {
 
 #[tokio::test]
 async fn test_import_preview_empty_diff() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Export current state
@@ -1630,7 +1631,7 @@ async fn test_import_preview_empty_diff() {
 
 #[tokio::test]
 async fn test_import_preview_with_changes() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create a backend
@@ -1681,7 +1682,8 @@ async fn test_import_preview_with_changes() {
 
 #[tokio::test]
 async fn test_session_purge_expired() {
-    let store = SessionStore::new();
+    let db = lorica_config::ConfigStore::open_in_memory().unwrap();
+    let store = SessionStore::new(Arc::new(Mutex::new(db))).await;
 
     // Create a session
     let sid = store.create("user1".into(), "admin".into()).await;
@@ -1714,7 +1716,7 @@ async fn test_session_purge_expired() {
 
 #[tokio::test]
 async fn test_create_route_empty_hostname_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1742,7 +1744,7 @@ async fn test_create_route_empty_hostname_returns_400() {
 
 #[tokio::test]
 async fn test_create_route_invalid_load_balancing_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1765,7 +1767,7 @@ async fn test_create_route_invalid_load_balancing_returns_400() {
 
 #[tokio::test]
 async fn test_update_route_nonexistent_returns_404() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1785,7 +1787,7 @@ async fn test_update_route_nonexistent_returns_404() {
 
 #[tokio::test]
 async fn test_delete_route_nonexistent_returns_error() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1806,7 +1808,7 @@ async fn test_delete_route_nonexistent_returns_error() {
 
 #[tokio::test]
 async fn test_create_backend_empty_address_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1826,7 +1828,7 @@ async fn test_create_backend_empty_address_returns_400() {
 
 #[tokio::test]
 async fn test_get_backend_nonexistent_returns_404() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1843,7 +1845,7 @@ async fn test_get_backend_nonexistent_returns_404() {
 
 #[tokio::test]
 async fn test_update_backend_nonexistent_returns_404() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1863,7 +1865,7 @@ async fn test_update_backend_nonexistent_returns_404() {
 
 #[tokio::test]
 async fn test_create_certificate_empty_domain_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1887,7 +1889,7 @@ async fn test_create_certificate_empty_domain_returns_400() {
 
 #[tokio::test]
 async fn test_create_certificate_empty_pem_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1911,7 +1913,7 @@ async fn test_create_certificate_empty_pem_returns_400() {
 
 #[tokio::test]
 async fn test_get_certificate_nonexistent_returns_404() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1928,7 +1930,7 @@ async fn test_get_certificate_nonexistent_returns_404() {
 
 #[tokio::test]
 async fn test_update_certificate_nonexistent_returns_404() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1948,7 +1950,7 @@ async fn test_update_certificate_nonexistent_returns_404() {
 
 #[tokio::test]
 async fn test_self_signed_empty_domain_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -1968,7 +1970,7 @@ async fn test_self_signed_empty_domain_returns_400() {
 
 #[tokio::test]
 async fn test_change_password_too_short_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let known_password = "test_password_123";
 
     // Create admin and set known password
@@ -2019,7 +2021,7 @@ async fn test_change_password_too_short_returns_400() {
 
 #[tokio::test]
 async fn test_change_password_wrong_current_returns_401() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let known_password = "test_password_123";
 
     {
@@ -2067,7 +2069,7 @@ async fn test_change_password_wrong_current_returns_401() {
 
 #[tokio::test]
 async fn test_login_nonexistent_user_returns_401() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     {
         let store = state.store.lock().await;
         ensure_admin_user(&store).unwrap();
@@ -2094,7 +2096,7 @@ async fn test_login_nonexistent_user_returns_401() {
 
 #[tokio::test]
 async fn test_import_malformed_toml_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2116,7 +2118,7 @@ async fn test_import_malformed_toml_returns_400() {
 
 #[tokio::test]
 async fn test_import_too_large_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Generate content larger than 1MB
@@ -2148,7 +2150,7 @@ async fn test_import_too_large_returns_400() {
 
 #[tokio::test]
 async fn test_import_preview_malformed_toml_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2170,7 +2172,7 @@ async fn test_import_preview_malformed_toml_returns_400() {
 
 #[tokio::test]
 async fn test_import_invalid_references_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let toml_content = r#"version = 1
@@ -2213,7 +2215,7 @@ updated_at = "2026-01-01T00:00:00Z"
 
 #[tokio::test]
 async fn test_settings_invalid_log_level_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2233,7 +2235,7 @@ async fn test_settings_invalid_log_level_returns_400() {
 
 #[tokio::test]
 async fn test_settings_invalid_health_check_interval_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2253,7 +2255,7 @@ async fn test_settings_invalid_health_check_interval_returns_400() {
 
 #[tokio::test]
 async fn test_settings_invalid_cert_warning_days_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2273,7 +2275,7 @@ async fn test_settings_invalid_cert_warning_days_returns_400() {
 
 #[tokio::test]
 async fn test_settings_invalid_cert_critical_days_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2295,7 +2297,7 @@ async fn test_settings_invalid_cert_critical_days_returns_400() {
 
 #[tokio::test]
 async fn test_create_notification_invalid_channel_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2319,7 +2321,7 @@ async fn test_create_notification_invalid_channel_returns_400() {
 
 #[tokio::test]
 async fn test_create_notification_empty_config_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2343,7 +2345,7 @@ async fn test_create_notification_empty_config_returns_400() {
 
 #[tokio::test]
 async fn test_create_notification_invalid_json_config_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2367,7 +2369,7 @@ async fn test_create_notification_invalid_json_config_returns_400() {
 
 #[tokio::test]
 async fn test_test_notification_nonexistent_returns_404() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2384,7 +2386,7 @@ async fn test_test_notification_nonexistent_returns_404() {
 
 #[tokio::test]
 async fn test_test_notification_email_missing_smtp_host_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create a notification without smtp_host
@@ -2426,7 +2428,7 @@ async fn test_test_notification_email_missing_smtp_host_returns_400() {
 
 #[tokio::test]
 async fn test_test_notification_webhook_missing_url_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -2468,7 +2470,7 @@ async fn test_test_notification_webhook_missing_url_returns_400() {
 
 #[tokio::test]
 async fn test_update_preference_nonexistent_returns_404() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2488,7 +2490,7 @@ async fn test_update_preference_nonexistent_returns_404() {
 
 #[tokio::test]
 async fn test_update_preference_invalid_value_returns_400() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create a preference first
@@ -2523,7 +2525,7 @@ async fn test_update_preference_invalid_value_returns_400() {
 
 #[tokio::test]
 async fn test_expired_session_returns_401() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Manually expire all sessions
@@ -2550,7 +2552,7 @@ async fn test_expired_session_returns_401() {
 
 #[tokio::test]
 async fn test_system_endpoint_returns_all_fields() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2579,7 +2581,7 @@ async fn test_system_endpoint_returns_all_fields() {
 
 #[tokio::test]
 async fn test_create_route_with_backend_ids() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create a backend first
@@ -2623,7 +2625,7 @@ async fn test_create_route_with_backend_ids() {
 
 #[tokio::test]
 async fn test_update_route_backend_associations() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create two backends
@@ -2693,7 +2695,7 @@ async fn test_update_route_backend_associations() {
 
 #[tokio::test]
 async fn test_status_counts_with_data() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Create route + backend + certificate
@@ -2759,13 +2761,14 @@ async fn test_status_counts_with_data() {
 
 // ---- WAF & Workers helpers ----
 
-fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
+async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
     let store = lorica_config::ConfigStore::open_in_memory().unwrap();
+    let store = Arc::new(Mutex::new(store));
     let engine = Arc::new(lorica_waf::WafEngine::new());
     let event_buffer = engine.event_buffer();
     let rule_count = engine.rule_count();
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        store: Arc::clone(&store),
         log_buffer: Arc::new(LogBuffer::new(1000)),
         system_cache: Arc::new(Mutex::new(SystemCache::new())),
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2791,15 +2794,16 @@ fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         log_store: None,
         aggregated_metrics: None,
     };
-    let session_store = SessionStore::new();
+    let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
     (state, session_store, rate_limiter)
 }
 
-fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
+async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
     let store = lorica_config::ConfigStore::open_in_memory().unwrap();
+    let store = Arc::new(Mutex::new(store));
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        store: Arc::clone(&store),
         log_buffer: Arc::new(LogBuffer::new(1000)),
         system_cache: Arc::new(Mutex::new(SystemCache::new())),
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2825,7 +2829,7 @@ fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         log_store: None,
         aggregated_metrics: None,
     };
-    let session_store = SessionStore::new();
+    let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
     (state, session_store, rate_limiter)
 }
@@ -2834,7 +2838,7 @@ fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
 
 #[tokio::test]
 async fn test_waf_events_empty() {
-    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let (state, session_store, rate_limiter) = test_state_with_waf().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2858,7 +2862,7 @@ async fn test_waf_events_empty() {
 
 #[tokio::test]
 async fn test_waf_stats_empty() {
-    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let (state, session_store, rate_limiter) = test_state_with_waf().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2882,7 +2886,7 @@ async fn test_waf_stats_empty() {
 
 #[tokio::test]
 async fn test_waf_clear_events() {
-    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let (state, session_store, rate_limiter) = test_state_with_waf().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2904,7 +2908,7 @@ async fn test_waf_clear_events() {
 
 #[tokio::test]
 async fn test_waf_rules_list() {
-    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let (state, session_store, rate_limiter) = test_state_with_waf().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2930,7 +2934,7 @@ async fn test_waf_rules_list() {
 
 #[tokio::test]
 async fn test_waf_rules_disable() {
-    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let (state, session_store, rate_limiter) = test_state_with_waf().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -2955,7 +2959,7 @@ async fn test_waf_rules_disable() {
 
 #[tokio::test]
 async fn test_waf_rules_enable() {
-    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let (state, session_store, rate_limiter) = test_state_with_waf().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // First disable rule 942100
@@ -2994,7 +2998,7 @@ async fn test_waf_rules_enable() {
 
 #[tokio::test]
 async fn test_waf_rules_not_found() {
-    let (state, session_store, rate_limiter) = test_state_with_waf();
+    let (state, session_store, rate_limiter) = test_state_with_waf().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -3013,7 +3017,7 @@ async fn test_waf_rules_not_found() {
 
 #[tokio::test]
 async fn test_waf_events_without_engine() {
-    let (state, session_store, rate_limiter) = test_state();
+    let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -3039,7 +3043,7 @@ async fn test_waf_events_without_engine() {
 
 #[tokio::test]
 async fn test_workers_empty() {
-    let (state, session_store, rate_limiter) = test_state_with_workers();
+    let (state, session_store, rate_limiter) = test_state_with_workers().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -3062,7 +3066,7 @@ async fn test_workers_empty() {
 
 #[tokio::test]
 async fn test_workers_with_metrics() {
-    let (state, session_store, rate_limiter) = test_state_with_workers();
+    let (state, session_store, rate_limiter) = test_state_with_workers().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Record a heartbeat for worker 1

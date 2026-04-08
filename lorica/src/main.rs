@@ -826,7 +826,7 @@ fn run_supervisor(cli: Cli) {
                 },
                 log_store: api_log_store,
             };
-            let session_store = SessionStore::new();
+            let session_store = SessionStore::new(Arc::clone(&state.store)).await;
             let rate_limiter = RateLimiter::new();
 
             if let Err(e) =
@@ -1818,7 +1818,7 @@ fn run_single_process(cli: Cli) {
                 alert_sender.clone(),
             );
 
-            let session_store = SessionStore::new();
+            let session_store = SessionStore::new(api_store.clone()).await;
             let rate_limiter = RateLimiter::new();
 
             if let Err(e) = lorica_api::server::start_server(

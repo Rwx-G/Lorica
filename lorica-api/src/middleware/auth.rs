@@ -5,6 +5,7 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use chrono::{DateTime, Duration, Utc};
+use lorica_config::ConfigStore;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -21,22 +22,51 @@ pub struct Session {
     pub expires_at: DateTime<Utc>,
 }
 
-/// In-memory session store.
+/// Session store backed by SQLite with an in-memory cache for fast lookups.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     pub(crate) sessions: Arc<Mutex<HashMap<String, Session>>>,
-}
-
-impl Default for SessionStore {
-    fn default() -> Self {
-        Self::new()
-    }
+    db: Arc<Mutex<ConfigStore>>,
 }
 
 impl SessionStore {
-    pub fn new() -> Self {
+    /// Create a new session store backed by the given ConfigStore.
+    /// Loads existing non-expired sessions from the database into memory.
+    pub async fn new(db: Arc<Mutex<ConfigStore>>) -> Self {
+        let mut cache = HashMap::new();
+
+        // Load persisted sessions from SQLite
+        {
+            let store = db.lock().await;
+            match store.load_all_sessions() {
+                Ok(rows) => {
+                    for (id, user_id, username, created_at, expires_at) in rows {
+                        cache.insert(
+                            id,
+                            Session {
+                                user_id,
+                                username,
+                                created_at,
+                                expires_at,
+                            },
+                        );
+                    }
+                    if !cache.is_empty() {
+                        tracing::info!(
+                            count = cache.len(),
+                            "restored sessions from database"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load sessions from database, starting fresh");
+                }
+            }
+        }
+
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(cache)),
+            db,
         }
     }
 
@@ -45,11 +75,27 @@ impl SessionStore {
         let session_id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let session = Session {
-            user_id,
-            username,
+            user_id: user_id.clone(),
+            username: username.clone(),
             created_at: now,
             expires_at: now + Duration::minutes(SESSION_TIMEOUT_MINUTES),
         };
+
+        // Persist to SQLite
+        {
+            let store = self.db.lock().await;
+            if let Err(e) = store.save_session(
+                &session_id,
+                &user_id,
+                &username,
+                &session.created_at,
+                &session.expires_at,
+            ) {
+                tracing::warn!(error = %e, "failed to persist session to database");
+            }
+        }
+
+        // Insert into memory cache
         self.sessions
             .lock()
             .await
@@ -59,26 +105,82 @@ impl SessionStore {
 
     /// Get a session by ID, returning None if expired or not found.
     pub async fn get(&self, session_id: &str) -> Option<Session> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(session_id) {
-            if session.expires_at > Utc::now() {
-                return Some(session.clone());
+        // Check memory cache first
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get(session_id) {
+                if session.expires_at > Utc::now() {
+                    return Some(session.clone());
+                }
+                // Expired - remove from cache and DB
+                sessions.remove(session_id);
+                let db = self.db.clone();
+                let sid = session_id.to_string();
+                tokio::spawn(async move {
+                    let store = db.lock().await;
+                    let _ = store.delete_session(&sid);
+                });
+                return None;
             }
-            sessions.remove(session_id);
         }
-        None
+
+        // Fallback: check database
+        let session = {
+            let store = self.db.lock().await;
+            match store.get_session(session_id) {
+                Ok(Some((user_id, username, created_at, expires_at))) => {
+                    if expires_at > Utc::now() {
+                        Some(Session {
+                            user_id,
+                            username,
+                            created_at,
+                            expires_at,
+                        })
+                    } else {
+                        let _ = store.delete_session(session_id);
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        // Populate cache if found in DB
+        if let Some(ref s) = session {
+            self.sessions
+                .lock()
+                .await
+                .insert(session_id.to_string(), s.clone());
+        }
+
+        session
     }
 
     /// Remove a session.
     pub async fn remove(&self, session_id: &str) {
         self.sessions.lock().await.remove(session_id);
+
+        let db = self.db.clone();
+        let sid = session_id.to_string();
+        tokio::spawn(async move {
+            let store = db.lock().await;
+            let _ = store.delete_session(&sid);
+        });
     }
 
     /// Renew a session's expiry (sliding window).
     pub async fn renew(&self, session_id: &str) {
+        let new_expiry = Utc::now() + Duration::minutes(SESSION_TIMEOUT_MINUTES);
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            session.expires_at = Utc::now() + Duration::minutes(SESSION_TIMEOUT_MINUTES);
+            session.expires_at = new_expiry;
+
+            let db = self.db.clone();
+            let sid = session_id.to_string();
+            tokio::spawn(async move {
+                let store = db.lock().await;
+                let _ = store.update_session_expiry(&sid, &new_expiry);
+            });
         }
     }
 
@@ -97,15 +199,33 @@ impl SessionStore {
         sessions.retain(|sid, session| {
             session.user_id != user_id || sid == keep_session_id
         });
+
+        let db = self.db.clone();
+        let uid = user_id.to_string();
+        let keep = keep_session_id.to_string();
+        tokio::spawn(async move {
+            let store = db.lock().await;
+            let _ = store.delete_sessions_for_user_except(&uid, &keep);
+        });
     }
 
-    /// Remove all expired sessions from memory.
+    /// Remove all expired sessions from memory and database.
     pub async fn purge_expired(&self) -> usize {
         let now = Utc::now();
         let mut sessions = self.sessions.lock().await;
         let before = sessions.len();
         sessions.retain(|_, s| s.expires_at > now);
-        before - sessions.len()
+        let purged = before - sessions.len();
+
+        if purged > 0 {
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                let store = db.lock().await;
+                let _ = store.cleanup_expired_sessions();
+            });
+        }
+
+        purged
     }
 
     /// Spawn a background task that purges expired sessions at a fixed interval.
@@ -173,9 +293,14 @@ pub async fn require_auth(req: Request, next: Next) -> Result<Response, ApiError
 mod tests {
     use super::*;
 
+    async fn test_store() -> SessionStore {
+        let db = ConfigStore::open_in_memory().unwrap();
+        SessionStore::new(Arc::new(Mutex::new(db))).await
+    }
+
     #[tokio::test]
     async fn test_session_store_create_and_get() {
-        let store = SessionStore::new();
+        let store = test_store().await;
         let sid = store.create("user-1".into(), "admin".into()).await;
         let session = store.get(&sid).await.unwrap();
         assert_eq!(session.user_id, "user-1");
@@ -184,21 +309,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_store_get_nonexistent() {
-        let store = SessionStore::new();
+        let store = test_store().await;
         assert!(store.get("nonexistent").await.is_none());
     }
 
     #[tokio::test]
     async fn test_session_store_remove() {
-        let store = SessionStore::new();
+        let store = test_store().await;
         let sid = store.create("user-1".into(), "admin".into()).await;
         store.remove(&sid).await;
+        // Allow spawned DB task to complete
+        tokio::task::yield_now().await;
         assert!(store.get(&sid).await.is_none());
     }
 
     #[tokio::test]
     async fn test_session_store_expires_at() {
-        let store = SessionStore::new();
+        let store = test_store().await;
         let sid = store.create("user-1".into(), "admin".into()).await;
         let expires = store.expires_at(&sid).await;
         assert!(expires.is_some());
@@ -207,13 +334,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_store_expires_at_nonexistent() {
-        let store = SessionStore::new();
+        let store = test_store().await;
         assert!(store.expires_at("nope").await.is_none());
     }
 
     #[tokio::test]
     async fn test_session_store_expired_session_returns_none() {
-        let store = SessionStore::new();
+        let store = test_store().await;
         let sid = Uuid::new_v4().to_string();
         let expired = Session {
             user_id: "user-1".into(),
@@ -229,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_purge_expired_removes_stale_sessions() {
-        let store = SessionStore::new();
+        let store = test_store().await;
 
         // Insert a valid session
         let valid_sid = store.create("user-1".into(), "admin".into()).await;
@@ -259,9 +386,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_purge_expired_returns_zero_when_none_expired() {
-        let store = SessionStore::new();
+        let store = test_store().await;
         store.create("user-1".into(), "admin".into()).await;
         assert_eq!(store.purge_expired().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_session_persisted_to_db() {
+        let db = Arc::new(Mutex::new(ConfigStore::open_in_memory().unwrap()));
+        let store = SessionStore::new(db.clone()).await;
+        let sid = store.create("user-1".into(), "admin".into()).await;
+
+        // Verify session exists in database
+        let db_lock = db.lock().await;
+        let row = db_lock.get_session(&sid).unwrap();
+        assert!(row.is_some());
+        let (user_id, _username, _created, _expires) = row.unwrap();
+        assert_eq!(user_id, "user-1");
+    }
+
+    #[tokio::test]
+    async fn test_session_restored_on_startup() {
+        let db = Arc::new(Mutex::new(ConfigStore::open_in_memory().unwrap()));
+
+        // Create a session with the first store instance
+        let store1 = SessionStore::new(db.clone()).await;
+        let sid = store1.create("user-1".into(), "admin".into()).await;
+        drop(store1);
+
+        // Create a new store instance (simulates restart)
+        let store2 = SessionStore::new(db.clone()).await;
+        let session = store2.get(&sid).await;
+        assert!(session.is_some());
+        assert_eq!(session.unwrap().user_id, "user-1");
     }
 
     #[test]
@@ -308,11 +465,5 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert!(extract_session_cookie(&req).is_none());
-    }
-
-    #[test]
-    fn test_session_store_default() {
-        let store = SessionStore::default();
-        assert!(store.sessions.try_lock().is_ok());
     }
 }
