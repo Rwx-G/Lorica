@@ -220,6 +220,11 @@ pub async fn provision_certificate(
     if domain.is_empty() {
         return Err(ApiError::BadRequest("domain is required".into()));
     }
+    if domain.contains(',') || domain.contains(' ') {
+        return Err(ApiError::BadRequest(
+            "ACME provisions one domain at a time. Remove commas/spaces and provision each domain separately.".into(),
+        ));
+    }
 
     let config = AcmeConfig {
         staging: body.staging,
