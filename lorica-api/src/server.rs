@@ -365,6 +365,7 @@ pub fn build_router(
                 .allow_headers(Any)
                 .allow_credentials(true),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
         .layer(axum::Extension(state))
         .layer(axum::Extension(session_store))
         .layer(axum::Extension(rate_limiter))
