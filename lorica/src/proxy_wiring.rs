@@ -1402,6 +1402,24 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
+        // Merge HTTP/2 split Cookie headers into a single HTTP/1.1 Cookie header.
+        // HTTP/2 allows multiple cookie headers (RFC 7540 section 8.1.2.5) but
+        // HTTP/1.1 backends (especially PHP/Apache) may only read the first one.
+        {
+            let req = session.req_header();
+            let cookies: Vec<&str> = req
+                .headers
+                .get_all("cookie")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            if cookies.len() > 1 {
+                let merged = cookies.join("; ");
+                let _ = upstream_request.remove_header("cookie");
+                let _ = upstream_request.insert_header("Cookie", &merged);
+            }
+        }
+
         // Default proxy headers
         let req = session.req_header();
         let client_ip = session
