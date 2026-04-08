@@ -255,8 +255,9 @@ impl WafEngine {
         let mut events = Vec::new();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Check path
-        self.scan_field("path", path, &now, &mut events);
+        // Check path (URL-decode to catch encoded traversal attacks)
+        let decoded_path = Self::url_decode(path);
+        self.scan_field("path", &decoded_path, &now, &mut events);
 
         // Check query string
         if let Some(q) = query {
@@ -379,8 +380,23 @@ impl WafEngine {
         }
     }
 
-    /// Basic URL decoding for common encoded attack payloads.
+    /// Recursive URL decoding for encoded attack payloads.
+    ///
+    /// Decodes until stable or max 3 iterations to prevent double-encoding bypass.
     fn url_decode(input: &str) -> String {
+        let mut current = input.to_string();
+        for _ in 0..3 {
+            let decoded = Self::url_decode_once(&current);
+            if decoded == current {
+                break;
+            }
+            current = decoded;
+        }
+        current
+    }
+
+    /// Single-pass URL decoding helper.
+    fn url_decode_once(input: &str) -> String {
         let mut result = String::with_capacity(input.len());
         let mut chars = input.chars();
 
@@ -680,11 +696,22 @@ mod tests {
 
     #[test]
     fn test_url_decode_double_encoded() {
-        // %252e = %2e after first decode = . after second
-        // We only do single decoding, but the pattern should still match
-        // %252e%252e in the path traversal rule
+        // %252e = %2e after first decode = . after second (recursive decoding)
         let decoded = WafEngine::url_decode("%252e%252e");
-        assert_eq!(decoded, "%2e%2e");
+        assert_eq!(decoded, "..");
+    }
+
+    #[test]
+    fn test_url_decode_triple_encoded() {
+        // %25252e -> %252e -> %2e -> . (three iterations needed)
+        let decoded = WafEngine::url_decode("%25252e");
+        assert_eq!(decoded, ".");
+    }
+
+    #[test]
+    fn test_url_decode_stable_input() {
+        // Already decoded input should remain unchanged
+        assert_eq!(WafEngine::url_decode("hello world"), "hello world");
     }
 
     // --- Mode behavior ---
