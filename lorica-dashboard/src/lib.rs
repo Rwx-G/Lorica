@@ -60,22 +60,25 @@ fn serve_embedded_file(path: &str) -> Response {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             let body = content.data.to_vec();
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, mime.as_ref().to_string()),
-                    (
-                        header::CACHE_CONTROL,
-                        if path.starts_with("assets/") {
-                            "public, max-age=31536000, immutable".to_string()
-                        } else {
-                            "no-cache".to_string()
-                        },
-                    ),
-                ],
-                body,
-            )
-                .into_response()
+            let cache_control = if path.starts_with("assets/") {
+                "public, max-age=31536000, immutable".to_string()
+            } else {
+                "no-cache".to_string()
+            };
+            let mut response = (StatusCode::OK, body).into_response();
+            let headers = response.headers_mut();
+            headers.insert(header::CONTENT_TYPE, mime.as_ref().parse().unwrap());
+            headers.insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
+            headers.insert(
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws:"
+                    .parse()
+                    .unwrap(),
+            );
+            headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+            headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+            headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+            response
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
