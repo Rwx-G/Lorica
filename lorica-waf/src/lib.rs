@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![deny(unsafe_code)]
+
 //! WAF engine for Lorica with OWASP CRS-inspired rules.
 //!
 //! Provides SQL injection, XSS, and path traversal detection using

@@ -1,4 +1,5 @@
 #![deny(clippy::all)]
+#![deny(unsafe_code)]
 
 pub mod active_probes;
 pub mod load_test;

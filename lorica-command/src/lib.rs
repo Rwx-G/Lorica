@@ -19,6 +19,7 @@
 //! with a three-state protocol (Ok, Error, Processing).
 
 #![warn(clippy::all)]
+#![deny(unsafe_code)]
 
 pub mod channel;
 pub mod messages;

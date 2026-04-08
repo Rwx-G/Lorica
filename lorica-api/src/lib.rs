@@ -1,4 +1,5 @@
 #![deny(clippy::all)]
+#![deny(unsafe_code)]
 
 pub mod acme;
 pub mod auth;
