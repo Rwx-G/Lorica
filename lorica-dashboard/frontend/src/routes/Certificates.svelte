@@ -786,7 +786,12 @@
           {#if detailCert.acme_method}
             <div class="detail-row">
               <span class="detail-label">ACME Method</span>
-              <span class="detail-value">{detailCert.acme_method}</span>
+              <span class="detail-value">
+                {detailCert.acme_method}
+                {#if detailCert.acme_method.startsWith('dns01-') && detailCert.acme_method !== 'dns01-manual'}
+                  <span style="display:inline-block;padding:0.0625rem 0.375rem;border-radius:9999px;font-size:0.625rem;font-weight:600;text-transform:uppercase;margin-left:0.375rem;background:rgba(34,197,94,0.15);color:var(--color-green);">credentials stored</span>
+                {/if}
+              </span>
             </div>
           {/if}
           <div class="detail-row">
