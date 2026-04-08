@@ -11,6 +11,7 @@ Author: Rwx-G
 
 ### Added
 
+- DNS-01 ACME multi-domain and wildcard certificate support. Both automatic and manual DNS-01 flows now accept comma-separated domains (e.g. "example.com, *.example.com"). Manual flow returns all TXT records to create. Wildcard domains use the base domain for the _acme-challenge TXT record name
 - Path rules: ordered sub-path overrides within a single route. Each rule can override backends, cache settings, response headers, rate limits, or return a direct HTTP status. First match wins, supports prefix and exact match types. Dashboard includes a Path Rules tab with reorder, collapsible override sections
 - Route `return_status` field: respond with a specific HTTP status code (e.g. 403, 404) without proxying. Combines with `redirect_to` for custom redirect status codes
 - Catch-all hostname `_`: routes with hostname `_` act as a last-resort fallback when no exact or wildcard match is found

@@ -658,6 +658,9 @@ paths:
     post:
       tags: [ACME]
       summary: Provision certificate via ACME DNS-01 challenge (automatic)
+      description: >
+        Supports multi-domain and wildcard certificates via comma-separated
+        domains (e.g. "example.com, *.example.com").
       security:
         - sessionCookie: []
       requestBody:
@@ -670,6 +673,9 @@ paths:
               properties:
                 domain:
                   type: string
+                  description: >
+                    One or more domains (comma-separated). Wildcards supported
+                    (e.g. "example.com, *.example.com").
       responses:
         "200":
           description: Certificate provisioned via DNS
@@ -685,7 +691,11 @@ paths:
   /api/v1/acme/provision-dns-manual:
     post:
       tags: [ACME]
-      summary: Start manual DNS-01 challenge (returns TXT record to create)
+      summary: Start manual DNS-01 challenge (returns TXT record(s) to create)
+      description: >
+        Supports multi-domain and wildcard certificates via comma-separated
+        domains (e.g. "example.com, *.example.com"). Returns all TXT records
+        that must be created before calling the confirm endpoint.
       security:
         - sessionCookie: []
       requestBody:
@@ -698,6 +708,14 @@ paths:
               properties:
                 domain:
                   type: string
+                  description: >
+                    One or more domains (comma-separated). Wildcards supported
+                    (e.g. "example.com, *.example.com").
+                staging:
+                  type: boolean
+                  default: true
+                contact_email:
+                  type: string
       responses:
         "200":
           description: DNS TXT record details to create
@@ -709,11 +727,30 @@ paths:
                   data:
                     type: object
                     properties:
-                      record_name:
+                      status:
                         type: string
-                      record_value:
+                      domain:
                         type: string
-                      challenge_id:
+                        description: Primary domain (first in comma-separated list).
+                      txt_record_name:
+                        type: string
+                        description: First TXT record name (backwards-compatible).
+                      txt_record_value:
+                        type: string
+                        description: First TXT record value (backwards-compatible).
+                      txt_records:
+                        type: array
+                        description: All TXT records to create.
+                        items:
+                          type: object
+                          properties:
+                            domain:
+                              type: string
+                            name:
+                              type: string
+                            value:
+                              type: string
+                      message:
                         type: string
         "400":
           $ref: "#/components/responses/BadRequest"
@@ -723,7 +760,10 @@ paths:
   /api/v1/acme/provision-dns-manual/confirm:
     post:
       tags: [ACME]
-      summary: Confirm manual DNS-01 challenge after TXT record is set
+      summary: Confirm manual DNS-01 challenge after TXT record(s) are set
+      description: >
+        Call after creating all TXT records returned by step 1. The domain
+        must match the primary domain used in the initial request.
       security:
         - sessionCookie: []
       requestBody:
@@ -732,10 +772,11 @@ paths:
           application/json:
             schema:
               type: object
-              required: [challenge_id]
+              required: [domain]
               properties:
-                challenge_id:
+                domain:
                   type: string
+                  description: Primary domain (same as returned in step 1).
       responses:
         "200":
           description: Certificate provisioned after DNS verification

@@ -1844,8 +1844,13 @@ mod tests {
             "example.com".to_string(),
             PendingDnsChallenge {
                 order_url: "https://acme.example/order/1".into(),
-                challenge_url: "https://acme.example/chall/1".into(),
-                txt_value: "abc123".into(),
+                challenge_urls: vec!["https://acme.example/chall/1".into()],
+                txt_records: vec![(
+                    "_acme-challenge.example.com".into(),
+                    "abc123".into(),
+                    "example.com".into(),
+                )],
+                domains: vec!["example.com".into()],
                 account_credentials_json: "{}".into(),
                 staging: true,
                 contact_email: Some("test@example.com".into()),
@@ -1857,18 +1862,69 @@ mod tests {
         assert!(!store.contains_key("other.com"));
 
         let (_, pending) = store.remove("example.com").unwrap();
-        assert_eq!(pending.txt_value, "abc123");
-        assert_eq!(pending.challenge_url, "https://acme.example/chall/1");
+        assert_eq!(pending.txt_records[0].1, "abc123");
+        assert_eq!(pending.challenge_urls[0], "https://acme.example/chall/1");
         assert!(pending.staging);
         assert!(!store.contains_key("example.com"));
+    }
+
+    #[test]
+    fn test_pending_dns_challenges_multi_domain() {
+        let store: PendingDnsChallenges = Arc::new(DashMap::new());
+        store.insert(
+            "example.com".to_string(),
+            PendingDnsChallenge {
+                order_url: "https://acme.example/order/2".into(),
+                challenge_urls: vec![
+                    "https://acme.example/chall/1".into(),
+                    "https://acme.example/chall/2".into(),
+                ],
+                txt_records: vec![
+                    (
+                        "_acme-challenge.example.com".into(),
+                        "val1".into(),
+                        "example.com".into(),
+                    ),
+                    (
+                        "_acme-challenge.example.com".into(),
+                        "val2".into(),
+                        "*.example.com".into(),
+                    ),
+                ],
+                domains: vec!["example.com".into(), "*.example.com".into()],
+                account_credentials_json: "{}".into(),
+                staging: false,
+                contact_email: None,
+                created_at: Instant::now(),
+            },
+        );
+
+        let (_, pending) = store.remove("example.com").unwrap();
+        assert_eq!(pending.domains.len(), 2);
+        assert_eq!(pending.challenge_urls.len(), 2);
+        assert_eq!(pending.txt_records.len(), 2);
+        // Both TXT records should target the same _acme-challenge name
+        assert_eq!(pending.txt_records[0].0, pending.txt_records[1].0);
+    }
+
+    #[test]
+    fn test_acme_dns_base_domain() {
+        assert_eq!(acme_dns_base_domain("example.com"), "example.com");
+        assert_eq!(acme_dns_base_domain("*.example.com"), "example.com");
+        assert_eq!(
+            acme_dns_base_domain("*.sub.example.com"),
+            "sub.example.com"
+        );
+        assert_eq!(acme_dns_base_domain("www.example.com"), "www.example.com");
     }
 
     #[test]
     fn test_pending_dns_challenge_expiry_check() {
         let pending = PendingDnsChallenge {
             order_url: String::new(),
-            challenge_url: String::new(),
-            txt_value: String::new(),
+            challenge_urls: vec![],
+            txt_records: vec![],
+            domains: vec![],
             account_credentials_json: String::new(),
             staging: false,
             contact_email: None,
@@ -1881,8 +1937,9 @@ mod tests {
     fn test_pending_dns_challenge_not_expired() {
         let pending = PendingDnsChallenge {
             order_url: String::new(),
-            challenge_url: String::new(),
-            txt_value: String::new(),
+            challenge_urls: vec![],
+            txt_records: vec![],
+            domains: vec![],
             account_credentials_json: String::new(),
             staging: false,
             contact_email: None,

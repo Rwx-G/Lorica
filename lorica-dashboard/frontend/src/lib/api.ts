@@ -845,11 +845,21 @@ export interface AcmeDnsManualConfirmRequest {
   domain: string;
 }
 
+export interface DnsManualTxtRecord {
+  domain: string;
+  name: string;
+  value: string;
+}
+
 export interface AcmeDnsManualResponse {
   status: string;
   domain: string;
+  /** Backwards-compatible: first TXT record name. */
   txt_record_name: string;
+  /** Backwards-compatible: first TXT record value. */
   txt_record_value: string;
+  /** All TXT records to create (for multi-domain / wildcard). */
+  txt_records: DnsManualTxtRecord[];
   message: string;
 }
 

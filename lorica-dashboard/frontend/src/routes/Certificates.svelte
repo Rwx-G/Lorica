@@ -12,6 +12,7 @@
     type AcmeDnsProvisionRequest,
     type AcmeDnsManualRequest,
     type AcmeDnsManualConfirmRequest,
+    type DnsManualTxtRecord,
   } from '../lib/api';
   import CertExpiryBadge from '../components/CertExpiryBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
@@ -88,6 +89,7 @@
   // Manual DNS-01 two-step state
   let manualTxtName = $state('');
   let manualTxtValue = $state('');
+  let manualTxtRecords: DnsManualTxtRecord[] = $state([]);
   let manualPendingDomain = $state('');
   let manualStep: 1 | 2 = $state(1);
   let manualCopied = $state('');
@@ -105,6 +107,7 @@
     acmeSuccess = '';
     manualTxtName = '';
     manualTxtValue = '';
+    manualTxtRecords = [];
     manualPendingDomain = '';
     manualStep = 1;
     manualCopied = '';
@@ -188,6 +191,7 @@
       } else if (res.data) {
         manualTxtName = res.data.txt_record_name;
         manualTxtValue = res.data.txt_record_value;
+        manualTxtRecords = res.data.txt_records || [];
         manualPendingDomain = res.data.domain;
         manualStep = 2;
       }
@@ -207,6 +211,7 @@
       manualStep = 1;
       manualTxtName = '';
       manualTxtValue = '';
+      manualTxtRecords = [];
       manualPendingDomain = '';
       await loadData();
     }
@@ -906,35 +911,64 @@
           <div class="form-error">{acmeError}</div>
         {/if}
 
-        <h3>Step 2 of 2 - Create DNS Record</h3>
-        <p>Add this TXT record at your DNS provider for <strong>{manualPendingDomain}</strong>, then click confirm.</p>
+        <h3>Step 2 of 2 - Create DNS Record{manualTxtRecords.length > 1 ? 's' : ''}</h3>
 
-        <div class="form-group">
-          <label>TXT Record Name</label>
-          <div class="copyable-field">
-            <code class="copyable-value">{manualTxtName}</code>
-            <button class="btn btn-small" onclick={() => copyToClipboard(manualTxtName, 'name')}>
-              {manualCopied === 'name' ? 'Copied' : 'Copy'}
-            </button>
+        {#if manualTxtRecords.length <= 1}
+          <p>Add this TXT record at your DNS provider for <strong>{manualPendingDomain}</strong>, then click confirm.</p>
+
+          <div class="form-group">
+            <label>TXT Record Name</label>
+            <div class="copyable-field">
+              <code class="copyable-value">{manualTxtName}</code>
+              <button class="btn btn-small" onclick={() => copyToClipboard(manualTxtName, 'name')}>
+                {manualCopied === 'name' ? 'Copied' : 'Copy'}
+              </button>
+            </div>
           </div>
-        </div>
 
-        <div class="form-group">
-          <label>TXT Record Value</label>
-          <div class="copyable-field">
-            <code class="copyable-value">{manualTxtValue}</code>
-            <button class="btn btn-small" onclick={() => copyToClipboard(manualTxtValue, 'value')}>
-              {manualCopied === 'value' ? 'Copied' : 'Copy'}
-            </button>
+          <div class="form-group">
+            <label>TXT Record Value</label>
+            <div class="copyable-field">
+              <code class="copyable-value">{manualTxtValue}</code>
+              <button class="btn btn-small" onclick={() => copyToClipboard(manualTxtValue, 'value')}>
+                {manualCopied === 'value' ? 'Copied' : 'Copy'}
+              </button>
+            </div>
           </div>
-        </div>
+        {:else}
+          <p>Add the following {manualTxtRecords.length} TXT records at your DNS provider, then click confirm.</p>
 
-        <span class="hint">After creating the record, wait a minute or two for DNS propagation before confirming. The challenge expires after 10 minutes.</span>
+          {#each manualTxtRecords as rec, i}
+            <div class="form-group" style="border-left: 3px solid var(--border-color); padding-left: 12px; margin-bottom: 16px;">
+              <label><strong>{rec.domain}</strong></label>
+              <div style="margin-top: 4px;">
+                <label>TXT Record Name</label>
+                <div class="copyable-field">
+                  <code class="copyable-value">{rec.name}</code>
+                  <button class="btn btn-small" onclick={() => copyToClipboard(rec.name, `name-${i}`)}>
+                    {manualCopied === `name-${i}` ? 'Copied' : 'Copy'}
+                  </button>
+                </div>
+              </div>
+              <div style="margin-top: 4px;">
+                <label>TXT Record Value</label>
+                <div class="copyable-field">
+                  <code class="copyable-value">{rec.value}</code>
+                  <button class="btn btn-small" onclick={() => copyToClipboard(rec.value, `value-${i}`)}>
+                    {manualCopied === `value-${i}` ? 'Copied' : 'Copy'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          {/each}
+        {/if}
+
+        <span class="hint">After creating the record{manualTxtRecords.length > 1 ? 's' : ''}, wait a minute or two for DNS propagation before confirming. The challenge expires after 10 minutes.</span>
 
         <div class="form-actions">
-          <button class="btn btn-cancel" onclick={() => { if (window.confirm('Going back will abandon the current ACME challenge. Continue?')) { manualStep = 1; manualTxtName = ''; manualTxtValue = ''; } }}>Back</button>
+          <button class="btn btn-cancel" onclick={() => { if (window.confirm('Going back will abandon the current ACME challenge. Continue?')) { manualStep = 1; manualTxtName = ''; manualTxtValue = ''; manualTxtRecords = []; } }}>Back</button>
           <button class="btn btn-primary" onclick={handleManualDnsConfirm} disabled={acmeSubmitting}>
-            {acmeSubmitting ? 'Verifying...' : 'I have created the record - Confirm'}
+            {acmeSubmitting ? 'Verifying...' : `I have created the record${manualTxtRecords.length > 1 ? 's' : ''} - Confirm`}
           </button>
         </div>
       {:else}
