@@ -374,8 +374,7 @@ async fn provision_with_acme(
             let failed: Vec<String> = fresh_auths
                 .iter()
                 .filter(|a| matches!(a.status, AuthorizationStatus::Invalid))
-                .filter_map(|a| a.identifier.as_ref())
-                .map(|id| format!("{:?}", id))
+                .map(|a| format!("{:?}", a.identifier))
                 .collect();
             return Err(format!("challenge validation failed for: {}", failed.join(", ")).into());
         }
