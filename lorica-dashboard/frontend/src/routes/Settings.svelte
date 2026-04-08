@@ -874,11 +874,11 @@
 <style>
   .settings-page { max-width: none; }
 
-  .section {
+  :global(.section) {
     margin-bottom: 1.5rem;
   }
 
-  .collapsible-header {
+  :global(.collapsible-header) {
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -892,16 +892,16 @@
     font-family: inherit;
   }
 
-  .collapsible-header:hover {
+  :global(.collapsible-header):hover {
     background: var(--color-bg-hover);
   }
 
-  .collapsible-header.open {
+  :global(.collapsible-header).open {
     border-radius: var(--radius-md) var(--radius-md) 0 0;
     border-bottom-color: transparent;
   }
 
-  .collapsible-header h2 {
+  :global(.collapsible-header) h2 {
     margin: 0;
     font-size: 0.875rem;
     text-transform: uppercase;
@@ -910,7 +910,7 @@
     color: var(--color-text-heading);
   }
 
-  .chevron {
+  :global(.chevron) {
     display: inline-block;
     width: 0.5rem;
     height: 0.5rem;
@@ -921,11 +921,11 @@
     flex-shrink: 0;
   }
 
-  .chevron.expanded {
+  :global(.chevron).expanded {
     transform: rotate(-135deg);
   }
 
-  .section-body {
+  :global(.section-body) {
     background: var(--color-bg-card);
     border: 1px solid var(--color-border);
     border-top: none;
@@ -933,13 +933,13 @@
     padding: var(--space-4);
   }
 
-  .section-hint {
+  :global(.section-hint) {
     color: var(--color-text-muted);
     font-size: 0.8125rem;
     margin: 0.25rem 0 1rem;
   }
 
-  .form-card {
+  :global(.form-card) {
     background: var(--color-bg-card);
     border: 1px solid var(--color-border);
     border-radius: 0.75rem;
@@ -951,21 +951,21 @@
     overflow-y: auto;
   }
 
-  .form-row {
+  :global(.form-row) {
     margin-bottom: 1rem;
   }
 
-  .form-row label {
+  :global(.form-row) label {
     display: block;
     font-size: 0.8125rem;
     color: var(--color-text-muted);
     margin-bottom: 0.375rem;
   }
 
-  .form-row input[type='number'],
-  .form-row input[type='text'],
-  .form-row select,
-  .form-row textarea {
+  :global(.form-row) input[type='number'],
+  :global(.form-row) input[type='text'],
+  :global(.form-row) select,
+  :global(.form-row) textarea {
     width: 100%;
     padding: 0.5rem 0.75rem;
     background: var(--color-bg-input);
@@ -976,12 +976,12 @@
     font-size: 0.875rem;
   }
 
-  .form-row textarea {
+  :global(.form-row) textarea {
     font-family: var(--mono);
     resize: vertical;
   }
 
-  .form-row input:disabled {
+  :global(.form-row) input:disabled {
     opacity: 0.5;
   }
 
@@ -1104,7 +1104,7 @@
   }
 
   /* Table action buttons */
-  .btn-table-action {
+  :global(.btn-table-)action {
     padding: 0.25rem 0.5rem;
     border-radius: var(--radius-sm);
     font-size: var(--text-xs);
@@ -1115,23 +1115,23 @@
     transition: all 0.15s;
     white-space: nowrap;
   }
-  .btn-table-action:disabled {
+  :global(.btn-table-)action:disabled {
     opacity: 0.5;
     cursor: not-allowed;
   }
-  .btn-table-edit { color: var(--color-primary); border-color: var(--color-primary); }
-  .btn-table-edit:hover:not(:disabled) { background: var(--color-primary-subtle); }
-  .btn-table-delete { color: var(--color-red); border-color: var(--color-red); }
-  .btn-table-delete:hover:not(:disabled) { background: var(--color-red-subtle); }
-  .btn-table-test { color: var(--color-green); border-color: var(--color-green); }
-  .btn-table-test:hover:not(:disabled) { background: var(--color-green-subtle); }
+  :global(.btn-table-)edit { color: var(--color-primary); border-color: var(--color-primary); }
+  :global(.btn-table-)edit:hover:not(:disabled) { background: var(--color-primary-subtle); }
+  :global(.btn-table-)delete { color: var(--color-red); border-color: var(--color-red); }
+  :global(.btn-table-)delete:hover:not(:disabled) { background: var(--color-red-subtle); }
+  :global(.btn-table-)test { color: var(--color-green); border-color: var(--color-green); }
+  :global(.btn-table-)test:hover:not(:disabled) { background: var(--color-green-subtle); }
 
   /* Settings tables - consistent column widths */
-  .settings-table { width: 100%; table-layout: fixed; }
-  .settings-table th:nth-child(1) { width: 20%; }
-  .settings-table th:nth-child(2) { width: 45%; }
-  .settings-table th:nth-child(3) { width: 15%; }
-  .settings-table th:nth-child(4) { width: 20%; }
+  :global(.settings-table) { width: 100%; table-layout: fixed; }
+  :global(.settings-table) th:nth-child(1) { width: 20%; }
+  :global(.settings-table) th:nth-child(2) { width: 45%; }
+  :global(.settings-table) th:nth-child(3) { width: 15%; }
+  :global(.settings-table) th:nth-child(4) { width: 20%; }
 
   .text-muted {
     color: var(--color-text-muted);
@@ -1239,22 +1239,22 @@
     margin-top: 1rem;
   }
 
-  .actions-left {
+  :global(.actions-left) {
     display: flex;
     justify-content: flex-start;
     gap: 0.75rem;
     margin-top: 1rem;
   }
 
-  .actions-center {
+  :global(.actions-center) {
     display: flex;
     justify-content: center;
     gap: 0.75rem;
     margin-top: 0.75rem;
   }
 
-  .section-body .btn-primary,
-  .section-body .btn-secondary {
+  :global(.section-body) .btn-primary,
+  :global(.section-body) .btn-secondary {
     min-width: 140px;
   }
 
@@ -1464,9 +1464,9 @@
     margin-top: var(--space-1);
   }
 
-  .form-row input[type='email'],
-  .form-row input[type='url'],
-  .form-row input[type='password'] {
+  :global(.form-row) input[type='email'],
+  :global(.form-row) input[type='url'],
+  :global(.form-row) input[type='password'] {
     width: 100%;
     padding: 0.5rem 0.75rem;
     background: var(--color-bg-input);
