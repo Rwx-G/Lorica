@@ -27,6 +27,7 @@ const MIGRATION_V13: &str = include_str!("migrations/013_waf_persistence.sql");
 const MIGRATION_V14: &str = include_str!("migrations/014_backend_tls_sni.sql");
 const MIGRATION_V15: &str = include_str!("migrations/015_probe_results.sql");
 const MIGRATION_V16: &str = include_str!("migrations/016_backend_tls_skip_verify.sql");
+const MIGRATION_V17: &str = include_str!("migrations/017_acme_method.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -118,6 +119,16 @@ impl ConfigStore {
             }
             None => Ok(stored.to_string()),
         }
+    }
+
+    /// Encrypt a DNS config JSON string for storage. Public so the API crate can use it.
+    pub fn encrypt_dns_config(&self, config: &str) -> Result<String> {
+        self.encrypt_config(config)
+    }
+
+    /// Decrypt a DNS config JSON string from storage. Public so the API crate can use it.
+    pub fn decrypt_dns_config(&self, stored: &str) -> Result<String> {
+        self.decrypt_config(stored)
     }
 
     fn run_migrations(&self) -> Result<()> {
@@ -349,6 +360,15 @@ impl ConfigStore {
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![18],
+            )?;
+        }
+
+        if current_version < 19 {
+            tracing::info!("applying migration 017_acme_method");
+            self.conn.execute_batch(MIGRATION_V17)?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![19],
             )?;
         }
 
@@ -871,10 +891,16 @@ impl ConfigStore {
         let san_json = serde_json::to_string(&cert.san_domains)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
         let encrypted_key = self.encrypt_key_pem(&cert.key_pem)?;
+        let encrypted_dns_config = cert
+            .acme_dns_config
+            .as_ref()
+            .map(|c| self.encrypt_config(c))
+            .transpose()?;
         self.conn.execute(
             "INSERT INTO certificates (id, domain, san_domains, fingerprint, cert_pem, key_pem,
-             issuer, not_before, not_after, is_acme, acme_auto_renew, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
+             acme_method, acme_dns_config)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 cert.id,
                 cert.domain,
@@ -888,6 +914,8 @@ impl ConfigStore {
                 cert.is_acme,
                 cert.acme_auto_renew,
                 cert.created_at.to_rfc3339(),
+                cert.acme_method,
+                encrypted_dns_config,
             ],
         )?;
         Ok(())
@@ -898,7 +926,8 @@ impl ConfigStore {
         self.conn
             .query_row(
                 "SELECT id, domain, san_domains, fingerprint, cert_pem, key_pem,
-                 issuer, not_before, not_after, is_acme, acme_auto_renew, created_at
+                 issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
+                 acme_method, acme_dns_config
                  FROM certificates WHERE id = ?1",
                 params![id],
                 |row| Ok(self.row_to_certificate(row)),
@@ -911,7 +940,8 @@ impl ConfigStore {
     pub fn list_certificates(&self) -> Result<Vec<Certificate>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, domain, san_domains, fingerprint, cert_pem, key_pem,
-             issuer, not_before, not_after, is_acme, acme_auto_renew, created_at
+             issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
+             acme_method, acme_dns_config
              FROM certificates ORDER BY domain",
         )?;
         let rows = stmt.query_map([], |row| Ok(self.row_to_certificate(row)))?;
@@ -927,10 +957,16 @@ impl ConfigStore {
         let san_json = serde_json::to_string(&cert.san_domains)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
         let encrypted_key = self.encrypt_key_pem(&cert.key_pem)?;
+        let encrypted_dns_config = cert
+            .acme_dns_config
+            .as_ref()
+            .map(|c| self.encrypt_config(c))
+            .transpose()?;
         let changed = self.conn.execute(
             "UPDATE certificates SET domain=?2, san_domains=?3, fingerprint=?4,
              cert_pem=?5, key_pem=?6, issuer=?7, not_before=?8, not_after=?9,
-             is_acme=?10, acme_auto_renew=?11 WHERE id=?1",
+             is_acme=?10, acme_auto_renew=?11, acme_method=?12, acme_dns_config=?13
+             WHERE id=?1",
             params![
                 cert.id,
                 cert.domain,
@@ -943,6 +979,8 @@ impl ConfigStore {
                 cert.not_after.to_rfc3339(),
                 cert.is_acme,
                 cert.acme_auto_renew,
+                cert.acme_method,
+                encrypted_dns_config,
             ],
         )?;
         if changed == 0 {
@@ -1529,6 +1567,11 @@ impl ConfigStore {
             .map_err(|e| ConfigError::Validation(format!("invalid san_domains JSON: {e}")))?;
         let key_pem_raw: Vec<u8> = row.get(5)?;
         let key_pem = self.decrypt_key_pem(&key_pem_raw)?;
+        let acme_method: Option<String> = row.get(12)?;
+        let encrypted_dns_config: Option<String> = row.get(13)?;
+        let acme_dns_config = encrypted_dns_config
+            .map(|c| self.decrypt_config(&c))
+            .transpose()?;
         Ok(Certificate {
             id: row.get(0)?,
             domain: row.get(1)?,
@@ -1542,6 +1585,8 @@ impl ConfigStore {
             is_acme: row.get(9)?,
             acme_auto_renew: row.get(10)?,
             created_at: parse_datetime(&row.get::<_, String>(11)?)?,
+            acme_method,
+            acme_dns_config,
         })
     }
 

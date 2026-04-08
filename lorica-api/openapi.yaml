@@ -2354,6 +2354,10 @@ components:
           type: boolean
         acme_auto_renew:
           type: boolean
+        acme_method:
+          type: string
+          description: "ACME provisioning method: http01, dns01-cloudflare, dns01-route53, dns01-ovh, dns01-manual"
+          nullable: true
         created_at:
           type: string
           format: date-time

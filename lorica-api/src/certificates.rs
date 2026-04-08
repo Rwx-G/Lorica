@@ -19,6 +19,8 @@ pub struct CertificateResponse {
     pub is_acme: bool,
     pub acme_auto_renew: bool,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acme_method: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +56,8 @@ pub struct CertificateDetailResponse {
     pub acme_auto_renew: bool,
     pub created_at: String,
     pub associated_routes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acme_method: Option<String>,
 }
 
 fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateResponse {
@@ -68,6 +72,7 @@ fn cert_to_response(c: &lorica_config::models::Certificate) -> CertificateRespon
         is_acme: c.is_acme,
         acme_auto_renew: c.acme_auto_renew,
         created_at: c.created_at.to_rfc3339(),
+        acme_method: c.acme_method.clone(),
     }
 }
 
@@ -229,6 +234,8 @@ pub async fn create_certificate(
         is_acme: false,
         acme_auto_renew: false,
         created_at: now,
+        acme_method: None,
+        acme_dns_config: None,
     };
 
     let store = state.store.lock().await;
@@ -273,6 +280,7 @@ pub async fn get_certificate(
         acme_auto_renew: cert.acme_auto_renew,
         created_at: cert.created_at.to_rfc3339(),
         associated_routes,
+        acme_method: cert.acme_method.clone(),
     };
 
     Ok(json_data(response))
@@ -380,6 +388,8 @@ pub async fn generate_self_signed(
         is_acme: false,
         acme_auto_renew: false,
         created_at: now,
+        acme_method: None,
+        acme_dns_config: None,
     };
 
     let store = state.store.lock().await;

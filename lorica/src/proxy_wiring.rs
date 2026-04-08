@@ -1870,6 +1870,8 @@ mod tests {
             is_acme: false,
             acme_auto_renew: false,
             created_at: now,
+            acme_method: None,
+            acme_dns_config: None,
         }
     }
 

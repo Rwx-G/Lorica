@@ -451,6 +451,8 @@ async fn provision_with_acme(
         is_acme: true,
         acme_auto_renew: true,
         created_at: now,
+        acme_method: Some("http01".into()),
+        acme_dns_config: None,
     };
 
     let store = state.store.lock().await;
@@ -521,6 +523,15 @@ pub fn spawn_renewal_task(
                     );
                 }
 
+                // Skip dns01-manual certs in auto-renewal
+                if cert.acme_method.as_deref() == Some("dns01-manual") {
+                    info!(
+                        domain = %cert.domain,
+                        "skipping auto-renewal for manual DNS-01 certificate"
+                    );
+                    continue;
+                }
+
                 let config = AcmeConfig {
                     staging: cert.issuer.contains("STAGING"),
                     contact_email: None,
@@ -529,12 +540,13 @@ pub fn spawn_renewal_task(
                 // Renew with all domains (primary + SANs)
                 let mut all_domains = vec![cert.domain.clone()];
                 all_domains.extend(cert.san_domains.iter().cloned());
-                match provision_with_acme(&state, &config, &all_domains).await {
+                match renew_with_method(&state, cert, &config, &all_domains).await {
                     Ok(new_cert_id) => {
                         info!(
                             domain = %cert.domain,
                             old_cert_id = %cert.id,
                             new_cert_id = %new_cert_id,
+                            acme_method = ?cert.acme_method,
                             "ACME certificate renewed successfully"
                         );
                     }
@@ -543,6 +555,7 @@ pub fn spawn_renewal_task(
                             domain = %cert.domain,
                             error = %e,
                             days_remaining = days_remaining,
+                            acme_method = ?cert.acme_method,
                             "ACME renewal failed - existing cert still active"
                         );
                     }
@@ -668,7 +681,8 @@ pub async fn renew_certificate(
     // Renew with all domains (primary + SANs)
     let mut all_domains = vec![cert.domain.clone()];
     all_domains.extend(cert.san_domains.iter().cloned());
-    let new_cert_id = provision_with_acme(&state, &config, &all_domains)
+
+    let new_cert_id = renew_with_method(&state, &cert, &config, &all_domains)
         .await
         .map_err(|e| ApiError::Internal(format!("ACME renewal failed: {e}")))?;
 
@@ -687,40 +701,143 @@ pub async fn renew_certificate(
     })))
 }
 
+/// Renew a certificate using the appropriate method based on `acme_method`.
+///
+/// - `"http01"` or `None` -> HTTP-01 (original behavior)
+/// - `"dns01-cloudflare"` / `"dns01-route53"` / `"dns01-ovh"` -> decrypt config, build challenger
+/// - `"dns01-manual"` -> error (requires manual renewal)
+async fn renew_with_method(
+    state: &AppState,
+    cert: &lorica_config::models::Certificate,
+    config: &AcmeConfig,
+    domains: &[String],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let method = cert.acme_method.as_deref().unwrap_or("http01");
+
+    match method {
+        "http01" => provision_with_acme(state, config, domains).await,
+        "dns01-manual" => Err(
+            "manual DNS-01 certificates require manual renewal - \
+             use the provision-dns-manual endpoint"
+                .into(),
+        ),
+        m if m.starts_with("dns01-") => {
+            // Extract provider name from "dns01-provider"
+            let provider = &m[6..];
+            let encrypted = cert.acme_dns_config.as_ref().ok_or_else(|| {
+                format!(
+                    "certificate has method '{m}' but no stored DNS config - \
+                     cannot auto-renew"
+                )
+            })?;
+
+            // Decrypt the DNS config
+            let dns_config_json = {
+                let store = state.store.lock().await;
+                store.decrypt_dns_config(encrypted)?
+            };
+
+            let dns_config: DnsChallengeConfig = serde_json::from_str(&dns_config_json)
+                .map_err(|e| format!("failed to parse stored DNS config: {e}"))?;
+
+            // Verify provider matches
+            if dns_config.provider != provider {
+                return Err(format!(
+                    "stored DNS config provider '{}' does not match method '{m}'",
+                    dns_config.provider
+                )
+                .into());
+            }
+
+            let challenger = build_dns_challenger(&dns_config).await.map_err(|e| {
+                format!("failed to build DNS challenger for renewal: {e}")
+            })?;
+
+            provision_with_acme_dns(
+                state,
+                config,
+                domains,
+                challenger.as_ref(),
+                m,
+                cert.acme_dns_config.clone(),
+            )
+            .await
+        }
+        other => Err(format!("unknown ACME method: {other}").into()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DNS-01 challenge support
 // ---------------------------------------------------------------------------
 
 /// Configuration for DNS-01 ACME challenges.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DnsChallengeConfig {
-    /// DNS provider: `"cloudflare"` or `"route53"`.
+    /// DNS provider: `"cloudflare"`, `"route53"`, or `"ovh"`.
     pub provider: String,
     /// Zone identifier (Cloudflare zone ID or Route53 hosted zone ID).
+    /// Not used for OVH (zone is extracted from domain).
+    #[serde(default)]
     pub zone_id: String,
     /// API token (Cloudflare API token or AWS access key ID).
+    /// For OVH: the application_key.
+    #[serde(default)]
     pub api_token: String,
-    /// Optional secret (AWS secret access key). Not used for Cloudflare.
+    /// Optional secret (AWS secret access key, OVH application_secret).
     pub api_secret: Option<String>,
+    /// OVH endpoint (default: "eu.api.ovh.com"). Only used for OVH.
+    #[serde(default)]
+    pub ovh_endpoint: Option<String>,
+    /// OVH consumer key. Only used for OVH.
+    #[serde(default)]
+    pub ovh_consumer_key: Option<String>,
 }
 
 impl DnsChallengeConfig {
     /// Validate the configuration and return an error message if invalid.
     pub fn validate(&self) -> Result<(), String> {
-        if self.provider != "cloudflare" && self.provider != "route53" {
-            return Err(format!(
-                "unsupported DNS provider '{}': expected 'cloudflare' or 'route53'",
-                self.provider
-            ));
-        }
-        if self.zone_id.is_empty() {
-            return Err("zone_id is required".into());
-        }
-        if self.api_token.is_empty() {
-            return Err("api_token is required".into());
-        }
-        if self.provider == "route53" && self.api_secret.as_ref().is_none_or(|s| s.is_empty()) {
-            return Err("api_secret is required for route53 provider".into());
+        match self.provider.as_str() {
+            "cloudflare" => {
+                if self.zone_id.is_empty() {
+                    return Err("zone_id is required".into());
+                }
+                if self.api_token.is_empty() {
+                    return Err("api_token is required".into());
+                }
+            }
+            "route53" => {
+                if self.zone_id.is_empty() {
+                    return Err("zone_id is required".into());
+                }
+                if self.api_token.is_empty() {
+                    return Err("api_token is required".into());
+                }
+                if self.api_secret.as_ref().is_none_or(|s| s.is_empty()) {
+                    return Err("api_secret is required for route53 provider".into());
+                }
+            }
+            "ovh" => {
+                if self.api_token.is_empty() {
+                    return Err("api_token (application_key) is required for OVH".into());
+                }
+                if self.api_secret.as_ref().is_none_or(|s| s.is_empty()) {
+                    return Err("api_secret (application_secret) is required for OVH".into());
+                }
+                if self
+                    .ovh_consumer_key
+                    .as_ref()
+                    .is_none_or(|s| s.is_empty())
+                {
+                    return Err("ovh_consumer_key is required for OVH".into());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unsupported DNS provider '{}': expected 'cloudflare', 'route53', or 'ovh'",
+                    other
+                ));
+            }
         }
         Ok(())
     }
@@ -960,6 +1077,212 @@ impl DnsChallenger for Route53DnsChallenger {
     }
 }
 
+/// OVH DNS-01 challenger using the OVH API.
+///
+/// OVH authentication uses application_key, application_secret and consumer_key.
+/// Each request is signed with a SHA1 hash of the concatenation:
+/// `application_secret+consumer_key+METHOD+URL+BODY+timestamp`.
+pub struct OvhDnsChallenger {
+    endpoint: String,
+    application_key: String,
+    application_secret: String,
+    consumer_key: String,
+    client: reqwest::Client,
+    /// Track created record IDs for cleanup (domain -> record_id).
+    created_records: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl OvhDnsChallenger {
+    pub fn new(
+        endpoint: String,
+        application_key: String,
+        application_secret: String,
+        consumer_key: String,
+    ) -> Self {
+        Self {
+            endpoint,
+            application_key,
+            application_secret,
+            consumer_key,
+            client: reqwest::Client::new(),
+            created_records: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Extract zone and subdomain from a domain name.
+    /// e.g. "bastion.rwx-g.fr" -> zone="rwx-g.fr", subdomain="_acme-challenge.bastion"
+    /// e.g. "rwx-g.fr" -> zone="rwx-g.fr", subdomain="_acme-challenge"
+    fn extract_zone_and_subdomain(domain: &str) -> (String, String) {
+        let parts: Vec<&str> = domain.split('.').collect();
+        if parts.len() <= 2 {
+            // domain is the zone itself (e.g. "rwx-g.fr")
+            (domain.to_string(), "_acme-challenge".to_string())
+        } else {
+            // zone is the last 2 parts, subdomain is the rest prefixed with _acme-challenge
+            let zone = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+            let sub_parts = &parts[..parts.len() - 2];
+            let subdomain = format!("_acme-challenge.{}", sub_parts.join("."));
+            (zone, subdomain)
+        }
+    }
+
+    /// Get the OVH server timestamp for request signing.
+    async fn get_server_time(&self) -> Result<i64, String> {
+        let url = format!("https://{}/1.0/auth/time", self.endpoint);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("OVH get server time failed: {e}"))?;
+        let time: i64 = resp
+            .json()
+            .await
+            .map_err(|e| format!("OVH server time parse failed: {e}"))?;
+        Ok(time)
+    }
+
+    /// Compute the OVH API signature.
+    /// Format: "$1$" + SHA1(application_secret+"+"+consumer_key+"+"+method+"+"+url+"+"+body+"+"+timestamp)
+    fn sign(
+        &self,
+        method: &str,
+        url: &str,
+        body: &str,
+        timestamp: i64,
+    ) -> String {
+        let to_sign = format!(
+            "{}+{}+{}+{}+{}+{}",
+            self.application_secret, self.consumer_key, method, url, body, timestamp
+        );
+        let digest = ring::digest::digest(
+            &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+            to_sign.as_bytes(),
+        );
+        let hex: String = digest
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("$1${hex}")
+    }
+
+    /// Make a signed request to the OVH API.
+    async fn ovh_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response, String> {
+        let url = format!("https://{}/1.0{}", self.endpoint, path);
+        let body_str = body
+            .map(|b| serde_json::to_string(b).unwrap_or_default())
+            .unwrap_or_default();
+        let timestamp = self.get_server_time().await?;
+        let signature = self.sign(method.as_str(), &url, &body_str, timestamp);
+
+        let mut req = self
+            .client
+            .request(method, &url)
+            .header("X-Ovh-Application", &self.application_key)
+            .header("X-Ovh-Timestamp", timestamp.to_string())
+            .header("X-Ovh-Consumer", &self.consumer_key)
+            .header("X-Ovh-Signature", &signature)
+            .header("Content-Type", "application/json");
+
+        if !body_str.is_empty() {
+            req = req.body(body_str);
+        }
+
+        req.send()
+            .await
+            .map_err(|e| format!("OVH API request failed: {e}"))
+    }
+
+    /// Refresh the DNS zone to apply changes.
+    async fn refresh_zone(&self, zone: &str) -> Result<(), String> {
+        let path = format!("/domain/zone/{zone}/refresh");
+        let resp = self
+            .ovh_request(reqwest::Method::POST, &path, None)
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("OVH zone refresh returned {status}: {body}"));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl DnsChallenger for OvhDnsChallenger {
+    async fn create_txt_record(&self, domain: &str, value: &str) -> Result<(), String> {
+        let (zone, subdomain) = Self::extract_zone_and_subdomain(domain);
+
+        let payload = serde_json::json!({
+            "fieldType": "TXT",
+            "subDomain": subdomain,
+            "target": value,
+            "ttl": 60
+        });
+
+        let path = format!("/domain/zone/{zone}/record");
+        let resp = self
+            .ovh_request(reqwest::Method::POST, &path, Some(&payload))
+            .await?;
+
+        let status = resp.status();
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("OVH create TXT response parse error: {e}"))?;
+
+        if !status.is_success() {
+            return Err(format!("OVH create TXT returned {status}: {body}"));
+        }
+
+        // Store record ID for later deletion
+        if let Some(id) = body.get("id").and_then(|v| v.as_u64()) {
+            self.created_records
+                .lock()
+                .insert(domain.to_string(), id);
+        }
+
+        // Refresh zone to apply changes
+        self.refresh_zone(&zone).await?;
+
+        info!(domain = %domain, zone = %zone, subdomain = %subdomain, "OVH DNS TXT record created");
+        Ok(())
+    }
+
+    async fn delete_txt_record(&self, domain: &str) -> Result<(), String> {
+        let (zone, _subdomain) = Self::extract_zone_and_subdomain(domain);
+
+        let record_id = self
+            .created_records
+            .lock()
+            .remove(domain)
+            .ok_or_else(|| format!("no tracked OVH record ID for domain '{domain}'"))?;
+
+        let path = format!("/domain/zone/{zone}/record/{record_id}");
+        let resp = self
+            .ovh_request(reqwest::Method::DELETE, &path, None)
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("OVH delete TXT returned {status}: {body}"));
+        }
+
+        // Refresh zone to apply changes
+        self.refresh_zone(&zone).await?;
+
+        info!(domain = %domain, "OVH DNS TXT record deleted");
+        Ok(())
+    }
+}
+
 /// Build a `DnsChallenger` from a `DnsChallengeConfig`.
 pub async fn build_dns_challenger(
     config: &DnsChallengeConfig,
@@ -981,6 +1304,15 @@ pub async fn build_dns_challenger(
         )),
         #[cfg(not(feature = "route53"))]
         "route53" => Err("route53 provider requires the 'route53' feature flag".into()),
+        "ovh" => Ok(Box::new(OvhDnsChallenger::new(
+            config
+                .ovh_endpoint
+                .clone()
+                .unwrap_or_else(|| "eu.api.ovh.com".to_string()),
+            config.api_token.clone(),
+            config.api_secret.clone().unwrap_or_default(),
+            config.ovh_consumer_key.clone().unwrap_or_default(),
+        ))),
         other => Err(format!("unsupported DNS provider: {other}")),
     }
 }
@@ -1033,6 +1365,21 @@ pub async fn provision_certificate_dns(
         contact_email: body.contact_email.clone(),
     };
 
+    let acme_method = format!("dns01-{}", body.dns.provider);
+
+    // Encrypt DNS credentials for storage so auto-renewal can reuse them
+    let dns_config_json = serde_json::to_string(&body.dns).unwrap_or_default();
+    let encrypted_dns_config = {
+        let store = state.store.lock().await;
+        match store.encrypt_dns_config(&dns_config_json) {
+            Ok(enc) => Some(enc),
+            Err(e) => {
+                warn!(error = %e, "failed to encrypt DNS config, auto-renewal will not work");
+                None
+            }
+        }
+    };
+
     info!(
         domains = ?domains,
         staging = config.staging,
@@ -1041,7 +1388,15 @@ pub async fn provision_certificate_dns(
         "starting ACME DNS-01 certificate provisioning"
     );
 
-    let result = provision_with_acme_dns(&state, &config, &domains, challenger.as_ref()).await;
+    let result = provision_with_acme_dns(
+        &state,
+        &config,
+        &domains,
+        challenger.as_ref(),
+        &acme_method,
+        encrypted_dns_config,
+    )
+    .await;
 
     match result {
         Ok(cert_id) => {
@@ -1070,11 +1425,16 @@ fn acme_dns_base_domain(domain: &str) -> &str {
 
 /// Internal ACME provisioning logic using DNS-01 challenge.
 /// Supports multi-domain and wildcard certificates.
+///
+/// `acme_method` is stored on the certificate (e.g. "dns01-cloudflare").
+/// `encrypted_dns_config` is the encrypted JSON of the DNS credentials.
 async fn provision_with_acme_dns(
     state: &AppState,
     config: &AcmeConfig,
     domains: &[String],
     challenger: &dyn DnsChallenger,
+    acme_method: &str,
+    encrypted_dns_config: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
         Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
@@ -1264,6 +1624,8 @@ async fn provision_with_acme_dns(
         is_acme: true,
         acme_auto_renew: true,
         created_at: now,
+        acme_method: Some(acme_method.to_string()),
+        acme_dns_config: encrypted_dns_config,
     };
 
     let store = state.store.lock().await;
@@ -1728,6 +2090,8 @@ pub async fn provision_dns_manual_confirm(
         is_acme: true,
         acme_auto_renew: false, // manual mode cannot auto-renew
         created_at: now,
+        acme_method: Some("dns01-manual".into()),
+        acme_dns_config: None,
     };
 
     let store = state.store.lock().await;
@@ -1803,6 +2167,8 @@ mod tests {
             zone_id: "zone123".into(),
             api_token: "token456".into(),
             api_secret: None,
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
         };
         assert!(config.validate().is_ok());
     }
@@ -1814,8 +2180,51 @@ mod tests {
             zone_id: "Z1234567890".into(),
             api_token: "AKIAIOSFODNN7EXAMPLE".into(),
             api_secret: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into()),
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_dns_config_valid_ovh() {
+        let config = DnsChallengeConfig {
+            provider: "ovh".into(),
+            zone_id: String::new(),
+            api_token: "app-key-123".into(),
+            api_secret: Some("app-secret-456".into()),
+            ovh_endpoint: Some("eu.api.ovh.com".into()),
+            ovh_consumer_key: Some("consumer-key-789".into()),
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_dns_config_ovh_missing_consumer_key() {
+        let config = DnsChallengeConfig {
+            provider: "ovh".into(),
+            zone_id: String::new(),
+            api_token: "app-key-123".into(),
+            api_secret: Some("app-secret-456".into()),
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("ovh_consumer_key"));
+    }
+
+    #[test]
+    fn test_dns_config_ovh_missing_secret() {
+        let config = DnsChallengeConfig {
+            provider: "ovh".into(),
+            zone_id: String::new(),
+            api_token: "app-key-123".into(),
+            api_secret: None,
+            ovh_endpoint: None,
+            ovh_consumer_key: Some("consumer-key-789".into()),
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("api_secret"));
     }
 
     #[test]
@@ -1825,6 +2234,8 @@ mod tests {
             zone_id: "zone123".into(),
             api_token: "token456".into(),
             api_secret: None,
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.contains("unsupported DNS provider"));
@@ -1838,6 +2249,8 @@ mod tests {
             zone_id: "".into(),
             api_token: "token456".into(),
             api_secret: None,
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.contains("zone_id"));
@@ -1850,6 +2263,8 @@ mod tests {
             zone_id: "zone123".into(),
             api_token: "".into(),
             api_secret: None,
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.contains("api_token"));
@@ -1862,6 +2277,8 @@ mod tests {
             zone_id: "Z1234567890".into(),
             api_token: "AKIAIOSFODNN7EXAMPLE".into(),
             api_secret: None,
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.contains("api_secret"));
@@ -1874,6 +2291,8 @@ mod tests {
             zone_id: "Z1234567890".into(),
             api_token: "AKIAIOSFODNN7EXAMPLE".into(),
             api_secret: Some("".into()),
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.contains("api_secret"));
@@ -1886,6 +2305,8 @@ mod tests {
             zone_id: "zone123".into(),
             api_token: "token456".into(),
             api_secret: None,
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
         };
         assert!(build_dns_challenger(&config).await.is_ok());
     }
@@ -1897,6 +2318,21 @@ mod tests {
             zone_id: "Z1234567890".into(),
             api_token: "AKIAIOSFODNN7EXAMPLE".into(),
             api_secret: Some("secret".into()),
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
+        };
+        assert!(build_dns_challenger(&config).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_dns_challenger_ovh() {
+        let config = DnsChallengeConfig {
+            provider: "ovh".into(),
+            zone_id: String::new(),
+            api_token: "app-key".into(),
+            api_secret: Some("app-secret".into()),
+            ovh_endpoint: Some("eu.api.ovh.com".into()),
+            ovh_consumer_key: Some("consumer-key".into()),
         };
         assert!(build_dns_challenger(&config).await.is_ok());
     }
@@ -1908,6 +2344,8 @@ mod tests {
             zone_id: "zone".into(),
             api_token: "token".into(),
             api_secret: None,
+            ovh_endpoint: None,
+            ovh_consumer_key: None,
         };
         assert!(build_dns_challenger(&config).await.is_err());
     }
@@ -2053,6 +2491,8 @@ mod tests {
             is_acme: false,
             acme_auto_renew: false,
             created_at: now - chrono::Duration::days(80),
+            acme_method: None,
+            acme_dns_config: None,
         };
 
         // Cert expiring in 2 days (critical level)
@@ -2069,6 +2509,8 @@ mod tests {
             is_acme: false,
             acme_auto_renew: false,
             created_at: now - chrono::Duration::days(88),
+            acme_method: None,
+            acme_dns_config: None,
         };
 
         // Cert expiring in 30 days (no alert)
@@ -2085,6 +2527,8 @@ mod tests {
             is_acme: true,
             acme_auto_renew: true,
             created_at: now - chrono::Duration::days(60),
+            acme_method: Some("http01".into()),
+            acme_dns_config: None,
         };
 
         store.create_certificate(&warning_cert).unwrap();
@@ -2154,5 +2598,26 @@ mod tests {
             warn.details.get("cert_id").unwrap(),
             "cert-warn"
         );
+    }
+
+    #[test]
+    fn test_ovh_zone_extraction_simple() {
+        let (zone, sub) = OvhDnsChallenger::extract_zone_and_subdomain("rwx-g.fr");
+        assert_eq!(zone, "rwx-g.fr");
+        assert_eq!(sub, "_acme-challenge");
+    }
+
+    #[test]
+    fn test_ovh_zone_extraction_subdomain() {
+        let (zone, sub) = OvhDnsChallenger::extract_zone_and_subdomain("bastion.rwx-g.fr");
+        assert_eq!(zone, "rwx-g.fr");
+        assert_eq!(sub, "_acme-challenge.bastion");
+    }
+
+    #[test]
+    fn test_ovh_zone_extraction_deep_subdomain() {
+        let (zone, sub) = OvhDnsChallenger::extract_zone_and_subdomain("a.b.rwx-g.fr");
+        assert_eq!(zone, "rwx-g.fr");
+        assert_eq!(sub, "_acme-challenge.a.b");
     }
 }

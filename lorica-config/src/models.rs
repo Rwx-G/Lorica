@@ -510,6 +510,14 @@ pub struct Certificate {
     pub is_acme: bool,
     pub acme_auto_renew: bool,
     pub created_at: DateTime<Utc>,
+    /// ACME provisioning method: "http01", "dns01-ovh", "dns01-cloudflare",
+    /// "dns01-route53", "dns01-manual". None for non-ACME certificates.
+    #[serde(default)]
+    pub acme_method: Option<String>,
+    /// Encrypted JSON containing DNS provider credentials for auto-renewal.
+    /// Only set for dns01-* methods (not manual or http01).
+    #[serde(default)]
+    pub acme_dns_config: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

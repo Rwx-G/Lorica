@@ -279,6 +279,7 @@ export interface CertificateResponse {
   is_acme: boolean;
   acme_auto_renew: boolean;
   created_at: string;
+  acme_method?: string;
 }
 
 export interface CertificateDetailResponse extends CertificateResponse {
@@ -828,6 +829,8 @@ export interface AcmeDnsProvisionRequest {
     zone_id: string;
     api_token: string;
     api_secret?: string;
+    ovh_endpoint?: string;
+    ovh_consumer_key?: string;
   };
 }
 
