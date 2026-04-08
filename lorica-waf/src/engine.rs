@@ -327,6 +327,90 @@ impl WafEngine {
         }
     }
 
+    /// Evaluate a request body against the WAF ruleset.
+    ///
+    /// Scans the body content using the same rules as `evaluate()`.
+    /// Intended to be called from `request_body_filter` once the full body
+    /// is buffered, complementing the header/path/query scan done in
+    /// `request_filter`.
+    pub fn evaluate_body(
+        &self,
+        mode: WafMode,
+        body: &[u8],
+        host: &str,
+        client_ip: &str,
+    ) -> WafVerdict {
+        // Only scan bodies that look like text (UTF-8 decodable).
+        // Binary uploads (images, protobuf, etc.) are skipped to avoid
+        // false positives and wasted CPU.
+        let text = match std::str::from_utf8(body) {
+            Ok(t) => t,
+            Err(_) => return WafVerdict::Pass,
+        };
+
+        let start = Instant::now();
+        let mut events = Vec::new();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // URL-decode the body to catch encoded payloads
+        let decoded = Self::url_decode(text);
+        self.scan_field("body", &decoded, &now, &mut events);
+
+        let elapsed = start.elapsed();
+
+        if events.is_empty() {
+            info!(
+                host = host,
+                latency_us = elapsed.as_micros() as u64,
+                "WAF body evaluation passed"
+            );
+            return WafVerdict::Pass;
+        }
+
+        // Stamp each event with the client IP
+        for ev in &mut events {
+            ev.client_ip = client_ip.to_string();
+        }
+
+        // Store events in the ring buffer
+        let mut buf = self.event_buffer.lock();
+        for event in &events {
+            if buf.len() >= self.max_events {
+                buf.pop_front();
+            }
+            buf.push_back(event.clone());
+        }
+        drop(buf);
+
+        let rule_ids: Vec<u32> = events.iter().map(|e| e.rule_id).collect();
+        let categories: Vec<&str> = events.iter().map(|e| e.category.as_str()).collect();
+
+        match mode {
+            WafMode::Detection => {
+                warn!(
+                    host = host,
+                    rules = ?rule_ids,
+                    categories = ?categories,
+                    mode = "detection",
+                    latency_us = elapsed.as_micros() as u64,
+                    "WAF body rules matched - request allowed (detection mode)"
+                );
+                WafVerdict::Detected(events)
+            }
+            WafMode::Blocking => {
+                warn!(
+                    host = host,
+                    rules = ?rule_ids,
+                    categories = ?categories,
+                    mode = "blocking",
+                    latency_us = elapsed.as_micros() as u64,
+                    "WAF body rules matched - request blocked"
+                );
+                WafVerdict::Blocked(events)
+            }
+        }
+    }
+
     /// Scan a single field against all enabled rules.
     fn scan_field(&self, field: &str, value: &str, timestamp: &str, events: &mut Vec<WafEvent>) {
         let disabled = self.disabled_rules.read();
@@ -881,6 +965,104 @@ mod tests {
         let recent = e.recent_events(10);
         for ev in &recent {
             assert_eq!(ev.client_ip, "10.20.30.40");
+        }
+    }
+
+    // --- Body scanning ---
+
+    #[test]
+    fn test_body_sqli_blocked() {
+        let e = engine();
+        let body = b"username=admin&password=1' OR 1=1--";
+        let verdict = e.evaluate_body(WafMode::Blocking, body, "example.com", "10.0.0.1");
+        match verdict {
+            WafVerdict::Blocked(events) => {
+                assert!(!events.is_empty());
+                assert!(events
+                    .iter()
+                    .any(|ev| ev.category == RuleCategory::SqlInjection));
+                assert!(events.iter().all(|ev| ev.matched_field == "body"));
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_body_xss_detected() {
+        let e = engine();
+        let body = b"comment=<script>alert(document.cookie)</script>";
+        let verdict = e.evaluate_body(WafMode::Detection, body, "example.com", "10.0.0.1");
+        match verdict {
+            WafVerdict::Detected(events) => {
+                assert!(!events.is_empty());
+                assert!(events.iter().any(|ev| ev.category == RuleCategory::Xss));
+            }
+            other => panic!("expected Detected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_body_cmdi_blocked() {
+        let e = engine();
+        let body = b"input=; cat /etc/passwd";
+        let verdict = e.evaluate_body(WafMode::Blocking, body, "example.com", "10.0.0.1");
+        match verdict {
+            WafVerdict::Blocked(events) => {
+                assert!(!events.is_empty());
+                assert!(events
+                    .iter()
+                    .any(|ev| ev.category == RuleCategory::CommandInjection));
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_body_clean_passes() {
+        let e = engine();
+        let body = b"username=admin&password=securePassword123";
+        let verdict = e.evaluate_body(WafMode::Blocking, body, "example.com", "10.0.0.1");
+        assert_eq!(verdict, WafVerdict::Pass);
+    }
+
+    #[test]
+    fn test_body_binary_skipped() {
+        let e = engine();
+        // Invalid UTF-8 body (binary data) should be skipped
+        let body: &[u8] = &[0xff, 0xfe, 0x00, 0x01, 0x80, 0x90];
+        let verdict = e.evaluate_body(WafMode::Blocking, body, "example.com", "10.0.0.1");
+        assert_eq!(verdict, WafVerdict::Pass);
+    }
+
+    #[test]
+    fn test_body_events_stored_in_buffer() {
+        let e = engine();
+        assert_eq!(e.event_count(), 0);
+        e.evaluate_body(
+            WafMode::Blocking,
+            b"data=1' UNION SELECT * FROM users",
+            "example.com",
+            "10.0.0.1",
+        );
+        assert!(e.event_count() > 0);
+    }
+
+    #[test]
+    fn test_body_client_ip_set() {
+        let e = engine();
+        let verdict = e.evaluate_body(
+            WafMode::Blocking,
+            b"q=<script>alert(1)</script>",
+            "example.com",
+            "192.168.1.100",
+        );
+        match verdict {
+            WafVerdict::Blocked(events) => {
+                for ev in &events {
+                    assert_eq!(ev.client_ip, "192.168.1.100");
+                }
+            }
+            other => panic!("expected Blocked, got {other:?}"),
         }
     }
 

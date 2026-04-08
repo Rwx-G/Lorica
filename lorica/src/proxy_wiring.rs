@@ -438,6 +438,10 @@ pub struct RequestCtx {
     pub retry_count: u32,
     /// Backends overridden by a matched path rule (None = use route backends).
     pub matched_backends: Option<Vec<Backend>>,
+    /// Accumulated request body bytes for chunked transfer size enforcement.
+    pub body_bytes_received: u64,
+    /// Buffered request body for WAF body scanning (only when WAF is enabled).
+    pub waf_body_buffer: Option<Vec<u8>>,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -558,6 +562,8 @@ impl ProxyHttp for LoricaProxy {
             rate_limit_info: None,
             retry_count: 0,
             matched_backends: None,
+            body_bytes_received: 0,
+            waf_body_buffer: None,
         }
     }
 
@@ -1137,6 +1143,115 @@ impl ProxyHttp for LoricaProxy {
             }
             lorica_waf::WafVerdict::Pass => Ok(false),
         }
+    }
+
+    /// Handle incoming request body chunks for WAF body scanning.
+    ///
+    /// Buffers the request body when WAF is enabled for the route.
+    /// When the full body is received (`end_of_stream`), the WAF engine
+    /// evaluates the buffered body. Only text bodies up to 1 MB are
+    /// scanned to avoid excessive memory use on large uploads.
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        /// Maximum body size buffered for WAF scanning (1 MB).
+        const WAF_BODY_SCAN_MAX: usize = 1_048_576;
+
+        if let Some(ref chunk) = body {
+            ctx.body_bytes_received += chunk.len() as u64;
+
+            // Buffer body for WAF scanning (only when WAF enabled)
+            if let Some(ref route) = ctx.route_snapshot {
+                if route.waf_enabled {
+                    let buf = ctx.waf_body_buffer.get_or_insert_with(Vec::new);
+                    // Only buffer up to WAF_BODY_SCAN_MAX bytes
+                    if buf.len() < WAF_BODY_SCAN_MAX {
+                        let remaining = WAF_BODY_SCAN_MAX - buf.len();
+                        let to_copy = chunk.len().min(remaining);
+                        buf.extend_from_slice(&chunk[..to_copy]);
+                    }
+                }
+            }
+        }
+
+        // When the full body is received, run WAF body evaluation
+        if end_of_stream {
+            if let Some(ref buf) = ctx.waf_body_buffer {
+                if !buf.is_empty() {
+                    let host = ctx.matched_host.as_deref().unwrap_or("-");
+                    let client_ip = ctx.client_ip.as_deref().unwrap_or("-");
+
+                    let waf_mode = match ctx.route_snapshot.as_ref().map(|r| &r.waf_mode) {
+                        Some(WafMode::Blocking) => lorica_waf::WafMode::Blocking,
+                        _ => lorica_waf::WafMode::Detection,
+                    };
+
+                    let verdict = self.waf_engine.evaluate_body(
+                        waf_mode,
+                        buf,
+                        host,
+                        client_ip,
+                    );
+
+                    match verdict {
+                        lorica_waf::WafVerdict::Blocked(ref events) => {
+                            for ev in events {
+                                lorica_api::metrics::record_waf_event(
+                                    ev.category.as_str(),
+                                    "blocked",
+                                );
+                                self.waf_counts
+                                    .entry((
+                                        ev.category.as_str().to_string(),
+                                        "blocked".to_string(),
+                                    ))
+                                    .or_insert_with(|| AtomicU64::new(0))
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if let Some(ref store) = self.log_store {
+                                    let _ = store.insert_waf_event(ev);
+                                }
+                            }
+                            ctx.waf_blocked = true;
+                            let header = lorica_http::ResponseHeader::build(403, None)?;
+                            session
+                                .write_response_header(Box::new(header), true)
+                                .await?;
+                            *body = None;
+                            return Ok(());
+                        }
+                        lorica_waf::WafVerdict::Detected(ref events) => {
+                            for ev in events {
+                                lorica_api::metrics::record_waf_event(
+                                    ev.category.as_str(),
+                                    "detected",
+                                );
+                                self.waf_counts
+                                    .entry((
+                                        ev.category.as_str().to_string(),
+                                        "detected".to_string(),
+                                    ))
+                                    .or_insert_with(|| AtomicU64::new(0))
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if let Some(ref store) = self.log_store {
+                                    let _ = store.insert_waf_event(ev);
+                                }
+                            }
+                            ctx.waf_detected = true;
+                        }
+                        lorica_waf::WafVerdict::Pass => {}
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Enable Pingora HTTP cache for cacheable routes.

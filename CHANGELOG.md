@@ -47,6 +47,7 @@ Author: Rwx-G
 - Per-IP login rate limiting (was global bucket)
 - CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy headers on dashboard
 - Recursive URL decoding in WAF (max 3 passes) to prevent double-encoding bypass
+- WAF request body scanning for SQL injection, XSS, and command injection in POST data (text bodies up to 1 MB, binary payloads skipped)
 - DNS server parameter validation before shell command execution
 - 10 MB global API request body size limit
 - `#![deny(unsafe_code)]` on pure-logic crates (waf, config, notify, bench, api)
