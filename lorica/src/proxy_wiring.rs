@@ -1145,12 +1145,15 @@ impl ProxyHttp for LoricaProxy {
         }
     }
 
-    /// Handle incoming request body chunks for WAF body scanning.
+    /// Handle incoming request body chunks.
     ///
-    /// Buffers the request body when WAF is enabled for the route.
-    /// When the full body is received (`end_of_stream`), the WAF engine
-    /// evaluates the buffered body. Only text bodies up to 1 MB are
-    /// scanned to avoid excessive memory use on large uploads.
+    /// This method performs two functions:
+    /// 1. Enforces `max_request_body_bytes` for chunked transfer encoding
+    ///    (Content-Length-based enforcement is done in `request_filter`).
+    /// 2. Buffers the request body for WAF scanning when WAF is enabled.
+    ///    When the full body is received (`end_of_stream`), the WAF engine
+    ///    evaluates the buffered body. Only text bodies up to 1 MB are
+    ///    scanned to avoid excessive memory use on large uploads.
     async fn request_body_filter(
         &self,
         session: &mut Session,
@@ -1166,6 +1169,25 @@ impl ProxyHttp for LoricaProxy {
 
         if let Some(ref chunk) = body {
             ctx.body_bytes_received += chunk.len() as u64;
+
+            // Chunked transfer body size enforcement.
+            // Content-Length based check is in request_filter; this catches
+            // Transfer-Encoding: chunked requests that have no Content-Length.
+            if let Some(max) = ctx.route_snapshot.as_ref().and_then(|r| r.max_request_body_bytes) {
+                if ctx.body_bytes_received > max {
+                    warn!(
+                        received = ctx.body_bytes_received,
+                        max = max,
+                        "chunked request body exceeds max_request_body_bytes (413)"
+                    );
+                    let header = lorica_http::ResponseHeader::build(413, None)?;
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    *body = None;
+                    return Ok(());
+                }
+            }
 
             // Buffer body for WAF scanning (only when WAF enabled)
             if let Some(ref route) = ctx.route_snapshot {

@@ -153,6 +153,10 @@ Author: Rwx-G
 - Reproducible benchmark suite using oha in Docker (single-process, multi-worker, WAF, cache scenarios)
 - Performance tuning guide with kernel sysctl, fd limits, worker sizing, cache and rate limit tuning
 
+### Fixed
+
+- Enforce `max_request_body_bytes` on chunked transfer encoding requests (previously only checked Content-Length header)
+
 ### Changed
 
 - DashMap for ban list and per-route connection counters replacing RwLock<HashMap> for reduced contention
