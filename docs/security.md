@@ -30,6 +30,8 @@
 | Memory corruption | Rust memory safety, no unsafe in product code | By design |
 
 ### Known Limitations
+
+- **WAF does not scan request bodies.** The WAF engine inspects the URI path, query string, and selected headers only. POST data, JSON payloads, and file uploads are not scanned. This means SQL injection, XSS, XXE, and command injection attacks embedded in request bodies are not detected by the WAF. Backend applications should implement their own input validation for body content. Body scanning is planned for a future release.
 - **serde_yml** (RUSTSEC-2025-0068): inherited from Pingora fork. Low risk - only used for Pingora internal server config parsing, not user input. Migration to serde_yaml_ng planned.
 - **HTTP-01 ACME challenge** requires port 80 reachable from Internet. Not suitable for NAT/internal deployments without DNS-01 (planned).
 - **HTTPS listener** requires certificates at boot. First cert added at runtime requires a restart.
