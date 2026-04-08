@@ -28,7 +28,6 @@ const MIGRATION_V14: &str = include_str!("migrations/014_backend_tls_sni.sql");
 const MIGRATION_V15: &str = include_str!("migrations/015_probe_results.sql");
 const MIGRATION_V16: &str = include_str!("migrations/016_backend_tls_skip_verify.sql");
 const MIGRATION_V17: &str = include_str!("migrations/017_acme_method.sql");
-const MIGRATION_V18: &str = include_str!("migrations/018_dns_providers.sql");
 const MIGRATION_V19: &str = include_str!("migrations/019_sessions.sql");
 
 /// Sole database access point for all Lorica configuration.
@@ -341,14 +340,14 @@ impl ConfigStore {
         }
 
         if current_version < 18 {
-            if let Err(_) = self.conn.execute(
+            let _ = self.conn.execute(
                 "ALTER TABLE routes ADD COLUMN path_rules TEXT DEFAULT '[]'",
                 [],
-            ) {}
-            if let Err(_) = self.conn.execute(
+            );
+            let _ = self.conn.execute(
                 "ALTER TABLE routes ADD COLUMN return_status INTEGER DEFAULT NULL",
                 [],
-            ) {}
+            );
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![18],
@@ -2510,6 +2509,7 @@ impl ConfigStore {
     }
 
     /// Get a session by ID. Returns None if not found.
+    #[allow(clippy::type_complexity)]
     pub fn get_session(
         &self,
         id: &str,
@@ -2579,6 +2579,7 @@ impl ConfigStore {
     }
 
     /// Load all non-expired sessions from the database.
+    #[allow(clippy::type_complexity)]
     pub fn load_all_sessions(
         &self,
     ) -> Result<Vec<(String, String, String, DateTime<Utc>, DateTime<Utc>)>> {
