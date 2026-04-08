@@ -804,7 +804,7 @@
 
           <!-- Builtin presets (read-only) -->
           <div class="table-wrap">
-            <table>
+            <table class="settings-table">
               <thead>
                 <tr>
                   <th>Name</th>
@@ -819,7 +819,7 @@
                     <td><code>{bp.name}</code></td>
                     <td class="preset-desc">{bp.description}</td>
                     <td><span class="badge badge-builtin">builtin</span></td>
-                    <td>-</td>
+                    <td><span class="text-muted">builtin</span></td>
                   </tr>
                 {/each}
                 {#each customPresets as cp, idx}
@@ -828,15 +828,15 @@
                     <td class="preset-desc">{Object.keys(cp.headers).length} header{Object.keys(cp.headers).length !== 1 ? 's' : ''}</td>
                     <td><span class="badge badge-custom">custom</span></td>
                     <td class="actions-cell">
-                      <button class="btn-link" onclick={() => openPresetEdit(idx)}>Edit</button>
-                      <button class="btn-link danger" onclick={() => deletingPresetIdx = idx}>Delete</button>
+                      <button class="btn-table-action btn-table-edit" onclick={() => openPresetEdit(idx)}>Edit</button>
+                      <button class="btn-table-action btn-table-delete" onclick={() => deletingPresetIdx = idx}>Delete</button>
                     </td>
                   </tr>
                 {/each}
               </tbody>
             </table>
           </div>
-          <div class="actions">
+          <div class="actions-left">
             <button class="btn btn-primary" onclick={openPresetCreate}>Add Preset</button>
           </div>
         </div>
@@ -870,7 +870,7 @@
             <p class="empty-text">No DNS providers configured.</p>
           {:else}
             <div class="table-wrap">
-              <table>
+              <table class="settings-table">
                 <thead>
                   <tr>
                     <th>Name</th>
@@ -886,11 +886,11 @@
                       <td class="capitalize">{dp.provider_type}</td>
                       <td class="mono">{new Date(dp.created_at).toLocaleDateString()}</td>
                       <td class="actions-cell">
-                        <button class="btn-link" onclick={() => handleTestDnsProvider(dp.id)} disabled={testingDnsProvider === dp.id}>
+                        <button class="btn-table-action btn-table-test" onclick={() => handleTestDnsProvider(dp.id)} disabled={testingDnsProvider === dp.id}>
                           {testingDnsProvider === dp.id ? 'Testing...' : 'Test'}
                         </button>
-                        <button class="btn-link" onclick={() => openDnsProviderEdit(dp)}>Edit</button>
-                        <button class="btn-link danger" onclick={() => deletingDnsProvider = dp}>Delete</button>
+                        <button class="btn-table-action btn-table-edit" onclick={() => openDnsProviderEdit(dp)}>Edit</button>
+                        <button class="btn-table-action btn-table-delete" onclick={() => deletingDnsProvider = dp}>Delete</button>
                       </td>
                     </tr>
                   {/each}
@@ -898,7 +898,7 @@
               </table>
             </div>
           {/if}
-          <div class="actions">
+          <div class="actions-left">
             <button class="btn btn-primary" onclick={openDnsProviderCreate}>Add Provider</button>
           </div>
         </div>
@@ -919,12 +919,12 @@
             <p class="empty-text">No notification channels configured.</p>
           {:else}
             <div class="table-wrap">
-              <table>
+              <table class="settings-table">
                 <thead>
                   <tr>
                     <th>Channel</th>
-                    <th>Enabled</th>
                     <th>Alert Types</th>
+                    <th>Enabled</th>
                     <th>Actions</th>
                   </tr>
                 </thead>
@@ -932,15 +932,15 @@
                   {#each notifications as nc}
                     <tr>
                       <td class="capitalize">{nc.channel}</td>
+                      <td>{nc.alert_types.join(', ') || '-'}</td>
                       <td>
                         <span class="status-dot" class:enabled={nc.enabled} class:disabled={!nc.enabled}></span>
                         {nc.enabled ? 'Yes' : 'No'}
                       </td>
-                      <td>{nc.alert_types.join(', ') || '-'}</td>
                       <td class="actions-cell">
-                        <button class="btn-link" onclick={() => handleTestNotif(nc.id)} disabled={testingNotif === nc.id}>Test</button>
-                        <button class="btn-link" onclick={() => openNotifEdit(nc)}>Edit</button>
-                        <button class="btn-link danger" onclick={() => deletingNotif = nc}>Delete</button>
+                        <button class="btn-table-action btn-table-test" onclick={() => handleTestNotif(nc.id)} disabled={testingNotif === nc.id}>Test</button>
+                        <button class="btn-table-action btn-table-edit" onclick={() => openNotifEdit(nc)}>Edit</button>
+                        <button class="btn-table-action btn-table-delete" onclick={() => deletingNotif = nc}>Delete</button>
                       </td>
                     </tr>
                   {/each}
@@ -948,7 +948,7 @@
               </table>
             </div>
           {/if}
-          <div class="actions">
+          <div class="actions-left">
             <button class="btn btn-primary" onclick={openNotifCreate}>Add Channel</button>
           </div>
         </div>
@@ -1083,9 +1083,11 @@
               {#if exportError}
                 <div class="form-error">{exportError}</div>
               {/if}
-              <button class="btn btn-primary" onclick={handleExport} disabled={exporting}>
-                {exporting ? 'Exporting...' : 'Download TOML'}
-              </button>
+              <div class="actions-center">
+                <button class="btn btn-primary" onclick={handleExport} disabled={exporting}>
+                  {exporting ? 'Exporting...' : 'Download TOML'}
+                </button>
+              </div>
             </div>
 
             <!-- Import -->
@@ -1093,9 +1095,11 @@
               <h3>Import</h3>
               <p class="section-hint">Upload a TOML file to preview and apply changes.</p>
               {#if !importDiff}
-                <div class="form-row">
-                  <label for="import-file">TOML File</label>
-                  <input id="import-file" type="file" accept=".toml,text/plain" onchange={handleFileSelect} />
+                <div class="actions-center">
+                  <label class="file-input-label">
+                    <input type="file" accept=".toml,text/plain" onchange={handleFileSelect} style="display:none" />
+                    {importFile ? importFile.name : 'Choose TOML file...'}
+                  </label>
                 </div>
                 {#if importToml}
                   <p class="file-info">File loaded: {importFile?.name} ({importToml.length} bytes)</p>
@@ -1106,9 +1110,11 @@
                 {#if importSuccess}
                   <div class="form-success">{importSuccess}</div>
                 {/if}
-                <button class="btn btn-primary" onclick={previewImport} disabled={!importToml || importPreviewing}>
-                  {importPreviewing ? 'Analyzing...' : 'Preview Changes'}
-                </button>
+                <div class="actions-center">
+                  <button class="btn btn-primary" onclick={previewImport} disabled={!importToml || importPreviewing}>
+                    {importPreviewing ? 'Analyzing...' : 'Preview Changes'}
+                  </button>
+                </div>
               {/if}
             </div>
           </div>
@@ -1539,11 +1545,6 @@
     font-size: 0.875rem;
   }
 
-  .form-row input[type='file'] {
-    font-size: 0.875rem;
-    color: var(--color-text-muted);
-  }
-
   .form-row textarea {
     font-family: var(--mono);
     resize: vertical;
@@ -1651,7 +1652,7 @@
 
   .actions-cell {
     display: flex;
-    gap: 0.75rem;
+    gap: 0.5rem;
   }
 
   .btn-link {
@@ -1669,6 +1670,42 @@
 
   .btn-link.danger {
     color: var(--color-red);
+  }
+
+  /* Table action buttons */
+  .btn-table-action {
+    padding: 0.25rem 0.5rem;
+    border-radius: var(--radius-sm);
+    font-size: var(--text-xs);
+    font-weight: 500;
+    border: 1px solid;
+    background: transparent;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .btn-table-action:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn-table-edit { color: var(--color-primary); border-color: var(--color-primary); }
+  .btn-table-edit:hover:not(:disabled) { background: var(--color-primary-subtle); }
+  .btn-table-delete { color: var(--color-red); border-color: var(--color-red); }
+  .btn-table-delete:hover:not(:disabled) { background: var(--color-red-subtle); }
+  .btn-table-test { color: var(--color-green); border-color: var(--color-green); }
+  .btn-table-test:hover:not(:disabled) { background: var(--color-green-subtle); }
+
+  /* Settings tables - consistent column widths */
+  .settings-table { width: 100%; table-layout: fixed; }
+  .settings-table th:nth-child(1) { width: 20%; }
+  .settings-table th:nth-child(2) { width: 45%; }
+  .settings-table th:nth-child(3) { width: 15%; }
+  .settings-table th:nth-child(4) { width: 20%; }
+
+  .text-muted {
+    color: var(--color-text-muted);
+    font-size: var(--text-xs);
+    font-style: italic;
   }
 
   /* Export/Import grid */
@@ -1771,9 +1808,42 @@
     margin-top: 1rem;
   }
 
+  .actions-left {
+    display: flex;
+    justify-content: flex-start;
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+
+  .actions-center {
+    display: flex;
+    justify-content: center;
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+  }
+
   .section-body .btn-primary,
   .section-body .btn-secondary {
     min-width: 140px;
+  }
+
+  /* Styled file input */
+  .file-input-label {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-bg-input);
+    color: var(--color-text-muted);
+    font-size: 0.875rem;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .file-input-label:hover {
+    background: var(--color-bg-hover);
+    border-color: var(--color-primary);
+    color: var(--color-text);
   }
 
 
@@ -1805,7 +1875,6 @@
   .preset-desc {
     font-size: 0.8125rem;
     color: var(--color-text-muted);
-    max-width: 400px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
