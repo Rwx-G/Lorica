@@ -131,6 +131,11 @@ pub async fn change_password(
             "new password must be at least 8 characters".into(),
         ));
     }
+    if body.new_password.len() > 128 {
+        return Err(ApiError::BadRequest(
+            "new password must not exceed 128 characters".into(),
+        ));
+    }
 
     let store = state.store.lock().await;
     let user = store
