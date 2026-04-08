@@ -171,7 +171,7 @@
             <span class="sla-hostname">{hostname}</span>
             <span class="sla-window">24h</span>
           </div>
-          <div class="sla-pct" style="color: {slaColor(s.sla_pct, s.target_pct)}">
+          <div class="sla-pct" style="color: {s.total_requests > 0 ? slaColor(s.sla_pct, s.target_pct) : 'var(--color-orange)'}">
             {s.total_requests > 0 ? s.sla_pct.toFixed(2) + '%' : 'No data'}
           </div>
           <div class="sla-meta">
