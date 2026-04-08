@@ -16,6 +16,29 @@
   let filterTimeRange = $state('');
   let autoRefresh = $state(true);
 
+  // Export controls
+  let showExport = $state(false);
+  let exportFormat = $state<'csv' | 'json'>('csv');
+  let exportFrom = $state('');
+  let exportTo = $state('');
+
+  // Initialize default export date range (last 24 hours)
+  function initExportDefaults() {
+    const now = new Date();
+    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    // Format as datetime-local value (YYYY-MM-DDTHH:MM)
+    exportTo = now.toISOString().slice(0, 16);
+    exportFrom = yesterday.toISOString().slice(0, 16);
+  }
+
+  function exportLogs() {
+    const params = new URLSearchParams();
+    if (exportFrom) params.set('time_from', new Date(exportFrom).toISOString());
+    if (exportTo) params.set('time_to', new Date(exportTo).toISOString());
+    params.set('format', exportFormat);
+    window.open(`/api/v1/logs/export?${params}`, '_blank');
+  }
+
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
   let ws: WebSocket | null = null;
   let wsConnected = $state(false);
@@ -194,9 +217,36 @@
         {#if wsConnected}<span class="ws-dot" title="WebSocket connected"></span>{/if}
       </label>
       <button class="btn btn-secondary" onclick={loadLogs}>Refresh</button>
+      <button
+        class="btn btn-secondary"
+        onclick={() => { if (!showExport) initExportDefaults(); showExport = !showExport; }}
+      >Export</button>
       <button class="btn btn-danger" onclick={() => (showClearConfirm = true)}>Clear</button>
     </div>
   </div>
+
+  {#if showExport}
+    <div class="export-panel">
+      <div class="export-row">
+        <label class="export-label">
+          From
+          <input type="datetime-local" class="export-input" bind:value={exportFrom} />
+        </label>
+        <label class="export-label">
+          To
+          <input type="datetime-local" class="export-input" bind:value={exportTo} />
+        </label>
+        <label class="export-label">
+          Format
+          <select class="export-select" bind:value={exportFormat}>
+            <option value="csv">CSV</option>
+            <option value="json">JSON</option>
+          </select>
+        </label>
+        <button class="btn btn-primary" onclick={exportLogs}>Download</button>
+      </div>
+    </div>
+  {/if}
 
   <div class="filters">
     <input
@@ -325,6 +375,47 @@
 
   .auto-refresh input {
     accent-color: var(--color-primary);
+  }
+
+  .export-panel {
+    padding: var(--space-3) var(--space-4);
+    margin-bottom: var(--space-4);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-bg-card);
+  }
+
+  .export-row {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-4);
+    flex-wrap: wrap;
+  }
+
+  .export-label {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    font-weight: 500;
+  }
+
+  .export-input,
+  .export-select {
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-bg-input);
+    color: var(--color-text);
+    font-size: var(--text-md);
+  }
+
+  .export-input:focus,
+  .export-select:focus {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--color-primary-subtle);
   }
 
   .filters {
