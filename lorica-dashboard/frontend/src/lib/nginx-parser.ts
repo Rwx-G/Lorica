@@ -844,60 +844,203 @@ function createDefaultRoute(): LoricaRouteImport {
 }
 
 /**
- * Nginx directives that Lorica handles differently or that are not relevant.
- * These are silently ignored (no diagnostic) because they are well-known
- * Nginx directives, not typos or unknown config.
+ * Nginx directives handled by Lorica internally, with human-readable descriptions.
+ * These are NOT mapped to Lorica route fields but are recognized and annotated
+ * in the resolved config view instead of showing "unknown".
  */
-const SILENTLY_IGNORED_DIRECTIVES = new Set([
-  'listen',
-  'http2',
-  'ssl',
-  'ssl_dhparam',
-  'ssl_protocols',
-  'ssl_ciphers',
-  'ssl_prefer_server_ciphers',
-  'ssl_session_cache',
-  'ssl_session_timeout',
-  'ssl_session_tickets',
-  'ssl_stapling',
-  'ssl_stapling_verify',
-  'ssl_trusted_certificate',
-  'proxy_http_version',
-  'proxy_buffering',
-  'proxy_buffer_size',
-  'proxy_buffers',
-  'proxy_busy_buffers_size',
-  'keepalive',
-  'keepalive_timeout',
-  'keepalive_requests',
-  'access_log',
-  'error_log',
-  'gzip',
-  'gzip_types',
-  'gzip_vary',
-  'gzip_proxied',
-  'gzip_comp_level',
-  'gzip_min_length',
-  'sendfile',
-  'tcp_nopush',
-  'tcp_nodelay',
-  'resolver',
-  'charset',
-  'server_tokens',
-  'root',
-  'index',
-  'try_files',
-  'error_page',
-  'expires',
-  'etag',
-  'if_modified_since',
-]);
+export const LORICA_HANDLED_DIRECTIVES: Record<string, string> = {
+  // TLS/SSL - Lorica manages TLS termination
+  listen: 'Lorica: HTTP/HTTPS ports',
+  http2: 'Lorica: HTTP/2 auto',
+  ssl: 'Lorica: TLS managed',
+  ssl_dhparam: 'Lorica: TLS managed',
+  ssl_protocols: 'Lorica: TLS managed',
+  ssl_ciphers: 'Lorica: TLS managed',
+  ssl_prefer_server_ciphers: 'Lorica: TLS managed',
+  ssl_session_cache: 'Lorica: TLS managed',
+  ssl_session_timeout: 'Lorica: TLS managed',
+  ssl_session_tickets: 'Lorica: TLS managed',
+  ssl_session_ticket_key: 'Lorica: TLS managed',
+  ssl_stapling: 'Lorica: TLS managed',
+  ssl_stapling_verify: 'Lorica: TLS managed',
+  ssl_trusted_certificate: 'Lorica: TLS managed',
+  ssl_verify_client: 'Lorica: TLS managed',
+  ssl_verify_depth: 'Lorica: TLS managed',
+  ssl_client_certificate: 'Lorica: TLS managed',
+  ssl_crl: 'Lorica: CRL via CLI flag',
+  ssl_ecdh_curve: 'Lorica: TLS managed',
+  ssl_buffer_size: 'Lorica: TLS managed',
+  ssl_password_file: 'Lorica: TLS managed',
+  ssl_early_data: 'Lorica: TLS managed',
+  ssl_reject_handshake: 'Lorica: TLS managed',
+  ssl_conf_command: 'Lorica: TLS managed',
+  // Proxy connection
+  proxy_http_version: 'Lorica: HTTP/1.1 auto',
+  proxy_buffering: 'Lorica: internal',
+  proxy_buffer_size: 'Lorica: internal',
+  proxy_buffers: 'Lorica: internal',
+  proxy_busy_buffers_size: 'Lorica: internal',
+  proxy_max_temp_file_size: 'Lorica: internal',
+  proxy_temp_file_write_size: 'Lorica: internal',
+  proxy_request_buffering: 'Lorica: internal',
+  proxy_temp_path: 'Lorica: internal',
+  proxy_redirect: 'Lorica: internal',
+  proxy_next_upstream: 'Lorica: retry_attempts',
+  proxy_next_upstream_tries: 'Lorica: retry_attempts',
+  proxy_next_upstream_timeout: 'Lorica: retry_attempts',
+  proxy_intercept_errors: 'Lorica: internal',
+  proxy_pass_request_headers: 'Lorica: internal',
+  proxy_pass_request_body: 'Lorica: internal',
+  proxy_headers_hash_max_size: 'Lorica: internal',
+  proxy_headers_hash_bucket_size: 'Lorica: internal',
+  proxy_ssl_server_name: 'Lorica: tls_sni on backend',
+  proxy_ssl_name: 'Lorica: tls_sni on backend',
+  proxy_ssl_verify: 'Lorica: tls_skip_verify on backend',
+  proxy_ssl_certificate: 'Lorica: internal',
+  proxy_ssl_certificate_key: 'Lorica: internal',
+  proxy_ssl_protocols: 'Lorica: internal',
+  proxy_ssl_ciphers: 'Lorica: internal',
+  proxy_ssl_session_reuse: 'Lorica: internal',
+  proxy_ssl_trusted_certificate: 'Lorica: internal',
+  proxy_cookie_domain: 'ignored: not applicable',
+  proxy_cookie_path: 'ignored: not applicable',
+  proxy_cookie_flags: 'ignored: not applicable',
+  proxy_bind: 'ignored: not applicable',
+  proxy_ignore_headers: 'ignored: not applicable',
+  proxy_force_ranges: 'ignored: not applicable',
+  proxy_limit_rate: 'ignored: not applicable',
+  proxy_method: 'ignored: not applicable',
+  proxy_set_body: 'ignored: not applicable',
+  proxy_pass_header: 'ignored: not applicable',
+  // Upstream/connection
+  keepalive: 'Lorica: connection pooling',
+  keepalive_timeout: 'Lorica: connection pooling',
+  keepalive_requests: 'Lorica: connection pooling',
+  // Logging
+  access_log: 'Lorica: own access logs',
+  error_log: 'Lorica: own error logs',
+  log_format: 'Lorica: own log format',
+  log_not_found: 'ignored: not applicable',
+  log_subrequest: 'ignored: not applicable',
+  open_log_file_cache: 'ignored: not applicable',
+  // Compression
+  gzip: 'Lorica: compression_enabled',
+  gzip_types: 'Lorica: compression auto',
+  gzip_vary: 'Lorica: compression auto',
+  gzip_proxied: 'Lorica: compression auto',
+  gzip_comp_level: 'Lorica: compression auto',
+  gzip_min_length: 'Lorica: compression auto',
+  gzip_disable: 'Lorica: compression auto',
+  gzip_buffers: 'Lorica: compression auto',
+  gzip_http_version: 'Lorica: compression auto',
+  gzip_static: 'ignored: static files',
+  brotli: 'ignored: not supported',
+  brotli_types: 'ignored: not supported',
+  brotli_comp_level: 'ignored: not supported',
+  brotli_min_length: 'ignored: not supported',
+  // Server/networking
+  sendfile: 'ignored: kernel optimization',
+  tcp_nopush: 'ignored: kernel optimization',
+  tcp_nodelay: 'ignored: kernel optimization',
+  resolver: 'Lorica: system DNS',
+  resolver_timeout: 'Lorica: system DNS',
+  charset: 'ignored: not applicable',
+  server_tokens: 'Lorica: no server token',
+  send_timeout: 'Lorica: send_timeout_s',
+  types_hash_max_size: 'ignored: internal',
+  variables_hash_max_size: 'ignored: internal',
+  reset_timedout_connection: 'ignored: internal',
+  lingering_close: 'ignored: internal',
+  lingering_time: 'ignored: internal',
+  lingering_timeout: 'ignored: internal',
+  // Static files (not applicable to RP)
+  root: 'ignored: static files',
+  alias: 'ignored: static files',
+  index: 'ignored: static files',
+  try_files: 'ignored: static files',
+  autoindex: 'ignored: static files',
+  expires: 'ignored: static files',
+  etag: 'ignored: static files',
+  if_modified_since: 'ignored: static files',
+  open_file_cache: 'ignored: static files',
+  open_file_cache_valid: 'ignored: static files',
+  open_file_cache_min_uses: 'ignored: static files',
+  types: 'ignored: not applicable',
+  default_type: 'ignored: not applicable',
+  // Client limits
+  client_body_timeout: 'Lorica: read_timeout_s',
+  client_header_timeout: 'Lorica: internal',
+  client_body_buffer_size: 'Lorica: internal',
+  client_header_buffer_size: 'Lorica: internal',
+  large_client_header_buffers: 'Lorica: internal',
+  // FastCGI/uwsgi/SCGI (backend-specific, not proxied)
+  fastcgi_pass: 'ignored: direct backend',
+  fastcgi_param: 'ignored: direct backend',
+  fastcgi_buffers: 'ignored: direct backend',
+  fastcgi_buffer_size: 'ignored: direct backend',
+  fastcgi_max_temp_file_size: 'ignored: direct backend',
+  fastcgi_connect_timeout: 'ignored: direct backend',
+  fastcgi_send_timeout: 'ignored: direct backend',
+  fastcgi_read_timeout: 'ignored: direct backend',
+  uwsgi_pass: 'ignored: direct backend',
+  uwsgi_param: 'ignored: direct backend',
+  scgi_pass: 'ignored: direct backend',
+  grpc_pass: 'ignored: not supported',
+  grpc_set_header: 'ignored: not supported',
+  // Rate limiting zones (handled differently)
+  limit_req_zone: 'Lorica: rate_limit_rps',
+  limit_conn: 'Lorica: max_connections',
+  limit_conn_zone: 'Lorica: max_connections',
+  limit_rate: 'ignored: not applicable',
+  limit_rate_after: 'ignored: not applicable',
+  // Auth
+  auth_basic: 'ignored: not applicable',
+  auth_basic_user_file: 'ignored: not applicable',
+  auth_request: 'ignored: not applicable',
+  auth_request_set: 'ignored: not applicable',
+  satisfy: 'ignored: not applicable',
+  allow: 'Lorica: ip_allowlist',
+  deny: 'Lorica: ip_denylist',
+  // Misc
+  error_page: 'ignored: not applicable',
+  map: 'ignored: not applicable',
+  set: 'ignored: not applicable',
+  geo: 'ignored: not applicable',
+  sub_filter: 'ignored: not applicable',
+  sub_filter_once: 'ignored: not applicable',
+  sub_filter_types: 'ignored: not applicable',
+  mirror: 'ignored: not applicable',
+  mirror_request_body: 'ignored: not applicable',
+  real_ip_header: 'Lorica: X-Real-IP auto',
+  set_real_ip_from: 'Lorica: trusted proxy',
+  real_ip_recursive: 'Lorica: internal',
+  more_set_headers: 'Lorica: response_headers',
+  more_clear_headers: 'Lorica: response_headers_remove',
+  // Upstream block directives (handled at block level, not directive level)
+  zone: 'ignored: upstream config',
+  least_conn: 'Lorica: load_balancing',
+  ip_hash: 'Lorica: load_balancing',
+  hash: 'Lorica: load_balancing',
+  // Proxy cache (advanced directives beyond basic)
+  proxy_cache_path: 'Lorica: cache internal',
+  proxy_cache_bypass: 'Lorica: cache internal',
+  proxy_cache_use_stale: 'Lorica: cache internal',
+  proxy_cache_lock: 'Lorica: cache internal',
+  proxy_cache_min_uses: 'Lorica: cache internal',
+  proxy_cache_methods: 'Lorica: cache internal',
+  proxy_no_cache: 'Lorica: cache internal',
+  proxy_cache_revalidate: 'Lorica: cache internal',
+  proxy_cache_background_update: 'Lorica: cache internal',
+  proxy_cache_key: 'Lorica: cache internal',
+};
 
 /**
  * Apply a directive to a route using the DIRECTIVE_MAP.
  *
- * Known-but-irrelevant directives are silently skipped.
- * Truly unknown directives generate an info-level diagnostic.
+ * Directives in LORICA_HANDLED_DIRECTIVES are silently skipped (annotated in
+ * the resolved config view). All other unrecognized directives are silently
+ * ignored - no "unknown" diagnostic is generated since the list of Nginx
+ * directives and third-party modules is effectively unbounded.
  *
  * @param directive - The parsed directive
  * @param route - The route being built
@@ -911,16 +1054,10 @@ function applyDirective(
   const handler = DIRECTIVE_MAP[directive.name];
   if (handler) {
     handler(directive.value, route, diagnostics, directive.line);
-  } else if (SILENTLY_IGNORED_DIRECTIVES.has(directive.name)) {
-    // Known Nginx directive - Lorica handles this differently, skip silently
-  } else {
-    diagnostics.push({
-      level: 'info',
-      line: directive.line,
-      message: `Skipped unknown directive "${directive.name}".`,
-      directive: directive.name,
-    });
   }
+  // All other directives (LORICA_HANDLED_DIRECTIVES or truly unknown) are
+  // silently skipped. The resolved config view handles annotations via
+  // getAnnotation() which checks both DIRECTIVE_MAP and LORICA_HANDLED_DIRECTIVES.
 }
 
 /**

@@ -8,6 +8,7 @@
     type NginxDiagnostic,
     type LoricaRouteImport,
     type PathRuleImport,
+    LORICA_HANDLED_DIRECTIVES,
   } from '../lib/nginx-parser';
   import { showToast } from '../lib/toast';
 
@@ -284,11 +285,17 @@
   };
 
   // Build the resolved config text with include replacements shown
-  let resolvedConfigLines: { text: string; annotation: string; kind: 'normal' | 'replaced' | 'directive' }[] = $derived.by(() => {
+  type ConfigLine = { text: string; annotation: string; annotationType: 'mapped' | 'handled' | 'none'; kind: 'normal' | 'replaced' };
+  let resolvedConfigLines: ConfigLine[] = $derived.by(() => {
     if (!configText.trim()) return [];
     const includeMap = new Map(unresolvedIncludes.map((inc) => [inc.path, inc.content]));
     const lines = configText.split('\n');
-    const result: { text: string; annotation: string; kind: 'normal' | 'replaced' | 'directive' }[] = [];
+    const result: ConfigLine[] = [];
+
+    function pushLine(text: string, kind: 'normal' | 'replaced' = 'normal') {
+      const ann = getAnnotation(text);
+      result.push({ text, annotation: ann.text, annotationType: ann.type, kind });
+    }
 
     for (const line of lines) {
       const includeMatch = line.match(/^\s*include\s+(.+?)\s*;/);
@@ -296,29 +303,41 @@
         const path = includeMatch[1];
         const content = includeMap.get(path);
         if (content?.trim()) {
-          result.push({ text: `# include ${path} -> resolved:`, annotation: '', kind: 'replaced' });
+          result.push({ text: `# include ${path} -> resolved:`, annotation: '', annotationType: 'none', kind: 'replaced' });
           for (const subLine of content.split('\n')) {
-            const ann = getAnnotation(subLine);
-            result.push({ text: subLine, annotation: ann, kind: ann ? 'directive' : 'normal' });
+            pushLine(subLine);
           }
           continue;
         }
       }
-      const ann = getAnnotation(line);
-      result.push({ text: line, annotation: ann, kind: ann ? 'directive' : 'normal' });
+      pushLine(line);
     }
     return result;
   });
 
-  function getAnnotation(line: string): string {
+  function getAnnotation(line: string): { text: string; type: 'mapped' | 'handled' | 'none' } {
     const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#') || trimmed === '{' || trimmed === '}') return '';
-    for (const [directive, loricaParam] of Object.entries(LORICA_ANNOTATION)) {
-      if (trimmed.startsWith(directive + ' ') || trimmed.startsWith(directive + '\t')) {
-        return loricaParam;
+    if (!trimmed || trimmed.startsWith('#') || trimmed === '{' || trimmed === '}') {
+      return { text: '', type: 'none' };
+    }
+    // Extract directive name
+    const spaceIdx = trimmed.indexOf(' ');
+    const tabIdx = trimmed.indexOf('\t');
+    const sepIdx = spaceIdx === -1 ? tabIdx : tabIdx === -1 ? spaceIdx : Math.min(spaceIdx, tabIdx);
+    const directive = sepIdx === -1 ? trimmed.replace(/;$/, '') : trimmed.substring(0, sepIdx);
+
+    // Check if it maps to a Lorica parameter (blue)
+    for (const [dir, loricaParam] of Object.entries(LORICA_ANNOTATION)) {
+      if (directive === dir) {
+        return { text: loricaParam, type: 'mapped' };
       }
     }
-    return '';
+    // Check if Lorica handles it internally (gray)
+    const handled = LORICA_HANDLED_DIRECTIVES[directive];
+    if (handled) {
+      return { text: handled, type: 'handled' };
+    }
+    return { text: '', type: 'none' };
   }
 
   function goToPreview() {
@@ -678,11 +697,11 @@
                 <h4>Resolved configuration</h4>
                 <div class="resolved-config">
                   {#each resolvedConfigLines as line, i}
-                    <div class="resolved-line" class:resolved-replaced={line.kind === 'replaced'} class:resolved-directive={line.kind === 'directive'}>
+                    <div class="resolved-line" class:resolved-replaced={line.kind === 'replaced'}>
                       <span class="resolved-lineno">{i + 1}</span>
                       <span class="resolved-text">{line.text}</span>
                       {#if line.annotation}
-                        <span class="resolved-annotation">{line.annotation}</span>
+                        <span class="resolved-annotation" class:annotation-mapped={line.annotationType === 'mapped'} class:annotation-handled={line.annotationType === 'handled'}>{line.annotation}</span>
                       {/if}
                     </div>
                   {/each}
@@ -1330,11 +1349,21 @@
   .resolved-annotation {
     margin-left: auto;
     padding-left: var(--space-4);
-    color: var(--color-primary);
     font-weight: 600;
     font-size: var(--text-xs);
     white-space: nowrap;
     opacity: 0.9;
+    color: var(--color-text-muted);
+  }
+
+  .annotation-mapped {
+    color: var(--color-primary);
+  }
+
+  .annotation-handled {
+    color: var(--color-text-muted);
+    font-weight: 400;
+    font-style: italic;
   }
 
   .resolved-replaced .resolved-text {
@@ -1342,9 +1371,6 @@
     font-style: italic;
   }
 
-  .resolved-directive .resolved-text {
-    color: var(--color-text);
-  }
 
   /* Preview tabs */
   .preview-tabs {
