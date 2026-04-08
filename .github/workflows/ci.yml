@@ -58,12 +58,12 @@ jobs:
           npm run build
 
       - name: Run Rust unit tests (product crates)
-        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench
+        run: cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command
         env:
           SKIP_FRONTEND_BUILD: ""
 
       - name: Run Rust unit tests (forked crates)
-        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-command -p lorica-worker -p lorica-lb || true
+        run: cargo test -p lorica-core -p lorica-proxy -p lorica-http -p lorica-error -p lorica-tls -p lorica-worker -p lorica-lb || true
         env:
           SKIP_FRONTEND_BUILD: "1"
 
@@ -170,6 +170,13 @@ jobs:
           path: dist/*.rpm
           retention-days: 30
 
+      - name: Upload GPG signatures
+        uses: actions/upload-artifact@v4
+        with:
+          name: lorica-signatures
+          path: dist/*.asc
+          retention-days: 30
+
   test-deb-install:
     name: Test .deb install
     needs: build-and-package
@@ -226,6 +233,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: lorica-rpm
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: lorica-signatures
           path: dist/
 
       - name: Generate SBOM
