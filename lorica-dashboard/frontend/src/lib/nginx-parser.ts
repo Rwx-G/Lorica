@@ -106,6 +106,10 @@ export interface LoricaRouteImport {
   cache_ttl_s: number;
   path_rules: PathRuleImport[];
   return_status: number | null;
+  /** Detected ssl_certificate path from Nginx config. */
+  _sslCertPath?: string;
+  /** Detected ssl_certificate_key path from Nginx config. */
+  _sslKeyPath?: string;
   /** Tracks which fields were explicitly imported (vs defaults). */
   importedFields: Set<string>;
 }
@@ -421,13 +425,15 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
     });
   },
 
-  ssl_certificate: (_v, r) => {
+  ssl_certificate: (v, r) => {
     r.certificate_needed = true;
+    r._sslCertPath = v.trim();
     r.importedFields.add('certificate_needed');
   },
 
-  ssl_certificate_key: (_v, r) => {
+  ssl_certificate_key: (v, r) => {
     r.certificate_needed = true;
+    r._sslKeyPath = v.trim();
     r.importedFields.add('certificate_needed');
   },
 

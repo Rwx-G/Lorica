@@ -44,6 +44,16 @@
   }
   let unresolvedIncludes: IncludeEntry[] = $state([]);
 
+  // Step 2: TLS certificate import
+  interface CertEntry {
+    hostname: string;
+    certPath: string;
+    keyPath: string;
+    certContent: string;
+    keyContent: string;
+  }
+  let certEntries: CertEntry[] = $state([]);
+
   // Step 3: active preview tab
   let previewTab = $state(0);
 
@@ -150,6 +160,7 @@
     existingBackends = [];
     backendChecks = [];
     unresolvedIncludes = [];
+    certEntries = [];
     previewTab = 0;
     applyResults = [];
     applying = false;
@@ -189,6 +200,22 @@
         path: d.message.replace('Unresolved include: ', '').replace('. Paste file contents to resolve.', ''),
         content: '',
       }));
+
+    // Extract TLS certificate paths (deduplicate by hostname)
+    const seenCertHosts = new Set<string>();
+    certEntries = [];
+    for (const route of importRoutes) {
+      if (route._sslCertPath && route._sslKeyPath && !seenCertHosts.has(route.hostname)) {
+        seenCertHosts.add(route.hostname);
+        certEntries.push({
+          hostname: route.hostname,
+          certPath: route._sslCertPath,
+          keyPath: route._sslKeyPath,
+          certContent: '',
+          keyContent: '',
+        });
+      }
+    }
 
     // Fetch existing backends for coherence check
     const res = await api.listBackends();
@@ -601,9 +628,40 @@
     // create custom presets for unmatched configurations
     await resolveSecurityPresets();
 
+    // Create TLS certificates and build hostname -> cert_id map
+    const certIdMap = new Map<string, string>();
+    for (const cert of certEntries) {
+      if (!cert.certContent.trim() || !cert.keyContent.trim()) continue;
+      const res = await api.createCertificate({
+        domain: cert.hostname,
+        cert_pem: cert.certContent.trim(),
+        key_pem: cert.keyContent.trim(),
+      });
+      if (res.error) {
+        applyResults = [...applyResults, {
+          type: 'backend' as const,
+          label: `Certificate ${cert.hostname}`,
+          success: false,
+          error: res.error.message,
+        }];
+      } else if (res.data) {
+        certIdMap.set(cert.hostname, res.data.id);
+        applyResults = [...applyResults, {
+          type: 'backend' as const,
+          label: `Certificate ${cert.hostname}`,
+          success: true,
+        }];
+      }
+    }
+
     // Create routes
     for (const route of importRoutes) {
       const req = buildCreateRequest(route, backendIdMap);
+      // Assign certificate if one was imported for this hostname
+      const certId = certIdMap.get(route.hostname);
+      if (certId) {
+        req.certificate_id = certId;
+      }
       const label = `${route.hostname}${route.path_prefix}`;
       const res = await api.createRoute(req);
       if (res.error) {
@@ -706,6 +764,9 @@
                       <span class="badge badge-error">include</span>
                       <code>{inc.path}</code> (line {inc.line})
                     </label>
+                    <div class="include-cmd">
+                      <code>{inc.path.includes('letsencrypt') || inc.path.includes('/etc/ssl') ? 'sudo ' : ''}cat {inc.path}</code>
+                    </div>
                     <textarea
                       class="include-textarea"
                       bind:value={unresolvedIncludes[i].content}
@@ -716,6 +777,46 @@
                   </div>
                 {/each}
                 <button class="btn btn-secondary" onclick={reparseWithIncludes}>Re-parse</button>
+              </div>
+            {/if}
+
+            <!-- TLS certificates -->
+            {#if certEntries.length > 0}
+              <div class="section">
+                <h4>TLS certificates (optional)</h4>
+                <p class="step-hint">Paste certificate and private key to import them with the route. Leave empty to configure later via the Certificates page or ACME.</p>
+                {#each certEntries as cert, i}
+                  <div class="cert-import-entry">
+                    <label class="include-label">
+                      <span class="badge badge-tls">TLS</span>
+                      <code>{cert.hostname}</code>
+                    </label>
+                    <div class="cert-import-row">
+                      <div class="cert-import-col">
+                        <span class="cert-import-label">Certificate (fullchain.pem)</span>
+                        <div class="include-cmd"><code>sudo cat {cert.certPath}</code></div>
+                        <textarea
+                          class="include-textarea"
+                          bind:value={certEntries[i].certContent}
+                          placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+                          rows="4"
+                          spellcheck="false"
+                        ></textarea>
+                      </div>
+                      <div class="cert-import-col">
+                        <span class="cert-import-label">Private key (privkey.pem)</span>
+                        <div class="include-cmd"><code>sudo cat {cert.keyPath}</code></div>
+                        <textarea
+                          class="include-textarea"
+                          bind:value={certEntries[i].keyContent}
+                          placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"
+                          rows="4"
+                          spellcheck="false"
+                        ></textarea>
+                      </div>
+                    </div>
+                  </div>
+                {/each}
               </div>
             {/if}
 
@@ -1350,6 +1451,45 @@
     outline: none;
     border-color: var(--color-primary);
     box-shadow: 0 0 0 3px var(--color-primary-subtle);
+  }
+
+  .include-cmd {
+    font-size: var(--text-xs);
+    color: var(--color-text-muted);
+    margin-bottom: var(--space-1);
+  }
+
+  .include-cmd code {
+    background: var(--color-bg-input);
+    padding: 0.125rem 0.5rem;
+    border-radius: var(--radius-sm);
+    font-family: var(--mono);
+    user-select: all;
+  }
+
+  .cert-import-entry {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding-bottom: var(--space-3);
+  }
+
+  .cert-import-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-3);
+  }
+
+  .cert-import-col {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .cert-import-label {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    color: var(--color-text-muted);
   }
 
   /* Resolved config */
