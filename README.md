@@ -108,8 +108,8 @@ lorica [OPTIONS]
 Options:
   --data-dir <PATH>          Data directory (default: /var/lib/lorica)
   --management-port <PORT>   Dashboard/API port (default: 9443)
-  --http-port <PORT>         HTTP proxy port (default: 80)
-  --https-port <PORT>        HTTPS proxy port (default: 443)
+  --http-port <PORT>         HTTP proxy port (default: 8080)
+  --https-port <PORT>        HTTPS proxy port (default: 8443)
   --workers <N>              Worker processes (default: 0 = single-process)
   --log-level <LEVEL>        Log level (default: info)
   --version                  Print version
