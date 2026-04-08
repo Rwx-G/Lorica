@@ -1409,6 +1409,15 @@ export function convertToLoricaRoutes(result: NginxParseResult): LoricaRouteImpo
   const diagnostics = result.diagnostics;
 
   for (const server of result.servers) {
+    // Skip server blocks listening on non-standard ports (Lorica serves 80/443 only)
+    const hasNonStandardPort = server.listen.some((l) => {
+      const portMatch = l.match(/(\d+)/);
+      if (!portMatch) return false;
+      const port = parseInt(portMatch[1], 10);
+      return port !== 80 && port !== 443;
+    });
+    if (hasNonStandardPort) continue;
+
     const route = createDefaultRoute();
 
     // Apply server-level SSL flag
