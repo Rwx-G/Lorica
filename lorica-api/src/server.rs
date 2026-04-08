@@ -221,6 +221,10 @@ pub fn build_router(
             post(crate::acme::provision_dns_manual),
         )
         .route(
+            "/api/v1/acme/provision-dns-manual/check",
+            post(crate::acme::check_dns_manual),
+        )
+        .route(
             "/api/v1/acme/provision-dns-manual/confirm",
             post(crate::acme::provision_dns_manual_confirm),
         )

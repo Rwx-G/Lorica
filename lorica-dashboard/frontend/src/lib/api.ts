@@ -638,6 +638,9 @@ export const api = {
   provisionAcmeDnsManual: (body: AcmeDnsManualRequest) =>
     request<AcmeDnsManualResponse>('POST', '/acme/provision-dns-manual', body),
 
+  checkAcmeDnsManual: (body: AcmeDnsManualConfirmRequest) =>
+    request<AcmeDnsCheckResponse>('POST', '/acme/provision-dns-manual/check', body),
+
   confirmAcmeDnsManual: (body: AcmeDnsManualConfirmRequest) =>
     request<AcmeProvisionResponse>('POST', '/acme/provision-dns-manual/confirm', body),
 
@@ -843,6 +846,12 @@ export interface AcmeDnsManualRequest {
 
 export interface AcmeDnsManualConfirmRequest {
   domain: string;
+  dns_server?: string;
+}
+
+export interface AcmeDnsCheckResponse {
+  all_found: boolean;
+  records: { domain: string; record_name: string; expected_value: string; found: boolean }[];
 }
 
 export interface DnsManualTxtRecord {

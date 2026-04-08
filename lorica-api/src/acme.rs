@@ -137,6 +137,7 @@ impl AcmeChallengeStore {
 pub type PendingDnsChallenges = Arc<DashMap<String, PendingDnsChallenge>>;
 
 /// State for a pending manual DNS-01 challenge between the two-step flow.
+#[derive(Clone)]
 pub struct PendingDnsChallenge {
     /// The order URL so we can restore the order from the ACME account.
     pub order_url: String,
@@ -1318,11 +1319,13 @@ struct AcmeDnsManualResponse {
     message: String,
 }
 
-/// Request body for step 2: confirm that the TXT record has been created.
+/// Request body for step 2 (check/confirm): verify or confirm TXT record.
 #[derive(Debug, Deserialize)]
 pub struct AcmeDnsManualConfirmRequest {
-    /// The domain whose pending challenge should be confirmed.
+    /// The primary domain whose pending challenge should be checked/confirmed.
     pub domain: String,
+    /// Optional DNS server to query (e.g. ns1.provider.com) instead of system DNS.
+    pub dns_server: Option<String>,
 }
 
 /// POST /api/v1/acme/provision-dns-manual - Step 1 of manual DNS-01 flow.
@@ -1483,6 +1486,69 @@ pub async fn provision_dns_manual(
     }))
 }
 
+/// POST /api/v1/acme/provision-dns-manual/check - Check TXT record propagation.
+///
+/// Verifies that the TXT records are resolvable before confirming.
+/// Returns which records are found and which are still missing.
+pub async fn check_dns_manual(
+    Extension(state): Extension<AppState>,
+    Json(body): Json<AcmeDnsManualConfirmRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let pending = state
+        .pending_dns_challenges
+        .get(&body.domain)
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "no pending DNS challenge for domain '{}'",
+                body.domain
+            ))
+        })?;
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut all_found = true;
+
+    let dns_server = body.dns_server.as_deref();
+    for (record_name, expected_value, domain) in &pending.txt_records {
+        let found = check_txt_record(record_name, expected_value, dns_server).await;
+        results.push(serde_json::json!({
+            "domain": domain,
+            "record_name": record_name,
+            "expected_value": expected_value,
+            "found": found,
+        }));
+        if !found {
+            all_found = false;
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "data": {
+            "all_found": all_found,
+            "records": results,
+        }
+    })))
+}
+
+/// Check if a TXT record contains the expected value.
+/// If dns_server is provided, queries that specific server (e.g. the authoritative NS).
+async fn check_txt_record(record_name: &str, expected_value: &str, dns_server: Option<&str>) -> bool {
+    let mut args = vec!["+short".to_string(), "TXT".to_string(), record_name.to_string()];
+    if let Some(server) = dns_server {
+        args.push(format!("@{server}"));
+    }
+    match tokio::process::Command::new("dig")
+        .args(&args)
+        .output()
+        .await
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains(expected_value)
+        }
+        Err(_) => false,
+    }
+}
+
 /// POST /api/v1/acme/provision-dns-manual/confirm - Step 2 of manual DNS-01 flow.
 ///
 /// The user calls this after creating the TXT record. Lorica tells Let's Encrypt
@@ -1498,16 +1564,18 @@ pub async fn provision_dns_manual_confirm(
         return Err(ApiError::BadRequest("domain is required".into()));
     }
 
-    // Look up and remove the pending challenge (keyed by primary domain)
-    let (_, pending) = state
+    // Look up the pending challenge (keyed by primary domain) - keep it for retry
+    let pending_ref = state
         .pending_dns_challenges
-        .remove(&body.domain)
+        .get(&body.domain)
         .ok_or_else(|| {
             ApiError::NotFound(format!(
                 "no pending DNS challenge for domain '{}'",
                 body.domain
             ))
         })?;
+    let pending = pending_ref.clone();
+    drop(pending_ref);
 
     // Check expiry
     if pending.created_at.elapsed() > PENDING_DNS_MAX_AGE {
@@ -1664,6 +1732,9 @@ pub async fn provision_dns_manual_confirm(
         .map_err(|e| ApiError::Internal(format!("failed to store certificate: {e}")))?;
     drop(store);
     state.notify_config_changed();
+
+    // Only remove the pending challenge after successful provisioning
+    state.pending_dns_challenges.remove(&body.domain);
 
     info!(
         domains = ?domains,
