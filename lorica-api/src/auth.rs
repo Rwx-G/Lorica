@@ -1,4 +1,6 @@
-use axum::extract::Extension;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Extension};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -46,12 +48,14 @@ pub struct PasswordChangedResponse {
 
 /// POST /api/v1/auth/login
 pub async fn login(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
     Extension(rate_limiter): Extension<RateLimiter>,
     Json(body): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if !rate_limiter.check("login").await {
+    let rate_key = format!("login:{}", addr.ip());
+    if !rate_limiter.check(&rate_key).await {
         return Err(ApiError::RateLimited);
     }
 

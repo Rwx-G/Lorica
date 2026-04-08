@@ -377,7 +377,8 @@ pub async fn start_server(
     session_store: SessionStore,
     rate_limiter: RateLimiter,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = build_router(state, session_store, rate_limiter);
+    let app = build_router(state, session_store, rate_limiter)
+        .into_make_service_with_connect_info::<SocketAddr>();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
     info!(port = port, "API server listening on localhost only");
