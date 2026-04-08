@@ -19,7 +19,7 @@
 //! with a three-state protocol (Ok, Error, Processing).
 
 #![warn(clippy::all)]
-#![deny(unsafe_code)]
+// Note: unsafe code needed for from_raw_fd (Unix socket FD passing between processes)
 
 pub mod channel;
 pub mod messages;
