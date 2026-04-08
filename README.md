@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-0.1.3-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.0.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Lorica%20Tests-502-brightgreen.svg" alt="Lorica Tests">
@@ -24,10 +24,12 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :shield: Proxy & Routing
 
 - HTTP/HTTPS reverse proxy with host-based and path-prefix routing
+- **Path rules** - ordered sub-path overrides within a route for backends, cache, headers, rate limits, or direct HTTP status responses
 - TLS termination via rustls (no OpenSSL dependency)
 - SNI-based certificate selection with wildcard domain support (`*.example.com`)
 - Path rewriting (strip/add prefix, regex with capture groups), hostname aliases, HTTP-to-HTTPS redirect
-- Configurable proxy headers, per-route timeouts, WebSocket passthrough
+- Catch-all hostname (`_`) as last-resort fallback, `redirect_to` for domain redirects, `return_status` for direct responses
+- Configurable proxy headers, per-route timeouts, WebSocket passthrough, X-Forwarded-Proto via TLS session detection
 - Connection pooling with health-aware backend filtering
 
 ### :lock: Security
@@ -36,6 +38,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **IP blocklist** - auto-fetched from Data-Shield IPv4 Blocklist (~80,000 entries, O(1) lookup, updated every 6h)
 - **Rate limiting** - per-route, per-client-IP with configurable RPS and burst tolerance
 - **Auto-ban** - IPs that repeatedly exceed rate limits are banned automatically (configurable threshold and duration)
+- **Trusted proxies** - CIDR list for X-Forwarded-For validation, prevents IP spoofing via header injection
 - **DDoS protection** - per-route max connections, global flood rate tracking
 - **Slowloris detection** - rejects slow-header attacks with configurable threshold
 - **Security headers** - presets (strict/moderate/none) with HSTS, CSP, X-Frame-Options, X-Content-Type-Options
@@ -55,9 +58,10 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Web dashboard** - Svelte 5 UI (~59 KB) embedded in the binary: routes, backends, certs, WAF, SLA, load tests, settings
 - **REST API** - full CRUD for all entities, session-based auth, rate-limited login
 - **TOML config export/import** - with diff preview before applying changes
-- **Nginx config import** - paste an `nginx.conf` to auto-create routes, backends, and certificates
-- **ACME / Let's Encrypt** - automatic TLS provisioning via HTTP-01 challenge
-- **Notification channels** - stdout, SMTP email, HTTP webhook with per-channel rate limiting
+- **Nginx config import** - paste an `nginx.conf` to auto-create routes, backends, certificates, and path rules with cert import support
+- **ACME / Let's Encrypt** - automatic TLS provisioning via HTTP-01 and DNS-01 challenges (Cloudflare, Route53, OVH providers), multi-domain SAN and wildcard support, smart auto-renewal
+- **DNS providers** - global DNS credentials configured once in Settings and referenced by ID for certificate provisioning (Cloudflare, Route53, OVH)
+- **Notification channels** - stdout, SMTP email, HTTP webhook, Slack with per-channel rate limiting
 - **Ban list management** - view and unban auto-banned IPs from the dashboard
 
 ### :zap: Performance
@@ -452,7 +456,7 @@ gpg --verify lorica.deb.asc lorica.deb
 
 | Feature | Status | Rationale |
 |---------|--------|-----------|
-| **HTTP/3 / QUIC** | Planned (post-0.2.0) | Waiting for [Pingora PR #524](https://github.com/cloudflare/pingora/pull/524) (tokio-quiche integration) to merge upstream |
+| **HTTP/3 / QUIC** | Planned | Waiting for [Pingora PR #524](https://github.com/cloudflare/pingora/pull/524) (tokio-quiche integration) to merge upstream |
 | **io_uring** | Not planned | tokio-uring is unmaintained since 2022. epoll via Tokio delivers sufficient performance (40M req/s at Cloudflare scale) |
 | **Windows / macOS** | Not supported | Linux x86_64 only (fork+exec worker model requires Linux) |
 | **OpenSSL / BoringSSL** | Removed | rustls is the sole TLS provider |

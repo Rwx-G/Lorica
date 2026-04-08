@@ -7,254 +7,150 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Author: Rwx-G
 
-## [Unreleased]
+## [1.0.0] - 2026-04-08
 
 ### Added
 
-- Global DNS providers: DNS credentials are now configured once in Settings and referenced by ID when provisioning certificates. CRUD API at `/api/v1/dns-providers` with encrypted credential storage. Dashboard Settings page includes a DNS Providers section for managing providers. Certificate provisioning via DNS-01 accepts a `dns_provider_id` instead of inline credentials. Backward compatible: existing certificates with per-certificate `acme_dns_config` continue to work for renewal
-- OVH DNS provider for ACME DNS-01 automated certificate provisioning. Supports OVH API signature authentication (application_key, application_secret, consumer_key) with automatic zone extraction from domain names. Available endpoints: EU, CA, US
-- ACME method and DNS credentials storage on certificates (acme_method, acme_dns_config columns). DNS provider credentials are encrypted at rest using the same encryption as notification configs
-- Smart ACME renewal: certificates now remember their provisioning method and DNS credentials, enabling automatic renewal for DNS-01 certificates (Cloudflare, Route53, OVH). Manual DNS-01 certificates are skipped during auto-renewal
+**Proxy Engine**
 
-- DNS-01 ACME multi-domain and wildcard certificate support. Both automatic and manual DNS-01 flows now accept comma-separated domains (e.g. "example.com, *.example.com"). Manual flow returns all TXT records to create. Wildcard domains use the base domain for the _acme-challenge TXT record name
-- Path rules: ordered sub-path overrides within a single route. Each rule can override backends, cache settings, response headers, rate limits, or return a direct HTTP status. First match wins, supports prefix and exact match types. Dashboard includes a Path Rules tab with reorder, collapsible override sections
-- Route `return_status` field: respond with a specific HTTP status code (e.g. 403, 404) without proxying. Combines with `redirect_to` for custom redirect status codes
-- Catch-all hostname `_`: routes with hostname `_` act as a last-resort fallback when no exact or wildcard match is found
-- Route `redirect_to` field: when set, the route responds with a 301 redirect to the specified URL instead of proxying to backends. The original request path and query string are appended automatically. Enables www-to-non-www redirects, domain migrations, etc.
-- Background certificate expiry check task that monitors ALL certificates (ACME and manual) every 12 hours and dispatches `CertExpiring` notifications when certificates are within the `cert_warning_days` or `cert_critical_days` thresholds from global settings. Critical-level alerts use a "CRITICAL:" prefix in the message
-- Encryption key rotation via `lorica rotate-key --new-key-file <path>` CLI command. Re-encrypts all certificate private keys and notification configs in a single transaction when rotating the encryption key
-- Global WAF auto-ban counter managed by the supervisor instead of per-worker counters. In multi-worker mode the supervisor aggregates WAF block events from all workers via waf.sock and broadcasts BanIp commands when the threshold is reached, fixing the issue where N workers required N*threshold requests to trigger a ban. Single-process mode retains a local fallback counter
-- Notification form: structured fields per channel type (SMTP, Webhook, Slack) replacing raw JSON textarea
-- Notification form: alert type checkboxes with human-readable labels and select all/none
-- Slack notification channel support in dashboard and API
-- Real test notification delivery via Test button (sends actual email/webhook/slack)
-- Toast notifications for test notification success/failure in dashboard
-- Overview: section helper "?" buttons visible independently of getting started guide
-- Worker metrics aggregation: cache hits/misses, active connections, ban list, and EWMA scores are now aggregated from workers to supervisor via command channel and displayed in the dashboard and Prometheus `/metrics` endpoint in multi-worker mode
-- CRL (Certificate Revocation List) support for upstream TLS connections via `--upstream-crl-file` CLI flag. When set, server certificates are checked against the CRL (PEM or DER format). Propagated to worker processes in multi-worker mode. CRL file changes are detected automatically every 60 seconds and hot-reloaded without restart
+- HTTP/HTTPS reverse proxy built on Cloudflare Pingora with host-based and path-prefix routing, TLS termination via rustls, structured JSON access logging, and configuration hot-reload via arc-swap
+- Path rules: ordered sub-path overrides within a route for backends, cache, headers, rate limits, or direct HTTP status responses. First match wins with prefix and exact match types
+- Route `redirect_to` field for 301 redirects (www-to-non-www, domain migrations) with automatic path and query string preservation
+- Route `return_status` field for direct HTTP status responses (e.g. 403, 404) without proxying
+- Catch-all hostname `_` as last-resort fallback when no exact or wildcard match is found
+- Path rewriting with strip/add prefix and regex capture groups (linear time, ReDoS-safe)
+- Per-backend `h2_upstream` toggle for HTTP/2 upstream (h2c plaintext, ALPN h2 for TLS) enabling gRPC proxying
+- Round-robin, Peak EWMA, Consistent Hash, and Random load balancing strategies per route
+- Configurable proxy headers, response headers, per-route timeouts, WebSocket passthrough, hostname aliases, force HTTPS redirect, per-route gzip compression and retry attempts
+- X-Forwarded-Proto detection via TLS session digest
+- SO_REUSEPORT on all proxy listeners for kernel-level connection distribution
+- Connection pooling with health-aware backend filtering
+- Cookie merge support for upstream responses
 
-### Security
+**Security**
 
-- Trusted proxies CIDR list for X-Forwarded-For validation. The proxy now only extracts client IP from XFF when the direct TCP client IP matches a configured trusted proxy range. Empty list (default) trusts no XFF, preventing IP spoofing via header injection. Configurable in dashboard Settings and via API
-- Load test target URL restricted to localhost (127.0.0.1, localhost, ::1) to prevent the engine from being used to attack external hosts. The dashboard now uses a route selector with path suffix instead of a free-text URL field
+- WAF engine with 28 OWASP CRS-inspired rules: SQLi, XSS, path traversal, command injection, SSRF (cloud metadata, localhost, internal networks, dangerous URI schemes), Log4Shell/JNDI, XXE, CRLF injection. Detection or blocking mode. Sub-0.5ms evaluation latency
+- Custom WAF rules persisted in SQLite, configurable per-rule enable/disable at runtime
+- IP blocklist auto-fetched from Data-Shield IPv4 Blocklist (~80,000 entries, O(1) lookup, refreshed every 6h)
+- Per-route rate limiting with configurable RPS, burst tolerance, and proper `X-RateLimit-*` response headers
+- Auto-ban for IPs exceeding rate limits (configurable threshold and duration), with global supervisor-aggregated counters in multi-worker mode
+- Trusted proxies CIDR list for X-Forwarded-For validation, preventing IP spoofing via header injection
+- Per-route max connections (503 rejection), global connection limit, adaptive flood defense (auto-halves rate limits under flood)
+- Slowloris detection with configurable threshold (408 rejection)
+- Security header presets (strict/moderate/none) with custom preset support, IP allowlist/denylist, CORS per route
+- Encrypted notification configs and certificate private keys at rest (AES-256-GCM)
+- Database file permissions restricted to 0600, encryption key file created atomically with 0600 permissions
+- Redacted password hashes in config export; import rejects redacted hashes
+- Explicit Argon2id parameters for password hashing
+- Empty SNI validates full certificate chain (CA, expiration, revocation)
+- Load test target URL restricted to localhost to prevent external attacks
+- HTTP request smuggling protections tested (CL.TE desync, TE obfuscation, duplicate CL)
+- CRL (Certificate Revocation List) support for upstream TLS via `--upstream-crl-file` with automatic hot-reload every 60s
 
-### Changed
+**TLS & Certificates**
 
-- Post-install message now lists all CLI flags and notes dashboard is localhost-only
-- Upgrade reqwest 0.11 to 0.12 across all crates, eliminating duplicate rustls-pemfile dependency tree
-
-### Fixed
-
-- Overview: fix spacing between section headers and cards when helper is collapsed
-- Overview: smooth single-motion expand/collapse animation for section helpers
-- Settings: fix theme toggle requiring two clicks (race condition with preferences reload)
-
-### Security
-
-- Encrypt notification config at rest using AES-256-GCM (same key as certificate private keys)
-- Mask SMTP password in API responses (returned as `********`)
-- Preserve existing SMTP password on update when masked value is submitted
-- Fix encryption key file created with restrictive permissions (0600) atomically at creation, eliminating race condition window (`lorica-config/src/crypto.rs`)
-- Fix potential panic on invalid private key format during mTLS client cert setup, replaced `.unwrap()` with proper error propagation (`lorica-core/src/connectors/tls/rustls/mod.rs`)
-- Redact password hashes from config export; import now rejects redacted hashes with a clear error message
-- Add HTTP request smuggling test suite (CL.TE desync, TE obfuscation, duplicate CL, HTTP/1.0+TE rejection)
-- Use explicit Argon2id parameters (19 MiB, 2 iterations) instead of library defaults for password hashing
-- Empty SNI now validates certificate chain (CA, expiration, revocation) instead of skipping all TLS verification. Only hostname check is skipped when no SNI is available
-- Add non-root `USER` to e2e test Dockerfiles (backend, backend-h2, test-runner)
-- Pin 11 overly broad `"0"` dependency version specs to minor version across 7 Cargo.toml files
-
-## [0.1.3] - 2026-04-03
-
-### Added
-
-- Real-time access log forwarding in worker mode via Unix domain socket (`/var/lib/lorica/log.sock`). Workers stream logs to the supervisor with sub-millisecond latency, making WebSocket live logs work in multi-worker mode
-- WAF engine in supervisor process for worker mode: rules listing, blocklist toggle, custom rules, and event viewing now work in the dashboard when running with `--workers N`
-- IP blocklist auto-refresh (every 6h) in supervisor mode, with immediate fetch at startup when enabled
-- WAF: 10 new detection rules - SSRF (cloud metadata, localhost, dangerous URI schemes, internal networks), Log4Shell/JNDI injection, XXE (DOCTYPE/ENTITY), CRLF injection. Total: 28 rules across 8 categories
-- Dashboard Overview: getting started guide with 10-step interactive setup checklist and per-section "?" helper toggles with contextual explanations. Animated expand/collapse. Dismissible with localStorage persistence and re-enable toggle in Settings
-- Dashboard: graceful error handling when backend is unreachable (network error, JSON parse failure). Auto-redirect to login on 401 session expiry
-- Self-proxy dashboard guide (`docs/self-proxy-dashboard.md`) with API setup script for exposing the dashboard through Lorica itself
-- Certificate upload now parses X.509 metadata (issuer, validity dates, SAN domains, DER fingerprint) instead of hardcoded placeholders
-- Manual certificate renewal button on ACME certificates in the dashboard
-- ACME auto-renewal background task (checks every 12h, renews at 30 days before expiry)
-- ACME HTTP-01 challenges served on proxy port 80 (previously only on management port, which Let's Encrypt cannot reach)
-- TLS termination in worker mode: workers create their own CertResolver, load certs from DB, and reload on config changes. HTTPS now works with `--workers N`
-- Notification system fully wired: NotifyDispatcher created from DB configs at startup, broadcast-based AlertSender for proxy hot path. Alert dispatch sites for `waf_alert`, `ip_banned`, `backend_down`, `cert_expiring`, `sla_breached`
-- Notification history endpoint (`GET /api/v1/notifications/history`) and dashboard table in Settings
-- Load testing available in supervisor/worker mode (was single-process only)
-
-### Changed
-
-- Dashboard: all pages now use consistent full-width layout (removed hardcoded max-width on Overview, Logs, System, Settings)
-- Dashboard: replaced all hardcoded `rgba()` colors with CSS design-token variables for proper dark/light mode support
-- Dashboard: removed redundant scoped CSS overrides in favor of global styles in app.css, added `.btn-secondary` and `.btn-danger` to the design system
-- Dashboard Overview: redesigned with header highlight bands, centered card values, stronger section hierarchy, and contextual color logic (orange for unconfigured, green for healthy)
-- systemd service file: add `LimitNOFILE=65536` for 10k+ concurrent connections out of the box
-- HTTPS listener starts unconditionally (even with no certs). TLS handshakes fail for unknown domains; when the first cert is uploaded and the resolver reloaded, TLS starts working without restart
-
-### Security
-
-- AES-256-GCM encryption enabled for certificate private keys at rest (encryption key auto-generated at `encryption.key`, chmod 0600)
-- Database file permissions restricted to 0600 (owner-only read/write)
-
-### Fixed
-
-- Worker mode: supervisor closes listening sockets after spawning workers. Fixes requests hanging indefinitely (kernel was routing connections to supervisor which had no proxy service)
-- Worker mode: use `TcpListener::from_raw_fd` instead of `TcpStream::from_raw_fd` for inherited listening sockets (correct socket type)
-- Worker mode: respawn recreates listening sockets (previously used closed FDs)
-- Worker mode: SLA flush task re-enabled in background runtime. Workers now flush SLA metrics to shared SQLite DB every 60s
-- Worker mode: graceful shutdown with 30s drain timeout then SIGKILL (Sozu soft-stop pattern, fixes `systemctl stop lorica` hanging)
-- Worker mode: worker PIDs now correctly reported in System dashboard (was hardcoded to 0)
-- TLS CertResolver now hot-reloads on certificate upload/update/delete (was only loaded at startup)
-- Certificate CRUD triggers proxy config reload (was missing `notify_config_changed`)
-- Route certificate removal: setting certificate_id to empty string now clears the TLS association
-- Certificate delete shows error toast when cert is referenced by routes (was silent failure)
-- Dashboard: all modal/drawer buttons now functional. Root cause: Svelte 5 event delegation incompatible with stopPropagation on container divs, plus RouteDrawer `$effect` tracking `form` as dependency caused state reset on every interaction (fixed via `untrack` + `$derived`)
-- Dashboard: HTTP/2 upstream checkbox text no longer wraps to two lines in backend form
-- Dashboard: ACME certificate form spacing before "Use staging environment" checkbox in DNS-01 mode
-- IP Blocklist toggle: fixed dimensions to match WAF rules toggles
-- NFR validation script: threaded backend with `/slow` endpoint for realistic 10k connection holding test
-
-## [0.1.2] - 2026-04-02
-
-### Fixed
-
-- Worker mode: SLA collector no longer panics on startup (tokio::spawn called outside runtime context)
-- NFR validation script: password input masked, special characters escaped via jq, HTTP instead of HTTPS for localhost API
-- NFR validation script: prerequisite checks (ulimit >= 20000, required tools) with clear error messages before running
-- NFR validation script: Python backend suppresses BrokenPipeError under load, SO_REUSEADDR for port reuse
-- Dashboard sidebar now stays fixed during page scroll (position: sticky)
-- NFR validation script: force `LC_ALL=C` for consistent decimal separator on French locale systems
-- Packaging (.deb/.rpm): service auto-restarts on upgrade (no manual `systemctl start` needed)
-- Packaging (.deb): removed conffiles prompt on upgrade - service file replaced cleanly, customize via `systemctl edit lorica` (drop-in overrides)
-- IP blocklist enabled/disabled state now persisted in GlobalSettings and restored on restart
-- WAF disabled rules persisted in GlobalSettings (JSON array) and restored on restart
-- WAF custom rules persisted in dedicated `waf_custom_rules` table (migration v13) and restored on restart
-
-## [0.1.1] - 2026-04-02
-
-### Added
-
-- Per-backend `h2_upstream` toggle to force HTTP/2 upstream connections (h2c for plaintext, ALPN h2 for TLS). Enables gRPC proxying via HTTP/2 end-to-end
-- SO_REUSEPORT enabled on all proxy listeners (both worker mode and single-process mode) for improved kernel-level connection distribution
-- Performance tuning guide (`docs/tuning.md`) covering kernel sysctl, file descriptor limits, worker sizing, cache and rate limit tuning, and production readiness checklist
-- Reproducible benchmark suite (`bench/`) using oha in Docker. Supports single-process, multi-worker, WAF, and cache scenarios with JSON output for comparison
-- Regex path rewriting per route (`path_rewrite_pattern` + `path_rewrite_replacement`). Supports capture groups ($1, $2). Uses Rust regex crate (linear time, ReDoS-safe by design). Applied after strip/add prefix. Pattern validated and precompiled at config reload. Nginx import wizard parses `rewrite` directives into regex fields
-
-## [0.1.0] - 2026-04-01
-
-### Added
-
-**Proxy Engine (Epics 1-2)**
-
-- HTTP/HTTPS reverse proxy built on Cloudflare Pingora (17 crates, renamed to `lorica-*`). Host-based and path-prefix routing, TLS termination via rustls, structured JSON access logging, and configuration hot-reload via `arc-swap` on API mutations
-- Round-robin load balancing with health-aware backend filtering, plus Peak EWMA latency-based selection, Consistent Hash, and Random strategies - selectable per route
-- Process-based worker isolation (`lorica-worker`): supervisor forks N worker processes, passes listening sockets via SCM_RIGHTS. Exponential restart backoff (1s-30s), graceful SIGTERM shutdown. Configurable via `--workers N` (default 0 = single-process mode)
-- Protobuf command channel (`lorica-command`) between supervisor and workers over Unix socketpair with 8-byte LE size-prefix framing. Dispatches ConfigReload on API changes; workers apply inline without pausing traffic. Heartbeat monitoring every 5s with timeout detection
-- SNI-based certificate hot-swap (`lorica-tls`) with wildcard support (`*.example.com`). Multiple certificates per domain sorted by expiration. Atomic swap via `arc-swap` with zero downtime. Integrated through rustls `ResolvesServerCert` trait
-- Backend lifecycle management with per-backend active connection tracking (atomic counters), graceful drain on removal (Normal/Closing/Closed states), and load balancer exclusion of draining backends
-- TCP and HTTP health checks with configurable interval. Backends marked degraded (>2s latency) or down (unreachable) and excluded from rotation. HTTP probes via `health_check_path` expecting 2xx within timeout
-- WebSocket log streaming via `GET /api/v1/logs/ws` with LogBuffer broadcast and frontend auto-connect with polling fallback
-
-**Security (Epics 3, 7)**
-
-- WAF engine (`lorica-waf`) with 18 OWASP CRS-inspired rules covering SQL injection, XSS, path traversal, command injection, and protocol violations. Detection mode (log only) and blocking mode (403). Precompiled regex with URL decoding. Sub-0.5ms evaluation latency. Zero overhead when disabled
-- Configurable WAF rule sets - individual rules can be enabled/disabled at runtime via API (`GET/PUT /api/v1/waf/rules/:id`)
-- Per-route rate limiting enforcement using `lorica-limits` Rate estimator keyed by route ID + client IP. 429 responses with `Retry-After` header. Burst tolerance via `rate_limit_burst`. Rate limit response headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`)
-- Per-route max connections enforcement - 503 rejection when active connections reach limit, with per-route atomic counters that auto-decrement on request completion
-- Slowloris detection - requests with headers exceeding `slowloris_threshold_ms` (default 5000ms) rejected with 408 Request Timeout. Disabled when threshold is 0
-- Anti-DDoS auto-ban protection - per-IP violation counter (1-minute sliding window) escalates repeated 429s into temporary IP bans when exceeding `auto_ban_threshold`. Banned IPs receive 403 before route lookup or WAF. Configurable duration via `auto_ban_duration_s` (default 1h). Ban list API (`GET /api/v1/bans`, `DELETE /api/v1/bans/:ip`)
-- Global connection limit via `max_global_connections` in GlobalSettings. New requests receive 503 when total active proxy connections reach the limit. 0 = unlimited (default)
-- Adaptive flood defense - when global RPS exceeds configurable `flood_threshold_rps` (in GlobalSettings), per-IP rate limits are automatically halved. Disabled by default (threshold = 0). Per-second request counter also feeds dashboard metrics
-- IP allowlist/denylist per route
-- CORS configuration per route (origins, methods, max-age)
-- Configurable security header presets ("strict", "moderate", "none") with support for custom presets via `custom_security_presets` in GlobalSettings. Presets include HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
-
-**Monitoring (Epic 5)**
-
-- Passive SLA monitoring (`lorica-bench`) - per-route metrics from real traffic with lock-free atomic counters. Time-bucketed aggregation (1-minute resolution), rolling SLA windows (1h, 24h, 7d, 30d), configurable success criteria per route. Background flush to SQLite every 60s. CSV/JSON export. API: `GET /api/v1/sla/overview`, `/sla/routes/:id`, `/sla/routes/:id/buckets`, `PUT /sla/routes/:id/config`, export endpoint
-- Active SLA monitoring - synthetic health probes per route/backend with configurable HTTP method, path, expected status, interval (min 5s), and timeout. System-wide `max_active_probes` cap (default 50). ProbeScheduler manages per-probe tokio tasks with automatic reload on config change. API: `CRUD /api/v1/probes`, `GET /sla/routes/:id/active`
-- SLA threshold alerts (`sla_breached` alert type) - automatic notifications when passive SLA drops below configured target
-- Built-in load testing - concurrent HTTP request generation with configurable concurrency, RPS, duration, and request pattern. Safe limits via global settings (not hardcoded) with explicit confirmation for exceeding them. Auto-abort on error rate threshold (default 10%). CPU circuit breaker at 90% to protect real traffic. SSE real-time streaming, cron-based scheduling, config cloning for reproducible comparisons
-- Prometheus metrics at `/metrics` (no auth): request count + latency histogram (route_id, status_code labels), active connections, backend health gauge, certificate expiry days, WAF events by category/action, system CPU and memory
-
-**Route Configuration (Epic 6)**
-
-- 25+ per-route production proxy settings: force HTTPS redirect (301), hostname redirect, hostname aliases, configurable proxy headers (set/remove), response headers (set/remove), security header presets, per-route timeouts (connect/read/send), path rewriting (strip/add prefix), access log toggle, max request body size, WebSocket toggle, rate limiting (RPS + burst), IP allowlist/denylist, CORS, per-route gzip compression and retry attempts (both wired through Pingora fork modifications)
-
-**Caching (Epic 7)**
-
-- HTTP response caching via Pingora MemCache with LRU eviction capped at 128 MiB. Per-route toggle (`cache_enabled`), configurable TTL (`cache_ttl_s`, default 300s) and max size (`cache_max_bytes`). Respects Cache-Control headers; bypasses cache for Authorization/Cookie headers. X-Cache-Status response header (HIT/MISS/STALE/REVALIDATED/BYPASS). Cache purge API (`DELETE /api/v1/cache/routes/:id`). Cache stats API (`GET /api/v1/cache/stats`) with hit/miss counters
-
-**Notifications (Epic 3)**
-
-- Notification system (`lorica-notify`) with 5 alert types: `cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `ip_banned`. Three delivery channels: stdout (structured JSON, always on), SMTP email (STARTTLS, configurable auth), HTTP webhook (JSON POST with optional Authorization header). Channel subscription filtering and event history ring buffer (100 events)
-- Notification rate limiting - per-channel sliding window (default: 10 per 60s) to prevent alert storms
-
-**Service Discovery (Epic 3)**
-
-- Docker Swarm service discovery (`DockerDiscovery`) via Docker daemon socket API (bollard). Health derived from running vs desired task counts. Behind `docker` feature flag
-- Kubernetes pod discovery (`K8sDiscovery`) via Kubernetes API (kube-rs), reads Endpoints with ready/not-ready addresses. Behind `kubernetes` feature flag
+- ACME HTTP-01 automatic provisioning via instant-acme with challenges served on proxy port 80
+- ACME DNS-01 automatic provisioning with Cloudflare, Route53 (AWS SDK), and OVH providers
+- ACME DNS-01 manual mode (two-step flow for any DNS provider)
+- Multi-domain SAN and wildcard certificate support for DNS-01 flows
+- Global DNS providers: credentials configured once in Settings, referenced by ID during provisioning
+- Smart auto-renewal: certificates remember their provisioning method and DNS credentials, renewing automatically every 12h (30 days before expiry). Manual DNS-01 certificates skipped
+- Background certificate expiry check every 12h with CertExpiring notifications at configurable warning/critical thresholds
+- SNI-based certificate hot-swap via arc-swap with wildcard support (`*.example.com`)
+- Certificate upload parses X.509 metadata (issuer, validity, SAN domains, fingerprint)
+- Encryption key rotation via `lorica rotate-key --new-key-file` CLI command
+- TLS termination in worker mode with per-worker CertResolver loaded from DB
+- HTTPS listener starts unconditionally; TLS works as soon as the first cert is uploaded
 
 **Dashboard**
 
-- Embedded Svelte 5 + TypeScript frontend compiled into the binary via `rust-embed` (~59 KB bundle). Login and password change screens, sidebar navigation, light/dark theme toggle
-- Overview cockpit dashboard with route/backend/certificate/alert summary cards, SLA chart, request rate sparkline, top routes table, and recent events timeline
-- Routes CRUD with collapsible Advanced Configuration section for all 25+ settings, WAF status (Detect/Block/-) in routes table
-- Backends CRUD with address, weight, health check (TCP/HTTP), TLS upstream, active connections
-- Certificates management with ACME vs manual distinction
-- Security page with WAF event table (category filtering), stats cards per attack category, configurable rule toggles, ban list tab with unban controls (auto-refreshes every 10s)
-- SLA page with per-route overview cards, passive/active side-by-side comparison, latency percentile tables, SLA config editor, CSV/JSON export, bucket history
-- Active Probes page with CRUD management, route selection, enable/disable toggle
-- Load Test page with config management, clone, one-click execution with safe limit confirmation, real-time SSE progress panel, abort button, historical results with comparison deltas
-- Scrollable access logs with filtering and live WebSocket streaming (green pulsing indicator)
-- System metrics page with worker table (health status, PID, heartbeat latency)
-- Settings page with notification channel configuration, global settings
-- Security Header Presets management in Settings - view builtin presets (strict, moderate, none), create/edit/delete custom presets with name and key=value header pairs
-- Config export/import with diff preview
-- Nginx config import wizard - paste an `nginx.conf` to auto-create routes, backends, and certificates
-- Input validation on all forms, sort/filter on Backends and Routes tables
-- DNS-01 ACME form with automatic (Cloudflare, Route53 via AWS SDK) and manual (any provider) modes
+- Embedded Svelte 5 + TypeScript frontend (~59 KB gzipped) compiled into the binary via rust-embed
+- Overview cockpit with system health cards, setup checklist, section helpers with animated expand/collapse
+- Routes CRUD with 25+ settings across 7 tabs, path rules tab with reorder and collapsible overrides
+- Backends CRUD with address, weight, health check (TCP/HTTP), TLS upstream, HTTP/2 toggle, active connections
+- Certificates management with ACME (HTTP-01, DNS-01) and manual upload, manual renewal button
+- Security page with WAF event table, category filtering, 28 rule toggles, IP ban list with unban
+- SLA page with passive/active side-by-side comparison, latency percentile tables, config editor, CSV/JSON export
+- Load test page with config management, clone, one-click execution, real-time SSE progress, historical results with comparison
+- Active probes CRUD with route selection and enable/disable toggle
+- Access logs with real-time WebSocket streaming (green pulsing indicator)
+- System page with worker table (PID, health, heartbeat latency), CPU/memory/disk gauges
+- Settings page with notification channels (structured forms per type), DNS providers, security header presets, config export/import with diff preview, getting started guide toggle
+- Nginx config import wizard with path rules and certificate import support
+- Notification form with structured fields per channel (SMTP, Webhook, Slack), alert type checkboxes, real test delivery via Test button
+- Graceful error handling when backend is unreachable, auto-redirect to login on 401 session expiry
+- Light/dark theme toggle, consistent full-width layout, CSS design-token variables
 
-**ACME (Epic 4)**
+**Notifications**
 
-- Automatic TLS certificate provisioning via HTTP-01 challenge using instant-acme. Challenge tokens served at `/.well-known/acme-challenge/:token`. Supports staging and production directories. Consent-driven (admin opt-in per domain). Certs stored with `is_acme=true`
-- DNS-01 manual mode for ACME provisioning: two-step flow (`POST /api/v1/acme/provision-dns-manual` and `/confirm`) that returns TXT record info for the user to create at any DNS provider, then confirms and downloads the certificate. Pending challenges stored in memory with 10-minute expiry. Dashboard UI with copyable TXT record fields
+- Notification system with 5 alert types: cert_expiring, backend_down, waf_alert, config_changed, ip_banned
+- Four delivery channels: stdout (structured JSON), SMTP email (STARTTLS), HTTP webhook, Slack
+- Per-channel rate limiting (sliding window), channel subscription filtering, event history (100 events)
+- Notification history endpoint and dashboard table
+- Hot-reload from database configs, broadcast-based AlertSender for proxy hot path
 
-**Configuration & API**
+**Monitoring**
 
-- Embedded SQLite database (`lorica-config`) with WAL mode, CRUD for routes, backends, certificates, global settings, notification configs, user preferences, and admin users. AES-256-GCM encryption for certificate private keys at rest
-- REST API (`lorica-api`) on localhost:9443 via axum. Session-based authentication with HTTP-only secure cookies, sliding window session renewal, first-run admin password generation, forced password change, rate-limited login. Full CRUD endpoints, config TOML export/import with preview and diff, notification test endpoint. Consistent JSON error envelope. OpenAPI 3.0.3 specification (`openapi.yaml`) covering all 85 endpoints
-- CLI (`lorica`) with `--version`, `--data-dir`, `--log-level`, `--management-port`, `--http-port`, `--https-port`, `--workers`. Graceful shutdown on SIGTERM/SIGINT. systemd unit file with security hardening
+- Passive SLA monitoring from real traffic with lock-free atomic counters, time-bucketed aggregation, rolling windows (1h/24h/7d/30d), configurable success criteria
+- Active SLA monitoring with synthetic HTTP probes (configurable method, path, status, interval, timeout)
+- SLA threshold alerts with automatic notifications when passive SLA drops below target
+- Built-in load testing with configurable concurrency, RPS, duration, safe limits, CPU circuit breaker (90%), cron scheduling, SSE streaming, config cloning
+- Prometheus metrics at `/metrics`: request count, latency histograms, active connections, backend health, cert expiry, WAF events, system CPU/memory
+- Worker metrics aggregation: cache hits/misses, active connections, ban list, EWMA scores from workers to supervisor
 
-**Packaging (Epic 4)**
+**Caching**
 
-- GitHub Actions CI pipeline (lint, test, build, package). Release workflow on tags creates GitHub Release with binary, `.deb`, and `.rpm` artifacts
-- GPG package signing for `.deb` and `.rpm` artifacts in CI
-- `.deb` package with systemd service, postinst (user creation, permissions, service enable), prerm/postrm scripts
-- Security-hardened systemd unit (MemoryDenyWriteExecute, SystemCallFilter, RestrictNamespaces, UMask)
-- NOTICE file crediting Cloudflare Pingora as upstream (Apache-2.0)
-- FORK.md documenting fork origin, renaming rules, removed components, and upstream comparison strategy
+- HTTP response cache via Pingora MemCache with LRU eviction (128 MiB cap, TinyUFO algorithm)
+- Per-route toggle with configurable TTL and max size, Cache-Control header respect, Authorization/Cookie bypass
+- Path rule cache overrides for sub-path-specific caching
+- X-Cache-Status response header (HIT/MISS/STALE/REVALIDATED/BYPASS)
+- Cache purge and stats APIs
+
+**Worker Mode**
+
+- Process-based worker isolation: supervisor forks N workers, passes listening sockets via SCM_RIGHTS
+- Protobuf command channel over Unix socketpair for ConfigReload, heartbeat monitoring (5s interval)
+- Graceful shutdown with 30s drain timeout then SIGKILL
+- Real-time access log forwarding via Unix domain socket (log.sock) with sub-millisecond latency
+- WAF engine in supervisor with global auto-ban counter aggregation across workers
+- TLS termination, SLA collection, load testing, notification dispatch all functional in worker mode
+- Worker PIDs, health status, and heartbeat latency visible in System dashboard
+- Exponential restart backoff (1s-30s), supervisor closes listening sockets after spawning
+
+**Configuration**
+
+- Embedded SQLite database with WAL mode, CRUD for all entities, 13+ schema migrations
+- AES-256-GCM encryption for certificate private keys and notification configs at rest
+- TOML config export/import with preview and diff, DNS provider CRUD with encrypted credentials
+- REST API on localhost:9443 via axum with session-based auth, sliding window session renewal, rate-limited login
+- CLI with `--version`, `--data-dir`, `--log-level`, `--management-port`, `--http-port`, `--https-port`, `--workers`, `--upstream-crl-file`
+- OpenAPI 3.0.3 specification covering all 85+ endpoints
+- IP blocklist and WAF disabled rules persisted in GlobalSettings and restored on restart
+
+**Packaging**
+
+- `.deb` package with systemd service, user creation, permissions, service enable/auto-restart on upgrade
+- `.rpm` spec with equivalent packaging
+- Security-hardened systemd unit (ProtectSystem, PrivateTmp, NoNewPrivileges, MemoryDenyWriteExecute, SystemCallFilter, LimitNOFILE=65536)
+- GitHub Actions CI pipeline (lint, test, build, package) with GPG-signed release artifacts
+- NOTICE file crediting Cloudflare Pingora, FORK.md documenting fork lineage
 
 **Testing**
 
-- 655 Rust unit tests (280 product crates: 97 config, 55 bench, 52 waf, 39 api, 37 notify + 375 forked Pingora crates) and 52 frontend Vitest tests
-- Docker Compose-based E2E test suite with 170+ assertions across 35 sections covering auth, dashboard, CRUD, proxy routing, WAF, health checks, certificates, TLS upstream, failover, Prometheus, Peak EWMA, SLA, probes, load testing, route config, rate limiting, CORS, cache, bans, compression, WebSocket blocking, backend validation, and worker isolation
+- 655 Rust unit tests across 25 crates and 52 frontend Vitest tests
+- Docker Compose E2E test suite with 170+ assertions across 35 sections
 - Fuzz testing targets for WAF evaluation and API input
+- Reproducible benchmark suite using oha in Docker (single-process, multi-worker, WAF, cache scenarios)
+- Performance tuning guide with kernel sysctl, fd limits, worker sizing, cache and rate limit tuning
 
 ### Changed
 
-- DashMap for ban list and per-route connection counters in the proxy hot path, replacing `RwLock<HashMap>` for reduced contention under high concurrency
-- Route53 DNS-01 provider migrated from custom SigV4 signing to official `aws-sdk-route53` crate. DELETE now uses the exact TXT value (tracked from create). Behind `route53` feature flag (enabled by default)
-
-### Fixed
-
-- `X-RateLimit-Reset` header now returns a real Unix timestamp (current time + 1s) instead of a hardcoded "1", in both 429 responses and normal rate-limited responses
-- Settings update (`PUT /api/v1/settings`) now triggers proxy config reload so changes take effect immediately
-- Config import diff now detects changes to `flood_threshold_rps` settings
-- Database concurrency - added `PRAGMA busy_timeout=5000` and idempotent migration inserts (`INSERT OR IGNORE`) to prevent race conditions with multiple worker processes
-- Cache purge endpoint (`DELETE /api/v1/cache/routes/:id`) was a stub - now clears all cached entries and resets hit/miss counters
+- DashMap for ban list and per-route connection counters replacing RwLock<HashMap> for reduced contention
+- Route53 DNS-01 provider uses official aws-sdk-route53 crate instead of custom SigV4 signing
+- Upgrade reqwest 0.11 to 0.12 across all crates
 
 ### Removed
 
-- Windows support - removed all Windows-specific code from forked Pingora crates (787 lines), deleted WinSock bindings, removed `windows-sys` dependency. Project is Linux-only
+- Windows support removed from forked Pingora crates (Linux-only)
+
+[1.0.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.0.0
