@@ -101,8 +101,18 @@ impl ProxyConfig {
         waf_ban_duration_s: u32,
         trusted_proxy_cidrs: Vec<String>,
     ) -> Self {
-        let backend_map: HashMap<String, Backend> =
-            backends.into_iter().map(|b| (b.id.clone(), b)).collect();
+        let backend_map: HashMap<String, Backend> = backends
+            .into_iter()
+            .map(|b| {
+                if b.tls_skip_verify {
+                    tracing::warn!(
+                        backend = %b.address,
+                        "tls_skip_verify enabled - upstream TLS certificate validation is disabled"
+                    );
+                }
+                (b.id.clone(), b)
+            })
+            .collect();
         let cert_map: HashMap<String, Certificate> = certificates
             .into_iter()
             .map(|c| (c.id.clone(), c))

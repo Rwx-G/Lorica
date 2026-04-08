@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Author: Rwx-G
 
+## [Unreleased]
+
+### Fixed
+
+- Log warning when a backend has `tls_skip_verify` enabled to alert operators that upstream TLS certificate validation is disabled
+
 ## [1.0.0] - 2026-04-08
 
 ### Added
