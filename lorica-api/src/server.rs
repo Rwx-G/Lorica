@@ -10,7 +10,7 @@ use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use http::Method;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{Any, CorsLayer};
 use tokio::sync::{watch, Mutex};
 use tracing::info;
 

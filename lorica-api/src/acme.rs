@@ -47,9 +47,15 @@ pub struct AcmeChallengeStore {
     db_path: std::path::PathBuf,
 }
 
+impl Default for AcmeChallengeStore {
+    fn default() -> Self {
+        Self::with_db_path(std::path::PathBuf::from("/var/lib/lorica/lorica.db"))
+    }
+}
+
 impl AcmeChallengeStore {
     pub fn new() -> Self {
-        Self::with_db_path(std::path::PathBuf::from("/var/lib/lorica/lorica.db"))
+        Self::default()
     }
 
     pub fn with_db_path(path: std::path::PathBuf) -> Self {
