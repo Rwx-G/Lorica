@@ -61,6 +61,17 @@
   // Derived: are there blocking errors (unresolved includes)?
   let hasBlockingErrors = $derived(unresolvedIncludes.length > 0);
 
+  // Derived: backend addresses that need TLS skip verify
+  let tlsSkipVerifyAddressesPreview = $derived.by(() => {
+    const addrs = new Set<string>();
+    for (const route of importRoutes) {
+      if (route._backendTlsSkipVerify) {
+        for (const addr of route.backend_addresses) addrs.add(addr);
+      }
+    }
+    return addrs;
+  });
+
   // Derived: diagnostics grouped by level
   let diagnostics = $derived(parseResult?.diagnostics ?? []);
   let errors = $derived(diagnostics.filter((d) => d.level === 'error' && d.directive !== 'include'));
@@ -533,13 +544,26 @@
     applying = true;
     applyResults = [];
 
+    // Collect backend addresses that need tls_skip_verify
+    const tlsSkipVerifyAddresses = new Set<string>();
+    for (const route of importRoutes) {
+      if (route._backendTlsSkipVerify) {
+        for (const addr of route.backend_addresses) {
+          tlsSkipVerifyAddresses.add(addr);
+        }
+      }
+    }
+
     // Build a map of address -> backend ID (existing + newly created)
     const backendIdMap = new Map<string, string>();
 
-    // Add existing backends
+    // Add existing backends and update tls_skip_verify if needed
     for (const check of backendChecks) {
       if (check.exists && check.existingId) {
         backendIdMap.set(check.address, check.existingId);
+        if (tlsSkipVerifyAddresses.has(check.address)) {
+          await api.updateBackend(check.existingId, { tls_skip_verify: true });
+        }
       }
     }
 
@@ -549,6 +573,7 @@
         const body: CreateBackendRequest = {
           address: check.address,
           name: check.address,
+          tls_skip_verify: tlsSkipVerifyAddresses.has(check.address) || undefined,
         };
         const res = await api.createBackend(body);
         if (res.error) {
@@ -768,6 +793,9 @@
                           <span class="badge badge-create">Will be created</span>
                         </label>
                       {/if}
+                      {#if tlsSkipVerifyAddressesPreview.has(check.address)}
+                        <span class="badge badge-tls">TLS skip verify</span>
+                      {/if}
                     </div>
                   {/each}
                 </div>
@@ -878,6 +906,13 @@
               <div class="cert-notice">
                 <strong>TLS certificates needed</strong>
                 <p>The imported route(s) had SSL certificates configured in Nginx. Upload or provision the certificates in the Certificates page, then assign them to the imported route(s) in the Route Drawer to enable HTTPS.</p>
+              </div>
+            {/if}
+
+            {#if importRoutes.some((r) => r._backendTlsSkipVerify)}
+              <div class="cert-notice">
+                <strong>Backend TLS skip verify configured</strong>
+                <p>Some backends use HTTPS upstream (proxy_pass https://). The <code>tls_skip_verify</code> flag has been {backendChecks.some(c => c.exists && tlsSkipVerifyAddressesPreview.has(c.address)) ? 'enabled on existing backends and ' : ''}set on newly created backends. Verify this setting in the Backends page if needed.</p>
               </div>
             {/if}
 
@@ -1230,6 +1265,11 @@
   .badge-create {
     background: var(--color-red-subtle);
     color: var(--color-red);
+  }
+
+  .badge-tls {
+    background: var(--color-orange-subtle, rgba(251, 146, 60, 0.15));
+    color: var(--color-orange, #fb923c);
   }
 
   .badge-imported {

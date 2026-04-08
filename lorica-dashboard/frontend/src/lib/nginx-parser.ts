@@ -92,6 +92,8 @@ export interface LoricaRouteImport {
   security_headers: string;
   /** Security headers detected during import, for preset matching. */
   _securityHeaders?: Record<string, string>;
+  /** Backends need tls_skip_verify (detected from proxy_pass https:// or proxy_ssl_verify off). */
+  _backendTlsSkipVerify?: boolean;
   strip_path_prefix: string | null;
   add_path_prefix: string | null;
   path_rewrite_pattern: string | null;
@@ -242,6 +244,16 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
   proxy_pass: (v, r) => {
     r.backend_addresses.push(extractHostPort(v));
     r.importedFields.add('backend_addresses');
+    // Detect HTTPS backend (proxy_pass https://...)
+    if (v.trim().startsWith('https://')) {
+      r._backendTlsSkipVerify = true;
+    }
+  },
+
+  proxy_ssl_verify: (v, r) => {
+    if (v.trim() === 'off') {
+      r._backendTlsSkipVerify = true;
+    }
   },
 
   proxy_read_timeout: (v, r) => {
@@ -895,7 +907,7 @@ export const LORICA_HANDLED_DIRECTIVES: Record<string, string> = {
   proxy_headers_hash_bucket_size: 'Lorica: internal',
   proxy_ssl_server_name: 'Lorica: tls_sni on backend',
   proxy_ssl_name: 'Lorica: tls_sni on backend',
-  proxy_ssl_verify: 'Lorica: tls_skip_verify on backend',
+  // proxy_ssl_verify is in DIRECTIVE_MAP (sets _backendTlsSkipVerify)
   proxy_ssl_certificate: 'Lorica: internal',
   proxy_ssl_certificate_key: 'Lorica: internal',
   proxy_ssl_protocols: 'Lorica: internal',
