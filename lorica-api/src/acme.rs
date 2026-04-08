@@ -428,7 +428,7 @@ async fn provision_with_acme(
     // Store certificate in database
     let now = chrono::Utc::now();
     let cert_id = uuid::Uuid::new_v4().to_string();
-    let san_domains: Vec<String> = domains.iter().skip(1).cloned().collect();
+    let san_domains: Vec<String> = domains.to_vec();
     let fingerprint = format!("acme:{}", domains.join(","));
 
     let cert = lorica_config::models::Certificate {
