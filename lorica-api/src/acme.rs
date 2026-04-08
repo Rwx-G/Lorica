@@ -1951,11 +1951,25 @@ pub async fn check_dns_manual(
     })))
 }
 
+/// Validate that a DNS server string is a safe IP address or hostname.
+/// Rejects values containing shell metacharacters, spaces, semicolons, etc.
+fn is_valid_dns_server(server: &str) -> bool {
+    if server.is_empty() || server.len() > 253 {
+        return false;
+    }
+    // Allow only alphanumeric, dots, hyphens, colons (for IPv6), and square brackets
+    server.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+}
+
 /// Check if a TXT record contains the expected value.
 /// If dns_server is provided, queries that specific server (e.g. the authoritative NS).
 async fn check_txt_record(record_name: &str, expected_value: &str, dns_server: Option<&str>) -> bool {
     let mut args = vec!["+short".to_string(), "TXT".to_string(), record_name.to_string()];
     if let Some(server) = dns_server {
+        if !is_valid_dns_server(server) {
+            tracing::warn!(server, "rejecting invalid DNS server parameter");
+            return false;
+        }
         args.push(format!("@{server}"));
     }
     let expected = expected_value.to_string();
