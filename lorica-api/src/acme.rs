@@ -453,6 +453,7 @@ async fn provision_with_acme(
         created_at: now,
         acme_method: Some("http01".into()),
         acme_dns_config: None,
+        acme_dns_provider_id: None,
     };
 
     let store = state.store.lock().await;
@@ -759,26 +760,44 @@ async fn renew_with_method(
         m if m.starts_with("dns01-") => {
             // Extract provider name from "dns01-provider"
             let provider = &m[6..];
-            let encrypted = cert.acme_dns_config.as_ref().ok_or_else(|| {
-                format!(
-                    "certificate has method '{m}' but no stored DNS config - \
+
+            // Try new approach first: global DNS provider reference
+            let (dns_config, dns_provider_id) = if let Some(ref pid) = cert.acme_dns_provider_id {
+                let store = state.store.lock().await;
+                let dp = store.get_dns_provider(pid).map_err(|e| {
+                    format!("failed to fetch DNS provider '{pid}': {e}")
+                })?;
+                drop(store);
+                let dp = dp.ok_or_else(|| {
+                    format!(
+                        "certificate references DNS provider '{pid}' which no longer exists - \
+                         cannot auto-renew"
+                    )
+                })?;
+                let cfg: DnsChallengeConfig = serde_json::from_str(&dp.config)
+                    .map_err(|e| format!("failed to parse DNS provider config: {e}"))?;
+                (cfg, Some(pid.clone()))
+            } else if let Some(ref encrypted) = cert.acme_dns_config {
+                // Legacy fallback: per-certificate encrypted config
+                let dns_config_json = {
+                    let store = state.store.lock().await;
+                    store.decrypt_dns_config(encrypted)?
+                };
+                let cfg: DnsChallengeConfig = serde_json::from_str(&dns_config_json)
+                    .map_err(|e| format!("failed to parse stored DNS config: {e}"))?;
+                (cfg, None)
+            } else {
+                return Err(format!(
+                    "certificate has method '{m}' but no DNS provider or stored DNS config - \
                      cannot auto-renew"
                 )
-            })?;
-
-            // Decrypt the DNS config
-            let dns_config_json = {
-                let store = state.store.lock().await;
-                store.decrypt_dns_config(encrypted)?
+                .into());
             };
-
-            let dns_config: DnsChallengeConfig = serde_json::from_str(&dns_config_json)
-                .map_err(|e| format!("failed to parse stored DNS config: {e}"))?;
 
             // Verify provider matches
             if dns_config.provider != provider {
                 return Err(format!(
-                    "stored DNS config provider '{}' does not match method '{m}'",
+                    "DNS config provider '{}' does not match method '{m}'",
                     dns_config.provider
                 )
                 .into());
@@ -795,6 +814,7 @@ async fn renew_with_method(
                 challenger.as_ref(),
                 m,
                 cert.acme_dns_config.clone(),
+                dns_provider_id,
             )
             .await
         }
@@ -1362,8 +1382,12 @@ pub struct AcmeDnsProvisionRequest {
     pub staging: bool,
     /// Contact email for Let's Encrypt.
     pub contact_email: Option<String>,
-    /// DNS provider configuration.
-    pub dns: DnsChallengeConfig,
+    /// DNS provider configuration (inline credentials - legacy).
+    #[serde(default)]
+    pub dns: Option<DnsChallengeConfig>,
+    /// Reference to a global DNS provider (new approach).
+    #[serde(default)]
+    pub dns_provider_id: Option<String>,
 }
 
 /// POST /api/v1/acme/provision-dns - Initiate ACME certificate provisioning via DNS-01.
@@ -1387,11 +1411,32 @@ pub async fn provision_certificate_dns(
     }
     let primary_domain = domains[0].clone();
 
-    if let Err(e) = body.dns.validate() {
+    // Resolve DNS config: either from a global provider or inline credentials
+    let (dns_config, dns_provider_id) = if let Some(ref provider_id) = body.dns_provider_id {
+        // New approach: look up global DNS provider
+        let store = state.store.lock().await;
+        let provider = store
+            .get_dns_provider(provider_id)
+            .map_err(|e| ApiError::Internal(format!("failed to fetch DNS provider: {e}")))?
+            .ok_or_else(|| ApiError::NotFound(format!("dns_provider {provider_id}")))?;
+        drop(store);
+        let config: DnsChallengeConfig = serde_json::from_str(&provider.config)
+            .map_err(|e| ApiError::Internal(format!("invalid DNS provider config: {e}")))?;
+        (config, Some(provider_id.clone()))
+    } else if let Some(ref dns) = body.dns {
+        // Legacy approach: inline credentials
+        (dns.clone(), None)
+    } else {
+        return Err(ApiError::BadRequest(
+            "either dns_provider_id or dns config is required".into(),
+        ));
+    };
+
+    if let Err(e) = dns_config.validate() {
         return Err(ApiError::BadRequest(format!("invalid DNS config: {e}")));
     }
 
-    let challenger = build_dns_challenger(&body.dns)
+    let challenger = build_dns_challenger(&dns_config)
         .await
         .map_err(|e| ApiError::BadRequest(format!("failed to build DNS challenger: {e}")))?;
 
@@ -1400,11 +1445,11 @@ pub async fn provision_certificate_dns(
         contact_email: body.contact_email.clone(),
     };
 
-    let acme_method = format!("dns01-{}", body.dns.provider);
+    let acme_method = format!("dns01-{}", dns_config.provider);
 
-    // Encrypt DNS credentials for storage so auto-renewal can reuse them
-    let dns_config_json = serde_json::to_string(&body.dns).unwrap_or_default();
-    let encrypted_dns_config = {
+    // Encrypt DNS credentials for storage so auto-renewal can reuse them (legacy path only)
+    let encrypted_dns_config = if dns_provider_id.is_none() {
+        let dns_config_json = serde_json::to_string(&dns_config).unwrap_or_default();
         let store = state.store.lock().await;
         match store.encrypt_dns_config(&dns_config_json) {
             Ok(enc) => Some(enc),
@@ -1413,13 +1458,16 @@ pub async fn provision_certificate_dns(
                 None
             }
         }
+    } else {
+        None
     };
 
     info!(
         domains = ?domains,
         staging = config.staging,
-        provider = %body.dns.provider,
+        provider = %dns_config.provider,
         directory = config.directory_url(),
+        dns_provider_id = ?dns_provider_id,
         "starting ACME DNS-01 certificate provisioning"
     );
 
@@ -1430,6 +1478,7 @@ pub async fn provision_certificate_dns(
         challenger.as_ref(),
         &acme_method,
         encrypted_dns_config,
+        dns_provider_id,
     )
     .await;
 
@@ -1462,7 +1511,8 @@ fn acme_dns_base_domain(domain: &str) -> &str {
 /// Supports multi-domain and wildcard certificates.
 ///
 /// `acme_method` is stored on the certificate (e.g. "dns01-cloudflare").
-/// `encrypted_dns_config` is the encrypted JSON of the DNS credentials.
+/// `encrypted_dns_config` is the encrypted JSON of the DNS credentials (legacy).
+/// `dns_provider_id` references a global DNS provider (new approach).
 async fn provision_with_acme_dns(
     state: &AppState,
     config: &AcmeConfig,
@@ -1470,6 +1520,7 @@ async fn provision_with_acme_dns(
     challenger: &dyn DnsChallenger,
     acme_method: &str,
     encrypted_dns_config: Option<String>,
+    dns_provider_id: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
         Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
@@ -1661,6 +1712,7 @@ async fn provision_with_acme_dns(
         created_at: now,
         acme_method: Some(acme_method.to_string()),
         acme_dns_config: encrypted_dns_config,
+        acme_dns_provider_id: dns_provider_id,
     };
 
     let store = state.store.lock().await;
@@ -2127,6 +2179,7 @@ pub async fn provision_dns_manual_confirm(
         created_at: now,
         acme_method: Some("dns01-manual".into()),
         acme_dns_config: None,
+        acme_dns_provider_id: None,
     };
 
     let store = state.store.lock().await;
@@ -2528,6 +2581,7 @@ mod tests {
             created_at: now - chrono::Duration::days(80),
             acme_method: None,
             acme_dns_config: None,
+            acme_dns_provider_id: None,
         };
 
         // Cert expiring in 2 days (critical level)
@@ -2546,6 +2600,7 @@ mod tests {
             created_at: now - chrono::Duration::days(88),
             acme_method: None,
             acme_dns_config: None,
+            acme_dns_provider_id: None,
         };
 
         // Cert expiring in 30 days (no alert)
@@ -2564,6 +2619,7 @@ mod tests {
             created_at: now - chrono::Duration::days(60),
             acme_method: Some("http01".into()),
             acme_dns_config: None,
+            acme_dns_provider_id: None,
         };
 
         store.create_certificate(&warning_cert).unwrap();

@@ -420,6 +420,37 @@ export interface CreateNotificationRequest {
   alert_types: string[];
 }
 
+// ---- DNS Providers ----
+
+export interface DnsProviderResponse {
+  id: string;
+  name: string;
+  provider_type: string;
+  created_at: string;
+}
+
+export interface DnsProviderConfig {
+  // OVH
+  ovh_endpoint?: string;
+  ovh_application_key?: string;
+  ovh_application_secret?: string;
+  ovh_consumer_key?: string;
+  // Cloudflare
+  api_token?: string;
+  zone_id?: string;
+  // Route53
+  aws_access_key_id?: string;
+  aws_secret_access_key?: string;
+  aws_region?: string;
+  hosted_zone_id?: string;
+}
+
+export interface CreateDnsProviderRequest {
+  name: string;
+  provider_type: string;
+  config: DnsProviderConfig;
+}
+
 export interface UserPreferenceResponse {
   id: string;
   preference_key: string;
@@ -553,6 +584,22 @@ export const api = {
 
   notificationHistory: () =>
     request<{ events: { alert_type: string; summary: string; timestamp: string; details: Record<string, string> }[]; total: number }>('GET', '/notifications/history'),
+
+  // DNS Providers
+  listDnsProviders: () =>
+    request<{ dns_providers: DnsProviderResponse[] }>('GET', '/dns-providers'),
+
+  createDnsProvider: (body: CreateDnsProviderRequest) =>
+    request<DnsProviderResponse>('POST', '/dns-providers', body),
+
+  updateDnsProvider: (id: string, body: CreateDnsProviderRequest) =>
+    request<DnsProviderResponse>('PUT', `/dns-providers/${id}`, body),
+
+  deleteDnsProvider: (id: string) =>
+    request<{ message: string }>('DELETE', `/dns-providers/${id}`),
+
+  testDnsProvider: (id: string) =>
+    request<{ message: string; provider_type: string }>('POST', `/dns-providers/${id}/test`),
 
   // Preferences
   listPreferences: () =>
@@ -824,7 +871,7 @@ export interface AcmeDnsProvisionRequest {
   domain: string;
   staging?: boolean;
   contact_email?: string;
-  dns: {
+  dns?: {
     provider: string;
     zone_id: string;
     api_token: string;
@@ -832,6 +879,7 @@ export interface AcmeDnsProvisionRequest {
     ovh_endpoint?: string;
     ovh_consumer_key?: string;
   };
+  dns_provider_id?: string;
 }
 
 export interface AcmeProvisionResponse {

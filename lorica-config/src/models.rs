@@ -516,8 +516,29 @@ pub struct Certificate {
     pub acme_method: Option<String>,
     /// Encrypted JSON containing DNS provider credentials for auto-renewal.
     /// Only set for dns01-* methods (not manual or http01).
+    /// Deprecated: use `acme_dns_provider_id` instead for new certificates.
     #[serde(default)]
     pub acme_dns_config: Option<String>,
+    /// Reference to a global DNS provider (dns_providers.id).
+    /// Used instead of per-certificate `acme_dns_config` for new certificates.
+    #[serde(default)]
+    pub acme_dns_provider_id: Option<String>,
+}
+
+/// A global DNS provider with encrypted credentials.
+///
+/// Instead of storing DNS credentials on each certificate, providers are
+/// configured once and referenced by ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsProvider {
+    pub id: String,
+    /// User-friendly name (e.g. "OVH rwx-g.fr").
+    pub name: String,
+    /// Provider type: "ovh", "cloudflare", "route53".
+    pub provider_type: String,
+    /// Encrypted JSON with provider credentials.
+    pub config: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

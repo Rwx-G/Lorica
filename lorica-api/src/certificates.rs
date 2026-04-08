@@ -236,6 +236,7 @@ pub async fn create_certificate(
         created_at: now,
         acme_method: None,
         acme_dns_config: None,
+        acme_dns_provider_id: None,
     };
 
     let store = state.store.lock().await;
@@ -390,6 +391,7 @@ pub async fn generate_self_signed(
         created_at: now,
         acme_method: None,
         acme_dns_config: None,
+        acme_dns_provider_id: None,
     };
 
     let store = state.store.lock().await;

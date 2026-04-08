@@ -13,6 +13,7 @@
     type AcmeDnsManualRequest,
     type AcmeDnsManualConfirmRequest,
     type DnsManualTxtRecord,
+    type DnsProviderResponse,
   } from '../lib/api';
   import CertExpiryBadge from '../components/CertExpiryBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
@@ -20,6 +21,7 @@
 
   let certificates: CertificateResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
+  let dnsProviders: DnsProviderResponse[] = $state([]);
   let error = $state('');
   let loading = $state(true);
 
@@ -80,6 +82,7 @@
   let acmeEmail = $state('');
   let acmeStaging = $state(false);
   let acmeDnsProvider = $state('cloudflare');
+  let acmeDnsProviderId = $state('');
   let acmeDnsZoneId = $state('');
   let acmeDnsApiToken = $state('');
   let acmeDnsApiSecret = $state('');
@@ -103,6 +106,7 @@
     acmeStaging = false;
     acmeMode = 'http01';
     acmeDnsProvider = 'cloudflare';
+    acmeDnsProviderId = '';
     acmeDnsZoneId = '';
     acmeDnsApiToken = '';
     acmeDnsApiSecret = '';
@@ -158,39 +162,58 @@
         await loadData();
       }
     } else if (acmeMode === 'dns01') {
-      if (acmeDnsProvider === 'ovh') {
-        if (!acmeDnsApiToken.trim() || !acmeDnsApiSecret.trim() || !acmeOvhConsumerKey.trim()) {
-          acmeError = 'Application Key, Application Secret and Consumer Key are required for OVH';
-          acmeSubmitting = false;
-          return;
+      // Use global DNS provider if selected, otherwise inline credentials
+      if (acmeDnsProviderId) {
+        const body: AcmeDnsProvisionRequest = {
+          domain: acmeDomain,
+          staging: acmeStaging,
+          contact_email: acmeEmail || undefined,
+          dns_provider_id: acmeDnsProviderId,
+        };
+        const res = await api.provisionAcmeDns(body);
+        acmeSubmitting = false;
+        if (res.error) {
+          acmeError = res.error.message;
+        } else if (res.data) {
+          acmeSuccess = res.data.message;
+          await loadData();
         }
       } else {
-        if (!acmeDnsZoneId.trim() || !acmeDnsApiToken.trim()) {
-          acmeError = 'Zone ID and API token are required for DNS-01';
-          acmeSubmitting = false;
-          return;
+        // Legacy inline credentials
+        if (acmeDnsProvider === 'ovh') {
+          if (!acmeDnsApiToken.trim() || !acmeDnsApiSecret.trim() || !acmeOvhConsumerKey.trim()) {
+            acmeError = 'Application Key, Application Secret and Consumer Key are required for OVH';
+            acmeSubmitting = false;
+            return;
+          }
+        } else {
+          if (!acmeDnsZoneId.trim() || !acmeDnsApiToken.trim()) {
+            acmeError = 'Zone ID and API token are required for DNS-01';
+            acmeSubmitting = false;
+            return;
+          }
         }
-      }
-      const body: AcmeDnsProvisionRequest = {
-        domain: acmeDomain,
-        staging: acmeStaging,
-        contact_email: acmeEmail || undefined,
-        dns: {
-          provider: acmeDnsProvider,
-          zone_id: acmeDnsZoneId,
-          api_token: acmeDnsApiToken,
-          api_secret: acmeDnsApiSecret || undefined,
-          ovh_endpoint: acmeDnsProvider === 'ovh' ? acmeOvhEndpoint : undefined,
-          ovh_consumer_key: acmeDnsProvider === 'ovh' ? acmeOvhConsumerKey : undefined,
-        },
-      };
-      const res = await api.provisionAcmeDns(body);
-      acmeSubmitting = false;
-      if (res.error) {
-        acmeError = res.error.message;
-      } else if (res.data) {
-        acmeSuccess = res.data.message;
-        await loadData();
+        const body: AcmeDnsProvisionRequest = {
+          domain: acmeDomain,
+          staging: acmeStaging,
+          contact_email: acmeEmail || undefined,
+          dns: {
+            provider: acmeDnsProvider,
+            zone_id: acmeDnsZoneId,
+            api_token: acmeDnsApiToken,
+            api_secret: acmeDnsApiSecret || undefined,
+            ovh_endpoint: acmeDnsProvider === 'ovh' ? acmeOvhEndpoint : undefined,
+            ovh_consumer_key: acmeDnsProvider === 'ovh' ? acmeOvhConsumerKey : undefined,
+          },
+        };
+        const res = await api.provisionAcmeDns(body);
+        acmeSubmitting = false;
+        if (res.error) {
+          acmeError = res.error.message;
+        } else if (res.data) {
+          acmeSuccess = res.data.message;
+          await loadData();
+        }
       }
     } else if (acmeMode === 'dns01-manual') {
       // Step 1: get the TXT record info
@@ -235,11 +258,12 @@
   async function loadData() {
     loading = true;
     error = '';
-    const [certsRes, routesRes, settingsRes, prefRes] = await Promise.all([
+    const [certsRes, routesRes, settingsRes, prefRes, dnsRes] = await Promise.all([
       api.listCertificates(),
       api.listRoutes(),
       api.getSettings(),
       api.listPreferences(),
+      api.listDnsProviders(),
     ]);
     if (certsRes.error) {
       error = certsRes.error.message;
@@ -252,6 +276,9 @@
     if (settingsRes.data) {
       warningDays = settingsRes.data.cert_warning_days;
       criticalDays = settingsRes.data.cert_critical_days;
+    }
+    if (dnsRes.data) {
+      dnsProviders = dnsRes.data.dns_providers;
     }
     // Self-signed pref loaded from localStorage at init
     loading = false;
@@ -1032,49 +1059,65 @@
         </div>
 
         {#if acmeMode === 'dns01'}
-          <div class="form-group">
-            <label>DNS Provider</label>
-            <select bind:value={acmeDnsProvider}>
-              <option value="cloudflare">Cloudflare</option>
-              <option value="route53">AWS Route53</option>
-              <option value="ovh">OVH</option>
-            </select>
-          </div>
-          {#if acmeDnsProvider === 'ovh'}
+          {#if dnsProviders.length > 0}
             <div class="form-group">
-              <label>Application Key <span class="required">*</span></label>
-              <input type="text" bind:value={acmeDnsApiToken} placeholder="OVH Application Key" />
-            </div>
-            <div class="form-group">
-              <label>Application Secret <span class="required">*</span></label>
-              <input type="password" bind:value={acmeDnsApiSecret} placeholder="OVH Application Secret" />
-            </div>
-            <div class="form-group">
-              <label>Consumer Key <span class="required">*</span></label>
-              <input type="password" bind:value={acmeOvhConsumerKey} placeholder="OVH Consumer Key" />
-            </div>
-            <div class="form-group">
-              <label>API Endpoint</label>
-              <select bind:value={acmeOvhEndpoint}>
-                <option value="eu.api.ovh.com">Europe (eu.api.ovh.com)</option>
-                <option value="ca.api.ovh.com">Canada (ca.api.ovh.com)</option>
-                <option value="api.us.ovhcloud.com">US (api.us.ovhcloud.com)</option>
+              <label>DNS Provider</label>
+              <select bind:value={acmeDnsProviderId}>
+                <option value="">-- Enter credentials manually --</option>
+                {#each dnsProviders as dp}
+                  <option value={dp.id}>{dp.name} ({dp.provider_type})</option>
+                {/each}
               </select>
             </div>
           {:else}
+            <p class="hint">No DNS providers configured. <a href="#/settings">Add one in Settings</a> or enter credentials below.</p>
+          {/if}
+
+          {#if !acmeDnsProviderId}
             <div class="form-group">
-              <label>Zone ID <span class="required">*</span></label>
-              <input type="text" bind:value={acmeDnsZoneId} placeholder="Zone identifier" />
+              <label>DNS Provider Type</label>
+              <select bind:value={acmeDnsProvider}>
+                <option value="cloudflare">Cloudflare</option>
+                <option value="route53">AWS Route53</option>
+                <option value="ovh">OVH</option>
+              </select>
             </div>
-            <div class="form-group">
-              <label>API Token <span class="required">*</span></label>
-              <input type="password" bind:value={acmeDnsApiToken} placeholder="API token" />
-            </div>
-            {#if acmeDnsProvider === 'route53'}
+            {#if acmeDnsProvider === 'ovh'}
               <div class="form-group">
-                <label>AWS Secret Access Key</label>
-                <input type="password" bind:value={acmeDnsApiSecret} placeholder="Secret key" />
+                <label>Application Key <span class="required">*</span></label>
+                <input type="text" bind:value={acmeDnsApiToken} placeholder="OVH Application Key" />
               </div>
+              <div class="form-group">
+                <label>Application Secret <span class="required">*</span></label>
+                <input type="password" bind:value={acmeDnsApiSecret} placeholder="OVH Application Secret" />
+              </div>
+              <div class="form-group">
+                <label>Consumer Key <span class="required">*</span></label>
+                <input type="password" bind:value={acmeOvhConsumerKey} placeholder="OVH Consumer Key" />
+              </div>
+              <div class="form-group">
+                <label>API Endpoint</label>
+                <select bind:value={acmeOvhEndpoint}>
+                  <option value="eu.api.ovh.com">Europe (eu.api.ovh.com)</option>
+                  <option value="ca.api.ovh.com">Canada (ca.api.ovh.com)</option>
+                  <option value="api.us.ovhcloud.com">US (api.us.ovhcloud.com)</option>
+                </select>
+              </div>
+            {:else}
+              <div class="form-group">
+                <label>Zone ID <span class="required">*</span></label>
+                <input type="text" bind:value={acmeDnsZoneId} placeholder="Zone identifier" />
+              </div>
+              <div class="form-group">
+                <label>API Token <span class="required">*</span></label>
+                <input type="password" bind:value={acmeDnsApiToken} placeholder="API token" />
+              </div>
+              {#if acmeDnsProvider === 'route53'}
+                <div class="form-group">
+                  <label>AWS Secret Access Key</label>
+                  <input type="password" bind:value={acmeDnsApiSecret} placeholder="Secret key" />
+                </div>
+              {/if}
             {/if}
           {/if}
           <span class="hint">Automated DNS-01 via Cloudflare, AWS Route53 or OVH API.</span>

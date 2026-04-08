@@ -28,6 +28,7 @@ const MIGRATION_V14: &str = include_str!("migrations/014_backend_tls_sni.sql");
 const MIGRATION_V15: &str = include_str!("migrations/015_probe_results.sql");
 const MIGRATION_V16: &str = include_str!("migrations/016_backend_tls_skip_verify.sql");
 const MIGRATION_V17: &str = include_str!("migrations/017_acme_method.sql");
+const MIGRATION_V18: &str = include_str!("migrations/018_dns_providers.sql");
 
 /// Sole database access point for all Lorica configuration.
 pub struct ConfigStore {
@@ -369,6 +370,30 @@ impl ConfigStore {
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![19],
+            )?;
+        }
+
+        if current_version < 20 {
+            tracing::info!("applying migration 018_dns_providers");
+            // Table creation is idempotent; ALTER TABLE may fail if column already exists.
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS dns_providers (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    provider_type TEXT NOT NULL,
+                    config TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );"
+            )?;
+            if let Err(e) = self.conn.execute(
+                "ALTER TABLE certificates ADD COLUMN acme_dns_provider_id TEXT DEFAULT NULL",
+                [],
+            ) {
+                tracing::debug!("acme_dns_provider_id column may already exist: {e}");
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![20],
             )?;
         }
 
@@ -899,8 +924,8 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT INTO certificates (id, domain, san_domains, fingerprint, cert_pem, key_pem,
              issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
-             acme_method, acme_dns_config)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             acme_method, acme_dns_config, acme_dns_provider_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 cert.id,
                 cert.domain,
@@ -916,6 +941,7 @@ impl ConfigStore {
                 cert.created_at.to_rfc3339(),
                 cert.acme_method,
                 encrypted_dns_config,
+                cert.acme_dns_provider_id,
             ],
         )?;
         Ok(())
@@ -927,7 +953,7 @@ impl ConfigStore {
             .query_row(
                 "SELECT id, domain, san_domains, fingerprint, cert_pem, key_pem,
                  issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
-                 acme_method, acme_dns_config
+                 acme_method, acme_dns_config, acme_dns_provider_id
                  FROM certificates WHERE id = ?1",
                 params![id],
                 |row| Ok(self.row_to_certificate(row)),
@@ -941,7 +967,7 @@ impl ConfigStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, domain, san_domains, fingerprint, cert_pem, key_pem,
              issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
-             acme_method, acme_dns_config
+             acme_method, acme_dns_config, acme_dns_provider_id
              FROM certificates ORDER BY domain",
         )?;
         let rows = stmt.query_map([], |row| Ok(self.row_to_certificate(row)))?;
@@ -965,7 +991,8 @@ impl ConfigStore {
         let changed = self.conn.execute(
             "UPDATE certificates SET domain=?2, san_domains=?3, fingerprint=?4,
              cert_pem=?5, key_pem=?6, issuer=?7, not_before=?8, not_after=?9,
-             is_acme=?10, acme_auto_renew=?11, acme_method=?12, acme_dns_config=?13
+             is_acme=?10, acme_auto_renew=?11, acme_method=?12, acme_dns_config=?13,
+             acme_dns_provider_id=?14
              WHERE id=?1",
             params![
                 cert.id,
@@ -981,6 +1008,7 @@ impl ConfigStore {
                 cert.acme_auto_renew,
                 cert.acme_method,
                 encrypted_dns_config,
+                cert.acme_dns_provider_id,
             ],
         )?;
         if changed == 0 {
@@ -1102,6 +1130,129 @@ impl ConfigStore {
             return Err(ConfigError::NotFound(format!("notification_config {id}")));
         }
         Ok(())
+    }
+
+    // ---- DNS Providers ----
+
+    /// Insert a new DNS provider. The `config` field is encrypted at rest.
+    pub fn create_dns_provider(&self, provider: &DnsProvider) -> Result<()> {
+        let encrypted_config = self.encrypt_config(&provider.config)?;
+        self.conn.execute(
+            "INSERT INTO dns_providers (id, name, provider_type, config, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                provider.id,
+                provider.name,
+                provider.provider_type,
+                encrypted_config,
+                provider.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch a DNS provider by ID, or `None` if not found. Decrypts `config` transparently.
+    pub fn get_dns_provider(&self, id: &str) -> Result<Option<DnsProvider>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT id, name, provider_type, config, created_at
+                 FROM dns_providers WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match result {
+            Some((id, name, provider_type, encrypted_config, created_at)) => {
+                let config = self.decrypt_config(&encrypted_config)?;
+                Ok(Some(DnsProvider {
+                    id,
+                    name,
+                    provider_type,
+                    config,
+                    created_at: parse_datetime(&created_at)?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List all DNS providers, ordered by name. Decrypts `config` transparently.
+    pub fn list_dns_providers(&self) -> Result<Vec<DnsProvider>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, provider_type, config, created_at
+             FROM dns_providers ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut providers = Vec::new();
+        for r in rows {
+            let (id, name, provider_type, encrypted_config, created_at) = r?;
+            let config = self.decrypt_config(&encrypted_config)?;
+            providers.push(DnsProvider {
+                id,
+                name,
+                provider_type,
+                config,
+                created_at: parse_datetime(&created_at)?,
+            });
+        }
+        Ok(providers)
+    }
+
+    /// Update an existing DNS provider. Re-encrypts `config` at rest.
+    pub fn update_dns_provider(&self, provider: &DnsProvider) -> Result<()> {
+        let encrypted_config = self.encrypt_config(&provider.config)?;
+        let changed = self.conn.execute(
+            "UPDATE dns_providers SET name=?2, provider_type=?3, config=?4
+             WHERE id=?1",
+            params![
+                provider.id,
+                provider.name,
+                provider.provider_type,
+                encrypted_config,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(ConfigError::NotFound(format!("dns_provider {}", provider.id)));
+        }
+        Ok(())
+    }
+
+    /// Delete a DNS provider by ID. Returns `NotFound` if the ID does not exist.
+    pub fn delete_dns_provider(&self, id: &str) -> Result<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM dns_providers WHERE id=?1", params![id])?;
+        if changed == 0 {
+            return Err(ConfigError::NotFound(format!("dns_provider {id}")));
+        }
+        Ok(())
+    }
+
+    /// Check if any certificates reference the given DNS provider.
+    pub fn dns_provider_in_use(&self, provider_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM certificates WHERE acme_dns_provider_id = ?1",
+            params![provider_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     // ---- User Preferences ----
@@ -1564,6 +1715,7 @@ impl ConfigStore {
              DELETE FROM backends;
              DELETE FROM certificates;
              DELETE FROM notification_configs;
+             DELETE FROM dns_providers;
              DELETE FROM user_preferences;
              DELETE FROM admin_users;
              DELETE FROM global_settings;",
@@ -1582,6 +1734,7 @@ impl ConfigStore {
         let acme_dns_config = encrypted_dns_config
             .map(|c| self.decrypt_config(&c))
             .transpose()?;
+        let acme_dns_provider_id: Option<String> = row.get(14)?;
         Ok(Certificate {
             id: row.get(0)?,
             domain: row.get(1)?,
@@ -1597,6 +1750,7 @@ impl ConfigStore {
             created_at: parse_datetime(&row.get::<_, String>(11)?)?,
             acme_method,
             acme_dns_config,
+            acme_dns_provider_id,
         })
     }
 

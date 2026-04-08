@@ -161,6 +161,26 @@ pub fn build_router(
         .route("/api/v1/settings", get(crate::settings::get_settings))
         .route("/api/v1/settings", put(crate::settings::update_settings))
         .route(
+            "/api/v1/dns-providers",
+            get(crate::dns_providers::list_dns_providers),
+        )
+        .route(
+            "/api/v1/dns-providers",
+            post(crate::dns_providers::create_dns_provider),
+        )
+        .route(
+            "/api/v1/dns-providers/:id",
+            put(crate::dns_providers::update_dns_provider),
+        )
+        .route(
+            "/api/v1/dns-providers/:id",
+            delete(crate::dns_providers::delete_dns_provider),
+        )
+        .route(
+            "/api/v1/dns-providers/:id/test",
+            post(crate::dns_providers::test_dns_provider),
+        )
+        .route(
             "/api/v1/notifications",
             get(crate::settings::list_notifications),
         )

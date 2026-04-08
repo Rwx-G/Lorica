@@ -11,6 +11,7 @@ Author: Rwx-G
 
 ### Added
 
+- Global DNS providers: DNS credentials are now configured once in Settings and referenced by ID when provisioning certificates. CRUD API at `/api/v1/dns-providers` with encrypted credential storage. Dashboard Settings page includes a DNS Providers section for managing providers. Certificate provisioning via DNS-01 accepts a `dns_provider_id` instead of inline credentials. Backward compatible: existing certificates with per-certificate `acme_dns_config` continue to work for renewal
 - OVH DNS provider for ACME DNS-01 automated certificate provisioning. Supports OVH API signature authentication (application_key, application_secret, consumer_key) with automatic zone extraction from domain names. Available endpoints: EU, CA, US
 - ACME method and DNS credentials storage on certificates (acme_method, acme_dns_config columns). DNS provider credentials are encrypted at rest using the same encryption as notification configs
 - Smart ACME renewal: certificates now remember their provisioning method and DNS credentials, enabling automatic renewal for DNS-01 certificates (Cloudflare, Route53, OVH). Manual DNS-01 certificates are skipped during auto-renewal

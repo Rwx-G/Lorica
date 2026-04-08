@@ -7,6 +7,7 @@ pub mod cache;
 pub mod certificates;
 pub mod config;
 pub mod connections;
+pub mod dns_providers;
 pub mod error;
 pub mod loadtest;
 pub mod log_store;

@@ -1872,6 +1872,7 @@ mod tests {
             created_at: now,
             acme_method: None,
             acme_dns_config: None,
+            acme_dns_provider_id: None,
         }
     }
 

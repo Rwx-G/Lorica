@@ -102,6 +102,17 @@ mod tests {
             created_at: now,
             acme_method: None,
             acme_dns_config: None,
+            acme_dns_provider_id: None,
+        }
+    }
+
+    fn make_dns_provider() -> DnsProvider {
+        DnsProvider {
+            id: new_id(),
+            name: "Test OVH Provider".into(),
+            provider_type: "ovh".into(),
+            config: r#"{"provider":"ovh","api_token":"ak","api_secret":"as","ovh_consumer_key":"ck"}"#.into(),
+            created_at: Utc::now(),
         }
     }
 
@@ -312,6 +323,63 @@ mod tests {
 
         store.delete_notification_config(&nc.id).unwrap();
         assert!(store.get_notification_config(&nc.id).unwrap().is_none());
+    }
+
+    // ---- DnsProvider CRUD ----
+
+    #[test]
+    fn test_dns_provider_crud() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut provider = make_dns_provider();
+
+        store.create_dns_provider(&provider).unwrap();
+
+        let fetched = store.get_dns_provider(&provider.id).unwrap().unwrap();
+        assert_eq!(fetched.name, "Test OVH Provider");
+        assert_eq!(fetched.provider_type, "ovh");
+        assert!(fetched.config.contains("api_token"));
+
+        let providers = store.list_dns_providers().unwrap();
+        assert_eq!(providers.len(), 1);
+
+        provider.name = "Updated Provider".into();
+        store.update_dns_provider(&provider).unwrap();
+        let fetched = store.get_dns_provider(&provider.id).unwrap().unwrap();
+        assert_eq!(fetched.name, "Updated Provider");
+
+        // Not in use
+        assert!(!store.dns_provider_in_use(&provider.id).unwrap());
+
+        store.delete_dns_provider(&provider.id).unwrap();
+        assert!(store.get_dns_provider(&provider.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_dns_provider_unique_name() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let p1 = make_dns_provider();
+        store.create_dns_provider(&p1).unwrap();
+
+        let mut p2 = make_dns_provider();
+        p2.name = p1.name.clone(); // same name, different id
+        let result = store.create_dns_provider(&p2);
+        assert!(result.is_err(), "duplicate name should fail");
+    }
+
+    #[test]
+    fn test_dns_provider_in_use() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let provider = make_dns_provider();
+        store.create_dns_provider(&provider).unwrap();
+
+        let mut cert = make_certificate();
+        cert.acme_dns_provider_id = Some(provider.id.clone());
+        store.create_certificate(&cert).unwrap();
+
+        assert!(store.dns_provider_in_use(&provider.id).unwrap());
+
+        store.delete_certificate(&cert.id).unwrap();
+        assert!(!store.dns_provider_in_use(&provider.id).unwrap());
     }
 
     // ---- UserPreference CRUD ----
