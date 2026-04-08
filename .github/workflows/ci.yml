@@ -37,7 +37,7 @@ jobs:
       - name: Cargo audit
         run: |
           cargo install cargo-audit --locked
-          cargo audit 2>&1 || true
+          cargo audit 2>&1
 
   test:
     name: Test
