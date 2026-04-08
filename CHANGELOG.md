@@ -7,17 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Author: Rwx-G
 
-## [Unreleased]
-
-### Added
-
-- Persist API sessions to SQLite for restart resilience (sessions survive daemon restarts with in-memory cache for fast lookups)
-
-### Fixed
-
-- Log warning when a backend has `tls_skip_verify` enabled to alert operators that upstream TLS certificate validation is disabled
-- Add `aria-label` to all icon-only buttons across the dashboard for screen reader accessibility
-
 ## [1.0.0] - 2026-04-08
 
 ### Added
