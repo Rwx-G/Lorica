@@ -409,6 +409,103 @@
     return formStateToCreateRequest(form);
   }
 
+  // Builtin security header presets for comparison
+  const BUILTIN_PRESETS: Record<string, Record<string, string>> = {
+    strict: {
+      'Strict-Transport-Security': 'max-age=63072000; includeSubDomains; preload',
+      'X-Frame-Options': 'DENY',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+      'Content-Security-Policy': "default-src 'self'",
+      'Permissions-Policy': 'geolocation=(), camera=(), microphone=()',
+      'X-XSS-Protection': '1; mode=block',
+    },
+    moderate: {
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'SAMEORIGIN',
+      'X-XSS-Protection': '1; mode=block',
+      'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
+    },
+  };
+
+  function headersMatch(a: Record<string, string>, b: Record<string, string>): boolean {
+    const keysA = Object.keys(a).sort();
+    const keysB = Object.keys(b).sort();
+    if (keysA.length !== keysB.length) return false;
+    return keysA.every((k, i) => k === keysB[i] && a[k] === b[k]);
+  }
+
+  async function resolveSecurityPresets() {
+    // Collect routes that need preset resolution
+    const routesWithAuto = importRoutes.filter(r => r.security_headers === 'auto' && r._securityHeaders);
+    if (routesWithAuto.length === 0) return;
+
+    // Fetch existing custom presets
+    const settingsRes = await api.getSettings();
+    const customPresets: Record<string, Record<string, string>> = {};
+    if (settingsRes.data?.custom_security_presets) {
+      for (const p of settingsRes.data.custom_security_presets) {
+        customPresets[p.name] = p.headers;
+      }
+    }
+
+    // All known presets: builtins + existing customs
+    const allPresets = { ...BUILTIN_PRESETS, ...customPresets };
+
+    // New presets to create
+    const newPresets: { name: string; headers: Record<string, string> }[] = [];
+
+    for (const route of routesWithAuto) {
+      const imported = route._securityHeaders!;
+
+      // Try to match an existing preset
+      let matched: string | null = null;
+      for (const [name, headers] of Object.entries(allPresets)) {
+        if (headersMatch(imported, headers)) {
+          matched = name;
+          break;
+        }
+      }
+
+      if (matched) {
+        route.security_headers = matched;
+      } else {
+        // Create a new preset named after the hostname
+        const presetName = route.hostname || 'imported';
+        // Avoid duplicates if multiple routes have the same unmatched headers
+        if (!allPresets[presetName]) {
+          newPresets.push({ name: presetName, headers: imported });
+          allPresets[presetName] = imported;
+        }
+        route.security_headers = presetName;
+      }
+    }
+
+    // Save new presets via settings API
+    if (newPresets.length > 0) {
+      const existingList = settingsRes.data?.custom_security_presets ?? [];
+      const merged = [...existingList, ...newPresets];
+      const res = await api.updateSettings({ custom_security_presets: merged });
+      if (res.error) {
+        applyResults = [...applyResults, {
+          type: 'backend' as const,
+          label: 'Security presets',
+          success: false,
+          error: res.error.message,
+        }];
+      } else {
+        for (const p of newPresets) {
+          applyResults = [...applyResults, {
+            type: 'backend' as const,
+            label: `Security preset "${p.name}"`,
+            success: true,
+          }];
+        }
+      }
+    }
+  }
+
   // Step 4: apply
   async function applyImport() {
     applying = true;
@@ -449,6 +546,10 @@
         }
       }
     }
+
+    // Resolve security header presets: match imported headers against existing presets,
+    // create custom presets for unmatched configurations
+    await resolveSecurityPresets();
 
     // Create routes
     for (const route of importRoutes) {

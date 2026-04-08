@@ -90,6 +90,8 @@ export interface LoricaRouteImport {
   send_timeout_s: number;
   max_request_body_bytes: number | null;
   security_headers: string;
+  /** Security headers detected during import, for preset matching. */
+  _securityHeaders?: Record<string, string>;
   strip_path_prefix: string | null;
   add_path_prefix: string | null;
   path_rewrite_pattern: string | null;
@@ -304,11 +306,15 @@ const DIRECTIVE_MAP: Record<string, DirectiveHandler> = {
       val = val.slice(1, -1);
     }
     if (key) {
-      r.response_headers[key] = val;
-      r.importedFields.add('response_headers');
       if (isSecurityHeader(key)) {
-        r.security_headers = 'strict';
+        // Track security headers separately for preset matching during import
+        if (!r._securityHeaders) r._securityHeaders = {};
+        r._securityHeaders[key] = val;
+        r.security_headers = 'auto';
         r.importedFields.add('security_headers');
+      } else {
+        r.response_headers[key] = val;
+        r.importedFields.add('response_headers');
       }
     }
   },
