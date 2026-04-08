@@ -53,8 +53,9 @@ impl AcmeChallengeStore {
     }
 
     pub fn with_db_path(path: std::path::PathBuf) -> Self {
-        // Ensure the acme_challenges table exists
+        // Ensure the acme_challenges table exists and WAL mode is enabled
         if let Ok(conn) = rusqlite::Connection::open(&path) {
+            let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
             let _ = conn.execute(
                 "CREATE TABLE IF NOT EXISTS acme_challenges (token TEXT PRIMARY KEY, key_auth TEXT NOT NULL)",
                 [],
@@ -83,13 +84,15 @@ impl AcmeChallengeStore {
     pub async fn get(&self, token: &str) -> Option<String> {
         // Try in-memory first (supervisor process)
         if let Some(val) = self.challenges.read().await.get(token).cloned() {
+            tracing::debug!(token = token, "ACME challenge found in memory");
             return Some(val);
         }
         // Fall back to SQLite (worker processes)
         let db_path = self.db_path.clone();
         let token_owned = token.to_string();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let conn = rusqlite::Connection::open(&db_path).ok()?;
+            let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
             conn.query_row(
                 "SELECT key_auth FROM acme_challenges WHERE token = ?1",
                 rusqlite::params![token_owned],
@@ -99,7 +102,13 @@ impl AcmeChallengeStore {
         })
         .await
         .ok()
-        .flatten()
+        .flatten();
+        if result.is_some() {
+            tracing::debug!(token = token, "ACME challenge found in SQLite");
+        } else {
+            tracing::debug!(token = token, db = %self.db_path.display(), "ACME challenge not found");
+        }
+        result
     }
 
     pub async fn remove(&self, token: &str) {
@@ -200,7 +209,8 @@ pub async fn provision_certificate(
     Extension(state): Extension<AppState>,
     Json(body): Json<AcmeProvisionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if body.domain.is_empty() {
+    let domain = body.domain.trim().to_string();
+    if domain.is_empty() {
         return Err(ApiError::BadRequest("domain is required".into()));
     }
 
@@ -210,27 +220,27 @@ pub async fn provision_certificate(
     };
 
     info!(
-        domain = %body.domain,
+        domain = %domain,
         staging = config.staging,
         directory = config.directory_url(),
         "starting ACME certificate provisioning"
     );
 
     // Use instant-acme to provision
-    let result = provision_with_acme(&state, &config, &body.domain).await;
+    let result = provision_with_acme(&state, &config, &domain).await;
 
     match result {
         Ok(cert_id) => {
-            info!(domain = %body.domain, cert_id = %cert_id, "ACME certificate provisioned");
+            info!(domain = %domain, cert_id = %cert_id, "ACME certificate provisioned");
             Ok(json_data(AcmeProvisionResponse {
                 status: "provisioned".into(),
-                domain: body.domain,
+                domain,
                 staging: config.staging,
                 message: format!("Certificate provisioned (id: {cert_id})"),
             }))
         }
         Err(e) => {
-            warn!(domain = %body.domain, error = %e, "ACME provisioning failed");
+            warn!(domain = %domain, error = %e, "ACME provisioning failed");
             // Fallback: don't disrupt existing certs, just report failure
             Err(ApiError::Internal(format!("ACME provisioning failed: {e}")))
         }
