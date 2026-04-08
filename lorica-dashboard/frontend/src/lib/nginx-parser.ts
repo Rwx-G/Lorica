@@ -201,6 +201,7 @@ const SECURITY_HEADER_NAMES = new Set([
   'x-xss-protection',
   'referrer-policy',
   'content-security-policy',
+  'permissions-policy',
 ]);
 
 /**

@@ -430,10 +430,13 @@
   };
 
   function headersMatch(a: Record<string, string>, b: Record<string, string>): boolean {
-    const keysA = Object.keys(a).sort();
-    const keysB = Object.keys(b).sort();
+    // Normalize keys to lowercase for case-insensitive comparison
+    const normA = Object.fromEntries(Object.entries(a).map(([k, v]) => [k.toLowerCase(), v]));
+    const normB = Object.fromEntries(Object.entries(b).map(([k, v]) => [k.toLowerCase(), v]));
+    const keysA = Object.keys(normA).sort();
+    const keysB = Object.keys(normB).sort();
     if (keysA.length !== keysB.length) return false;
-    return keysA.every((k, i) => k === keysB[i] && a[k] === b[k]);
+    return keysA.every((k, i) => k === keysB[i] && normA[k] === normB[k]);
   }
 
   async function resolveSecurityPresets() {
