@@ -216,15 +216,17 @@ pub async fn provision_certificate(
     Extension(state): Extension<AppState>,
     Json(body): Json<AcmeProvisionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = body.domain.trim().to_string();
-    if domain.is_empty() {
+    // Support multi-domain: "www.rwx-g.fr, rwx-g.fr" or "www.rwx-g.fr,rwx-g.fr"
+    let domains: Vec<String> = body
+        .domain
+        .split(',')
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if domains.is_empty() {
         return Err(ApiError::BadRequest("domain is required".into()));
     }
-    if domain.contains(',') || domain.contains(' ') {
-        return Err(ApiError::BadRequest(
-            "ACME provisions one domain at a time. Remove commas/spaces and provision each domain separately.".into(),
-        ));
-    }
+    let primary_domain = domains[0].clone();
 
     let config = AcmeConfig {
         staging: body.staging,
@@ -232,28 +234,26 @@ pub async fn provision_certificate(
     };
 
     info!(
-        domain = %domain,
+        domains = ?domains,
         staging = config.staging,
         directory = config.directory_url(),
         "starting ACME certificate provisioning"
     );
 
-    // Use instant-acme to provision
-    let result = provision_with_acme(&state, &config, &domain).await;
+    let result = provision_with_acme(&state, &config, &domains).await;
 
     match result {
         Ok(cert_id) => {
-            info!(domain = %domain, cert_id = %cert_id, "ACME certificate provisioned");
+            info!(domains = ?domains, cert_id = %cert_id, "ACME certificate provisioned");
             Ok(json_data(AcmeProvisionResponse {
                 status: "provisioned".into(),
-                domain,
+                domain: primary_domain,
                 staging: config.staging,
-                message: format!("Certificate provisioned (id: {cert_id})"),
+                message: format!("Certificate provisioned for {} domain(s) (id: {cert_id})", domains.len()),
             }))
         }
         Err(e) => {
-            warn!(domain = %domain, error = %e, "ACME provisioning failed");
-            // Fallback: don't disrupt existing certs, just report failure
+            warn!(domains = ?domains, error = %e, "ACME provisioning failed");
             Err(ApiError::Internal(format!("ACME provisioning failed: {e}")))
         }
     }
@@ -279,14 +279,17 @@ pub async fn serve_challenge(
 }
 
 /// Internal ACME provisioning logic using instant-acme.
+/// Supports multi-domain SAN certificates (one order, N challenges).
 async fn provision_with_acme(
     state: &AppState,
     config: &AcmeConfig,
-    domain: &str,
+    domains: &[String],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
         Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
     };
+
+    let primary_domain = &domains[0];
 
     // Create or load ACME account
     let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
@@ -303,23 +306,27 @@ async fn provision_with_acme(
     )
     .await?;
 
-    // Create order for the domain
-    let identifier = Identifier::Dns(domain.to_string());
+    // Create order with all domains as identifiers
+    let identifiers: Vec<Identifier> = domains
+        .iter()
+        .map(|d| Identifier::Dns(d.clone()))
+        .collect();
     let mut order = account
         .new_order(&NewOrder {
-            identifiers: &[identifier],
+            identifiers: &identifiers,
         })
         .await?;
 
-    // Get authorizations
+    // Get authorizations (one per domain)
     let authorizations = order.authorizations().await?;
 
+    // Phase 1: Store all challenge tokens before signaling readiness
+    let mut challenge_info: Vec<(String, String)> = Vec::new(); // (token, challenge_url)
     for auth in &authorizations {
         if matches!(auth.status, AuthorizationStatus::Valid) {
             continue;
         }
 
-        // Find HTTP-01 challenge
         let challenge = auth
             .challenges
             .iter()
@@ -338,43 +345,56 @@ async fn provision_with_acme(
                 .await;
         }
 
-        // Tell ACME server we're ready
-        order.set_challenge_ready(&challenge.url).await?;
+        challenge_info.push((challenge.token.clone(), challenge.url.clone()));
+    }
 
-        // Wait for validation (poll with backoff)
-        let mut attempts = 0;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let fresh_auth = order.authorizations().await?;
-            let auth = &fresh_auth[0];
+    // Phase 2: Signal readiness for all challenges
+    for (_, url) in &challenge_info {
+        order.set_challenge_ready(url).await?;
+    }
 
-            match auth.status {
-                AuthorizationStatus::Valid => break,
-                AuthorizationStatus::Pending => {
-                    attempts += 1;
-                    if attempts > 15 {
-                        return Err("challenge validation timed out after 30s".into());
-                    }
-                }
-                AuthorizationStatus::Invalid => {
-                    return Err("challenge validation failed (invalid)".into());
-                }
-                _ => {
-                    return Err(
-                        format!("unexpected authorization status: {:?}", auth.status).into(),
-                    );
-                }
-            }
+    // Phase 3: Wait for all authorizations to become valid
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let fresh_auths = order.authorizations().await?;
+
+        let all_valid = fresh_auths
+            .iter()
+            .all(|a| matches!(a.status, AuthorizationStatus::Valid));
+        if all_valid {
+            break;
         }
 
-        // Clean up challenge
-        if let Some(ref store) = state.acme_challenge_store {
-            store.remove(&challenge.token).await;
+        let any_invalid = fresh_auths
+            .iter()
+            .any(|a| matches!(a.status, AuthorizationStatus::Invalid));
+        if any_invalid {
+            // Find which domain failed
+            let failed: Vec<String> = fresh_auths
+                .iter()
+                .filter(|a| matches!(a.status, AuthorizationStatus::Invalid))
+                .filter_map(|a| a.identifier.as_ref())
+                .map(|id| format!("{:?}", id))
+                .collect();
+            return Err(format!("challenge validation failed for: {}", failed.join(", ")).into());
+        }
+
+        attempts += 1;
+        if attempts > 15 {
+            return Err("challenge validation timed out after 30s".into());
         }
     }
 
-    // Generate CSR and finalize order
-    let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
+    // Clean up all challenge tokens
+    if let Some(ref store) = state.acme_challenge_store {
+        for (token, _) in &challenge_info {
+            store.remove(token).await;
+        }
+    }
+
+    // Generate CSR with all domains as SANs and finalize order
+    let mut params = rcgen::CertificateParams::new(domains.to_vec())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     let private_key = rcgen::KeyPair::generate()?;
     let csr = params.serialize_request(&private_key)?;
@@ -409,14 +429,13 @@ async fn provision_with_acme(
     // Store certificate in database
     let now = chrono::Utc::now();
     let cert_id = uuid::Uuid::new_v4().to_string();
-
-    // Parse cert to get expiry info
-    let fingerprint = format!("acme:{domain}");
+    let san_domains: Vec<String> = domains.iter().skip(1).cloned().collect();
+    let fingerprint = format!("acme:{}", domains.join(","));
 
     let cert = lorica_config::models::Certificate {
         id: cert_id.clone(),
-        domain: domain.to_string(),
-        san_domains: vec![domain.to_string()],
+        domain: primary_domain.clone(),
+        san_domains,
         fingerprint,
         cert_pem,
         key_pem,
@@ -505,7 +524,10 @@ pub fn spawn_renewal_task(
                     contact_email: None,
                 };
 
-                match provision_with_acme(&state, &config, &cert.domain).await {
+                // Renew with all domains (primary + SANs)
+                let mut all_domains = vec![cert.domain.clone()];
+                all_domains.extend(cert.san_domains.iter().cloned());
+                match provision_with_acme(&state, &config, &all_domains).await {
                     Ok(new_cert_id) => {
                         info!(
                             domain = %cert.domain,
@@ -641,7 +663,10 @@ pub async fn renew_certificate(
         contact_email: None,
     };
 
-    let new_cert_id = provision_with_acme(&state, &config, &cert.domain)
+    // Renew with all domains (primary + SANs)
+    let mut all_domains = vec![cert.domain.clone()];
+    all_domains.extend(cert.san_domains.iter().cloned());
+    let new_cert_id = provision_with_acme(&state, &config, &all_domains)
         .await
         .map_err(|e| ApiError::Internal(format!("ACME renewal failed: {e}")))?;
 
