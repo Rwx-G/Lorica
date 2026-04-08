@@ -784,7 +784,7 @@
             {#if certEntries.length > 0}
               <div class="section">
                 <h4>TLS certificates (optional)</h4>
-                <p class="step-hint">Paste certificate and private key to import them with the route. Leave empty to configure later via the Certificates page or ACME.</p>
+                <p class="step-hint">Paste certificate and private key to import them with the route. Leave empty to configure later - you may prefer to create them via ACME (Let's Encrypt) directly on Lorica.</p>
                 {#each certEntries as cert, i}
                   <div class="cert-import-entry">
                     <label class="include-label">
