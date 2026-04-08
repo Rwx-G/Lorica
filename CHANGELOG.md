@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Author: Rwx-G
 
+## [Unreleased]
+
+### Fixed
+
+- Use OWASP Argon2id parameters for password hashing (was using Argon2 defaults)
+- Add maximum password length (128 chars) to prevent DoS via large passwords
+- Make `cargo audit` failures block the CI build (remove `|| true`)
+- Validate DNS server parameter format before passing to `dig`
+- Add CSP, X-Frame-Options, X-Content-Type-Options, and Referrer-Policy headers on dashboard
+- Invalidate all other sessions on password change
+- Per-IP login rate limiting instead of a single global bucket
+- Add 10 MB global request body size limit on the API
+
+### Security
+
+- Addressed findings H3, M1, M2, M3, M5, L1, L7 from the security audit
+
 ## [1.0.0] - 2026-04-08
 
 ### Added
