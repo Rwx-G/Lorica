@@ -47,8 +47,10 @@
   // Step 2: TLS certificate import
   interface CertEntry {
     hostname: string;
+    aliases: string[];
     certPath: string;
     keyPath: string;
+    mode: 'acme' | 'import' | 'skip';
     certContent: string;
     keyContent: string;
   }
@@ -201,7 +203,7 @@
         content: '',
       }));
 
-    // Extract TLS certificate paths (deduplicate by hostname)
+    // Extract TLS certificate paths (deduplicate by hostname, include aliases for SAN)
     const seenCertHosts = new Set<string>();
     certEntries = [];
     for (const route of importRoutes) {
@@ -209,8 +211,10 @@
         seenCertHosts.add(route.hostname);
         certEntries.push({
           hostname: route.hostname,
+          aliases: route.hostname_aliases.filter(Boolean),
           certPath: route._sslCertPath,
           keyPath: route._sslKeyPath,
+          mode: 'acme',
           certContent: '',
           keyContent: '',
         });
@@ -631,26 +635,67 @@
     // Create TLS certificates and build hostname -> cert_id map
     const certIdMap = new Map<string, string>();
     for (const cert of certEntries) {
-      if (!cert.certContent.trim() || !cert.keyContent.trim()) continue;
-      const res = await api.createCertificate({
-        domain: cert.hostname,
-        cert_pem: cert.certContent.trim(),
-        key_pem: cert.keyContent.trim(),
-      });
-      if (res.error) {
-        applyResults = [...applyResults, {
-          type: 'backend' as const,
-          label: `Certificate ${cert.hostname}`,
-          success: false,
-          error: res.error.message,
-        }];
-      } else if (res.data) {
-        certIdMap.set(cert.hostname, res.data.id);
-        applyResults = [...applyResults, {
-          type: 'backend' as const,
-          label: `Certificate ${cert.hostname}`,
-          success: true,
-        }];
+      if (cert.mode === 'skip') continue;
+
+      if (cert.mode === 'acme') {
+        // ACME provisioning: include hostname + aliases as SAN domains
+        const allDomains = [cert.hostname, ...cert.aliases].join(', ');
+        const res = await api.provisionAcme({
+          domain: allDomains,
+          staging: false,
+        });
+        if (res.error) {
+          applyResults = [...applyResults, {
+            type: 'backend' as const,
+            label: `ACME certificate ${cert.hostname}`,
+            success: false,
+            error: res.error.message,
+          }];
+        } else if (res.data) {
+          // Fetch the cert list to find the newly created cert ID
+          const certsRes = await api.listCertificates();
+          if (certsRes.data) {
+            const newCert = certsRes.data.certificates.find(c => c.domain === cert.hostname);
+            if (newCert) {
+              certIdMap.set(cert.hostname, newCert.id);
+              // Also map aliases to the same cert
+              for (const alias of cert.aliases) {
+                certIdMap.set(alias, newCert.id);
+              }
+            }
+          }
+          applyResults = [...applyResults, {
+            type: 'backend' as const,
+            label: `ACME certificate ${allDomains}`,
+            success: true,
+          }];
+        }
+      } else if (cert.mode === 'import') {
+        // Import PEM: only if content provided
+        if (!cert.certContent.trim() || !cert.keyContent.trim()) continue;
+        const res = await api.createCertificate({
+          domain: cert.hostname,
+          cert_pem: cert.certContent.trim(),
+          key_pem: cert.keyContent.trim(),
+        });
+        if (res.error) {
+          applyResults = [...applyResults, {
+            type: 'backend' as const,
+            label: `Certificate ${cert.hostname}`,
+            success: false,
+            error: res.error.message,
+          }];
+        } else if (res.data) {
+          certIdMap.set(cert.hostname, res.data.id);
+          for (const alias of cert.aliases) {
+            certIdMap.set(alias, res.data.id);
+          }
+          applyResults = [...applyResults, {
+            type: 'backend' as const,
+            label: `Certificate ${cert.hostname}`,
+            success: true,
+          }];
+        }
       }
     }
 
@@ -783,38 +828,48 @@
             <!-- TLS certificates -->
             {#if certEntries.length > 0}
               <div class="section">
-                <h4>TLS certificates (optional)</h4>
-                <p class="step-hint">Paste certificate and private key to import them with the route. Leave empty to configure later - you may prefer to create them via ACME (Let's Encrypt) directly on Lorica.</p>
+                <h4>TLS certificates</h4>
                 {#each certEntries as cert, i}
                   <div class="cert-import-entry">
                     <label class="include-label">
                       <span class="badge badge-tls">TLS</span>
-                      <code>{cert.hostname}</code>
+                      <code>{cert.hostname}{cert.aliases.length > 0 ? `, ${cert.aliases.join(', ')}` : ''}</code>
                     </label>
-                    <div class="cert-import-row">
-                      <div class="cert-import-col">
-                        <span class="cert-import-label">Certificate (fullchain.pem)</span>
-                        <div class="include-cmd"><code>sudo cat {cert.certPath}</code></div>
-                        <textarea
-                          class="include-textarea"
-                          bind:value={certEntries[i].certContent}
-                          placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
-                          rows="4"
-                          spellcheck="false"
-                        ></textarea>
-                      </div>
-                      <div class="cert-import-col">
-                        <span class="cert-import-label">Private key (privkey.pem)</span>
-                        <div class="include-cmd"><code>sudo cat {cert.keyPath}</code></div>
-                        <textarea
-                          class="include-textarea"
-                          bind:value={certEntries[i].keyContent}
-                          placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"
-                          rows="4"
-                          spellcheck="false"
-                        ></textarea>
-                      </div>
+                    <div class="cert-mode-toggle">
+                      <button class="cert-mode-btn" class:active={cert.mode === 'acme'} onclick={() => { certEntries[i].mode = 'acme'; certEntries = [...certEntries]; }}>ACME (Let's Encrypt)</button>
+                      <button class="cert-mode-btn" class:active={cert.mode === 'import'} onclick={() => { certEntries[i].mode = 'import'; certEntries = [...certEntries]; }}>Import PEM</button>
+                      <button class="cert-mode-btn" class:active={cert.mode === 'skip'} onclick={() => { certEntries[i].mode = 'skip'; certEntries = [...certEntries]; }}>Skip</button>
                     </div>
+                    {#if cert.mode === 'acme'}
+                      <p class="step-hint">Certificate will be provisioned automatically via Let's Encrypt HTTP-01. Ensure DNS for {cert.hostname}{cert.aliases.length > 0 ? ` and ${cert.aliases.join(', ')}` : ''} points to this Lorica server on port 80.</p>
+                    {:else if cert.mode === 'import'}
+                      <div class="cert-import-row">
+                        <div class="cert-import-col">
+                          <span class="cert-import-label">Certificate (fullchain.pem)</span>
+                          <div class="include-cmd"><code>sudo cat {cert.certPath}</code></div>
+                          <textarea
+                            class="include-textarea"
+                            bind:value={certEntries[i].certContent}
+                            placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+                            rows="4"
+                            spellcheck="false"
+                          ></textarea>
+                        </div>
+                        <div class="cert-import-col">
+                          <span class="cert-import-label">Private key (privkey.pem)</span>
+                          <div class="include-cmd"><code>sudo cat {cert.keyPath}</code></div>
+                          <textarea
+                            class="include-textarea"
+                            bind:value={certEntries[i].keyContent}
+                            placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"
+                            rows="4"
+                            spellcheck="false"
+                          ></textarea>
+                        </div>
+                      </div>
+                    {:else}
+                      <p class="step-hint">No certificate will be created. You can configure it later in the Certificates page.</p>
+                    {/if}
                   </div>
                 {/each}
               </div>
@@ -1006,10 +1061,10 @@
               {/each}
             </div>
 
-            {#if importRoutes.some((r) => r.certificate_needed)}
+            {#if certEntries.some((c) => c.mode === 'skip')}
               <div class="cert-notice">
-                <strong>TLS certificates needed</strong>
-                <p>The imported route(s) had SSL certificates configured in Nginx. Upload or provision the certificates in the Certificates page, then assign them to the imported route(s) in the Route Drawer to enable HTTPS.</p>
+                <strong>TLS certificates skipped</strong>
+                <p>Some certificates were skipped during import. Configure them in the Certificates page (upload or ACME), then assign them to the routes in the Route Drawer to enable HTTPS.</p>
               </div>
             {/if}
 
@@ -1465,6 +1520,40 @@
     border-radius: var(--radius-sm);
     font-family: var(--mono);
     user-select: all;
+  }
+
+  .cert-mode-toggle {
+    display: flex;
+    gap: 0;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    width: fit-content;
+  }
+
+  .cert-mode-btn {
+    padding: 0.375rem 0.75rem;
+    border: none;
+    background: var(--color-bg-input);
+    color: var(--color-text-muted);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    transition: all 0.15s;
+    border-right: 1px solid var(--color-border);
+  }
+
+  .cert-mode-btn:last-child {
+    border-right: none;
+  }
+
+  .cert-mode-btn.active {
+    background: var(--color-primary);
+    color: white;
+    font-weight: 600;
+  }
+
+  .cert-mode-btn:hover:not(.active) {
+    background: var(--color-bg-hover);
   }
 
   .cert-import-entry {
