@@ -122,16 +122,6 @@ impl ConfigStore {
         }
     }
 
-    /// Encrypt a DNS config JSON string for storage. Public so the API crate can use it.
-    pub fn encrypt_dns_config(&self, config: &str) -> Result<String> {
-        self.encrypt_config(config)
-    }
-
-    /// Decrypt a DNS config JSON string from storage. Public so the API crate can use it.
-    pub fn decrypt_dns_config(&self, stored: &str) -> Result<String> {
-        self.decrypt_config(stored)
-    }
-
     fn run_migrations(&self) -> Result<()> {
         // Ensure schema_migrations table exists before querying it
         self.conn.execute_batch(
@@ -916,16 +906,11 @@ impl ConfigStore {
         let san_json = serde_json::to_string(&cert.san_domains)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
         let encrypted_key = self.encrypt_key_pem(&cert.key_pem)?;
-        let encrypted_dns_config = cert
-            .acme_dns_config
-            .as_ref()
-            .map(|c| self.encrypt_config(c))
-            .transpose()?;
         self.conn.execute(
             "INSERT INTO certificates (id, domain, san_domains, fingerprint, cert_pem, key_pem,
              issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
-             acme_method, acme_dns_config, acme_dns_provider_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             acme_method, acme_dns_provider_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 cert.id,
                 cert.domain,
@@ -940,7 +925,6 @@ impl ConfigStore {
                 cert.acme_auto_renew,
                 cert.created_at.to_rfc3339(),
                 cert.acme_method,
-                encrypted_dns_config,
                 cert.acme_dns_provider_id,
             ],
         )?;
@@ -953,7 +937,7 @@ impl ConfigStore {
             .query_row(
                 "SELECT id, domain, san_domains, fingerprint, cert_pem, key_pem,
                  issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
-                 acme_method, acme_dns_config, acme_dns_provider_id
+                 acme_method, acme_dns_provider_id
                  FROM certificates WHERE id = ?1",
                 params![id],
                 |row| Ok(self.row_to_certificate(row)),
@@ -967,7 +951,7 @@ impl ConfigStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, domain, san_domains, fingerprint, cert_pem, key_pem,
              issuer, not_before, not_after, is_acme, acme_auto_renew, created_at,
-             acme_method, acme_dns_config, acme_dns_provider_id
+             acme_method, acme_dns_provider_id
              FROM certificates ORDER BY domain",
         )?;
         let rows = stmt.query_map([], |row| Ok(self.row_to_certificate(row)))?;
@@ -983,16 +967,11 @@ impl ConfigStore {
         let san_json = serde_json::to_string(&cert.san_domains)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
         let encrypted_key = self.encrypt_key_pem(&cert.key_pem)?;
-        let encrypted_dns_config = cert
-            .acme_dns_config
-            .as_ref()
-            .map(|c| self.encrypt_config(c))
-            .transpose()?;
         let changed = self.conn.execute(
             "UPDATE certificates SET domain=?2, san_domains=?3, fingerprint=?4,
              cert_pem=?5, key_pem=?6, issuer=?7, not_before=?8, not_after=?9,
-             is_acme=?10, acme_auto_renew=?11, acme_method=?12, acme_dns_config=?13,
-             acme_dns_provider_id=?14
+             is_acme=?10, acme_auto_renew=?11, acme_method=?12,
+             acme_dns_provider_id=?13
              WHERE id=?1",
             params![
                 cert.id,
@@ -1007,7 +986,6 @@ impl ConfigStore {
                 cert.is_acme,
                 cert.acme_auto_renew,
                 cert.acme_method,
-                encrypted_dns_config,
                 cert.acme_dns_provider_id,
             ],
         )?;
@@ -1730,11 +1708,7 @@ impl ConfigStore {
         let key_pem_raw: Vec<u8> = row.get(5)?;
         let key_pem = self.decrypt_key_pem(&key_pem_raw)?;
         let acme_method: Option<String> = row.get(12)?;
-        let encrypted_dns_config: Option<String> = row.get(13)?;
-        let acme_dns_config = encrypted_dns_config
-            .map(|c| self.decrypt_config(&c))
-            .transpose()?;
-        let acme_dns_provider_id: Option<String> = row.get(14)?;
+        let acme_dns_provider_id: Option<String> = row.get(13)?;
         Ok(Certificate {
             id: row.get(0)?,
             domain: row.get(1)?,
@@ -1749,7 +1723,6 @@ impl ConfigStore {
             acme_auto_renew: row.get(10)?,
             created_at: parse_datetime(&row.get::<_, String>(11)?)?,
             acme_method,
-            acme_dns_config,
             acme_dns_provider_id,
         })
     }

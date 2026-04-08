@@ -238,7 +238,7 @@ pub async fn create_certificate(
         acme_auto_renew: false,
         created_at: now,
         acme_method: None,
-        acme_dns_config: None,
+
         acme_dns_provider_id: None,
     };
 
@@ -402,7 +402,7 @@ pub async fn generate_self_signed(
         acme_auto_renew: false,
         created_at: now,
         acme_method: None,
-        acme_dns_config: None,
+
         acme_dns_provider_id: None,
     };
 

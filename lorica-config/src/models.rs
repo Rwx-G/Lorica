@@ -514,13 +514,7 @@ pub struct Certificate {
     /// "dns01-route53", "dns01-manual". None for non-ACME certificates.
     #[serde(default)]
     pub acme_method: Option<String>,
-    /// Encrypted JSON containing DNS provider credentials for auto-renewal.
-    /// Only set for dns01-* methods (not manual or http01).
-    /// Deprecated: use `acme_dns_provider_id` instead for new certificates.
-    #[serde(default)]
-    pub acme_dns_config: Option<String>,
     /// Reference to a global DNS provider (dns_providers.id).
-    /// Used instead of per-certificate `acme_dns_config` for new certificates.
     #[serde(default)]
     pub acme_dns_provider_id: Option<String>,
 }

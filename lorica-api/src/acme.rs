@@ -452,7 +452,7 @@ async fn provision_with_acme(
         acme_auto_renew: true,
         created_at: now,
         acme_method: Some("http01".into()),
-        acme_dns_config: None,
+
         acme_dns_provider_id: None,
     };
 
@@ -777,18 +777,9 @@ async fn renew_with_method(
                 let cfg: DnsChallengeConfig = serde_json::from_str(&dp.config)
                     .map_err(|e| format!("failed to parse DNS provider config: {e}"))?;
                 (cfg, Some(pid.clone()))
-            } else if let Some(ref encrypted) = cert.acme_dns_config {
-                // Legacy fallback: per-certificate encrypted config
-                let dns_config_json = {
-                    let store = state.store.lock().await;
-                    store.decrypt_dns_config(encrypted)?
-                };
-                let cfg: DnsChallengeConfig = serde_json::from_str(&dns_config_json)
-                    .map_err(|e| format!("failed to parse stored DNS config: {e}"))?;
-                (cfg, None)
             } else {
                 return Err(format!(
-                    "certificate has method '{m}' but no DNS provider or stored DNS config - \
+                    "certificate has method '{m}' but no DNS provider configured - \
                      cannot auto-renew"
                 )
                 .into());
@@ -813,7 +804,6 @@ async fn renew_with_method(
                 domains,
                 challenger.as_ref(),
                 m,
-                cert.acme_dns_config.clone(),
                 dns_provider_id,
             )
             .await
@@ -1447,21 +1437,6 @@ pub async fn provision_certificate_dns(
 
     let acme_method = format!("dns01-{}", dns_config.provider);
 
-    // Encrypt DNS credentials for storage so auto-renewal can reuse them (legacy path only)
-    let encrypted_dns_config = if dns_provider_id.is_none() {
-        let dns_config_json = serde_json::to_string(&dns_config).unwrap_or_default();
-        let store = state.store.lock().await;
-        match store.encrypt_dns_config(&dns_config_json) {
-            Ok(enc) => Some(enc),
-            Err(e) => {
-                warn!(error = %e, "failed to encrypt DNS config, auto-renewal will not work");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     info!(
         domains = ?domains,
         staging = config.staging,
@@ -1477,7 +1452,6 @@ pub async fn provision_certificate_dns(
         &domains,
         challenger.as_ref(),
         &acme_method,
-        encrypted_dns_config,
         dns_provider_id,
     )
     .await;
@@ -1519,7 +1493,6 @@ async fn provision_with_acme_dns(
     domains: &[String],
     challenger: &dyn DnsChallenger,
     acme_method: &str,
-    encrypted_dns_config: Option<String>,
     dns_provider_id: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
@@ -1711,7 +1684,7 @@ async fn provision_with_acme_dns(
         acme_auto_renew: true,
         created_at: now,
         acme_method: Some(acme_method.to_string()),
-        acme_dns_config: encrypted_dns_config,
+
         acme_dns_provider_id: dns_provider_id,
     };
 
@@ -2178,7 +2151,7 @@ pub async fn provision_dns_manual_confirm(
         acme_auto_renew: false, // manual mode cannot auto-renew
         created_at: now,
         acme_method: Some("dns01-manual".into()),
-        acme_dns_config: None,
+
         acme_dns_provider_id: None,
     };
 
@@ -2580,7 +2553,7 @@ mod tests {
             acme_auto_renew: false,
             created_at: now - chrono::Duration::days(80),
             acme_method: None,
-            acme_dns_config: None,
+    
             acme_dns_provider_id: None,
         };
 
@@ -2599,7 +2572,7 @@ mod tests {
             acme_auto_renew: false,
             created_at: now - chrono::Duration::days(88),
             acme_method: None,
-            acme_dns_config: None,
+    
             acme_dns_provider_id: None,
         };
 
@@ -2618,7 +2591,7 @@ mod tests {
             acme_auto_renew: true,
             created_at: now - chrono::Duration::days(60),
             acme_method: Some("http01".into()),
-            acme_dns_config: None,
+    
             acme_dns_provider_id: None,
         };
 
