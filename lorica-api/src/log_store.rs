@@ -220,6 +220,94 @@ impl LogStore {
         Ok((entries, total))
     }
 
+    /// Query entries for export (up to `max` rows, no pagination). Returns oldest first.
+    pub fn query_export(&self, params: &LogsQuery, max: usize) -> Result<Vec<LogEntry>, String> {
+        let conn = self.conn.lock();
+
+        let mut conditions = Vec::new();
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(ref route) = params.route {
+            conditions.push("host LIKE ?".to_string());
+            bind_values.push(Box::new(format!("%{route}%")));
+        }
+        if let Some(status) = params.status {
+            conditions.push("status = ?".to_string());
+            bind_values.push(Box::new(status as i64));
+        }
+        if let Some(min) = params.status_min {
+            conditions.push("status >= ?".to_string());
+            bind_values.push(Box::new(min as i64));
+        }
+        if let Some(max_s) = params.status_max {
+            conditions.push("status <= ?".to_string());
+            bind_values.push(Box::new(max_s as i64));
+        }
+        if let Some(ref time_from) = params.time_from {
+            conditions.push("timestamp >= ?".to_string());
+            bind_values.push(Box::new(time_from.clone()));
+        }
+        if let Some(ref time_to) = params.time_to {
+            conditions.push("timestamp <= ?".to_string());
+            bind_values.push(Box::new(time_to.clone()));
+        }
+        if let Some(ref search) = params.search {
+            let pattern = format!("%{search}%");
+            conditions.push(
+                "(method LIKE ? OR path LIKE ? OR host LIKE ? OR backend LIKE ? OR error LIKE ?)"
+                    .to_string(),
+            );
+            bind_values.push(Box::new(pattern.clone()));
+            bind_values.push(Box::new(pattern.clone()));
+            bind_values.push(Box::new(pattern.clone()));
+            bind_values.push(Box::new(pattern.clone()));
+            bind_values.push(Box::new(pattern));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let query_sql = format!(
+            "SELECT id, timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff, xff_proxy_ip, source \
+             FROM access_logs {where_clause} ORDER BY id ASC LIMIT ?",
+        );
+        bind_values.push(Box::new(max as i64));
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+
+        let mut stmt = conn
+            .prepare(&query_sql)
+            .map_err(|e| format!("failed to prepare export query: {e}"))?;
+        let rows = stmt
+            .query_map(refs.as_slice(), |row| {
+                Ok(LogEntry {
+                    id: row.get::<_, i64>(0)? as u64,
+                    timestamp: row.get(1)?,
+                    method: row.get(2)?,
+                    path: row.get(3)?,
+                    host: row.get(4)?,
+                    status: row.get::<_, i64>(5)? as u16,
+                    latency_ms: row.get::<_, i64>(6)? as u64,
+                    backend: row.get(7)?,
+                    error: row.get(8)?,
+                    client_ip: row.get(9)?,
+                    is_xff: row.get::<_, i64>(10)? != 0,
+                    xff_proxy_ip: row.get::<_, String>(11).unwrap_or_default(),
+                    source: row.get::<_, String>(12).unwrap_or_default(),
+                })
+            })
+            .map_err(|e| format!("failed to query export logs: {e}"))?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row.map_err(|e| format!("failed to read export log row: {e}"))?);
+        }
+        Ok(entries)
+    }
+
     /// Delete entries older than the retention limit, keeping at most `max_entries` rows.
     pub fn enforce_retention(&self, max_entries: u64) -> Result<u64, String> {
         let conn = self.conn.lock();

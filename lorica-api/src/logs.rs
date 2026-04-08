@@ -3,6 +3,7 @@ use axum::extract::{Extension, Query};
 use axum::response::IntoResponse;
 use axum::Json;
 use futures_util::{SinkExt, StreamExt};
+use http::header;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -232,6 +233,188 @@ pub async fn get_logs(
     Ok(json_data(LogsResponse { entries, total }))
 }
 
+/// Query parameters for the log export endpoint.
+#[derive(Debug, Deserialize)]
+pub struct LogExportQuery {
+    /// Filter by route hostname.
+    pub route: Option<String>,
+    /// Filter by HTTP status code.
+    pub status: Option<u16>,
+    /// Filter by minimum status code.
+    pub status_min: Option<u16>,
+    /// Filter by maximum status code.
+    pub status_max: Option<u16>,
+    /// Filter by start time (ISO 8601 / RFC 3339).
+    pub time_from: Option<String>,
+    /// Filter by end time (ISO 8601 / RFC 3339).
+    pub time_to: Option<String>,
+    /// Search text across method, path, host, backend, error fields.
+    pub search: Option<String>,
+    /// Export format: "csv" (default) or "json".
+    pub format: Option<String>,
+}
+
+impl LogExportQuery {
+    /// Convert to a LogsQuery for reuse with the store query method.
+    fn to_logs_query(&self) -> LogsQuery {
+        LogsQuery {
+            route: self.route.clone(),
+            status: self.status,
+            status_min: self.status_min,
+            status_max: self.status_max,
+            time_from: self.time_from.clone(),
+            time_to: self.time_to.clone(),
+            search: self.search.clone(),
+            limit: None,
+            after_id: None,
+        }
+    }
+}
+
+/// Escape a field value for CSV output (RFC 4180).
+fn csv_escape(s: &str) -> String {
+    if s.contains('"') || s.contains(',') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Maximum number of entries for a single export request.
+const EXPORT_MAX_ENTRIES: usize = 100_000;
+
+/// GET /api/v1/logs/export
+pub async fn export_logs(
+    Extension(state): Extension<AppState>,
+    Query(params): Query<LogExportQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let format = params
+        .format
+        .as_deref()
+        .unwrap_or("csv")
+        .to_lowercase();
+
+    if format != "csv" && format != "json" {
+        return Err(ApiError::BadRequest(
+            "format must be \"csv\" or \"json\"".into(),
+        ));
+    }
+
+    let logs_query = params.to_logs_query();
+
+    // Collect entries from the persistent store or in-memory buffer.
+    let entries: Vec<LogEntry> = if let Some(ref store) = state.log_store {
+        store
+            .query_export(&logs_query, EXPORT_MAX_ENTRIES)
+            .map_err(|e| ApiError::Internal(format!("log export query failed: {e}")))?
+    } else {
+        // Fallback: filter in-memory buffer (same logic as get_logs but without limit).
+        let all = state.log_buffer.snapshot().await;
+        all.into_iter()
+            .filter(|e| {
+                if let Some(ref route) = logs_query.route {
+                    if !e.host.contains(route.as_str()) {
+                        return false;
+                    }
+                }
+                if let Some(status) = logs_query.status {
+                    if e.status != status {
+                        return false;
+                    }
+                }
+                if let Some(min) = logs_query.status_min {
+                    if e.status < min {
+                        return false;
+                    }
+                }
+                if let Some(max) = logs_query.status_max {
+                    if e.status > max {
+                        return false;
+                    }
+                }
+                if let Some(ref time_from) = logs_query.time_from {
+                    if e.timestamp.as_str() < time_from.as_str() {
+                        return false;
+                    }
+                }
+                if let Some(ref time_to) = logs_query.time_to {
+                    if e.timestamp.as_str() > time_to.as_str() {
+                        return false;
+                    }
+                }
+                if let Some(ref search) = logs_query.search {
+                    let s = search.to_lowercase();
+                    let matches = e.method.to_lowercase().contains(&s)
+                        || e.path.to_lowercase().contains(&s)
+                        || e.host.to_lowercase().contains(&s)
+                        || e.backend.to_lowercase().contains(&s)
+                        || e
+                            .error
+                            .as_ref()
+                            .is_some_and(|err| err.to_lowercase().contains(&s));
+                    if !matches {
+                        return false;
+                    }
+                }
+                true
+            })
+            .take(EXPORT_MAX_ENTRIES)
+            .collect()
+    };
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    if format == "json" {
+        let body = serde_json::to_string(&entries)
+            .map_err(|e| ApiError::Internal(format!("JSON serialization failed: {e}")))?;
+        let filename = format!("lorica-logs-{today}.json");
+        Ok((
+            [
+                (header::CONTENT_TYPE, "application/json".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                ),
+            ],
+            body,
+        ))
+    } else {
+        let mut csv = String::with_capacity(entries.len() * 120);
+        csv.push_str("timestamp,method,path,host,status,latency_ms,backend,client_ip,error\n");
+        for e in &entries {
+            csv.push_str(&csv_escape(&e.timestamp));
+            csv.push(',');
+            csv.push_str(&csv_escape(&e.method));
+            csv.push(',');
+            csv.push_str(&csv_escape(&e.path));
+            csv.push(',');
+            csv.push_str(&csv_escape(&e.host));
+            csv.push(',');
+            csv.push_str(&e.status.to_string());
+            csv.push(',');
+            csv.push_str(&e.latency_ms.to_string());
+            csv.push(',');
+            csv.push_str(&csv_escape(&e.backend));
+            csv.push(',');
+            csv.push_str(&csv_escape(&e.client_ip));
+            csv.push(',');
+            csv.push_str(&csv_escape(e.error.as_deref().unwrap_or("")));
+            csv.push('\n');
+        }
+        let filename = format!("lorica-logs-{today}.csv");
+        Ok((
+            [
+                (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                ),
+            ],
+            csv,
+        ))
+    }
+}
+
 /// DELETE /api/v1/logs
 pub async fn clear_logs(
     Extension(state): Extension<AppState>,
@@ -359,6 +542,48 @@ mod tests {
         assert_eq!(snap[0].id, 3);
         assert_eq!(snap[1].id, 4);
         assert_eq!(snap[2].id, 5);
+    }
+
+    #[test]
+    fn test_csv_escape_plain() {
+        assert_eq!(csv_escape("hello"), "hello");
+    }
+
+    #[test]
+    fn test_csv_escape_with_comma() {
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+    }
+
+    #[test]
+    fn test_csv_escape_with_quotes() {
+        assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn test_csv_escape_with_newline() {
+        assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    #[test]
+    fn test_log_export_query_to_logs_query() {
+        let export = LogExportQuery {
+            route: Some("example.com".into()),
+            status: None,
+            status_min: Some(200),
+            status_max: Some(299),
+            time_from: Some("2026-01-01T00:00:00Z".into()),
+            time_to: Some("2026-01-02T00:00:00Z".into()),
+            search: None,
+            format: Some("csv".into()),
+        };
+        let lq = export.to_logs_query();
+        assert_eq!(lq.route.as_deref(), Some("example.com"));
+        assert_eq!(lq.status_min, Some(200));
+        assert_eq!(lq.status_max, Some(299));
+        assert_eq!(lq.time_from.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(lq.time_to.as_deref(), Some("2026-01-02T00:00:00Z"));
+        assert!(lq.limit.is_none());
+        assert!(lq.after_id.is_none());
     }
 
     #[tokio::test]

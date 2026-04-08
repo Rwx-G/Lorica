@@ -151,6 +151,7 @@ pub fn build_router(
         .route("/api/v1/status", get(crate::status::get_status))
         .route("/api/v1/logs", get(crate::logs::get_logs))
         .route("/api/v1/logs", delete(crate::logs::clear_logs))
+        .route("/api/v1/logs/export", get(crate::logs::export_logs))
         .route("/api/v1/logs/ws", get(crate::logs::logs_ws))
         .route("/api/v1/system", get(crate::system::get_system))
         .route("/api/v1/workers", get(crate::workers::get_workers))

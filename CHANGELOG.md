@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Author: Rwx-G
 
+## [Unreleased]
+
+### Added
+
+- Log export endpoint (`GET /api/v1/logs/export`) with CSV and JSON format options, date range filtering, and downloadable file response
+- Log export UI in the Logs page with date range picker and format selector
+
 ## [1.0.0] - 2026-04-08
 
 ### Added
