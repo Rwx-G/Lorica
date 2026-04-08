@@ -788,6 +788,7 @@ fn run_supervisor(cli: Cli) {
         let api_worker_metrics = Arc::clone(&worker_metrics);
         let api_aggregated_metrics = Arc::clone(&aggregated_metrics);
         let management_port = cli.management_port;
+        let api_db_path = db_path.clone();
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -802,7 +803,7 @@ fn run_supervisor(cli: Cli) {
                 waf_event_buffer: Some(waf_event_buffer),
                 waf_engine: Some(waf_engine),
                 waf_rule_count: Some(waf_rule_count),
-                acme_challenge_store: None,
+                acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::with_db_path(api_db_path)),
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
                 load_test_engine: Some(Arc::new(lorica_bench::LoadTestEngine::new())),
