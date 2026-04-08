@@ -169,7 +169,7 @@ pub fn hash_password(password: &str) -> Result<String, ApiError> {
     use rand::rngs::OsRng;
 
     let salt = SaltString::generate(&mut OsRng);
-    let hash = argon2::Argon2::default()
+    let hash = argon2_hasher()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| ApiError::Internal(format!("password hashing failed: {e}")))?;
     Ok(hash.to_string())
