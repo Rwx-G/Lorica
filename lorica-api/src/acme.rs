@@ -73,18 +73,25 @@ impl AcmeChallengeStore {
             .await
             .insert(token.clone(), key_authorization.clone());
         // Persist to SQLite for cross-process access (workers)
-        if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO acme_challenges (token, key_auth) VALUES (?1, ?2)",
-                rusqlite::params![token, key_authorization],
-            );
+        match rusqlite::Connection::open(&self.db_path) {
+            Ok(conn) => {
+                let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+                match conn.execute(
+                    "INSERT OR REPLACE INTO acme_challenges (token, key_auth) VALUES (?1, ?2)",
+                    rusqlite::params![token, key_authorization],
+                ) {
+                    Ok(_) => tracing::info!(token = %token, db = %self.db_path.display(), "ACME challenge persisted to SQLite"),
+                    Err(e) => tracing::warn!(token = %token, error = %e, "failed to persist ACME challenge to SQLite"),
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, db = %self.db_path.display(), "failed to open SQLite for ACME challenge"),
         }
     }
 
     pub async fn get(&self, token: &str) -> Option<String> {
         // Try in-memory first (supervisor process)
         if let Some(val) = self.challenges.read().await.get(token).cloned() {
-            tracing::debug!(token = token, "ACME challenge found in memory");
+            tracing::info!(token = token, "ACME challenge found in memory");
             return Some(val);
         }
         // Fall back to SQLite (worker processes)
@@ -104,9 +111,9 @@ impl AcmeChallengeStore {
         .ok()
         .flatten();
         if result.is_some() {
-            tracing::debug!(token = token, "ACME challenge found in SQLite");
+            tracing::info!(token = token, "ACME challenge found in SQLite");
         } else {
-            tracing::debug!(token = token, db = %self.db_path.display(), "ACME challenge not found");
+            tracing::info!(token = token, db = %self.db_path.display(), "ACME challenge not found in memory or SQLite");
         }
         result
     }

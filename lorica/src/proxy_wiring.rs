@@ -542,6 +542,7 @@ impl ProxyHttp for LoricaProxy {
         if let Some(ref challenge_store) = self.acme_challenge_store {
             let path = session.req_header().uri.path();
             if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+                info!(token = token, "ACME challenge request intercepted, looking up token");
                 if let Some(key_auth) = challenge_store.get(token).await {
                     let mut header = ResponseHeader::build(200, None)?;
                     header.insert_header("Content-Type", "text/plain")?;
