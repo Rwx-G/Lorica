@@ -716,7 +716,7 @@ export function parseNginxConfig(text: string): NginxParseResult {
         diagnostics.push({
           level: 'warning',
           line: effectiveLine,
-          message: 'Conditional "if" block not supported. Verify behavior after import.',
+          message: 'Conditional "if" block skipped. Most applications handle this logic internally - verify behavior after import.',
         });
         blockStack.push({ type: 'other', name: nameLower, startLine: effectiveLine });
         continue;
