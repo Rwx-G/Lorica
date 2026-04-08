@@ -35,31 +35,81 @@ use tracing::{error, info, warn};
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
-/// In-memory store for pending ACME HTTP-01 challenges.
+/// SQLite-backed store for pending ACME HTTP-01 challenges.
 /// Maps token -> key_authorization for /.well-known/acme-challenge/{token}.
-#[derive(Debug, Default, Clone)]
+/// Uses SQLite so challenges are accessible across forked worker processes
+/// (workers share the same database file).
+#[derive(Debug, Clone)]
 pub struct AcmeChallengeStore {
+    /// In-memory cache for fast lookups in the supervisor process.
     challenges: Arc<RwLock<HashMap<String, String>>>,
+    /// Path to the SQLite database for cross-process sharing.
+    db_path: std::path::PathBuf,
 }
 
 impl AcmeChallengeStore {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_db_path(std::path::PathBuf::from("/var/lib/lorica/lorica.db"))
+    }
+
+    pub fn with_db_path(path: std::path::PathBuf) -> Self {
+        // Ensure the acme_challenges table exists
+        if let Ok(conn) = rusqlite::Connection::open(&path) {
+            let _ = conn.execute(
+                "CREATE TABLE IF NOT EXISTS acme_challenges (token TEXT PRIMARY KEY, key_auth TEXT NOT NULL)",
+                [],
+            );
+        }
+        Self {
+            challenges: Arc::new(RwLock::new(HashMap::new())),
+            db_path: path,
+        }
     }
 
     pub async fn set(&self, token: String, key_authorization: String) {
         self.challenges
             .write()
             .await
-            .insert(token, key_authorization);
+            .insert(token.clone(), key_authorization.clone());
+        // Persist to SQLite for cross-process access (workers)
+        if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO acme_challenges (token, key_auth) VALUES (?1, ?2)",
+                rusqlite::params![token, key_authorization],
+            );
+        }
     }
 
     pub async fn get(&self, token: &str) -> Option<String> {
-        self.challenges.read().await.get(token).cloned()
+        // Try in-memory first (supervisor process)
+        if let Some(val) = self.challenges.read().await.get(token).cloned() {
+            return Some(val);
+        }
+        // Fall back to SQLite (worker processes)
+        let db_path = self.db_path.clone();
+        let token_owned = token.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&db_path).ok()?;
+            conn.query_row(
+                "SELECT key_auth FROM acme_challenges WHERE token = ?1",
+                rusqlite::params![token_owned],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub async fn remove(&self, token: &str) {
         self.challenges.write().await.remove(token);
+        if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
+            let _ = conn.execute(
+                "DELETE FROM acme_challenges WHERE token = ?1",
+                rusqlite::params![token],
+            );
+        }
     }
 }
 
@@ -1466,9 +1516,15 @@ pub async fn provision_dns_manual_confirm(
 mod tests {
     use super::*;
 
+    fn temp_challenge_store() -> AcmeChallengeStore {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.into_path().join("test-acme.db");
+        AcmeChallengeStore::with_db_path(db_path)
+    }
+
     #[tokio::test]
     async fn test_challenge_store_set_get_remove() {
-        let store = AcmeChallengeStore::new();
+        let store = temp_challenge_store();
         store.set("token1".into(), "auth1".into()).await;
         assert_eq!(store.get("token1").await, Some("auth1".to_string()));
         store.remove("token1").await;
@@ -1477,7 +1533,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_challenge_store_get_nonexistent() {
-        let store = AcmeChallengeStore::new();
+        let store = temp_challenge_store();
         assert_eq!(store.get("nonexistent").await, None);
     }
 

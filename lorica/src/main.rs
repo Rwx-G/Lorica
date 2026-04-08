@@ -1486,6 +1486,10 @@ fn run_worker(
     lorica_proxy.request_counts = worker_request_counts;
     lorica_proxy.waf_counts = worker_waf_counts;
     lorica_proxy.waf_engine = waf_engine;
+    // ACME challenge store backed by SQLite - workers can read challenges set by supervisor
+    lorica_proxy.acme_challenge_store = Some(
+        lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone()),
+    );
 
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
         upstream_crl_file: upstream_crl_file.map(|s| s.to_string()),
@@ -1696,8 +1700,8 @@ fn run_single_process(cli: Cli) {
         let lt_scheduler_engine = Arc::clone(&load_test_engine);
         lorica_bench::scheduler::start_scheduler(lt_scheduler_store, lt_scheduler_engine);
 
-        // Create shared ACME challenge store for proxy + API (internally Arc'd)
-        let acme_challenge_store = lorica_api::acme::AcmeChallengeStore::new();
+        // Create shared ACME challenge store backed by SQLite for cross-process access
+        let acme_challenge_store = lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone());
 
         // Start the HTTP proxy service
         let mut lorica_proxy = LoricaProxy::new(

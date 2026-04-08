@@ -697,8 +697,8 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Force HTTPS redirect
-        if entry.route.force_https {
+        // Force HTTPS redirect (skip for ACME challenges - must stay HTTP)
+        if entry.route.force_https && !path.starts_with("/.well-known/acme-challenge/") {
             let is_tls = session
                 .digest()
                 .and_then(|d| d.ssl_digest.as_ref())
