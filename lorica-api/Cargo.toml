@@ -45,6 +45,7 @@ once_cell = { workspace = true }
 http = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 parking_lot = "0.12"
+ipnet = "2"
 
 [features]
 default = ["route53"]

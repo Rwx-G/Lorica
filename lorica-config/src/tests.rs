@@ -433,6 +433,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_global_settings_trusted_proxies_round_trip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+
+        // Initially empty
+        let settings = store.get_global_settings().unwrap();
+        assert!(settings.trusted_proxies.is_empty());
+
+        // Store trusted proxies
+        let mut updated = settings;
+        updated.trusted_proxies = vec![
+            "192.168.0.0/16".to_string(),
+            "10.0.0.1".to_string(),
+        ];
+        store.update_global_settings(&updated).unwrap();
+
+        // Read back
+        let fetched = store.get_global_settings().unwrap();
+        assert_eq!(fetched.trusted_proxies.len(), 2);
+        assert_eq!(fetched.trusted_proxies[0], "192.168.0.0/16");
+        assert_eq!(fetched.trusted_proxies[1], "10.0.0.1");
+    }
+
     // ---- Migration ----
 
     #[test]

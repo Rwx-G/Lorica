@@ -140,10 +140,12 @@ pub type PendingDnsChallenges = Arc<DashMap<String, PendingDnsChallenge>>;
 pub struct PendingDnsChallenge {
     /// The order URL so we can restore the order from the ACME account.
     pub order_url: String,
-    /// The challenge URL to mark as ready.
-    pub challenge_url: String,
-    /// The TXT record value the user must create.
-    pub txt_value: String,
+    /// The challenge URLs to mark as ready (one per domain).
+    pub challenge_urls: Vec<String>,
+    /// The TXT record entries the user must create: (record_name, txt_value, domain).
+    pub txt_records: Vec<(String, String, String)>,
+    /// All domains in this order.
+    pub domains: Vec<String>,
     /// Serialized account credentials (JSON) to restore the ACME account.
     pub account_credentials_json: String,
     /// Whether this was issued against the staging directory.
@@ -1005,9 +1007,17 @@ pub async fn provision_certificate_dns(
     Extension(state): Extension<AppState>,
     Json(body): Json<AcmeDnsProvisionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if body.domain.is_empty() {
+    // Support multi-domain: "example.com, *.example.com" or "a.com,b.com"
+    let domains: Vec<String> = body
+        .domain
+        .split(',')
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if domains.is_empty() {
         return Err(ApiError::BadRequest("domain is required".into()));
     }
+    let primary_domain = domains[0].clone();
 
     if let Err(e) = body.dns.validate() {
         return Err(ApiError::BadRequest(format!("invalid DNS config: {e}")));
@@ -1023,27 +1033,27 @@ pub async fn provision_certificate_dns(
     };
 
     info!(
-        domain = %body.domain,
+        domains = ?domains,
         staging = config.staging,
         provider = %body.dns.provider,
         directory = config.directory_url(),
         "starting ACME DNS-01 certificate provisioning"
     );
 
-    let result = provision_with_acme_dns(&state, &config, &body.domain, challenger.as_ref()).await;
+    let result = provision_with_acme_dns(&state, &config, &domains, challenger.as_ref()).await;
 
     match result {
         Ok(cert_id) => {
-            info!(domain = %body.domain, cert_id = %cert_id, "ACME DNS-01 certificate provisioned");
+            info!(domains = ?domains, cert_id = %cert_id, "ACME DNS-01 certificate provisioned");
             Ok(json_data(AcmeProvisionResponse {
                 status: "provisioned".into(),
-                domain: body.domain,
+                domain: primary_domain,
                 staging: config.staging,
-                message: format!("Certificate provisioned via DNS-01 (id: {cert_id})"),
+                message: format!("Certificate provisioned via DNS-01 for {} domain(s) (id: {cert_id})", domains.len()),
             }))
         }
         Err(e) => {
-            warn!(domain = %body.domain, error = %e, "ACME DNS-01 provisioning failed");
+            warn!(domains = ?domains, error = %e, "ACME DNS-01 provisioning failed");
             Err(ApiError::Internal(format!(
                 "ACME DNS-01 provisioning failed: {e}"
             )))
@@ -1051,16 +1061,25 @@ pub async fn provision_certificate_dns(
     }
 }
 
+/// Strip the `*.` prefix from a wildcard domain to get the base domain
+/// for the `_acme-challenge` TXT record.
+fn acme_dns_base_domain(domain: &str) -> &str {
+    domain.strip_prefix("*.").unwrap_or(domain)
+}
+
 /// Internal ACME provisioning logic using DNS-01 challenge.
+/// Supports multi-domain and wildcard certificates.
 async fn provision_with_acme_dns(
     state: &AppState,
     config: &AcmeConfig,
-    domain: &str,
+    domains: &[String],
     challenger: &dyn DnsChallenger,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
         Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
     };
+
+    let primary_domain = &domains[0];
 
     // Create or load ACME account
     let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
@@ -1077,16 +1096,23 @@ async fn provision_with_acme_dns(
     )
     .await?;
 
-    // Create order for the domain
-    let identifier = Identifier::Dns(domain.to_string());
+    // Create order with all domains as identifiers
+    let identifiers: Vec<Identifier> = domains
+        .iter()
+        .map(|d| Identifier::Dns(d.clone()))
+        .collect();
     let mut order = account
         .new_order(&NewOrder {
-            identifiers: &[identifier],
+            identifiers: &identifiers,
         })
         .await?;
 
-    // Get authorizations
+    // Get authorizations (one per domain)
     let authorizations = order.authorizations().await?;
+
+    // Phase 1: Create all TXT records before signaling readiness
+    // Track (base_domain, challenge_url) for cleanup and signaling
+    let mut challenge_info: Vec<(String, String)> = Vec::new(); // (base_domain, challenge_url)
 
     for auth in &authorizations {
         if matches!(auth.status, AuthorizationStatus::Valid) {
@@ -1106,60 +1132,84 @@ async fn provision_with_acme_dns(
         // of the key authorization.
         use base64::Engine;
         use ring::digest;
-        let digest = digest::digest(&digest::SHA256, key_authorization.as_str().as_bytes());
-        let txt_value = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref());
+        let digest_val = digest::digest(&digest::SHA256, key_authorization.as_str().as_bytes());
+        let txt_value =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest_val.as_ref());
+
+        // For wildcards, strip the `*.` prefix for the TXT record domain
+        let auth_domain = match &auth.identifier {
+            Identifier::Dns(d) => d.clone(),
+        };
+        let base_domain = acme_dns_base_domain(&auth_domain).to_string();
 
         // Create TXT record via DNS provider
         challenger
-            .create_txt_record(domain, &txt_value)
+            .create_txt_record(&base_domain, &txt_value)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-        // Wait for DNS propagation
-        info!(domain = %domain, "waiting for DNS propagation (30s)");
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        challenge_info.push((base_domain, challenge.url.clone()));
+    }
 
-        // Tell ACME server we're ready
-        order.set_challenge_ready(&challenge.url).await?;
+    // Wait for DNS propagation
+    info!(domains = ?domains, "waiting for DNS propagation (30s)");
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-        // Wait for validation (poll with backoff)
-        let mut attempts = 0;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let fresh_auth = order.authorizations().await?;
-            let auth = &fresh_auth[0];
+    // Phase 2: Signal readiness for all challenges
+    for (_, url) in &challenge_info {
+        order.set_challenge_ready(url).await?;
+    }
 
-            match auth.status {
-                AuthorizationStatus::Valid => break,
-                AuthorizationStatus::Pending => {
-                    attempts += 1;
-                    if attempts > 24 {
-                        // Clean up TXT record before returning error
-                        let _ = challenger.delete_txt_record(domain).await;
-                        return Err("DNS-01 challenge validation timed out after 120s".into());
-                    }
-                }
-                AuthorizationStatus::Invalid => {
-                    let _ = challenger.delete_txt_record(domain).await;
-                    return Err("DNS-01 challenge validation failed (invalid)".into());
-                }
-                _ => {
-                    let _ = challenger.delete_txt_record(domain).await;
-                    return Err(
-                        format!("unexpected authorization status: {:?}", auth.status).into(),
-                    );
-                }
-            }
+    // Phase 3: Wait for all authorizations to become valid
+    let mut attempts = 0;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let fresh_auths = order.authorizations().await?;
+
+        let all_valid = fresh_auths
+            .iter()
+            .all(|a| matches!(a.status, AuthorizationStatus::Valid));
+        if all_valid {
+            break;
         }
 
-        // Clean up TXT record
-        if let Err(e) = challenger.delete_txt_record(domain).await {
-            warn!(domain = %domain, error = %e, "failed to clean up DNS TXT record");
+        let any_invalid = fresh_auths
+            .iter()
+            .any(|a| matches!(a.status, AuthorizationStatus::Invalid));
+        if any_invalid {
+            // Clean up all TXT records before returning error
+            for (base_domain, _) in &challenge_info {
+                let _ = challenger.delete_txt_record(base_domain).await;
+            }
+            let failed: Vec<String> = fresh_auths
+                .iter()
+                .filter(|a| matches!(a.status, AuthorizationStatus::Invalid))
+                .map(|a| format!("{:?}", a.identifier))
+                .collect();
+            return Err(
+                format!("DNS-01 challenge validation failed for: {}", failed.join(", ")).into(),
+            );
+        }
+
+        attempts += 1;
+        if attempts > 24 {
+            // Clean up all TXT records before returning error
+            for (base_domain, _) in &challenge_info {
+                let _ = challenger.delete_txt_record(base_domain).await;
+            }
+            return Err("DNS-01 challenge validation timed out after 120s".into());
         }
     }
 
-    // Generate CSR and finalize order
-    let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
+    // Clean up all TXT records
+    for (base_domain, _) in &challenge_info {
+        if let Err(e) = challenger.delete_txt_record(base_domain).await {
+            warn!(domain = %base_domain, error = %e, "failed to clean up DNS TXT record");
+        }
+    }
+
+    // Generate CSR with all domains as SANs and finalize order
+    let mut params = rcgen::CertificateParams::new(domains.to_vec())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     let private_key = rcgen::KeyPair::generate()?;
     let csr = params.serialize_request(&private_key)?;
@@ -1194,12 +1244,12 @@ async fn provision_with_acme_dns(
     // Store certificate in database
     let now = chrono::Utc::now();
     let cert_id = uuid::Uuid::new_v4().to_string();
-    let fingerprint = format!("acme-dns:{domain}");
+    let fingerprint = format!("acme-dns:{}", domains.join(","));
 
     let cert = lorica_config::models::Certificate {
         id: cert_id.clone(),
-        domain: domain.to_string(),
-        san_domains: vec![domain.to_string()],
+        domain: primary_domain.clone(),
+        san_domains: domains.to_vec(),
         fingerprint,
         cert_pem,
         key_pem,
@@ -1242,13 +1292,29 @@ pub struct AcmeDnsManualRequest {
     pub contact_email: Option<String>,
 }
 
-/// Response for step 1: the TXT record the user must create.
+/// A single TXT record entry for the manual DNS-01 response.
+#[derive(Debug, Serialize)]
+struct DnsManualTxtRecord {
+    /// The domain this TXT record is for.
+    domain: String,
+    /// The TXT record name (e.g. `_acme-challenge.example.com`).
+    name: String,
+    /// The TXT record value to set.
+    value: String,
+}
+
+/// Response for step 1: the TXT record(s) the user must create.
 #[derive(Debug, Serialize)]
 struct AcmeDnsManualResponse {
     status: String,
+    /// Primary domain (first in the list).
     domain: String,
+    /// For backwards compatibility with single-domain usage.
     txt_record_name: String,
+    /// For backwards compatibility with single-domain usage.
     txt_record_value: String,
+    /// All TXT records to create (for multi-domain / wildcard).
+    txt_records: Vec<DnsManualTxtRecord>,
     message: String,
 }
 
@@ -1272,9 +1338,17 @@ pub async fn provision_dns_manual(
         Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder,
     };
 
-    if body.domain.is_empty() {
+    // Support multi-domain: "example.com, *.example.com" or "a.com,b.com"
+    let domains: Vec<String> = body
+        .domain
+        .split(',')
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if domains.is_empty() {
         return Err(ApiError::BadRequest("domain is required".into()));
     }
+    let primary_domain = domains[0].clone();
 
     let config = AcmeConfig {
         staging: body.staging,
@@ -1282,7 +1356,7 @@ pub async fn provision_dns_manual(
     };
 
     info!(
-        domain = %body.domain,
+        domains = ?domains,
         staging = config.staging,
         "starting manual DNS-01 challenge (step 1)"
     );
@@ -1303,50 +1377,73 @@ pub async fn provision_dns_manual(
     .await
     .map_err(|e| ApiError::Internal(format!("ACME account creation failed: {e}")))?;
 
-    // Create order
-    let identifier = Identifier::Dns(body.domain.clone());
+    // Create order with all domains as identifiers
+    let identifiers: Vec<Identifier> = domains
+        .iter()
+        .map(|d| Identifier::Dns(d.clone()))
+        .collect();
     let mut order = account
         .new_order(&NewOrder {
-            identifiers: &[identifier],
+            identifiers: &identifiers,
         })
         .await
         .map_err(|e| ApiError::Internal(format!("ACME order creation failed: {e}")))?;
 
-    // Get authorizations and find DNS-01 challenge
+    // Get authorizations and extract DNS-01 challenge for each domain
     let authorizations = order
         .authorizations()
         .await
         .map_err(|e| ApiError::Internal(format!("failed to get authorizations: {e}")))?;
 
-    let auth = authorizations
-        .first()
-        .ok_or_else(|| ApiError::Internal("no authorizations returned".into()))?;
+    let mut challenge_urls: Vec<String> = Vec::new();
+    let mut txt_records_out: Vec<DnsManualTxtRecord> = Vec::new();
+    let mut txt_records_pending: Vec<(String, String, String)> = Vec::new(); // (record_name, txt_value, domain)
 
-    if matches!(auth.status, AuthorizationStatus::Valid) {
-        return Err(ApiError::BadRequest(
-            "authorization already valid - no challenge needed".into(),
-        ));
+    for auth in &authorizations {
+        if matches!(auth.status, AuthorizationStatus::Valid) {
+            continue;
+        }
+
+        let challenge = auth
+            .challenges
+            .iter()
+            .find(|c| c.r#type == ChallengeType::Dns01)
+            .ok_or_else(|| ApiError::Internal("no DNS-01 challenge available".into()))?;
+
+        let key_authorization = order.key_authorization(challenge);
+        let txt_value = key_authorization.dns_value();
+
+        let auth_domain = match &auth.identifier {
+            Identifier::Dns(d) => d.clone(),
+        };
+        let base_domain = acme_dns_base_domain(&auth_domain);
+        let txt_record_name = format!("_acme-challenge.{base_domain}");
+
+        challenge_urls.push(challenge.url.clone());
+        txt_records_out.push(DnsManualTxtRecord {
+            domain: auth_domain.clone(),
+            name: txt_record_name.clone(),
+            value: txt_value.clone(),
+        });
+        txt_records_pending.push((txt_record_name, txt_value, auth_domain));
     }
 
-    let challenge = auth
-        .challenges
-        .iter()
-        .find(|c| c.r#type == ChallengeType::Dns01)
-        .ok_or_else(|| ApiError::Internal("no DNS-01 challenge available".into()))?;
-
-    let key_authorization = order.key_authorization(challenge);
-    let txt_value = key_authorization.dns_value();
-    let txt_record_name = format!("_acme-challenge.{}", body.domain);
+    if txt_records_out.is_empty() {
+        return Err(ApiError::BadRequest(
+            "all authorizations already valid - no challenge needed".into(),
+        ));
+    }
 
     // Serialize account credentials for later restoration
     let credentials_json = serde_json::to_string(&credentials)
         .map_err(|e| ApiError::Internal(format!("failed to serialize credentials: {e}")))?;
 
-    // Store the pending challenge
+    // Store the pending challenge (keyed by primary domain)
     let pending = PendingDnsChallenge {
         order_url: order.url().to_string(),
-        challenge_url: challenge.url.clone(),
-        txt_value: txt_value.clone(),
+        challenge_urls,
+        txt_records: txt_records_pending,
+        domains: domains.clone(),
         account_credentials_json: credentials_json,
         staging: body.staging,
         contact_email: body.contact_email.clone(),
@@ -1355,20 +1452,34 @@ pub async fn provision_dns_manual(
 
     state
         .pending_dns_challenges
-        .insert(body.domain.clone(), pending);
+        .insert(primary_domain.clone(), pending);
+
+    // Backwards-compatible fields use the first TXT record
+    let first_name = txt_records_out[0].name.clone();
+    let first_value = txt_records_out[0].value.clone();
+
+    let message = if txt_records_out.len() == 1 {
+        "Create a DNS TXT record with the above name and value, then call confirm.".to_string()
+    } else {
+        format!(
+            "Create {} DNS TXT records as listed in txt_records, then call confirm.",
+            txt_records_out.len()
+        )
+    };
 
     info!(
-        domain = %body.domain,
-        txt_record = %txt_record_name,
-        "manual DNS-01 challenge created, waiting for user to set TXT record"
+        domains = ?domains,
+        record_count = txt_records_out.len(),
+        "manual DNS-01 challenge created, waiting for user to set TXT record(s)"
     );
 
     Ok(json_data(AcmeDnsManualResponse {
         status: "pending_dns".into(),
-        domain: body.domain,
-        txt_record_name,
-        txt_record_value: txt_value,
-        message: "Create a DNS TXT record with the above name and value, then call confirm.".into(),
+        domain: primary_domain,
+        txt_record_name: first_name,
+        txt_record_value: first_value,
+        txt_records: txt_records_out,
+        message,
     }))
 }
 
@@ -1387,7 +1498,7 @@ pub async fn provision_dns_manual_confirm(
         return Err(ApiError::BadRequest("domain is required".into()));
     }
 
-    // Look up and remove the pending challenge
+    // Look up and remove the pending challenge (keyed by primary domain)
     let (_, pending) = state
         .pending_dns_challenges
         .remove(&body.domain)
@@ -1405,8 +1516,11 @@ pub async fn provision_dns_manual_confirm(
         ));
     }
 
+    let domains = &pending.domains;
+    let primary_domain = domains[0].clone();
+
     info!(
-        domain = %body.domain,
+        domains = ?domains,
         "confirming manual DNS-01 challenge (step 2)"
     );
 
@@ -1425,48 +1539,55 @@ pub async fn provision_dns_manual_confirm(
         .await
         .map_err(|e| ApiError::Internal(format!("failed to restore ACME order: {e}")))?;
 
-    // Tell ACME server the challenge is ready
-    order
-        .set_challenge_ready(&pending.challenge_url)
-        .await
-        .map_err(|e| ApiError::Internal(format!("set_challenge_ready failed: {e}")))?;
+    // Tell ACME server all challenges are ready
+    for challenge_url in &pending.challenge_urls {
+        order
+            .set_challenge_ready(challenge_url)
+            .await
+            .map_err(|e| ApiError::Internal(format!("set_challenge_ready failed: {e}")))?;
+    }
 
-    // Wait for validation (poll with backoff)
+    // Wait for all authorizations to become valid
     let mut attempts = 0;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let fresh_auth = order
+        let fresh_auths = order
             .authorizations()
             .await
             .map_err(|e| ApiError::Internal(format!("failed to poll authorizations: {e}")))?;
-        let auth = &fresh_auth[0];
 
-        match auth.status {
-            AuthorizationStatus::Valid => break,
-            AuthorizationStatus::Pending => {
-                attempts += 1;
-                if attempts > 24 {
-                    return Err(ApiError::Internal(
-                        "DNS-01 challenge validation timed out after 120s".into(),
-                    ));
-                }
-            }
-            AuthorizationStatus::Invalid => {
-                return Err(ApiError::Internal(
-                    "DNS-01 challenge validation failed (invalid) - check your TXT record".into(),
-                ));
-            }
-            _ => {
-                return Err(ApiError::Internal(format!(
-                    "unexpected authorization status: {:?}",
-                    auth.status
-                )));
-            }
+        let all_valid = fresh_auths
+            .iter()
+            .all(|a| matches!(a.status, AuthorizationStatus::Valid));
+        if all_valid {
+            break;
+        }
+
+        let any_invalid = fresh_auths
+            .iter()
+            .any(|a| matches!(a.status, AuthorizationStatus::Invalid));
+        if any_invalid {
+            let failed: Vec<String> = fresh_auths
+                .iter()
+                .filter(|a| matches!(a.status, AuthorizationStatus::Invalid))
+                .map(|a| format!("{:?}", a.identifier))
+                .collect();
+            return Err(ApiError::Internal(format!(
+                "DNS-01 challenge validation failed for: {} - check your TXT records",
+                failed.join(", ")
+            )));
+        }
+
+        attempts += 1;
+        if attempts > 24 {
+            return Err(ApiError::Internal(
+                "DNS-01 challenge validation timed out after 120s".into(),
+            ));
         }
     }
 
-    // Generate CSR and finalize order
-    let mut params = rcgen::CertificateParams::new(vec![body.domain.clone()])
+    // Generate CSR with all domains and finalize order
+    let mut params = rcgen::CertificateParams::new(domains.clone())
         .map_err(|e| ApiError::Internal(format!("CSR params error: {e}")))?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     let private_key =
@@ -1516,12 +1637,12 @@ pub async fn provision_dns_manual_confirm(
     // Store certificate in database
     let now = chrono::Utc::now();
     let cert_id = uuid::Uuid::new_v4().to_string();
-    let fingerprint = format!("acme-dns-manual:{}", body.domain);
+    let fingerprint = format!("acme-dns-manual:{}", domains.join(","));
 
     let cert = lorica_config::models::Certificate {
         id: cert_id.clone(),
-        domain: body.domain.clone(),
-        san_domains: vec![body.domain.clone()],
+        domain: primary_domain.clone(),
+        san_domains: domains.clone(),
         fingerprint,
         cert_pem,
         key_pem,
@@ -1545,16 +1666,16 @@ pub async fn provision_dns_manual_confirm(
     state.notify_config_changed();
 
     info!(
-        domain = %body.domain,
+        domains = ?domains,
         cert_id = %cert_id,
         "manual DNS-01 certificate provisioned"
     );
 
     Ok(json_data(AcmeProvisionResponse {
         status: "provisioned".into(),
-        domain: body.domain,
+        domain: primary_domain,
         staging: pending.staging,
-        message: format!("Certificate provisioned via manual DNS-01 (id: {cert_id})"),
+        message: format!("Certificate provisioned via manual DNS-01 for {} domain(s) (id: {cert_id})", domains.len()),
     }))
 }
 

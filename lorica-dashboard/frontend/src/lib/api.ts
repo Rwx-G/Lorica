@@ -383,6 +383,7 @@ export interface GlobalSettingsResponse {
   sla_purge_retention_days: number;
   sla_purge_schedule: string;
   custom_security_presets?: SecurityHeaderPreset[];
+  trusted_proxies: string[];
 }
 
 export interface UpdateSettingsRequest {
@@ -400,6 +401,7 @@ export interface UpdateSettingsRequest {
   sla_purge_retention_days?: number;
   sla_purge_schedule?: string;
   custom_security_presets?: SecurityHeaderPreset[];
+  trusted_proxies?: string[];
 }
 
 export interface NotificationConfigResponse {

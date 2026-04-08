@@ -33,6 +33,7 @@ pub struct UpdateSettingsRequest {
     pub sla_purge_retention_days: Option<i32>,
     pub sla_purge_schedule: Option<String>,
     pub custom_security_presets: Option<Vec<lorica_config::models::SecurityHeaderPreset>>,
+    pub trusted_proxies: Option<Vec<String>>,
 }
 
 /// PUT /api/v1/settings
@@ -143,6 +144,24 @@ pub async fn update_settings(
     }
     if let Some(presets) = body.custom_security_presets {
         settings.custom_security_presets = presets;
+    }
+    if let Some(ref proxies) = body.trusted_proxies {
+        // Validate each entry is a valid CIDR or IP address
+        for entry in proxies {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Accept both bare IPs (1.2.3.4) and CIDR notation (1.2.3.0/24)
+            if trimmed.parse::<std::net::IpAddr>().is_err()
+                && trimmed.parse::<ipnet::IpNet>().is_err()
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "invalid trusted proxy CIDR or IP: {trimmed}"
+                )));
+            }
+        }
+        settings.trusted_proxies = proxies.clone();
     }
 
     store.update_global_settings(&settings)?;

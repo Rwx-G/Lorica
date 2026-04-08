@@ -1318,6 +1318,14 @@ impl ConfigStore {
                 "sla_purge_schedule" => {
                     settings.sla_purge_schedule = value;
                 }
+                "trusted_proxies" => {
+                    settings.trusted_proxies =
+                        serde_json::from_str(&value).map_err(|e| {
+                            ConfigError::Validation(format!(
+                                "invalid trusted_proxies JSON: {e}"
+                            ))
+                        })?;
+                }
                 _ => {}
             }
         }
@@ -1389,6 +1397,14 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('sla_purge_schedule', ?1)",
             params![settings.sla_purge_schedule],
+        )?;
+        let trusted_proxies_json =
+            serde_json::to_string(&settings.trusted_proxies).map_err(|e| {
+                ConfigError::Validation(format!("failed to serialize trusted_proxies: {e}"))
+            })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('trusted_proxies', ?1)",
+            params![trusted_proxies_json],
         )?;
         Ok(())
     }

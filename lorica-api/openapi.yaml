@@ -201,6 +201,11 @@ paths:
     put:
       tags: [Settings]
       summary: Update global settings
+      description: |
+        Updates global settings. All fields are optional - only provided fields
+        are changed. The `trusted_proxies` field accepts an array of CIDR ranges
+        or IP addresses. X-Forwarded-For is only trusted when the direct TCP
+        client IP matches a trusted proxy entry. Empty array = trust no XFF.
       security:
         - sessionCookie: []
       requestBody:
@@ -209,6 +214,13 @@ paths:
           application/json:
             schema:
               type: object
+              properties:
+                trusted_proxies:
+                  type: array
+                  items:
+                    type: string
+                  description: CIDR ranges or IPs of trusted reverse proxies
+                  example: ["192.168.0.0/16", "10.0.0.0/8"]
       responses:
         "200":
           description: Settings updated

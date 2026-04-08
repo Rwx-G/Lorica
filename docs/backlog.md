@@ -6,7 +6,7 @@ Items identified during QA traceability audit (2026-04-01) and acceptance testin
 
 | Source | Description | References |
 |--------|-------------|------------|
-| Security audit | **XFF Trust without validation**: proxy trusts X-Forwarded-For from any client, bypassing IP blocklist, bans, and rate limiting. Add `trusted_proxies` CIDR list to global settings. Only trust XFF when direct client IP is in the list. | `proxy_wiring.rs:548` |
+| ~~Security audit~~ | ~~**XFF Trust without validation**: resolved - trusted_proxies CIDR list added to global settings. XFF only trusted when direct client IP matches a configured proxy range. Empty = trust no XFF (secure default).~~ | ~~`proxy_wiring.rs`~~ |
 
 ## Medium Priority
 

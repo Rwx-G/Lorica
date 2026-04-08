@@ -29,6 +29,7 @@ Author: Rwx-G
 
 ### Security
 
+- Trusted proxies CIDR list for X-Forwarded-For validation. The proxy now only extracts client IP from XFF when the direct TCP client IP matches a configured trusted proxy range. Empty list (default) trusts no XFF, preventing IP spoofing via header injection. Configurable in dashboard Settings and via API
 - Load test target URL restricted to localhost (127.0.0.1, localhost, ::1) to prevent the engine from being used to attack external hosts. The dashboard now uses a route selector with path suffix instead of a free-text URL field
 
 ### Changed

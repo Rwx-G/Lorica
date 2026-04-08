@@ -13,7 +13,7 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, max_global_connections: 0, flood_threshold_rps: 0, waf_ban_threshold: 5, waf_ban_duration_s: 3600, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month' });
+  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, max_global_connections: 0, flood_threshold_rps: 0, waf_ban_threshold: 5, waf_ban_duration_s: 3600, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month', trusted_proxies: '' });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -156,7 +156,7 @@
       error = settingsRes.error.message;
     } else if (settingsRes.data) {
       settings = settingsRes.data;
-      settingsForm = { ...settingsRes.data };
+      settingsForm = { ...settingsRes.data, trusted_proxies: (settingsRes.data.trusted_proxies ?? []).join('\n') };
       customPresets = settingsRes.data.custom_security_presets ?? [];
     }
     if (notifRes.data) {
@@ -199,12 +199,20 @@
     settingsSaving = true;
     settingsMsg = '';
     settingsError = '';
-    const res = await api.updateSettings(settingsForm);
+    // Convert trusted_proxies textarea (newline-separated) to string array
+    const payload = {
+      ...settingsForm,
+      trusted_proxies: settingsForm.trusted_proxies
+        .split('\n')
+        .map((s: string) => s.trim())
+        .filter((s: string) => s.length > 0),
+    };
+    const res = await api.updateSettings(payload);
     if (res.error) {
       settingsError = res.error.message;
     } else if (res.data) {
       settings = res.data;
-      settingsForm = { ...res.data };
+      settingsForm = { ...res.data, trusted_proxies: (res.data.trusted_proxies ?? []).join('\n') };
       settingsMsg = 'Settings saved.';
       setTimeout(() => settingsMsg = '', 3000);
     }
@@ -602,6 +610,11 @@
           <label for="waf-ban-duration">WAF Ban Duration (seconds)</label>
           <input id="waf-ban-duration" type="number" bind:value={settingsForm.waf_ban_duration_s} min="0" max="604800" />
           <span class="hint">How long to ban (default 3600 = 1 hour, max 7 days).</span>
+        </div>
+        <div class="form-row">
+          <label for="trusted-proxies">Trusted Proxies (CIDR)</label>
+          <textarea id="trusted-proxies" rows="4" bind:value={settingsForm.trusted_proxies} placeholder="192.168.0.0/16&#10;10.0.0.0/8&#10;172.16.0.0/12"></textarea>
+          <span class="hint">One CIDR range or IP per line. X-Forwarded-For is only trusted from these addresses. Empty = trust no XFF (direct client IP always used).</span>
         </div>
         <div class="form-row">
           <label for="s-log-retention">Access Log Retention (entries)</label>

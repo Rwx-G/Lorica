@@ -943,8 +943,9 @@
         {/if}
 
         <div class="form-group">
-          <label>Domain <span class="required">*</span></label>
-          <input type="text" bind:value={acmeDomain} placeholder="example.com" />
+          <label>Domain(s) <span class="required">*</span></label>
+          <input type="text" bind:value={acmeDomain} placeholder="example.com, www.example.com" />
+          <span class="hint">Separate multiple domains with commas for a SAN certificate. Use *.example.com for wildcards (DNS-01 only).</span>
         </div>
 
         <div class="form-group">
