@@ -66,6 +66,7 @@ pub async fn health_check_loop(
     default_interval_s: u64,
     backend_connections: Option<Arc<BackendConnections>>,
     alert_sender: Option<lorica_notify::AlertSender>,
+    config_reload_tx: Option<tokio::sync::broadcast::Sender<u64>>,
 ) {
     let interval = Duration::from_secs(default_interval_s.max(5));
     // Track when each backend entered Closing state for drain timeout
@@ -197,6 +198,10 @@ pub async fn health_check_loop(
         if changed {
             if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
                 warn!(error = %e, "failed to reload proxy config after health check");
+            }
+            // Notify workers to reload their proxy config with updated health statuses
+            if let Some(ref tx) = config_reload_tx {
+                let _ = tx.send(0);
             }
         }
     }

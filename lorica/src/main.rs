@@ -571,6 +571,7 @@ fn run_supervisor(cli: Cli) {
         let health_alert_sender = alert_sender.clone();
         let health_store = Arc::clone(&store);
         let health_config = Arc::clone(&proxy_config);
+        let health_reload_tx = reload_bc_tx.clone();
         let health_interval = {
             let s = store.lock().await;
             s.get_global_settings()
@@ -579,7 +580,7 @@ fn run_supervisor(cli: Cli) {
         };
         let health_handle = tokio::spawn(async move {
             // No backend_connections in supervisor - drain monitoring is per-worker
-            health::health_check_loop(health_store, health_config, health_interval, None, Some(health_alert_sender)).await;
+            health::health_check_loop(health_store, health_config, health_interval, None, Some(health_alert_sender), Some(health_reload_tx)).await;
         });
 
         // Create WAF engine in supervisor for API access (rules listing,
@@ -1902,6 +1903,7 @@ fn run_single_process(cli: Cli) {
                 health_interval,
                 Some(health_backend_conns),
                 Some(health_alert_sender2),
+                None, // single-process mode, no workers to notify
             )
             .await;
         });
