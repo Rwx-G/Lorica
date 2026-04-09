@@ -528,7 +528,7 @@
           <p class="settings-hint">Custom presets appear alongside builtin presets (strict, moderate, none) in the route security headers dropdown.</p>
 
           <!-- Builtin presets (read-only) -->
-          <div class="table-wrap">
+          <div class="settings-table-wrap">
             <table class="settings-table">
               <thead>
                 <tr>
@@ -552,7 +552,7 @@
                     <td><code>{cp.name}</code></td>
                     <td class="preset-desc">{Object.keys(cp.headers).length} header{Object.keys(cp.headers).length !== 1 ? 's' : ''}</td>
                     <td><span class="badge badge-custom">custom</span></td>
-                    <td class="actions-cell">
+                    <td class="settings-actions-cell">
                       <button class="settings-btn-action settings-btn-edit" onclick={() => openPresetEdit(idx)}>Edit</button>
                       <button class="settings-btn-action settings-btn-delete" onclick={() => deletingPresetIdx = idx}>Delete</button>
                     </td>
@@ -596,7 +596,7 @@
           <p class="settings-hint">Recent alert events dispatched by Lorica (last 100).</p>
 
           {#if notifHistory.length === 0}
-            <p class="empty-text">No notification events yet.</p>
+            <p class="settings-empty-text">No notification events yet.</p>
           {:else}
             <div class="notif-history-scroll">
               <table>
@@ -659,9 +659,9 @@
           </div>
 
           {#if preferences.length === 0}
-            <p class="empty-text">No other stored preferences.</p>
+            <p class="settings-empty-text">No other stored preferences.</p>
           {:else}
-            <div class="table-wrap">
+            <div class="settings-table-wrap">
               <table>
                 <thead>
                   <tr>
@@ -684,7 +684,7 @@
                           <option value="once">once</option>
                         </select>
                       </td>
-                      <td class="actions-cell">
+                      <td class="settings-actions-cell">
                         <button class="btn-link danger" onclick={() => deletingPref = pref}>Delete</button>
                       </td>
                     </tr>
@@ -754,7 +754,7 @@
             <div class="diff-preview">
               <h3>Import Preview</h3>
               {#if !diffHasChanges(importDiff)}
-                <p class="empty-text">No changes detected - the imported configuration is identical to the current one.</p>
+                <p class="settings-empty-text">No changes detected - the imported configuration is identical to the current one.</p>
               {:else}
                 {@const sections = [
                   { label: 'Routes', diff: importDiff.routes },
@@ -893,10 +893,6 @@
     margin: 0.5rem 0;
   }
 
-  .empty-text {
-    color: var(--color-text-muted);
-    font-size: 0.875rem;
-  }
 
   .file-info {
     font-size: 0.8125rem;
@@ -904,10 +900,6 @@
     margin: 0.5rem 0;
   }
 
-  /* Tables */
-  .table-wrap {
-    overflow-x: auto;
-  }
 
   table {
     width: 100%;
@@ -949,31 +941,6 @@
     font-size: 0.8125rem;
   }
 
-  .capitalize {
-    text-transform: capitalize;
-  }
-
-  .status-dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    margin-right: 0.375rem;
-    vertical-align: middle;
-  }
-
-  .status-dot.enabled {
-    background: var(--color-green);
-  }
-
-  .status-dot.disabled {
-    background: var(--color-text-muted);
-  }
-
-  .actions-cell {
-    display: flex;
-    gap: 0.5rem;
-  }
 
   .btn-link {
     background: none;

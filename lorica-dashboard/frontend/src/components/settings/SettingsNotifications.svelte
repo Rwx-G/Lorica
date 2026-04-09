@@ -189,9 +189,9 @@
       <p class="settings-hint">Stdout logging is always enabled. Configure additional channels below.</p>
 
       {#if notifications.length === 0}
-        <p class="empty-text">No notification channels configured.</p>
+        <p class="settings-empty-text">No notification channels configured.</p>
       {:else}
-        <div class="table-wrap">
+        <div class="settings-table-wrap">
           <table class="settings-table">
             <thead>
               <tr>
@@ -204,13 +204,13 @@
             <tbody>
               {#each notifications as nc}
                 <tr>
-                  <td class="capitalize">{nc.channel}</td>
+                  <td class="settings-capitalize">{nc.channel}</td>
                   <td>{nc.alert_types.join(', ') || '-'}</td>
                   <td>
-                    <span class="status-dot" class:enabled={nc.enabled} class:disabled={!nc.enabled}></span>
+                    <span class="settings-status-dot" class:enabled={nc.enabled} class:disabled={!nc.enabled}></span>
                     {nc.enabled ? 'Yes' : 'No'}
                   </td>
-                  <td class="actions-cell">
+                  <td class="settings-actions-cell">
                     <button class="settings-btn-action settings-btn-test" onclick={() => handleTestNotif(nc.id)} disabled={testingNotif === nc.id}>Test</button>
                     <button class="settings-btn-action settings-btn-edit" onclick={() => openNotifEdit(nc)}>Edit</button>
                     <button class="settings-btn-action settings-btn-delete" onclick={() => deletingNotif = nc}>Delete</button>

@@ -148,9 +148,9 @@
       <p class="settings-hint">Global DNS provider credentials for ACME DNS-01 certificate provisioning. Credentials are stored encrypted and never shown back.</p>
 
       {#if dnsProviders.length === 0}
-        <p class="empty-text">No DNS providers configured.</p>
+        <p class="settings-empty-text">No DNS providers configured.</p>
       {:else}
-        <div class="table-wrap">
+        <div class="settings-table-wrap">
           <table class="settings-table">
             <thead>
               <tr>
@@ -164,9 +164,9 @@
               {#each dnsProviders as dp}
                 <tr>
                   <td>{dp.name}</td>
-                  <td class="capitalize">{dp.provider_type}</td>
+                  <td class="settings-capitalize">{dp.provider_type}</td>
                   <td class="mono">{new Date(dp.created_at).toLocaleDateString()}</td>
-                  <td class="actions-cell">
+                  <td class="settings-actions-cell">
                     <button class="settings-btn-action settings-btn-test" onclick={() => handleTestDnsProvider(dp.id)} disabled={testingDnsProvider === dp.id}>
                       {testingDnsProvider === dp.id ? 'Testing...' : 'Test'}
                     </button>

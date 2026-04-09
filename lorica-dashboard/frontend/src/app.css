@@ -863,3 +863,38 @@ tbody tr:hover td {
 .settings-separator {
   color: var(--color-text-muted);
 }
+
+.settings-empty-text {
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+}
+
+.settings-table-wrap {
+  overflow-x: auto;
+}
+
+.settings-capitalize {
+  text-transform: capitalize;
+}
+
+.settings-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 0.375rem;
+  vertical-align: middle;
+}
+
+.settings-status-dot.enabled {
+  background: var(--color-green);
+}
+
+.settings-status-dot.disabled {
+  background: var(--color-text-muted);
+}
+
+.settings-actions-cell {
+  display: flex;
+  gap: 0.5rem;
+}
