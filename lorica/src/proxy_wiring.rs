@@ -584,6 +584,17 @@ impl CircuitBreaker {
     }
 }
 
+/// Compute the upstream keepalive pool size based on the number of backends.
+/// - <= 15 backends: 128 (Pingora default)
+/// - 16+ backends: 8 connections per backend, capped at 1024
+pub fn compute_pool_size(backend_count: usize) -> usize {
+    if backend_count <= 15 {
+        128
+    } else {
+        (backend_count * 8).min(1024)
+    }
+}
+
 /// Check whether an IP address matches a pattern (exact or CIDR prefix).
 fn ip_matches(ip: &str, pattern: &str) -> bool {
     if pattern.contains('/') {

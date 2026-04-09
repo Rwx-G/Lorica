@@ -1573,8 +1573,14 @@ fn run_worker(
         lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone()),
     );
 
+    let pool_size = {
+        let backend_count = store.blocking_lock().list_backends().map(|b| b.len()).unwrap_or(0);
+        lorica::proxy_wiring::compute_pool_size(backend_count)
+    };
+    info!(pool_size, "upstream keepalive pool size");
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
         upstream_crl_file: upstream_crl_file.map(|s| s.to_string()),
+        upstream_keepalive_pool_size: pool_size,
         ..Default::default()
     });
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
@@ -1805,8 +1811,15 @@ fn run_single_process(cli: Cli) {
         let proxy_cache_misses = Arc::clone(&lorica_proxy.cache_misses);
         let proxy_ban_list = Arc::clone(&lorica_proxy.ban_list);
         let proxy_ewma_scores = lorica_proxy.ewma_tracker.scores_ref();
+        let pool_size = {
+            let s = store.blocking_lock();
+            let backend_count = s.list_backends().map(|b| b.len()).unwrap_or(0);
+            lorica::proxy_wiring::compute_pool_size(backend_count)
+        };
+        info!(pool_size, "upstream keepalive pool size");
         let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
             upstream_crl_file: cli.upstream_crl_file.clone(),
+            upstream_keepalive_pool_size: pool_size,
             ..Default::default()
         });
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);

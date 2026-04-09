@@ -32,6 +32,7 @@ Author: Rwx-G
 - Client H2 disconnects ("not a result of an error") no longer shown as errors in access logs - status 0 is sufficient
 - TCP keepalive on upstream connections (idle 15s, interval 5s, 3 probes) to detect stale/half-closed pooled connections before reuse
 - Upstream idle connection timeout (60s) evicts stale connections from the pool
+- Upstream keepalive pool auto-sizing at startup: 128 for <= 15 backends, scales to 8 per backend up to 1024 max
 
 ## [1.0.0] - 2026-04-09
 
