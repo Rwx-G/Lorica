@@ -86,11 +86,13 @@ impl SmoothWrrState {
 
         let mut cw = self.current_weights.lock();
 
-        // Initialize new backends with offset-based head start
+        // Initialize new backends with offset-based head start.
+        // The head start is just +1 so the offset backend wins the first
+        // tie-break without skewing the overall distribution.
         for (i, (addr, _)) in backends.iter().enumerate() {
             cw.entry(addr.to_string()).or_insert_with(|| {
                 if i == self.worker_offset % backends.len() {
-                    total // head start for the offset backend
+                    1 // tiny head start to win first tie-break
                 } else {
                     0
                 }
