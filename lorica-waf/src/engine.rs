@@ -48,6 +48,12 @@ pub struct WafEvent {
     /// Client IP that triggered the event (set by the proxy layer).
     #[serde(default)]
     pub client_ip: String,
+    /// Route hostname that was matched (set by the proxy layer).
+    #[serde(default)]
+    pub route_hostname: String,
+    /// Whether the request was blocked or just detected.
+    #[serde(default)]
+    pub action: String,
 }
 
 /// WAF operating mode for a specific evaluation.

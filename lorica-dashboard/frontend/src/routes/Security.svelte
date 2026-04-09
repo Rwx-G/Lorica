@@ -324,6 +324,8 @@
             <tr>
               <th>Time</th>
               <th>Client IP</th>
+              <th>Route</th>
+              <th>Action</th>
               <th>Rule</th>
               <th>Category</th>
               <th>Severity</th>
@@ -337,6 +339,8 @@
               <tr>
                 <td class="mono">{formatTime(event.timestamp)}</td>
                 <td class="mono">{event.client_ip || '-'}</td>
+                <td class="mono">{event.route_hostname || '-'}</td>
+                <td><span class="action-badge" class:action-blocked={event.action === 'blocked'} class:action-detected={event.action === 'detected'}>{event.action || '-'}</span></td>
                 <td class="mono">{event.rule_id}</td>
                 <td><span class="category-badge">{categoryLabel(event.category)}</span></td>
                 <td><span class={severityClass(event.severity)}>{event.severity}/5</span></td>
@@ -701,6 +705,17 @@
     background: var(--color-orange-subtle);
     color: var(--color-orange);
   }
+
+  .action-badge {
+    display: inline-block;
+    padding: 0.125rem 0.5rem;
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .action-blocked { background: var(--color-red-subtle); color: var(--color-red); }
+  .action-detected { background: var(--color-orange-subtle); color: var(--color-orange); }
 
   .severity-critical {
     color: var(--color-red);

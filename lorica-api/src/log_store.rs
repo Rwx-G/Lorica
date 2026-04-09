@@ -351,9 +351,12 @@ impl LogStore {
     /// Insert a WAF event.
     pub fn insert_waf_event(&self, event: &lorica_waf::WafEvent) -> Result<(), String> {
         let conn = self.conn.lock();
+        // Add columns if they don't exist (migration for existing DBs)
+        let _ = conn.execute("ALTER TABLE waf_events ADD COLUMN route_hostname TEXT DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE waf_events ADD COLUMN action TEXT DEFAULT ''", []);
         conn.execute(
-            "INSERT INTO waf_events (rule_id, description, category, severity, matched_field, matched_value, timestamp, client_ip)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO waf_events (rule_id, description, category, severity, matched_field, matched_value, timestamp, client_ip, route_hostname, action)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 event.rule_id as i64,
                 event.description,
@@ -363,6 +366,8 @@ impl LogStore {
                 event.matched_value,
                 event.timestamp,
                 event.client_ip,
+                event.route_hostname,
+                event.action,
             ],
         )
         .map_err(|e| format!("failed to insert WAF event: {e}"))?;
@@ -374,7 +379,7 @@ impl LogStore {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT rule_id, description, category, severity, matched_field, matched_value, timestamp, client_ip
+                "SELECT rule_id, description, category, severity, matched_field, matched_value, timestamp, client_ip, route_hostname, action
                  FROM waf_events ORDER BY id DESC LIMIT ?1",
             )
             .map_err(|e| format!("failed to prepare WAF events query: {e}"))?;
@@ -393,6 +398,8 @@ impl LogStore {
                     matched_value: row.get(5)?,
                     timestamp: row.get(6)?,
                     client_ip: row.get::<_, String>(7).unwrap_or_default(),
+                    route_hostname: row.get::<_, String>(8).unwrap_or_default(),
+                    action: row.get::<_, String>(9).unwrap_or_default(),
                 })
             })
             .map_err(|e| format!("failed to query WAF events: {e}"))?;

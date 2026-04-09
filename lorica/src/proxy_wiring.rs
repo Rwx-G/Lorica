@@ -712,6 +712,8 @@ impl ProxyHttp for LoricaProxy {
                         matched_value: ip.to_string(),
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         client_ip: ip.to_string(),
+                        route_hostname: host.to_string(),
+                        action: "blocked".to_string(),
                     };
                     let _ = store.insert_waf_event(&ev);
                 }
@@ -1048,7 +1050,7 @@ impl ProxyHttp for LoricaProxy {
             WafMode::Blocking => lorica_waf::WafMode::Blocking,
         };
 
-        let verdict = self.waf_engine.evaluate(
+        let mut verdict = self.waf_engine.evaluate(
             waf_mode,
             path,
             query,
@@ -1058,8 +1060,10 @@ impl ProxyHttp for LoricaProxy {
         );
 
         match verdict {
-            lorica_waf::WafVerdict::Blocked(ref events) => {
-                for ev in events {
+            lorica_waf::WafVerdict::Blocked(ref mut events) => {
+                for ev in events.iter_mut() {
+                    ev.route_hostname = host.to_string();
+                    ev.action = "blocked".to_string();
                     lorica_api::metrics::record_waf_event(ev.category.as_str(), "blocked");
                     self.waf_counts
                         .entry((ev.category.as_str().to_string(), "blocked".to_string()))
@@ -1137,8 +1141,10 @@ impl ProxyHttp for LoricaProxy {
                     .await?;
                 Ok(true)
             }
-            lorica_waf::WafVerdict::Detected(ref events) => {
-                for ev in events {
+            lorica_waf::WafVerdict::Detected(ref mut events) => {
+                for ev in events.iter_mut() {
+                    ev.route_hostname = host.to_string();
+                    ev.action = "detected".to_string();
                     lorica_api::metrics::record_waf_event(ev.category.as_str(), "detected");
                     self.waf_counts
                         .entry((ev.category.as_str().to_string(), "detected".to_string()))
