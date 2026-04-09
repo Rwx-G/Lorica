@@ -124,6 +124,8 @@ impl WafEngine {
             matched_value: ip.to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             client_ip: ip.to_string(),
+            route_hostname: String::new(),
+            action: String::new(),
         };
         let mut buf = self.event_buffer.lock();
         if buf.len() >= self.max_events {
@@ -441,6 +443,8 @@ impl WafEngine {
                     matched_value,
                     timestamp: timestamp.to_string(),
                     client_ip: String::new(),
+                    route_hostname: String::new(),
+                    action: String::new(),
                 });
             }
         }
@@ -465,6 +469,8 @@ impl WafEngine {
                     matched_value,
                     timestamp: timestamp.to_string(),
                     client_ip: String::new(),
+                    route_hostname: String::new(),
+                    action: String::new(),
                 });
             }
         }
