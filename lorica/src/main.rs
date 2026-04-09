@@ -600,7 +600,6 @@ fn run_supervisor(cli: Cli) {
             let _ = std::fs::set_permissions(&waf_sock_path, std::fs::Permissions::from_mode(0o660));
         }
         let waf_event_sink = Arc::clone(&waf_event_buffer);
-        let waf_log_store = log_store.clone();
         let waf_alert_sender = alert_sender.clone();
         // Global WAF violation counter: counts blocked events per IP across all workers
         let waf_global_violations: Arc<dashmap::DashMap<String, std::sync::atomic::AtomicU64>> =
@@ -612,7 +611,6 @@ fn run_supervisor(cli: Cli) {
                 match waf_listener.accept().await {
                     Ok((stream, _)) => {
                         let sink = Arc::clone(&waf_event_sink);
-                        let store = waf_log_store.clone();
                         let alert_tx = waf_alert_sender.clone();
                         let violations = Arc::clone(&waf_global_violations);
                         let ban_tx = waf_ban_tx.clone();
@@ -626,9 +624,10 @@ fn run_supervisor(cli: Cli) {
                                     Ok(0) => break,
                                     Ok(_) => {
                                         if let Ok(event) = serde_json::from_str::<lorica_waf::WafEvent>(&line) {
-                                            if let Some(ref s) = store {
-                                                let _ = s.insert_waf_event(&event);
-                                            }
+                                            // Workers insert WAF events into the DB directly
+                                            // (with route_hostname and action stamped), so we
+                                            // skip the insert here to avoid duplicates.
+
                                             // Dispatch WAF alert notification
                                             alert_tx.send(
                                                 lorica_notify::AlertEvent::new(
