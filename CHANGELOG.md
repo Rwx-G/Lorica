@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Author: Rwx-G
 
-## [1.0.0] - 2026-04-08
+## [1.0.0] - 2026-04-09
 
 ### Added
 
@@ -147,21 +147,11 @@ Author: Rwx-G
 
 **Testing**
 
-- 871 Rust unit tests across 25 crates (442 product + 429 forked Pingora), 350+ E2E Docker assertions across standalone and worker modes
-- Docker Compose E2E test suite with 170+ assertions across 35 sections
+- 892 Rust unit tests across 25 crates (463 product + 429 forked Pingora), 119 frontend Vitest tests, 350+ E2E Docker assertions across standalone and worker modes
+- Docker Compose E2E test suite with 350+ assertions across 65+ sections (standalone + worker modes)
 - Fuzz testing targets for WAF evaluation and API input
 - Reproducible benchmark suite using oha in Docker (single-process, multi-worker, WAF, cache scenarios)
 - Performance tuning guide with kernel sysctl, fd limits, worker sizing, cache and rate limit tuning
-
-### Fixed
-
-- Enforce `max_request_body_bytes` on chunked transfer encoding requests (previously only checked Content-Length header)
-
-### Changed
-
-- DashMap for ban list and per-route connection counters replacing RwLock<HashMap> for reduced contention
-- Route53 DNS-01 provider uses official aws-sdk-route53 crate instead of custom SigV4 signing
-- Upgrade reqwest 0.11 to 0.12 across all crates
 
 ### Removed
 

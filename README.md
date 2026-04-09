@@ -9,8 +9,8 @@
   <img src="https://img.shields.io/badge/version-1.0.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-502-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-375-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-582-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-429-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -403,13 +403,13 @@ cargo build --release
 ### Running tests
 
 ```bash
-# All Rust unit tests (871 tests across 25 crates)
+# All Rust unit tests (892 tests across 25 crates)
 cargo test
 
-# Product crate tests only (280 tests)
-cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench
+# Product crate tests only (463 tests)
+cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command
 
-# Frontend tests (52 Vitest tests)
+# Frontend tests (119 Vitest tests)
 cd lorica-dashboard/frontend && npx vitest run
 
 # E2E tests (350+ assertions across 65+ sections, Docker required)
