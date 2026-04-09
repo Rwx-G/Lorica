@@ -65,7 +65,7 @@ pub async fn reload_proxy_config(
         .map(|rb| (rb.route_id, rb.backend_id))
         .collect();
 
-    let new_config = ProxyConfig::from_store(
+    let mut new_config = ProxyConfig::from_store(
         routes,
         backends,
         certificates,
@@ -77,6 +77,19 @@ pub async fn reload_proxy_config(
         waf_ban_duration_s,
         trusted_proxies,
     );
+
+    // Preserve round-robin counters from the old config to avoid resetting
+    // load distribution on every config reload
+    let old_config = proxy_config.load();
+    for entries in new_config.routes_by_host.values_mut() {
+        for entry in entries.iter_mut() {
+            if let Some(old_entries) = old_config.routes_by_host.get(&entry.route.hostname) {
+                if let Some(old_entry) = old_entries.iter().find(|e| e.route.id == entry.route.id) {
+                    entry.rr_counter = Arc::clone(&old_entry.rr_counter);
+                }
+            }
+        }
+    }
 
     let route_count: usize = new_config.routes_by_host.values().map(|v| v.len()).sum();
     info!(routes = route_count, "proxy configuration reloaded");
