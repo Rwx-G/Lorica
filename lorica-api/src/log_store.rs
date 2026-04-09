@@ -45,9 +45,10 @@ impl LogStore {
         let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN xff_proxy_ip TEXT NOT NULL DEFAULT ''", []);
         let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN source TEXT NOT NULL DEFAULT ''", []);
 
-        // Migrate: add client_ip column to waf_events if missing
-        let _ = conn
-            .execute_batch("ALTER TABLE waf_events ADD COLUMN client_ip TEXT NOT NULL DEFAULT '';");
+        // Migrate: add columns to waf_events if missing
+        let _ = conn.execute("ALTER TABLE waf_events ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE waf_events ADD COLUMN route_hostname TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE waf_events ADD COLUMN action TEXT NOT NULL DEFAULT ''", []);
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS waf_events (
@@ -59,7 +60,9 @@ impl LogStore {
                 matched_field TEXT NOT NULL,
                 matched_value TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
-                client_ip TEXT NOT NULL DEFAULT ''
+                client_ip TEXT NOT NULL DEFAULT '',
+                route_hostname TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_waf_events_timestamp ON waf_events(timestamp);
             CREATE INDEX IF NOT EXISTS idx_waf_events_category ON waf_events(category);",
@@ -351,9 +354,6 @@ impl LogStore {
     /// Insert a WAF event.
     pub fn insert_waf_event(&self, event: &lorica_waf::WafEvent) -> Result<(), String> {
         let conn = self.conn.lock();
-        // Add columns if they don't exist (migration for existing DBs)
-        let _ = conn.execute("ALTER TABLE waf_events ADD COLUMN route_hostname TEXT DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE waf_events ADD COLUMN action TEXT DEFAULT ''", []);
         conn.execute(
             "INSERT INTO waf_events (rule_id, description, category, severity, matched_field, matched_value, timestamp, client_ip, route_hostname, action)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
