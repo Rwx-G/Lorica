@@ -261,16 +261,16 @@
     />
     <input
       type="text"
-      class="filter-input route-input"
-      placeholder="Filter by host..."
-      bind:value={filterRoute}
+      class="filter-input ip-input"
+      placeholder="Filter by Client IP..."
+      bind:value={filterClientIp}
       onkeydown={(e) => { if (e.key === 'Enter') loadLogs(); }}
     />
     <input
       type="text"
-      class="filter-input ip-input"
-      placeholder="Filter by IP..."
-      bind:value={filterClientIp}
+      class="filter-input route-input"
+      placeholder="Filter by host..."
+      bind:value={filterRoute}
       onkeydown={(e) => { if (e.key === 'Enter') loadLogs(); }}
     />
     <select class="filter-select" bind:value={filterStatusCategory} onchange={loadLogs}>
