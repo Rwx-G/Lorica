@@ -1801,6 +1801,16 @@ impl ProxyHttp for LoricaProxy {
         peer.options.read_timeout = Some(Duration::from_secs(entry.route.read_timeout_s as u64));
         peer.options.write_timeout = Some(Duration::from_secs(entry.route.send_timeout_s as u64));
 
+        // Drop idle pooled connections after 60s to avoid stale/half-closed TCP
+        peer.options.idle_timeout = Some(Duration::from_secs(60));
+
+        // TCP keepalive: detect dead connections in the pool before reuse
+        peer.options.tcp_keepalive = Some(lorica_core::protocols::TcpKeepalive {
+            idle: Duration::from_secs(15),
+            interval: Duration::from_secs(5),
+            count: 3,
+        });
+
         Ok(peer)
     }
 

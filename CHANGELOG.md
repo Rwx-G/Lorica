@@ -30,6 +30,8 @@ Author: Rwx-G
 - IP blocklist WAF events showing `-` as route when request has no Host header: now falls back to URI authority (IP:port)
 - Security page: missing category labels (SSRF, XXE, SSTI, Log4Shell, IP Blocklist, Prototype Pollution) and event filter options
 - Client H2 disconnects ("not a result of an error") no longer shown as errors in access logs - status 0 is sufficient
+- TCP keepalive on upstream connections (idle 15s, interval 5s, 3 probes) to detect stale/half-closed pooled connections before reuse
+- Upstream idle connection timeout (60s) evicts stale connections from the pool
 
 ## [1.0.0] - 2026-04-09
 
