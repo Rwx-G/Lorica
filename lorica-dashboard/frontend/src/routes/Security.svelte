@@ -221,7 +221,13 @@
       xss: 'XSS',
       path_traversal: 'Path Traversal',
       command_injection: 'Cmd Injection',
-      protocol_violation: 'Protocol',
+      protocol_violation: 'Protocol Violation',
+      SSRF: 'SSRF',
+      log_injection: 'Log4Shell/JNDI',
+      XXE: 'XXE',
+      ip_blocklist: 'IP Blocklist',
+      SSTI: 'SSTI',
+      prototype_pollution: 'Prototype Pollution',
     };
     return labels[cat] ?? cat;
   }
@@ -306,6 +312,12 @@
         <option value="path_traversal">Path Traversal</option>
         <option value="command_injection">Command Injection</option>
         <option value="protocol_violation">Protocol Violation</option>
+        <option value="SSRF">SSRF</option>
+        <option value="log_injection">Log4Shell/JNDI</option>
+        <option value="XXE">XXE</option>
+        <option value="ip_blocklist">IP Blocklist</option>
+        <option value="SSTI">SSTI</option>
+        <option value="prototype_pollution">Prototype Pollution</option>
       </select>
     </div>
 

@@ -25,6 +25,7 @@ Author: Rwx-G
 - SLA breach notifications not firing in worker mode: supervisor now checks thresholds on every flush cycle regardless of local data, reading SLA metrics flushed by workers
 - Access logs: disabling auto-refresh/live toggle did not disconnect WebSocket, choice not persisted across page reloads
 - IP blocklist WAF events showing `-` as route when request has no Host header: now falls back to URI authority (IP:port)
+- Security page: missing category labels (SSRF, XXE, SSTI, Log4Shell, IP Blocklist, Prototype Pollution) and event filter options
 
 ## [1.0.0] - 2026-04-09
 
