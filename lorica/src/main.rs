@@ -353,13 +353,11 @@ fn run_supervisor(cli: Cli) {
             let _ = std::fs::set_permissions(&log_sock_path, std::fs::Permissions::from_mode(0o660));
         }
         let log_sink = Arc::clone(&log_buffer);
-        let log_store_sink = log_store.clone();
         tokio::spawn(async move {
             loop {
                 match log_listener.accept().await {
                     Ok((stream, _)) => {
                         let sink = Arc::clone(&log_sink);
-                        let store_sink = log_store_sink.clone();
                         tokio::spawn(async move {
                             let mut reader = tokio::io::BufReader::new(stream);
                             let mut line = String::new();
@@ -369,11 +367,9 @@ fn run_supervisor(cli: Cli) {
                                     Ok(0) => break, // EOF - worker disconnected
                                     Ok(_) => {
                                         if let Ok(entry) = serde_json::from_str::<lorica_api::logs::LogEntry>(&line) {
-                                            if let Some(ref s) = store_sink {
-                                                if let Err(e) = s.insert(&entry) {
-                                                    tracing::warn!(error = %e, "failed to persist access log entry");
-                                                }
-                                            }
+                                            // Workers persist access logs directly via their own
+                                            // LogStore, so we only push to the in-memory buffer
+                                            // here (for WebSocket streaming to the dashboard).
                                             sink.push(entry).await;
                                         }
                                     }
