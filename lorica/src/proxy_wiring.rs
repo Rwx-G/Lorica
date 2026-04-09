@@ -548,6 +548,9 @@ pub struct RequestCtx {
     pub retry_count: u32,
     /// Backends overridden by a matched path rule (None = use route backends).
     pub matched_backends: Option<Vec<Backend>>,
+    /// Human-readable reason when the proxy short-circuits with an error status
+    /// (e.g. "WAF blocked", "rate limited", "return_status rule", "IP banned").
+    pub block_reason: Option<String>,
     /// Accumulated request body bytes for chunked transfer size enforcement.
     pub body_bytes_received: u64,
     /// Buffered request body for WAF body scanning (only when WAF is enabled).
@@ -672,6 +675,7 @@ impl ProxyHttp for LoricaProxy {
             rate_limit_info: None,
             retry_count: 0,
             matched_backends: None,
+            block_reason: None,
             body_bytes_received: 0,
             waf_body_buffer: None,
         }
@@ -709,6 +713,7 @@ impl ProxyHttp for LoricaProxy {
         if config.max_global_connections > 0 {
             let current = self.active_connections.load(Ordering::Relaxed);
             if current >= config.max_global_connections as u64 {
+                ctx.block_reason = Some("global connection limit".to_string());
                 let header = lorica_http::ResponseHeader::build(503, None)?;
                 session
                     .write_response_header(Box::new(header), true)
@@ -778,6 +783,7 @@ impl ProxyHttp for LoricaProxy {
                 false
             };
             if banned {
+                ctx.block_reason = Some("IP banned".to_string());
                 let header = lorica_http::ResponseHeader::build(403, None)?;
                 session
                     .write_response_header(Box::new(header), true)
@@ -850,6 +856,7 @@ impl ProxyHttp for LoricaProxy {
                     .unwrap_or("")
                     .eq_ignore_ascii_case("websocket")
                 {
+                    ctx.block_reason = Some("WebSocket disabled".to_string());
                     let header = lorica_http::ResponseHeader::build(403, None)?;
                     session
                         .write_response_header(Box::new(header), true)
@@ -923,6 +930,7 @@ impl ProxyHttp for LoricaProxy {
 
         // Direct status response (return_status)
         if let Some(status) = ctx.route_snapshot.as_ref().and_then(|r| r.return_status) {
+            ctx.block_reason = Some(format!("return_status {status}"));
             if let Some(ref target) = ctx.route_snapshot.as_ref().and_then(|r| r.redirect_to.clone())
             {
                 // return_status + redirect_to = redirect with specific status code
@@ -964,6 +972,7 @@ impl ProxyHttp for LoricaProxy {
             if !entry.route.ip_allowlist.is_empty()
                 && !entry.route.ip_allowlist.iter().any(|a| ip_matches(ip, a))
             {
+                ctx.block_reason = Some("IP not in allowlist".to_string());
                 let header = lorica_http::ResponseHeader::build(403, None)?;
                 session
                     .write_response_header(Box::new(header), true)
@@ -971,6 +980,7 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(true);
             }
             if entry.route.ip_denylist.iter().any(|d| ip_matches(ip, d)) {
+                ctx.block_reason = Some("IP in denylist".to_string());
                 let header = lorica_http::ResponseHeader::build(403, None)?;
                 session
                     .write_response_header(Box::new(header), true)
@@ -994,6 +1004,7 @@ impl ProxyHttp for LoricaProxy {
                     route_id = %entry.route.id,
                     "slowloris detected - slow request headers"
                 );
+                ctx.block_reason = Some("slowloris detected".to_string());
                 let header = lorica_http::ResponseHeader::build(408, None)?;
                 session
                     .write_response_header(Box::new(header), true)
@@ -1021,6 +1032,7 @@ impl ProxyHttp for LoricaProxy {
                     max_connections = max_conn,
                     "max connections exceeded for route (503)"
                 );
+                ctx.block_reason = Some("route connection limit".to_string());
                 let header = lorica_http::ResponseHeader::build(503, None)?;
                 session
                     .write_response_header(Box::new(header), true)
@@ -1112,6 +1124,7 @@ impl ProxyHttp for LoricaProxy {
                         .unwrap_or_default()
                         .as_secs()
                         + 1;
+                    ctx.block_reason = Some("rate limited".to_string());
                     let mut header = lorica_http::ResponseHeader::build(429, None)?;
                     header.insert_header("Retry-After", "1")?;
                     header.insert_header("X-RateLimit-Reset", reset_ts.to_string())?;
@@ -1914,7 +1927,9 @@ impl ProxyHttp for LoricaProxy {
 
         let backend_addr = ctx.backend_addr.as_deref().unwrap_or("-");
 
-        let error_str = if ctx.waf_blocked {
+        let error_str = if let Some(ref reason) = ctx.block_reason {
+            Some(reason.clone())
+        } else if ctx.waf_blocked {
             Some("WAF blocked".to_string())
         } else if ctx.waf_detected {
             Some("WAF detected".to_string())
