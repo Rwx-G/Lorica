@@ -138,14 +138,14 @@
 </script>
 
 <!-- DNS Providers -->
-<section class="section">
-  <button class="collapsible-header" class:open={expandedSections.dns_providers} onclick={() => toggleSection('dns_providers')}>
+<section class="settings-section">
+  <button class="settings-collapsible-header" class:open={expandedSections.dns_providers} onclick={() => toggleSection('dns_providers')}>
     <h2>DNS Providers</h2>
-    <span class="chevron" class:expanded={expandedSections.dns_providers}></span>
+    <span class="settings-chevron" class:expanded={expandedSections.dns_providers}></span>
   </button>
   {#if expandedSections.dns_providers}
-    <div class="section-body">
-      <p class="section-hint">Global DNS provider credentials for ACME DNS-01 certificate provisioning. Credentials are stored encrypted and never shown back.</p>
+    <div class="settings-section-body">
+      <p class="settings-hint">Global DNS provider credentials for ACME DNS-01 certificate provisioning. Credentials are stored encrypted and never shown back.</p>
 
       {#if dnsProviders.length === 0}
         <p class="empty-text">No DNS providers configured.</p>
@@ -167,11 +167,11 @@
                   <td class="capitalize">{dp.provider_type}</td>
                   <td class="mono">{new Date(dp.created_at).toLocaleDateString()}</td>
                   <td class="actions-cell">
-                    <button class="btn-table-action btn-table-test" onclick={() => handleTestDnsProvider(dp.id)} disabled={testingDnsProvider === dp.id}>
+                    <button class="settings-btn-action settings-btn-test" onclick={() => handleTestDnsProvider(dp.id)} disabled={testingDnsProvider === dp.id}>
                       {testingDnsProvider === dp.id ? 'Testing...' : 'Test'}
                     </button>
-                    <button class="btn-table-action btn-table-edit" onclick={() => openDnsProviderEdit(dp)}>Edit</button>
-                    <button class="btn-table-action btn-table-delete" onclick={() => deletingDnsProvider = dp}>Delete</button>
+                    <button class="settings-btn-action settings-btn-edit" onclick={() => openDnsProviderEdit(dp)}>Edit</button>
+                    <button class="settings-btn-action settings-btn-delete" onclick={() => deletingDnsProvider = dp}>Delete</button>
                   </td>
                 </tr>
               {/each}
@@ -179,7 +179,7 @@
           </table>
         </div>
       {/if}
-      <div class="actions-left">
+      <div class="settings-actions-left">
         <button class="btn btn-primary" onclick={openDnsProviderCreate}>Add Provider</button>
       </div>
     </div>
@@ -253,7 +253,7 @@
       {/if}
 
       {#if dnsProviderEditing}
-        <p class="section-hint">Credentials are write-only. Fill in all required fields to update them.</p>
+        <p class="settings-hint">Credentials are write-only. Fill in all required fields to update them.</p>
       {/if}
 
       {#if dnsProviderError}

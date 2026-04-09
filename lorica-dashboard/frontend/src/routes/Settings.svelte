@@ -391,14 +391,14 @@
     <p class="loading">Loading...</p>
   {:else}
     <!-- Theme -->
-    <section class="section">
-      <button class="collapsible-header" class:open={expandedSections.appearance} onclick={() => toggleSection('appearance')}>
+    <section class="settings-section">
+      <button class="settings-collapsible-header" class:open={expandedSections.appearance} onclick={() => toggleSection('appearance')}>
         <h2>Appearance</h2>
-        <span class="chevron" class:expanded={expandedSections.appearance}></span>
+        <span class="settings-chevron" class:expanded={expandedSections.appearance}></span>
       </button>
       {#if expandedSections.appearance}
-        <div class="section-body">
-          <p class="section-hint">Current theme: {theme}.</p>
+        <div class="settings-section-body">
+          <p class="settings-hint">Current theme: {theme}.</p>
           <div class="actions">
             <button class="btn btn-secondary" onclick={toggleTheme}>
               {theme === 'dark' ? 'Switch to Light' : 'Switch to Dark'}
@@ -409,13 +409,13 @@
     </section>
 
     <!-- Global Settings -->
-    <section class="section">
-      <button class="collapsible-header" class:open={expandedSections.global} onclick={() => toggleSection('global')}>
+    <section class="settings-section">
+      <button class="settings-collapsible-header" class:open={expandedSections.global} onclick={() => toggleSection('global')}>
         <h2>Global Configuration</h2>
-        <span class="chevron" class:expanded={expandedSections.global}></span>
+        <span class="settings-chevron" class:expanded={expandedSections.global}></span>
       </button>
       {#if expandedSections.global}
-      <div class="section-body">
+      <div class="settings-section-body">
         <div class="form-row">
           <label for="mgmt-port">Management Port</label>
           <input id="mgmt-port" type="number" bind:value={settingsForm.management_port} min="1" max="65535" disabled />
@@ -518,14 +518,14 @@
     </section>
 
     <!-- Security Header Presets -->
-    <section class="section">
-      <button class="collapsible-header" class:open={expandedSections.presets} onclick={() => toggleSection('presets')}>
+    <section class="settings-section">
+      <button class="settings-collapsible-header" class:open={expandedSections.presets} onclick={() => toggleSection('presets')}>
         <h2>Security Header Presets</h2>
-        <span class="chevron" class:expanded={expandedSections.presets}></span>
+        <span class="settings-chevron" class:expanded={expandedSections.presets}></span>
       </button>
       {#if expandedSections.presets}
-        <div class="section-body">
-          <p class="section-hint">Custom presets appear alongside builtin presets (strict, moderate, none) in the route security headers dropdown.</p>
+        <div class="settings-section-body">
+          <p class="settings-hint">Custom presets appear alongside builtin presets (strict, moderate, none) in the route security headers dropdown.</p>
 
           <!-- Builtin presets (read-only) -->
           <div class="table-wrap">
@@ -553,15 +553,15 @@
                     <td class="preset-desc">{Object.keys(cp.headers).length} header{Object.keys(cp.headers).length !== 1 ? 's' : ''}</td>
                     <td><span class="badge badge-custom">custom</span></td>
                     <td class="actions-cell">
-                      <button class="btn-table-action btn-table-edit" onclick={() => openPresetEdit(idx)}>Edit</button>
-                      <button class="btn-table-action btn-table-delete" onclick={() => deletingPresetIdx = idx}>Delete</button>
+                      <button class="settings-btn-action settings-btn-edit" onclick={() => openPresetEdit(idx)}>Edit</button>
+                      <button class="settings-btn-action settings-btn-delete" onclick={() => deletingPresetIdx = idx}>Delete</button>
                     </td>
                   </tr>
                 {/each}
               </tbody>
             </table>
           </div>
-          <div class="actions-left">
+          <div class="settings-actions-left">
             <button class="btn btn-primary" onclick={openPresetCreate}>Add Preset</button>
           </div>
         </div>
@@ -569,14 +569,14 @@
     </section>
 
     <!-- Ban configuration note -->
-    <section class="section">
-      <button class="collapsible-header" class:open={expandedSections.ban_rules} onclick={() => toggleSection('ban_rules')}>
+    <section class="settings-section">
+      <button class="settings-collapsible-header" class:open={expandedSections.ban_rules} onclick={() => toggleSection('ban_rules')}>
         <h2>Ban Rules</h2>
-        <span class="chevron" class:expanded={expandedSections.ban_rules}></span>
+        <span class="settings-chevron" class:expanded={expandedSections.ban_rules}></span>
       </button>
       {#if expandedSections.ban_rules}
-        <div class="section-body">
-          <p class="section-hint">Ban rules (slowloris protection, auto-ban threshold and duration) are configured per-route in the Routes page under Advanced Configuration > Protection.</p>
+        <div class="settings-section-body">
+          <p class="settings-hint">Ban rules (slowloris protection, auto-ban threshold and duration) are configured per-route in the Routes page under Advanced Configuration > Protection.</p>
         </div>
       {/if}
     </section>
@@ -586,14 +586,14 @@
     <SettingsNotifications bind:notifications {expandedSections} {toggleSection} onReload={loadAll} />
 
     <!-- Notification History -->
-    <section class="section">
-      <button class="collapsible-header" class:open={expandedSections.history} onclick={() => toggleSection('history')}>
+    <section class="settings-section">
+      <button class="settings-collapsible-header" class:open={expandedSections.history} onclick={() => toggleSection('history')}>
         <h2>Notification History</h2>
-        <span class="chevron" class:expanded={expandedSections.history}></span>
+        <span class="settings-chevron" class:expanded={expandedSections.history}></span>
       </button>
       {#if expandedSections.history}
-        <div class="section-body">
-          <p class="section-hint">Recent alert events dispatched by Lorica (last 100).</p>
+        <div class="settings-section-body">
+          <p class="settings-hint">Recent alert events dispatched by Lorica (last 100).</p>
 
           {#if notifHistory.length === 0}
             <p class="empty-text">No notification events yet.</p>
@@ -624,14 +624,14 @@
     </section>
 
     <!-- Preference Memory -->
-    <section class="section">
-      <button class="collapsible-header" class:open={expandedSections.preferences} onclick={() => toggleSection('preferences')}>
+    <section class="settings-section">
+      <button class="settings-collapsible-header" class:open={expandedSections.preferences} onclick={() => toggleSection('preferences')}>
         <h2>Preference Memory</h2>
-        <span class="chevron" class:expanded={expandedSections.preferences}></span>
+        <span class="settings-chevron" class:expanded={expandedSections.preferences}></span>
       </button>
       {#if expandedSections.preferences}
-        <div class="section-body">
-          <p class="section-hint">Stored decisions for prompts and UI preferences.</p>
+        <div class="settings-section-body">
+          <p class="settings-hint">Stored decisions for prompts and UI preferences.</p>
 
           <div class="pref-row">
             <div class="pref-info">
@@ -698,18 +698,18 @@
     </section>
 
     <!-- Export/Import -->
-    <section class="section">
-      <button class="collapsible-header" class:open={expandedSections.export} onclick={() => toggleSection('export')}>
+    <section class="settings-section">
+      <button class="settings-collapsible-header" class:open={expandedSections.export} onclick={() => toggleSection('export')}>
         <h2>Configuration Export / Import</h2>
-        <span class="chevron" class:expanded={expandedSections.export}></span>
+        <span class="settings-chevron" class:expanded={expandedSections.export}></span>
       </button>
       {#if expandedSections.export}
-        <div class="section-body">
+        <div class="settings-section-body">
           <div class="export-import-grid">
             <!-- Export -->
             <div class="form-card">
               <h3>Export</h3>
-              <p class="section-hint">Download the full configuration as a TOML file.</p>
+              <p class="settings-hint">Download the full configuration as a TOML file.</p>
               {#if exportError}
                 <div class="form-error">{exportError}</div>
               {/if}
@@ -723,7 +723,7 @@
             <!-- Import -->
             <div class="form-card">
               <h3>Import</h3>
-              <p class="section-hint">Upload a TOML file to preview and apply changes.</p>
+              <p class="settings-hint">Upload a TOML file to preview and apply changes.</p>
               {#if !importDiff}
                 <div class="actions-center">
                   <label class="file-input-label">
@@ -873,71 +873,6 @@
 
 <style>
   .settings-page { max-width: none; }
-
-  :global(.section) {
-    margin-bottom: 1.5rem;
-  }
-
-  :global(.collapsible-header) {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    width: 100%;
-    padding: var(--space-3) var(--space-4);
-    background: var(--color-bg-input);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-md);
-    cursor: pointer;
-    transition: background-color var(--transition-fast);
-    font-family: inherit;
-  }
-
-  :global(.collapsible-header):hover {
-    background: var(--color-bg-hover);
-  }
-
-  :global(.collapsible-header.open) {
-    border-radius: var(--radius-md) var(--radius-md) 0 0;
-    border-bottom-color: transparent;
-  }
-
-  :global(.collapsible-header) h2 {
-    margin: 0;
-    font-size: 0.875rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    font-weight: 600;
-    color: var(--color-text-heading);
-  }
-
-  :global(.chevron) {
-    display: inline-block;
-    width: 0.5rem;
-    height: 0.5rem;
-    border-right: 2px solid var(--color-text-muted);
-    border-bottom: 2px solid var(--color-text-muted);
-    transform: rotate(45deg);
-    transition: transform 0.2s ease;
-    flex-shrink: 0;
-  }
-
-  :global(.chevron.expanded) {
-    transform: rotate(-135deg);
-  }
-
-  :global(.section-body) {
-    background: var(--color-bg-card);
-    border: 1px solid var(--color-border);
-    border-top: none;
-    border-radius: 0 0 var(--radius-md) var(--radius-md);
-    padding: var(--space-4);
-  }
-
-  :global(.section-hint) {
-    color: var(--color-text-muted);
-    font-size: 0.8125rem;
-    margin: 0.25rem 0 1rem;
-  }
 
   :global(.form-card) {
     background: var(--color-bg-card);
@@ -1103,36 +1038,6 @@
     color: var(--color-red);
   }
 
-  /* Table action buttons */
-  :global(.btn-table-action) {
-    padding: 0.25rem 0.5rem;
-    border-radius: var(--radius-sm);
-    font-size: var(--text-xs);
-    font-weight: 500;
-    border: 1px solid;
-    background: transparent;
-    cursor: pointer;
-    transition: all 0.15s;
-    white-space: nowrap;
-  }
-  :global(.btn-table-action:disabled) {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-  :global(.btn-table-edit) { color: var(--color-primary); border-color: var(--color-primary); }
-  :global(.btn-table-edit:hover:not(:disabled)) { background: var(--color-primary-subtle); }
-  :global(.btn-table-delete) { color: var(--color-red); border-color: var(--color-red); }
-  :global(.btn-table-delete:hover:not(:disabled)) { background: var(--color-red-subtle); }
-  :global(.btn-table-test) { color: var(--color-green); border-color: var(--color-green); }
-  :global(.btn-table-test:hover:not(:disabled)) { background: var(--color-green-subtle); }
-
-  /* Settings tables - consistent column widths */
-  :global(.settings-table) { width: 100%; table-layout: fixed; }
-  :global(.settings-table) th:nth-child(1) { width: 20%; }
-  :global(.settings-table) th:nth-child(2) { width: 45%; }
-  :global(.settings-table) th:nth-child(3) { width: 15%; }
-  :global(.settings-table) th:nth-child(4) { width: 20%; }
-
   .text-muted {
     color: var(--color-text-muted);
     font-size: var(--text-xs);
@@ -1239,13 +1144,6 @@
     margin-top: 1rem;
   }
 
-  :global(.actions-left) {
-    display: flex;
-    justify-content: flex-start;
-    gap: 0.75rem;
-    margin-top: 1rem;
-  }
-
   :global(.actions-center) {
     display: flex;
     justify-content: center;
@@ -1253,8 +1151,8 @@
     margin-top: 0.75rem;
   }
 
-  :global(.section-body) .btn-primary,
-  :global(.section-body) .btn-secondary {
+  :global(.settings-section-body) .btn-primary,
+  :global(.settings-section-body) .btn-secondary {
     min-width: 140px;
   }
 

@@ -179,14 +179,14 @@
 </script>
 
 <!-- Notification Channels -->
-<section class="section">
-  <button class="collapsible-header" class:open={expandedSections.notifications} onclick={() => toggleSection('notifications')}>
+<section class="settings-section">
+  <button class="settings-collapsible-header" class:open={expandedSections.notifications} onclick={() => toggleSection('notifications')}>
     <h2>Notification Channels</h2>
-    <span class="chevron" class:expanded={expandedSections.notifications}></span>
+    <span class="settings-chevron" class:expanded={expandedSections.notifications}></span>
   </button>
   {#if expandedSections.notifications}
-    <div class="section-body">
-      <p class="section-hint">Stdout logging is always enabled. Configure additional channels below.</p>
+    <div class="settings-section-body">
+      <p class="settings-hint">Stdout logging is always enabled. Configure additional channels below.</p>
 
       {#if notifications.length === 0}
         <p class="empty-text">No notification channels configured.</p>
@@ -211,9 +211,9 @@
                     {nc.enabled ? 'Yes' : 'No'}
                   </td>
                   <td class="actions-cell">
-                    <button class="btn-table-action btn-table-test" onclick={() => handleTestNotif(nc.id)} disabled={testingNotif === nc.id}>Test</button>
-                    <button class="btn-table-action btn-table-edit" onclick={() => openNotifEdit(nc)}>Edit</button>
-                    <button class="btn-table-action btn-table-delete" onclick={() => deletingNotif = nc}>Delete</button>
+                    <button class="settings-btn-action settings-btn-test" onclick={() => handleTestNotif(nc.id)} disabled={testingNotif === nc.id}>Test</button>
+                    <button class="settings-btn-action settings-btn-edit" onclick={() => openNotifEdit(nc)}>Edit</button>
+                    <button class="settings-btn-action settings-btn-delete" onclick={() => deletingNotif = nc}>Delete</button>
                   </td>
                 </tr>
               {/each}
@@ -221,7 +221,7 @@
           </table>
         </div>
       {/if}
-      <div class="actions-left">
+      <div class="settings-actions-left">
         <button class="btn btn-primary" onclick={openNotifCreate}>Add Channel</button>
       </div>
     </div>
