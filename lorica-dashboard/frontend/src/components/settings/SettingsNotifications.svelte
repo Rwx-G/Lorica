@@ -234,7 +234,7 @@
   <div class="settings-overlay" onclick={(e) => { if (e.target === e.currentTarget) showNotifForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showNotifForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
     <div class="settings-dialog" role="document">
       <h3>{notifEditing ? 'Edit' : 'Add'} Notification Channel</h3>
-      <div class="form-row">
+      <div class="settings-form-row">
         <label for="notif-channel">Channel</label>
         <select id="notif-channel" bind:value={notifChannel}>
           <option value="email">Email (SMTP)</option>
@@ -242,7 +242,7 @@
           <option value="slack">Slack</option>
         </select>
       </div>
-      <div class="form-row">
+      <div class="settings-form-row">
         <label for="notif-enabled">
           <input id="notif-enabled" type="checkbox" bind:checked={notifEnabled} />
           Enabled
@@ -250,59 +250,59 @@
       </div>
 
       {#if notifChannel === 'email'}
-        <fieldset class="notif-fieldset">
+        <fieldset class="settings-fieldset">
           <legend>SMTP Server</legend>
-          <div class="form-row">
+          <div class="settings-form-row">
             <label for="notif-smtp-host">SMTP Host <span class="settings-required">*</span></label>
             <input id="notif-smtp-host" type="text" bind:value={notifSmtpHost} placeholder="smtp.example.com" required />
           </div>
-          <div class="form-row">
+          <div class="settings-form-row">
             <label for="notif-smtp-port">SMTP Port</label>
             <input id="notif-smtp-port" type="number" bind:value={notifSmtpPort} placeholder="587" min="1" max="65535" />
-            <span class="form-hint">587 (STARTTLS) or 465 (SSL)</span>
+            <span class="settings-form-hint">587 (STARTTLS) or 465 (SSL)</span>
           </div>
-          <div class="form-row">
+          <div class="settings-form-row">
             <label for="notif-smtp-user">Username</label>
             <input id="notif-smtp-user" type="text" bind:value={notifSmtpUsername} placeholder="user@example.com" />
           </div>
-          <div class="form-row">
+          <div class="settings-form-row">
             <label for="notif-smtp-pass">Password</label>
             <input id="notif-smtp-pass" type="password" bind:value={notifSmtpPassword} placeholder={notifEditing ? 'Leave empty to keep current' : ''} />
           </div>
         </fieldset>
-        <fieldset class="notif-fieldset">
+        <fieldset class="settings-fieldset">
           <legend>Addresses</legend>
-          <div class="form-row">
+          <div class="settings-form-row">
             <label for="notif-from">From <span class="settings-required">*</span></label>
             <input id="notif-from" type="email" bind:value={notifFromAddress} placeholder="noreply@example.com" required />
           </div>
-          <div class="form-row">
+          <div class="settings-form-row">
             <label for="notif-to">To <span class="settings-required">*</span></label>
             <input id="notif-to" type="email" bind:value={notifToAddress} placeholder="admin@example.com" required />
           </div>
         </fieldset>
       {:else}
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="notif-url">URL <span class="settings-required">*</span></label>
           <input id="notif-url" type="url" bind:value={notifUrl} placeholder={notifChannel === 'slack' ? 'https://hooks.slack.com/services/T.../B.../xxx' : 'https://example.com/webhook'} required />
         </div>
         {#if notifChannel === 'webhook'}
-          <div class="form-row">
+          <div class="settings-form-row">
             <label for="notif-auth">Authorization Header</label>
             <input id="notif-auth" type="text" bind:value={notifAuthHeader} placeholder="Bearer your-token" />
-            <span class="form-hint">Optional - sent as Authorization header</span>
+            <span class="settings-form-hint">Optional - sent as Authorization header</span>
           </div>
         {/if}
       {/if}
 
-      <fieldset class="notif-fieldset">
+      <fieldset class="settings-fieldset">
         <legend>Alert Types</legend>
-        <div class="alert-select-all">
-          <button type="button" class="btn-link" onclick={() => { notifAlertBackendDown = notifAlertCertExpiring = notifAlertWafAlert = notifAlertConfigChanged = notifAlertSlaBreached = notifAlertIpBanned = true; }}>Select all</button>
-          <span class="separator">|</span>
-          <button type="button" class="btn-link" onclick={() => { notifAlertBackendDown = notifAlertCertExpiring = notifAlertWafAlert = notifAlertConfigChanged = notifAlertSlaBreached = notifAlertIpBanned = false; }}>None</button>
+        <div class="settings-alert-select-all">
+          <button type="button" class="settings-btn-link" onclick={() => { notifAlertBackendDown = notifAlertCertExpiring = notifAlertWafAlert = notifAlertConfigChanged = notifAlertSlaBreached = notifAlertIpBanned = true; }}>Select all</button>
+          <span class="settings-separator">|</span>
+          <button type="button" class="settings-btn-link" onclick={() => { notifAlertBackendDown = notifAlertCertExpiring = notifAlertWafAlert = notifAlertConfigChanged = notifAlertSlaBreached = notifAlertIpBanned = false; }}>None</button>
         </div>
-        <div class="alert-checkboxes">
+        <div class="settings-alert-checkboxes">
           <label><input type="checkbox" bind:checked={notifAlertBackendDown} /> Backend down</label>
           <label><input type="checkbox" bind:checked={notifAlertCertExpiring} /> Certificate expiring</label>
           <label><input type="checkbox" bind:checked={notifAlertWafAlert} /> WAF alert</label>

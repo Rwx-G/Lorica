@@ -757,3 +757,109 @@ tbody tr:hover td {
   gap: 0.75rem;
   margin-top: 1rem;
 }
+
+.settings-form-row {
+  margin-bottom: 1rem;
+}
+
+.settings-form-row label {
+  display: block;
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+  margin-bottom: 0.375rem;
+}
+
+.settings-form-row input[type='number'],
+.settings-form-row input[type='text'],
+.settings-form-row input[type='email'],
+.settings-form-row input[type='url'],
+.settings-form-row input[type='password'],
+.settings-form-row select,
+.settings-form-row textarea {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  background: var(--color-bg-input);
+  border: 1px solid var(--color-border);
+  border-radius: 0.375rem;
+  color: var(--color-text);
+  font-family: var(--sans);
+  font-size: 0.875rem;
+}
+
+.settings-form-row textarea {
+  font-family: var(--mono);
+  resize: vertical;
+}
+
+.settings-form-row input:disabled {
+  opacity: 0.5;
+}
+
+.settings-form-hint {
+  display: block;
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  margin-top: var(--space-1);
+}
+
+.settings-form-card {
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: 0.75rem;
+  padding: 1.25rem;
+}
+
+.settings-fieldset {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.settings-fieldset legend {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+  padding: 0 var(--space-1);
+}
+
+.settings-alert-checkboxes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-2);
+}
+
+.settings-alert-checkboxes label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.settings-alert-select-all {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-bottom: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.settings-btn-link {
+  background: none;
+  border: none;
+  color: var(--color-primary);
+  font-size: 0.8125rem;
+  padding: 0;
+  cursor: pointer;
+}
+
+.settings-btn-link:hover {
+  text-decoration: underline;
+}
+
+.settings-separator {
+  color: var(--color-text-muted);
+}

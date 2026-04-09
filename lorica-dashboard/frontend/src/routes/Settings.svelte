@@ -416,12 +416,12 @@
       </button>
       {#if expandedSections.global}
       <div class="settings-section-body">
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="mgmt-port">Management Port</label>
           <input id="mgmt-port" type="number" bind:value={settingsForm.management_port} min="1" max="65535" disabled />
           <span class="hint">Read-only - requires restart to change</span>
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="log-level">Log Level</label>
           <select id="log-level" bind:value={settingsForm.log_level}>
             <option value="trace">trace</option>
@@ -431,63 +431,63 @@
             <option value="error">error</option>
           </select>
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="hc-interval">Default Health Check Interval (s)</label>
           <input id="hc-interval" type="number" bind:value={settingsForm.default_health_check_interval_s} min="1" max="3600" />
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="cert-warn">Certificate Warning Threshold (days)</label>
           <input id="cert-warn" type="number" bind:value={settingsForm.cert_warning_days} min="1" max="365" />
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="cert-crit">Certificate Critical Threshold (days)</label>
           <input id="cert-crit" type="number" bind:value={settingsForm.cert_critical_days} min="1" max="365" />
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="max-global-conn">Max Global Connections</label>
           <input id="max-global-conn" type="number" bind:value={settingsForm.max_global_connections} min="0" max="1000000" />
           <span class="hint">0 = unlimited. New requests get 503 when limit is reached.</span>
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="flood-threshold">Flood Detection Threshold (RPS)</label>
           <input id="flood-threshold" type="number" bind:value={settingsForm.flood_threshold_rps} min="0" max="1000000" />
           <span class="hint">0 = disabled. When exceeded, per-IP rate limits are halved.</span>
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="waf-ban-threshold">WAF Auto-ban Threshold</label>
           <input id="waf-ban-threshold" type="number" bind:value={settingsForm.waf_ban_threshold} min="0" max="1000" />
           <span class="hint">Ban IP after this many WAF blocks per worker (0 = disabled, default 3). With N workers, up to N x threshold requests may pass before the ban triggers.</span>
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="waf-ban-duration">WAF Ban Duration (seconds)</label>
           <input id="waf-ban-duration" type="number" bind:value={settingsForm.waf_ban_duration_s} min="0" max="604800" />
           <span class="hint">How long to ban (default 3600 = 1 hour, max 7 days).</span>
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="trusted-proxies">Trusted Proxies (CIDR)</label>
           <textarea id="trusted-proxies" rows="4" bind:value={settingsForm.trusted_proxies} placeholder="192.168.0.0/16&#10;10.0.0.0/8&#10;172.16.0.0/12"></textarea>
           <span class="hint">One CIDR range or IP per line. X-Forwarded-For is only trusted from these addresses. Empty = trust no XFF (direct client IP always used).</span>
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="s-log-retention">Access Log Retention (entries)</label>
           <input id="s-log-retention" type="number" min="0" bind:value={settingsForm.access_log_retention} />
           <span class="hint">Maximum entries in persistent log store (0 = unlimited).</span>
         </div>
 
         <h3 class="subsection-title">SLA Data Purge</h3>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="sla-purge-toggle" class="toggle-label">
             <input id="sla-purge-toggle" type="checkbox" bind:checked={settingsForm.sla_purge_enabled} />
             Enable automatic SLA purge
           </label>
         </div>
         {#if settingsForm.sla_purge_enabled}
-          <div class="form-row">
+          <div class="settings-form-row">
             <label for="sla-purge-days">Purge SLA data older than (days)</label>
             <input id="sla-purge-days" type="number" min="1" max="3650" bind:value={settingsForm.sla_purge_retention_days} />
             <span class="hint">Buckets older than this will be permanently deleted.</span>
           </div>
-          <div class="form-row">
+          <div class="settings-form-row">
             <label for="sla-purge-schedule">Purge schedule</label>
             <select id="sla-purge-schedule" bind:value={settingsForm.sla_purge_schedule}>
               <option value="first_of_month">First day of the month</option>
@@ -707,7 +707,7 @@
         <div class="settings-section-body">
           <div class="export-import-grid">
             <!-- Export -->
-            <div class="form-card">
+            <div class="settings-form-card">
               <h3>Export</h3>
               <p class="settings-hint">Download the full configuration as a TOML file.</p>
               {#if exportError}
@@ -721,7 +721,7 @@
             </div>
 
             <!-- Import -->
-            <div class="form-card">
+            <div class="settings-form-card">
               <h3>Import</h3>
               <p class="settings-hint">Upload a TOML file to preview and apply changes.</p>
               {#if !importDiff}
@@ -840,11 +840,11 @@
   <div class="settings-overlay" onclick={(e) => { if (e.target === e.currentTarget) showPresetForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showPresetForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
     <div class="settings-dialog" role="document">
       <h3>{presetEditing !== null ? 'Edit' : 'Add'} Security Header Preset</h3>
-      <div class="form-row">
+      <div class="settings-form-row">
         <label for="preset-name">Preset Name <span class="settings-required">*</span></label>
         <input id="preset-name" type="text" bind:value={presetName} placeholder="e.g. my-api-preset" />
       </div>
-      <div class="form-row">
+      <div class="settings-form-row">
         <label for="preset-headers">Headers (one per line, Key=Value) <span class="settings-required">*</span></label>
         <textarea id="preset-headers" bind:value={presetHeaders} rows="6" placeholder="X-Frame-Options=DENY&#10;X-Content-Type-Options=nosniff&#10;Referrer-Policy=no-referrer"></textarea>
       </div>
@@ -874,50 +874,9 @@
 <style>
   .settings-page { max-width: none; }
 
-  :global(.form-card) {
-    background: var(--color-bg-card);
-    border: 1px solid var(--color-border);
-    border-radius: 0.75rem;
-    padding: 1.25rem;
-  }
-
   .notif-history-scroll {
     max-height: 400px;
     overflow-y: auto;
-  }
-
-  :global(.form-row) {
-    margin-bottom: 1rem;
-  }
-
-  :global(.form-row) label {
-    display: block;
-    font-size: 0.8125rem;
-    color: var(--color-text-muted);
-    margin-bottom: 0.375rem;
-  }
-
-  :global(.form-row) input[type='number'],
-  :global(.form-row) input[type='text'],
-  :global(.form-row) select,
-  :global(.form-row) textarea {
-    width: 100%;
-    padding: 0.5rem 0.75rem;
-    background: var(--color-bg-input);
-    border: 1px solid var(--color-border);
-    border-radius: 0.375rem;
-    color: var(--color-text);
-    font-family: var(--sans);
-    font-size: 0.875rem;
-  }
-
-  :global(.form-row) textarea {
-    font-family: var(--mono);
-    resize: vertical;
-  }
-
-  :global(.form-row) input:disabled {
-    opacity: 0.5;
   }
 
   .hint {
@@ -1274,64 +1233,4 @@
     background: var(--color-bg-hover);
   }
 
-  .notif-fieldset {
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-md);
-    padding: var(--space-3);
-    margin-bottom: var(--space-3);
-  }
-
-  .notif-fieldset legend {
-    font-size: var(--text-xs);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--color-text-muted);
-    padding: 0 var(--space-1);
-  }
-
-  .alert-checkboxes {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--space-2);
-  }
-
-  .alert-checkboxes label {
-    display: flex;
-    align-items: center;
-    gap: var(--space-1);
-    font-size: var(--text-sm);
-    cursor: pointer;
-  }
-
-  .alert-select-all {
-    display: flex;
-    gap: var(--space-2);
-    align-items: center;
-    margin-bottom: var(--space-2);
-    font-size: var(--text-xs);
-  }
-
-  .separator {
-    color: var(--color-text-muted);
-  }
-
-  .form-hint {
-    font-size: var(--text-xs);
-    color: var(--color-text-muted);
-    margin-top: var(--space-1);
-  }
-
-  :global(.form-row) input[type='email'],
-  :global(.form-row) input[type='url'],
-  :global(.form-row) input[type='password'] {
-    width: 100%;
-    padding: 0.5rem 0.75rem;
-    background: var(--color-bg-input);
-    border: 1px solid var(--color-border);
-    border-radius: 0.375rem;
-    color: var(--color-text);
-    font-family: var(--sans);
-    font-size: 0.875rem;
-  }
 </style>

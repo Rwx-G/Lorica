@@ -193,12 +193,12 @@
     <div class="settings-dialog" role="document">
       <h3>{dnsProviderEditing ? 'Edit' : 'Add'} DNS Provider</h3>
 
-      <div class="form-row">
+      <div class="settings-form-row">
         <label for="dp-name">Name <span class="settings-required">*</span></label>
         <input id="dp-name" type="text" bind:value={dnsProviderName} placeholder="e.g. OVH example.com" />
       </div>
 
-      <div class="form-row">
+      <div class="settings-form-row">
         <label for="dp-type">Provider Type</label>
         <select id="dp-type" bind:value={dnsProviderType}>
           <option value="ovh">OVH</option>
@@ -208,19 +208,19 @@
       </div>
 
       {#if dnsProviderType === 'ovh'}
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="dp-ovh-appkey">Application Key <span class="settings-required">*</span></label>
           <input id="dp-ovh-appkey" type="text" bind:value={dpOvhAppKey} placeholder="OVH Application Key" />
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="dp-ovh-appsecret">Application Secret <span class="settings-required">*</span></label>
           <input id="dp-ovh-appsecret" type="password" bind:value={dpOvhAppSecret} placeholder="OVH Application Secret" />
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="dp-ovh-ck">Consumer Key <span class="settings-required">*</span></label>
           <input id="dp-ovh-ck" type="password" bind:value={dpOvhConsumerKey} placeholder="OVH Consumer Key" />
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="dp-ovh-endpoint">API Endpoint</label>
           <select id="dp-ovh-endpoint" bind:value={dpOvhEndpoint}>
             <option value="eu.api.ovh.com">Europe (eu.api.ovh.com)</option>
@@ -229,24 +229,24 @@
           </select>
         </div>
       {:else if dnsProviderType === 'cloudflare'}
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="dp-cf-token">API Token <span class="settings-required">*</span></label>
           <input id="dp-cf-token" type="password" bind:value={dpCfApiToken} placeholder="Cloudflare API token" />
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="dp-cf-zone">Zone ID <span class="settings-required">*</span></label>
           <input id="dp-cf-zone" type="text" bind:value={dpCfZoneId} placeholder="Zone identifier" />
         </div>
       {:else if dnsProviderType === 'route53'}
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="dp-r53-key">AWS Access Key ID <span class="settings-required">*</span></label>
           <input id="dp-r53-key" type="text" bind:value={dpR53AccessKey} placeholder="Access key ID" />
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="dp-r53-secret">AWS Secret Access Key <span class="settings-required">*</span></label>
           <input id="dp-r53-secret" type="password" bind:value={dpR53SecretKey} placeholder="Secret access key" />
         </div>
-        <div class="form-row">
+        <div class="settings-form-row">
           <label for="dp-r53-zone">Hosted Zone ID <span class="settings-required">*</span></label>
           <input id="dp-r53-zone" type="text" bind:value={dpR53HostedZoneId} placeholder="Hosted zone ID" />
         </div>
