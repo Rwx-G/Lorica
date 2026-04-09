@@ -189,12 +189,12 @@
 <!-- DNS Provider form modal -->
 {#if showDnsProviderForm}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) showDnsProviderForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showDnsProviderForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="dialog" role="document">
+  <div class="settings-overlay" onclick={(e) => { if (e.target === e.currentTarget) showDnsProviderForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showDnsProviderForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="settings-dialog" role="document">
       <h3>{dnsProviderEditing ? 'Edit' : 'Add'} DNS Provider</h3>
 
       <div class="form-row">
-        <label for="dp-name">Name <span class="required">*</span></label>
+        <label for="dp-name">Name <span class="settings-required">*</span></label>
         <input id="dp-name" type="text" bind:value={dnsProviderName} placeholder="e.g. OVH example.com" />
       </div>
 
@@ -209,15 +209,15 @@
 
       {#if dnsProviderType === 'ovh'}
         <div class="form-row">
-          <label for="dp-ovh-appkey">Application Key <span class="required">*</span></label>
+          <label for="dp-ovh-appkey">Application Key <span class="settings-required">*</span></label>
           <input id="dp-ovh-appkey" type="text" bind:value={dpOvhAppKey} placeholder="OVH Application Key" />
         </div>
         <div class="form-row">
-          <label for="dp-ovh-appsecret">Application Secret <span class="required">*</span></label>
+          <label for="dp-ovh-appsecret">Application Secret <span class="settings-required">*</span></label>
           <input id="dp-ovh-appsecret" type="password" bind:value={dpOvhAppSecret} placeholder="OVH Application Secret" />
         </div>
         <div class="form-row">
-          <label for="dp-ovh-ck">Consumer Key <span class="required">*</span></label>
+          <label for="dp-ovh-ck">Consumer Key <span class="settings-required">*</span></label>
           <input id="dp-ovh-ck" type="password" bind:value={dpOvhConsumerKey} placeholder="OVH Consumer Key" />
         </div>
         <div class="form-row">
@@ -230,24 +230,24 @@
         </div>
       {:else if dnsProviderType === 'cloudflare'}
         <div class="form-row">
-          <label for="dp-cf-token">API Token <span class="required">*</span></label>
+          <label for="dp-cf-token">API Token <span class="settings-required">*</span></label>
           <input id="dp-cf-token" type="password" bind:value={dpCfApiToken} placeholder="Cloudflare API token" />
         </div>
         <div class="form-row">
-          <label for="dp-cf-zone">Zone ID <span class="required">*</span></label>
+          <label for="dp-cf-zone">Zone ID <span class="settings-required">*</span></label>
           <input id="dp-cf-zone" type="text" bind:value={dpCfZoneId} placeholder="Zone identifier" />
         </div>
       {:else if dnsProviderType === 'route53'}
         <div class="form-row">
-          <label for="dp-r53-key">AWS Access Key ID <span class="required">*</span></label>
+          <label for="dp-r53-key">AWS Access Key ID <span class="settings-required">*</span></label>
           <input id="dp-r53-key" type="text" bind:value={dpR53AccessKey} placeholder="Access key ID" />
         </div>
         <div class="form-row">
-          <label for="dp-r53-secret">AWS Secret Access Key <span class="required">*</span></label>
+          <label for="dp-r53-secret">AWS Secret Access Key <span class="settings-required">*</span></label>
           <input id="dp-r53-secret" type="password" bind:value={dpR53SecretKey} placeholder="Secret access key" />
         </div>
         <div class="form-row">
-          <label for="dp-r53-zone">Hosted Zone ID <span class="required">*</span></label>
+          <label for="dp-r53-zone">Hosted Zone ID <span class="settings-required">*</span></label>
           <input id="dp-r53-zone" type="text" bind:value={dpR53HostedZoneId} placeholder="Hosted zone ID" />
         </div>
       {/if}
@@ -257,10 +257,10 @@
       {/if}
 
       {#if dnsProviderError}
-        <p class="form-error">{dnsProviderError}</p>
+        <p class="settings-form-error">{dnsProviderError}</p>
       {/if}
 
-      <div class="form-actions">
+      <div class="settings-dialog-actions">
         <button class="btn btn-cancel" onclick={() => showDnsProviderForm = false}>Cancel</button>
         <button class="btn btn-primary" onclick={saveDnsProvider} disabled={dnsProviderSaving}>
           {dnsProviderSaving ? 'Saving...' : (dnsProviderEditing ? 'Update' : 'Create')}

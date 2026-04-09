@@ -399,7 +399,7 @@
       {#if expandedSections.appearance}
         <div class="settings-section-body">
           <p class="settings-hint">Current theme: {theme}.</p>
-          <div class="actions">
+          <div class="settings-dialog-actions">
             <button class="btn btn-secondary" onclick={toggleTheme}>
               {theme === 'dark' ? 'Switch to Light' : 'Switch to Dark'}
             </button>
@@ -503,12 +503,12 @@
         {/if}
 
         {#if settingsError}
-          <div class="form-error">{settingsError}</div>
+          <div class="settings-form-error">{settingsError}</div>
         {/if}
         {#if settingsMsg}
           <div class="form-success">{settingsMsg}</div>
         {/if}
-        <div class="actions">
+        <div class="settings-dialog-actions">
           <button class="btn btn-primary" onclick={saveSettings} disabled={settingsSaving}>
             {settingsSaving ? 'Saving...' : 'Save Settings'}
           </button>
@@ -711,7 +711,7 @@
               <h3>Export</h3>
               <p class="settings-hint">Download the full configuration as a TOML file.</p>
               {#if exportError}
-                <div class="form-error">{exportError}</div>
+                <div class="settings-form-error">{exportError}</div>
               {/if}
               <div class="actions-center">
                 <button class="btn btn-primary" onclick={handleExport} disabled={exporting}>
@@ -735,7 +735,7 @@
                   <p class="file-info">File loaded: {importFile?.name} ({importToml.length} bytes)</p>
                 {/if}
                 {#if importError}
-                  <div class="form-error">{importError}</div>
+                  <div class="settings-form-error">{importError}</div>
                 {/if}
                 {#if importSuccess}
                   <div class="form-success">{importSuccess}</div>
@@ -805,7 +805,7 @@
                 {/if}
               {/if}
               {#if importError}
-                <div class="form-error">{importError}</div>
+                <div class="settings-form-error">{importError}</div>
               {/if}
               <div class="diff-actions">
                 <button class="btn btn-cancel" onclick={cancelImport}>Cancel</button>
@@ -837,21 +837,21 @@
 <!-- Preset form modal -->
 {#if showPresetForm}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) showPresetForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showPresetForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="dialog" role="document">
+  <div class="settings-overlay" onclick={(e) => { if (e.target === e.currentTarget) showPresetForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showPresetForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="settings-dialog" role="document">
       <h3>{presetEditing !== null ? 'Edit' : 'Add'} Security Header Preset</h3>
       <div class="form-row">
-        <label for="preset-name">Preset Name <span class="required">*</span></label>
+        <label for="preset-name">Preset Name <span class="settings-required">*</span></label>
         <input id="preset-name" type="text" bind:value={presetName} placeholder="e.g. my-api-preset" />
       </div>
       <div class="form-row">
-        <label for="preset-headers">Headers (one per line, Key=Value) <span class="required">*</span></label>
+        <label for="preset-headers">Headers (one per line, Key=Value) <span class="settings-required">*</span></label>
         <textarea id="preset-headers" bind:value={presetHeaders} rows="6" placeholder="X-Frame-Options=DENY&#10;X-Content-Type-Options=nosniff&#10;Referrer-Policy=no-referrer"></textarea>
       </div>
       {#if presetError}
-        <div class="form-error">{presetError}</div>
+        <div class="settings-form-error">{presetError}</div>
       {/if}
-      <div class="actions">
+      <div class="settings-dialog-actions">
         <button class="btn btn-cancel" onclick={() => showPresetForm = false}>Cancel</button>
         <button class="btn btn-primary" onclick={savePreset} disabled={presetSaving}>
           {presetSaving ? 'Saving...' : 'Save'}
@@ -927,11 +927,6 @@
     margin-top: 0.25rem;
   }
 
-  .form-error {
-    color: var(--color-red);
-    font-size: 0.8125rem;
-    margin: 0.5rem 0;
-  }
 
   .form-success {
     color: var(--color-green);
@@ -1111,38 +1106,6 @@
   }
 
   /* Modal */
-  .overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
-    animation: fadeIn var(--transition-fast);
-  }
-
-  .dialog {
-    background: var(--color-bg-elevated);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-xl);
-    padding: var(--space-6);
-    max-width: 500px;
-    width: 90%;
-    box-shadow: var(--shadow-lg);
-    animation: slideUp var(--transition-base);
-  }
-
-  .dialog h3 {
-    margin: 0 0 var(--space-4);
-  }
-
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.75rem;
-    margin-top: 1rem;
-  }
 
   :global(.actions-center) {
     display: flex;
@@ -1177,9 +1140,6 @@
 
 
 
-  .required {
-    color: var(--color-red);
-  }
 
   .badge {
     display: inline-block;

@@ -231,8 +231,8 @@
 <!-- Notification form modal -->
 {#if showNotifForm}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) showNotifForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showNotifForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="dialog" role="document">
+  <div class="settings-overlay" onclick={(e) => { if (e.target === e.currentTarget) showNotifForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showNotifForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="settings-dialog" role="document">
       <h3>{notifEditing ? 'Edit' : 'Add'} Notification Channel</h3>
       <div class="form-row">
         <label for="notif-channel">Channel</label>
@@ -253,7 +253,7 @@
         <fieldset class="notif-fieldset">
           <legend>SMTP Server</legend>
           <div class="form-row">
-            <label for="notif-smtp-host">SMTP Host <span class="required">*</span></label>
+            <label for="notif-smtp-host">SMTP Host <span class="settings-required">*</span></label>
             <input id="notif-smtp-host" type="text" bind:value={notifSmtpHost} placeholder="smtp.example.com" required />
           </div>
           <div class="form-row">
@@ -273,17 +273,17 @@
         <fieldset class="notif-fieldset">
           <legend>Addresses</legend>
           <div class="form-row">
-            <label for="notif-from">From <span class="required">*</span></label>
+            <label for="notif-from">From <span class="settings-required">*</span></label>
             <input id="notif-from" type="email" bind:value={notifFromAddress} placeholder="noreply@example.com" required />
           </div>
           <div class="form-row">
-            <label for="notif-to">To <span class="required">*</span></label>
+            <label for="notif-to">To <span class="settings-required">*</span></label>
             <input id="notif-to" type="email" bind:value={notifToAddress} placeholder="admin@example.com" required />
           </div>
         </fieldset>
       {:else}
         <div class="form-row">
-          <label for="notif-url">URL <span class="required">*</span></label>
+          <label for="notif-url">URL <span class="settings-required">*</span></label>
           <input id="notif-url" type="url" bind:value={notifUrl} placeholder={notifChannel === 'slack' ? 'https://hooks.slack.com/services/T.../B.../xxx' : 'https://example.com/webhook'} required />
         </div>
         {#if notifChannel === 'webhook'}
@@ -312,9 +312,9 @@
         </div>
       </fieldset>
       {#if notifError}
-        <div class="form-error">{notifError}</div>
+        <div class="settings-form-error">{notifError}</div>
       {/if}
-      <div class="actions">
+      <div class="settings-dialog-actions">
         <button class="btn btn-cancel" onclick={() => showNotifForm = false}>Cancel</button>
         <button class="btn btn-primary" onclick={saveNotification} disabled={notifSaving}>
           {notifSaving ? 'Saving...' : 'Save'}
