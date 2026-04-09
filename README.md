@@ -89,7 +89,26 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 # Download the latest release
 wget https://github.com/Rwx-G/Lorica/releases/latest/download/lorica.deb
 sudo dpkg -i lorica.deb
-sudo systemctl enable --now lorica
+```
+
+The package creates a `lorica` user, installs a systemd service (enabled by default), and starts Lorica on ports 8080 (HTTP), 8443 (HTTPS), and 9443 (dashboard).
+
+To customize ports, workers, or log level, edit the systemd unit:
+
+```bash
+sudo systemctl edit lorica
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/lorica --data-dir /var/lib/lorica \
+  --http-port 80 --https-port 443 --management-port 9443 \
+  --workers 4 --log-level info
+```
+
+```bash
+sudo systemctl restart lorica
 ```
 
 ### Run directly
