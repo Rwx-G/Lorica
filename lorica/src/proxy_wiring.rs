@@ -491,6 +491,99 @@ impl EwmaTracker {
     }
 }
 
+/// Per-backend circuit breaker.
+///
+/// Tracks consecutive failures per backend. When the failure count reaches the
+/// threshold, the circuit opens and all traffic is redirected to other backends
+/// for a cooldown period. After the cooldown, one probe request is allowed
+/// through (half-open). If it succeeds the circuit closes; if it fails the
+/// circuit re-opens.
+#[derive(Debug)]
+pub struct CircuitBreaker {
+    /// Per-backend state: (consecutive_failures, state, last_state_change)
+    states: dashmap::DashMap<String, CircuitBreakerState>,
+    /// Number of consecutive errors before opening the circuit.
+    threshold: u32,
+    /// How long the circuit stays open before moving to half-open (seconds).
+    cooldown_s: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CircuitBreakerState {
+    failures: u32,
+    state: CircuitStatus,
+    changed_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CircuitStatus {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+impl CircuitBreaker {
+    pub fn new(threshold: u32, cooldown_s: u64) -> Self {
+        Self {
+            states: dashmap::DashMap::new(),
+            threshold,
+            cooldown_s,
+        }
+    }
+
+    /// Check if a backend is available (not in Open state).
+    /// Open circuits that have exceeded the cooldown move to HalfOpen.
+    pub fn is_available(&self, addr: &str) -> bool {
+        let mut entry = match self.states.get_mut(addr) {
+            Some(e) => e,
+            None => return true, // no state = closed = available
+        };
+        match entry.state {
+            CircuitStatus::Closed | CircuitStatus::HalfOpen => true,
+            CircuitStatus::Open => {
+                if entry.changed_at.elapsed() >= Duration::from_secs(self.cooldown_s) {
+                    entry.state = CircuitStatus::HalfOpen;
+                    entry.changed_at = Instant::now();
+                    true // allow one probe request
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Record a successful response. Resets the failure count and closes the circuit.
+    pub fn record_success(&self, addr: &str) {
+        if let Some(mut entry) = self.states.get_mut(addr) {
+            if entry.failures > 0 || entry.state != CircuitStatus::Closed {
+                entry.failures = 0;
+                entry.state = CircuitStatus::Closed;
+                entry.changed_at = Instant::now();
+            }
+        }
+    }
+
+    /// Record a failure. Increments the counter and opens the circuit if threshold is reached.
+    pub fn record_failure(&self, addr: &str) {
+        let mut entry = self.states.entry(addr.to_string()).or_insert(CircuitBreakerState {
+            failures: 0,
+            state: CircuitStatus::Closed,
+            changed_at: Instant::now(),
+        });
+        entry.failures += 1;
+        if entry.failures >= self.threshold && entry.state != CircuitStatus::Open {
+            entry.state = CircuitStatus::Open;
+            entry.changed_at = Instant::now();
+            tracing::warn!(
+                backend = %addr,
+                failures = entry.failures,
+                cooldown_s = self.cooldown_s,
+                "circuit breaker opened - backend removed from rotation"
+            );
+        }
+    }
+}
+
 /// Check whether an IP address matches a pattern (exact or CIDR prefix).
 fn ip_matches(ip: &str, pattern: &str) -> bool {
     if pattern.contains('/') {
@@ -627,6 +720,8 @@ pub struct LoricaProxy {
     pub alert_sender: Option<lorica_notify::AlertSender>,
     /// Persistent access log store (SQLite).
     pub log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    /// Per-backend circuit breaker (opens after consecutive failures).
+    pub circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl LoricaProxy {
@@ -657,6 +752,7 @@ impl LoricaProxy {
             acme_challenge_store: None,
             alert_sender: None,
             log_store: None,
+            circuit_breaker: Arc::new(CircuitBreaker::new(5, 10)),
         }
     }
 
@@ -1632,7 +1728,9 @@ impl ProxyHttp for LoricaProxy {
         let healthy_backends: Vec<&Backend> = backends_source
             .iter()
             .filter(|b| {
-                b.health_status != HealthStatus::Down && b.lifecycle_state == LifecycleState::Normal
+                b.health_status != HealthStatus::Down
+                    && b.lifecycle_state == LifecycleState::Normal
+                    && self.circuit_breaker.is_available(&b.address)
             })
             .collect();
 
@@ -2039,6 +2137,13 @@ impl ProxyHttp for LoricaProxy {
         if let Some(ref addr) = ctx.backend_addr {
             self.active_connections.fetch_sub(1, Ordering::Relaxed);
             self.backend_connections.decrement(addr);
+
+            // Update circuit breaker: 5xx or connection error = failure, else success
+            if e.is_some() || status >= 500 {
+                self.circuit_breaker.record_failure(addr);
+            } else {
+                self.circuit_breaker.record_success(addr);
+            }
         }
 
         // Push to the in-memory log buffer for dashboard viewing (if enabled)

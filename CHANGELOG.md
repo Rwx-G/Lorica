@@ -18,6 +18,7 @@ Author: Rwx-G
 - Access logs: configurable entry limit (100/500/1K/5K/10K) and "X of Y entries" total count display
 - 12 new WAF rules (49 total): SQLi auth bypass, info schema recon, encoding evasion, NoSQL injection (MongoDB), XSS eval/base64, backup file access, PowerShell/Windows commands, HTTP request smuggling, scanner detection, PHP/Java deserialization, HTTP method abuse
 - X-Request-Id header: unique request identifier generated per request, propagated to backends and logged in access logs for end-to-end tracing
+- Circuit breaker: per-backend failure tracking that removes backends from rotation after 5 consecutive errors (5xx or connection failures), with 10s cooldown and half-open probe before recovery
 
 ### Fixed
 
