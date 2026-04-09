@@ -621,6 +621,7 @@ mod tests {
             is_xff: false,
             xff_proxy_ip: String::new(),
             source: String::new(),
+            request_id: String::new(),
         })
         .await;
 

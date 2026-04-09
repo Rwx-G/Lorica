@@ -1820,6 +1820,8 @@ impl ProxyHttp for LoricaProxy {
             idle: Duration::from_secs(15),
             interval: Duration::from_secs(5),
             count: 3,
+            #[cfg(target_os = "linux")]
+            user_timeout: Duration::from_secs(0),
         });
 
         Ok(peer)
