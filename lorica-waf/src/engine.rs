@@ -420,10 +420,16 @@ impl WafEngine {
     }
 
     /// Scan a single field against all enabled rules.
+    /// When `field` is "body", rules that don't apply to body content
+    /// (e.g. path traversal, protocol violations) are skipped.
     fn scan_field(&self, field: &str, value: &str, timestamp: &str, events: &mut Vec<WafEvent>) {
+        let is_body = field == "body";
         let disabled = self.disabled_rules.read();
         for rule in self.ruleset.rules() {
             if disabled.contains(&rule.id) {
+                continue;
+            }
+            if is_body && !rule.applies_to_body() {
                 continue;
             }
             if rule.pattern.is_match(value) {
@@ -1036,6 +1042,25 @@ mod tests {
         let body = b"username=admin&password=securePassword123";
         let verdict = e.evaluate_body(WafMode::Blocking, body, "example.com", "10.0.0.1");
         assert_eq!(verdict, WafVerdict::Pass);
+    }
+
+    #[test]
+    fn test_body_path_traversal_not_scanned() {
+        // Path traversal patterns in body content (e.g. CMS articles) should
+        // NOT trigger WAF rules - these rules only apply to path/query/headers.
+        let e = engine();
+        let body = br#"{"content": "Navigate to ..\ or ../ to go back"}"#;
+        let verdict = e.evaluate_body(WafMode::Blocking, body, "example.com", "10.0.0.1");
+        assert_eq!(verdict, WafVerdict::Pass);
+    }
+
+    #[test]
+    fn test_body_sqli_still_caught() {
+        // SQLi in body should still be caught (applies_to_body = true)
+        let e = engine();
+        let body = b"search=1 UNION SELECT * FROM users";
+        let verdict = e.evaluate_body(WafMode::Blocking, body, "example.com", "10.0.0.1");
+        assert!(matches!(verdict, WafVerdict::Blocked(_)));
     }
 
     #[test]

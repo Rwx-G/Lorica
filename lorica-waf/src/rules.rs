@@ -84,6 +84,19 @@ pub struct WafRule {
     pub severity: u8,
 }
 
+impl WafRule {
+    /// Whether this rule should be evaluated during body scanning.
+    /// Path-specific rules (path traversal, sensitive file access, protocol
+    /// violations) are skipped for body content to avoid false positives
+    /// on CMS articles, JSON payloads, and form submissions.
+    pub fn applies_to_body(&self) -> bool {
+        !matches!(
+            self.category,
+            RuleCategory::PathTraversal | RuleCategory::ProtocolViolation
+        )
+    }
+}
+
 impl std::fmt::Debug for WafRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WafRule")
