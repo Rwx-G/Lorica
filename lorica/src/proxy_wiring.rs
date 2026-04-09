@@ -1994,7 +1994,16 @@ impl ProxyHttp for LoricaProxy {
         } else if ctx.waf_detected {
             Some("WAF detected".to_string())
         } else {
-            e.map(|err| err.to_string())
+            e.and_then(|err| {
+                let msg = err.to_string();
+                // Client disconnects (H2 stream reset, connection close) are not
+                // server errors. Status 0 already signals the incomplete response.
+                if msg.contains("not a result of an error") || msg.contains("Client closed") {
+                    None
+                } else {
+                    Some(msg)
+                }
+            })
         };
         let latency_ms = elapsed.as_millis() as u64;
 
