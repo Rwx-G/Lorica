@@ -321,6 +321,7 @@ export interface LogEntry {
   is_xff: boolean;
   xff_proxy_ip: string;
   source: string;
+  request_id: string;
 }
 
 export interface LogsResponse {

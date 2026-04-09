@@ -551,6 +551,8 @@ pub struct RequestCtx {
     pub waf_detected: bool,
     /// Snapshot of the matched route for use in later pipeline stages.
     pub route_snapshot: Option<Route>,
+    /// Unique request identifier for tracing (propagated to backend via X-Request-Id).
+    pub request_id: String,
     /// Whether access logging is enabled for this route.
     pub access_log_enabled: bool,
     /// Client IP address (from socket or X-Forwarded-For).
@@ -667,6 +669,24 @@ impl LoricaProxy {
 /// Extract the request host from the Host header, falling back to URI authority.
 /// HTTP/2 uses :authority pseudo-header which pingora maps to the URI authority,
 /// while the Host header may be absent.
+/// Generate a compact hex request ID (16 bytes = 32 hex chars).
+fn generate_request_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let rand: u64 = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        ts.hash(&mut h);
+        std::thread::current().id().hash(&mut h);
+        h.finish()
+    };
+    format!("{ts:016x}{rand:016x}")
+}
+
 fn extract_host(req: &lorica_http::RequestHeader) -> &str {
     req.headers
         .get("host")
@@ -690,6 +710,7 @@ impl ProxyHttp for LoricaProxy {
             waf_detected: false,
             route_snapshot: None,
             path_rewrite_regex: None,
+            request_id: generate_request_id(),
             access_log_enabled: true,
             client_ip: None,
             is_xff: false,
@@ -1699,6 +1720,9 @@ impl ProxyHttp for LoricaProxy {
             None => return Ok(()),
         };
 
+        // Inject X-Request-Id for end-to-end tracing
+        let _ = upstream_request.insert_header("X-Request-Id", &ctx.request_id);
+
         // Path rewriting: strip prefix then add prefix
         let original_path = upstream_request.uri.path().to_string();
         let query = upstream_request
@@ -2024,6 +2048,7 @@ impl ProxyHttp for LoricaProxy {
                 is_xff: ctx.is_xff,
                 xff_proxy_ip: ctx.xff_proxy_ip.as_deref().unwrap_or("").to_string(),
                 source: ctx.source.clone(),
+                request_id: ctx.request_id.clone(),
             };
             if let Some(ref store) = self.log_store {
                 if let Err(e) = store.insert(&entry) {

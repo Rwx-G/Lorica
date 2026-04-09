@@ -17,6 +17,7 @@ Author: Rwx-G
 - CLI `lorica unban <IP> --password <PASSWORD>` command for emergency IP removal when locked out of the dashboard
 - Access logs: configurable entry limit (100/500/1K/5K/10K) and "X of Y entries" total count display
 - 12 new WAF rules (49 total): SQLi auth bypass, info schema recon, encoding evasion, NoSQL injection (MongoDB), XSS eval/base64, backup file access, PowerShell/Windows commands, HTTP request smuggling, scanner detection, PHP/Java deserialization, HTTP method abuse
+- X-Request-Id header: unique request identifier generated per request, propagated to backends and logged in access logs for end-to-end tracing
 
 ### Fixed
 
