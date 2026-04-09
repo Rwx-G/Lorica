@@ -1502,6 +1502,16 @@ fn run_worker(
     lorica_proxy.request_counts = worker_request_counts;
     lorica_proxy.waf_counts = worker_waf_counts;
     lorica_proxy.waf_engine = waf_engine;
+    // Open a LogStore so the worker can persist WAF events directly (with
+    // route_hostname and action stamped). SQLite WAL mode allows concurrent
+    // writes from multiple worker processes.
+    lorica_proxy.log_store = match lorica_api::log_store::LogStore::open(&data_dir) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            warn!(error = %e, "worker: failed to open log store, WAF event persistence disabled");
+            None
+        }
+    };
     // ACME challenge store backed by SQLite - workers can read challenges set by supervisor
     lorica_proxy.acme_challenge_store = Some(
         lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone()),
