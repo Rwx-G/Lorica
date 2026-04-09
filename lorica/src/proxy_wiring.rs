@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1315,7 +1315,7 @@ impl ProxyHttp for LoricaProxy {
                         _ => lorica_waf::WafMode::Detection,
                     };
 
-                    let verdict = self.waf_engine.evaluate_body(
+                    let mut verdict = self.waf_engine.evaluate_body(
                         waf_mode,
                         buf,
                         host,
