@@ -21,7 +21,7 @@ Author: Rwx-G
 
 - Duplicate access log entries in worker mode: workers now persist logs directly, supervisor only pushes to in-memory buffer for WebSocket streaming
 - WAF body scanning false positives: path traversal (930xxx) and protocol violation (920xxx) rules are no longer applied to request bodies, preventing false positives on CMS content containing `..\ ` or similar text
-- SLA metrics polluted by proxy-level rejections: WAF blocks, bans, rate limits, and return_status responses are excluded from SLA latency percentiles and uptime calculations
+- SLA metrics polluted by proxy-level rejections and connection errors: WAF blocks, bans, rate limits, return_status responses, and upstream/downstream errors (resets, timeouts) are excluded from SLA latency percentiles
 - SLA breach notifications not firing in worker mode: supervisor now checks thresholds on every flush cycle regardless of local data, reading SLA metrics flushed by workers
 - Access logs: disabling auto-refresh/live toggle did not disconnect WebSocket, choice not persisted across page reloads
 

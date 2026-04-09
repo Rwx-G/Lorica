@@ -2044,11 +2044,16 @@ impl ProxyHttp for LoricaProxy {
             .fetch_add(1, Ordering::Relaxed);
 
         // Record SLA metrics for passive monitoring.
-        // Exclude WebSocket upgrades (status 101) and proxy-level rejections
-        // (WAF blocks, bans, rate limits, return_status) as their latency is
-        // not representative of backend performance.
+        // Exclude WebSocket upgrades (status 101), proxy-level rejections
+        // (WAF blocks, bans, rate limits, return_status), and connection
+        // errors (downstream/upstream resets, timeouts) as their latency
+        // is not representative of backend performance.
         if let Some(ref route_id) = ctx.route_id {
-            if status != 101 && ctx.block_reason.is_none() && !ctx.waf_blocked {
+            if status != 101
+                && ctx.block_reason.is_none()
+                && !ctx.waf_blocked
+                && e.is_none()
+            {
                 self.sla_collector.record(route_id, status, latency_ms);
             }
         }
