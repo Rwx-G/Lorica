@@ -60,8 +60,8 @@
         const entry: LogEntry = JSON.parse(event.data);
         // Apply client-side filters before adding
         if (matchesFilters(entry)) {
-          entries = [...entries.slice(-499), entry];
-          total = entries.length;
+          entries = [...entries.slice(-(filterLimit - 1)), entry];
+          total += 1;
         }
       } catch { /* ignore malformed messages */ }
     };

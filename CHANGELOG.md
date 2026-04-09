@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Author: Rwx-G
 
+## Unreleased
+
+## [1.0.1] - 2026-04-10
+
+### Added
+
+- Global WAF whitelist IPs in Settings: IPs or CIDRs that bypass WAF evaluation, rate limiting, IP blocklist, and auto-ban entirely. Prevents operators from being auto-banned by false positives (e.g. CMS body content triggering path traversal rules)
+- CLI `lorica unban <IP> --password <PASSWORD>` command for emergency IP removal when locked out of the dashboard
+- Access logs: configurable entry limit (100/500/1K/5K/10K) and "X of Y entries" total count display
+
+### Fixed
+
+- Duplicate access log entries in worker mode: workers now persist logs directly, supervisor only pushes to in-memory buffer for WebSocket streaming
+- WAF body scanning false positives: path traversal (930xxx) and protocol violation (920xxx) rules are no longer applied to request bodies, preventing false positives on CMS content containing `..\ ` or similar text
+- SLA metrics polluted by proxy-level rejections: WAF blocks, bans, rate limits, and return_status responses are excluded from SLA latency percentiles and uptime calculations
+- SLA breach notifications not firing in worker mode: supervisor now checks thresholds on every flush cycle regardless of local data, reading SLA metrics flushed by workers
+- Access logs: disabling auto-refresh/live toggle did not disconnect WebSocket, choice not persisted across page reloads
+
 ## [1.0.0] - 2026-04-09
 
 ### Added
@@ -157,4 +175,5 @@ Author: Rwx-G
 
 - Windows support removed from forked Pingora crates (Linux-only)
 
+[1.0.1]: https://github.com/Rwx-G/Lorica/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.0.0
