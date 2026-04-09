@@ -620,6 +620,11 @@ pub struct GlobalSettings {
     /// Examples: `["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]`.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// IP addresses or CIDR ranges that bypass WAF evaluation, rate limiting,
+    /// and auto-ban entirely. Use for admin/operator IPs to prevent self-blocking.
+    /// Examples: `["203.0.113.50", "10.0.0.0/8"]`.
+    #[serde(default)]
+    pub waf_whitelist_ips: Vec<String>,
 }
 
 fn default_security_headers() -> String {
@@ -733,6 +738,7 @@ impl Default for GlobalSettings {
             sla_purge_retention_days: default_sla_purge_retention_days(),
             sla_purge_schedule: default_sla_purge_schedule(),
             trusted_proxies: Vec::new(),
+            waf_whitelist_ips: Vec::new(),
         }
     }
 }

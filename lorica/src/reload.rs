@@ -59,6 +59,10 @@ pub async fn reload_proxy_config(
         .as_ref()
         .map(|s| s.trusted_proxies.clone())
         .unwrap_or_default();
+    let waf_whitelist_ips = settings
+        .as_ref()
+        .map(|s| s.waf_whitelist_ips.clone())
+        .unwrap_or_default();
 
     let links: Vec<(String, String)> = route_backends
         .into_iter()
@@ -77,6 +81,7 @@ pub async fn reload_proxy_config(
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs: trusted_proxies,
+            waf_whitelist_cidrs: waf_whitelist_ips,
         },
     );
 

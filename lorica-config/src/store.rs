@@ -1512,6 +1512,14 @@ impl ConfigStore {
                             ))
                         })?;
                 }
+                "waf_whitelist_ips" => {
+                    settings.waf_whitelist_ips =
+                        serde_json::from_str(&value).map_err(|e| {
+                            ConfigError::Validation(format!(
+                                "invalid waf_whitelist_ips JSON: {e}"
+                            ))
+                        })?;
+                }
                 _ => {}
             }
         }
@@ -1591,6 +1599,14 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('trusted_proxies', ?1)",
             params![trusted_proxies_json],
+        )?;
+        let waf_whitelist_json =
+            serde_json::to_string(&settings.waf_whitelist_ips).map_err(|e| {
+                ConfigError::Validation(format!("failed to serialize waf_whitelist_ips: {e}"))
+            })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_whitelist_ips', ?1)",
+            params![waf_whitelist_json],
         )?;
         Ok(())
     }

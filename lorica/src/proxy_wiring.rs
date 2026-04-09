@@ -167,6 +167,8 @@ pub struct ProxyConfig {
     /// client IP matches one of these will X-Forwarded-For be used for the
     /// real client IP. Empty = trust no XFF (secure default).
     pub trusted_proxies: Vec<ipnet::IpNet>,
+    /// Parsed CIDR ranges of IPs that bypass WAF, rate limiting, and auto-ban.
+    pub waf_whitelist: Vec<ipnet::IpNet>,
 }
 
 /// Global settings extracted from the config store for ProxyConfig construction.
@@ -178,6 +180,7 @@ pub struct ProxyConfigGlobals {
     pub waf_ban_threshold: u32,
     pub waf_ban_duration_s: u32,
     pub trusted_proxy_cidrs: Vec<String>,
+    pub waf_whitelist_cidrs: Vec<String>,
 }
 
 impl ProxyConfig {
@@ -200,6 +203,7 @@ impl ProxyConfig {
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs,
+            waf_whitelist_cidrs,
         } = globals;
         let backend_map: HashMap<String, Backend> = backends
             .into_iter()
@@ -354,6 +358,25 @@ impl ProxyConfig {
             })
             .collect();
 
+        // Parse WAF whitelist CIDRs (same logic as trusted proxies)
+        let waf_whitelist: Vec<ipnet::IpNet> = waf_whitelist_cidrs
+            .iter()
+            .filter_map(|s| {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                if let Ok(net) = trimmed.parse::<ipnet::IpNet>() {
+                    Some(net)
+                } else if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+                    Some(ipnet::IpNet::from(ip))
+                } else {
+                    warn!(entry = %trimmed, "ignoring invalid waf_whitelist_ips entry");
+                    None
+                }
+            })
+            .collect();
+
         ProxyConfig {
             routes_by_host,
             wildcard_routes,
@@ -363,6 +386,7 @@ impl ProxyConfig {
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxies,
+            waf_whitelist,
         }
     }
 
@@ -767,8 +791,19 @@ impl ProxyHttp for LoricaProxy {
             .unwrap_or("")
             .to_string();
 
-        // Ban list check (before any other processing for banned IPs)
-        if let Some(ref ip) = check_ip {
+        // Global WAF whitelist: IPs in this list bypass ban checks, IP blocklist,
+        // rate limiting, and WAF evaluation entirely.
+        let is_whitelisted = check_ip.as_ref().is_some_and(|ip| {
+            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                config.waf_whitelist.iter().any(|net| net.contains(&addr))
+            } else {
+                false
+            }
+        });
+
+        // Ban list + IP blocklist checks (skipped for whitelisted IPs)
+        if !is_whitelisted {
+          if let Some(ref ip) = check_ip {
             let banned = if let Some(entry) = self.ban_list.get(ip) {
                 let (banned_at, duration_s) = entry.value();
                 if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
@@ -790,9 +825,7 @@ impl ProxyHttp for LoricaProxy {
                     .await?;
                 return Ok(true);
             }
-        }
 
-        if let Some(ref ip) = check_ip {
             if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
                 warn!(
                     ip = %ip,
@@ -830,6 +863,7 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(true);
             }
         }
+        } // end if !is_whitelisted (ban + blocklist)
 
         let host_raw = extract_host(req);
         let host = host_raw.split(':').next().unwrap_or(host_raw);
@@ -1057,8 +1091,9 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Per-route rate limiting
-        if let Some(rps) = entry.route.rate_limit_rps {
+        // Per-route rate limiting (skipped for whitelisted IPs)
+        if !is_whitelisted {
+          if let Some(rps) = entry.route.rate_limit_rps {
             if let Some(ref ip) = check_ip {
                 let key = format!("{}:{}", entry.route.id, ip);
                 self.rate_limiter.observe(&key, 1);
@@ -1135,9 +1170,10 @@ impl ProxyHttp for LoricaProxy {
                 }
             }
         }
+        } // end if !is_whitelisted (rate limiting)
 
-        // Skip WAF evaluation entirely if not enabled (zero overhead)
-        if !entry.route.waf_enabled {
+        // Skip WAF evaluation entirely if not enabled or IP is whitelisted (zero overhead)
+        if is_whitelisted || !entry.route.waf_enabled {
             return Ok(false);
         }
 
@@ -2007,11 +2043,12 @@ impl ProxyHttp for LoricaProxy {
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
 
-        // Record SLA metrics for passive monitoring
-        // Exclude WebSocket upgrades (status 101) as their connection duration
-        // is not representative of HTTP request latency
+        // Record SLA metrics for passive monitoring.
+        // Exclude WebSocket upgrades (status 101) and proxy-level rejections
+        // (WAF blocks, bans, rate limits, return_status) as their latency is
+        // not representative of backend performance.
         if let Some(ref route_id) = ctx.route_id {
-            if status != 101 {
+            if status != 101 && ctx.block_reason.is_none() && !ctx.waf_blocked {
                 self.sla_collector.record(route_id, status, latency_ms);
             }
         }
