@@ -169,24 +169,38 @@ pub struct ProxyConfig {
     pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
+/// Global settings extracted from the config store for ProxyConfig construction.
+#[derive(Default)]
+pub struct ProxyConfigGlobals {
+    pub custom_security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
+    pub max_global_connections: u32,
+    pub flood_threshold_rps: u32,
+    pub waf_ban_threshold: u32,
+    pub waf_ban_duration_s: u32,
+    pub trusted_proxy_cidrs: Vec<String>,
+}
+
 impl ProxyConfig {
     /// Build from config store data.
     ///
-    /// `custom_security_presets` are merged with the builtins. A custom preset
-    /// whose name matches a builtin replaces it, allowing operators to override
-    /// the default "strict" / "moderate" definitions.
+    /// `globals.custom_security_presets` are merged with the builtins. A custom
+    /// preset whose name matches a builtin replaces it, allowing operators to
+    /// override the default "strict" / "moderate" definitions.
     pub fn from_store(
         routes: Vec<Route>,
         backends: Vec<Backend>,
         certificates: Vec<Certificate>,
         route_backend_links: Vec<(String, String)>,
-        custom_security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
-        max_global_connections: u32,
-        flood_threshold_rps: u32,
-        waf_ban_threshold: u32,
-        waf_ban_duration_s: u32,
-        trusted_proxy_cidrs: Vec<String>,
+        globals: ProxyConfigGlobals,
     ) -> Self {
+        let ProxyConfigGlobals {
+            custom_security_presets,
+            max_global_connections,
+            flood_threshold_rps,
+            waf_ban_threshold,
+            waf_ban_duration_s,
+            trusted_proxy_cidrs,
+        } = globals;
         let backend_map: HashMap<String, Backend> = backends
             .into_iter()
             .map(|b| {
@@ -716,7 +730,7 @@ impl ProxyHttp for LoricaProxy {
         let has_xff = req.headers.get("x-forwarded-for").is_some();
         let direct_ip = client_ip.clone();
 
-        let direct_is_trusted = direct_ip.as_ref().map_or(false, |ip| {
+        let direct_is_trusted = direct_ip.as_ref().is_some_and(|ip| {
             if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
                 config.trusted_proxies.iter().any(|net| net.contains(&addr))
             } else {
@@ -916,14 +930,14 @@ impl ProxyHttp for LoricaProxy {
                 let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
                 let base = target.trim_end_matches('/');
                 let location = format!("{base}{redir_path}{redir_query}");
-                let mut header = lorica_http::ResponseHeader::build(status as u16, None)?;
+                let mut header = lorica_http::ResponseHeader::build(status, None)?;
                 header.insert_header("Location", &location)?;
                 session
                     .write_response_header(Box::new(header), true)
                     .await?;
             } else {
                 // return_status alone = direct response with empty body
-                let header = lorica_http::ResponseHeader::build(status as u16, None)?;
+                let header = lorica_http::ResponseHeader::build(status, None)?;
                 session
                     .write_response_header(Box::new(header), true)
                     .await?;
@@ -2115,7 +2129,7 @@ mod tests {
 
     #[test]
     fn test_from_store_empty() {
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
         assert!(config.routes_by_host.is_empty());
     }
 
@@ -2130,12 +2144,7 @@ mod tests {
             vec![backend],
             vec![],
             links,
-            vec![],
-            0,
-            0,
-            0,
-            0,
-            vec![],
+            ProxyConfigGlobals::default(),
         );
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries.len(), 1);
@@ -2149,7 +2158,7 @@ mod tests {
         let r2 = make_route("r2", "disabled.com", "/", false);
 
         let config =
-            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], ProxyConfigGlobals::default());
         assert!(config.routes_by_host.contains_key("example.com"));
         assert!(!config.routes_by_host.contains_key("disabled.com"));
     }
@@ -2161,7 +2170,7 @@ mod tests {
         let r3 = make_route("r3", "example.com", "/api/v1", true);
 
         let config =
-            ProxyConfig::from_store(vec![r1, r2, r3], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![r1, r2, r3], vec![], vec![], vec![], ProxyConfigGlobals::default());
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].route.path_prefix, "/api/v1");
@@ -2174,7 +2183,7 @@ mod tests {
         let route = make_route("r1", "example.com", "/", true);
 
         let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].backends.is_empty());
     }
@@ -2186,7 +2195,7 @@ mod tests {
         let cert = make_certificate("c1", "example.com");
 
         let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![cert], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![route], vec![], vec![cert], vec![], ProxyConfigGlobals::default());
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].certificate.is_some());
         assert_eq!(
@@ -2201,7 +2210,7 @@ mod tests {
         route.certificate_id = Some("nonexistent".into());
 
         let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].certificate.is_none());
     }
@@ -2214,7 +2223,7 @@ mod tests {
         let links = vec![("r1".into(), "b1".into()), ("r1".into(), "b2".into())];
 
         let config =
-            ProxyConfig::from_store(vec![route], vec![b1, b2], vec![], links, vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![route], vec![b1, b2], vec![], links, ProxyConfigGlobals::default());
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries[0].backends.len(), 2);
     }
@@ -2225,7 +2234,7 @@ mod tests {
         let r2 = make_route("r2", "bar.com", "/", true);
 
         let config =
-            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], ProxyConfigGlobals::default());
         assert_eq!(config.routes_by_host.len(), 2);
         assert!(config.routes_by_host.contains_key("foo.com"));
         assert!(config.routes_by_host.contains_key("bar.com"));
@@ -2237,7 +2246,7 @@ mod tests {
         let links = vec![("r1".into(), "nonexistent-backend".into())];
 
         let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], links, vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![route], vec![], vec![], links, ProxyConfigGlobals::default());
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].backends.is_empty());
     }
@@ -2406,7 +2415,7 @@ mod tests {
         route.hostname_aliases = vec!["www.example.com".into(), "alias.example.com".into()];
 
         let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
         assert!(config.routes_by_host.contains_key("example.com"));
         assert!(config.routes_by_host.contains_key("www.example.com"));
         assert!(config.routes_by_host.contains_key("alias.example.com"));
@@ -2435,7 +2444,7 @@ mod tests {
 
     #[test]
     fn test_proxy_config_has_builtin_presets_by_default() {
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
         let names: Vec<&str> = config
             .security_presets
             .iter()
@@ -2455,7 +2464,7 @@ mod tests {
                 "yes".to_string(),
             )]),
         };
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![custom], 0, 0, 0, 0, vec![]);
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { custom_security_presets: vec![custom], ..Default::default() });
         let found = config
             .security_presets
             .iter()
@@ -2474,7 +2483,7 @@ mod tests {
             )]),
         };
         let config =
-            ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![custom_strict], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { custom_security_presets: vec![custom_strict], ..Default::default() });
         let strict = config
             .security_presets
             .iter()
@@ -2492,7 +2501,7 @@ mod tests {
     fn test_wildcard_hostname_matching() {
         let route = make_route("r1", "*.example.com", "/", true);
         let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
 
         // Should match subdomains
         assert!(config.find_route("foo.example.com", "/").is_some());
@@ -2510,7 +2519,7 @@ mod tests {
         let r1 = make_route("r1", "*.example.com", "/", true);
         let r2 = make_route("r2", "specific.example.com", "/", true);
         let config =
-            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], ProxyConfigGlobals::default());
 
         let entry = config.find_route("specific.example.com", "/").unwrap();
         assert_eq!(entry.route.id, "r2"); // exact match wins
@@ -2880,7 +2889,7 @@ mod tests {
     fn test_flood_threshold_halves_effective_limit() {
         // When flood_threshold_rps > 0 and global RPS exceeds it,
         // the effective per-IP rate limit should be halved.
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![], 0, 100, 0, 0, vec![]);
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { flood_threshold_rps: 100, ..Default::default() });
         assert_eq!(config.flood_threshold_rps, 100);
 
         // Simulate: route has rate_limit_rps=50, burst=10 -> effective=60
@@ -2908,7 +2917,7 @@ mod tests {
     #[test]
     fn test_flood_threshold_zero_disables_defense() {
         // When flood_threshold_rps is 0, adaptive defense is disabled
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
         assert_eq!(config.flood_threshold_rps, 0);
 
         let base_limit: f64 = 100.0;
@@ -2947,7 +2956,7 @@ mod tests {
     fn test_catch_all_hostname() {
         let route = make_route("r_catch", "_", "/", true);
         let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
 
         // Catch-all "_" should match any hostname
         assert!(config.find_route("anything.example.com", "/").is_some());
@@ -2966,12 +2975,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            vec![],
-            0,
-            0,
-            0,
-            0,
-            vec![],
+            ProxyConfigGlobals::default(),
         );
 
         // Exact hostname takes precedence
@@ -3018,7 +3022,7 @@ mod tests {
         ];
 
         let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
 
         let entry = config.find_route("example.com", "/api/v2/users").unwrap();
         assert_eq!(entry.route.id, "r1");
@@ -3054,7 +3058,7 @@ mod tests {
 
     #[test]
     fn test_trusted_proxies_empty_by_default() {
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
         assert!(config.trusted_proxies.is_empty());
     }
 
@@ -3064,7 +3068,7 @@ mod tests {
             "192.168.0.0/16".to_string(),
             "10.0.0.0/8".to_string(),
         ];
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![], 0, 0, 0, 0, cidrs);
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
         assert_eq!(config.trusted_proxies.len(), 2);
         // 192.168.1.1 is in 192.168.0.0/16
         let addr: std::net::IpAddr = "192.168.1.1".parse().unwrap();
@@ -3077,7 +3081,7 @@ mod tests {
     #[test]
     fn test_trusted_proxies_bare_ip_converted() {
         let cidrs = vec!["10.0.0.1".to_string()];
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![], 0, 0, 0, 0, cidrs);
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
         assert_eq!(config.trusted_proxies.len(), 1);
         let addr: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         assert!(config.trusted_proxies.iter().any(|net| net.contains(&addr)));
@@ -3094,7 +3098,7 @@ mod tests {
             "".to_string(),
             "10.0.0.1".to_string(),
         ];
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], vec![], 0, 0, 0, 0, cidrs);
+        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
         // Only the valid CIDR and the valid bare IP should be parsed
         assert_eq!(config.trusted_proxies.len(), 2);
     }

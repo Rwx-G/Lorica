@@ -70,12 +70,14 @@ pub async fn reload_proxy_config(
         backends,
         certificates,
         links,
-        custom_presets,
-        max_global_connections,
-        flood_threshold_rps,
-        waf_ban_threshold,
-        waf_ban_duration_s,
-        trusted_proxies,
+        crate::proxy_wiring::ProxyConfigGlobals {
+            custom_security_presets: custom_presets,
+            max_global_connections,
+            flood_threshold_rps,
+            waf_ban_threshold,
+            waf_ban_duration_s,
+            trusted_proxy_cidrs: trusted_proxies,
+        },
     );
 
     // Preserve round-robin counters from the old config to avoid resetting
