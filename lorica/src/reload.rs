@@ -85,7 +85,7 @@ pub async fn reload_proxy_config(
         for entry in entries.iter_mut() {
             if let Some(old_entries) = old_config.routes_by_host.get(&entry.route.hostname) {
                 if let Some(old_entry) = old_entries.iter().find(|e| e.route.id == entry.route.id) {
-                    entry.rr_counter = Arc::clone(&old_entry.rr_counter);
+                    entry.wrr_state = Arc::clone(&old_entry.wrr_state);
                 }
             }
         }

@@ -17,7 +17,7 @@
   let hostnameError = $state('');
 
   const loadBalancingOptions = [
-    { value: 'round_robin', label: 'Round Robin' },
+    { value: 'round_robin', label: 'Weighted Round Robin' },
     { value: 'consistent_hash', label: 'Consistent Hash' },
     { value: 'random', label: 'Random' },
     { value: 'peak_ewma', label: 'Peak EWMA' },

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,69 @@ use lorica_waf::WafEngine;
 use once_cell::sync::Lazy;
 use tracing::{info, warn};
 
+/// Smooth weighted round-robin state (Nginx algorithm).
+/// Each backend has a `current_weight` that increases by `effective_weight` on each
+/// selection. The backend with the highest `current_weight` is chosen, then its
+/// weight is decreased by `total_weight`. This produces an interleaved distribution
+/// like A,A,B,A,C,A,A for weights 5,1,1 instead of AAAAABC.
+#[derive(Debug, Clone)]
+pub struct SmoothWrrState {
+    /// Per-backend current weights, indexed by backend position.
+    current_weights: Vec<AtomicI64>,
+}
+
+impl SmoothWrrState {
+    pub fn new(num_backends: usize, worker_offset: usize) -> Self {
+        let weights: Vec<AtomicI64> = (0..num_backends)
+            .map(|_| AtomicI64::new(0))
+            .collect();
+        // Apply worker offset: advance the state to avoid all workers
+        // selecting the same backend on their first request
+        if num_backends > 0 {
+            let offset_idx = worker_offset % num_backends;
+            // Give the offset backend a head start
+            weights[offset_idx].store(1000, Ordering::Relaxed);
+        }
+        Self { current_weights: weights }
+    }
+
+    /// Select the next backend index using smooth weighted round-robin.
+    /// `weights` is the configured weight for each backend.
+    pub fn next(&self, weights: &[i64]) -> usize {
+        if weights.is_empty() {
+            return 0;
+        }
+        let total: i64 = weights.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+
+        // Increase all current_weights by their effective weight
+        for (i, w) in weights.iter().enumerate() {
+            if i < self.current_weights.len() {
+                self.current_weights[i].fetch_add(*w, Ordering::Relaxed);
+            }
+        }
+
+        // Find the backend with the highest current_weight
+        let mut best_idx = 0;
+        let mut best_weight = i64::MIN;
+        for (i, cw) in self.current_weights.iter().enumerate() {
+            if i >= weights.len() { break; }
+            let w = cw.load(Ordering::Relaxed);
+            if w > best_weight {
+                best_weight = w;
+                best_idx = i;
+            }
+        }
+
+        // Decrease the selected backend's current_weight by total_weight
+        self.current_weights[best_idx].fetch_sub(total, Ordering::Relaxed);
+
+        best_idx
+    }
+}
+
 /// In-memory snapshot of a route and its backends for fast lookup.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -46,8 +109,8 @@ pub struct RouteEntry {
     pub route: Route,
     pub backends: Vec<Backend>,
     pub certificate: Option<Certificate>,
-    /// Round-robin counter for this route.
-    pub rr_counter: Arc<AtomicUsize>,
+    /// Smooth weighted round-robin state for this route.
+    pub wrr_state: Arc<SmoothWrrState>,
     /// Precompiled regex for path rewriting (None if not configured).
     pub path_rewrite_regex: Option<regex::Regex>,
     /// Resolved backends per path rule (parallel to route.path_rules).
@@ -183,7 +246,7 @@ impl ProxyConfig {
                 route: route.clone(),
                 backends: route_backends,
                 certificate,
-                rr_counter: Arc::new(AtomicUsize::new(0)),
+                wrr_state: Arc::new(SmoothWrrState::new(route_backends.len(), std::process::id() as usize)),
                 path_rewrite_regex,
                 path_rule_backends,
             };
@@ -1484,22 +1547,12 @@ impl ProxyHttp for LoricaProxy {
                 (hasher.finish() as usize) % healthy_backends.len()
             }
             _ => {
-                // Weighted round-robin (default for RoundRobin and ConsistentHash)
-                let total_weight: usize = healthy_backends
+                // Smooth weighted round-robin (Nginx algorithm)
+                let weights: Vec<i64> = healthy_backends
                     .iter()
-                    .map(|b| (b.weight.max(1)) as usize)
-                    .sum();
-                let pos = entry.rr_counter.fetch_add(1, Ordering::Relaxed) % total_weight;
-                let mut acc = 0;
-                let mut selected = 0;
-                for (i, b) in healthy_backends.iter().enumerate() {
-                    acc += b.weight.max(1) as usize;
-                    if pos < acc {
-                        selected = i;
-                        break;
-                    }
-                }
-                selected
+                    .map(|b| b.weight.max(1) as i64)
+                    .collect();
+                entry.wrr_state.next(&weights)
             }
         };
         let backend = healthy_backends[idx];
@@ -2163,13 +2216,45 @@ mod tests {
     }
 
     #[test]
-    fn test_from_store_rr_counter_starts_at_zero() {
-        let route = make_route("r1", "example.com", "/", true);
+    fn test_smooth_wrr_distribution() {
+        // 3 backends with equal weight: should distribute evenly
+        let state = SmoothWrrState::new(3, 0);
+        let weights = vec![100i64, 100, 100];
+        let mut counts = [0usize; 3];
+        for _ in 0..30 {
+            let idx = state.next(&weights);
+            counts[idx] += 1;
+        }
+        // Each should get exactly 10 with equal weights
+        assert_eq!(counts[0], 10);
+        assert_eq!(counts[1], 10);
+        assert_eq!(counts[2], 10);
+    }
 
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], vec![], 0, 0, 0, 0, vec![]);
-        let entries = config.routes_by_host.get("example.com").unwrap();
-        assert_eq!(entries[0].rr_counter.load(Ordering::Relaxed), 0);
+    #[test]
+    fn test_smooth_wrr_weighted() {
+        // Weights 5,3,2: should distribute proportionally
+        let state = SmoothWrrState::new(3, 0);
+        let weights = vec![5i64, 3, 2];
+        let mut counts = [0usize; 3];
+        for _ in 0..10 {
+            let idx = state.next(&weights);
+            counts[idx] += 1;
+        }
+        assert_eq!(counts[0], 5);
+        assert_eq!(counts[1], 3);
+        assert_eq!(counts[2], 2);
+    }
+
+    #[test]
+    fn test_smooth_wrr_worker_offset() {
+        // Two workers with different offsets should start on different backends
+        let state0 = SmoothWrrState::new(3, 0);
+        let state1 = SmoothWrrState::new(3, 1);
+        let weights = vec![100i64, 100, 100];
+        let first0 = state0.next(&weights);
+        let first1 = state1.next(&weights);
+        assert_ne!(first0, first1, "different workers should start on different backends");
     }
 
     #[test]
