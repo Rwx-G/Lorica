@@ -335,6 +335,7 @@ export interface LogsQuery {
   status_max?: number;
   time_from?: string;
   time_to?: string;
+  client_ip?: string;
   search?: string;
   limit?: number;
   after_id?: number;
@@ -550,6 +551,7 @@ export const api = {
     if (params?.status_max !== undefined) query.set('status_max', String(params.status_max));
     if (params?.time_from) query.set('time_from', params.time_from);
     if (params?.time_to) query.set('time_to', params.time_to);
+    if (params?.client_ip) query.set('client_ip', params.client_ip);
     if (params?.search) query.set('search', params.search);
     if (params?.limit !== undefined) query.set('limit', String(params.limit));
     if (params?.after_id !== undefined) query.set('after_id', String(params.after_id));

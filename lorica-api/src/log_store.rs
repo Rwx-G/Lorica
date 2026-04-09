@@ -151,6 +151,10 @@ impl LogStore {
             conditions.push("id > ?".to_string());
             bind_values.push(Box::new(after_id as i64));
         }
+        if let Some(ref ip) = params.client_ip {
+            conditions.push("client_ip LIKE ?".to_string());
+            bind_values.push(Box::new(format!("{ip}%")));
+        }
         if let Some(ref search) = params.search {
             let pattern = format!("%{search}%");
             conditions.push(

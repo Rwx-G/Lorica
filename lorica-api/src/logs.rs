@@ -138,6 +138,8 @@ pub struct LogsQuery {
     pub time_from: Option<String>,
     /// Filter by end time (ISO 8601 / RFC 3339).
     pub time_to: Option<String>,
+    /// Filter by client IP (prefix match).
+    pub client_ip: Option<String>,
     /// Search text across method, path, host, backend, error fields.
     pub search: Option<String>,
     /// Maximum number of entries to return (default 200).
@@ -205,6 +207,11 @@ pub async fn get_logs(
                     return false;
                 }
             }
+            if let Some(ref ip) = params.client_ip {
+                if !e.client_ip.starts_with(ip.as_str()) {
+                    return false;
+                }
+            }
             if let Some(ref search) = params.search {
                 let s = search.to_lowercase();
                 let matches = e.method.to_lowercase().contains(&s)
@@ -248,6 +255,8 @@ pub struct LogExportQuery {
     pub time_from: Option<String>,
     /// Filter by end time (ISO 8601 / RFC 3339).
     pub time_to: Option<String>,
+    /// Filter by client IP (prefix match).
+    pub client_ip: Option<String>,
     /// Search text across method, path, host, backend, error fields.
     pub search: Option<String>,
     /// Export format: "csv" (default) or "json".
@@ -264,6 +273,7 @@ impl LogExportQuery {
             status_max: self.status_max,
             time_from: self.time_from.clone(),
             time_to: self.time_to.clone(),
+            client_ip: self.client_ip.clone(),
             search: self.search.clone(),
             limit: None,
             after_id: None,
@@ -573,6 +583,7 @@ mod tests {
             status_max: Some(299),
             time_from: Some("2026-01-01T00:00:00Z".into()),
             time_to: Some("2026-01-02T00:00:00Z".into()),
+            client_ip: None,
             search: None,
             format: Some("csv".into()),
         };

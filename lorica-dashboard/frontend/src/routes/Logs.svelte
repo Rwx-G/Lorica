@@ -12,6 +12,7 @@
   // Filters
   let searchText = $state('');
   let filterRoute = $state('');
+  let filterClientIp = $state('');
   let filterStatusCategory = $state('');
   let filterTimeRange = $state('');
   let autoRefresh = $state(true);
@@ -95,6 +96,7 @@
         && !e.backend.toLowerCase().includes(s)) return false;
     }
     if (filterRoute.trim() && !e.host.includes(filterRoute.trim())) return false;
+    if (filterClientIp.trim() && !e.client_ip.startsWith(filterClientIp.trim())) return false;
     return true;
   }
 
@@ -102,6 +104,7 @@
     const params: LogsQuery = { limit: 500 };
     if (searchText.trim()) params.search = searchText.trim();
     if (filterRoute.trim()) params.route = filterRoute.trim();
+    if (filterClientIp.trim()) params.client_ip = filterClientIp.trim();
     if (filterStatusCategory === '2xx') { params.status_min = 200; params.status_max = 299; }
     else if (filterStatusCategory === '3xx') { params.status_min = 300; params.status_max = 399; }
     else if (filterStatusCategory === '4xx') { params.status_min = 400; params.status_max = 499; }
@@ -261,6 +264,13 @@
       class="filter-input route-input"
       placeholder="Filter by host..."
       bind:value={filterRoute}
+      onkeydown={(e) => { if (e.key === 'Enter') loadLogs(); }}
+    />
+    <input
+      type="text"
+      class="filter-input ip-input"
+      placeholder="Filter by IP..."
+      bind:value={filterClientIp}
       onkeydown={(e) => { if (e.key === 'Enter') loadLogs(); }}
     />
     <select class="filter-select" bind:value={filterStatusCategory} onchange={loadLogs}>
@@ -447,6 +457,10 @@
 
   .route-input {
     width: 180px;
+  }
+
+  .ip-input {
+    width: 160px;
   }
 
   .filter-select {
