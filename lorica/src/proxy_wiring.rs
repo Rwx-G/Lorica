@@ -712,7 +712,7 @@ impl ProxyHttp for LoricaProxy {
                         matched_value: ip.to_string(),
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         client_ip: ip.to_string(),
-                        route_hostname: host.to_string(),
+                        route_hostname: req.headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("-").to_string(),
                         action: "blocked".to_string(),
                     };
                     let _ = store.insert_waf_event(&ev);
