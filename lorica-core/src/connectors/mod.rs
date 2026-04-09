@@ -473,11 +473,19 @@ mod tests {
     use super::*;
     use crate::upstreams::peer::BasicPeer;
 
+    // Ensure the rustls CryptoProvider is installed before any TLS test runs.
+    // When multiple workspace crates enable both `ring` and `aws-lc-rs`,
+    // rustls cannot auto-detect the provider. This explicit call avoids that.
+    fn init_crypto() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     // 192.0.2.1 is effectively a black hole
     const BLACK_HOLE: &str = "192.0.2.1:79";
 
     #[tokio::test]
     async fn test_connect() {
+        init_crypto();
         let connector = TransportConnector::new(None);
         let peer = BasicPeer::new("1.1.1.1:80");
         // make a new connection to 1.1.1.1
@@ -490,6 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_tls() {
+        init_crypto();
         let connector = TransportConnector::new(None);
         let mut peer = BasicPeer::new("1.1.1.1:443");
         // BasicPeer will use tls when SNI is set
@@ -505,6 +514,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[cfg(unix)]
     async fn test_connect_uds() {
+        init_crypto();
         let socket_path = test_utils::unique_uds_path("transport_connector");
         let (ready_rx, shutdown_tx, server_handle) =
             test_utils::spawn_mock_uds_server(socket_path.clone(), b"it works!");
@@ -533,6 +543,7 @@ mod tests {
     }
 
     async fn do_test_conn_timeout(conf: Option<ConnectorOptions>) {
+        init_crypto();
         let connector = TransportConnector::new(conf);
         let mut peer = BasicPeer::new(BLACK_HOLE);
         peer.options.connection_timeout = Some(std::time::Duration::from_millis(1));
@@ -557,6 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connector_bind_to() {
+        init_crypto();
         // connect to remote while bind to localhost will fail
         let peer = BasicPeer::new("240.0.0.1:80");
         let mut conf = ConnectorOptions::new(1);
@@ -573,6 +585,7 @@ mod tests {
     /// This assumes that the connection will fail to on the peer and returns
     /// the decomposed error type and message
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
+        init_crypto();
         let tls_connector = Connector::new(None);
         let stream = do_connect(peer, None, None, &tls_connector.ctx).await;
         match stream {

@@ -326,6 +326,11 @@ mod test {
     use tokio::net::TcpStream;
     use tokio::time::{sleep, Duration};
 
+    #[cfg(feature = "any_tls")]
+    fn init_crypto() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     #[tokio::test]
     async fn test_listen_tcp() {
         let addr1 = "127.0.0.1:7101";
@@ -354,6 +359,7 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_listen_tls() {
+        init_crypto();
         use tokio::io::AsyncReadExt;
 
         let addr = "127.0.0.1:7103";

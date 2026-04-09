@@ -169,6 +169,10 @@ mod tests {
     use crate::protocols::http::v1::client::HttpSession as Http1Session;
     use crate::protocols::tls::CustomALPN;
     use crate::upstreams::peer::HttpPeer;
+
+    fn init_crypto() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     use crate::upstreams::peer::PeerOptions;
     use async_trait::async_trait;
     use lorica_http::RequestHeader;
@@ -192,6 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_h2() {
+        init_crypto();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
@@ -217,6 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_h1() {
+        init_crypto();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(1, 1);
@@ -246,6 +252,7 @@ mod tests {
         // this test verify that if the server doesn't support h2, the Connector will reuse the
         // h1 session instead.
 
+        init_crypto();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         // As it is hard to find a server that support only h1, we use the following hack to trick
@@ -278,6 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_prefer_h1() {
+        init_crypto();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 1);

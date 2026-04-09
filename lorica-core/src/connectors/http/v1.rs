@@ -73,6 +73,10 @@ mod tests {
     use crate::upstreams::peer::HttpPeer;
     use lorica_http::RequestHeader;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     async fn get_http(http: &mut HttpSession, expected_status: u16) {
         let mut req = Box::new(RequestHeader::build("GET", b"/", None).unwrap());
         req.append_header("Host", "one.one.one.one").unwrap();
@@ -86,6 +90,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect() {
+        init_crypto();
         let connector = Connector::new(None);
         let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
         // make a new connection to 1.1.1.1
@@ -107,6 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reuse_rejects_fd_mismatch() {
+        init_crypto();
         use std::fmt::{Display, Formatter, Result as FmtResult};
         use std::os::unix::prelude::AsRawFd;
 
@@ -165,6 +171,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_connect_tls() {
+        init_crypto();
         let connector = Connector::new(None);
         let peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         // make a new connection to https://1.1.1.1

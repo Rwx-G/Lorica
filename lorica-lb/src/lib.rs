@@ -492,6 +492,10 @@ mod test {
     use super::*;
     use async_trait::async_trait;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     #[tokio::test]
     async fn test_static_backends() {
         let backends: LoadBalancer<selection::RoundRobin> =
@@ -506,6 +510,7 @@ mod test {
 
     #[tokio::test]
     async fn test_backends() {
+        init_crypto();
         let discovery = discovery::Static::default();
         let good1 = Backend::new("1.1.1.1:80").unwrap();
         discovery.add(good1.clone());
@@ -616,6 +621,7 @@ mod test {
 
     #[tokio::test]
     async fn test_parallel_health_check() {
+        init_crypto();
         let discovery = discovery::Static::default();
         let good1 = Backend::new("1.1.1.1:80").unwrap();
         discovery.add(good1.clone());

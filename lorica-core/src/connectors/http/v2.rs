@@ -540,9 +540,15 @@ mod tests {
     use super::*;
     use crate::upstreams::peer::HttpPeer;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_connect_h2() {
+        init_crypto();
+        init_crypto();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
@@ -560,6 +566,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_connect_h1() {
+        init_crypto();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         // a hack to force h1, new_http_session() in the future might validate this setting
@@ -577,6 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_h1_plaintext() {
+        init_crypto();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
         peer.options.set_http_version(2, 1);
@@ -594,6 +602,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_h2_single_stream() {
+        init_crypto();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
@@ -630,6 +639,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_h2_multiple_stream() {
+        init_crypto();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
@@ -692,6 +702,7 @@ mod tests {
     #[cfg(all(feature = "any_tls", unix))]
     #[tokio::test]
     async fn test_h2_reuse_rejects_fd_mismatch() {
+        init_crypto();
         use crate::protocols::l4::socket::SocketAddr;
         use crate::upstreams::peer::Peer;
         use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -731,6 +742,7 @@ mod tests {
             }
         }
 
+        init_crypto();
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);

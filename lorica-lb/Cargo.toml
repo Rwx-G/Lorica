@@ -33,6 +33,7 @@ http = { workspace = true }
 derivative.workspace = true
 
 [dev-dependencies]
+rustls = "0.23"
 
 [features]
 default = []

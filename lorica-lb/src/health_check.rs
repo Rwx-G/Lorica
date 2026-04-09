@@ -428,8 +428,13 @@ mod test {
     use async_trait::async_trait;
     use http::Extensions;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     #[tokio::test]
     async fn test_tcp_check() {
+        init_crypto();
         let tcp_check = TcpHealthCheck::default();
 
         let backend = Backend {
@@ -452,6 +457,7 @@ mod test {
     #[cfg(feature = "any_tls")]
     #[tokio::test]
     async fn test_tls_check() {
+        init_crypto();
         let tls_check = TcpHealthCheck::new_tls("one.one.one.one");
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
@@ -465,6 +471,7 @@ mod test {
     #[cfg(feature = "any_tls")]
     #[tokio::test]
     async fn test_https_check() {
+        init_crypto();
         let https_check = HttpHealthCheck::new("one.one.one.one", true);
 
         let backend = Backend {
@@ -478,6 +485,7 @@ mod test {
 
     #[tokio::test]
     async fn test_http_custom_check() {
+        init_crypto();
         let mut http_check = HttpHealthCheck::new("one.one.one.one", false);
         http_check.validator = Some(Box::new(|resp: &ResponseHeader| {
             if resp.status == 301 {
@@ -503,6 +511,7 @@ mod test {
 
     #[tokio::test]
     async fn test_health_observe() {
+        init_crypto();
         struct Observe {
             unhealthy_count: Arc<AtomicU16>,
         }
