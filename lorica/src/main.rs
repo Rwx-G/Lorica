@@ -706,7 +706,11 @@ fn run_supervisor(cli: Cli) {
             if let Ok(settings) = s.get_global_settings() {
                 if settings.ip_blocklist_enabled {
                     waf_engine.ip_blocklist().set_enabled(true);
-                    info!("supervisor: IP blocklist restored as enabled");
+                    // Fetch blocklist immediately at startup
+                    match lorica_api::waf::fetch_and_load_blocklist(waf_engine.ip_blocklist()).await {
+                        Ok(count) => info!(count, "supervisor: IP blocklist loaded at startup"),
+                        Err(e) => warn!(error = %e, "supervisor: IP blocklist initial load failed"),
+                    }
                 }
             }
             if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
@@ -1403,6 +1407,12 @@ fn run_worker(
             sla_flush_collector.start_flush_task(sla_flush_store, None);
 
             // IP blocklist: initial load + periodic refresh (every 6h)
+            if waf_fwd_engine.ip_blocklist().is_enabled() {
+                match lorica_api::waf::fetch_and_load_blocklist(waf_fwd_engine.ip_blocklist()).await {
+                    Ok(count) => tracing::info!(count, "worker: IP blocklist loaded at startup"),
+                    Err(e) => tracing::warn!(error = %e, "worker: IP blocklist initial load failed"),
+                }
+            }
             let blocklist_engine = Arc::clone(&waf_fwd_engine);
             lorica_api::waf::spawn_blocklist_refresh(
                 blocklist_engine,
@@ -1638,7 +1648,10 @@ fn run_single_process(cli: Cli) {
             if let Ok(settings) = s.get_global_settings() {
                 if settings.ip_blocklist_enabled {
                     waf_engine.ip_blocklist().set_enabled(true);
-                    info!("IP blocklist restored as enabled from settings");
+                    match lorica_api::waf::fetch_and_load_blocklist(waf_engine.ip_blocklist()).await {
+                        Ok(count) => info!(count, "IP blocklist loaded at startup"),
+                        Err(e) => warn!(error = %e, "IP blocklist initial load failed"),
+                    }
                 }
             }
             // Restore disabled WAF rules
