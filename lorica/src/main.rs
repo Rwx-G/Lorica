@@ -114,6 +114,19 @@ enum Commands {
         #[arg(long)]
         new_key_file: String,
     },
+    /// Remove an IP from the auto-ban list
+    Unban {
+        /// IP address to unban
+        ip: String,
+
+        /// Admin username
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// Admin password
+        #[arg(long)]
+        password: String,
+    },
 }
 
 fn init_logging(log_level: &str) {
@@ -197,6 +210,53 @@ fn main() {
             );
             println!("  mv {} {}.backup", key_path.display(), key_path.display());
             println!("  mv {} {}", new_key_path.display(), key_path.display());
+        }
+        Some(Commands::Unban { ip, user, password }) => {
+            let port = cli.management_port;
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(async {
+                let client = reqwest::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .cookie_store(true)
+                    .build()
+                    .expect("HTTP client");
+
+                // Login
+                let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
+                let login_res = client
+                    .post(&login_url)
+                    .json(&serde_json::json!({ "username": user, "password": password }))
+                    .send()
+                    .await;
+                match login_res {
+                    Ok(r) if r.status().is_success() => {}
+                    Ok(r) => {
+                        eprintln!("Login failed ({}). Check credentials.", r.status());
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Cannot connect to management API on port {port}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+
+                // Unban
+                let unban_url = format!("https://127.0.0.1:{port}/api/v1/bans/{ip}");
+                match client.delete(&unban_url).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        println!("IP {ip} unbanned successfully.");
+                    }
+                    Ok(r) => {
+                        let body = r.text().await.unwrap_or_default();
+                        eprintln!("Unban failed: {body}");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Unban request failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            });
         }
         None => {
             init_logging(&cli.log_level);
