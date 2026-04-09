@@ -15,7 +15,8 @@
   let filterClientIp = $state('');
   let filterStatusCategory = $state('');
   let filterTimeRange = $state('');
-  let autoRefresh = $state(true);
+  let filterLimit = $state(500);
+  let autoRefresh = $state(localStorage.getItem('lorica-logs-autorefresh') !== 'false');
 
   // Export controls
   let showExport = $state(false);
@@ -101,7 +102,7 @@
   }
 
   async function loadLogs() {
-    const params: LogsQuery = { limit: 500 };
+    const params: LogsQuery = { limit: filterLimit };
     if (searchText.trim()) params.search = searchText.trim();
     if (filterRoute.trim()) params.route = filterRoute.trim();
     if (filterClientIp.trim()) params.client_ip = filterClientIp.trim();
@@ -174,8 +175,8 @@
   }
 
   onMount(() => {
-    loadLogs();          // Initial load via REST
-    connectWebSocket();  // Then switch to real-time WS
+    loadLogs();
+    if (autoRefresh) connectWebSocket();
   });
 
   onDestroy(() => {
@@ -183,11 +184,14 @@
     disconnectWebSocket();
   });
 
-  // Restart auto-refresh when toggle changes
+  // React to auto-refresh toggle: connect/disconnect WS + polling
   $effect(() => {
+    localStorage.setItem('lorica-logs-autorefresh', String(autoRefresh));
     if (autoRefresh) {
+      connectWebSocket();
       startAutoRefresh();
     } else {
+      disconnectWebSocket();
       stopAutoRefresh();
     }
   });
@@ -283,7 +287,14 @@
         <option value={tr.value}>{tr.label}</option>
       {/each}
     </select>
-    <span class="entry-count">{total} entries</span>
+    <select class="filter-select" bind:value={filterLimit} onchange={loadLogs}>
+      <option value={100}>100</option>
+      <option value={500}>500</option>
+      <option value={1000}>1 000</option>
+      <option value={5000}>5 000</option>
+      <option value={10000}>10 000</option>
+    </select>
+    <span class="entry-count">{entries.length === total ? `${total} entries` : `${entries.length} of ${total} entries`}</span>
   </div>
 
   {#if error}
