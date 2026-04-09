@@ -277,7 +277,7 @@ server {
       d => d.level === 'warning' && d.message.includes('if')
     );
     expect(ifWarnings.length).toBeGreaterThanOrEqual(1);
-    expect(ifWarnings[0].message).toContain('not supported');
+    expect(ifWarnings[0].message).toContain('skipped');
   });
 
   it('warns on non-standard listen ports', () => {
