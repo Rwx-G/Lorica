@@ -279,9 +279,9 @@
                   </tr>
                 </thead>
                 <tbody>
-                  {#each buckets.slice(-30) as b}
+                  {#each [...buckets].reverse().slice(0, 30) as b}
                     <tr>
-                      <td class="mono">{new Date(b.bucket_start).toLocaleTimeString()}</td>
+                      <td class="mono">{new Date(b.bucket_start).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })}</td>
                       <td>{b.request_count}</td>
                       <td style="color: var(--color-green)">{b.success_count}</td>
                       <td style="color: {b.error_count > 0 ? 'var(--color-red)' : 'var(--color-text-muted)'}">{b.error_count}</td>
