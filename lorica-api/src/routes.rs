@@ -97,6 +97,7 @@ pub struct RouteResponse {
     pub path_rules: Vec<PathRuleResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_status: Option<u16>,
+    pub sticky_session: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -147,6 +148,7 @@ pub struct CreateRouteRequest {
     pub auto_ban_duration_s: Option<i32>,
     pub path_rules: Option<Vec<PathRuleRequest>>,
     pub return_status: Option<u16>,
+    pub sticky_session: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +198,7 @@ pub struct UpdateRouteRequest {
     pub auto_ban_duration_s: Option<i32>,
     pub path_rules: Option<Vec<PathRuleRequest>>,
     pub return_status: Option<u16>,
+    pub sticky_session: Option<bool>,
 }
 
 fn route_to_response(
@@ -265,6 +268,7 @@ fn route_to_response(
             })
             .collect(),
         return_status: route.return_status,
+        sticky_session: route.sticky_session,
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -390,6 +394,7 @@ pub async fn create_route(
         auto_ban_duration_s: body.auto_ban_duration_s.unwrap_or(3600),
         path_rules,
         return_status: body.return_status,
+        sticky_session: body.sticky_session.unwrap_or(false),
         created_at: now,
         updated_at: now,
     };
@@ -619,6 +624,9 @@ pub async fn update_route(
     }
     if let Some(return_status) = body.return_status {
         route.return_status = if return_status == 0 { None } else { Some(return_status) };
+    }
+    if let Some(sticky) = body.sticky_session {
+        route.sticky_session = sticky;
     }
     route.updated_at = Utc::now();
 

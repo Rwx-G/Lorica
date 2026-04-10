@@ -588,6 +588,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -677,6 +678,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -781,6 +783,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -870,6 +873,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -942,6 +946,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

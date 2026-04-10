@@ -66,6 +66,7 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str) -> Route {
         auto_ban_duration_s: 3600,
         path_rules: vec![],
         return_status: None,
+            sticky_session: false,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

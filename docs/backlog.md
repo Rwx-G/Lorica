@@ -4,8 +4,7 @@
 
 | # | Feature | Complexity | Type | Notes |
 |---|---------|-----------|------|-------|
-| 1 | Sticky Sessions (cookie-based) | Low | Table-stakes | Inject Set-Cookie with backend ID, lookup on next request. Essential for stateful apps (PHP sessions, e-commerce). All major proxies have it. |
-| 2 | Forward Auth (external authentication) | Medium | Table-stakes | Sub-request to auth service (Authelia, Authentik, Keycloak) before proxying. Standard SSO/MFA mechanism. Traefik forwardAuth, Nginx auth_request. |
+| 1 | Forward Auth (external authentication) | Medium | Table-stakes | Sub-request to auth service (Authelia, Authentik, Keycloak) before proxying. Standard SSO/MFA mechanism. Traefik forwardAuth, Nginx auth_request. |
 | 3 | Custom Error Pages + Maintenance Mode | Low | Table-stakes | Change route `enabled: bool` to enum `active/maintenance/disabled`. Maintenance returns 503 with configurable HTML page. Custom error pages for 502/503/504/429. |
 
 ## Medium Priority

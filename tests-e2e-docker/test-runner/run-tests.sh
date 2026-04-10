@@ -3422,9 +3422,70 @@ if [ -n "$SESSION" ]; then
     api_del "/api/v1/backends/$RND_B2_ID" >/dev/null 2>&1 || true
 
 # =============================================================================
-# 65. CLEANUP
+# 66. STICKY SESSIONS
 # =============================================================================
-    log "=== 65. Cleanup ==="
+    log "=== 66. Sticky Sessions ==="
+
+    # Use existing healthy backend (B1_ID from section 4)
+    STICKY_BACKEND_ID="$B1_ID"
+    if [ -n "$STICKY_BACKEND_ID" ]; then
+        ok "Using existing backend for sticky test"
+        STICKY_ROUTE=$(api_post "/api/v1/routes" '{"hostname":"sticky.test","path_prefix":"/","backend_ids":["'"$STICKY_BACKEND_ID"'"],"sticky_session":true}')
+        STICKY_ROUTE_ID=$(echo "$STICKY_ROUTE" | jq -r '.data.id // empty')
+        if [ -n "$STICKY_ROUTE_ID" ]; then
+            ok "Sticky route created"
+
+            STICKY_GET=$(api_get "/api/v1/routes/$STICKY_ROUTE_ID")
+            STICKY_VAL=$(echo "$STICKY_GET" | jq -r '.data.sticky_session // empty')
+            if [ "$STICKY_VAL" = "true" ]; then
+                ok "sticky_session persisted as true"
+            else
+                fail "sticky_session not persisted (got: $STICKY_VAL)"
+            fi
+
+            sleep 12  # wait for health check (default 10s interval) + config reload
+            STICKY_RESP_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: sticky.test" "$PROXY/" 2>/dev/null || true)
+            log "Sticky proxy status: $STICKY_RESP_STATUS"
+            STICKY_HEADERS=$(curl -s -D - -o /dev/null -H "Host: sticky.test" "$PROXY/" 2>/dev/null || true)
+            if echo "$STICKY_HEADERS" | grep -qi "LORICA_SRV="; then
+                ok "LORICA_SRV cookie present in response"
+                SRV_COOKIE=$(echo "$STICKY_HEADERS" | grep -i "Set-Cookie.*LORICA_SRV" | sed 's/.*LORICA_SRV=//;s/;.*//' | tr -d '\r')
+                if [ -n "$SRV_COOKIE" ]; then
+                    ok "Cookie contains backend ID"
+                    STICKY_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: sticky.test" -b "LORICA_SRV=$SRV_COOKIE" "$PROXY/" 2>/dev/null || true)
+                    if [ "$STICKY_STATUS" = "200" ]; then
+                        ok "Request with sticky cookie succeeds"
+                    else
+                        fail "Request with sticky cookie failed (status: $STICKY_STATUS)"
+                    fi
+                else
+                    fail "LORICA_SRV cookie value is empty"
+                fi
+            else
+                fail "LORICA_SRV cookie missing from response"
+            fi
+
+            api_put "/api/v1/routes/$STICKY_ROUTE_ID" '{"sticky_session":false}' > /dev/null
+            sleep 1
+            NOSTICKY_HEADERS=$(curl -s -D - -o /dev/null -H "Host: sticky.test" "$PROXY/" 2>/dev/null || true)
+            if echo "$NOSTICKY_HEADERS" | grep -qi "LORICA_SRV="; then
+                fail "Cookie still present after disabling sticky"
+            else
+                ok "No cookie after disabling sticky_session"
+            fi
+
+            api_del "/api/v1/routes/$STICKY_ROUTE_ID" > /dev/null
+        else
+            fail "Failed to create sticky route"
+        fi
+    else
+        fail "Failed to create sticky backend"
+    fi
+
+# =============================================================================
+# 67. CLEANUP
+# =============================================================================
+    log "=== 67. Cleanup ==="
 
     api_del "/api/v1/routes/$R1_ID" >/dev/null && ok "Route 1 deleted" || fail "Route 1 delete failed"
     api_del "/api/v1/routes/$R2_ID" >/dev/null && ok "Route 2 deleted" || fail "Route 2 delete failed"

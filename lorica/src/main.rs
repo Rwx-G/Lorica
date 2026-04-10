@@ -1812,7 +1812,7 @@ fn run_single_process(cli: Cli) {
         let proxy_ban_list = Arc::clone(&lorica_proxy.ban_list);
         let proxy_ewma_scores = lorica_proxy.ewma_tracker.scores_ref();
         let pool_size = {
-            let s = store.blocking_lock();
+            let s = store.lock().await;
             let backend_count = s.list_backends().map(|b| b.len()).unwrap_or(0);
             lorica::proxy_wiring::compute_pool_size(backend_count)
         };

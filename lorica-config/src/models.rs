@@ -416,6 +416,10 @@ pub struct Route {
     pub path_rules: Vec<PathRule>,
     #[serde(default)]
     pub return_status: Option<u16>,
+    /// Enable cookie-based sticky sessions (session affinity).
+    /// When enabled, a `LORICA_SRV` cookie is set with the backend ID.
+    #[serde(default)]
+    pub sticky_session: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1329,6 +1333,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: now,
             updated_at: now,
         };

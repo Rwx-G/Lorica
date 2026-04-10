@@ -685,6 +685,8 @@ pub struct RequestCtx {
     pub body_bytes_received: u64,
     /// Buffered request body for WAF body scanning (only when WAF is enabled).
     pub waf_body_buffer: Option<Vec<u8>>,
+    /// Backend ID for sticky session cookie injection (set in upstream_peer).
+    pub sticky_backend_id: Option<String>,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -776,6 +778,14 @@ impl LoricaProxy {
 /// Extract the request host from the Host header, falling back to URI authority.
 /// HTTP/2 uses :authority pseudo-header which pingora maps to the URI authority,
 /// while the Host header may be absent.
+/// Extract the LORICA_SRV backend ID from a Cookie header value.
+fn extract_sticky_backend(cookie_header: &str) -> Option<&str> {
+    cookie_header.split(';').find_map(|c| {
+        let c = c.trim();
+        c.strip_prefix("LORICA_SRV=")
+    })
+}
+
 /// Generate a compact hex request ID (16 bytes = 32 hex chars).
 fn generate_request_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -830,6 +840,7 @@ impl ProxyHttp for LoricaProxy {
             block_reason: None,
             body_bytes_received: 0,
             waf_body_buffer: None,
+            sticky_backend_id: None,
         }
     }
 
@@ -1755,9 +1766,29 @@ impl ProxyHttp for LoricaProxy {
             );
         }
 
+        // Sticky session: if enabled, try to route to the backend from the cookie
+        let sticky_backend_idx = if entry.route.sticky_session {
+            session
+                .req_header()
+                .headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .and_then(extract_sticky_backend)
+                .and_then(|backend_id| {
+                    healthy_backends
+                        .iter()
+                        .position(|b| b.id == backend_id)
+                })
+        } else {
+            None
+        };
+
         // Backend selection based on load balancing algorithm
         use lorica_config::models::LoadBalancing;
-        let idx = match entry.route.load_balancing {
+        let idx = if let Some(sticky_idx) = sticky_backend_idx {
+            sticky_idx
+        } else {
+        match entry.route.load_balancing {
             LoadBalancing::PeakEwma => self.ewma_tracker.select_best(&healthy_backends),
             LoadBalancing::Random => {
                 use std::collections::hash_map::DefaultHasher;
@@ -1774,8 +1805,14 @@ impl ProxyHttp for LoricaProxy {
                     .collect();
                 entry.wrr_state.next(&bw)
             }
+        }
         };
         let backend = healthy_backends[idx];
+
+        // Set sticky session cookie if enabled and no existing cookie matched
+        if entry.route.sticky_session && sticky_backend_idx.is_none() {
+            ctx.sticky_backend_id = Some(backend.id.clone());
+        }
 
         ctx.backend_addr = Some(backend.address.clone());
         self.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -2066,6 +2103,12 @@ impl ProxyHttp for LoricaProxy {
             let _ = upstream_response.insert_header(name, value);
         }
 
+        // Inject sticky session cookie
+        if let Some(ref backend_id) = ctx.sticky_backend_id {
+            let cookie = format!("LORICA_SRV={backend_id}; Path=/; HttpOnly; SameSite=Lax");
+            let _ = upstream_response.append_header("Set-Cookie", &cookie);
+        }
+
         Ok(())
     }
 
@@ -2297,6 +2340,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: now,
             updated_at: now,
         }
@@ -3320,5 +3364,36 @@ mod tests {
         let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
         // Only the valid CIDR and the valid bare IP should be parsed
         assert_eq!(config.trusted_proxies.len(), 2);
+    }
+
+    // ---- Sticky sessions ----
+
+    #[test]
+    fn test_extract_sticky_backend_single_cookie() {
+        assert_eq!(
+            extract_sticky_backend("LORICA_SRV=abc-123"),
+            Some("abc-123")
+        );
+    }
+
+    #[test]
+    fn test_extract_sticky_backend_multiple_cookies() {
+        assert_eq!(
+            extract_sticky_backend("session=xyz; LORICA_SRV=backend-42; lang=en"),
+            Some("backend-42")
+        );
+    }
+
+    #[test]
+    fn test_extract_sticky_backend_absent() {
+        assert_eq!(
+            extract_sticky_backend("session=xyz; lang=en"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_sticky_backend_empty() {
+        assert_eq!(extract_sticky_backend(""), None);
     }
 }

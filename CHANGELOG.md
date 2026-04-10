@@ -9,7 +9,7 @@ Author: Rwx-G
 
 ## Unreleased
 
-## [1.0.1] - 2026-04-10
+## [1.1.0] - 2026-04-10
 
 ### Added
 
@@ -19,6 +19,7 @@ Author: Rwx-G
 - 12 new WAF rules (49 total): SQLi auth bypass, info schema recon, encoding evasion, NoSQL injection (MongoDB), XSS eval/base64, backup file access, PowerShell/Windows commands, HTTP request smuggling, scanner detection, PHP/Java deserialization, HTTP method abuse
 - X-Request-Id header: unique request identifier generated per request, propagated to backends and logged in access logs for end-to-end tracing
 - Circuit breaker: per-backend failure tracking that removes backends from rotation after 5 consecutive errors (5xx or connection failures), with 10s cooldown and half-open probe before recovery
+- Sticky sessions: cookie-based session affinity per route. When enabled, a `LORICA_SRV` cookie containing the backend ID is set on first request. Subsequent requests are routed to the same backend. Falls back to normal load balancing if the backend is down
 
 ### Fixed
 

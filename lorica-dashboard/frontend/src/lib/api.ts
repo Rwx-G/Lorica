@@ -148,6 +148,7 @@ export interface RouteResponse {
   auto_ban_duration_s: number;
   path_rules: PathRuleResponse[];
   return_status: number | null;
+  sticky_session: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -197,6 +198,7 @@ export interface CreateRouteRequest {
   auto_ban_duration_s?: number;
   path_rules?: PathRuleRequest[];
   return_status?: number;
+  sticky_session?: boolean;
 }
 
 export interface UpdateRouteRequest {
@@ -245,6 +247,7 @@ export interface UpdateRouteRequest {
   auto_ban_duration_s?: number;
   path_rules?: PathRuleRequest[];
   return_status?: number;
+  sticky_session?: boolean;
 }
 
 export interface BackendResponse {
