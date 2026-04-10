@@ -354,6 +354,12 @@ impl ConfigStore {
             )?;
         }
 
+        // Unconditional column additions (idempotent, let _ = ignores "already exists")
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN sticky_session INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
         if current_version < 19 {
             tracing::info!("applying migration 017_acme_method");
             self.conn.execute_batch(MIGRATION_V17)?;
@@ -504,12 +510,12 @@ impl ConfigStore {
              max_connections, slowloris_threshold_ms,
              auto_ban_threshold, auto_ban_duration_s,
              created_at, updated_at,
-             path_rules, return_status)
+             path_rules, return_status, sticky_session)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
                      ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45,
-                     ?46, ?47)",
+                     ?46, ?47, ?48)",
             params![
                 route.id,
                 route.hostname,
@@ -558,6 +564,7 @@ impl ConfigStore {
                 route.updated_at.to_rfc3339(),
                 path_rules_json,
                 route.return_status.map(|v| v as i32),
+                route.sticky_session,
             ],
         )?;
         Ok(())
@@ -585,7 +592,7 @@ impl ConfigStore {
                  max_connections, slowloris_threshold_ms,
                  auto_ban_threshold, auto_ban_duration_s,
                  created_at, updated_at,
-                 path_rules, return_status
+                 path_rules, return_status, sticky_session
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
@@ -615,7 +622,7 @@ impl ConfigStore {
              max_connections, slowloris_threshold_ms,
              auto_ban_threshold, auto_ban_duration_s,
              created_at, updated_at,
-             path_rules, return_status
+             path_rules, return_status, sticky_session
              FROM routes ORDER BY hostname, path_prefix",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_route(row)))?;
@@ -671,7 +678,7 @@ impl ConfigStore {
              max_connections=?40, slowloris_threshold_ms=?41,
              auto_ban_threshold=?42, auto_ban_duration_s=?43,
              updated_at=?44,
-             path_rules=?45, return_status=?46 WHERE id=?1",
+             path_rules=?45, return_status=?46, sticky_session=?47 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -719,6 +726,7 @@ impl ConfigStore {
                 route.updated_at.to_rfc3339(),
                 path_rules_json,
                 route.return_status.map(|v| v as i32),
+                route.sticky_session,
             ],
         )?;
         if changed == 0 {
@@ -1512,6 +1520,14 @@ impl ConfigStore {
                             ))
                         })?;
                 }
+                "waf_whitelist_ips" => {
+                    settings.waf_whitelist_ips =
+                        serde_json::from_str(&value).map_err(|e| {
+                            ConfigError::Validation(format!(
+                                "invalid waf_whitelist_ips JSON: {e}"
+                            ))
+                        })?;
+                }
                 _ => {}
             }
         }
@@ -1591,6 +1607,14 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('trusted_proxies', ?1)",
             params![trusted_proxies_json],
+        )?;
+        let waf_whitelist_json =
+            serde_json::to_string(&settings.waf_whitelist_ips).map_err(|e| {
+                ConfigError::Validation(format!("failed to serialize waf_whitelist_ips: {e}"))
+            })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_whitelist_ips', ?1)",
+            params![waf_whitelist_json],
         )?;
         Ok(())
     }
@@ -2716,6 +2740,7 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         auto_ban_duration_s: row.get(42)?,
         path_rules,
         return_status,
+        sticky_session: row.get::<_, bool>(47).unwrap_or(false),
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

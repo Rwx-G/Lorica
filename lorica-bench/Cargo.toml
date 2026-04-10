@@ -1,6 +1,6 @@
 [package]
 name = "lorica-bench"
-version = "1.0.0"
+version = "1.1.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -8,7 +8,7 @@ repository = "https://github.com/Rwx-G/Lorica"
 description = "SLA monitoring and load testing for Lorica reverse proxy"
 
 [dependencies]
-lorica-config = { version = "1.0.0", path = "../lorica-config" }
+lorica-config = { version = "1.1.0", path = "../lorica-config" }
 lorica-notify = { version = "0.1.0", path = "../lorica-notify" }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -34,6 +34,7 @@ pub struct UpdateSettingsRequest {
     pub sla_purge_schedule: Option<String>,
     pub custom_security_presets: Option<Vec<lorica_config::models::SecurityHeaderPreset>>,
     pub trusted_proxies: Option<Vec<String>>,
+    pub waf_whitelist_ips: Option<Vec<String>>,
 }
 
 /// PUT /api/v1/settings
@@ -162,6 +163,22 @@ pub async fn update_settings(
             }
         }
         settings.trusted_proxies = proxies.clone();
+    }
+    if let Some(ref ips) = body.waf_whitelist_ips {
+        for entry in ips {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.parse::<std::net::IpAddr>().is_err()
+                && trimmed.parse::<ipnet::IpNet>().is_err()
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "invalid WAF whitelist CIDR or IP: {trimmed}"
+                )));
+            }
+        }
+        settings.waf_whitelist_ips = ips.clone();
     }
 
     store.update_global_settings(&settings)?;

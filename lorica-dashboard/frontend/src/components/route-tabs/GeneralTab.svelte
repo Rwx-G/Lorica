@@ -196,6 +196,14 @@
     </label>
     {#if isImported('compression_enabled')}<span class="imported-badge">imported</span>{/if}
   </div>
+
+  <div class="form-group" class:modified={isModified('sticky_session')}>
+    <label class="checkbox-item">
+      <input type="checkbox" bind:checked={form.sticky_session} />
+      <span>Sticky sessions</span>
+    </label>
+    <span class="hint">Routes returning clients to the same backend via a cookie (LORICA_SRV). Useful for stateful applications.</span>
+  </div>
 </div>
 
 <style>

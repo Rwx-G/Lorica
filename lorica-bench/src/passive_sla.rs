@@ -302,11 +302,14 @@ impl SlaCollector {
             loop {
                 interval.tick().await;
 
-                // Flush buckets while holding the store lock, then release it
+                // Flush buckets while holding the store lock, then release it.
+                // Always check thresholds even if this process flushed nothing:
+                // in worker mode, workers flush SLA data to the DB and the
+                // supervisor must still check thresholds to dispatch alerts.
                 let (flushed, alerts) = {
                     let store_guard = store.lock().await;
                     let flushed = collector.flush(&store_guard);
-                    let alerts = if flushed > 0 {
+                    let alerts = if dispatcher.is_some() {
                         collector.check_thresholds(&store_guard)
                     } else {
                         Vec::new()
@@ -585,6 +588,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -674,6 +678,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -778,6 +783,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -867,6 +873,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -939,6 +946,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

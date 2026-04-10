@@ -167,6 +167,8 @@ pub struct ProxyConfig {
     /// client IP matches one of these will X-Forwarded-For be used for the
     /// real client IP. Empty = trust no XFF (secure default).
     pub trusted_proxies: Vec<ipnet::IpNet>,
+    /// Parsed CIDR ranges of IPs that bypass WAF, rate limiting, and auto-ban.
+    pub waf_whitelist: Vec<ipnet::IpNet>,
 }
 
 /// Global settings extracted from the config store for ProxyConfig construction.
@@ -178,6 +180,7 @@ pub struct ProxyConfigGlobals {
     pub waf_ban_threshold: u32,
     pub waf_ban_duration_s: u32,
     pub trusted_proxy_cidrs: Vec<String>,
+    pub waf_whitelist_cidrs: Vec<String>,
 }
 
 impl ProxyConfig {
@@ -200,6 +203,7 @@ impl ProxyConfig {
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs,
+            waf_whitelist_cidrs,
         } = globals;
         let backend_map: HashMap<String, Backend> = backends
             .into_iter()
@@ -354,6 +358,25 @@ impl ProxyConfig {
             })
             .collect();
 
+        // Parse WAF whitelist CIDRs (same logic as trusted proxies)
+        let waf_whitelist: Vec<ipnet::IpNet> = waf_whitelist_cidrs
+            .iter()
+            .filter_map(|s| {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                if let Ok(net) = trimmed.parse::<ipnet::IpNet>() {
+                    Some(net)
+                } else if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+                    Some(ipnet::IpNet::from(ip))
+                } else {
+                    warn!(entry = %trimmed, "ignoring invalid waf_whitelist_ips entry");
+                    None
+                }
+            })
+            .collect();
+
         ProxyConfig {
             routes_by_host,
             wildcard_routes,
@@ -363,6 +386,7 @@ impl ProxyConfig {
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxies,
+            waf_whitelist,
         }
     }
 
@@ -467,6 +491,110 @@ impl EwmaTracker {
     }
 }
 
+/// Per-backend circuit breaker.
+///
+/// Tracks consecutive failures per backend. When the failure count reaches the
+/// threshold, the circuit opens and all traffic is redirected to other backends
+/// for a cooldown period. After the cooldown, one probe request is allowed
+/// through (half-open). If it succeeds the circuit closes; if it fails the
+/// circuit re-opens.
+#[derive(Debug)]
+pub struct CircuitBreaker {
+    /// Per-backend state: (consecutive_failures, state, last_state_change)
+    states: dashmap::DashMap<String, CircuitBreakerState>,
+    /// Number of consecutive errors before opening the circuit.
+    threshold: u32,
+    /// How long the circuit stays open before moving to half-open (seconds).
+    cooldown_s: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CircuitBreakerState {
+    failures: u32,
+    state: CircuitStatus,
+    changed_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CircuitStatus {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+impl CircuitBreaker {
+    pub fn new(threshold: u32, cooldown_s: u64) -> Self {
+        Self {
+            states: dashmap::DashMap::new(),
+            threshold,
+            cooldown_s,
+        }
+    }
+
+    /// Check if a backend is available (not in Open state).
+    /// Open circuits that have exceeded the cooldown move to HalfOpen.
+    pub fn is_available(&self, addr: &str) -> bool {
+        let mut entry = match self.states.get_mut(addr) {
+            Some(e) => e,
+            None => return true, // no state = closed = available
+        };
+        match entry.state {
+            CircuitStatus::Closed | CircuitStatus::HalfOpen => true,
+            CircuitStatus::Open => {
+                if entry.changed_at.elapsed() >= Duration::from_secs(self.cooldown_s) {
+                    entry.state = CircuitStatus::HalfOpen;
+                    entry.changed_at = Instant::now();
+                    true // allow one probe request
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Record a successful response. Resets the failure count and closes the circuit.
+    pub fn record_success(&self, addr: &str) {
+        if let Some(mut entry) = self.states.get_mut(addr) {
+            if entry.failures > 0 || entry.state != CircuitStatus::Closed {
+                entry.failures = 0;
+                entry.state = CircuitStatus::Closed;
+                entry.changed_at = Instant::now();
+            }
+        }
+    }
+
+    /// Record a failure. Increments the counter and opens the circuit if threshold is reached.
+    pub fn record_failure(&self, addr: &str) {
+        let mut entry = self.states.entry(addr.to_string()).or_insert(CircuitBreakerState {
+            failures: 0,
+            state: CircuitStatus::Closed,
+            changed_at: Instant::now(),
+        });
+        entry.failures += 1;
+        if entry.failures >= self.threshold && entry.state != CircuitStatus::Open {
+            entry.state = CircuitStatus::Open;
+            entry.changed_at = Instant::now();
+            tracing::warn!(
+                backend = %addr,
+                failures = entry.failures,
+                cooldown_s = self.cooldown_s,
+                "circuit breaker opened - backend removed from rotation"
+            );
+        }
+    }
+}
+
+/// Compute the upstream keepalive pool size based on the number of backends.
+/// - <= 15 backends: 128 (Pingora default)
+/// - 16+ backends: 8 connections per backend, capped at 1024
+pub fn compute_pool_size(backend_count: usize) -> usize {
+    if backend_count <= 15 {
+        128
+    } else {
+        (backend_count * 8).min(1024)
+    }
+}
+
 /// Check whether an IP address matches a pattern (exact or CIDR prefix).
 fn ip_matches(ip: &str, pattern: &str) -> bool {
     if pattern.contains('/') {
@@ -527,6 +655,8 @@ pub struct RequestCtx {
     pub waf_detected: bool,
     /// Snapshot of the matched route for use in later pipeline stages.
     pub route_snapshot: Option<Route>,
+    /// Unique request identifier for tracing (propagated to backend via X-Request-Id).
+    pub request_id: String,
     /// Whether access logging is enabled for this route.
     pub access_log_enabled: bool,
     /// Client IP address (from socket or X-Forwarded-For).
@@ -555,6 +685,8 @@ pub struct RequestCtx {
     pub body_bytes_received: u64,
     /// Buffered request body for WAF body scanning (only when WAF is enabled).
     pub waf_body_buffer: Option<Vec<u8>>,
+    /// Backend ID for sticky session cookie injection (set in upstream_peer).
+    pub sticky_backend_id: Option<String>,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -601,6 +733,8 @@ pub struct LoricaProxy {
     pub alert_sender: Option<lorica_notify::AlertSender>,
     /// Persistent access log store (SQLite).
     pub log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    /// Per-backend circuit breaker (opens after consecutive failures).
+    pub circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl LoricaProxy {
@@ -631,6 +765,7 @@ impl LoricaProxy {
             acme_challenge_store: None,
             alert_sender: None,
             log_store: None,
+            circuit_breaker: Arc::new(CircuitBreaker::new(5, 10)),
         }
     }
 
@@ -643,6 +778,32 @@ impl LoricaProxy {
 /// Extract the request host from the Host header, falling back to URI authority.
 /// HTTP/2 uses :authority pseudo-header which pingora maps to the URI authority,
 /// while the Host header may be absent.
+/// Extract the LORICA_SRV backend ID from a Cookie header value.
+fn extract_sticky_backend(cookie_header: &str) -> Option<&str> {
+    cookie_header.split(';').find_map(|c| {
+        let c = c.trim();
+        c.strip_prefix("LORICA_SRV=")
+    })
+}
+
+/// Generate a compact hex request ID (16 bytes = 32 hex chars).
+fn generate_request_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let rand: u64 = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        ts.hash(&mut h);
+        std::thread::current().id().hash(&mut h);
+        h.finish()
+    };
+    format!("{ts:016x}{rand:016x}")
+}
+
 fn extract_host(req: &lorica_http::RequestHeader) -> &str {
     req.headers
         .get("host")
@@ -666,6 +827,7 @@ impl ProxyHttp for LoricaProxy {
             waf_detected: false,
             route_snapshot: None,
             path_rewrite_regex: None,
+            request_id: generate_request_id(),
             access_log_enabled: true,
             client_ip: None,
             is_xff: false,
@@ -678,6 +840,7 @@ impl ProxyHttp for LoricaProxy {
             block_reason: None,
             body_bytes_received: 0,
             waf_body_buffer: None,
+            sticky_backend_id: None,
         }
     }
 
@@ -767,8 +930,19 @@ impl ProxyHttp for LoricaProxy {
             .unwrap_or("")
             .to_string();
 
-        // Ban list check (before any other processing for banned IPs)
-        if let Some(ref ip) = check_ip {
+        // Global WAF whitelist: IPs in this list bypass ban checks, IP blocklist,
+        // rate limiting, and WAF evaluation entirely.
+        let is_whitelisted = check_ip.as_ref().is_some_and(|ip| {
+            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                config.waf_whitelist.iter().any(|net| net.contains(&addr))
+            } else {
+                false
+            }
+        });
+
+        // Ban list + IP blocklist checks (skipped for whitelisted IPs)
+        if !is_whitelisted {
+          if let Some(ref ip) = check_ip {
             let banned = if let Some(entry) = self.ban_list.get(ip) {
                 let (banned_at, duration_s) = entry.value();
                 if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
@@ -790,9 +964,7 @@ impl ProxyHttp for LoricaProxy {
                     .await?;
                 return Ok(true);
             }
-        }
 
-        if let Some(ref ip) = check_ip {
             if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
                 warn!(
                     ip = %ip,
@@ -818,7 +990,7 @@ impl ProxyHttp for LoricaProxy {
                         matched_value: ip.to_string(),
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         client_ip: ip.to_string(),
-                        route_hostname: req.headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("-").to_string(),
+                        route_hostname: { let h = extract_host(req); if h.is_empty() { "-" } else { h } }.to_string(),
                         action: "blocked".to_string(),
                     };
                     let _ = store.insert_waf_event(&ev);
@@ -830,6 +1002,7 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(true);
             }
         }
+        } // end if !is_whitelisted (ban + blocklist)
 
         let host_raw = extract_host(req);
         let host = host_raw.split(':').next().unwrap_or(host_raw);
@@ -1057,8 +1230,9 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Per-route rate limiting
-        if let Some(rps) = entry.route.rate_limit_rps {
+        // Per-route rate limiting (skipped for whitelisted IPs)
+        if !is_whitelisted {
+          if let Some(rps) = entry.route.rate_limit_rps {
             if let Some(ref ip) = check_ip {
                 let key = format!("{}:{}", entry.route.id, ip);
                 self.rate_limiter.observe(&key, 1);
@@ -1135,9 +1309,10 @@ impl ProxyHttp for LoricaProxy {
                 }
             }
         }
+        } // end if !is_whitelisted (rate limiting)
 
-        // Skip WAF evaluation entirely if not enabled (zero overhead)
-        if !entry.route.waf_enabled {
+        // Skip WAF evaluation entirely if not enabled or IP is whitelisted (zero overhead)
+        if is_whitelisted || !entry.route.waf_enabled {
             return Ok(false);
         }
 
@@ -1575,7 +1750,9 @@ impl ProxyHttp for LoricaProxy {
         let healthy_backends: Vec<&Backend> = backends_source
             .iter()
             .filter(|b| {
-                b.health_status != HealthStatus::Down && b.lifecycle_state == LifecycleState::Normal
+                b.health_status != HealthStatus::Down
+                    && b.lifecycle_state == LifecycleState::Normal
+                    && self.circuit_breaker.is_available(&b.address)
             })
             .collect();
 
@@ -1589,9 +1766,29 @@ impl ProxyHttp for LoricaProxy {
             );
         }
 
+        // Sticky session: if enabled, try to route to the backend from the cookie
+        let sticky_backend_idx = if entry.route.sticky_session {
+            session
+                .req_header()
+                .headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .and_then(extract_sticky_backend)
+                .and_then(|backend_id| {
+                    healthy_backends
+                        .iter()
+                        .position(|b| b.id == backend_id)
+                })
+        } else {
+            None
+        };
+
         // Backend selection based on load balancing algorithm
         use lorica_config::models::LoadBalancing;
-        let idx = match entry.route.load_balancing {
+        let idx = if let Some(sticky_idx) = sticky_backend_idx {
+            sticky_idx
+        } else {
+        match entry.route.load_balancing {
             LoadBalancing::PeakEwma => self.ewma_tracker.select_best(&healthy_backends),
             LoadBalancing::Random => {
                 use std::collections::hash_map::DefaultHasher;
@@ -1608,8 +1805,14 @@ impl ProxyHttp for LoricaProxy {
                     .collect();
                 entry.wrr_state.next(&bw)
             }
+        }
         };
         let backend = healthy_backends[idx];
+
+        // Set sticky session cookie if enabled and no existing cookie matched
+        if entry.route.sticky_session && sticky_backend_idx.is_none() {
+            ctx.sticky_backend_id = Some(backend.id.clone());
+        }
 
         ctx.backend_addr = Some(backend.address.clone());
         self.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -1646,6 +1849,18 @@ impl ProxyHttp for LoricaProxy {
         peer.options.read_timeout = Some(Duration::from_secs(entry.route.read_timeout_s as u64));
         peer.options.write_timeout = Some(Duration::from_secs(entry.route.send_timeout_s as u64));
 
+        // Drop idle pooled connections after 60s to avoid stale/half-closed TCP
+        peer.options.idle_timeout = Some(Duration::from_secs(60));
+
+        // TCP keepalive: detect dead connections in the pool before reuse
+        peer.options.tcp_keepalive = Some(lorica_core::protocols::TcpKeepalive {
+            idle: Duration::from_secs(15),
+            interval: Duration::from_secs(5),
+            count: 3,
+            #[cfg(target_os = "linux")]
+            user_timeout: Duration::from_secs(0),
+        });
+
         Ok(peer)
     }
 
@@ -1662,6 +1877,9 @@ impl ProxyHttp for LoricaProxy {
             Some(ref r) => r,
             None => return Ok(()),
         };
+
+        // Inject X-Request-Id for end-to-end tracing
+        let _ = upstream_request.insert_header("X-Request-Id", &ctx.request_id);
 
         // Path rewriting: strip prefix then add prefix
         let original_path = upstream_request.uri.path().to_string();
@@ -1885,6 +2103,12 @@ impl ProxyHttp for LoricaProxy {
             let _ = upstream_response.insert_header(name, value);
         }
 
+        // Inject sticky session cookie
+        if let Some(ref backend_id) = ctx.sticky_backend_id {
+            let cookie = format!("LORICA_SRV={backend_id}; Path=/; HttpOnly; SameSite=Lax");
+            let _ = upstream_response.append_header("Set-Cookie", &cookie);
+        }
+
         Ok(())
     }
 
@@ -1934,7 +2158,16 @@ impl ProxyHttp for LoricaProxy {
         } else if ctx.waf_detected {
             Some("WAF detected".to_string())
         } else {
-            e.map(|err| err.to_string())
+            e.and_then(|err| {
+                let msg = err.to_string();
+                // Client disconnects (H2 stream reset, connection close) are not
+                // server errors. Status 0 already signals the incomplete response.
+                if msg.contains("not a result of an error") || msg.contains("Client closed") {
+                    None
+                } else {
+                    Some(msg)
+                }
+            })
         };
         let latency_ms = elapsed.as_millis() as u64;
 
@@ -1970,6 +2203,13 @@ impl ProxyHttp for LoricaProxy {
         if let Some(ref addr) = ctx.backend_addr {
             self.active_connections.fetch_sub(1, Ordering::Relaxed);
             self.backend_connections.decrement(addr);
+
+            // Update circuit breaker: 5xx or connection error = failure, else success
+            if e.is_some() || status >= 500 {
+                self.circuit_breaker.record_failure(addr);
+            } else {
+                self.circuit_breaker.record_success(addr);
+            }
         }
 
         // Push to the in-memory log buffer for dashboard viewing (if enabled)
@@ -1988,6 +2228,7 @@ impl ProxyHttp for LoricaProxy {
                 is_xff: ctx.is_xff,
                 xff_proxy_ip: ctx.xff_proxy_ip.as_deref().unwrap_or("").to_string(),
                 source: ctx.source.clone(),
+                request_id: ctx.request_id.clone(),
             };
             if let Some(ref store) = self.log_store {
                 if let Err(e) = store.insert(&entry) {
@@ -2007,11 +2248,17 @@ impl ProxyHttp for LoricaProxy {
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
 
-        // Record SLA metrics for passive monitoring
-        // Exclude WebSocket upgrades (status 101) as their connection duration
-        // is not representative of HTTP request latency
+        // Record SLA metrics for passive monitoring.
+        // Exclude WebSocket upgrades (status 101), proxy-level rejections
+        // (WAF blocks, bans, rate limits, return_status), and connection
+        // errors (downstream/upstream resets, timeouts) as their latency
+        // is not representative of backend performance.
         if let Some(ref route_id) = ctx.route_id {
-            if status != 101 {
+            if status != 101
+                && ctx.block_reason.is_none()
+                && !ctx.waf_blocked
+                && e.is_none()
+            {
                 self.sla_collector.record(route_id, status, latency_ms);
             }
         }
@@ -2093,6 +2340,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: now,
             updated_at: now,
         }
@@ -3116,5 +3364,36 @@ mod tests {
         let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
         // Only the valid CIDR and the valid bare IP should be parsed
         assert_eq!(config.trusted_proxies.len(), 2);
+    }
+
+    // ---- Sticky sessions ----
+
+    #[test]
+    fn test_extract_sticky_backend_single_cookie() {
+        assert_eq!(
+            extract_sticky_backend("LORICA_SRV=abc-123"),
+            Some("abc-123")
+        );
+    }
+
+    #[test]
+    fn test_extract_sticky_backend_multiple_cookies() {
+        assert_eq!(
+            extract_sticky_backend("session=xyz; LORICA_SRV=backend-42; lang=en"),
+            Some("backend-42")
+        );
+    }
+
+    #[test]
+    fn test_extract_sticky_backend_absent() {
+        assert_eq!(
+            extract_sticky_backend("session=xyz; lang=en"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_sticky_backend_empty() {
+        assert_eq!(extract_sticky_backend(""), None);
     }
 }

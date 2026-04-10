@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Author: Rwx-G
 
+## Unreleased
+
+## [1.1.0] - 2026-04-10
+
+### Added
+
+- Global WAF whitelist IPs in Settings: IPs or CIDRs that bypass WAF evaluation, rate limiting, IP blocklist, and auto-ban entirely. Prevents operators from being auto-banned by false positives (e.g. CMS body content triggering path traversal rules)
+- CLI `lorica unban <IP> --password <PASSWORD>` command for emergency IP removal when locked out of the dashboard
+- Access logs: configurable entry limit (100/500/1K/5K/10K) and "X of Y entries" total count display
+- 12 new WAF rules (49 total): SQLi auth bypass, info schema recon, encoding evasion, NoSQL injection (MongoDB), XSS eval/base64, backup file access, PowerShell/Windows commands, HTTP request smuggling, scanner detection, PHP/Java deserialization, HTTP method abuse
+- X-Request-Id header: unique request identifier generated per request, propagated to backends and logged in access logs for end-to-end tracing
+- Circuit breaker: per-backend failure tracking that removes backends from rotation after 5 consecutive errors (5xx or connection failures), with 10s cooldown and half-open probe before recovery
+- Sticky sessions: cookie-based session affinity per route. When enabled, a `LORICA_SRV` cookie containing the backend ID is set on first request. Subsequent requests are routed to the same backend. Falls back to normal load balancing if the backend is down
+
+### Fixed
+
+- Duplicate access log entries in worker mode: workers now persist logs directly, supervisor only pushes to in-memory buffer for WebSocket streaming
+- WAF body scanning false positives: path traversal (930xxx) and protocol violation (920xxx) rules are no longer applied to request bodies, preventing false positives on CMS content containing `..\ ` or similar text
+- SLA metrics polluted by proxy-level rejections and connection errors: WAF blocks, bans, rate limits, return_status responses, and upstream/downstream errors (resets, timeouts) are excluded from SLA latency percentiles
+- SLA breach notifications not firing in worker mode: supervisor now checks thresholds on every flush cycle regardless of local data, reading SLA metrics flushed by workers
+- Access logs: disabling auto-refresh/live toggle did not disconnect WebSocket, choice not persisted across page reloads
+- IP blocklist WAF events showing `-` as route when request has no Host header: now falls back to URI authority (IP:port)
+- Security page: missing category labels (SSRF, XXE, SSTI, Log4Shell, IP Blocklist, Prototype Pollution) and event filter options
+- Client H2 disconnects ("not a result of an error") no longer shown as errors in access logs - status 0 is sufficient
+- TCP keepalive on upstream connections (idle 15s, interval 5s, 3 probes) to detect stale/half-closed pooled connections before reuse
+- Upstream idle connection timeout (60s) evicts stale connections from the pool
+- Upstream keepalive pool auto-sizing at startup: 128 for <= 15 backends, scales to 8 per backend up to 1024 max
+
 ## [1.0.0] - 2026-04-09
 
 ### Added
@@ -157,4 +185,5 @@ Author: Rwx-G
 
 - Windows support removed from forked Pingora crates (Linux-only)
 
+[1.1.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.0.0

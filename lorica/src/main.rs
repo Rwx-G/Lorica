@@ -114,6 +114,19 @@ enum Commands {
         #[arg(long)]
         new_key_file: String,
     },
+    /// Remove an IP from the auto-ban list
+    Unban {
+        /// IP address to unban
+        ip: String,
+
+        /// Admin username
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// Admin password
+        #[arg(long)]
+        password: String,
+    },
 }
 
 fn init_logging(log_level: &str) {
@@ -197,6 +210,53 @@ fn main() {
             );
             println!("  mv {} {}.backup", key_path.display(), key_path.display());
             println!("  mv {} {}", new_key_path.display(), key_path.display());
+        }
+        Some(Commands::Unban { ip, user, password }) => {
+            let port = cli.management_port;
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(async {
+                let client = reqwest::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .cookie_store(true)
+                    .build()
+                    .expect("HTTP client");
+
+                // Login
+                let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
+                let login_res = client
+                    .post(&login_url)
+                    .json(&serde_json::json!({ "username": user, "password": password }))
+                    .send()
+                    .await;
+                match login_res {
+                    Ok(r) if r.status().is_success() => {}
+                    Ok(r) => {
+                        eprintln!("Login failed ({}). Check credentials.", r.status());
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Cannot connect to management API on port {port}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+
+                // Unban
+                let unban_url = format!("https://127.0.0.1:{port}/api/v1/bans/{ip}");
+                match client.delete(&unban_url).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        println!("IP {ip} unbanned successfully.");
+                    }
+                    Ok(r) => {
+                        let body = r.text().await.unwrap_or_default();
+                        eprintln!("Unban failed: {body}");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Unban request failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            });
         }
         None => {
             init_logging(&cli.log_level);
@@ -353,13 +413,11 @@ fn run_supervisor(cli: Cli) {
             let _ = std::fs::set_permissions(&log_sock_path, std::fs::Permissions::from_mode(0o660));
         }
         let log_sink = Arc::clone(&log_buffer);
-        let log_store_sink = log_store.clone();
         tokio::spawn(async move {
             loop {
                 match log_listener.accept().await {
                     Ok((stream, _)) => {
                         let sink = Arc::clone(&log_sink);
-                        let store_sink = log_store_sink.clone();
                         tokio::spawn(async move {
                             let mut reader = tokio::io::BufReader::new(stream);
                             let mut line = String::new();
@@ -369,11 +427,9 @@ fn run_supervisor(cli: Cli) {
                                     Ok(0) => break, // EOF - worker disconnected
                                     Ok(_) => {
                                         if let Ok(entry) = serde_json::from_str::<lorica_api::logs::LogEntry>(&line) {
-                                            if let Some(ref s) = store_sink {
-                                                if let Err(e) = s.insert(&entry) {
-                                                    tracing::warn!(error = %e, "failed to persist access log entry");
-                                                }
-                                            }
+                                            // Workers persist access logs directly via their own
+                                            // LogStore, so we only push to the in-memory buffer
+                                            // here (for WebSocket streaming to the dashboard).
                                             sink.push(entry).await;
                                         }
                                     }
@@ -1517,8 +1573,14 @@ fn run_worker(
         lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone()),
     );
 
+    let pool_size = {
+        let backend_count = store.blocking_lock().list_backends().map(|b| b.len()).unwrap_or(0);
+        lorica::proxy_wiring::compute_pool_size(backend_count)
+    };
+    info!(pool_size, "upstream keepalive pool size");
     let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
         upstream_crl_file: upstream_crl_file.map(|s| s.to_string()),
+        upstream_keepalive_pool_size: pool_size,
         ..Default::default()
     });
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
@@ -1749,8 +1811,15 @@ fn run_single_process(cli: Cli) {
         let proxy_cache_misses = Arc::clone(&lorica_proxy.cache_misses);
         let proxy_ban_list = Arc::clone(&lorica_proxy.ban_list);
         let proxy_ewma_scores = lorica_proxy.ewma_tracker.scores_ref();
+        let pool_size = {
+            let s = store.lock().await;
+            let backend_count = s.list_backends().map(|b| b.len()).unwrap_or(0);
+            lorica::proxy_wiring::compute_pool_size(backend_count)
+        };
+        info!(pool_size, "upstream keepalive pool size");
         let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
             upstream_crl_file: cli.upstream_crl_file.clone(),
+            upstream_keepalive_pool_size: pool_size,
             ..Default::default()
         });
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);

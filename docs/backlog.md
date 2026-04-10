@@ -1,37 +1,27 @@
 # Technical Backlog
 
-Items identified during QA traceability audit (2026-04-01) and acceptance testing (2026-04-05/06).
-
 ## High Priority
 
-| Source | Description | References |
-|--------|-------------|------------|
-| ~~Security audit~~ | ~~**XFF Trust without validation**: resolved - trusted_proxies CIDR list added to global settings. XFF only trusted when direct client IP matches a configured proxy range. Empty = trust no XFF (secure default).~~ | ~~`proxy_wiring.rs`~~ |
+| # | Feature | Complexity | Type | Notes |
+|---|---------|-----------|------|-------|
+| 1 | Forward Auth (external authentication) | Medium | Table-stakes | Sub-request to auth service (Authelia, Authentik, Keycloak) before proxying. Standard SSO/MFA mechanism. Traefik forwardAuth, Nginx auth_request. |
+| 3 | Custom Error Pages + Maintenance Mode | Low | Table-stakes | Change route `enabled: bool` to enum `active/maintenance/disabled`. Maintenance returns 503 with configurable HTML page. Custom error pages for 502/503/504/429. |
 
 ## Medium Priority
 
-| Source | Description | References |
-|--------|-------------|------------|
-| *(empty - all medium items resolved)* | | |
+| # | Feature | Complexity | Type | Notes |
+|---|---------|-----------|------|-------|
+| 4 | Basic Auth per Route | Low | Table-stakes | HTTP Basic Auth on specific routes. Useful for staging, internal tools. |
+| 5 | Canary / Traffic Split | Medium | Differentiator | Route X% traffic to backend group A, Y% to group B. Zero-risk deployments. |
+| 6 | Header-Based Routing | Low-Medium | Differentiator | Route by HTTP headers (X-Version, X-Tenant). A/B testing, multi-tenant. |
+| 7 | Retry Policy (enriched) | Low-Medium | Table-stakes | Extend retry_attempts with retry_on (status codes), retry_methods, retry_backoff_ms. |
 
 ## Low Priority
 
-| Source | Description | References |
-|--------|-------------|------------|
-| *(empty - all low items resolved)* | | |
-
-## Resolved
-
-| Item | Resolution |
-|------|------------|
-| `#[allow(dead_code)]` on RouteEntry | Already removed by prior refactor |
-| `request_counts`/`waf_counts` DashMaps | Accepted: bounded by config (routes * status codes), low risk |
-| Rule 920100 unreachable | Fixed: added `content-length` and `transfer-encoding` to WAF header inspection list |
-| Mutex poisoning | Migrated to `parking_lot::Mutex/RwLock` across all crates |
-| WAF config propagation | Already functional via ConfigReload command channel |
-| WAF auto-ban per-worker | Fixed: global counter via supervisor + BanIp command broadcast |
-| WAF events in detection mode | Working via waf.sock forwarding + supervisor persistence |
-| Encryption key rotation | Implemented: `lorica rotate-key --new-key-file` CLI |
-| Export secret leak | Fixed: SMTP passwords and private keys redacted in exports |
-| Memory leak waf_violations | Fixed: entries removed on ban |
-| SQLite busy_timeout | Fixed: PRAGMA busy_timeout=5000 on access-log.db |
+| # | Feature | Complexity | Type | Notes |
+|---|---------|-----------|------|-------|
+| 8 | Structured JSON Logs (file/syslog) | Medium | Differentiator | Configurable log format, write to file/stdout/syslog. ELK/Loki/Datadog integration. |
+| 9 | Request Mirroring | Medium | Differentiator | Duplicate traffic to secondary backend (fire-and-forget). Shadow testing. |
+| 10 | mTLS Client Verification | Medium | Differentiator | Require client TLS certificate for specific routes. Zero-trust, B2B. |
+| 11 | Response Body Rewriting | Medium-High | Table-stakes | Replace strings in response body (Nginx sub_filter). URL rewriting for legacy apps. |
+| 12 | TCP/L4 Proxying | High | Differentiator | Stream proxy for databases, MQTT, SSH. SNI-based routing without TLS termination. |

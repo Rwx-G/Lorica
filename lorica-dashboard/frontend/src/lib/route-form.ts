@@ -60,6 +60,7 @@ export interface RouteFormState {
   auto_ban_duration_s: number;
   path_rules: PathRuleFormState[];
   return_status: string;
+  sticky_session: boolean;
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -108,6 +109,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   auto_ban_duration_s: 3600,
   path_rules: [],
   return_status: '',
+  sticky_session: false,
 };
 
 // Tab field mappings for dot indicators
@@ -115,7 +117,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   general: [
     'hostname', 'path_prefix', 'force_https', 'redirect_hostname', 'redirect_to',
     'hostname_aliases', 'websocket_enabled', 'access_log_enabled',
-    'compression_enabled', 'waf_enabled', 'return_status',
+    'compression_enabled', 'waf_enabled', 'return_status', 'sticky_session',
   ],
   timeouts: [
     'connect_timeout_s', 'read_timeout_s', 'send_timeout_s',
@@ -226,6 +228,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
       return_status: r.return_status != null ? String(r.return_status) : '',
     })),
     return_status: route.return_status != null ? String(route.return_status) : '',
+    sticky_session: route.sticky_session ?? false,
   };
 }
 
@@ -290,6 +293,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     auto_ban_duration_s: form.auto_ban_duration_s,
     path_rules: pathRuleFormToRequest(form.path_rules) ?? (isUpdate ? [] : undefined),
     return_status: form.return_status ? Number(form.return_status) : empty(0),
+    sticky_session: form.sticky_session,
   };
 }
 

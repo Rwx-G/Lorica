@@ -962,6 +962,7 @@ async fn test_logs_endpoint_with_entries() {
                 is_xff: false,
                 xff_proxy_ip: String::new(),
                 source: String::new(),
+                request_id: String::new(),
             })
             .await;
     }
@@ -1007,6 +1008,7 @@ async fn test_logs_endpoint_filtering() {
             is_xff: false,
                 xff_proxy_ip: String::new(),
                 source: String::new(),
+                request_id: String::new(),
         })
         .await;
     state
@@ -1025,6 +1027,7 @@ async fn test_logs_endpoint_filtering() {
             is_xff: false,
                 xff_proxy_ip: String::new(),
                 source: String::new(),
+                request_id: String::new(),
         })
         .await;
 
@@ -1084,6 +1087,7 @@ async fn test_clear_logs_endpoint() {
             is_xff: false,
                 xff_proxy_ip: String::new(),
                 source: String::new(),
+                request_id: String::new(),
         })
         .await;
 
@@ -1139,6 +1143,7 @@ async fn test_logs_endpoint_status_range() {
                 is_xff: false,
                 xff_proxy_ip: String::new(),
                 source: String::new(),
+                request_id: String::new(),
             })
             .await;
     }
@@ -1182,6 +1187,7 @@ async fn test_logs_endpoint_time_range() {
             is_xff: false,
                 xff_proxy_ip: String::new(),
                 source: String::new(),
+                request_id: String::new(),
         })
         .await;
     state
@@ -1200,6 +1206,7 @@ async fn test_logs_endpoint_time_range() {
             is_xff: false,
                 xff_proxy_ip: String::new(),
                 source: String::new(),
+                request_id: String::new(),
         })
         .await;
 
@@ -1244,6 +1251,7 @@ async fn test_logs_endpoint_limit_and_after_id() {
                 is_xff: false,
                 xff_proxy_ip: String::new(),
                 source: String::new(),
+                request_id: String::new(),
             })
             .await;
     }

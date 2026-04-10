@@ -16,7 +16,7 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, max_global_connections: 0, flood_threshold_rps: 0, waf_ban_threshold: 5, waf_ban_duration_s: 3600, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month', trusted_proxies: '' });
+  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, max_global_connections: 0, flood_threshold_rps: 0, waf_ban_threshold: 5, waf_ban_duration_s: 3600, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month', trusted_proxies: '', waf_whitelist_ips: '' });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -138,7 +138,7 @@
       error = settingsRes.error.message;
     } else if (settingsRes.data) {
       settings = settingsRes.data;
-      settingsForm = { ...settingsRes.data, trusted_proxies: (settingsRes.data.trusted_proxies ?? []).join('\n') };
+      settingsForm = { ...settingsRes.data, trusted_proxies: (settingsRes.data.trusted_proxies ?? []).join('\n'), waf_whitelist_ips: (settingsRes.data.waf_whitelist_ips ?? []).join('\n') };
       customPresets = settingsRes.data.custom_security_presets ?? [];
     }
     if (notifRes.data) {
@@ -184,10 +184,14 @@
     settingsSaving = true;
     settingsMsg = '';
     settingsError = '';
-    // Convert trusted_proxies textarea (newline-separated) to string array
+    // Convert textarea fields (newline-separated) to string arrays
     const payload = {
       ...settingsForm,
       trusted_proxies: settingsForm.trusted_proxies
+        .split('\n')
+        .map((s: string) => s.trim())
+        .filter((s: string) => s.length > 0),
+      waf_whitelist_ips: settingsForm.waf_whitelist_ips
         .split('\n')
         .map((s: string) => s.trim())
         .filter((s: string) => s.length > 0),
@@ -197,7 +201,7 @@
       settingsError = res.error.message;
     } else if (res.data) {
       settings = res.data;
-      settingsForm = { ...res.data, trusted_proxies: (res.data.trusted_proxies ?? []).join('\n') };
+      settingsForm = { ...res.data, trusted_proxies: (res.data.trusted_proxies ?? []).join('\n'), waf_whitelist_ips: (res.data.waf_whitelist_ips ?? []).join('\n') };
       settingsMsg = 'Settings saved.';
       setTimeout(() => settingsMsg = '', 3000);
     }
@@ -467,6 +471,11 @@
           <label for="trusted-proxies">Trusted Proxies (CIDR)</label>
           <textarea id="trusted-proxies" rows="4" bind:value={settingsForm.trusted_proxies} placeholder="192.168.0.0/16&#10;10.0.0.0/8&#10;172.16.0.0/12"></textarea>
           <span class="hint">One CIDR range or IP per line. X-Forwarded-For is only trusted from these addresses. Empty = trust no XFF (direct client IP always used).</span>
+        </div>
+        <div class="settings-form-row">
+          <label for="waf-whitelist">WAF Whitelist IPs</label>
+          <textarea id="waf-whitelist" rows="3" bind:value={settingsForm.waf_whitelist_ips} placeholder="203.0.113.50&#10;10.0.0.0/8"></textarea>
+          <span class="hint">One IP or CIDR per line. These IPs bypass WAF, rate limiting, IP blocklist, and auto-ban entirely. Use for admin/operator IPs.</span>
         </div>
         <div class="settings-form-row">
           <label for="s-log-retention">Access Log Retention (entries)</label>

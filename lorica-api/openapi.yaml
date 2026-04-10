@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Lorica API
   description: REST API for Lorica reverse proxy management
-  version: 1.0.0
+  version: 1.1.0
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -221,6 +221,12 @@ paths:
                     type: string
                   description: CIDR ranges or IPs of trusted reverse proxies
                   example: ["192.168.0.0/16", "10.0.0.0/8"]
+                waf_whitelist_ips:
+                  type: array
+                  items:
+                    type: string
+                  description: IPs or CIDRs that bypass WAF, rate limiting, IP blocklist, and auto-ban
+                  example: ["203.0.113.50", "10.0.0.0/8"]
       responses:
         "200":
           description: Settings updated

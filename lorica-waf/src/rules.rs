@@ -84,6 +84,19 @@ pub struct WafRule {
     pub severity: u8,
 }
 
+impl WafRule {
+    /// Whether this rule should be evaluated during body scanning.
+    /// Path-specific rules (path traversal, sensitive file access, protocol
+    /// violations) are skipped for body content to avoid false positives
+    /// on CMS articles, JSON payloads, and form submissions.
+    pub fn applies_to_body(&self) -> bool {
+        !matches!(
+            self.category,
+            RuleCategory::PathTraversal | RuleCategory::ProtocolViolation
+        )
+    }
+}
+
 impl std::fmt::Debug for WafRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WafRule")
@@ -422,6 +435,123 @@ impl RuleSet {
                 ).unwrap(),
                 severity: 4,
             },
+            // --- SQL Injection: auth bypass & evasion ---
+            WafRule {
+                id: 942170,
+                description: "SQL injection via authentication bypass",
+                category: RuleCategory::SqlInjection,
+                pattern: Regex::new(
+                    r"(?i)('|%27)\s*(or|and)\s*('|%27|\d+\s*=\s*\d+|true|1\s*--|'\s*=\s*')",
+                ).unwrap(),
+                severity: 5,
+            },
+            WafRule {
+                id: 942180,
+                description: "SQL injection via information schema reconnaissance",
+                category: RuleCategory::SqlInjection,
+                pattern: Regex::new(
+                    r"(?i)\b(information_schema|sys\.(tables|columns|objects)|pg_catalog|pg_tables|sqlite_master|mysql\.user)\b",
+                ).unwrap(),
+                severity: 4,
+            },
+            WafRule {
+                id: 942190,
+                description: "SQL injection via CHAR/CONCAT/HEX encoding evasion",
+                category: RuleCategory::SqlInjection,
+                pattern: Regex::new(
+                    r"(?i)\b(char|chr|concat|concat_ws|hex|unhex|conv)\s*\(\s*\d+",
+                ).unwrap(),
+                severity: 4,
+            },
+            // --- NoSQL Injection ---
+            WafRule {
+                id: 942200,
+                description: "NoSQL injection via MongoDB operators",
+                category: RuleCategory::SqlInjection,
+                pattern: Regex::new(
+                    r#"(?i)(\$(?:ne|eq|gt|lt|gte|lte|in|nin|regex|exists|where|or|and|not|nor)\b|\{\s*["\']?\$(?:gt|ne|regex|where))"#,
+                ).unwrap(),
+                severity: 5,
+            },
+            // --- Additional XSS ---
+            WafRule {
+                id: 941160,
+                description: "XSS via JavaScript eval/constructor execution",
+                category: RuleCategory::Xss,
+                pattern: Regex::new(
+                    r"(?i)\b(eval|settimeout|setinterval|function|constructor)\s*\(",
+                ).unwrap(),
+                severity: 5,
+            },
+            WafRule {
+                id: 941170,
+                description: "XSS via base64 obfuscated payload",
+                category: RuleCategory::Xss,
+                pattern: Regex::new(
+                    r"(?i)(atob|btoa)\s*\(|data\s*:\s*[^;]*;base64\s*,",
+                ).unwrap(),
+                severity: 4,
+            },
+            // --- Backup/sensitive file access ---
+            WafRule {
+                id: 930130,
+                description: "Backup or sensitive file access",
+                category: RuleCategory::PathTraversal,
+                pattern: Regex::new(
+                    r"(?i)\.(bak|backup|old|orig|save|swp|swo|tmp|temp|dist|copy|sql|tar\.gz|zip|rar|7z|log|conf|cfg|ini)\s*$",
+                ).unwrap(),
+                severity: 5,
+            },
+            // --- Windows command injection ---
+            WafRule {
+                id: 932130,
+                description: "Command injection via PowerShell/Windows binaries",
+                category: RuleCategory::CommandInjection,
+                pattern: Regex::new(
+                    r"(?i)\b(powershell|cmd\.exe|certutil|bitsadmin|mshta|wscript|cscript|regsvr32|rundll32)\b",
+                ).unwrap(),
+                severity: 5,
+            },
+            // --- HTTP request smuggling ---
+            WafRule {
+                id: 920140,
+                description: "HTTP request smuggling via Transfer-Encoding manipulation",
+                category: RuleCategory::ProtocolViolation,
+                pattern: Regex::new(
+                    r"(?i)(transfer-encoding\s*:.*chunked.*chunked|transfer-encoding\s*:.*,|content-length.*transfer-encoding|transfer-encoding.*content-length)",
+                ).unwrap(),
+                severity: 5,
+            },
+            // --- Scanner/bot detection ---
+            WafRule {
+                id: 913100,
+                description: "Automated scanner/attack tool detected",
+                category: RuleCategory::ProtocolViolation,
+                pattern: Regex::new(
+                    r"(?i)(nikto|sqlmap|nmap|masscan|dirbuster|gobuster|feroxbuster|nuclei|wpscan|acunetix|nessus|burpsuite|zgrab|httpx|subfinder)",
+                ).unwrap(),
+                severity: 3,
+            },
+            // --- Deserialization attacks ---
+            WafRule {
+                id: 944130,
+                description: "PHP/Java deserialization attack",
+                category: RuleCategory::LogInjection,
+                pattern: Regex::new(
+                    r#"(?i)(O:\d+:"[^"]+"|rO0ABX|aced0005|java\.lang\.(ProcessBuilder|Runtime)|php://input|php://filter)"#,
+                ).unwrap(),
+                severity: 5,
+            },
+            // --- HTTP method abuse ---
+            WafRule {
+                id: 920150,
+                description: "Dangerous HTTP method (TRACE/DEBUG/WebDAV)",
+                category: RuleCategory::ProtocolViolation,
+                pattern: Regex::new(
+                    r"(?i)^(TRACE|TRACK|CONNECT|DEBUG|PROPFIND|PROPPATCH|MKCOL|COPY|MOVE|LOCK|UNLOCK)\s",
+                ).unwrap(),
+                severity: 3,
+            },
         ];
 
         Self { rules }
@@ -735,5 +865,118 @@ mod tests {
         assert_eq!(RuleCategory::SSRF.as_str(), "SSRF");
         assert_eq!(RuleCategory::LogInjection.as_str(), "log_injection");
         assert_eq!(RuleCategory::XXE.as_str(), "XXE");
+    }
+
+    // --- New rules (v1.0.1) ---
+
+    #[test]
+    fn test_sqli_auth_bypass() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 942170).unwrap();
+        assert!(rule.pattern.is_match("' OR '1'='1"));
+        assert!(rule.pattern.is_match("' or true--"));
+        assert!(rule.pattern.is_match("%27 OR 1=1"));
+        assert!(!rule.pattern.is_match("username=admin"));
+    }
+
+    #[test]
+    fn test_sqli_info_schema() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 942180).unwrap();
+        assert!(rule.pattern.is_match("SELECT * FROM information_schema.tables"));
+        assert!(rule.pattern.is_match("sqlite_master"));
+        assert!(rule.pattern.is_match("pg_catalog"));
+        assert!(!rule.pattern.is_match("SELECT name FROM users"));
+    }
+
+    #[test]
+    fn test_sqli_encoding_evasion() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 942190).unwrap();
+        assert!(rule.pattern.is_match("CHAR(0x61,0x64)"));
+        assert!(rule.pattern.is_match("concat(0x7e,version())"));
+        assert!(!rule.pattern.is_match("character set utf8"));
+    }
+
+    #[test]
+    fn test_nosql_injection() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 942200).unwrap();
+        assert!(rule.pattern.is_match(r#"{"$gt":""}"#));
+        assert!(rule.pattern.is_match("$where"));
+        assert!(rule.pattern.is_match("$ne"));
+        assert!(!rule.pattern.is_match("total: $100"));
+    }
+
+    #[test]
+    fn test_xss_eval() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 941160).unwrap();
+        assert!(rule.pattern.is_match("eval('alert(1)')"));
+        assert!(rule.pattern.is_match("setTimeout(payload)"));
+        assert!(rule.pattern.is_match("constructor('return this')"));
+        assert!(!rule.pattern.is_match("evaluate the results"));
+    }
+
+    #[test]
+    fn test_xss_base64() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 941170).unwrap();
+        assert!(rule.pattern.is_match("atob('YWxlcnQ=')"));
+        assert!(rule.pattern.is_match("data:text/html;base64,PHNjcmlwdD4="));
+        assert!(!rule.pattern.is_match("database connection"));
+    }
+
+    #[test]
+    fn test_backup_file_access() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 930130).unwrap();
+        assert!(rule.pattern.is_match("/config.bak"));
+        assert!(rule.pattern.is_match("/dump.sql"));
+        assert!(rule.pattern.is_match("/site.tar.gz"));
+        assert!(!rule.pattern.is_match("/style.css"));
+    }
+
+    #[test]
+    fn test_powershell_injection() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 932130).unwrap();
+        assert!(rule.pattern.is_match("powershell -enc"));
+        assert!(rule.pattern.is_match("certutil -urlcache"));
+        assert!(!rule.pattern.is_match("power supply"));
+    }
+
+    #[test]
+    fn test_request_smuggling() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 920140).unwrap();
+        assert!(rule.pattern.is_match("transfer-encoding: chunked chunked"));
+        assert!(rule.pattern.is_match("transfer-encoding: chunked, identity"));
+    }
+
+    #[test]
+    fn test_scanner_detection() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 913100).unwrap();
+        assert!(rule.pattern.is_match("sqlmap/1.0"));
+        assert!(rule.pattern.is_match("Nikto/2.1.6"));
+        assert!(rule.pattern.is_match("nuclei"));
+        assert!(!rule.pattern.is_match("Mozilla/5.0"));
+    }
+
+    #[test]
+    fn test_deserialization() {
+        let rs = RuleSet::default_crs();
+        let rule = rs.rules().iter().find(|r| r.id == 944130).unwrap();
+        assert!(rule.pattern.is_match(r#"O:4:"User":1:{}"#));
+        assert!(rule.pattern.is_match("rO0ABX"));
+        assert!(rule.pattern.is_match("php://filter/convert.base64-encode"));
+        assert!(!rule.pattern.is_match("photos of cats"));
+    }
+
+    #[test]
+    fn test_rule_count() {
+        let rs = RuleSet::default_crs();
+        assert_eq!(rs.len(), 49);
     }
 }

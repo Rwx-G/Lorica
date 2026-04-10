@@ -57,6 +57,7 @@ mod tests {
             auto_ban_duration_s: 3600,
             path_rules: vec![],
             return_status: None,
+            sticky_session: false,
             created_at: now,
             updated_at: now,
         }
@@ -1503,5 +1504,34 @@ cert_critical_days = 3
 
         let count = store.rotate_encryption_key(&key2).unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_sticky_session_persistence() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.sticky_session = true;
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.sticky_session, "sticky_session should persist as true");
+
+        // Toggle off
+        let mut updated = loaded;
+        updated.sticky_session = false;
+        store.update_route(&updated).unwrap();
+
+        let reloaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(!reloaded.sticky_session, "sticky_session should persist as false");
+    }
+
+    #[test]
+    fn test_sticky_session_default_false() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(!loaded.sticky_session, "sticky_session should default to false");
     }
 }

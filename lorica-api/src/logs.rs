@@ -34,6 +34,9 @@ pub struct LogEntry {
     /// Request source identifier (e.g., "loadtest" from X-Lorica-Source header).
     #[serde(default)]
     pub source: String,
+    /// Unique request ID for end-to-end tracing.
+    #[serde(default)]
+    pub request_id: String,
 }
 
 /// Thread-safe in-memory ring buffer for access logs with real-time broadcast.
@@ -390,7 +393,7 @@ pub async fn export_logs(
         ))
     } else {
         let mut csv = String::with_capacity(entries.len() * 120);
-        csv.push_str("timestamp,method,path,host,status,latency_ms,backend,client_ip,error\n");
+        csv.push_str("timestamp,method,path,host,status,latency_ms,backend,client_ip,error,request_id\n");
         for e in &entries {
             csv.push_str(&csv_escape(&e.timestamp));
             csv.push(',');
@@ -409,6 +412,8 @@ pub async fn export_logs(
             csv.push_str(&csv_escape(&e.client_ip));
             csv.push(',');
             csv.push_str(&csv_escape(e.error.as_deref().unwrap_or("")));
+            csv.push(',');
+            csv.push_str(&csv_escape(&e.request_id));
             csv.push('\n');
         }
         let filename = format!("lorica-logs-{today}.csv");
@@ -513,6 +518,7 @@ mod tests {
                 is_xff: false,
                 xff_proxy_ip: String::new(),
                 source: String::new(),
+                request_id: String::new(),
             })
             .await;
         }
@@ -542,6 +548,7 @@ mod tests {
                 is_xff: false,
                 xff_proxy_ip: String::new(),
                 source: String::new(),
+                request_id: String::new(),
             })
             .await;
         }
@@ -614,6 +621,7 @@ mod tests {
             is_xff: false,
             xff_proxy_ip: String::new(),
             source: String::new(),
+            request_id: String::new(),
         })
         .await;
 
