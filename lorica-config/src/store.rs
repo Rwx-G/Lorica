@@ -348,15 +348,17 @@ impl ConfigStore {
                 "ALTER TABLE routes ADD COLUMN return_status INTEGER DEFAULT NULL",
                 [],
             );
-            let _ = self.conn.execute(
-                "ALTER TABLE routes ADD COLUMN sticky_session INTEGER NOT NULL DEFAULT 0",
-                [],
-            );
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
                 params![18],
             )?;
         }
+
+        // Unconditional column additions (idempotent, let _ = ignores "already exists")
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN sticky_session INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         if current_version < 19 {
             tracing::info!("applying migration 017_acme_method");

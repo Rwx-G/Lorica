@@ -185,5 +185,5 @@ Author: Rwx-G
 
 - Windows support removed from forked Pingora crates (Linux-only)
 
-[1.0.1]: https://github.com/Rwx-G/Lorica/releases/tag/v1.0.1
+[1.1.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.0.0
