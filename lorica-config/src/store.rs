@@ -402,6 +402,42 @@ impl ConfigStore {
             )?;
         }
 
+        // V22: basic auth per route
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN basic_auth_username TEXT DEFAULT NULL",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN basic_auth_password_hash TEXT DEFAULT NULL",
+            [],
+        );
+
+        // V23: stale cache config per route
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN stale_while_revalidate_s INTEGER NOT NULL DEFAULT 10",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN stale_if_error_s INTEGER NOT NULL DEFAULT 60",
+            [],
+        );
+
+        // V24: retry_on_methods
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN retry_on_methods TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+
+        // V24: maintenance mode + custom error pages
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN maintenance_mode INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN error_page_html TEXT DEFAULT NULL",
+            [],
+        );
+
         Ok(())
     }
 
@@ -490,6 +526,8 @@ impl ConfigStore {
             .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_methods: {e}")))?;
         let path_rules_json = serde_json::to_string(&route.path_rules)
             .map_err(|e| ConfigError::Validation(format!("invalid path_rules: {e}")))?;
+        let retry_on_methods_json = serde_json::to_string(&route.retry_on_methods)
+            .map_err(|e| ConfigError::Validation(format!("invalid retry_on_methods: {e}")))?;
 
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
@@ -510,12 +548,16 @@ impl ConfigStore {
              max_connections, slowloris_threshold_ms,
              auto_ban_threshold, auto_ban_duration_s,
              created_at, updated_at,
-             path_rules, return_status, sticky_session)
+             path_rules, return_status, sticky_session,
+             basic_auth_username, basic_auth_password_hash,
+             stale_while_revalidate_s, stale_if_error_s,
+             retry_on_methods,
+             maintenance_mode, error_page_html)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
                      ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45,
-                     ?46, ?47, ?48)",
+                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55)",
             params![
                 route.id,
                 route.hostname,
@@ -565,6 +607,13 @@ impl ConfigStore {
                 path_rules_json,
                 route.return_status.map(|v| v as i32),
                 route.sticky_session,
+                route.basic_auth_username,
+                route.basic_auth_password_hash,
+                route.stale_while_revalidate_s,
+                route.stale_if_error_s,
+                retry_on_methods_json,
+                route.maintenance_mode,
+                route.error_page_html,
             ],
         )?;
         Ok(())
@@ -592,7 +641,11 @@ impl ConfigStore {
                  max_connections, slowloris_threshold_ms,
                  auto_ban_threshold, auto_ban_duration_s,
                  created_at, updated_at,
-                 path_rules, return_status, sticky_session
+                 path_rules, return_status, sticky_session,
+                 basic_auth_username, basic_auth_password_hash,
+                 stale_while_revalidate_s, stale_if_error_s,
+                 retry_on_methods,
+                 maintenance_mode, error_page_html
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
@@ -622,7 +675,11 @@ impl ConfigStore {
              max_connections, slowloris_threshold_ms,
              auto_ban_threshold, auto_ban_duration_s,
              created_at, updated_at,
-             path_rules, return_status, sticky_session
+             path_rules, return_status, sticky_session,
+             basic_auth_username, basic_auth_password_hash,
+             stale_while_revalidate_s, stale_if_error_s,
+             retry_on_methods,
+             maintenance_mode, error_page_html
              FROM routes ORDER BY hostname, path_prefix",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_route(row)))?;
@@ -659,6 +716,8 @@ impl ConfigStore {
             .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_methods: {e}")))?;
         let path_rules_json = serde_json::to_string(&route.path_rules)
             .map_err(|e| ConfigError::Validation(format!("invalid path_rules: {e}")))?;
+        let retry_on_methods_json = serde_json::to_string(&route.retry_on_methods)
+            .map_err(|e| ConfigError::Validation(format!("invalid retry_on_methods: {e}")))?;
 
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,
@@ -678,7 +737,11 @@ impl ConfigStore {
              max_connections=?40, slowloris_threshold_ms=?41,
              auto_ban_threshold=?42, auto_ban_duration_s=?43,
              updated_at=?44,
-             path_rules=?45, return_status=?46, sticky_session=?47 WHERE id=?1",
+             path_rules=?45, return_status=?46, sticky_session=?47,
+             basic_auth_username=?48, basic_auth_password_hash=?49,
+             stale_while_revalidate_s=?50, stale_if_error_s=?51,
+             retry_on_methods=?52,
+             maintenance_mode=?53, error_page_html=?54 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -727,6 +790,13 @@ impl ConfigStore {
                 path_rules_json,
                 route.return_status.map(|v| v as i32),
                 route.sticky_session,
+                route.basic_auth_username,
+                route.basic_auth_password_hash,
+                route.stale_while_revalidate_s,
+                route.stale_if_error_s,
+                retry_on_methods_json,
+                route.maintenance_mode,
+                route.error_page_html,
             ],
         )?;
         if changed == 0 {
@@ -2741,6 +2811,16 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         path_rules,
         return_status,
         sticky_session: row.get::<_, bool>(47).unwrap_or(false),
+        basic_auth_username: row.get::<_, Option<String>>(48).unwrap_or(None),
+        basic_auth_password_hash: row.get::<_, Option<String>>(49).unwrap_or(None),
+        stale_while_revalidate_s: row.get::<_, i32>(50).unwrap_or(10),
+        stale_if_error_s: row.get::<_, i32>(51).unwrap_or(60),
+        retry_on_methods: {
+            let json: String = row.get::<_, String>(52).unwrap_or_else(|_| "[]".to_string());
+            serde_json::from_str(&json).unwrap_or_default()
+        },
+        maintenance_mode: row.get::<_, bool>(53).unwrap_or(false),
+        error_page_html: row.get::<_, Option<String>>(54).unwrap_or(None),
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

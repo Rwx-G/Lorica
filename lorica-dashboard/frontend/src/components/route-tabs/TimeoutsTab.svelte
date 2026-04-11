@@ -75,6 +75,12 @@
     {#if isImported('retry_attempts')}<span class="imported-badge">imported</span>{/if}
     <input id="retry-attempts" type="number" min="0" bind:value={form.retry_attempts} placeholder="No retry" />
   </div>
+
+  <div class="form-group" class:modified={isModified('retry_on_methods')}>
+    <label for="retry-methods">Retry on methods</label>
+    <input id="retry-methods" type="text" bind:value={form.retry_on_methods} placeholder="All methods (e.g. GET, HEAD, OPTIONS)" />
+    <span class="hint">Comma-separated list of HTTP methods eligible for retry. Empty = all methods.</span>
+  </div>
 </div>
 
 <style>

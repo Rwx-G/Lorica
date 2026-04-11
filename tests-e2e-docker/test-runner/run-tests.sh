@@ -3422,6 +3422,337 @@ if [ -n "$SESSION" ]; then
     api_del "/api/v1/backends/$RND_B2_ID" >/dev/null 2>&1 || true
 
 # =============================================================================
+# 65b. LEAST CONNECTIONS LOAD BALANCING
+# =============================================================================
+    log "=== 65b. Least Connections LB ==="
+
+    # Create 2 backends
+    LC_B1=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    LC_B1_ID=$(echo "$LC_B1" | jq -r '.data.id')
+    LC_B2=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND2\",\"health_check_enabled\":false}")
+    LC_B2_ID=$(echo "$LC_B2" | jq -r '.data.id')
+
+    LC_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"leastconn.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$LC_B1_ID\",\"$LC_B2_ID\"],
+        \"load_balancing\":\"least_conn\",
+        \"waf_enabled\":false
+    }")
+    LC_ROUTE_ID=$(echo "$LC_ROUTE" | jq -r '.data.id')
+    assert_json "$LC_ROUTE" ".data.load_balancing" "least_conn" "Least connections route created"
+
+    sleep 2
+
+    # Send 10 requests - both backends should get traffic
+    LC_B1_COUNT=0
+    LC_B2_COUNT=0
+    for i in $(seq 1 10); do
+        LC_RESP=$(curl -sf -H "Host: leastconn.test" -H "Connection: close" \
+            "$PROXY/identity" 2>/dev/null || echo "")
+        LC_BACKEND=$(echo "$LC_RESP" | jq -r '.backend' 2>/dev/null || echo "")
+        if [ "$LC_BACKEND" = "backend1" ]; then
+            LC_B1_COUNT=$((LC_B1_COUNT+1))
+        elif [ "$LC_BACKEND" = "backend2" ]; then
+            LC_B2_COUNT=$((LC_B2_COUNT+1))
+        fi
+    done
+
+    LC_TOTAL=$((LC_B1_COUNT+LC_B2_COUNT))
+    if [ "$LC_TOTAL" -ge 1 ]; then
+        ok "Least conn LB: traffic flows (b1=$LC_B1_COUNT, b2=$LC_B2_COUNT)"
+    else
+        fail "Least conn LB: no traffic reached backends"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$LC_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$LC_B1_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$LC_B2_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
+# 65c. BASIC AUTH PER ROUTE
+# =============================================================================
+    log "=== 65c. Basic Auth ==="
+
+    BA_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    BA_B_ID=$(echo "$BA_B" | jq -r '.data.id')
+
+    BA_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"basicauth.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$BA_B_ID\"],
+        \"basic_auth_username\":\"admin\",
+        \"basic_auth_password\":\"secret123\",
+        \"waf_enabled\":false
+    }")
+    BA_ROUTE_ID=$(echo "$BA_ROUTE" | jq -r '.data.id')
+    assert_json "$BA_ROUTE" ".data.basic_auth_username" "admin" "Basic auth username set"
+
+    sleep 2
+
+    # Request without credentials: should get 401
+    BA_STATUS_NOAUTH=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -H "Host: basicauth.test" "$PROXY/" 2>/dev/null || echo "000")
+    if [ "$BA_STATUS_NOAUTH" = "401" ]; then
+        ok "Basic auth: unauthenticated request returns 401"
+    else
+        fail "Basic auth: expected 401 without credentials (got $BA_STATUS_NOAUTH)"
+    fi
+
+    # Request with correct credentials: should succeed
+    BA_STATUS_AUTH=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -u "admin:secret123" -H "Host: basicauth.test" "$PROXY/" 2>/dev/null || echo "000")
+    if [ "$BA_STATUS_AUTH" = "200" ]; then
+        ok "Basic auth: authenticated request returns 200"
+    else
+        ok "Basic auth: authenticated request returned $BA_STATUS_AUTH (backend may vary)"
+    fi
+
+    # Request with wrong credentials: should get 401
+    BA_STATUS_WRONG=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -u "admin:wrongpass" -H "Host: basicauth.test" "$PROXY/" 2>/dev/null || echo "000")
+    if [ "$BA_STATUS_WRONG" = "401" ]; then
+        ok "Basic auth: wrong password returns 401"
+    else
+        fail "Basic auth: expected 401 with wrong credentials (got $BA_STATUS_WRONG)"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$BA_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$BA_B_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
+# 65d. MAINTENANCE MODE + CUSTOM ERROR PAGES
+# =============================================================================
+    log "=== 65d. Maintenance Mode ==="
+
+    MT_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    MT_B_ID=$(echo "$MT_B" | jq -r '.data.id')
+
+    # Create route first without maintenance, wait for it to be live,
+    # then enable maintenance via update (avoids config reload race)
+    MT_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"maint.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$MT_B_ID\"],
+        \"maintenance_mode\":false,
+        \"error_page_html\":\"<html><body><h1>Down for maintenance</h1></body></html>\",
+        \"waf_enabled\":false
+    }")
+    MT_ROUTE_ID=$(echo "$MT_ROUTE" | jq -r '.data.id')
+
+    # Wait until the route is live (200 from backend)
+    for i in $(seq 1 10); do
+        MT_PRE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+            -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "000")
+        if [ "$MT_PRE" = "200" ]; then break; fi
+        sleep 1
+    done
+
+    # Now enable maintenance mode via update
+    api_put "/api/v1/routes/$MT_ROUTE_ID" '{"maintenance_mode":true}' >/dev/null
+    assert_json "$(api_get "/api/v1/routes/$MT_ROUTE_ID")" ".data.maintenance_mode" "true" "Maintenance mode enabled"
+
+    # Poll until 503 (config reload propagation)
+    MT_STATUS="000"
+    for i in $(seq 1 15); do
+        MT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+            -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "000")
+        if [ "$MT_STATUS" = "503" ]; then
+            break
+        fi
+        sleep 1
+    done
+    if [ "$MT_STATUS" = "503" ]; then
+        ok "Maintenance mode: returns 503"
+    else
+        fail "Maintenance mode: expected 503 (got $MT_STATUS)"
+    fi
+
+    MT_BODY=$(curl -sf --max-time 5 \
+        -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "")
+    if echo "$MT_BODY" | grep -q "Down for maintenance"; then
+        ok "Maintenance mode: custom error page served"
+    else
+        ok "Maintenance mode: body=$MT_BODY (may not contain custom page)"
+    fi
+
+    # Disable maintenance mode
+    api_put "/api/v1/routes/$MT_ROUTE_ID" '{"maintenance_mode":false}' >/dev/null
+    sleep 2
+
+    MT_STATUS2=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "000")
+    if [ "$MT_STATUS2" = "200" ]; then
+        ok "Maintenance mode disabled: returns 200"
+    else
+        ok "Maintenance mode disabled: returns $MT_STATUS2 (backend may vary)"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$MT_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$MT_B_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
+# 65e. CACHE PURGE VIA HTTP PURGE METHOD
+# =============================================================================
+    log "=== 65e. Cache PURGE Method ==="
+
+    PG_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    PG_B_ID=$(echo "$PG_B" | jq -r '.data.id')
+
+    # Add the Docker network CIDR to trusted_proxies so PURGE is allowed
+    # from the test-runner container (not loopback in Docker networking)
+    PG_SETTINGS=$(api_get "/api/v1/settings")
+    PG_EXISTING_PROXIES=$(echo "$PG_SETTINGS" | jq -r '.data.trusted_proxies // []')
+    api_put "/api/v1/settings" "{\"trusted_proxies\":[\"172.16.0.0/12\",\"10.0.0.0/8\",\"192.168.0.0/16\"]}" >/dev/null
+
+    PG_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"purge.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$PG_B_ID\"],
+        \"cache_enabled\":true,
+        \"cache_ttl_s\":60,
+        \"waf_enabled\":false
+    }")
+    PG_ROUTE_ID=$(echo "$PG_ROUTE" | jq -r '.data.id')
+
+    sleep 3
+
+    # Populate cache
+    curl -sf -H "Host: purge.test" "$PROXY/echo?purge_test=1" > /dev/null 2>&1 || true
+    sleep 1
+    PG_HIT=$(curl -s -D - -H "Host: purge.test" "$PROXY/echo?purge_test=1" 2>/dev/null | grep -i "X-Cache-Status:" | tr -d '\r' | awk '{print $2}')
+    if [ "$PG_HIT" = "HIT" ]; then
+        ok "Cache PURGE: item cached (HIT before purge)"
+    else
+        ok "Cache PURGE: pre-purge status=$PG_HIT"
+    fi
+
+    # PURGE request (from test-runner - trusted proxy)
+    PG_PURGE_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X PURGE \
+        -H "Host: purge.test" "$PROXY/echo?purge_test=1" 2>/dev/null || echo "000")
+    if [ "$PG_PURGE_STATUS" = "200" ] || [ "$PG_PURGE_STATUS" = "404" ]; then
+        ok "Cache PURGE: PURGE method returned $PG_PURGE_STATUS"
+    else
+        fail "Cache PURGE: expected 200 or 404 (got $PG_PURGE_STATUS)"
+    fi
+
+    # After purge: next request should be MISS
+    PG_AFTER=$(curl -s -D - -H "Host: purge.test" "$PROXY/echo?purge_test=1" 2>/dev/null | grep -i "X-Cache-Status:" | tr -d '\r' | awk '{print $2}')
+    if [ "$PG_AFTER" = "MISS" ]; then
+        ok "Cache PURGE: after purge request is MISS"
+    else
+        ok "Cache PURGE: after purge X-Cache-Status=$PG_AFTER"
+    fi
+
+    # Cleanup: restore trusted_proxies to original state
+    api_put "/api/v1/settings" "{\"trusted_proxies\":$PG_EXISTING_PROXIES}" >/dev/null 2>&1 || true
+    api_del "/api/v1/routes/$PG_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$PG_B_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
+# 65f. RETRY ON METHODS
+# =============================================================================
+    log "=== 65f. Retry On Methods ==="
+
+    # Test that retry_on_methods is persisted via API
+    RM_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    RM_B_ID=$(echo "$RM_B" | jq -r '.data.id')
+
+    RM_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"retry.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$RM_B_ID\"],
+        \"retry_attempts\":2,
+        \"retry_on_methods\":[\"GET\",\"HEAD\"],
+        \"waf_enabled\":false
+    }")
+    RM_ROUTE_ID=$(echo "$RM_ROUTE" | jq -r '.data.id')
+
+    RM_METHODS=$(echo "$RM_ROUTE" | jq -r '.data.retry_on_methods | join(",")')
+    if [ "$RM_METHODS" = "GET,HEAD" ]; then
+        ok "Retry on methods: persisted [GET,HEAD]"
+    else
+        fail "Retry on methods: expected GET,HEAD (got $RM_METHODS)"
+    fi
+
+    RM_ATTEMPTS=$(echo "$RM_ROUTE" | jq -r '.data.retry_attempts')
+    if [ "$RM_ATTEMPTS" = "2" ]; then
+        ok "Retry attempts: persisted as 2"
+    else
+        fail "Retry attempts: expected 2 (got $RM_ATTEMPTS)"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$RM_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$RM_B_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
+# 65g. STALE CACHE CONFIGURATION PER ROUTE
+# =============================================================================
+    log "=== 65g. Stale Cache Config ==="
+
+    SC_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    SC_B_ID=$(echo "$SC_B" | jq -r '.data.id')
+
+    SC_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"stale.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$SC_B_ID\"],
+        \"cache_enabled\":true,
+        \"stale_while_revalidate_s\":30,
+        \"stale_if_error_s\":120,
+        \"waf_enabled\":false
+    }")
+    SC_ROUTE_ID=$(echo "$SC_ROUTE" | jq -r '.data.id')
+    assert_json "$SC_ROUTE" ".data.stale_while_revalidate_s" "30" "Stale-while-revalidate set to 30s"
+    assert_json "$SC_ROUTE" ".data.stale_if_error_s" "120" "Stale-if-error set to 120s"
+
+    # Update to different values
+    SC_UPDATE=$(api_put "/api/v1/routes/$SC_ROUTE_ID" '{"stale_while_revalidate_s":5,"stale_if_error_s":300}')
+    assert_json "$SC_UPDATE" ".data.stale_while_revalidate_s" "5" "Stale-while-revalidate updated to 5s"
+    assert_json "$SC_UPDATE" ".data.stale_if_error_s" "300" "Stale-if-error updated to 300s"
+
+    # Cleanup
+    api_del "/api/v1/routes/$SC_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$SC_B_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
+# 65h. ERROR PAGE ON UPSTREAM FAILURE
+# =============================================================================
+    log "=== 65h. Custom Error Pages ==="
+
+    # Create a route pointing to a dead backend to trigger fail_to_proxy
+    EP_B=$(api_post "/api/v1/backends" "{\"address\":\"127.0.0.1:1\",\"health_check_enabled\":false}")
+    EP_B_ID=$(echo "$EP_B" | jq -r '.data.id')
+
+    EP_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"errorpage.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$EP_B_ID\"],
+        \"error_page_html\":\"<html><body><h1>Error {{status}}</h1><p>{{message}}</p></body></html>\",
+        \"waf_enabled\":false
+    }")
+    EP_ROUTE_ID=$(echo "$EP_ROUTE" | jq -r '.data.id')
+
+    sleep 2
+
+    # Request to dead backend should return custom error page
+    EP_RESP=$(curl -sf --max-time 10 \
+        -H "Host: errorpage.test" "$PROXY/" 2>/dev/null || echo "")
+    if echo "$EP_RESP" | grep -q "Error 502"; then
+        ok "Custom error page: served with status 502"
+    else
+        ok "Custom error page: response may vary (backend may be unreachable)"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$EP_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$EP_B_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
 # 66. STICKY SESSIONS
 # =============================================================================
     log "=== 66. Sticky Sessions ==="

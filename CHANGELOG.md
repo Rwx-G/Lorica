@@ -9,6 +9,51 @@ Author: Rwx-G
 
 ## Unreleased
 
+## [1.2.0] - 2026-04-11
+
+### Added
+
+- Cache lock for thundering herd protection: only one request fetches from upstream on cache miss, others wait for the cached response (10 s timeout)
+- Stale-while-error: serve cached responses when upstream fails (60 s) and during background revalidation (10 s), via `should_serve_stale()` hook
+- Cache PURGE method: HTTP PURGE requests invalidate cached entries matching the request URI
+- gRPC-Web bridge module: transparently converts HTTP/1.1 gRPC-web requests to HTTP/2 gRPC for upstream backends
+- Least Connections load balancing algorithm: routes traffic to the backend with the fewest active connections
+- HTTP Basic Auth per route: username/password (Argon2id-hashed) with 401 + WWW-Authenticate challenge. Configurable in Security tab
+- Maintenance mode per route: returns 503 with Retry-After header and optional custom HTML error page
+- Custom error pages: configurable HTML template for upstream errors (502/504) with `{{status}}` and `{{message}}` placeholders, served via `fail_to_proxy()` hook
+- Enriched retry policy: `retry_on_methods` field filters which HTTP methods are eligible for retry (e.g. GET, HEAD only), preventing duplicate side-effects on POST/PUT
+- Structured log output: `--log-format` CLI option (json/text) and `--log-file` for file output alongside stdout. Propagated to worker processes
+- OCSP stapling: automatic OCSP response fetch from CA responder (AIA extension), attached to TLS handshakes via rustls CertifiedKey. Best-effort with warning on failure
+- Production Dockerfile: multi-stage build (Node 22 + Rust + Debian slim), non-root user, volume mount at /var/lib/lorica
+- Per-route stale cache configuration: `stale_while_revalidate_s` (default 10) and `stale_if_error_s` (default 60) configurable via API and dashboard Caching tab
+
+### Security
+
+- PURGE method restricted to loopback and trusted proxy CIDRs to prevent external cache invalidation
+- HTML escape for `{{message}}` placeholder in custom error pages to prevent XSS via crafted upstream error messages
+- Basic auth credential verification cache (60 s TTL) avoids Argon2 hot-path overhead on repeated requests
+
+### Changed
+
+- Route struct wrapped in Arc in ProxyConfig to avoid deep-cloning on every request (~300-500ns saved)
+- Path rewrite regex wrapped in Arc to avoid compiled NFA/DFA duplication per request
+- WAF rule matching uses single `find()` instead of `is_match()` + `find()` (halves regex cost on matches)
+- WAF `url_decode` fast path skips decode loop when input has no percent-encoding
+- HTML sanitize regexes compiled once at startup via `Lazy<Regex>` instead of per-call
+
+### Fixed
+
+- Per-route IP allowlist/denylist CIDR matching was using string prefix comparison (`starts_with`), which incorrectly matched `10.1.2.3` against `10.1.2.30/24`. Now uses proper network containment via ipnet
+- WAF event category filter: filter now applied at SQL level so LIMIT returns correct results when filtering by category (e.g. XSS events were invisible when IP Blocklist dominated the top N rows)
+- list_routes() SELECT was missing stale_while_revalidate_s, stale_if_error_s, and retry_on_methods columns, causing maintenance_mode and other v1.2.0 fields to read incorrect values from shifted column indices
+- Frontend TypeScript types synchronized with Rust API: WafEvent (route_hostname, action), ProxyInfo (http_port, https_port), GlobalSettings (waf_whitelist_ips), route-form test fixture (v1.2.0 fields)
+- Supervisor mutex poison recovery: worker monitor and shutdown no longer panic on poisoned mutex, recover gracefully with warning log
+- Encryption key load failure now logs an explicit error instead of silently falling back to unencrypted storage
+- Dashboard accessibility: all dialog overlays have Escape key handler, aria-modal, tabindex; all sortable table headers have keyboard Enter handler and role="button"; backdrop has role="presentation"
+- Prometheus metric creation uses `expect()` instead of `unwrap()` for better startup diagnostics
+- `log_store.rs` `copy_to_sql` handles conversion errors gracefully instead of panicking
+- SLA CSV export response builder uses `expect()` instead of `unwrap()`
+
 ## [1.1.0] - 2026-04-10
 
 ### Added
@@ -185,5 +230,6 @@ Author: Rwx-G
 
 - Windows support removed from forked Pingora crates (Linux-only)
 
+[1.2.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.0.0

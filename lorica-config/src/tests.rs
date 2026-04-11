@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use chrono::Utc;
     use tempfile::NamedTempFile;
 
@@ -58,6 +60,13 @@ mod tests {
             path_rules: vec![],
             return_status: None,
             sticky_session: false,
+            basic_auth_username: None,
+            basic_auth_password_hash: None,
+            stale_while_revalidate_s: 10,
+            stale_if_error_s: 60,
+            retry_on_methods: vec![],
+            maintenance_mode: false,
+            error_page_html: None,
             created_at: now,
             updated_at: now,
         }
@@ -1533,5 +1542,131 @@ cert_critical_days = 3
 
         let loaded = store.get_route(&route.id).unwrap().unwrap();
         assert!(!loaded.sticky_session, "sticky_session should default to false");
+    }
+
+    #[test]
+    fn test_load_balancing_least_conn_roundtrip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.load_balancing = LoadBalancing::LeastConn;
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(loaded.load_balancing, LoadBalancing::LeastConn);
+    }
+
+    #[test]
+    fn test_load_balancing_from_str() {
+        assert_eq!(
+            LoadBalancing::from_str("least_conn").unwrap(),
+            LoadBalancing::LeastConn
+        );
+        assert_eq!(
+            LoadBalancing::from_str("round_robin").unwrap(),
+            LoadBalancing::RoundRobin
+        );
+        assert!(LoadBalancing::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_load_balancing_as_str() {
+        assert_eq!(LoadBalancing::LeastConn.as_str(), "least_conn");
+        assert_eq!(LoadBalancing::PeakEwma.as_str(), "peak_ewma");
+    }
+
+    #[test]
+    fn test_basic_auth_roundtrip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.basic_auth_username = Some("admin".to_string());
+        route.basic_auth_password_hash = Some("$argon2id$v=19$m=19456,t=2,p=1$salt$hash".to_string());
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(loaded.basic_auth_username.as_deref(), Some("admin"));
+        assert_eq!(
+            loaded.basic_auth_password_hash.as_deref(),
+            Some("$argon2id$v=19$m=19456,t=2,p=1$salt$hash")
+        );
+    }
+
+    #[test]
+    fn test_basic_auth_default_none() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.basic_auth_username.is_none());
+        assert!(loaded.basic_auth_password_hash.is_none());
+    }
+
+    #[test]
+    fn test_maintenance_mode_roundtrip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.maintenance_mode = true;
+        route.error_page_html = Some("<h1>Down for maintenance</h1>".to_string());
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.maintenance_mode);
+        assert_eq!(
+            loaded.error_page_html.as_deref(),
+            Some("<h1>Down for maintenance</h1>")
+        );
+    }
+
+    #[test]
+    fn test_maintenance_mode_default_false() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(!loaded.maintenance_mode);
+        assert!(loaded.error_page_html.is_none());
+    }
+
+    #[test]
+    fn test_stale_config_roundtrip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.stale_while_revalidate_s = 30;
+        route.stale_if_error_s = 120;
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(loaded.stale_while_revalidate_s, 30);
+        assert_eq!(loaded.stale_if_error_s, 120);
+    }
+
+    #[test]
+    fn test_stale_config_default_values() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(loaded.stale_while_revalidate_s, 10, "default stale-while-revalidate should be 10s");
+        assert_eq!(loaded.stale_if_error_s, 60, "default stale-if-error should be 60s");
+    }
+
+    #[test]
+    fn test_basic_auth_clear() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.basic_auth_username = Some("user".to_string());
+        route.basic_auth_password_hash = Some("hash".to_string());
+        store.create_route(&route).unwrap();
+
+        let mut updated = store.get_route(&route.id).unwrap().unwrap();
+        updated.basic_auth_username = None;
+        updated.basic_auth_password_hash = None;
+        store.update_route(&updated).unwrap();
+
+        let reloaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(reloaded.basic_auth_username.is_none());
+        assert!(reloaded.basic_auth_password_hash.is_none());
     }
 }

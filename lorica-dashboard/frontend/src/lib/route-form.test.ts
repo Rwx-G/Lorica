@@ -168,6 +168,13 @@ describe('routeToFormState', () => {
     auto_ban_duration_s: 7200,
     path_rules: [],
     return_status: null,
+    sticky_session: false,
+    basic_auth_username: null,
+    stale_while_revalidate_s: 10,
+    stale_if_error_s: 60,
+    retry_on_methods: [],
+    maintenance_mode: false,
+    error_page_html: null,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
   };

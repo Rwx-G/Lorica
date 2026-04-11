@@ -13,6 +13,7 @@ pub enum LoadBalancing {
     ConsistentHash,
     Random,
     PeakEwma,
+    LeastConn,
 }
 
 impl LoadBalancing {
@@ -22,6 +23,7 @@ impl LoadBalancing {
             Self::ConsistentHash => "consistent_hash",
             Self::Random => "random",
             Self::PeakEwma => "peak_ewma",
+            Self::LeastConn => "least_conn",
         }
     }
 }
@@ -34,6 +36,7 @@ impl FromStr for LoadBalancing {
             "consistent_hash" => Ok(Self::ConsistentHash),
             "random" => Ok(Self::Random),
             "peak_ewma" => Ok(Self::PeakEwma),
+            "least_conn" => Ok(Self::LeastConn),
             other => Err(format!("unknown load balancing algorithm: {other}")),
         }
     }
@@ -420,6 +423,20 @@ pub struct Route {
     /// When enabled, a `LORICA_SRV` cookie is set with the backend ID.
     #[serde(default)]
     pub sticky_session: bool,
+    #[serde(default)]
+    pub basic_auth_username: Option<String>,
+    #[serde(default)]
+    pub basic_auth_password_hash: Option<String>,
+    #[serde(default = "default_stale_while_revalidate_s")]
+    pub stale_while_revalidate_s: i32,
+    #[serde(default = "default_stale_if_error_s")]
+    pub stale_if_error_s: i32,
+    #[serde(default)]
+    pub retry_on_methods: Vec<String>,
+    #[serde(default)]
+    pub maintenance_mode: bool,
+    #[serde(default)]
+    pub error_page_html: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -633,6 +650,14 @@ pub struct GlobalSettings {
 
 fn default_security_headers() -> String {
     "moderate".to_string()
+}
+
+fn default_stale_while_revalidate_s() -> i32 {
+    10
+}
+
+fn default_stale_if_error_s() -> i32 {
+    60
 }
 
 fn default_connect_timeout_s() -> i32 {
@@ -1334,6 +1359,13 @@ mod tests {
             path_rules: vec![],
             return_status: None,
             sticky_session: false,
+            basic_auth_username: None,
+            basic_auth_password_hash: None,
+            stale_while_revalidate_s: 10,
+            stale_if_error_s: 60,
+            retry_on_methods: vec![],
+            maintenance_mode: false,
+            error_page_html: None,
             created_at: now,
             updated_at: now,
         };

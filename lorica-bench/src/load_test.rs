@@ -221,7 +221,7 @@ pub struct LoadTestEngine {
 impl LoadTestEngine {
     pub fn new() -> Self {
         let http_client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(true) // Load tests target localhost with self-signed certs
             .pool_max_idle_per_host(200)
             .build()
             .unwrap_or_default();
@@ -275,7 +275,7 @@ impl LoadTestEngine {
         // send SNI=127.0.0.1 which doesn't match any certificate.
         let run_client = {
             let mut builder = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_certs(true) // Load tests target localhost with self-signed certs
                 .pool_max_idle_per_host(200);
             if let Ok(url) = reqwest::Url::parse(&config.target_url) {
                 if let Some(host) = url.host_str() {

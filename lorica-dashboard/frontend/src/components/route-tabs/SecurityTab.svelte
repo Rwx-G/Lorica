@@ -68,6 +68,19 @@
       <textarea id="ip-deny" rows="3" bind:value={form.ip_denylist} placeholder="203.0.113.0/24"></textarea>
     </div>
   </div>
+
+  <div class="form-row">
+    <div class="form-group" class:modified={isModified('basic_auth_username')}>
+      <label for="basic-auth-user">Basic auth username</label>
+      <input id="basic-auth-user" type="text" bind:value={form.basic_auth_username} placeholder="Leave empty to disable" />
+      <span class="hint">HTTP Basic Auth for staging or internal tools. Nginx: auth_basic | Traefik: BasicAuth middleware</span>
+    </div>
+    <div class="form-group" class:modified={isModified('basic_auth_password')}>
+      <label for="basic-auth-pass">Basic auth password</label>
+      <input id="basic-auth-pass" type="password" bind:value={form.basic_auth_password} placeholder={form.basic_auth_username ? '(unchanged)' : 'Leave empty to disable'} />
+      <span class="hint">Password is hashed (Argon2id) before storage. Send a new value to change it.</span>
+    </div>
+  </div>
 </div>
 
 <style>
@@ -85,7 +98,9 @@
   }
 
   .form-group select,
-  .form-group input[type="number"] {
+  .form-group input[type="number"],
+  .form-group input[type="text"],
+  .form-group input[type="password"] {
     width: 100%;
     padding: 0.5rem 0.75rem;
     border: 1px solid var(--color-border);

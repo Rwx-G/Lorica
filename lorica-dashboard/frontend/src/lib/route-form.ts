@@ -61,6 +61,13 @@ export interface RouteFormState {
   path_rules: PathRuleFormState[];
   return_status: string;
   sticky_session: boolean;
+  basic_auth_username: string;
+  basic_auth_password: string;
+  stale_while_revalidate_s: number;
+  stale_if_error_s: number;
+  retry_on_methods: string;
+  maintenance_mode: boolean;
+  error_page_html: string;
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -110,6 +117,13 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   path_rules: [],
   return_status: '',
   sticky_session: false,
+  basic_auth_username: '',
+  basic_auth_password: '',
+  stale_while_revalidate_s: 10,
+  stale_if_error_s: 60,
+  retry_on_methods: '',
+  maintenance_mode: false,
+  error_page_html: '',
 };
 
 // Tab field mappings for dot indicators
@@ -117,15 +131,16 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   general: [
     'hostname', 'path_prefix', 'force_https', 'redirect_hostname', 'redirect_to',
     'hostname_aliases', 'websocket_enabled', 'access_log_enabled',
-    'compression_enabled', 'waf_enabled', 'return_status', 'sticky_session',
+    'compression_enabled', 'waf_enabled', 'return_status', 'sticky_session', 'maintenance_mode', 'error_page_html',
   ],
   timeouts: [
     'connect_timeout_s', 'read_timeout_s', 'send_timeout_s',
-    'strip_path_prefix', 'add_path_prefix', 'path_rewrite_pattern', 'path_rewrite_replacement', 'retry_attempts',
+    'strip_path_prefix', 'add_path_prefix', 'path_rewrite_pattern', 'path_rewrite_replacement', 'retry_attempts', 'retry_on_methods',
   ],
   security: [
     'security_headers', 'max_body_mb', 'rate_limit_rps',
     'rate_limit_burst', 'ip_allowlist', 'ip_denylist',
+    'basic_auth_username', 'basic_auth_password',
   ],
   headers: [
     'proxy_headers', 'proxy_headers_remove',
@@ -135,7 +150,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'cors_allowed_origins', 'cors_allowed_methods', 'cors_max_age_s',
   ],
   caching: [
-    'cache_enabled', 'cache_ttl_s', 'cache_max_mb',
+    'cache_enabled', 'cache_ttl_s', 'cache_max_mb', 'stale_while_revalidate_s', 'stale_if_error_s',
   ],
   protection: [
     'max_connections', 'slowloris_threshold_ms',
@@ -229,6 +244,13 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     })),
     return_status: route.return_status != null ? String(route.return_status) : '',
     sticky_session: route.sticky_session ?? false,
+    basic_auth_username: route.basic_auth_username ?? '',
+    basic_auth_password: '',
+    stale_while_revalidate_s: route.stale_while_revalidate_s ?? 10,
+    stale_if_error_s: route.stale_if_error_s ?? 60,
+    retry_on_methods: (route.retry_on_methods ?? []).join(', '),
+    maintenance_mode: route.maintenance_mode ?? false,
+    error_page_html: route.error_page_html ?? '',
   };
 }
 
@@ -294,6 +316,13 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     path_rules: pathRuleFormToRequest(form.path_rules) ?? (isUpdate ? [] : undefined),
     return_status: form.return_status ? Number(form.return_status) : empty(0),
     sticky_session: form.sticky_session,
+    basic_auth_username: form.basic_auth_username || undefined,
+    basic_auth_password: form.basic_auth_password || undefined,
+    stale_while_revalidate_s: form.stale_while_revalidate_s,
+    stale_if_error_s: form.stale_if_error_s,
+    retry_on_methods: csvToArray(form.retry_on_methods).length > 0 ? csvToArray(form.retry_on_methods) : empty([]),
+    maintenance_mode: form.maintenance_mode,
+    error_page_html: form.error_page_html || undefined,
   };
 }
 

@@ -82,8 +82,6 @@ pub type RoundRobin = Weighted<algorithms::RoundRobin>;
 /// Consistent Ketama hashing on weighted backends
 pub type Consistent = consistent::KetamaHashing;
 
-// TODO: least conn
-
 /// An iterator which wraps another iterator and yields unique items. It optionally takes a max
 /// number of iterations if the wrapped iterator never returns.
 pub struct UniqueIterator<I>

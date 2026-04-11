@@ -43,3 +43,4 @@ Desktop.ini
 
 # Claude
 .claude/
+static_analysis_semgrep_1/

@@ -251,16 +251,16 @@
       <table>
         <thead>
           <tr>
-            <th class="sortable" onclick={() => toggleSort('name')}>
+            <th class="sortable" tabindex="0" role="button" onclick={() => toggleSort('name')} onkeydown={(e) => { if (e.key === 'Enter') toggleSort('name'); }}>
               Name {sortColumn === 'name' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
             </th>
-            <th class="sortable" onclick={() => toggleSort('group')}>
+            <th class="sortable" tabindex="0" role="button" onclick={() => toggleSort('group')} onkeydown={(e) => { if (e.key === 'Enter') toggleSort('group'); }}>
               Group {sortColumn === 'group' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
             </th>
-            <th class="sortable" onclick={() => toggleSort('address')}>
+            <th class="sortable" tabindex="0" role="button" onclick={() => toggleSort('address')} onkeydown={(e) => { if (e.key === 'Enter') toggleSort('address'); }}>
               Address {sortColumn === 'address' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
             </th>
-            <th class="sortable" onclick={() => toggleSort('health')}>
+            <th class="sortable" tabindex="0" role="button" onclick={() => toggleSort('health')} onkeydown={(e) => { if (e.key === 'Enter') toggleSort('health'); }}>
               Health {sortColumn === 'health' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
             </th>
             <th>Weight</th>
@@ -325,7 +325,7 @@
   {/if}
 
   {#if showForm}
-    <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showForm = false; }}>
+    <div class="overlay" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) showForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showForm = false; }}>
       <div class="modal">
         <h2>{editingBackend ? 'Edit Backend' : 'Add Backend'}</h2>
 

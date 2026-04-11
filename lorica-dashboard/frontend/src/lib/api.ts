@@ -149,6 +149,12 @@ export interface RouteResponse {
   path_rules: PathRuleResponse[];
   return_status: number | null;
   sticky_session: boolean;
+  basic_auth_username: string | null;
+  stale_while_revalidate_s: number;
+  stale_if_error_s: number;
+  retry_on_methods: string[];
+  maintenance_mode: boolean;
+  error_page_html: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -199,7 +205,15 @@ export interface CreateRouteRequest {
   path_rules?: PathRuleRequest[];
   return_status?: number;
   sticky_session?: boolean;
+  basic_auth_username?: string;
+  basic_auth_password?: string;
+  stale_while_revalidate_s?: number;
+  stale_if_error_s?: number;
+  retry_on_methods?: string[];
+  maintenance_mode?: boolean;
+  error_page_html?: string;
 }
+
 
 export interface UpdateRouteRequest {
   hostname?: string;
@@ -248,6 +262,13 @@ export interface UpdateRouteRequest {
   path_rules?: PathRuleRequest[];
   return_status?: number;
   sticky_session?: boolean;
+  basic_auth_username?: string;
+  basic_auth_password?: string;
+  stale_while_revalidate_s?: number;
+  stale_if_error_s?: number;
+  retry_on_methods?: string[];
+  maintenance_mode?: boolean;
+  error_page_html?: string;
 }
 
 export interface BackendResponse {
@@ -365,6 +386,8 @@ export interface ProxyInfo {
   version: string;
   uptime_seconds: number;
   active_connections: number;
+  http_port: number;
+  https_port: number;
 }
 
 export interface SystemResponse {
@@ -394,6 +417,7 @@ export interface GlobalSettingsResponse {
   sla_purge_schedule: string;
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies: string[];
+  waf_whitelist_ips: string[];
 }
 
 export interface UpdateSettingsRequest {
@@ -412,6 +436,7 @@ export interface UpdateSettingsRequest {
   sla_purge_schedule?: string;
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies?: string[];
+  waf_whitelist_ips?: string[];
 }
 
 export interface NotificationConfigResponse {
@@ -821,7 +846,9 @@ export interface WafEvent {
   matched_field: string;
   matched_value: string;
   timestamp: string;
-  client_ip?: string;
+  client_ip: string;
+  route_hostname: string;
+  action: string;
 }
 
 export interface WafEventsResponse {

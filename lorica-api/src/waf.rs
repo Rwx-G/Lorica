@@ -59,26 +59,27 @@ pub async fn get_waf_events(
     let limit = params.limit.unwrap_or(50).min(500);
     let rule_count = state.waf_rule_count.unwrap_or(0);
 
-    // Read from persistent store if available, fall back to in-memory buffer
+    // Read from persistent store if available, fall back to in-memory buffer.
+    // When a category filter is specified, it is applied at the SQL level for
+    // the persistent store (so LIMIT applies to the filtered set), and
+    // post-query for the in-memory fallback.
     let events = if let Some(ref store) = state.log_store {
         store
-            .list_waf_events(limit)
+            .list_waf_events(limit, params.category.as_deref())
             .map_err(|e| ApiError::Internal(format!("waf event query failed: {e}")))?
     } else if let Some(ref waf_buffer) = state.waf_event_buffer {
         let buf = waf_buffer.lock();
-        buf.iter().rev().take(limit).cloned().collect()
+        let iter = buf.iter().rev();
+        if let Some(ref cat) = params.category {
+            iter.filter(|e| e.category.as_str() == cat.as_str())
+                .take(limit)
+                .cloned()
+                .collect()
+        } else {
+            iter.take(limit).cloned().collect()
+        }
     } else {
         vec![]
-    };
-
-    // Apply category filter if specified
-    let events: Vec<WafEvent> = if let Some(ref cat) = params.category {
-        events
-            .into_iter()
-            .filter(|e| e.category.as_str() == cat.as_str())
-            .collect()
-    } else {
-        events
     };
 
     let total = events.len();
@@ -97,7 +98,7 @@ pub async fn get_waf_stats(
 
     // Read from persistent store if available, fall back to in-memory buffer
     let (total_events, by_category) = if let Some(ref store) = state.log_store {
-        match store.list_waf_events(10000) {
+        match store.list_waf_events(10000, None) {
             Ok(events) => {
                 let total = events.len();
                 let mut counts = std::collections::HashMap::new();

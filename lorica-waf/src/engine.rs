@@ -432,13 +432,8 @@ impl WafEngine {
             if is_body && !rule.applies_to_body() {
                 continue;
             }
-            if rule.pattern.is_match(value) {
-                // Extract the matched substring (first match only)
-                let matched_value = rule
-                    .pattern
-                    .find(value)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
+            if let Some(m) = rule.pattern.find(value) {
+                let matched_value = m.as_str().to_string();
 
                 events.push(WafEvent {
                     rule_id: rule.id,
@@ -461,11 +456,8 @@ impl WafEngine {
             if !rule.enabled {
                 continue;
             }
-            if regex.is_match(value) {
-                let matched_value = regex
-                    .find(value)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
+            if let Some(m) = regex.find(value) {
+                let matched_value = m.as_str().to_string();
                 events.push(WafEvent {
                     rule_id: rule.id,
                     description: rule.description.clone(),
@@ -486,6 +478,10 @@ impl WafEngine {
     ///
     /// Decodes until stable or max 3 iterations to prevent double-encoding bypass.
     fn url_decode(input: &str) -> String {
+        // Fast path: no percent-encoding or plus signs -> skip decode entirely
+        if !input.contains('%') && !input.contains('+') {
+            return input.to_string();
+        }
         let mut current = input.to_string();
         for _ in 0..3 {
             let decoded = Self::url_decode_once(&current);

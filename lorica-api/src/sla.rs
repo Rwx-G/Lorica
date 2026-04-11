@@ -240,7 +240,7 @@ pub async fn export_sla_data(
                 format!("attachment; filename=\"sla-{route_id}.csv\""),
             )
             .body(axum::body::Body::from(csv))
-            .unwrap())
+            .expect("CSV response builder"))
     } else {
         let config = store
             .get_sla_config(&route_id)

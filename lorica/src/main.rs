@@ -54,6 +54,15 @@ struct Cli {
     #[arg(long, default_value = "info")]
     log_level: String,
 
+    /// Log format: "json" (default) or "text"
+    #[arg(long, default_value = "json", value_parser = clap::builder::PossibleValuesParser::new(["json", "text"]))]
+    log_format: String,
+
+    /// Path to a log file. When set, logs are written to this file in
+    /// addition to stdout. The file is appended to (not truncated).
+    #[arg(long)]
+    log_file: Option<String>,
+
     /// Management port (localhost only)
     #[arg(long, default_value_t = DEFAULT_MANAGEMENT_PORT)]
     management_port: u16,
@@ -104,6 +113,14 @@ enum Commands {
         #[arg(long, default_value = "info")]
         log_level: String,
 
+        /// Log format (json or text)
+        #[arg(long, default_value = "json", value_parser = clap::builder::PossibleValuesParser::new(["json", "text"]))]
+        log_format: String,
+
+        /// Log file path
+        #[arg(long)]
+        log_file: Option<String>,
+
         /// Path to upstream CRL file (passed from supervisor)
         #[arg(long)]
         upstream_crl_file: Option<String>,
@@ -129,18 +146,57 @@ enum Commands {
     },
 }
 
-fn init_logging(log_level: &str) {
+/// Guard that must be held alive for the non-blocking file appender to flush.
+/// Stored in main() to keep it alive for the process lifetime.
+#[allow(dead_code)]
+static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+    std::sync::OnceLock::new();
+
+fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_timer(tracing_subscriber::fmt::time::SystemTime)
-        .init();
+    // Build the writer: file (non-blocking, thread-safe) or stdout.
+    macro_rules! build_subscriber {
+        ($writer:expr, $ansi:expr) => {
+            if log_format == "text" {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_target(true)
+                    .with_thread_ids(true)
+                    .with_timer(tracing_subscriber::fmt::time::SystemTime)
+                    .with_ansi($ansi)
+                    .with_writer($writer)
+                    .init();
+            } else {
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(filter)
+                    .with_target(true)
+                    .with_thread_ids(true)
+                    .with_timer(tracing_subscriber::fmt::time::SystemTime)
+                    .with_writer($writer)
+                    .init();
+            }
+        };
+    }
+
+    if let Some(path) = log_file {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("lorica.log");
+        let file_appender = tracing_appender::rolling::never(dir, filename);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let _ = LOG_GUARD.set(guard);
+        build_subscriber!(non_blocking, false);
+    } else {
+        build_subscriber!(std::io::stdout, true);
+    }
 }
 
 fn startup_banner(cli: &Cli) {
@@ -170,9 +226,11 @@ fn main() {
             data_dir,
             https_port,
             log_level,
+            log_format,
+            log_file,
             upstream_crl_file,
         }) => {
-            init_logging(&log_level);
+            init_logging(&log_level, &log_format, log_file.as_deref());
             run_worker(
                 id,
                 cmd_fd,
@@ -259,7 +317,7 @@ fn main() {
             });
         }
         None => {
-            init_logging(&cli.log_level);
+            init_logging(&cli.log_level, &cli.log_format, cli.log_file.as_deref());
             startup_banner(&cli);
 
             if cli.workers > 0 {
@@ -295,6 +353,8 @@ fn run_supervisor(cli: Cli) {
         worker_count,
         data_dir: cli.data_dir.clone(),
         log_level: cli.log_level.clone(),
+        log_format: cli.log_format.clone(),
+        log_file: cli.log_file.clone(),
         http_addr: format!("0.0.0.0:{}", cli.http_port),
         https_addr: Some(format!("0.0.0.0:{}", cli.https_port)),
         https_port: cli.https_port,
@@ -307,7 +367,19 @@ fn run_supervisor(cli: Cli) {
         let data_dir = PathBuf::from(&cli.data_dir);
         let _ = std::fs::create_dir_all(&data_dir);
         let key_path = data_dir.join("encryption.key");
-        let encryption_key = lorica_config::crypto::EncryptionKey::load_or_create(&key_path).ok();
+        let encryption_key = match lorica_config::crypto::EncryptionKey::load_or_create(&key_path) {
+            Ok(key) => Some(key),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    path = %key_path.display(),
+                    "failed to load encryption key - database will open WITHOUT encryption. \
+                     Certificate private keys and notification credentials will be stored in cleartext. \
+                     Fix the key file permissions or path and restart."
+                );
+                None
+            }
+        };
         let db_path = data_dir.join("lorica.db");
         if let Err(e) = ConfigStore::open(&db_path, encryption_key) {
             error!(error = %e, "failed to run database migrations before forking workers");
@@ -473,6 +545,9 @@ fn run_supervisor(cli: Cli) {
         // Spawn a per-worker task that handles both config reload and heartbeat
         // No shared Mutex - each worker has its own channel and task
         for (worker_id, worker_pid, raw_fd) in worker_fds {
+            // SAFETY: raw_fd is a valid file descriptor from the socketpair
+            // created by WorkerManager::spawn_workers(), passed to this task
+            // immediately after fork. The fd is exclusively owned by this task.
             let mut channel = match unsafe { CommandChannel::from_raw_fd(raw_fd) } {
                 Ok(ch) => ch,
                 Err(e) => {
@@ -944,7 +1019,10 @@ fn run_supervisor(cli: Cli) {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
-                let mut mgr = monitor_mgr.lock().unwrap();
+                let mut mgr = monitor_mgr.lock().unwrap_or_else(|e| {
+                    warn!("worker monitor mutex poisoned, recovering");
+                    e.into_inner()
+                });
                 let events = mgr.check_workers();
                 for event in events {
                     let (id, log_msg) = match event {
@@ -974,6 +1052,8 @@ fn run_supervisor(cli: Cli) {
                                 .map(|(_, pid)| pid.as_raw())
                                 .unwrap_or(0);
                             info!(worker_id = id, new_pid, reason = log_msg, "worker restarted, reconnecting channel");
+                            // SAFETY: new_fd is a fresh socketpair fd from
+                            // WorkerManager::restart_worker(), exclusively owned here.
                             match unsafe { CommandChannel::from_raw_fd(new_fd.into_raw_fd()) } {
                                 Ok(mut channel) => {
                                     let mut rx = monitor_reload_tx.subscribe();
@@ -1079,7 +1159,13 @@ fn run_supervisor(cli: Cli) {
 
         info!("supervisor shutting down");
         // Explicit SIGTERM to all workers before exiting
-        manager.lock().unwrap().shutdown_all();
+        manager
+            .lock()
+            .unwrap_or_else(|e| {
+                warn!("worker manager mutex poisoned during shutdown, recovering");
+                e.into_inner()
+            })
+            .shutdown_all();
         api_handle.abort();
         health_handle.abort();
         monitor_handle.abort();
@@ -1130,7 +1216,17 @@ fn run_worker(
     // Open the configuration database with encryption key
     let data_dir = PathBuf::from(data_dir);
     let key_path = data_dir.join("encryption.key");
-    let encryption_key = lorica_config::crypto::EncryptionKey::load_or_create(&key_path).ok();
+    let encryption_key = match lorica_config::crypto::EncryptionKey::load_or_create(&key_path) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            error!(
+                error = %e,
+                path = %key_path.display(),
+                "worker: failed to load encryption key - database opens WITHOUT encryption"
+            );
+            None
+        }
+    };
     let db_path = data_dir.join("lorica.db");
     let store = match ConfigStore::open(&db_path, encryption_key) {
         Ok(s) => s,
@@ -1168,6 +1264,7 @@ fn run_worker(
                     cert_pem: c.cert_pem.clone(),
                     key_pem: c.key_pem.clone(),
                     not_after_epoch: c.not_after.timestamp(),
+                    ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
                 })
                 .collect();
             if let Err(e) = cert_resolver.reload(cert_data) {
@@ -1246,7 +1343,9 @@ fn run_worker(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create command channel runtime");
         rt.block_on(async move {
-            // Create the command channel from the socketpair FD
+            // SAFETY: cmd_fd is the socketpair file descriptor passed by the
+            // supervisor via --cmd-fd CLI arg. It is exclusively owned by this
+            // worker process after fork/exec.
             let mut channel = match unsafe { CommandChannel::from_raw_fd(cmd_fd) } {
                 Ok(ch) => ch,
                 Err(e) => {
@@ -1695,6 +1794,7 @@ fn run_single_process(cli: Cli) {
                         cert_pem: c.cert_pem.clone(),
                         key_pem: c.key_pem.clone(),
                         not_after_epoch: c.not_after.timestamp(),
+                        ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
                     })
                     .collect();
                 if let Err(e) = cert_resolver.reload(cert_data) {

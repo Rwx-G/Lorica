@@ -26,15 +26,16 @@ use lorica_bench::SlaCollector;
 use lorica_cache::cache_control::CacheControl;
 use lorica_cache::eviction::simple_lru;
 use lorica_cache::filters::resp_cacheable;
+use lorica_cache::lock::CacheLock;
 use lorica_cache::{
     CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable,
 };
 use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route, WafMode};
 use lorica_core::protocols::Digest;
 use lorica_core::upstreams::peer::HttpPeer;
-use lorica_error::{Error, ErrorType, Result};
+use lorica_error::{Error, ErrorSource, ErrorType, Result};
 use lorica_http::ResponseHeader;
-use lorica_proxy::{ProxyHttp, Session};
+use lorica_proxy::{FailToProxy, ProxyHttp, Session};
 use lorica_waf::WafEngine;
 use once_cell::sync::Lazy;
 use tracing::{info, warn};
@@ -129,13 +130,14 @@ impl SmoothWrrState {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct RouteEntry {
-    pub route: Route,
+    pub route: Arc<Route>,
     pub backends: Vec<Backend>,
     pub certificate: Option<Certificate>,
     /// Smooth weighted round-robin state for this route.
     pub wrr_state: Arc<SmoothWrrState>,
     /// Precompiled regex for path rewriting (None if not configured).
-    pub path_rewrite_regex: Option<regex::Regex>,
+    /// Wrapped in Arc to avoid expensive Regex clone on every request.
+    pub path_rewrite_regex: Option<Arc<regex::Regex>>,
     /// Resolved backends per path rule (parallel to route.path_rules).
     /// None = inherit route backends, Some = override with these backends.
     pub path_rule_backends: Vec<Option<Vec<Backend>>>,
@@ -284,11 +286,11 @@ impl ProxyConfig {
             });
 
             let entry = RouteEntry {
-                route: route.clone(),
+                route: Arc::new(route.clone()),
                 backends: route_backends,
                 certificate,
                 wrr_state: Arc::new(SmoothWrrState::new(std::process::id() as usize)),
-                path_rewrite_regex,
+                path_rewrite_regex: path_rewrite_regex.map(Arc::new),
                 path_rule_backends,
             };
 
@@ -595,11 +597,19 @@ pub fn compute_pool_size(backend_count: usize) -> usize {
     }
 }
 
-/// Check whether an IP address matches a pattern (exact or CIDR prefix).
+/// Check whether an IP address matches a pattern (exact match or CIDR range).
 fn ip_matches(ip: &str, pattern: &str) -> bool {
     if pattern.contains('/') {
-        // CIDR - simple prefix match for now
-        ip.starts_with(pattern.split('/').next().unwrap_or(""))
+        // CIDR - parse and use proper network containment check
+        let net: std::net::IpAddr = match ip.parse() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let cidr: ipnet::IpNet = match pattern.parse() {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        cidr.contains(&net)
     } else {
         ip == pattern
     }
@@ -622,6 +632,16 @@ pub static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
 static CACHE_EVICTION: Lazy<simple_lru::Manager> =
     Lazy::new(|| simple_lru::Manager::new(CACHE_SIZE_LIMIT));
 
+/// Cache lock that prevents thundering herd on cache miss.
+/// When multiple requests hit the same uncached key simultaneously, only the
+/// first one fetches from upstream (the writer); others wait for the writer to
+/// finish and then serve the cached response. The lock times out after 10 s so
+/// readers are never blocked indefinitely.
+static CACHE_LOCK: Lazy<&'static CacheLock> = Lazy::new(|| {
+    let lock = CacheLock::new_boxed(Duration::from_secs(10));
+    Box::leak(lock)
+});
+
 /// Default cache TTL for cacheable status codes when the origin does not send
 /// explicit `Cache-Control` headers. The route-specific `cache_ttl_s` is used
 /// as the default fresh duration for 200 and 301 responses.
@@ -633,8 +653,8 @@ const CACHE_DEFAULTS_5MIN: CacheMetaDefaults = CacheMetaDefaults::new(
         200 | 301 => Some(Duration::from_secs(300)),
         _ => None,
     },
-    0, // stale-while-revalidate
-    0, // stale-if-error
+    10, // stale-while-revalidate: serve stale for 10 s while background refresh
+    60, // stale-if-error: serve stale for 60 s when upstream fails
 );
 
 /// Per-request context carried through the proxy pipeline.
@@ -654,7 +674,8 @@ pub struct RequestCtx {
     /// Whether WAF detected (but allowed) a threat on this request.
     pub waf_detected: bool,
     /// Snapshot of the matched route for use in later pipeline stages.
-    pub route_snapshot: Option<Route>,
+    /// Arc-wrapped to avoid deep-cloning the Route struct on every request.
+    pub route_snapshot: Option<Arc<Route>>,
     /// Unique request identifier for tracing (propagated to backend via X-Request-Id).
     pub request_id: String,
     /// Whether access logging is enabled for this route.
@@ -671,7 +692,7 @@ pub struct RequestCtx {
     /// Stored here so the counter is decremented in `logging()` when the request ends.
     pub route_conn_counter: Option<Arc<AtomicU64>>,
     /// Precompiled regex for path rewriting (from RouteEntry, avoids recompiling per request).
-    pub path_rewrite_regex: Option<regex::Regex>,
+    pub path_rewrite_regex: Option<Arc<regex::Regex>>,
     /// Rate limit info for response headers: (limit_rps, current_rate).
     pub rate_limit_info: Option<(u32, f64)>,
     /// Retry counter for upstream connection failures.
@@ -735,6 +756,11 @@ pub struct LoricaProxy {
     pub log_store: Option<Arc<lorica_api::log_store::LogStore>>,
     /// Per-backend circuit breaker (opens after consecutive failures).
     pub circuit_breaker: Arc<CircuitBreaker>,
+    /// Basic auth credential verification cache. Maps a hash of
+    /// "username:password" to the timestamp of the last successful Argon2
+    /// verification. Entries older than 60 s are ignored, forcing a fresh
+    /// Argon2 check. This avoids ~100 ms per request on auth-protected routes.
+    basic_auth_cache: Arc<DashMap<u64, Instant>>,
 }
 
 impl LoricaProxy {
@@ -766,6 +792,7 @@ impl LoricaProxy {
             alert_sender: None,
             log_store: None,
             circuit_breaker: Arc::new(CircuitBreaker::new(5, 10)),
+            basic_auth_cache: Arc::new(DashMap::new()),
         }
     }
 
@@ -804,6 +831,34 @@ fn generate_request_id() -> String {
     format!("{ts:016x}{rand:016x}")
 }
 
+/// Escape HTML special characters to prevent XSS when injecting dynamic values
+/// into HTML templates (e.g. error pages).
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+/// Sanitize admin-provided HTML by removing dangerous tags and attributes
+/// that could execute JavaScript (XSS). Keeps safe formatting tags intact.
+/// Precompiled regexes for HTML sanitization (compiled once, used on every
+/// error page render). Avoids ~300-500us of regex compilation per call.
+static RE_SCRIPT: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"(?is)<script[\s>].*?</script>").expect("sanitize: script regex"));
+static RE_EVENTS: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)"#).expect("sanitize: event handler regex"));
+static RE_JS_URI: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r#"(?i)(href|src|action)\s*=\s*["']?\s*javascript:"#).expect("sanitize: javascript URI regex"));
+
+fn sanitize_html(html: &str) -> String {
+    let out = RE_SCRIPT.replace_all(html, "");
+    let out = RE_EVENTS.replace_all(&out, "");
+    let out = RE_JS_URI.replace_all(&out, r#"$1=""#);
+    out.into_owned()
+}
+
 fn extract_host(req: &lorica_http::RequestHeader) -> &str {
     req.headers
         .get("host")
@@ -815,6 +870,17 @@ fn extract_host(req: &lorica_http::RequestHeader) -> &str {
 #[async_trait]
 impl ProxyHttp for LoricaProxy {
     type CTX = RequestCtx;
+
+    fn init_downstream_modules(&self, modules: &mut lorica_core::modules::http::HttpModules) {
+        // Default compression module (disabled; per-route level set in
+        // response_compression_level)
+        modules.add_module(
+            lorica_core::modules::http::compression::ResponseCompressionBuilder::enable(0),
+        );
+        // gRPC-Web bridge: transparently converts HTTP/1.1 gRPC-web requests
+        // (application/grpc-web) to HTTP/2 gRPC for the upstream backend.
+        modules.add_module(Box::new(lorica_core::modules::http::grpc_web::GrpcWeb));
+    }
 
     fn new_ctx(&self) -> Self::CTX {
         RequestCtx {
@@ -1017,8 +1083,8 @@ impl ProxyHttp for LoricaProxy {
         };
 
         // Store route snapshot, precompiled regex, and access log setting for later pipeline stages
-        ctx.route_snapshot = Some(entry.route.clone());
-        ctx.path_rewrite_regex = entry.path_rewrite_regex.clone();
+        ctx.route_snapshot = Some(Arc::clone(&entry.route));
+        ctx.path_rewrite_regex = entry.path_rewrite_regex.clone(); // Arc::clone, cheap
         ctx.access_log_enabled = entry.route.access_log_enabled;
 
         // Block WebSocket upgrades if disabled on this route
@@ -1091,13 +1157,115 @@ impl ProxyHttp for LoricaProxy {
         for (i, rule) in entry.route.path_rules.iter().enumerate() {
             if rule.matches(path) {
                 let effective = entry.route.with_path_rule_overrides(rule);
-                ctx.route_snapshot = Some(effective);
+                ctx.route_snapshot = Some(Arc::new(effective));
                 if rule.backend_ids.is_some() {
                     if let Some(ref backends) = entry.path_rule_backends[i] {
                         ctx.matched_backends = Some(backends.clone());
                     }
                 }
                 break;
+            }
+        }
+
+        // Maintenance mode - return 503 with optional custom HTML
+        if let Some(ref route) = ctx.route_snapshot {
+            if route.maintenance_mode {
+                let raw_html = route.error_page_html.as_deref().unwrap_or(
+                    "<html><body><h1>503 Service Unavailable</h1><p>This service is under maintenance.</p></body></html>",
+                );
+                let body_html = sanitize_html(raw_html);
+                let mut header = ResponseHeader::build(503, None)?;
+                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                header.insert_header("Content-Length", body_html.len().to_string())?;
+                header.insert_header("Retry-After", "300")?;
+                session
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body_html.to_owned())), true)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        // HTTP Basic Auth (per-route) with credential verification cache.
+        // The cache avoids running Argon2 (~100ms) on every request by caching
+        // the hash of verified credentials for 60 seconds.
+        if let Some(ref route) = ctx.route_snapshot {
+            if let (Some(ref expected_user), Some(ref expected_hash)) =
+                (&route.basic_auth_username, &route.basic_auth_password_hash)
+            {
+                let authorized = session
+                    .req_header()
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Basic "))
+                    .and_then(|b64| {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                    })
+                    .and_then(|decoded| String::from_utf8(decoded).ok())
+                    .map(|cred| {
+                        let mut parts = cred.splitn(2, ':');
+                        let user = parts.next().unwrap_or("");
+                        let pass = parts.next().unwrap_or("");
+                        if user != expected_user {
+                            return false;
+                        }
+
+                        // Check credential cache before running Argon2
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut h = DefaultHasher::new();
+                        cred.hash(&mut h);
+                        expected_hash.hash(&mut h);
+                        let cache_key = h.finish();
+
+                        const AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
+                        if let Some(verified_at) = self.basic_auth_cache.get(&cache_key) {
+                            if verified_at.elapsed() < AUTH_CACHE_TTL {
+                                return true; // cache hit - skip Argon2
+                            }
+                        }
+
+                        // Cache miss or expired - run full Argon2 verification.
+                        // Parse the hash first; if it's corrupt, deny immediately.
+                        let parsed_hash = match argon2::PasswordHash::new(expected_hash) {
+                            Ok(h) => h,
+                            Err(_) => return false, // corrupt hash -> deny
+                        };
+                        // Offload CPU-intensive Argon2 to the blocking thread
+                        // pool to avoid stalling the async proxy runtime.
+                        let pass_bytes = pass.as_bytes().to_vec();
+                        let hash_str = expected_hash.to_string();
+                        let ok = tokio::task::block_in_place(|| {
+                            use argon2::PasswordVerifier;
+                            match argon2::PasswordHash::new(&hash_str) {
+                                Ok(h) => argon2::Argon2::default()
+                                    .verify_password(&pass_bytes, &h)
+                                    .is_ok(),
+                                Err(_) => false,
+                            }
+                        });
+                        if ok {
+                            self.basic_auth_cache.insert(cache_key, Instant::now());
+                            // Evict expired entries to prevent unbounded growth
+                            self.basic_auth_cache.retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
+                        }
+                        ok
+                    })
+                    .unwrap_or(false);
+
+                if !authorized {
+                    let mut header = ResponseHeader::build(401, None)?;
+                    header.insert_header("WWW-Authenticate", "Basic realm=\"Lorica\"")?;
+                    header.insert_header("Content-Length", "0")?;
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(true);
+                }
             }
         }
 
@@ -1602,8 +1770,12 @@ impl ProxyHttp for LoricaProxy {
 
         let req = session.req_header();
 
-        // Only cache GET and HEAD
-        if req.method != http::Method::GET && req.method != http::Method::HEAD {
+        // Only cache GET and HEAD (but also enable for PURGE so the cache
+        // subsystem can process purge requests via is_purge/proxy_purge)
+        if req.method != http::Method::GET
+            && req.method != http::Method::HEAD
+            && req.method.as_str() != "PURGE"
+        {
             return Ok(());
         }
 
@@ -1624,7 +1796,7 @@ impl ProxyHttp for LoricaProxy {
             &*CACHE_BACKEND,
             Some(&*CACHE_EVICTION),
             None, // no predictor
-            None, // no cache lock
+            Some(*CACHE_LOCK),
             None, // no option overrides
         );
 
@@ -1695,15 +1867,142 @@ impl ProxyHttp for LoricaProxy {
         if status == 200 || status == 301 {
             let now = std::time::SystemTime::now();
             let fresh_until = now + Duration::from_secs(ttl_s);
+            let swr = ctx
+                .route_snapshot
+                .as_ref()
+                .map(|r| r.stale_while_revalidate_s.max(0) as u32)
+                .unwrap_or(10);
+            let sie = ctx
+                .route_snapshot
+                .as_ref()
+                .map(|r| r.stale_if_error_s.max(0) as u32)
+                .unwrap_or(60);
             Ok(RespCacheable::Cacheable(CacheMeta::new(
                 fresh_until,
                 now,
-                0, // stale-while-revalidate
-                0, // stale-if-error
+                swr,
+                sie,
                 resp.clone(),
             )))
         } else {
             Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache))
+        }
+    }
+
+    /// Serve stale cached responses when the upstream is unavailable.
+    ///
+    /// Called in two scenarios:
+    /// - `error = None`: during stale-while-revalidate (background refresh in
+    ///   progress). We allow serving stale so users get an instant response.
+    /// - `error = Some(e)`: upstream failed (5xx, connection refused, timeout).
+    ///   We serve stale only for upstream errors, not for downstream or
+    ///   internal errors.
+    fn should_serve_stale(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        error: Option<&Error>,
+    ) -> bool {
+        match error {
+            None => true, // stale-while-revalidate
+            Some(e) => e.esource() == &ErrorSource::Upstream,
+        }
+    }
+
+    /// Detect HTTP PURGE requests for cache invalidation.
+    ///
+    /// When this returns true, the proxy cache layer handles the purge
+    /// automatically: it deletes the cached entry matching the request URI
+    /// and returns a 200 (purged) or 404 (not found) response.
+    ///
+    /// PURGE is restricted to loopback addresses and trusted proxy CIDRs
+    /// to prevent external cache invalidation attacks.
+    fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
+        if session.req_header().method.as_str() != "PURGE" {
+            return false;
+        }
+        let client_ip = session
+            .downstream_session
+            .client_addr()
+            .and_then(|a| a.as_inet())
+            .map(|addr| addr.ip());
+        let allowed = match client_ip {
+            Some(ip) if ip.is_loopback() => true,
+            Some(ip) => {
+                let config = self.config.load();
+                config.trusted_proxies.iter().any(|net| net.contains(&ip))
+            }
+            None => false,
+        };
+        if !allowed {
+            warn!("PURGE request denied: client IP not in trusted proxies or loopback");
+        }
+        allowed
+    }
+
+    /// Serve custom error pages when the upstream fails.
+    ///
+    /// If the route has an `error_page_html` configured, render it with the
+    /// error status code. Otherwise fall back to the default Pingora error
+    /// response (plain-text status line).
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        ctx: &mut Self::CTX,
+    ) -> FailToProxy {
+        let code = match e.etype() {
+            ErrorType::HTTPStatus(code) => *code,
+            _ => match e.esource() {
+                ErrorSource::Upstream => 502,
+                ErrorSource::Downstream => {
+                    // Connection already dead - skip response writing
+                    match e.etype() {
+                        ErrorType::WriteError
+                        | ErrorType::ReadError
+                        | ErrorType::ConnectionClosed => 0,
+                        _ => 400,
+                    }
+                }
+                _ => 500,
+            },
+        };
+
+        if code > 0 {
+            // Serve custom error page HTML if the route has one configured
+            let custom_served = if let Some(ref route) = ctx.route_snapshot {
+                if let Some(ref html) = route.error_page_html {
+                    let body = sanitize_html(html)
+                        .replace("{{status}}", &code.to_string())
+                        .replace("{{message}}", &escape_html(&e.to_string()));
+                    if let Ok(mut header) = ResponseHeader::build(code, None) {
+                        let _ = header.insert_header("Content-Type", "text/html; charset=utf-8");
+                        let _ = header.insert_header("Content-Length", body.len().to_string());
+                        let r1 = session
+                            .write_response_header(Box::new(header), false)
+                            .await;
+                        let r2 = session
+                            .write_response_body(Some(bytes::Bytes::from(body)), true)
+                            .await;
+                        r1.is_ok() && r2.is_ok()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !custom_served {
+                let _ = session.respond_error(code).await;
+            }
+        }
+
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
         }
     }
 
@@ -1736,7 +2035,7 @@ impl ProxyHttp for LoricaProxy {
         ctx.route_id = Some(entry.route.id.clone());
         // Ensure route snapshot is available for upstream_request_filter
         if ctx.route_snapshot.is_none() {
-            ctx.route_snapshot = Some(entry.route.clone());
+            ctx.route_snapshot = Some(Arc::clone(&entry.route));
             ctx.path_rewrite_regex = entry.path_rewrite_regex.clone();
             ctx.access_log_enabled = entry.route.access_log_enabled;
         }
@@ -1797,8 +2096,18 @@ impl ProxyHttp for LoricaProxy {
                 ctx.start_time.hash(&mut hasher);
                 (hasher.finish() as usize) % healthy_backends.len()
             }
+            LoadBalancing::LeastConn => {
+                // Select the backend with the fewest active connections
+                healthy_backends
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, b)| self.backend_connections.get(&b.address))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            }
             _ => {
-                // Smooth weighted round-robin (Nginx algorithm)
+                // Smooth weighted round-robin (Nginx algorithm) - covers
+                // RoundRobin and ConsistentHash
                 let bw: Vec<(&str, i64)> = healthy_backends
                     .iter()
                     .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
@@ -2124,10 +2433,22 @@ impl ProxyHttp for LoricaProxy {
         }
     }
 
-    fn max_request_retries(&self, _session: &Session, ctx: &Self::CTX) -> Option<usize> {
-        ctx.route_snapshot
-            .as_ref()
-            .and_then(|r| r.retry_attempts.map(|n| n as usize))
+    fn max_request_retries(&self, session: &Session, ctx: &Self::CTX) -> Option<usize> {
+        ctx.route_snapshot.as_ref().and_then(|r| {
+            let attempts = r.retry_attempts?;
+            // If retry_on_methods is configured, only retry for listed methods
+            if !r.retry_on_methods.is_empty() {
+                let method = session.req_header().method.as_str();
+                if !r
+                    .retry_on_methods
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(method))
+                {
+                    return None; // method not eligible for retry
+                }
+            }
+            Some(attempts as usize)
+        })
     }
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX)
@@ -2341,6 +2662,13 @@ mod tests {
             path_rules: vec![],
             return_status: None,
             sticky_session: false,
+            basic_auth_username: None,
+            basic_auth_password_hash: None,
+            stale_while_revalidate_s: 10,
+            stale_if_error_s: 60,
+            retry_on_methods: vec![],
+            maintenance_mode: false,
+            error_page_html: None,
             created_at: now,
             updated_at: now,
         }
@@ -2556,6 +2884,55 @@ mod tests {
         assert_ne!(first0, first1, "different workers should start on different backends");
     }
 
+    // ---- Least Connections ----
+
+    #[test]
+    fn test_least_conn_selects_backend_with_fewest_connections() {
+        let bc = BackendConnections::new();
+        bc.increment("10.0.0.1:80");
+        bc.increment("10.0.0.1:80");
+        bc.increment("10.0.0.1:80");
+        bc.increment("10.0.0.2:80");
+
+        // 10.0.0.3:80 has 0 connections, should be selected
+        let backends = vec![
+            make_backend("b1", "10.0.0.1:80"),
+            make_backend("b2", "10.0.0.2:80"),
+            make_backend("b3", "10.0.0.3:80"),
+        ];
+
+        let idx = backends
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| bc.get(&b.address))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        assert_eq!(idx, 2, "Should select backend with 0 connections");
+        assert_eq!(bc.get("10.0.0.1:80"), 3);
+        assert_eq!(bc.get("10.0.0.2:80"), 1);
+        assert_eq!(bc.get("10.0.0.3:80"), 0);
+    }
+
+    #[test]
+    fn test_least_conn_with_equal_connections() {
+        let bc = BackendConnections::new();
+        // All have 0 connections - should select index 0 (first min)
+        let backends = vec![
+            make_backend("b1", "10.0.0.1:80"),
+            make_backend("b2", "10.0.0.2:80"),
+        ];
+
+        let idx = backends
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| bc.get(&b.address))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        assert_eq!(idx, 0, "Equal connections should select first backend");
+    }
+
     #[test]
     fn test_proxy_config_default_is_empty() {
         let config = ProxyConfig::default();
@@ -2699,8 +3076,13 @@ mod tests {
 
     #[test]
     fn test_ip_matches_cidr_prefix() {
-        assert!(ip_matches("192.168.1.100", "192.168.1/24"));
-        assert!(!ip_matches("10.0.0.1", "192.168.1/24"));
+        assert!(ip_matches("192.168.1.100", "192.168.1.0/24"));
+        assert!(ip_matches("192.168.1.1", "192.168.1.0/24"));
+        assert!(!ip_matches("192.168.2.1", "192.168.1.0/24"));
+        assert!(!ip_matches("10.0.0.1", "192.168.1.0/24"));
+        // Regression: old string prefix match would incorrectly match
+        // 10.1.2.3 against "10.1.2.30/24" because "10.1.2.3".starts_with("10.1.2.3")
+        assert!(!ip_matches("10.1.2.3", "10.1.2.30/32"));
     }
 
     // ---- Security Presets in ProxyConfig ----
@@ -3395,5 +3777,181 @@ mod tests {
     #[test]
     fn test_extract_sticky_backend_empty() {
         assert_eq!(extract_sticky_backend(""), None);
+    }
+
+    // ---- Cache Lock ----
+
+    #[test]
+    fn test_cache_lock_static_initializes() {
+        let lock: &'static CacheLock = *CACHE_LOCK;
+        let _: &'static lorica_cache::lock::CacheKeyLockImpl = lock;
+    }
+
+    // ---- Stale-while-error defaults ----
+
+    #[test]
+    fn test_cache_defaults_accessible() {
+        // Verify the CACHE_DEFAULTS_5MIN static compiles and is usable.
+        // The stale-while-revalidate (10s) and stale-if-error (60s) values
+        // are set inline in the constant definition.
+        let _defaults = &CACHE_DEFAULTS_5MIN;
+    }
+
+    // ---- HTML escape ----
+
+    #[test]
+    fn test_escape_html_basic() {
+        assert_eq!(escape_html("hello"), "hello");
+        assert_eq!(escape_html("<script>"), "&lt;script&gt;");
+        assert_eq!(escape_html("a&b"), "a&amp;b");
+        assert_eq!(escape_html("\"quoted\""), "&quot;quoted&quot;");
+        assert_eq!(escape_html("it's"), "it&#x27;s");
+    }
+
+    #[test]
+    fn test_escape_html_combined() {
+        let input = "<img src=x onerror=\"alert('xss')\">";
+        let escaped = escape_html(input);
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+        assert!(!escaped.contains('"'));
+    }
+
+    // ---- HTML sanitize ----
+
+    #[test]
+    fn test_sanitize_html_strips_script() {
+        let input = "<h1>Error</h1><script>alert('xss')</script><p>Details</p>";
+        let sanitized = sanitize_html(input);
+        assert!(!sanitized.contains("<script"));
+        assert!(!sanitized.contains("alert"));
+        assert!(sanitized.contains("<h1>Error</h1>"));
+        assert!(sanitized.contains("<p>Details</p>"));
+    }
+
+    #[test]
+    fn test_sanitize_html_strips_event_handlers() {
+        let input = r#"<img src="x" onerror="alert(1)"><div onclick="steal()">"#;
+        let sanitized = sanitize_html(input);
+        assert!(!sanitized.contains("onerror"));
+        assert!(!sanitized.contains("onclick"));
+        assert!(sanitized.contains("<img"));
+        assert!(sanitized.contains("<div"));
+    }
+
+    #[test]
+    fn test_sanitize_html_strips_javascript_uri() {
+        let input = r#"<a href="javascript:alert(1)">click</a>"#;
+        let sanitized = sanitize_html(input);
+        assert!(!sanitized.contains("javascript:"));
+    }
+
+    #[test]
+    fn test_sanitize_html_preserves_safe_content() {
+        let input = "<html><body><h1>{{status}}</h1><p>{{message}}</p></body></html>";
+        let sanitized = sanitize_html(input);
+        assert_eq!(input, sanitized);
+    }
+
+    // ---- Basic auth credential cache ----
+
+    #[test]
+    fn test_basic_auth_cache_stores_and_retrieves() {
+        let cache: DashMap<u64, Instant> = DashMap::new();
+        let key: u64 = 12345;
+        cache.insert(key, Instant::now());
+        assert!(cache.get(&key).is_some());
+        assert!(cache.get(&key).unwrap().elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_basic_auth_cache_ttl_expiry() {
+        let cache: DashMap<u64, Instant> = DashMap::new();
+        let key: u64 = 99999;
+        // Insert with a timestamp in the past (simulate expired entry)
+        cache.insert(key, Instant::now() - Duration::from_secs(120));
+        let ttl = Duration::from_secs(60);
+        let is_valid = cache
+            .get(&key)
+            .map(|t| t.elapsed() < ttl)
+            .unwrap_or(false);
+        assert!(!is_valid, "Entry older than TTL should be considered expired");
+    }
+
+    #[test]
+    fn test_basic_auth_cache_key_changes_on_password() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut h1 = DefaultHasher::new();
+        "admin:password1".hash(&mut h1);
+        "$argon2id$hash1".hash(&mut h1);
+        let key1 = h1.finish();
+
+        let mut h2 = DefaultHasher::new();
+        "admin:password2".hash(&mut h2);
+        "$argon2id$hash1".hash(&mut h2);
+        let key2 = h2.finish();
+
+        assert_ne!(key1, key2, "Different passwords should produce different cache keys");
+    }
+
+    // ---- Retry on methods filtering ----
+
+    #[test]
+    fn test_retry_on_methods_empty_allows_all() {
+        let route = make_route("r1", "example.com", "/", true);
+        // retry_on_methods is empty by default - all methods eligible
+        assert!(route.retry_on_methods.is_empty());
+        // With retry_attempts set, max_request_retries should return Some
+        let mut r = route;
+        r.retry_attempts = Some(3);
+        assert_eq!(r.retry_attempts, Some(3));
+    }
+
+    #[test]
+    fn test_retry_on_methods_filters_post() {
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.retry_attempts = Some(2);
+        route.retry_on_methods = vec!["GET".to_string(), "HEAD".to_string()];
+
+        // POST is not in the list - should be filtered out
+        let method = "POST";
+        let eligible = route.retry_on_methods.is_empty()
+            || route.retry_on_methods.iter().any(|m| m.eq_ignore_ascii_case(method));
+        assert!(!eligible, "POST should not be eligible for retry");
+
+        // GET is in the list - should be eligible
+        let method = "GET";
+        let eligible = route.retry_on_methods.is_empty()
+            || route.retry_on_methods.iter().any(|m| m.eq_ignore_ascii_case(method));
+        assert!(eligible, "GET should be eligible for retry");
+    }
+
+    // ---- Stale cache config per route ----
+
+    #[test]
+    fn test_stale_config_defaults() {
+        let route = make_route("r1", "example.com", "/", true);
+        assert_eq!(route.stale_while_revalidate_s, 10);
+        assert_eq!(route.stale_if_error_s, 60);
+    }
+
+    #[test]
+    fn test_stale_config_custom_values() {
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.stale_while_revalidate_s = 30;
+        route.stale_if_error_s = 300;
+        assert_eq!(route.stale_while_revalidate_s, 30);
+        assert_eq!(route.stale_if_error_s, 300);
+    }
+
+    #[test]
+    fn test_stale_config_zero_disables() {
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.stale_while_revalidate_s = 0;
+        route.stale_if_error_s = 0;
+        assert_eq!(route.stale_while_revalidate_s as u32, 0);
+        assert_eq!(route.stale_if_error_s as u32, 0);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "lorica"
-version = "1.1.0"
+version = "1.2.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -23,24 +23,25 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time", "net"] }
 lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = false }
 lorica-http = { version = "0.1.0", path = "../lorica-http" }
 lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }
 lorica-lb = { version = "0.1.0", path = "../lorica-lb", optional = true, default-features = false }
 lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, default-features = false }
-lorica-config = { version = "1.1.0", path = "../lorica-config" }
-lorica-api = { version = "1.1.0", path = "../lorica-api" }
+lorica-config = { version = "1.2.0", path = "../lorica-config" }
+lorica-api = { version = "1.2.0", path = "../lorica-api" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
-lorica-worker = { version = "1.1.0", path = "../lorica-worker" }
-lorica-command = { version = "1.1.0", path = "../lorica-command" }
+lorica-worker = { version = "1.2.0", path = "../lorica-worker" }
+lorica-command = { version = "1.2.0", path = "../lorica-command" }
 lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
 lorica-notify = { version = "0.1.0", path = "../lorica-notify" }
 lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
 once_cell = { workspace = true }
-lorica-bench = { version = "1.1.0", path = "../lorica-bench" }
+lorica-bench = { version = "1.2.0", path = "../lorica-bench" }
 regex = "1"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "cookies", "json"] }
@@ -49,6 +50,8 @@ futures-util = "0.3"
 arc-swap = "1"
 dashmap = "5"
 parking_lot = "0.12"
+argon2 = "0.5"
+base64 = "0.22"
 async-trait = { workspace = true }
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
