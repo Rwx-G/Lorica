@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## Unreleased
 
+## [1.2.0] - 2026-04-11
+
 ### Added
 
 - Cache lock for thundering herd protection: only one request fetches from upstream on cache miss, others wait for the cached response (10 s timeout)
@@ -228,5 +230,6 @@ Author: Rwx-G
 
 - Windows support removed from forked Pingora crates (Linux-only)
 
+[1.2.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Rwx-G/Lorica/releases/tag/v1.0.0
