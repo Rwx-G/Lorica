@@ -133,16 +133,31 @@ pub async fn reload_cert_resolver(
         }
     };
 
-    let cert_data: Vec<CertData> = db_certs
+    // Build CertData with OCSP staple responses fetched in parallel.
+    // Drop the store lock before doing network I/O.
+    let active_certs: Vec<_> = db_certs
         .iter()
         .filter(|c| active_cert_ids.contains(&c.id))
-        .map(|c| CertData {
+        .cloned()
+        .collect();
+    drop(s);
+
+    let ocsp_futures: Vec<_> = active_certs
+        .iter()
+        .map(|c| lorica_tls::ocsp::try_fetch_ocsp(&c.cert_pem))
+        .collect();
+    let ocsp_responses = futures_util::future::join_all(ocsp_futures).await;
+
+    let cert_data: Vec<CertData> = active_certs
+        .iter()
+        .zip(ocsp_responses)
+        .map(|(c, ocsp)| CertData {
             domain: c.domain.clone(),
             san_domains: c.san_domains.clone(),
             cert_pem: c.cert_pem.clone(),
             key_pem: c.key_pem.clone(),
             not_after_epoch: c.not_after.timestamp(),
-            ocsp_response: None,
+            ocsp_response: ocsp,
         })
         .collect();
 

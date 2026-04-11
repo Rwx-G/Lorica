@@ -146,70 +146,65 @@ enum Commands {
     },
 }
 
+/// Guard that must be held alive for the non-blocking file appender to flush.
+/// Stored in main() to keep it alive for the process lifetime.
+#[allow(dead_code)]
+static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+    std::sync::OnceLock::new();
+
 fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
-    use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
-    if log_format == "text" {
-        // Plain text format (human-readable)
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_timer(tracing_subscriber::fmt::time::SystemTime);
+    // When --log-file is set, write to that file (non-blocking, thread-safe
+    // via tracing-appender). Otherwise write to stdout.
+    if let Some(path) = log_file {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("lorica.log");
+        let file_appender = tracing_appender::rolling::never(dir, filename);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let _ = LOG_GUARD.set(guard);
 
-        if let Some(path) = log_file {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .expect("failed to open log file");
-            let file_layer = tracing_subscriber::fmt::layer()
+        if log_format == "text" {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
                 .with_target(true)
+                .with_thread_ids(true)
+                .with_timer(tracing_subscriber::fmt::time::SystemTime)
                 .with_ansi(false)
-                .with_writer(file);
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt_layer)
-                .with(file_layer)
+                .with_writer(non_blocking)
                 .init();
         } else {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt_layer)
-                .init();
-        }
-    } else {
-        // JSON format (default, machine-readable)
-        let json_layer = tracing_subscriber::fmt::layer()
-            .json()
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_timer(tracing_subscriber::fmt::time::SystemTime);
-
-        if let Some(path) = log_file {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .expect("failed to open log file");
-            let file_layer = tracing_subscriber::fmt::layer()
+            tracing_subscriber::fmt()
                 .json()
+                .with_env_filter(filter)
                 .with_target(true)
-                .with_ansi(false)
-                .with_writer(file);
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(json_layer)
-                .with(file_layer)
-                .init();
-        } else {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(json_layer)
+                .with_thread_ids(true)
+                .with_timer(tracing_subscriber::fmt::time::SystemTime)
+                .with_writer(non_blocking)
                 .init();
         }
+    } else if log_format == "text" {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_timer(tracing_subscriber::fmt::time::SystemTime)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_timer(tracing_subscriber::fmt::time::SystemTime)
+            .init();
     }
 }
 
@@ -1242,7 +1237,7 @@ fn run_worker(
                     cert_pem: c.cert_pem.clone(),
                     key_pem: c.key_pem.clone(),
                     not_after_epoch: c.not_after.timestamp(),
-                    ocsp_response: None,
+                    ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
                 })
                 .collect();
             if let Err(e) = cert_resolver.reload(cert_data) {
@@ -1770,7 +1765,7 @@ fn run_single_process(cli: Cli) {
                         cert_pem: c.cert_pem.clone(),
                         key_pem: c.key_pem.clone(),
                         not_after_epoch: c.not_after.timestamp(),
-                        ocsp_response: None,
+                        ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
                     })
                     .collect();
                 if let Err(e) = cert_resolver.reload(cert_data) {

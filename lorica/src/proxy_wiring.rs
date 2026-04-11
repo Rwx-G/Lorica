@@ -815,6 +815,16 @@ fn generate_request_id() -> String {
     format!("{ts:016x}{rand:016x}")
 }
 
+/// Escape HTML special characters to prevent XSS when injecting dynamic values
+/// into HTML templates (e.g. error pages).
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 fn extract_host(req: &lorica_http::RequestHeader) -> &str {
     req.headers
         .get("host")
@@ -1825,10 +1835,29 @@ impl ProxyHttp for LoricaProxy {
     /// automatically: it deletes the cached entry matching the request URI
     /// and returns a 200 (purged) or 404 (not found) response.
     ///
-    /// Network-level access control (firewall, IP allowlist) should be used
-    /// to restrict who can send PURGE requests.
+    /// PURGE is restricted to loopback addresses and trusted proxy CIDRs
+    /// to prevent external cache invalidation attacks.
     fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
-        session.req_header().method.as_str() == "PURGE"
+        if session.req_header().method.as_str() != "PURGE" {
+            return false;
+        }
+        let client_ip = session
+            .downstream_session
+            .client_addr()
+            .and_then(|a| a.as_inet())
+            .map(|addr| addr.ip());
+        let allowed = match client_ip {
+            Some(ip) if ip.is_loopback() => true,
+            Some(ip) => {
+                let config = self.config.load();
+                config.trusted_proxies.iter().any(|net| net.contains(&ip))
+            }
+            None => false,
+        };
+        if !allowed {
+            warn!("PURGE request denied: client IP not in trusted proxies or loopback");
+        }
+        allowed
     }
 
     /// Serve custom error pages when the upstream fails.
@@ -1846,7 +1875,15 @@ impl ProxyHttp for LoricaProxy {
             ErrorType::HTTPStatus(code) => *code,
             _ => match e.esource() {
                 ErrorSource::Upstream => 502,
-                ErrorSource::Downstream => 400,
+                ErrorSource::Downstream => {
+                    // Connection already dead - skip response writing
+                    match e.etype() {
+                        ErrorType::WriteError
+                        | ErrorType::ReadError
+                        | ErrorType::ConnectionClosed => 0,
+                        _ => 400,
+                    }
+                }
                 _ => 500,
             },
         };
@@ -1857,7 +1894,7 @@ impl ProxyHttp for LoricaProxy {
                 if let Some(ref html) = route.error_page_html {
                     let body = html
                         .replace("{{status}}", &code.to_string())
-                        .replace("{{message}}", e.to_string().as_str());
+                        .replace("{{message}}", &escape_html(&e.to_string()));
                     if let Ok(mut header) = ResponseHeader::build(code, None) {
                         let _ = header.insert_header("Content-Type", "text/html; charset=utf-8");
                         let _ = header.insert_header("Content-Length", body.len().to_string());
@@ -3659,12 +3696,37 @@ mod tests {
 
     #[test]
     fn test_cache_lock_static_initializes() {
-        // CACHE_LOCK is a leaked &'static CacheLock. Verify it initializes
-        // without panicking and produces a valid reference that can be passed
-        // to session.cache.enable().
         let lock: &'static CacheLock = *CACHE_LOCK;
-        // The lock is a trait object-compatible reference; if this compiles
-        // and doesn't panic, the lazy static is correctly wired.
         let _: &'static lorica_cache::lock::CacheKeyLockImpl = lock;
+    }
+
+    // ---- Stale-while-error defaults ----
+
+    #[test]
+    fn test_cache_defaults_accessible() {
+        // Verify the CACHE_DEFAULTS_5MIN static compiles and is usable.
+        // The stale-while-revalidate (10s) and stale-if-error (60s) values
+        // are set inline in the constant definition.
+        let _defaults = &CACHE_DEFAULTS_5MIN;
+    }
+
+    // ---- HTML escape ----
+
+    #[test]
+    fn test_escape_html_basic() {
+        assert_eq!(escape_html("hello"), "hello");
+        assert_eq!(escape_html("<script>"), "&lt;script&gt;");
+        assert_eq!(escape_html("a&b"), "a&amp;b");
+        assert_eq!(escape_html("\"quoted\""), "&quot;quoted&quot;");
+        assert_eq!(escape_html("it's"), "it&#x27;s");
+    }
+
+    #[test]
+    fn test_escape_html_combined() {
+        let input = "<img src=x onerror=\"alert('xss')\">";
+        let escaped = escape_html(input);
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+        assert!(!escaped.contains('"'));
     }
 }
