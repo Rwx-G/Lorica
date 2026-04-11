@@ -1851,8 +1851,18 @@ impl ProxyHttp for LoricaProxy {
                 ctx.start_time.hash(&mut hasher);
                 (hasher.finish() as usize) % healthy_backends.len()
             }
+            LoadBalancing::LeastConn => {
+                // Select the backend with the fewest active connections
+                healthy_backends
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, b)| self.backend_connections.get(&b.address))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            }
             _ => {
-                // Smooth weighted round-robin (Nginx algorithm)
+                // Smooth weighted round-robin (Nginx algorithm) - covers
+                // RoundRobin and ConsistentHash
                 let bw: Vec<(&str, i64)> = healthy_backends
                     .iter()
                     .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
@@ -2608,6 +2618,55 @@ mod tests {
         let first0 = state0.next(&backends);
         let first1 = state1.next(&backends);
         assert_ne!(first0, first1, "different workers should start on different backends");
+    }
+
+    // ---- Least Connections ----
+
+    #[test]
+    fn test_least_conn_selects_backend_with_fewest_connections() {
+        let bc = BackendConnections::new();
+        bc.increment("10.0.0.1:80");
+        bc.increment("10.0.0.1:80");
+        bc.increment("10.0.0.1:80");
+        bc.increment("10.0.0.2:80");
+
+        // 10.0.0.3:80 has 0 connections, should be selected
+        let backends = vec![
+            make_backend("b1", "10.0.0.1:80"),
+            make_backend("b2", "10.0.0.2:80"),
+            make_backend("b3", "10.0.0.3:80"),
+        ];
+
+        let idx = backends
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| bc.get(&b.address))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        assert_eq!(idx, 2, "Should select backend with 0 connections");
+        assert_eq!(bc.get("10.0.0.1:80"), 3);
+        assert_eq!(bc.get("10.0.0.2:80"), 1);
+        assert_eq!(bc.get("10.0.0.3:80"), 0);
+    }
+
+    #[test]
+    fn test_least_conn_with_equal_connections() {
+        let bc = BackendConnections::new();
+        // All have 0 connections - should select index 0 (first min)
+        let backends = vec![
+            make_backend("b1", "10.0.0.1:80"),
+            make_backend("b2", "10.0.0.2:80"),
+        ];
+
+        let idx = backends
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| bc.get(&b.address))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        assert_eq!(idx, 0, "Equal connections should select first backend");
     }
 
     #[test]

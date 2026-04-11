@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use chrono::Utc;
     use tempfile::NamedTempFile;
 
@@ -1533,5 +1535,35 @@ cert_critical_days = 3
 
         let loaded = store.get_route(&route.id).unwrap().unwrap();
         assert!(!loaded.sticky_session, "sticky_session should default to false");
+    }
+
+    #[test]
+    fn test_load_balancing_least_conn_roundtrip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.load_balancing = LoadBalancing::LeastConn;
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(loaded.load_balancing, LoadBalancing::LeastConn);
+    }
+
+    #[test]
+    fn test_load_balancing_from_str() {
+        assert_eq!(
+            LoadBalancing::from_str("least_conn").unwrap(),
+            LoadBalancing::LeastConn
+        );
+        assert_eq!(
+            LoadBalancing::from_str("round_robin").unwrap(),
+            LoadBalancing::RoundRobin
+        );
+        assert!(LoadBalancing::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_load_balancing_as_str() {
+        assert_eq!(LoadBalancing::LeastConn.as_str(), "least_conn");
+        assert_eq!(LoadBalancing::PeakEwma.as_str(), "peak_ewma");
     }
 }

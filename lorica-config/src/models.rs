@@ -13,6 +13,7 @@ pub enum LoadBalancing {
     ConsistentHash,
     Random,
     PeakEwma,
+    LeastConn,
 }
 
 impl LoadBalancing {
@@ -22,6 +23,7 @@ impl LoadBalancing {
             Self::ConsistentHash => "consistent_hash",
             Self::Random => "random",
             Self::PeakEwma => "peak_ewma",
+            Self::LeastConn => "least_conn",
         }
     }
 }
@@ -34,6 +36,7 @@ impl FromStr for LoadBalancing {
             "consistent_hash" => Ok(Self::ConsistentHash),
             "random" => Ok(Self::Random),
             "peak_ewma" => Ok(Self::PeakEwma),
+            "least_conn" => Ok(Self::LeastConn),
             other => Err(format!("unknown load balancing algorithm: {other}")),
         }
     }

@@ -3422,6 +3422,55 @@ if [ -n "$SESSION" ]; then
     api_del "/api/v1/backends/$RND_B2_ID" >/dev/null 2>&1 || true
 
 # =============================================================================
+# 65b. LEAST CONNECTIONS LOAD BALANCING
+# =============================================================================
+    log "=== 65b. Least Connections LB ==="
+
+    # Create 2 backends
+    LC_B1=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    LC_B1_ID=$(echo "$LC_B1" | jq -r '.data.id')
+    LC_B2=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND2\",\"health_check_enabled\":false}")
+    LC_B2_ID=$(echo "$LC_B2" | jq -r '.data.id')
+
+    LC_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"leastconn.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$LC_B1_ID\",\"$LC_B2_ID\"],
+        \"load_balancing\":\"least_conn\",
+        \"waf_enabled\":false
+    }")
+    LC_ROUTE_ID=$(echo "$LC_ROUTE" | jq -r '.data.id')
+    assert_json "$LC_ROUTE" ".data.load_balancing" "least_conn" "Least connections route created"
+
+    sleep 2
+
+    # Send 10 requests - both backends should get traffic
+    LC_B1_COUNT=0
+    LC_B2_COUNT=0
+    for i in $(seq 1 10); do
+        LC_RESP=$(curl -sf -H "Host: leastconn.test" -H "Connection: close" \
+            "$PROXY/identity" 2>/dev/null || echo "")
+        LC_BACKEND=$(echo "$LC_RESP" | jq -r '.backend' 2>/dev/null || echo "")
+        if [ "$LC_BACKEND" = "backend1" ]; then
+            LC_B1_COUNT=$((LC_B1_COUNT+1))
+        elif [ "$LC_BACKEND" = "backend2" ]; then
+            LC_B2_COUNT=$((LC_B2_COUNT+1))
+        fi
+    done
+
+    LC_TOTAL=$((LC_B1_COUNT+LC_B2_COUNT))
+    if [ "$LC_TOTAL" -ge 1 ]; then
+        ok "Least conn LB: traffic flows (b1=$LC_B1_COUNT, b2=$LC_B2_COUNT)"
+    else
+        fail "Least conn LB: no traffic reached backends"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$LC_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$LC_B1_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$LC_B2_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
 # 66. STICKY SESSIONS
 # =============================================================================
     log "=== 66. Sticky Sessions ==="

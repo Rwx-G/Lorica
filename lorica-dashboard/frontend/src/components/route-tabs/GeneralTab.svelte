@@ -21,6 +21,7 @@
     { value: 'consistent_hash', label: 'Consistent Hash' },
     { value: 'random', label: 'Random' },
     { value: 'peak_ewma', label: 'Peak EWMA' },
+    { value: 'least_conn', label: 'Least Connections' },
   ];
 
   function handleHostnameBlur() {
