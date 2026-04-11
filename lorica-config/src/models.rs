@@ -423,6 +423,10 @@ pub struct Route {
     /// When enabled, a `LORICA_SRV` cookie is set with the backend ID.
     #[serde(default)]
     pub sticky_session: bool,
+    #[serde(default)]
+    pub basic_auth_username: Option<String>,
+    #[serde(default)]
+    pub basic_auth_password_hash: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1337,6 +1341,8 @@ mod tests {
             path_rules: vec![],
             return_status: None,
             sticky_session: false,
+            basic_auth_username: None,
+            basic_auth_password_hash: None,
             created_at: now,
             updated_at: now,
         };

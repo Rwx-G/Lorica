@@ -61,6 +61,8 @@ export interface RouteFormState {
   path_rules: PathRuleFormState[];
   return_status: string;
   sticky_session: boolean;
+  basic_auth_username: string;
+  basic_auth_password: string;
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -110,6 +112,8 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   path_rules: [],
   return_status: '',
   sticky_session: false,
+  basic_auth_username: '',
+  basic_auth_password: '',
 };
 
 // Tab field mappings for dot indicators
@@ -126,6 +130,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   security: [
     'security_headers', 'max_body_mb', 'rate_limit_rps',
     'rate_limit_burst', 'ip_allowlist', 'ip_denylist',
+    'basic_auth_username', 'basic_auth_password',
   ],
   headers: [
     'proxy_headers', 'proxy_headers_remove',
@@ -229,6 +234,8 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     })),
     return_status: route.return_status != null ? String(route.return_status) : '',
     sticky_session: route.sticky_session ?? false,
+    basic_auth_username: route.basic_auth_username ?? '',
+    basic_auth_password: '',
   };
 }
 
@@ -294,6 +301,8 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     path_rules: pathRuleFormToRequest(form.path_rules) ?? (isUpdate ? [] : undefined),
     return_status: form.return_status ? Number(form.return_status) : empty(0),
     sticky_session: form.sticky_session,
+    basic_auth_username: form.basic_auth_username || undefined,
+    basic_auth_password: form.basic_auth_password || undefined,
   };
 }
 

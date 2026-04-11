@@ -1123,6 +1123,56 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
+        // HTTP Basic Auth (per-route)
+        if let Some(ref route) = ctx.route_snapshot {
+            if let (Some(ref expected_user), Some(ref expected_hash)) =
+                (&route.basic_auth_username, &route.basic_auth_password_hash)
+            {
+                let authorized = session
+                    .req_header()
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Basic "))
+                    .and_then(|b64| {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                    })
+                    .and_then(|decoded| String::from_utf8(decoded).ok())
+                    .map(|cred| {
+                        let mut parts = cred.splitn(2, ':');
+                        let user = parts.next().unwrap_or("");
+                        let pass = parts.next().unwrap_or("");
+                        if user != expected_user {
+                            return false;
+                        }
+                        use argon2::PasswordVerifier;
+                        argon2::Argon2::default()
+                            .verify_password(
+                                pass.as_bytes(),
+                                &argon2::PasswordHash::new(expected_hash)
+                                    .unwrap_or_else(|_| {
+                                        // Invalid hash format - deny access
+                                        argon2::PasswordHash::new("$argon2id$v=19$m=1,t=1,p=1$AAAA$AAAA")
+                                            .unwrap()
+                                    }),
+                            )
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+
+                if !authorized {
+                    let mut header = ResponseHeader::build(401, None)?;
+                    header.insert_header("WWW-Authenticate", "Basic realm=\"Lorica\"")?;
+                    header.insert_header("Content-Length", "0")?;
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
+
         // Direct status response (return_status)
         if let Some(status) = ctx.route_snapshot.as_ref().and_then(|r| r.return_status) {
             ctx.block_reason = Some(format!("return_status {status}"));
@@ -2405,6 +2455,8 @@ mod tests {
             path_rules: vec![],
             return_status: None,
             sticky_session: false,
+            basic_auth_username: None,
+            basic_auth_password_hash: None,
             created_at: now,
             updated_at: now,
         }

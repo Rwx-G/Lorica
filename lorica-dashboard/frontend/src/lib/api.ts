@@ -149,6 +149,7 @@ export interface RouteResponse {
   path_rules: PathRuleResponse[];
   return_status: number | null;
   sticky_session: boolean;
+  basic_auth_username: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -199,6 +200,8 @@ export interface CreateRouteRequest {
   path_rules?: PathRuleRequest[];
   return_status?: number;
   sticky_session?: boolean;
+  basic_auth_username?: string;
+  basic_auth_password?: string;
 }
 
 export interface UpdateRouteRequest {
@@ -248,6 +251,8 @@ export interface UpdateRouteRequest {
   path_rules?: PathRuleRequest[];
   return_status?: number;
   sticky_session?: boolean;
+  basic_auth_username?: string;
+  basic_auth_password?: string;
 }
 
 export interface BackendResponse {

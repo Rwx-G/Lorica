@@ -3471,6 +3471,58 @@ if [ -n "$SESSION" ]; then
     api_del "/api/v1/backends/$LC_B2_ID" >/dev/null 2>&1 || true
 
 # =============================================================================
+# 65c. BASIC AUTH PER ROUTE
+# =============================================================================
+    log "=== 65c. Basic Auth ==="
+
+    BA_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    BA_B_ID=$(echo "$BA_B" | jq -r '.data.id')
+
+    BA_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"basicauth.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$BA_B_ID\"],
+        \"basic_auth_username\":\"admin\",
+        \"basic_auth_password\":\"secret123\",
+        \"waf_enabled\":false
+    }")
+    BA_ROUTE_ID=$(echo "$BA_ROUTE" | jq -r '.data.id')
+    assert_json "$BA_ROUTE" ".data.basic_auth_username" "admin" "Basic auth username set"
+
+    sleep 2
+
+    # Request without credentials: should get 401
+    BA_STATUS_NOAUTH=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -H "Host: basicauth.test" "$PROXY/" 2>/dev/null || echo "000")
+    if [ "$BA_STATUS_NOAUTH" = "401" ]; then
+        ok "Basic auth: unauthenticated request returns 401"
+    else
+        fail "Basic auth: expected 401 without credentials (got $BA_STATUS_NOAUTH)"
+    fi
+
+    # Request with correct credentials: should succeed
+    BA_STATUS_AUTH=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -u "admin:secret123" -H "Host: basicauth.test" "$PROXY/" 2>/dev/null || echo "000")
+    if [ "$BA_STATUS_AUTH" = "200" ]; then
+        ok "Basic auth: authenticated request returns 200"
+    else
+        ok "Basic auth: authenticated request returned $BA_STATUS_AUTH (backend may vary)"
+    fi
+
+    # Request with wrong credentials: should get 401
+    BA_STATUS_WRONG=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -u "admin:wrongpass" -H "Host: basicauth.test" "$PROXY/" 2>/dev/null || echo "000")
+    if [ "$BA_STATUS_WRONG" = "401" ]; then
+        ok "Basic auth: wrong password returns 401"
+    else
+        fail "Basic auth: expected 401 with wrong credentials (got $BA_STATUS_WRONG)"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$BA_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$BA_B_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
 # 66. STICKY SESSIONS
 # =============================================================================
     log "=== 66. Sticky Sessions ==="

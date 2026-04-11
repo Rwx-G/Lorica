@@ -98,6 +98,8 @@ pub struct RouteResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_status: Option<u16>,
     pub sticky_session: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basic_auth_username: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -149,6 +151,8 @@ pub struct CreateRouteRequest {
     pub path_rules: Option<Vec<PathRuleRequest>>,
     pub return_status: Option<u16>,
     pub sticky_session: Option<bool>,
+    pub basic_auth_username: Option<String>,
+    pub basic_auth_password: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +203,8 @@ pub struct UpdateRouteRequest {
     pub path_rules: Option<Vec<PathRuleRequest>>,
     pub return_status: Option<u16>,
     pub sticky_session: Option<bool>,
+    pub basic_auth_username: Option<String>,
+    pub basic_auth_password: Option<String>,
 }
 
 fn route_to_response(
@@ -269,6 +275,7 @@ fn route_to_response(
             .collect(),
         return_status: route.return_status,
         sticky_session: route.sticky_session,
+        basic_auth_username: route.basic_auth_username.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -395,6 +402,12 @@ pub async fn create_route(
         path_rules,
         return_status: body.return_status,
         sticky_session: body.sticky_session.unwrap_or(false),
+        basic_auth_username: body.basic_auth_username.clone(),
+        basic_auth_password_hash: if let Some(ref pw) = body.basic_auth_password {
+            Some(crate::auth::hash_password(pw)?)
+        } else {
+            None
+        },
         created_at: now,
         updated_at: now,
     };
@@ -627,6 +640,16 @@ pub async fn update_route(
     }
     if let Some(sticky) = body.sticky_session {
         route.sticky_session = sticky;
+    }
+    if let Some(ref username) = body.basic_auth_username {
+        route.basic_auth_username = if username.is_empty() { None } else { Some(username.clone()) };
+    }
+    if let Some(ref password) = body.basic_auth_password {
+        route.basic_auth_password_hash = if password.is_empty() {
+            None
+        } else {
+            Some(crate::auth::hash_password(password)?)
+        };
     }
     route.updated_at = Utc::now();
 

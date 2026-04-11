@@ -60,6 +60,8 @@ mod tests {
             path_rules: vec![],
             return_status: None,
             sticky_session: false,
+            basic_auth_username: None,
+            basic_auth_password_hash: None,
             created_at: now,
             updated_at: now,
         }
@@ -1565,5 +1567,50 @@ cert_critical_days = 3
     fn test_load_balancing_as_str() {
         assert_eq!(LoadBalancing::LeastConn.as_str(), "least_conn");
         assert_eq!(LoadBalancing::PeakEwma.as_str(), "peak_ewma");
+    }
+
+    #[test]
+    fn test_basic_auth_roundtrip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.basic_auth_username = Some("admin".to_string());
+        route.basic_auth_password_hash = Some("$argon2id$v=19$m=19456,t=2,p=1$salt$hash".to_string());
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(loaded.basic_auth_username.as_deref(), Some("admin"));
+        assert_eq!(
+            loaded.basic_auth_password_hash.as_deref(),
+            Some("$argon2id$v=19$m=19456,t=2,p=1$salt$hash")
+        );
+    }
+
+    #[test]
+    fn test_basic_auth_default_none() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.basic_auth_username.is_none());
+        assert!(loaded.basic_auth_password_hash.is_none());
+    }
+
+    #[test]
+    fn test_basic_auth_clear() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.basic_auth_username = Some("user".to_string());
+        route.basic_auth_password_hash = Some("hash".to_string());
+        store.create_route(&route).unwrap();
+
+        let mut updated = store.get_route(&route.id).unwrap().unwrap();
+        updated.basic_auth_username = None;
+        updated.basic_auth_password_hash = None;
+        store.update_route(&updated).unwrap();
+
+        let reloaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(reloaded.basic_auth_username.is_none());
+        assert!(reloaded.basic_auth_password_hash.is_none());
     }
 }
