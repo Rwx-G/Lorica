@@ -831,6 +831,21 @@ fn escape_html(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
+/// Sanitize admin-provided HTML by removing dangerous tags and attributes
+/// that could execute JavaScript (XSS). Keeps safe formatting tags intact.
+fn sanitize_html(html: &str) -> String {
+    // Strip <script>...</script> blocks (case-insensitive, including multiline)
+    let re_script = regex::Regex::new(r"(?is)<script[\s>].*?</script>").unwrap();
+    let out = re_script.replace_all(html, "");
+    // Strip event handler attributes (onclick, onerror, onload, etc.)
+    let re_events = regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
+    let out = re_events.replace_all(&out, "");
+    // Strip javascript: URIs in href/src/action attributes
+    let re_js_uri = regex::Regex::new(r#"(?i)(href|src|action)\s*=\s*["']?\s*javascript:"#).unwrap();
+    let out = re_js_uri.replace_all(&out, r#"$1=""#);
+    out.into_owned()
+}
+
 fn extract_host(req: &lorica_http::RequestHeader) -> &str {
     req.headers
         .get("host")
@@ -1142,9 +1157,10 @@ impl ProxyHttp for LoricaProxy {
         // Maintenance mode - return 503 with optional custom HTML
         if let Some(ref route) = ctx.route_snapshot {
             if route.maintenance_mode {
-                let body_html = route.error_page_html.as_deref().unwrap_or(
+                let raw_html = route.error_page_html.as_deref().unwrap_or(
                     "<html><body><h1>503 Service Unavailable</h1><p>This service is under maintenance.</p></body></html>",
                 );
+                let body_html = sanitize_html(raw_html);
                 let mut header = ResponseHeader::build(503, None)?;
                 header.insert_header("Content-Type", "text/html; charset=utf-8")?;
                 header.insert_header("Content-Length", body_html.len().to_string())?;
@@ -1941,7 +1957,7 @@ impl ProxyHttp for LoricaProxy {
             // Serve custom error page HTML if the route has one configured
             let custom_served = if let Some(ref route) = ctx.route_snapshot {
                 if let Some(ref html) = route.error_page_html {
-                    let body = html
+                    let body = sanitize_html(html)
                         .replace("{{status}}", &code.to_string())
                         .replace("{{message}}", &escape_html(&e.to_string()));
                     if let Ok(mut header) = ResponseHeader::build(code, None) {
@@ -3779,6 +3795,42 @@ mod tests {
         assert!(!escaped.contains('<'));
         assert!(!escaped.contains('>'));
         assert!(!escaped.contains('"'));
+    }
+
+    // ---- HTML sanitize ----
+
+    #[test]
+    fn test_sanitize_html_strips_script() {
+        let input = "<h1>Error</h1><script>alert('xss')</script><p>Details</p>";
+        let sanitized = sanitize_html(input);
+        assert!(!sanitized.contains("<script"));
+        assert!(!sanitized.contains("alert"));
+        assert!(sanitized.contains("<h1>Error</h1>"));
+        assert!(sanitized.contains("<p>Details</p>"));
+    }
+
+    #[test]
+    fn test_sanitize_html_strips_event_handlers() {
+        let input = r#"<img src="x" onerror="alert(1)"><div onclick="steal()">"#;
+        let sanitized = sanitize_html(input);
+        assert!(!sanitized.contains("onerror"));
+        assert!(!sanitized.contains("onclick"));
+        assert!(sanitized.contains("<img"));
+        assert!(sanitized.contains("<div"));
+    }
+
+    #[test]
+    fn test_sanitize_html_strips_javascript_uri() {
+        let input = r#"<a href="javascript:alert(1)">click</a>"#;
+        let sanitized = sanitize_html(input);
+        assert!(!sanitized.contains("javascript:"));
+    }
+
+    #[test]
+    fn test_sanitize_html_preserves_safe_content() {
+        let input = "<html><body><h1>{{status}}</h1><p>{{message}}</p></body></html>";
+        let sanitized = sanitize_html(input);
+        assert_eq!(input, sanitized);
     }
 
     // ---- Basic auth credential cache ----

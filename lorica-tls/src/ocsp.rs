@@ -118,9 +118,35 @@ pub async fn fetch_ocsp_response(
         .await
         .map_err(|e| format!("read OCSP response: {e}"))?;
 
-    // Basic validation: OCSP response must start with a SEQUENCE tag (0x30)
-    if bytes.first() != Some(&0x30) {
+    // Validate OCSP response structure (RFC 6960 section 4.2.1):
+    // OCSPResponse ::= SEQUENCE { responseStatus ENUMERATED, ... }
+    // The response must be a DER SEQUENCE (0x30) and the responseStatus
+    // (first field, ENUMERATED tag 0x0A) must be 0 (successful).
+    if bytes.len() < 5 {
+        return Err("OCSP response too short".to_string());
+    }
+    if bytes[0] != 0x30 {
         return Err("invalid OCSP response (not a DER SEQUENCE)".to_string());
+    }
+    // Find the responseStatus ENUMERATED field. It follows the SEQUENCE
+    // length bytes (1-3 bytes depending on total length).
+    let status_offset = if bytes[1] < 0x80 {
+        2 // short form: 1-byte length
+    } else if bytes[1] == 0x81 {
+        3 // long form: 2 header bytes + 1 length byte
+    } else {
+        4 // long form: 2 header bytes + 2 length bytes
+    };
+    if bytes.len() <= status_offset + 2 {
+        return Err("OCSP response too short for status field".to_string());
+    }
+    // ENUMERATED tag (0x0A), length 1, value must be 0 (successful)
+    if bytes[status_offset] != 0x0A || bytes[status_offset + 2] != 0x00 {
+        let status = bytes.get(status_offset + 2).copied().unwrap_or(0xFF);
+        return Err(format!(
+            "OCSP response status is {} (expected 0 = successful)",
+            status
+        ));
     }
 
     Ok(bytes.to_vec())

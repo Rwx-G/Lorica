@@ -158,6 +158,9 @@ pub struct CreateRouteRequest {
     pub return_status: Option<u16>,
     pub sticky_session: Option<bool>,
     pub basic_auth_username: Option<String>,
+    /// Plaintext password - hashed with Argon2id before storage. Never stored
+    /// or logged in cleartext. The management API binds to localhost only;
+    /// ensure TLS or SSH tunnel if accessing remotely.
     pub basic_auth_password: Option<String>,
     pub stale_while_revalidate_s: Option<i32>,
     pub stale_if_error_s: Option<i32>,
@@ -215,6 +218,7 @@ pub struct UpdateRouteRequest {
     pub return_status: Option<u16>,
     pub sticky_session: Option<bool>,
     pub basic_auth_username: Option<String>,
+    /// Plaintext password - hashed with Argon2id before storage.
     pub basic_auth_password: Option<String>,
     pub stale_while_revalidate_s: Option<i32>,
     pub stale_if_error_s: Option<i32>,

@@ -157,8 +157,31 @@ fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
-    // When --log-file is set, write to that file (non-blocking, thread-safe
-    // via tracing-appender). Otherwise write to stdout.
+    // Build the writer: file (non-blocking, thread-safe) or stdout.
+    macro_rules! build_subscriber {
+        ($writer:expr, $ansi:expr) => {
+            if log_format == "text" {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_target(true)
+                    .with_thread_ids(true)
+                    .with_timer(tracing_subscriber::fmt::time::SystemTime)
+                    .with_ansi($ansi)
+                    .with_writer($writer)
+                    .init();
+            } else {
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(filter)
+                    .with_target(true)
+                    .with_thread_ids(true)
+                    .with_timer(tracing_subscriber::fmt::time::SystemTime)
+                    .with_writer($writer)
+                    .init();
+            }
+        };
+    }
+
     if let Some(path) = log_file {
         let dir = std::path::Path::new(path)
             .parent()
@@ -170,41 +193,9 @@ fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
         let file_appender = tracing_appender::rolling::never(dir, filename);
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
         let _ = LOG_GUARD.set(guard);
-
-        if log_format == "text" {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(true)
-                .with_thread_ids(true)
-                .with_timer(tracing_subscriber::fmt::time::SystemTime)
-                .with_ansi(false)
-                .with_writer(non_blocking)
-                .init();
-        } else {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter)
-                .with_target(true)
-                .with_thread_ids(true)
-                .with_timer(tracing_subscriber::fmt::time::SystemTime)
-                .with_writer(non_blocking)
-                .init();
-        }
-    } else if log_format == "text" {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_timer(tracing_subscriber::fmt::time::SystemTime)
-            .init();
+        build_subscriber!(non_blocking, false);
     } else {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_timer(tracing_subscriber::fmt::time::SystemTime)
-            .init();
+        build_subscriber!(std::io::stdout, true);
     }
 }
 
