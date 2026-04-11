@@ -846,11 +846,11 @@ fn escape_html(s: &str) -> String {
 /// Precompiled regexes for HTML sanitization (compiled once, used on every
 /// error page render). Avoids ~300-500us of regex compilation per call.
 static RE_SCRIPT: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r"(?is)<script[\s>].*?</script>").unwrap());
+    Lazy::new(|| regex::Regex::new(r"(?is)<script[\s>].*?</script>").expect("sanitize: script regex"));
 static RE_EVENTS: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)"#).unwrap());
+    Lazy::new(|| regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)"#).expect("sanitize: event handler regex"));
 static RE_JS_URI: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r#"(?i)(href|src|action)\s*=\s*["']?\s*javascript:"#).unwrap());
+    Lazy::new(|| regex::Regex::new(r#"(?i)(href|src|action)\s*=\s*["']?\s*javascript:"#).expect("sanitize: javascript URI regex"));
 
 fn sanitize_html(html: &str) -> String {
     let out = RE_SCRIPT.replace_all(html, "");
