@@ -1734,8 +1734,12 @@ impl ProxyHttp for LoricaProxy {
 
         let req = session.req_header();
 
-        // Only cache GET and HEAD
-        if req.method != http::Method::GET && req.method != http::Method::HEAD {
+        // Only cache GET and HEAD (but also enable for PURGE so the cache
+        // subsystem can process purge requests via is_purge/proxy_purge)
+        if req.method != http::Method::GET
+            && req.method != http::Method::HEAD
+            && req.method.as_str() != "PURGE"
+        {
             return Ok(());
         }
 

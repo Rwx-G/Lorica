@@ -3541,24 +3541,20 @@ if [ -n "$SESSION" ]; then
     MT_ROUTE_ID=$(echo "$MT_ROUTE" | jq -r '.data.id')
     assert_json "$MT_ROUTE" ".data.maintenance_mode" "true" "Maintenance mode enabled"
 
-    # Wait for config reload to propagate the new route
-    sleep 4
-
-    # Request should get 503 with custom HTML
-    MT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "000")
+    # Wait for config reload with polling (up to 15s)
+    MT_STATUS="000"
+    for i in $(seq 1 15); do
+        MT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+            -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "000")
+        if [ "$MT_STATUS" = "503" ]; then
+            break
+        fi
+        sleep 1
+    done
     if [ "$MT_STATUS" = "503" ]; then
         ok "Maintenance mode: returns 503"
     else
-        # Retry once after extra wait (config reload timing can vary)
-        sleep 3
-        MT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-            -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "000")
-        if [ "$MT_STATUS" = "503" ]; then
-            ok "Maintenance mode: returns 503 (after retry)"
-        else
-            fail "Maintenance mode: expected 503 (got $MT_STATUS)"
-        fi
+        fail "Maintenance mode: expected 503 (got $MT_STATUS)"
     fi
 
     MT_BODY=$(curl -sf --max-time 5 \
