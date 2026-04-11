@@ -47,6 +47,9 @@ Author: Rwx-G
 - Frontend TypeScript types synchronized with Rust API: WafEvent (route_hostname, action), ProxyInfo (http_port, https_port), GlobalSettings (waf_whitelist_ips), route-form test fixture (v1.2.0 fields)
 - Supervisor mutex poison recovery: worker monitor and shutdown no longer panic on poisoned mutex, recover gracefully with warning log
 - Encryption key load failure now logs an explicit error instead of silently falling back to unencrypted storage
+- Prometheus metric creation uses `expect()` instead of `unwrap()` for better startup diagnostics
+- `log_store.rs` `copy_to_sql` handles conversion errors gracefully instead of panicking
+- SLA CSV export response builder uses `expect()` instead of `unwrap()`
 
 ## [1.1.0] - 2026-04-10
 

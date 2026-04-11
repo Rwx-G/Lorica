@@ -36,7 +36,7 @@ static HTTP_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
         prometheus::opts!("http_requests_total", "Total HTTP requests proxied").namespace("lorica"),
         &["route_id", "status_code"],
     )
-    .unwrap();
+    .expect("prometheus metric creation");
     REGISTRY.register(Box::new(counter.clone())).ok();
     counter
 });
@@ -54,7 +54,7 @@ static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
         ]),
         &["route_id"],
     )
-    .unwrap();
+    .expect("prometheus metric creation");
     REGISTRY.register(Box::new(histogram.clone())).ok();
     histogram
 });
@@ -68,7 +68,7 @@ static ACTIVE_CONNECTIONS: Lazy<IntGauge> = Lazy::new(|| {
         )
         .namespace("lorica"),
     )
-    .unwrap();
+    .expect("prometheus metric creation");
     REGISTRY.register(Box::new(gauge.clone())).ok();
     gauge
 });
@@ -83,7 +83,7 @@ static BACKEND_HEALTH: Lazy<GaugeVec> = Lazy::new(|| {
         .namespace("lorica"),
         &["backend_id", "address"],
     )
-    .unwrap();
+    .expect("prometheus metric creation");
     REGISTRY.register(Box::new(gauge.clone())).ok();
     gauge
 });
@@ -98,7 +98,7 @@ static CERT_EXPIRY_DAYS: Lazy<GaugeVec> = Lazy::new(|| {
         .namespace("lorica"),
         &["domain"],
     )
-    .unwrap();
+    .expect("prometheus metric creation");
     REGISTRY.register(Box::new(gauge.clone())).ok();
     gauge
 });
@@ -109,7 +109,7 @@ static WAF_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
         prometheus::opts!("waf_events_total", "Total WAF events").namespace("lorica"),
         &["category", "action"],
     )
-    .unwrap();
+    .expect("prometheus metric creation");
     REGISTRY.register(Box::new(counter.clone())).ok();
     counter
 });
@@ -124,7 +124,7 @@ static EWMA_SCORE: Lazy<GaugeVec> = Lazy::new(|| {
         .namespace("lorica"),
         &["backend_address"],
     )
-    .unwrap();
+    .expect("prometheus metric creation");
     REGISTRY.register(Box::new(gauge.clone())).ok();
     gauge
 });
@@ -140,7 +140,7 @@ static SYSTEM_CPU_PERCENT: Lazy<prometheus::Gauge> = Lazy::new(|| {
         prometheus::Opts::new("system_cpu_percent", "System CPU usage percentage")
             .namespace("lorica"),
     )
-    .unwrap();
+    .expect("prometheus metric creation");
     REGISTRY.register(Box::new(gauge.clone())).ok();
     gauge
 });
@@ -151,7 +151,7 @@ static SYSTEM_MEMORY_USED_BYTES: Lazy<IntGauge> = Lazy::new(|| {
         prometheus::Opts::new("system_memory_used_bytes", "System memory used in bytes")
             .namespace("lorica"),
     )
-    .unwrap();
+    .expect("prometheus metric creation");
     REGISTRY.register(Box::new(gauge.clone())).ok();
     gauge
 });

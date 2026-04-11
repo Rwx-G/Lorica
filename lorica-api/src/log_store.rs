@@ -552,7 +552,7 @@ impl LogStore {
 /// We only store String and i64 values, so this covers all cases.
 fn copy_to_sql(val: &dyn rusqlite::types::ToSql) -> Box<dyn rusqlite::types::ToSql> {
     use rusqlite::types::{ToSqlOutput, Value};
-    match val.to_sql().unwrap() {
+    match val.to_sql().unwrap_or(ToSqlOutput::Owned(Value::Null)) {
         ToSqlOutput::Owned(Value::Text(s)) => Box::new(s),
         ToSqlOutput::Owned(Value::Integer(i)) => Box::new(i),
         ToSqlOutput::Borrowed(rusqlite::types::ValueRef::Text(b)) => {
