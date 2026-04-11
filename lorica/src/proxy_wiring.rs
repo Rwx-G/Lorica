@@ -130,13 +130,14 @@ impl SmoothWrrState {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct RouteEntry {
-    pub route: Route,
+    pub route: Arc<Route>,
     pub backends: Vec<Backend>,
     pub certificate: Option<Certificate>,
     /// Smooth weighted round-robin state for this route.
     pub wrr_state: Arc<SmoothWrrState>,
     /// Precompiled regex for path rewriting (None if not configured).
-    pub path_rewrite_regex: Option<regex::Regex>,
+    /// Wrapped in Arc to avoid expensive Regex clone on every request.
+    pub path_rewrite_regex: Option<Arc<regex::Regex>>,
     /// Resolved backends per path rule (parallel to route.path_rules).
     /// None = inherit route backends, Some = override with these backends.
     pub path_rule_backends: Vec<Option<Vec<Backend>>>,
@@ -285,11 +286,11 @@ impl ProxyConfig {
             });
 
             let entry = RouteEntry {
-                route: route.clone(),
+                route: Arc::new(route.clone()),
                 backends: route_backends,
                 certificate,
                 wrr_state: Arc::new(SmoothWrrState::new(std::process::id() as usize)),
-                path_rewrite_regex,
+                path_rewrite_regex: path_rewrite_regex.map(Arc::new),
                 path_rule_backends,
             };
 
@@ -596,11 +597,19 @@ pub fn compute_pool_size(backend_count: usize) -> usize {
     }
 }
 
-/// Check whether an IP address matches a pattern (exact or CIDR prefix).
+/// Check whether an IP address matches a pattern (exact match or CIDR range).
 fn ip_matches(ip: &str, pattern: &str) -> bool {
     if pattern.contains('/') {
-        // CIDR - simple prefix match for now
-        ip.starts_with(pattern.split('/').next().unwrap_or(""))
+        // CIDR - parse and use proper network containment check
+        let net: std::net::IpAddr = match ip.parse() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let cidr: ipnet::IpNet = match pattern.parse() {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        cidr.contains(&net)
     } else {
         ip == pattern
     }
@@ -665,7 +674,8 @@ pub struct RequestCtx {
     /// Whether WAF detected (but allowed) a threat on this request.
     pub waf_detected: bool,
     /// Snapshot of the matched route for use in later pipeline stages.
-    pub route_snapshot: Option<Route>,
+    /// Arc-wrapped to avoid deep-cloning the Route struct on every request.
+    pub route_snapshot: Option<Arc<Route>>,
     /// Unique request identifier for tracing (propagated to backend via X-Request-Id).
     pub request_id: String,
     /// Whether access logging is enabled for this route.
@@ -682,7 +692,7 @@ pub struct RequestCtx {
     /// Stored here so the counter is decremented in `logging()` when the request ends.
     pub route_conn_counter: Option<Arc<AtomicU64>>,
     /// Precompiled regex for path rewriting (from RouteEntry, avoids recompiling per request).
-    pub path_rewrite_regex: Option<regex::Regex>,
+    pub path_rewrite_regex: Option<Arc<regex::Regex>>,
     /// Rate limit info for response headers: (limit_rps, current_rate).
     pub rate_limit_info: Option<(u32, f64)>,
     /// Retry counter for upstream connection failures.
@@ -833,16 +843,19 @@ fn escape_html(s: &str) -> String {
 
 /// Sanitize admin-provided HTML by removing dangerous tags and attributes
 /// that could execute JavaScript (XSS). Keeps safe formatting tags intact.
+/// Precompiled regexes for HTML sanitization (compiled once, used on every
+/// error page render). Avoids ~300-500us of regex compilation per call.
+static RE_SCRIPT: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"(?is)<script[\s>].*?</script>").unwrap());
+static RE_EVENTS: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)"#).unwrap());
+static RE_JS_URI: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r#"(?i)(href|src|action)\s*=\s*["']?\s*javascript:"#).unwrap());
+
 fn sanitize_html(html: &str) -> String {
-    // Strip <script>...</script> blocks (case-insensitive, including multiline)
-    let re_script = regex::Regex::new(r"(?is)<script[\s>].*?</script>").unwrap();
-    let out = re_script.replace_all(html, "");
-    // Strip event handler attributes (onclick, onerror, onload, etc.)
-    let re_events = regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)"#).unwrap();
-    let out = re_events.replace_all(&out, "");
-    // Strip javascript: URIs in href/src/action attributes
-    let re_js_uri = regex::Regex::new(r#"(?i)(href|src|action)\s*=\s*["']?\s*javascript:"#).unwrap();
-    let out = re_js_uri.replace_all(&out, r#"$1=""#);
+    let out = RE_SCRIPT.replace_all(html, "");
+    let out = RE_EVENTS.replace_all(&out, "");
+    let out = RE_JS_URI.replace_all(&out, r#"$1=""#);
     out.into_owned()
 }
 
@@ -1070,8 +1083,8 @@ impl ProxyHttp for LoricaProxy {
         };
 
         // Store route snapshot, precompiled regex, and access log setting for later pipeline stages
-        ctx.route_snapshot = Some(entry.route.clone());
-        ctx.path_rewrite_regex = entry.path_rewrite_regex.clone();
+        ctx.route_snapshot = Some(Arc::clone(&entry.route));
+        ctx.path_rewrite_regex = entry.path_rewrite_regex.clone(); // Arc::clone, cheap
         ctx.access_log_enabled = entry.route.access_log_enabled;
 
         // Block WebSocket upgrades if disabled on this route
@@ -1144,7 +1157,7 @@ impl ProxyHttp for LoricaProxy {
         for (i, rule) in entry.route.path_rules.iter().enumerate() {
             if rule.matches(path) {
                 let effective = entry.route.with_path_rule_overrides(rule);
-                ctx.route_snapshot = Some(effective);
+                ctx.route_snapshot = Some(Arc::new(effective));
                 if rule.backend_ids.is_some() {
                     if let Some(ref backends) = entry.path_rule_backends[i] {
                         ctx.matched_backends = Some(backends.clone());
@@ -2022,7 +2035,7 @@ impl ProxyHttp for LoricaProxy {
         ctx.route_id = Some(entry.route.id.clone());
         // Ensure route snapshot is available for upstream_request_filter
         if ctx.route_snapshot.is_none() {
-            ctx.route_snapshot = Some(entry.route.clone());
+            ctx.route_snapshot = Some(Arc::clone(&entry.route));
             ctx.path_rewrite_regex = entry.path_rewrite_regex.clone();
             ctx.access_log_enabled = entry.route.access_log_enabled;
         }
@@ -3063,8 +3076,13 @@ mod tests {
 
     #[test]
     fn test_ip_matches_cidr_prefix() {
-        assert!(ip_matches("192.168.1.100", "192.168.1/24"));
-        assert!(!ip_matches("10.0.0.1", "192.168.1/24"));
+        assert!(ip_matches("192.168.1.100", "192.168.1.0/24"));
+        assert!(ip_matches("192.168.1.1", "192.168.1.0/24"));
+        assert!(!ip_matches("192.168.2.1", "192.168.1.0/24"));
+        assert!(!ip_matches("10.0.0.1", "192.168.1.0/24"));
+        // Regression: old string prefix match would incorrectly match
+        // 10.1.2.3 against "10.1.2.30/24" because "10.1.2.3".starts_with("10.1.2.3")
+        assert!(!ip_matches("10.1.2.3", "10.1.2.30/32"));
     }
 
     // ---- Security Presets in ProxyConfig ----

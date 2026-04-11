@@ -31,9 +31,19 @@ Author: Rwx-G
 - HTML escape for `{{message}}` placeholder in custom error pages to prevent XSS via crafted upstream error messages
 - Basic auth credential verification cache (60 s TTL) avoids Argon2 hot-path overhead on repeated requests
 
+### Changed
+
+- Route struct wrapped in Arc in ProxyConfig to avoid deep-cloning on every request (~300-500ns saved)
+- Path rewrite regex wrapped in Arc to avoid compiled NFA/DFA duplication per request
+- WAF rule matching uses single `find()` instead of `is_match()` + `find()` (halves regex cost on matches)
+- WAF `url_decode` fast path skips decode loop when input has no percent-encoding
+- HTML sanitize regexes compiled once at startup via `Lazy<Regex>` instead of per-call
+
 ### Fixed
 
+- Per-route IP allowlist/denylist CIDR matching was using string prefix comparison (`starts_with`), which incorrectly matched `10.1.2.3` against `10.1.2.30/24`. Now uses proper network containment via ipnet
 - WAF event category filter: filter now applied at SQL level so LIMIT returns correct results when filtering by category (e.g. XSS events were invisible when IP Blocklist dominated the top N rows)
+- list_routes() SELECT was missing stale_while_revalidate_s, stale_if_error_s, and retry_on_methods columns, causing maintenance_mode and other v1.2.0 fields to read incorrect values from shifted column indices
 
 ## [1.1.0] - 2026-04-10
 
