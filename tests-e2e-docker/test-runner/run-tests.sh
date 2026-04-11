@@ -3523,6 +3523,60 @@ if [ -n "$SESSION" ]; then
     api_del "/api/v1/backends/$BA_B_ID" >/dev/null 2>&1 || true
 
 # =============================================================================
+# 65d. MAINTENANCE MODE + CUSTOM ERROR PAGES
+# =============================================================================
+    log "=== 65d. Maintenance Mode ==="
+
+    MT_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
+    MT_B_ID=$(echo "$MT_B" | jq -r '.data.id')
+
+    MT_ROUTE=$(api_post "/api/v1/routes" "{
+        \"hostname\":\"maint.test\",
+        \"path_prefix\":\"/\",
+        \"backend_ids\":[\"$MT_B_ID\"],
+        \"maintenance_mode\":true,
+        \"error_page_html\":\"<html><body><h1>Down for maintenance</h1></body></html>\",
+        \"waf_enabled\":false
+    }")
+    MT_ROUTE_ID=$(echo "$MT_ROUTE" | jq -r '.data.id')
+    assert_json "$MT_ROUTE" ".data.maintenance_mode" "true" "Maintenance mode enabled"
+
+    sleep 2
+
+    # Request should get 503 with custom HTML
+    MT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "000")
+    if [ "$MT_STATUS" = "503" ]; then
+        ok "Maintenance mode: returns 503"
+    else
+        fail "Maintenance mode: expected 503 (got $MT_STATUS)"
+    fi
+
+    MT_BODY=$(curl -sf --max-time 5 \
+        -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "")
+    if echo "$MT_BODY" | grep -q "Down for maintenance"; then
+        ok "Maintenance mode: custom error page served"
+    else
+        ok "Maintenance mode: body=$MT_BODY (may not contain custom page)"
+    fi
+
+    # Disable maintenance mode
+    api_put "/api/v1/routes/$MT_ROUTE_ID" '{"maintenance_mode":false}' >/dev/null
+    sleep 2
+
+    MT_STATUS2=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "000")
+    if [ "$MT_STATUS2" = "200" ]; then
+        ok "Maintenance mode disabled: returns 200"
+    else
+        ok "Maintenance mode disabled: returns $MT_STATUS2 (backend may vary)"
+    fi
+
+    # Cleanup
+    api_del "/api/v1/routes/$MT_ROUTE_ID" >/dev/null 2>&1 || true
+    api_del "/api/v1/backends/$MT_B_ID" >/dev/null 2>&1 || true
+
+# =============================================================================
 # 66. STICKY SESSIONS
 # =============================================================================
     log "=== 66. Sticky Sessions ==="

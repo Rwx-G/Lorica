@@ -62,6 +62,8 @@ mod tests {
             sticky_session: false,
             basic_auth_username: None,
             basic_auth_password_hash: None,
+            maintenance_mode: false,
+            error_page_html: None,
             created_at: now,
             updated_at: now,
         }
@@ -1594,6 +1596,33 @@ cert_critical_days = 3
         let loaded = store.get_route(&route.id).unwrap().unwrap();
         assert!(loaded.basic_auth_username.is_none());
         assert!(loaded.basic_auth_password_hash.is_none());
+    }
+
+    #[test]
+    fn test_maintenance_mode_roundtrip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.maintenance_mode = true;
+        route.error_page_html = Some("<h1>Down for maintenance</h1>".to_string());
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.maintenance_mode);
+        assert_eq!(
+            loaded.error_page_html.as_deref(),
+            Some("<h1>Down for maintenance</h1>")
+        );
+    }
+
+    #[test]
+    fn test_maintenance_mode_default_false() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(!loaded.maintenance_mode);
+        assert!(loaded.error_page_html.is_none());
     }
 
     #[test]

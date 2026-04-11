@@ -35,7 +35,7 @@ use lorica_core::protocols::Digest;
 use lorica_core::upstreams::peer::HttpPeer;
 use lorica_error::{Error, ErrorSource, ErrorType, Result};
 use lorica_http::ResponseHeader;
-use lorica_proxy::{ProxyHttp, Session};
+use lorica_proxy::{FailToProxy, ProxyHttp, Session};
 use lorica_waf::WafEngine;
 use once_cell::sync::Lazy;
 use tracing::{info, warn};
@@ -1123,6 +1123,26 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
+        // Maintenance mode - return 503 with optional custom HTML
+        if let Some(ref route) = ctx.route_snapshot {
+            if route.maintenance_mode {
+                let body_html = route.error_page_html.as_deref().unwrap_or(
+                    "<html><body><h1>503 Service Unavailable</h1><p>This service is under maintenance.</p></body></html>",
+                );
+                let mut header = ResponseHeader::build(503, None)?;
+                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                header.insert_header("Content-Length", body_html.len().to_string())?;
+                header.insert_header("Retry-After", "300")?;
+                session
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body_html.to_owned())), true)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
         // HTTP Basic Auth (per-route)
         if let Some(ref route) = ctx.route_snapshot {
             if let (Some(ref expected_user), Some(ref expected_hash)) =
@@ -1811,6 +1831,64 @@ impl ProxyHttp for LoricaProxy {
         session.req_header().method.as_str() == "PURGE"
     }
 
+    /// Serve custom error pages when the upstream fails.
+    ///
+    /// If the route has an `error_page_html` configured, render it with the
+    /// error status code. Otherwise fall back to the default Pingora error
+    /// response (plain-text status line).
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        ctx: &mut Self::CTX,
+    ) -> FailToProxy {
+        let code = match e.etype() {
+            ErrorType::HTTPStatus(code) => *code,
+            _ => match e.esource() {
+                ErrorSource::Upstream => 502,
+                ErrorSource::Downstream => 400,
+                _ => 500,
+            },
+        };
+
+        if code > 0 {
+            // Serve custom error page HTML if the route has one configured
+            let custom_served = if let Some(ref route) = ctx.route_snapshot {
+                if let Some(ref html) = route.error_page_html {
+                    let body = html
+                        .replace("{{status}}", &code.to_string())
+                        .replace("{{message}}", e.to_string().as_str());
+                    if let Ok(mut header) = ResponseHeader::build(code, None) {
+                        let _ = header.insert_header("Content-Type", "text/html; charset=utf-8");
+                        let _ = header.insert_header("Content-Length", body.len().to_string());
+                        let r1 = session
+                            .write_response_header(Box::new(header), false)
+                            .await;
+                        let r2 = session
+                            .write_response_body(Some(bytes::Bytes::from(body)), true)
+                            .await;
+                        r1.is_ok() && r2.is_ok()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !custom_served {
+                let _ = session.respond_error(code).await;
+            }
+        }
+
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
+    }
+
     async fn upstream_peer(
         &self,
         session: &mut Session,
@@ -2457,6 +2535,8 @@ mod tests {
             sticky_session: false,
             basic_auth_username: None,
             basic_auth_password_hash: None,
+            maintenance_mode: false,
+            error_page_html: None,
             created_at: now,
             updated_at: now,
         }

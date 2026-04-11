@@ -63,6 +63,8 @@ export interface RouteFormState {
   sticky_session: boolean;
   basic_auth_username: string;
   basic_auth_password: string;
+  maintenance_mode: boolean;
+  error_page_html: string;
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -114,6 +116,8 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   sticky_session: false,
   basic_auth_username: '',
   basic_auth_password: '',
+  maintenance_mode: false,
+  error_page_html: '',
 };
 
 // Tab field mappings for dot indicators
@@ -121,7 +125,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   general: [
     'hostname', 'path_prefix', 'force_https', 'redirect_hostname', 'redirect_to',
     'hostname_aliases', 'websocket_enabled', 'access_log_enabled',
-    'compression_enabled', 'waf_enabled', 'return_status', 'sticky_session',
+    'compression_enabled', 'waf_enabled', 'return_status', 'sticky_session', 'maintenance_mode', 'error_page_html',
   ],
   timeouts: [
     'connect_timeout_s', 'read_timeout_s', 'send_timeout_s',
@@ -236,6 +240,8 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     sticky_session: route.sticky_session ?? false,
     basic_auth_username: route.basic_auth_username ?? '',
     basic_auth_password: '',
+    maintenance_mode: route.maintenance_mode ?? false,
+    error_page_html: route.error_page_html ?? '',
   };
 }
 
@@ -303,6 +309,8 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     sticky_session: form.sticky_session,
     basic_auth_username: form.basic_auth_username || undefined,
     basic_auth_password: form.basic_auth_password || undefined,
+    maintenance_mode: form.maintenance_mode,
+    error_page_html: form.error_page_html || undefined,
   };
 }
 

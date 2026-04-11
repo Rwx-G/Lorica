@@ -69,6 +69,8 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str) -> Route {
             sticky_session: false,
         basic_auth_username: None,
         basic_auth_password_hash: None,
+        maintenance_mode: false,
+        error_page_html: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

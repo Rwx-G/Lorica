@@ -427,6 +427,10 @@ pub struct Route {
     pub basic_auth_username: Option<String>,
     #[serde(default)]
     pub basic_auth_password_hash: Option<String>,
+    #[serde(default)]
+    pub maintenance_mode: bool,
+    #[serde(default)]
+    pub error_page_html: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1343,6 +1347,8 @@ mod tests {
             sticky_session: false,
             basic_auth_username: None,
             basic_auth_password_hash: None,
+            maintenance_mode: false,
+            error_page_html: None,
             created_at: now,
             updated_at: now,
         };

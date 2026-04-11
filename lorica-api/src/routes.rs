@@ -100,6 +100,9 @@ pub struct RouteResponse {
     pub sticky_session: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basic_auth_username: Option<String>,
+    pub maintenance_mode: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_page_html: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -153,6 +156,8 @@ pub struct CreateRouteRequest {
     pub sticky_session: Option<bool>,
     pub basic_auth_username: Option<String>,
     pub basic_auth_password: Option<String>,
+    pub maintenance_mode: Option<bool>,
+    pub error_page_html: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +210,8 @@ pub struct UpdateRouteRequest {
     pub sticky_session: Option<bool>,
     pub basic_auth_username: Option<String>,
     pub basic_auth_password: Option<String>,
+    pub maintenance_mode: Option<bool>,
+    pub error_page_html: Option<String>,
 }
 
 fn route_to_response(
@@ -276,6 +283,8 @@ fn route_to_response(
         return_status: route.return_status,
         sticky_session: route.sticky_session,
         basic_auth_username: route.basic_auth_username.clone(),
+        maintenance_mode: route.maintenance_mode,
+        error_page_html: route.error_page_html.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -408,6 +417,8 @@ pub async fn create_route(
         } else {
             None
         },
+        maintenance_mode: body.maintenance_mode.unwrap_or(false),
+        error_page_html: body.error_page_html.clone(),
         created_at: now,
         updated_at: now,
     };
@@ -650,6 +661,12 @@ pub async fn update_route(
         } else {
             Some(crate::auth::hash_password(password)?)
         };
+    }
+    if let Some(maintenance) = body.maintenance_mode {
+        route.maintenance_mode = maintenance;
+    }
+    if let Some(ref html) = body.error_page_html {
+        route.error_page_html = if html.is_empty() { None } else { Some(html.clone()) };
     }
     route.updated_at = Utc::now();
 

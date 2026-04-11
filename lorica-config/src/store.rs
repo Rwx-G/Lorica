@@ -412,6 +412,16 @@ impl ConfigStore {
             [],
         );
 
+        // V23: maintenance mode + custom error pages
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN maintenance_mode INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN error_page_html TEXT DEFAULT NULL",
+            [],
+        );
+
         Ok(())
     }
 
@@ -521,12 +531,13 @@ impl ConfigStore {
              auto_ban_threshold, auto_ban_duration_s,
              created_at, updated_at,
              path_rules, return_status, sticky_session,
-             basic_auth_username, basic_auth_password_hash)
+             basic_auth_username, basic_auth_password_hash,
+             maintenance_mode, error_page_html)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
                      ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45,
-                     ?46, ?47, ?48, ?49, ?50)",
+                     ?46, ?47, ?48, ?49, ?50, ?51, ?52)",
             params![
                 route.id,
                 route.hostname,
@@ -578,6 +589,8 @@ impl ConfigStore {
                 route.sticky_session,
                 route.basic_auth_username,
                 route.basic_auth_password_hash,
+                route.maintenance_mode,
+                route.error_page_html,
             ],
         )?;
         Ok(())
@@ -606,7 +619,8 @@ impl ConfigStore {
                  auto_ban_threshold, auto_ban_duration_s,
                  created_at, updated_at,
                  path_rules, return_status, sticky_session,
-                 basic_auth_username, basic_auth_password_hash
+                 basic_auth_username, basic_auth_password_hash,
+                 maintenance_mode, error_page_html
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
@@ -637,7 +651,8 @@ impl ConfigStore {
              auto_ban_threshold, auto_ban_duration_s,
              created_at, updated_at,
              path_rules, return_status, sticky_session,
-             basic_auth_username, basic_auth_password_hash
+             basic_auth_username, basic_auth_password_hash,
+             maintenance_mode, error_page_html
              FROM routes ORDER BY hostname, path_prefix",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_route(row)))?;
@@ -694,7 +709,8 @@ impl ConfigStore {
              auto_ban_threshold=?42, auto_ban_duration_s=?43,
              updated_at=?44,
              path_rules=?45, return_status=?46, sticky_session=?47,
-             basic_auth_username=?48, basic_auth_password_hash=?49 WHERE id=?1",
+             basic_auth_username=?48, basic_auth_password_hash=?49,
+             maintenance_mode=?50, error_page_html=?51 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -745,6 +761,8 @@ impl ConfigStore {
                 route.sticky_session,
                 route.basic_auth_username,
                 route.basic_auth_password_hash,
+                route.maintenance_mode,
+                route.error_page_html,
             ],
         )?;
         if changed == 0 {
@@ -2761,6 +2779,8 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         sticky_session: row.get::<_, bool>(47).unwrap_or(false),
         basic_auth_username: row.get::<_, Option<String>>(48).unwrap_or(None),
         basic_auth_password_hash: row.get::<_, Option<String>>(49).unwrap_or(None),
+        maintenance_mode: row.get::<_, bool>(50).unwrap_or(false),
+        error_page_html: row.get::<_, Option<String>>(51).unwrap_or(None),
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })
