@@ -29,6 +29,9 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - SNI-based certificate selection with wildcard domain support (`*.example.com`)
 - Path rewriting (strip/add prefix, regex with capture groups), hostname aliases, HTTP-to-HTTPS redirect
 - Catch-all hostname (`_`) as last-resort fallback, `redirect_to` for domain redirects, `return_status` for direct responses
+- **gRPC-Web bridge** - transparently converts HTTP/1.1 gRPC-web requests to HTTP/2 gRPC for upstream backends
+- **Maintenance mode** - per-route 503 with Retry-After header and custom HTML error page
+- **Custom error pages** - configurable HTML for upstream errors (502/504) with `{{status}}` and `{{message}}` placeholders
 - Configurable proxy headers, per-route timeouts, WebSocket passthrough, X-Forwarded-Proto via TLS session detection
 - Connection pooling with health-aware backend filtering
 
@@ -42,6 +45,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **DDoS protection** - per-route max connections, global flood rate tracking
 - **Slowloris detection** - rejects slow-header attacks with configurable threshold
 - **Security headers** - presets (strict/moderate/none) with HSTS, CSP, X-Frame-Options, X-Content-Type-Options
+- **HTTP Basic Auth** - per-route username/password authentication (Argon2id-hashed) with cached verification
 - **IP allowlist/denylist** and **CORS configuration** per route
 
 ### :bar_chart: Monitoring & Observability
@@ -59,7 +63,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **REST API** - full CRUD for all entities, session-based auth, rate-limited login
 - **TOML config export/import** - with diff preview before applying changes
 - **Nginx config import** - paste an `nginx.conf` to auto-create routes, backends, certificates, and path rules with cert import support
-- **ACME / Let's Encrypt** - automatic TLS provisioning via HTTP-01 and DNS-01 challenges (Cloudflare, Route53, OVH providers), multi-domain SAN and wildcard support, smart auto-renewal
+- **ACME / Let's Encrypt** - automatic TLS provisioning via HTTP-01 and DNS-01 challenges (Cloudflare, Route53, OVH providers), multi-domain SAN and wildcard support, smart auto-renewal, OCSP stapling
 - **DNS providers** - global DNS credentials configured once in Settings and referenced by ID for certificate provisioning (Cloudflare, Route53, OVH)
 - **Notification channels** - stdout, SMTP email, HTTP webhook, Slack with per-channel rate limiting
 - **Ban list management** - view and unban auto-banned IPs from the dashboard
@@ -67,8 +71,8 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :zap: Performance
 
 - **Pingora engine** - forked from Cloudflare's production proxy framework
-- **HTTP cache** - in-memory response caching with LRU eviction (128 MiB cap), TinyUFO algorithm
-- **Peak EWMA load balancing** - latency-aware backend selection alongside Round Robin, Consistent Hash, Random
+- **HTTP cache** - in-memory response caching with LRU eviction (128 MiB cap), TinyUFO algorithm, cache lock (thundering herd protection), stale-while-revalidate/stale-if-error, HTTP PURGE method support
+- **Peak EWMA load balancing** - latency-aware backend selection alongside Round Robin, Consistent Hash, Random, Least Connections
 - **DashMap** - lock-free concurrent reads for ban list and route connections in the hot path
 - **Sub-0.5ms WAF evaluation** - precompiled regex patterns with zero overhead when disabled
 
@@ -111,6 +115,13 @@ ExecStart=/usr/bin/lorica --data-dir /var/lib/lorica \
 sudo systemctl restart lorica
 ```
 
+### Run with Docker
+
+```bash
+docker run -p 8080:8080 -p 8443:8443 -p 9443:9443 \
+  -v lorica-data:/var/lib/lorica lorica
+```
+
 ### Run directly
 
 ```bash
@@ -131,6 +142,8 @@ Options:
   --https-port <PORT>        HTTPS proxy port (default: 8443)
   --workers <N>              Worker processes (default: 0 = single-process)
   --log-level <LEVEL>        Log level (default: info)
+  --log-format <FORMAT>      Log format: json (default) or text
+  --log-file <PATH>          Log to file (in addition to stdout)
   --version                  Print version
 ```
 
@@ -200,7 +213,7 @@ Lorica is a Rust workspace with 25 crates: 15 forked from Cloudflare Pingora and
 | `lorica-bench` | SLA monitoring, load testing engine |
 | `lorica-worker` | fork+exec worker isolation, socket passing |
 | `lorica-command` | Protobuf supervisor-worker command channel |
-| `lorica-lb` | Load balancing (Round Robin, Peak EWMA, Hash, Random) |
+| `lorica-lb` | Load balancing (Round Robin, Peak EWMA, Hash, Random, Least Conn) |
 | `lorica-cache` | HTTP response cache, LRU eviction |
 | `lorica-limits` | Rate estimator for rate limiting |
 

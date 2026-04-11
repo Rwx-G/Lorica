@@ -25,6 +25,12 @@ Author: Rwx-G
 - Production Dockerfile: multi-stage build (Node 22 + Rust + Debian slim), non-root user, volume mount at /var/lib/lorica
 - Per-route stale cache configuration: `stale_while_revalidate_s` (default 10) and `stale_if_error_s` (default 60) configurable via API and dashboard Caching tab
 
+### Security
+
+- PURGE method restricted to loopback and trusted proxy CIDRs to prevent external cache invalidation
+- HTML escape for `{{message}}` placeholder in custom error pages to prevent XSS via crafted upstream error messages
+- Basic auth credential verification cache (60 s TTL) avoids Argon2 hot-path overhead on repeated requests
+
 ### Fixed
 
 - WAF event category filter: filter now applied at SQL level so LIMIT returns correct results when filtering by category (e.g. XSS events were invisible when IP Blocklist dominated the top N rows)

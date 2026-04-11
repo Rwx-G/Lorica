@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-04-11 | Lorica v1.1.0
+> Last updated: 2026-04-11 | Lorica v1.2.0 (unreleased)
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin/Module (not built-in)
 >
@@ -47,7 +47,7 @@
 | Algorithm | Lorica | Pingora | Sozu | Nginx | Traefik | BunkerWeb | Caddy | HAProxy |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | Round Robin (weighted) | Y | Y | Y | Y | Y | Paid | Y | Y |
-| Least Connections | N | Y | Y | Y | Y | N | Y | Y |
+| Least Connections | Y | Y | Y | Y | Y | N | Y | Y |
 | Peak EWMA | Y | Y | N | N | N | N | N | N |
 | Consistent Hash | Y | Y | N | Y | N | N | Y | Y |
 | Random | Y | Y | Y | Y | N | N | Y | Y |
@@ -77,7 +77,7 @@
 | Security header presets | Y | N | N | N | Y | Y | N | N |
 | IP allowlist/denylist | Y | N | N | Y | Y | Y | Y | Y |
 | CORS per route | Y | N | N | P | Y | Y | P | P |
-| **Basic auth per route** | **N** | N | N | Y | Y | Y | Y | Y |
+| Basic auth per route | Y | N | N | Y | Y | Y | Y | Y |
 | **Bot detection (captcha)** | **N** | N | N | N | N | Y | N | N |
 | **Country blocking (GeoIP)** | **N** | N | N | Plug | N | Y | N | N |
 | Request body scanning | Y | N | N | Plug | Plug | Y | N | N |
@@ -92,7 +92,7 @@
 
 ### Gaps for Lorica
 
-- **Basic auth per route** - Table-stakes, trivial to implement.
+- ~~Basic auth per route~~ - Implemented in v1.2.0.
 - **mTLS client verification** - Already in backlog. Important for zero-trust and B2B.
 - **Bot detection** - BunkerWeb's major differentiator (JS challenge, captcha, hCaptcha, Turnstile).
 - **Country blocking** - BunkerWeb has it. Useful for compliance and attack surface reduction.
@@ -129,7 +129,7 @@
 | Wildcard via DNS-01 | Y | N | N | N | Y | Y | Y | Y |
 | SNI hot-swap | Y | P | Y | N | Y | N | Y | N |
 | CRL support | Y | P | N | Y | N | N | N | Y |
-| OCSP stapling | N | N | N | Y | N | Y | Y | Y |
+| OCSP stapling | Y | N | N | Y | N | Y | Y | Y |
 | **mTLS client certs** | **N** | Y | N | Y | Y | Y | Y | Y |
 
 ### Lorica Strengths
@@ -233,7 +233,7 @@
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | .deb package | Y | N | N | Y | Y | Y | Y | Y |
 | .rpm package | Y | N | N | Y | Y | Y | Y | Y |
-| Docker image | N | N | Y | Y | Y | Y | Y | Y |
+| Docker image | Y | N | Y | Y | Y | Y | Y | Y |
 | Systemd hardened unit | Y | N | Y | Y | N | N | Y | Y |
 | Single binary | Y | N | Y | Y | Y | N | Y | Y |
 | GPG-signed releases | Y | N | N | Y | Y | N | Y | N |
@@ -271,10 +271,10 @@ These features are either unique to Lorica or extremely rare among competitors:
 | Feature | Backlog? | Competitors With It |
 |---|---|---|
 | Forward auth (external auth) | Yes (#1) | Nginx, Traefik, BunkerWeb, Caddy |
-| Basic auth per route | Yes (#4) | Nginx, Traefik, BunkerWeb, Caddy, HAProxy |
-| Custom error pages + maintenance mode | Yes (#3) | All |
+| ~~Basic auth per route~~ | ~~Yes (#4)~~ | Implemented in v1.2.0 |
+| ~~Custom error pages + maintenance mode~~ | ~~Yes (#3)~~ | Implemented in v1.2.0 |
 | mTLS client verification | Yes (#10) | Nginx, Traefik, BunkerWeb, Caddy, HAProxy |
-| Retry with backoff | Yes (#7) | Traefik, Caddy, HAProxy |
+| ~~Retry with backoff~~ | ~~Yes (#7)~~ | Implemented in v1.2.0 (retry_on_methods) |
 
 ### Differentiators (competitive advantage opportunities)
 
@@ -290,10 +290,10 @@ These features are either unique to Lorica or extremely rare among competitors:
 
 | Feature | Priority | Rationale |
 |---|---|---|
-| OCSP stapling | Medium | Standard TLS feature, 4 competitors support it |
+| ~~OCSP stapling~~ | ~~Medium~~ | Implemented in v1.2.0 |
 | OpenTelemetry tracing | Medium | Traefik, HAProxy, Sozu support it. Key for distributed systems |
-| Least Connections LB | Low | Easy to add, Pingora provides it |
-| Docker image | Medium | All competitors provide one. Lowers adoption barrier |
+| ~~Least Connections LB~~ | ~~Low~~ | Implemented in v1.2.0 |
+| ~~Docker image~~ | ~~Medium~~ | Implemented in v1.2.0 |
 | Bot detection (JS challenge/captcha) | Low | Only BunkerWeb has it. Niche but impressive |
 | Country blocking (GeoIP) | Low | Only BunkerWeb has it. Useful for compliance |
 | Response body rewriting | Low | Already in backlog (#11). Nginx sub_filter equivalent |
