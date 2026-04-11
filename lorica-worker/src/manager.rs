@@ -53,6 +53,10 @@ pub struct WorkerConfig {
     pub https_addr: Option<String>,
     /// HTTPS port number for workers to identify TLS listeners.
     pub https_port: u16,
+    /// Log format (json or text).
+    pub log_format: String,
+    /// Path to a log file (passed to worker via CLI).
+    pub log_file: Option<String>,
     /// Path to upstream CRL file (passed to worker via CLI).
     pub upstream_crl_file: Option<String>,
 }
@@ -226,7 +230,13 @@ impl WorkerManager {
                     self.config.https_port.to_string(),
                     "--log-level".to_string(),
                     self.config.log_level.clone(),
+                    "--log-format".to_string(),
+                    self.config.log_format.clone(),
                 ];
+                if let Some(ref log_file) = self.config.log_file {
+                    args_strings.push("--log-file".to_string());
+                    args_strings.push(log_file.clone());
+                }
                 if let Some(ref crl) = self.config.upstream_crl_file {
                     args_strings.push("--upstream-crl-file".to_string());
                     args_strings.push(crl.clone());
@@ -455,6 +465,8 @@ mod tests {
             worker_count: 2,
             data_dir: "/tmp".to_string(),
             log_level: "info".to_string(),
+            log_format: "json".to_string(),
+            log_file: None,
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: None,
             https_port: 0,
@@ -471,6 +483,8 @@ mod tests {
             worker_count: 1,
             data_dir: "/tmp".to_string(),
             log_level: "info".to_string(),
+            log_format: "json".to_string(),
+            log_file: None,
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: None,
             https_port: 0,
@@ -488,6 +502,8 @@ mod tests {
             worker_count: 1,
             data_dir: "/tmp".to_string(),
             log_level: "info".to_string(),
+            log_format: "json".to_string(),
+            log_file: None,
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: Some("127.0.0.1:0".to_string()),
             https_port: 443,
@@ -505,6 +521,8 @@ mod tests {
             worker_count: 0,
             data_dir: "/tmp".to_string(),
             log_level: "info".to_string(),
+            log_format: "json".to_string(),
+            log_file: None,
             http_addr: "127.0.0.1:0".to_string(),
             https_addr: None,
             https_port: 0,

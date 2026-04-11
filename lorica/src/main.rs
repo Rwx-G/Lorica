@@ -54,6 +54,15 @@ struct Cli {
     #[arg(long, default_value = "info")]
     log_level: String,
 
+    /// Log format: "json" (default) or "text"
+    #[arg(long, default_value = "json")]
+    log_format: String,
+
+    /// Path to a log file. When set, logs are written to this file in
+    /// addition to stdout. The file is appended to (not truncated).
+    #[arg(long)]
+    log_file: Option<String>,
+
     /// Management port (localhost only)
     #[arg(long, default_value_t = DEFAULT_MANAGEMENT_PORT)]
     management_port: u16,
@@ -104,6 +113,14 @@ enum Commands {
         #[arg(long, default_value = "info")]
         log_level: String,
 
+        /// Log format (json or text)
+        #[arg(long, default_value = "json")]
+        log_format: String,
+
+        /// Log file path
+        #[arg(long)]
+        log_file: Option<String>,
+
         /// Path to upstream CRL file (passed from supervisor)
         #[arg(long)]
         upstream_crl_file: Option<String>,
@@ -129,18 +146,71 @@ enum Commands {
     },
 }
 
-fn init_logging(log_level: &str) {
+fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
+    use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_timer(tracing_subscriber::fmt::time::SystemTime)
-        .init();
+    if log_format == "text" {
+        // Plain text format (human-readable)
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_timer(tracing_subscriber::fmt::time::SystemTime);
+
+        if let Some(path) = log_file {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("failed to open log file");
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_ansi(false)
+                .with_writer(file);
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt_layer)
+                .with(file_layer)
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt_layer)
+                .init();
+        }
+    } else {
+        // JSON format (default, machine-readable)
+        let json_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_timer(tracing_subscriber::fmt::time::SystemTime);
+
+        if let Some(path) = log_file {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("failed to open log file");
+            let file_layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_target(true)
+                .with_ansi(false)
+                .with_writer(file);
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(json_layer)
+                .with(file_layer)
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(json_layer)
+                .init();
+        }
+    }
 }
 
 fn startup_banner(cli: &Cli) {
@@ -170,9 +240,11 @@ fn main() {
             data_dir,
             https_port,
             log_level,
+            log_format,
+            log_file,
             upstream_crl_file,
         }) => {
-            init_logging(&log_level);
+            init_logging(&log_level, &log_format, log_file.as_deref());
             run_worker(
                 id,
                 cmd_fd,
@@ -259,7 +331,7 @@ fn main() {
             });
         }
         None => {
-            init_logging(&cli.log_level);
+            init_logging(&cli.log_level, &cli.log_format, cli.log_file.as_deref());
             startup_banner(&cli);
 
             if cli.workers > 0 {
@@ -295,6 +367,8 @@ fn run_supervisor(cli: Cli) {
         worker_count,
         data_dir: cli.data_dir.clone(),
         log_level: cli.log_level.clone(),
+        log_format: cli.log_format.clone(),
+        log_file: cli.log_file.clone(),
         http_addr: format!("0.0.0.0:{}", cli.http_port),
         https_addr: Some(format!("0.0.0.0:{}", cli.https_port)),
         https_port: cli.https_port,
