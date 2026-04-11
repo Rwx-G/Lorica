@@ -100,6 +100,8 @@ pub struct RouteResponse {
     pub sticky_session: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basic_auth_username: Option<String>,
+    pub stale_while_revalidate_s: i32,
+    pub stale_if_error_s: i32,
     pub retry_on_methods: Vec<String>,
     pub maintenance_mode: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,6 +159,8 @@ pub struct CreateRouteRequest {
     pub sticky_session: Option<bool>,
     pub basic_auth_username: Option<String>,
     pub basic_auth_password: Option<String>,
+    pub stale_while_revalidate_s: Option<i32>,
+    pub stale_if_error_s: Option<i32>,
     pub retry_on_methods: Option<Vec<String>>,
     pub maintenance_mode: Option<bool>,
     pub error_page_html: Option<String>,
@@ -212,6 +216,8 @@ pub struct UpdateRouteRequest {
     pub sticky_session: Option<bool>,
     pub basic_auth_username: Option<String>,
     pub basic_auth_password: Option<String>,
+    pub stale_while_revalidate_s: Option<i32>,
+    pub stale_if_error_s: Option<i32>,
     pub retry_on_methods: Option<Vec<String>>,
     pub maintenance_mode: Option<bool>,
     pub error_page_html: Option<String>,
@@ -286,6 +292,8 @@ fn route_to_response(
         return_status: route.return_status,
         sticky_session: route.sticky_session,
         basic_auth_username: route.basic_auth_username.clone(),
+        stale_while_revalidate_s: route.stale_while_revalidate_s,
+        stale_if_error_s: route.stale_if_error_s,
         retry_on_methods: route.retry_on_methods.clone(),
         maintenance_mode: route.maintenance_mode,
         error_page_html: route.error_page_html.clone(),
@@ -421,6 +429,8 @@ pub async fn create_route(
         } else {
             None
         },
+        stale_while_revalidate_s: body.stale_while_revalidate_s.unwrap_or(10),
+        stale_if_error_s: body.stale_if_error_s.unwrap_or(60),
         retry_on_methods: body.retry_on_methods.clone().unwrap_or_default(),
         maintenance_mode: body.maintenance_mode.unwrap_or(false),
         error_page_html: body.error_page_html.clone(),
@@ -666,6 +676,12 @@ pub async fn update_route(
         } else {
             Some(crate::auth::hash_password(password)?)
         };
+    }
+    if let Some(swr) = body.stale_while_revalidate_s {
+        route.stale_while_revalidate_s = swr;
+    }
+    if let Some(sie) = body.stale_if_error_s {
+        route.stale_if_error_s = sie;
     }
     if let Some(ref methods) = body.retry_on_methods {
         route.retry_on_methods = methods.clone();

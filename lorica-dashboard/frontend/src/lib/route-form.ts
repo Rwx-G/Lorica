@@ -63,6 +63,8 @@ export interface RouteFormState {
   sticky_session: boolean;
   basic_auth_username: string;
   basic_auth_password: string;
+  stale_while_revalidate_s: number;
+  stale_if_error_s: number;
   retry_on_methods: string;
   maintenance_mode: boolean;
   error_page_html: string;
@@ -117,6 +119,8 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   sticky_session: false,
   basic_auth_username: '',
   basic_auth_password: '',
+  stale_while_revalidate_s: 10,
+  stale_if_error_s: 60,
   retry_on_methods: '',
   maintenance_mode: false,
   error_page_html: '',
@@ -146,7 +150,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'cors_allowed_origins', 'cors_allowed_methods', 'cors_max_age_s',
   ],
   caching: [
-    'cache_enabled', 'cache_ttl_s', 'cache_max_mb',
+    'cache_enabled', 'cache_ttl_s', 'cache_max_mb', 'stale_while_revalidate_s', 'stale_if_error_s',
   ],
   protection: [
     'max_connections', 'slowloris_threshold_ms',
@@ -242,6 +246,8 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     sticky_session: route.sticky_session ?? false,
     basic_auth_username: route.basic_auth_username ?? '',
     basic_auth_password: '',
+    stale_while_revalidate_s: route.stale_while_revalidate_s ?? 10,
+    stale_if_error_s: route.stale_if_error_s ?? 60,
     retry_on_methods: (route.retry_on_methods ?? []).join(', '),
     maintenance_mode: route.maintenance_mode ?? false,
     error_page_html: route.error_page_html ?? '',
@@ -312,6 +318,8 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     sticky_session: form.sticky_session,
     basic_auth_username: form.basic_auth_username || undefined,
     basic_auth_password: form.basic_auth_password || undefined,
+    stale_while_revalidate_s: form.stale_while_revalidate_s,
+    stale_if_error_s: form.stale_if_error_s,
     retry_on_methods: csvToArray(form.retry_on_methods).length > 0 ? csvToArray(form.retry_on_methods) : empty([]),
     maintenance_mode: form.maintenance_mode,
     error_page_html: form.error_page_html || undefined,

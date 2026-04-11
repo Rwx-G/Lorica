@@ -69,6 +69,8 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str) -> Route {
             sticky_session: false,
         basic_auth_username: None,
         basic_auth_password_hash: None,
+        stale_while_revalidate_s: 10,
+        stale_if_error_s: 60,
         retry_on_methods: vec![],
         maintenance_mode: false,
         error_page_html: None,

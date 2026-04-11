@@ -412,7 +412,17 @@ impl ConfigStore {
             [],
         );
 
-        // V23: retry_on_methods
+        // V23: stale cache config per route
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN stale_while_revalidate_s INTEGER NOT NULL DEFAULT 10",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN stale_if_error_s INTEGER NOT NULL DEFAULT 60",
+            [],
+        );
+
+        // V24: retry_on_methods
         let _ = self.conn.execute(
             "ALTER TABLE routes ADD COLUMN retry_on_methods TEXT NOT NULL DEFAULT '[]'",
             [],
@@ -540,13 +550,14 @@ impl ConfigStore {
              created_at, updated_at,
              path_rules, return_status, sticky_session,
              basic_auth_username, basic_auth_password_hash,
+             stale_while_revalidate_s, stale_if_error_s,
              retry_on_methods,
              maintenance_mode, error_page_html)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
                      ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45,
-                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53)",
+                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55)",
             params![
                 route.id,
                 route.hostname,
@@ -598,6 +609,8 @@ impl ConfigStore {
                 route.sticky_session,
                 route.basic_auth_username,
                 route.basic_auth_password_hash,
+                route.stale_while_revalidate_s,
+                route.stale_if_error_s,
                 retry_on_methods_json,
                 route.maintenance_mode,
                 route.error_page_html,
@@ -630,6 +643,7 @@ impl ConfigStore {
                  created_at, updated_at,
                  path_rules, return_status, sticky_session,
                  basic_auth_username, basic_auth_password_hash,
+                 stale_while_revalidate_s, stale_if_error_s,
                  retry_on_methods,
                  maintenance_mode, error_page_html
                  FROM routes WHERE id = ?1",
@@ -723,8 +737,9 @@ impl ConfigStore {
              updated_at=?44,
              path_rules=?45, return_status=?46, sticky_session=?47,
              basic_auth_username=?48, basic_auth_password_hash=?49,
-             retry_on_methods=?50,
-             maintenance_mode=?51, error_page_html=?52 WHERE id=?1",
+             stale_while_revalidate_s=?50, stale_if_error_s=?51,
+             retry_on_methods=?52,
+             maintenance_mode=?53, error_page_html=?54 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -775,6 +790,8 @@ impl ConfigStore {
                 route.sticky_session,
                 route.basic_auth_username,
                 route.basic_auth_password_hash,
+                route.stale_while_revalidate_s,
+                route.stale_if_error_s,
                 retry_on_methods_json,
                 route.maintenance_mode,
                 route.error_page_html,
@@ -2794,12 +2811,14 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         sticky_session: row.get::<_, bool>(47).unwrap_or(false),
         basic_auth_username: row.get::<_, Option<String>>(48).unwrap_or(None),
         basic_auth_password_hash: row.get::<_, Option<String>>(49).unwrap_or(None),
+        stale_while_revalidate_s: row.get::<_, i32>(50).unwrap_or(10),
+        stale_if_error_s: row.get::<_, i32>(51).unwrap_or(60),
         retry_on_methods: {
-            let json: String = row.get::<_, String>(50).unwrap_or_else(|_| "[]".to_string());
+            let json: String = row.get::<_, String>(52).unwrap_or_else(|_| "[]".to_string());
             serde_json::from_str(&json).unwrap_or_default()
         },
-        maintenance_mode: row.get::<_, bool>(51).unwrap_or(false),
-        error_page_html: row.get::<_, Option<String>>(52).unwrap_or(None),
+        maintenance_mode: row.get::<_, bool>(53).unwrap_or(false),
+        error_page_html: row.get::<_, Option<String>>(54).unwrap_or(None),
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

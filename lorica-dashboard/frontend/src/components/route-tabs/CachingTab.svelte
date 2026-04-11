@@ -40,6 +40,19 @@
       <input id="cache-max-mb" type="number" min="1" bind:value={form.cache_max_mb} placeholder="50" />
     </div>
   </div>
+
+  <div class="form-row">
+    <div class="form-group" class:modified={isModified('stale_while_revalidate_s')}>
+      <label for="stale-revalidate">Stale-while-revalidate (s)</label>
+      <input id="stale-revalidate" type="number" min="0" bind:value={form.stale_while_revalidate_s} placeholder="10" />
+      <span class="hint">Serve stale cached content while refreshing in the background. 0 = disabled.</span>
+    </div>
+    <div class="form-group" class:modified={isModified('stale_if_error_s')}>
+      <label for="stale-error">Stale-if-error (s)</label>
+      <input id="stale-error" type="number" min="0" bind:value={form.stale_if_error_s} placeholder="60" />
+      <span class="hint">Serve stale cached content when upstream returns an error. 0 = disabled.</span>
+    </div>
+  </div>
 </div>
 
 <style>

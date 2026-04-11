@@ -746,6 +746,11 @@ pub struct LoricaProxy {
     pub log_store: Option<Arc<lorica_api::log_store::LogStore>>,
     /// Per-backend circuit breaker (opens after consecutive failures).
     pub circuit_breaker: Arc<CircuitBreaker>,
+    /// Basic auth credential verification cache. Maps a hash of
+    /// "username:password" to the timestamp of the last successful Argon2
+    /// verification. Entries older than 60 s are ignored, forcing a fresh
+    /// Argon2 check. This avoids ~100 ms per request on auth-protected routes.
+    basic_auth_cache: Arc<DashMap<u64, Instant>>,
 }
 
 impl LoricaProxy {
@@ -777,6 +782,7 @@ impl LoricaProxy {
             alert_sender: None,
             log_store: None,
             circuit_breaker: Arc::new(CircuitBreaker::new(5, 10)),
+            basic_auth_cache: Arc::new(DashMap::new()),
         }
     }
 
@@ -1153,7 +1159,9 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // HTTP Basic Auth (per-route)
+        // HTTP Basic Auth (per-route) with credential verification cache.
+        // The cache avoids running Argon2 (~100ms) on every request by caching
+        // the hash of verified credentials for 60 seconds.
         if let Some(ref route) = ctx.route_snapshot {
             if let (Some(ref expected_user), Some(ref expected_hash)) =
                 (&route.basic_auth_username, &route.basic_auth_password_hash)
@@ -1176,18 +1184,40 @@ impl ProxyHttp for LoricaProxy {
                         if user != expected_user {
                             return false;
                         }
+
+                        // Check credential cache before running Argon2
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut h = DefaultHasher::new();
+                        cred.hash(&mut h);
+                        expected_hash.hash(&mut h);
+                        let cache_key = h.finish();
+
+                        const AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
+                        if let Some(verified_at) = self.basic_auth_cache.get(&cache_key) {
+                            if verified_at.elapsed() < AUTH_CACHE_TTL {
+                                return true; // cache hit - skip Argon2
+                            }
+                        }
+
+                        // Cache miss or expired - run full Argon2 verification
                         use argon2::PasswordVerifier;
-                        argon2::Argon2::default()
+                        let ok = argon2::Argon2::default()
                             .verify_password(
                                 pass.as_bytes(),
                                 &argon2::PasswordHash::new(expected_hash)
                                     .unwrap_or_else(|_| {
-                                        // Invalid hash format - deny access
-                                        argon2::PasswordHash::new("$argon2id$v=19$m=1,t=1,p=1$AAAA$AAAA")
-                                            .unwrap()
+                                        argon2::PasswordHash::new(
+                                            "$argon2id$v=19$m=1,t=1,p=1$AAAA$AAAA",
+                                        )
+                                        .unwrap()
                                     }),
                             )
-                            .is_ok()
+                            .is_ok();
+                        if ok {
+                            self.basic_auth_cache.insert(cache_key, Instant::now());
+                        }
+                        ok
                     })
                     .unwrap_or(false);
 
@@ -1797,11 +1827,21 @@ impl ProxyHttp for LoricaProxy {
         if status == 200 || status == 301 {
             let now = std::time::SystemTime::now();
             let fresh_until = now + Duration::from_secs(ttl_s);
+            let swr = ctx
+                .route_snapshot
+                .as_ref()
+                .map(|r| r.stale_while_revalidate_s as u32)
+                .unwrap_or(10);
+            let sie = ctx
+                .route_snapshot
+                .as_ref()
+                .map(|r| r.stale_if_error_s as u32)
+                .unwrap_or(60);
             Ok(RespCacheable::Cacheable(CacheMeta::new(
                 fresh_until,
                 now,
-                10, // stale-while-revalidate
-                60, // stale-if-error
+                swr,
+                sie,
                 resp.clone(),
             )))
         } else {
@@ -2584,6 +2624,8 @@ mod tests {
             sticky_session: false,
             basic_auth_username: None,
             basic_auth_password_hash: None,
+            stale_while_revalidate_s: 10,
+            stale_if_error_s: 60,
             retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,

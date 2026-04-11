@@ -427,6 +427,10 @@ pub struct Route {
     pub basic_auth_username: Option<String>,
     #[serde(default)]
     pub basic_auth_password_hash: Option<String>,
+    #[serde(default = "default_stale_while_revalidate_s")]
+    pub stale_while_revalidate_s: i32,
+    #[serde(default = "default_stale_if_error_s")]
+    pub stale_if_error_s: i32,
     #[serde(default)]
     pub retry_on_methods: Vec<String>,
     #[serde(default)]
@@ -646,6 +650,14 @@ pub struct GlobalSettings {
 
 fn default_security_headers() -> String {
     "moderate".to_string()
+}
+
+fn default_stale_while_revalidate_s() -> i32 {
+    10
+}
+
+fn default_stale_if_error_s() -> i32 {
+    60
 }
 
 fn default_connect_timeout_s() -> i32 {
@@ -1349,6 +1361,8 @@ mod tests {
             sticky_session: false,
             basic_auth_username: None,
             basic_auth_password_hash: None,
+            stale_while_revalidate_s: 10,
+            stale_if_error_s: 60,
             retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
