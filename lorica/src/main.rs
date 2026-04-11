@@ -367,7 +367,19 @@ fn run_supervisor(cli: Cli) {
         let data_dir = PathBuf::from(&cli.data_dir);
         let _ = std::fs::create_dir_all(&data_dir);
         let key_path = data_dir.join("encryption.key");
-        let encryption_key = lorica_config::crypto::EncryptionKey::load_or_create(&key_path).ok();
+        let encryption_key = match lorica_config::crypto::EncryptionKey::load_or_create(&key_path) {
+            Ok(key) => Some(key),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    path = %key_path.display(),
+                    "failed to load encryption key - database will open WITHOUT encryption. \
+                     Certificate private keys and notification credentials will be stored in cleartext. \
+                     Fix the key file permissions or path and restart."
+                );
+                None
+            }
+        };
         let db_path = data_dir.join("lorica.db");
         if let Err(e) = ConfigStore::open(&db_path, encryption_key) {
             error!(error = %e, "failed to run database migrations before forking workers");
@@ -1004,7 +1016,10 @@ fn run_supervisor(cli: Cli) {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
-                let mut mgr = monitor_mgr.lock().unwrap();
+                let mut mgr = monitor_mgr.lock().unwrap_or_else(|e| {
+                    warn!("worker monitor mutex poisoned, recovering");
+                    e.into_inner()
+                });
                 let events = mgr.check_workers();
                 for event in events {
                     let (id, log_msg) = match event {
@@ -1139,7 +1154,13 @@ fn run_supervisor(cli: Cli) {
 
         info!("supervisor shutting down");
         // Explicit SIGTERM to all workers before exiting
-        manager.lock().unwrap().shutdown_all();
+        manager
+            .lock()
+            .unwrap_or_else(|e| {
+                warn!("worker manager mutex poisoned during shutdown, recovering");
+                e.into_inner()
+            })
+            .shutdown_all();
         api_handle.abort();
         health_handle.abort();
         monitor_handle.abort();
@@ -1190,7 +1211,17 @@ fn run_worker(
     // Open the configuration database with encryption key
     let data_dir = PathBuf::from(data_dir);
     let key_path = data_dir.join("encryption.key");
-    let encryption_key = lorica_config::crypto::EncryptionKey::load_or_create(&key_path).ok();
+    let encryption_key = match lorica_config::crypto::EncryptionKey::load_or_create(&key_path) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            error!(
+                error = %e,
+                path = %key_path.display(),
+                "worker: failed to load encryption key - database opens WITHOUT encryption"
+            );
+            None
+        }
+    };
     let db_path = data_dir.join("lorica.db");
     let store = match ConfigStore::open(&db_path, encryption_key) {
         Ok(s) => s,

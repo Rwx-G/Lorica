@@ -44,6 +44,9 @@ Author: Rwx-G
 - Per-route IP allowlist/denylist CIDR matching was using string prefix comparison (`starts_with`), which incorrectly matched `10.1.2.3` against `10.1.2.30/24`. Now uses proper network containment via ipnet
 - WAF event category filter: filter now applied at SQL level so LIMIT returns correct results when filtering by category (e.g. XSS events were invisible when IP Blocklist dominated the top N rows)
 - list_routes() SELECT was missing stale_while_revalidate_s, stale_if_error_s, and retry_on_methods columns, causing maintenance_mode and other v1.2.0 fields to read incorrect values from shifted column indices
+- Frontend TypeScript types synchronized with Rust API: WafEvent (route_hostname, action), ProxyInfo (http_port, https_port), GlobalSettings (waf_whitelist_ips), route-form test fixture (v1.2.0 fields)
+- Supervisor mutex poison recovery: worker monitor and shutdown no longer panic on poisoned mutex, recover gracefully with warning log
+- Encryption key load failure now logs an explicit error instead of silently falling back to unencrypted storage
 
 ## [1.1.0] - 2026-04-10
 

@@ -386,6 +386,8 @@ export interface ProxyInfo {
   version: string;
   uptime_seconds: number;
   active_connections: number;
+  http_port: number;
+  https_port: number;
 }
 
 export interface SystemResponse {
@@ -415,6 +417,7 @@ export interface GlobalSettingsResponse {
   sla_purge_schedule: string;
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies: string[];
+  waf_whitelist_ips: string[];
 }
 
 export interface UpdateSettingsRequest {
@@ -433,6 +436,7 @@ export interface UpdateSettingsRequest {
   sla_purge_schedule?: string;
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies?: string[];
+  waf_whitelist_ips?: string[];
 }
 
 export interface NotificationConfigResponse {
@@ -842,7 +846,9 @@ export interface WafEvent {
   matched_field: string;
   matched_value: string;
   timestamp: string;
-  client_ip?: string;
+  client_ip: string;
+  route_hostname: string;
+  action: string;
 }
 
 export interface WafEventsResponse {
