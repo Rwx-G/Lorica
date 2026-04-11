@@ -148,6 +148,7 @@ pub async fn try_fetch_ocsp(cert_pem: &str) -> Option<Vec<u8>> {
 fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     let len = content.len();
+    debug_assert!(len <= 0xFFFF, "DER TLV content exceeds 2-byte length encoding");
     if len < 128 {
         out.push(len as u8);
     } else if len < 256 {

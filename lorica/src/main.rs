@@ -55,7 +55,7 @@ struct Cli {
     log_level: String,
 
     /// Log format: "json" (default) or "text"
-    #[arg(long, default_value = "json")]
+    #[arg(long, default_value = "json", value_parser = clap::builder::PossibleValuesParser::new(["json", "text"]))]
     log_format: String,
 
     /// Path to a log file. When set, logs are written to this file in
@@ -114,7 +114,7 @@ enum Commands {
         log_level: String,
 
         /// Log format (json or text)
-        #[arg(long, default_value = "json")]
+        #[arg(long, default_value = "json", value_parser = clap::builder::PossibleValuesParser::new(["json", "text"]))]
         log_format: String,
 
         /// Log file path

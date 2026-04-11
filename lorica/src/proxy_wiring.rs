@@ -1200,22 +1200,27 @@ impl ProxyHttp for LoricaProxy {
                             }
                         }
 
-                        // Cache miss or expired - run full Argon2 verification
-                        use argon2::PasswordVerifier;
-                        let ok = argon2::Argon2::default()
-                            .verify_password(
-                                pass.as_bytes(),
-                                &argon2::PasswordHash::new(expected_hash)
-                                    .unwrap_or_else(|_| {
-                                        argon2::PasswordHash::new(
-                                            "$argon2id$v=19$m=1,t=1,p=1$AAAA$AAAA",
-                                        )
-                                        .unwrap()
-                                    }),
-                            )
-                            .is_ok();
+                        // Cache miss or expired - run full Argon2 verification.
+                        // Parse the hash first; if it's corrupt, deny immediately.
+                        let parsed_hash = match argon2::PasswordHash::new(expected_hash) {
+                            Ok(h) => h,
+                            Err(_) => return false, // corrupt hash -> deny
+                        };
+                        // Offload CPU-intensive Argon2 to the blocking thread
+                        // pool to avoid stalling the async proxy runtime.
+                        let pass_bytes = pass.as_bytes().to_vec();
+                        let hash_str = expected_hash.to_string();
+                        let ok = tokio::task::block_in_place(|| {
+                            use argon2::PasswordVerifier;
+                            let h = argon2::PasswordHash::new(&hash_str).unwrap();
+                            argon2::Argon2::default()
+                                .verify_password(&pass_bytes, &h)
+                                .is_ok()
+                        });
                         if ok {
                             self.basic_auth_cache.insert(cache_key, Instant::now());
+                            // Evict expired entries to prevent unbounded growth
+                            self.basic_auth_cache.retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
                         }
                         ok
                     })
@@ -1834,12 +1839,12 @@ impl ProxyHttp for LoricaProxy {
             let swr = ctx
                 .route_snapshot
                 .as_ref()
-                .map(|r| r.stale_while_revalidate_s as u32)
+                .map(|r| r.stale_while_revalidate_s.max(0) as u32)
                 .unwrap_or(10);
             let sie = ctx
                 .route_snapshot
                 .as_ref()
-                .map(|r| r.stale_if_error_s as u32)
+                .map(|r| r.stale_if_error_s.max(0) as u32)
                 .unwrap_or(60);
             Ok(RespCacheable::Cacheable(CacheMeta::new(
                 fresh_until,
