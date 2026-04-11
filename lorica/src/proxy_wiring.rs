@@ -26,13 +26,14 @@ use lorica_bench::SlaCollector;
 use lorica_cache::cache_control::CacheControl;
 use lorica_cache::eviction::simple_lru;
 use lorica_cache::filters::resp_cacheable;
+use lorica_cache::lock::CacheLock;
 use lorica_cache::{
     CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable,
 };
 use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route, WafMode};
 use lorica_core::protocols::Digest;
 use lorica_core::upstreams::peer::HttpPeer;
-use lorica_error::{Error, ErrorType, Result};
+use lorica_error::{Error, ErrorSource, ErrorType, Result};
 use lorica_http::ResponseHeader;
 use lorica_proxy::{ProxyHttp, Session};
 use lorica_waf::WafEngine;
@@ -622,6 +623,16 @@ pub static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
 static CACHE_EVICTION: Lazy<simple_lru::Manager> =
     Lazy::new(|| simple_lru::Manager::new(CACHE_SIZE_LIMIT));
 
+/// Cache lock that prevents thundering herd on cache miss.
+/// When multiple requests hit the same uncached key simultaneously, only the
+/// first one fetches from upstream (the writer); others wait for the writer to
+/// finish and then serve the cached response. The lock times out after 10 s so
+/// readers are never blocked indefinitely.
+static CACHE_LOCK: Lazy<&'static CacheLock> = Lazy::new(|| {
+    let lock = CacheLock::new_boxed(Duration::from_secs(10));
+    Box::leak(lock)
+});
+
 /// Default cache TTL for cacheable status codes when the origin does not send
 /// explicit `Cache-Control` headers. The route-specific `cache_ttl_s` is used
 /// as the default fresh duration for 200 and 301 responses.
@@ -633,8 +644,8 @@ const CACHE_DEFAULTS_5MIN: CacheMetaDefaults = CacheMetaDefaults::new(
         200 | 301 => Some(Duration::from_secs(300)),
         _ => None,
     },
-    0, // stale-while-revalidate
-    0, // stale-if-error
+    10, // stale-while-revalidate: serve stale for 10 s while background refresh
+    60, // stale-if-error: serve stale for 60 s when upstream fails
 );
 
 /// Per-request context carried through the proxy pipeline.
@@ -815,6 +826,17 @@ fn extract_host(req: &lorica_http::RequestHeader) -> &str {
 #[async_trait]
 impl ProxyHttp for LoricaProxy {
     type CTX = RequestCtx;
+
+    fn init_downstream_modules(&self, modules: &mut lorica_core::modules::http::HttpModules) {
+        // Default compression module (disabled; per-route level set in
+        // response_compression_level)
+        modules.add_module(
+            lorica_core::modules::http::compression::ResponseCompressionBuilder::enable(0),
+        );
+        // gRPC-Web bridge: transparently converts HTTP/1.1 gRPC-web requests
+        // (application/grpc-web) to HTTP/2 gRPC for the upstream backend.
+        modules.add_module(Box::new(lorica_core::modules::http::grpc_web::GrpcWeb));
+    }
 
     fn new_ctx(&self) -> Self::CTX {
         RequestCtx {
@@ -1624,7 +1646,7 @@ impl ProxyHttp for LoricaProxy {
             &*CACHE_BACKEND,
             Some(&*CACHE_EVICTION),
             None, // no predictor
-            None, // no cache lock
+            Some(*CACHE_LOCK),
             None, // no option overrides
         );
 
@@ -1698,13 +1720,45 @@ impl ProxyHttp for LoricaProxy {
             Ok(RespCacheable::Cacheable(CacheMeta::new(
                 fresh_until,
                 now,
-                0, // stale-while-revalidate
-                0, // stale-if-error
+                10, // stale-while-revalidate
+                60, // stale-if-error
                 resp.clone(),
             )))
         } else {
             Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache))
         }
+    }
+
+    /// Serve stale cached responses when the upstream is unavailable.
+    ///
+    /// Called in two scenarios:
+    /// - `error = None`: during stale-while-revalidate (background refresh in
+    ///   progress). We allow serving stale so users get an instant response.
+    /// - `error = Some(e)`: upstream failed (5xx, connection refused, timeout).
+    ///   We serve stale only for upstream errors, not for downstream or
+    ///   internal errors.
+    fn should_serve_stale(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        error: Option<&Error>,
+    ) -> bool {
+        match error {
+            None => true, // stale-while-revalidate
+            Some(e) => e.esource() == &ErrorSource::Upstream,
+        }
+    }
+
+    /// Detect HTTP PURGE requests for cache invalidation.
+    ///
+    /// When this returns true, the proxy cache layer handles the purge
+    /// automatically: it deletes the cached entry matching the request URI
+    /// and returns a 200 (purged) or 404 (not found) response.
+    ///
+    /// Network-level access control (firewall, IP allowlist) should be used
+    /// to restrict who can send PURGE requests.
+    fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
+        session.req_header().method.as_str() == "PURGE"
     }
 
     async fn upstream_peer(
@@ -3395,5 +3449,18 @@ mod tests {
     #[test]
     fn test_extract_sticky_backend_empty() {
         assert_eq!(extract_sticky_backend(""), None);
+    }
+
+    // ---- Cache Lock ----
+
+    #[test]
+    fn test_cache_lock_static_initializes() {
+        // CACHE_LOCK is a leaked &'static CacheLock. Verify it initializes
+        // without panicking and produces a valid reference that can be passed
+        // to session.cache.enable().
+        let lock: &'static CacheLock = *CACHE_LOCK;
+        // The lock is a trait object-compatible reference; if this compiles
+        // and doesn't panic, the lazy static is correctly wired.
+        let _: &'static lorica_cache::lock::CacheKeyLockImpl = lock;
     }
 }
