@@ -1,8 +1,0 @@
-Mode: important only
-Engine: Semgrep OSS 1.156.0
-
-Rust: p/rust, p/security-audit, p/trailofbits
-TypeScript: p/typescript, p/security-audit, p/owasp-top-ten
-Shell: p/bash, p/security-audit
-Docker: p/dockerfile, p/security-audit
-Python: p/python, p/security-audit
