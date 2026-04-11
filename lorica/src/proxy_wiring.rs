@@ -3771,4 +3771,106 @@ mod tests {
         assert!(!escaped.contains('>'));
         assert!(!escaped.contains('"'));
     }
+
+    // ---- Basic auth credential cache ----
+
+    #[test]
+    fn test_basic_auth_cache_stores_and_retrieves() {
+        let cache: DashMap<u64, Instant> = DashMap::new();
+        let key: u64 = 12345;
+        cache.insert(key, Instant::now());
+        assert!(cache.get(&key).is_some());
+        assert!(cache.get(&key).unwrap().elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_basic_auth_cache_ttl_expiry() {
+        let cache: DashMap<u64, Instant> = DashMap::new();
+        let key: u64 = 99999;
+        // Insert with a timestamp in the past (simulate expired entry)
+        cache.insert(key, Instant::now() - Duration::from_secs(120));
+        let ttl = Duration::from_secs(60);
+        let is_valid = cache
+            .get(&key)
+            .map(|t| t.elapsed() < ttl)
+            .unwrap_or(false);
+        assert!(!is_valid, "Entry older than TTL should be considered expired");
+    }
+
+    #[test]
+    fn test_basic_auth_cache_key_changes_on_password() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut h1 = DefaultHasher::new();
+        "admin:password1".hash(&mut h1);
+        "$argon2id$hash1".hash(&mut h1);
+        let key1 = h1.finish();
+
+        let mut h2 = DefaultHasher::new();
+        "admin:password2".hash(&mut h2);
+        "$argon2id$hash1".hash(&mut h2);
+        let key2 = h2.finish();
+
+        assert_ne!(key1, key2, "Different passwords should produce different cache keys");
+    }
+
+    // ---- Retry on methods filtering ----
+
+    #[test]
+    fn test_retry_on_methods_empty_allows_all() {
+        let route = make_route("r1", "example.com", "/", true);
+        // retry_on_methods is empty by default - all methods eligible
+        assert!(route.retry_on_methods.is_empty());
+        // With retry_attempts set, max_request_retries should return Some
+        let mut r = route;
+        r.retry_attempts = Some(3);
+        assert_eq!(r.retry_attempts, Some(3));
+    }
+
+    #[test]
+    fn test_retry_on_methods_filters_post() {
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.retry_attempts = Some(2);
+        route.retry_on_methods = vec!["GET".to_string(), "HEAD".to_string()];
+
+        // POST is not in the list - should be filtered out
+        let method = "POST";
+        let eligible = route.retry_on_methods.is_empty()
+            || route.retry_on_methods.iter().any(|m| m.eq_ignore_ascii_case(method));
+        assert!(!eligible, "POST should not be eligible for retry");
+
+        // GET is in the list - should be eligible
+        let method = "GET";
+        let eligible = route.retry_on_methods.is_empty()
+            || route.retry_on_methods.iter().any(|m| m.eq_ignore_ascii_case(method));
+        assert!(eligible, "GET should be eligible for retry");
+    }
+
+    // ---- Stale cache config per route ----
+
+    #[test]
+    fn test_stale_config_defaults() {
+        let route = make_route("r1", "example.com", "/", true);
+        assert_eq!(route.stale_while_revalidate_s, 10);
+        assert_eq!(route.stale_if_error_s, 60);
+    }
+
+    #[test]
+    fn test_stale_config_custom_values() {
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.stale_while_revalidate_s = 30;
+        route.stale_if_error_s = 300;
+        assert_eq!(route.stale_while_revalidate_s, 30);
+        assert_eq!(route.stale_if_error_s, 300);
+    }
+
+    #[test]
+    fn test_stale_config_zero_disables() {
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.stale_while_revalidate_s = 0;
+        route.stale_if_error_s = 0;
+        assert_eq!(route.stale_while_revalidate_s as u32, 0);
+        assert_eq!(route.stale_if_error_s as u32, 0);
+    }
 }

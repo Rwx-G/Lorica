@@ -1629,6 +1629,30 @@ cert_critical_days = 3
     }
 
     #[test]
+    fn test_stale_config_roundtrip() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.stale_while_revalidate_s = 30;
+        route.stale_if_error_s = 120;
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(loaded.stale_while_revalidate_s, 30);
+        assert_eq!(loaded.stale_if_error_s, 120);
+    }
+
+    #[test]
+    fn test_stale_config_default_values() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(loaded.stale_while_revalidate_s, 10, "default stale-while-revalidate should be 10s");
+        assert_eq!(loaded.stale_if_error_s, 60, "default stale-if-error should be 60s");
+    }
+
+    #[test]
     fn test_basic_auth_clear() {
         let store = ConfigStore::open_in_memory().unwrap();
         let mut route = make_route();
