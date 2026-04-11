@@ -62,6 +62,7 @@ mod tests {
             sticky_session: false,
             basic_auth_username: None,
             basic_auth_password_hash: None,
+            retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
             created_at: now,

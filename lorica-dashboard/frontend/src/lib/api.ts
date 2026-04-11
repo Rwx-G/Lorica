@@ -150,6 +150,7 @@ export interface RouteResponse {
   return_status: number | null;
   sticky_session: boolean;
   basic_auth_username: string | null;
+  retry_on_methods: string[];
   maintenance_mode: boolean;
   error_page_html: string | null;
   created_at: string;
@@ -204,6 +205,7 @@ export interface CreateRouteRequest {
   sticky_session?: boolean;
   basic_auth_username?: string;
   basic_auth_password?: string;
+  retry_on_methods?: string[];
   maintenance_mode?: boolean;
   error_page_html?: string;
 }
@@ -258,6 +260,7 @@ export interface UpdateRouteRequest {
   sticky_session?: boolean;
   basic_auth_username?: string;
   basic_auth_password?: string;
+  retry_on_methods?: string[];
   maintenance_mode?: boolean;
   error_page_html?: string;
 }

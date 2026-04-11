@@ -428,6 +428,8 @@ pub struct Route {
     #[serde(default)]
     pub basic_auth_password_hash: Option<String>,
     #[serde(default)]
+    pub retry_on_methods: Vec<String>,
+    #[serde(default)]
     pub maintenance_mode: bool,
     #[serde(default)]
     pub error_page_html: Option<String>,
@@ -1347,6 +1349,7 @@ mod tests {
             sticky_session: false,
             basic_auth_username: None,
             basic_auth_password_hash: None,
+            retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
             created_at: now,

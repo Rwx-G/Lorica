@@ -2316,10 +2316,22 @@ impl ProxyHttp for LoricaProxy {
         }
     }
 
-    fn max_request_retries(&self, _session: &Session, ctx: &Self::CTX) -> Option<usize> {
-        ctx.route_snapshot
-            .as_ref()
-            .and_then(|r| r.retry_attempts.map(|n| n as usize))
+    fn max_request_retries(&self, session: &Session, ctx: &Self::CTX) -> Option<usize> {
+        ctx.route_snapshot.as_ref().and_then(|r| {
+            let attempts = r.retry_attempts?;
+            // If retry_on_methods is configured, only retry for listed methods
+            if !r.retry_on_methods.is_empty() {
+                let method = session.req_header().method.as_str();
+                if !r
+                    .retry_on_methods
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(method))
+                {
+                    return None; // method not eligible for retry
+                }
+            }
+            Some(attempts as usize)
+        })
     }
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX)
@@ -2535,6 +2547,7 @@ mod tests {
             sticky_session: false,
             basic_auth_username: None,
             basic_auth_password_hash: None,
+            retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
             created_at: now,

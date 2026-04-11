@@ -63,6 +63,7 @@ export interface RouteFormState {
   sticky_session: boolean;
   basic_auth_username: string;
   basic_auth_password: string;
+  retry_on_methods: string;
   maintenance_mode: boolean;
   error_page_html: string;
 }
@@ -116,6 +117,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   sticky_session: false,
   basic_auth_username: '',
   basic_auth_password: '',
+  retry_on_methods: '',
   maintenance_mode: false,
   error_page_html: '',
 };
@@ -129,7 +131,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   ],
   timeouts: [
     'connect_timeout_s', 'read_timeout_s', 'send_timeout_s',
-    'strip_path_prefix', 'add_path_prefix', 'path_rewrite_pattern', 'path_rewrite_replacement', 'retry_attempts',
+    'strip_path_prefix', 'add_path_prefix', 'path_rewrite_pattern', 'path_rewrite_replacement', 'retry_attempts', 'retry_on_methods',
   ],
   security: [
     'security_headers', 'max_body_mb', 'rate_limit_rps',
@@ -240,6 +242,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     sticky_session: route.sticky_session ?? false,
     basic_auth_username: route.basic_auth_username ?? '',
     basic_auth_password: '',
+    retry_on_methods: (route.retry_on_methods ?? []).join(', '),
     maintenance_mode: route.maintenance_mode ?? false,
     error_page_html: route.error_page_html ?? '',
   };
@@ -309,6 +312,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     sticky_session: form.sticky_session,
     basic_auth_username: form.basic_auth_username || undefined,
     basic_auth_password: form.basic_auth_password || undefined,
+    retry_on_methods: csvToArray(form.retry_on_methods).length > 0 ? csvToArray(form.retry_on_methods) : empty([]),
     maintenance_mode: form.maintenance_mode,
     error_page_html: form.error_page_html || undefined,
   };
