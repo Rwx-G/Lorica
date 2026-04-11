@@ -1242,6 +1242,7 @@ fn run_worker(
                     cert_pem: c.cert_pem.clone(),
                     key_pem: c.key_pem.clone(),
                     not_after_epoch: c.not_after.timestamp(),
+                    ocsp_response: None,
                 })
                 .collect();
             if let Err(e) = cert_resolver.reload(cert_data) {
@@ -1769,6 +1770,7 @@ fn run_single_process(cli: Cli) {
                         cert_pem: c.cert_pem.clone(),
                         key_pem: c.key_pem.clone(),
                         not_after_epoch: c.not_after.timestamp(),
+                        ocsp_response: None,
                     })
                     .collect();
                 if let Err(e) = cert_resolver.reload(cert_data) {

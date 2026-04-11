@@ -18,6 +18,7 @@
 #![warn(clippy::all)]
 
 pub mod cert_resolver;
+pub mod ocsp;
 
 use std::fs::File;
 use std::io::BufReader;

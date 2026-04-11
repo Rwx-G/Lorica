@@ -142,6 +142,7 @@ pub async fn reload_cert_resolver(
             cert_pem: c.cert_pem.clone(),
             key_pem: c.key_pem.clone(),
             not_after_epoch: c.not_after.timestamp(),
+            ocsp_response: None,
         })
         .collect();
 

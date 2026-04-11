@@ -48,6 +48,8 @@ pub struct CertData {
     pub key_pem: String,
     /// Expiration timestamp (seconds since Unix epoch).
     pub not_after_epoch: i64,
+    /// DER-encoded OCSP response for stapling (optional).
+    pub ocsp_response: Option<Vec<u8>>,
 }
 
 /// A single certificate entry, sorted by expiration.
@@ -104,7 +106,11 @@ impl CertResolver {
         let mut map: HashMap<String, Vec<CertEntry>> = HashMap::new();
 
         for cert_data in certs {
-            let certified_key = build_certified_key(&cert_data.cert_pem, &cert_data.key_pem)?;
+            let certified_key = build_certified_key(
+                &cert_data.cert_pem,
+                &cert_data.key_pem,
+                cert_data.ocsp_response.clone(),
+            )?;
             let entry = CertEntry {
                 key: Arc::new(certified_key),
                 not_after_epoch: cert_data.not_after_epoch,
@@ -162,15 +168,24 @@ impl ResolvesServerCert for CertResolver {
     }
 }
 
-/// Parse PEM strings and build a rustls `CertifiedKey`.
-fn build_certified_key(cert_pem: &str, key_pem: &str) -> Result<CertifiedKey> {
+/// Parse PEM strings and build a rustls `CertifiedKey`, optionally with an
+/// OCSP staple response.
+fn build_certified_key(
+    cert_pem: &str,
+    key_pem: &str,
+    ocsp_response: Option<Vec<u8>>,
+) -> Result<CertifiedKey> {
     let certs = parse_certs_from_pem(cert_pem)?;
     let key = parse_key_from_pem(key_pem)?;
 
     let signing_key =
         any_supported_type(&key).or_err(ErrorType::InvalidCert, "unsupported key type")?;
 
-    Ok(CertifiedKey::new(certs, signing_key))
+    let mut ck = CertifiedKey::new(certs, signing_key);
+    if let Some(ocsp) = ocsp_response {
+        ck.ocsp = Some(ocsp);
+    }
+    Ok(ck)
 }
 
 fn parse_certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
@@ -251,6 +266,7 @@ mod tests {
             cert_pem: cert_pem.to_string(),
             key_pem: key_pem.to_string(),
             not_after_epoch: 9999999999,
+            ocsp_response: None,
         }]);
 
         assert!(result.is_ok());
@@ -273,6 +289,7 @@ mod tests {
                 cert_pem: cert_pem.to_string(),
                 key_pem: key_pem.to_string(),
                 not_after_epoch: 1000,
+                ocsp_response: None,
             }])
             .unwrap();
         assert_eq!(resolver.domain_count(), 1);
@@ -285,6 +302,7 @@ mod tests {
                 cert_pem: cert_pem.to_string(),
                 key_pem: key_pem.to_string(),
                 not_after_epoch: 2000,
+                ocsp_response: None,
             }])
             .unwrap();
         assert_eq!(resolver.domain_count(), 1);
@@ -304,6 +322,7 @@ mod tests {
                     cert_pem: cert_pem.to_string(),
                     key_pem: key_pem.to_string(),
                     not_after_epoch: 1000, // short-lived
+                    ocsp_response: None,
                 },
                 CertData {
                     domain: "example.com".to_string(),
@@ -311,6 +330,7 @@ mod tests {
                     cert_pem: cert_pem.to_string(),
                     key_pem: key_pem.to_string(),
                     not_after_epoch: 9000, // long-lived
+                    ocsp_response: None,
                 },
             ])
             .unwrap();
@@ -333,6 +353,7 @@ mod tests {
                 cert_pem: cert_pem.to_string(),
                 key_pem: key_pem.to_string(),
                 not_after_epoch: 9999999999,
+                ocsp_response: None,
             }])
             .unwrap();
 
@@ -352,6 +373,7 @@ mod tests {
                 cert_pem: cert_pem.to_string(),
                 key_pem: key_pem.to_string(),
                 not_after_epoch: 9999999999,
+                ocsp_response: None,
             }])
             .unwrap();
 
