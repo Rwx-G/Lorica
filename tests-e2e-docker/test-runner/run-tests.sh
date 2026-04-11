@@ -3530,18 +3530,31 @@ if [ -n "$SESSION" ]; then
     MT_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
     MT_B_ID=$(echo "$MT_B" | jq -r '.data.id')
 
+    # Create route first without maintenance, wait for it to be live,
+    # then enable maintenance via update (avoids config reload race)
     MT_ROUTE=$(api_post "/api/v1/routes" "{
         \"hostname\":\"maint.test\",
         \"path_prefix\":\"/\",
         \"backend_ids\":[\"$MT_B_ID\"],
-        \"maintenance_mode\":true,
+        \"maintenance_mode\":false,
         \"error_page_html\":\"<html><body><h1>Down for maintenance</h1></body></html>\",
         \"waf_enabled\":false
     }")
     MT_ROUTE_ID=$(echo "$MT_ROUTE" | jq -r '.data.id')
-    assert_json "$MT_ROUTE" ".data.maintenance_mode" "true" "Maintenance mode enabled"
 
-    # Wait for config reload with polling (up to 15s)
+    # Wait until the route is live (200 from backend)
+    for i in $(seq 1 10); do
+        MT_PRE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+            -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "000")
+        if [ "$MT_PRE" = "200" ]; then break; fi
+        sleep 1
+    done
+
+    # Now enable maintenance mode via update
+    api_put "/api/v1/routes/$MT_ROUTE_ID" '{"maintenance_mode":true}' >/dev/null
+    assert_json "$(api_get "/api/v1/routes/$MT_ROUTE_ID")" ".data.maintenance_mode" "true" "Maintenance mode enabled"
+
+    # Poll until 503 (config reload propagation)
     MT_STATUS="000"
     for i in $(seq 1 15); do
         MT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
