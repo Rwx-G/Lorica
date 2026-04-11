@@ -382,17 +382,37 @@ impl LogStore {
         Ok(())
     }
 
-    /// Query WAF events, newest first.
-    pub fn list_waf_events(&self, limit: usize) -> Result<Vec<lorica_waf::WafEvent>, String> {
+    /// Query WAF events, newest first. When `category` is provided, only
+    /// events matching that category are returned (filtered at the SQL level
+    /// so that `limit` applies to the filtered set, not the full table).
+    pub fn list_waf_events(
+        &self,
+        limit: usize,
+        category: Option<&str>,
+    ) -> Result<Vec<lorica_waf::WafEvent>, String> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare(
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(cat) =
+            category
+        {
+            (
                 "SELECT rule_id, description, category, severity, matched_field, matched_value, timestamp, client_ip, route_hostname, action
-                 FROM waf_events ORDER BY id DESC LIMIT ?1",
+                 FROM waf_events WHERE category = ?2 ORDER BY id DESC LIMIT ?1".to_string(),
+                vec![Box::new(limit as i64), Box::new(cat.to_string())],
             )
+        } else {
+            (
+                "SELECT rule_id, description, category, severity, matched_field, matched_value, timestamp, client_ip, route_hostname, action
+                 FROM waf_events ORDER BY id DESC LIMIT ?1".to_string(),
+                vec![Box::new(limit as i64)],
+            )
+        };
+        let mut stmt = conn
+            .prepare(&sql)
             .map_err(|e| format!("failed to prepare WAF events query: {e}"))?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
-            .query_map(params![limit as i64], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 let cat_str: String = row.get(2)?;
                 let category = cat_str
                     .parse::<lorica_waf::RuleCategory>()

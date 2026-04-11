@@ -23,6 +23,11 @@ Author: Rwx-G
 - Structured log output: `--log-format` CLI option (json/text) and `--log-file` for file output alongside stdout. Propagated to worker processes
 - OCSP stapling: automatic OCSP response fetch from CA responder (AIA extension), attached to TLS handshakes via rustls CertifiedKey. Best-effort with warning on failure
 - Production Dockerfile: multi-stage build (Node 22 + Rust + Debian slim), non-root user, volume mount at /var/lib/lorica
+- Per-route stale cache configuration: `stale_while_revalidate_s` (default 10) and `stale_if_error_s` (default 60) configurable via API and dashboard Caching tab
+
+### Fixed
+
+- WAF event category filter: filter now applied at SQL level so LIMIT returns correct results when filtering by category (e.g. XSS events were invisible when IP Blocklist dominated the top N rows)
 
 ## [1.1.0] - 2026-04-10
 
