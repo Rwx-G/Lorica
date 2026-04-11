@@ -677,6 +677,8 @@ impl ConfigStore {
              created_at, updated_at,
              path_rules, return_status, sticky_session,
              basic_auth_username, basic_auth_password_hash,
+             stale_while_revalidate_s, stale_if_error_s,
+             retry_on_methods,
              maintenance_mode, error_page_html
              FROM routes ORDER BY hostname, path_prefix",
         )?;

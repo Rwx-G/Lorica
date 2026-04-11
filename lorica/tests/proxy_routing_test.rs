@@ -323,3 +323,109 @@ async fn test_down_backends_filtered() {
     assert_eq!(healthy.len(), 1);
     assert_eq!(healthy[0].address, "10.0.0.1:80");
 }
+
+/// Verify that v1.2.0 route fields survive the full store -> reload -> ProxyConfig
+/// pipeline: maintenance_mode, basic_auth, stale config, retry_on_methods, error_page.
+#[tokio::test]
+async fn test_v120_fields_survive_reload() {
+    let store = ConfigStore::open_in_memory().unwrap();
+
+    let mut route = make_route("r1", "v120.test", "/");
+    route.maintenance_mode = true;
+    route.error_page_html = Some("<h1>Down</h1>".to_string());
+    route.basic_auth_username = Some("admin".to_string());
+    route.basic_auth_password_hash = Some("$argon2id$hash".to_string());
+    route.stale_while_revalidate_s = 30;
+    route.stale_if_error_s = 120;
+    route.retry_on_methods = vec!["GET".to_string(), "HEAD".to_string()];
+    store.create_route(&route).unwrap();
+    store
+        .create_backend(&make_backend("b1", "10.0.0.1:80"))
+        .unwrap();
+    store.link_route_backend("r1", "b1").unwrap();
+
+    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let proxy_config = Arc::new(arc_swap::ArcSwap::from_pointee(
+        lorica::proxy_wiring::ProxyConfig::default(),
+    ));
+
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+
+    let config = proxy_config.load();
+    let entries = config.routes_by_host.get("v120.test").unwrap();
+    let r = &entries[0].route;
+
+    assert!(r.maintenance_mode, "maintenance_mode must survive reload");
+    assert_eq!(r.error_page_html.as_deref(), Some("<h1>Down</h1>"));
+    assert_eq!(r.basic_auth_username.as_deref(), Some("admin"));
+    assert_eq!(r.basic_auth_password_hash.as_deref(), Some("$argon2id$hash"));
+    assert_eq!(r.stale_while_revalidate_s, 30);
+    assert_eq!(r.stale_if_error_s, 120);
+    assert_eq!(r.retry_on_methods, vec!["GET", "HEAD"]);
+}
+
+/// Verify that maintenance_mode can be toggled via update + reload.
+#[tokio::test]
+async fn test_maintenance_mode_toggle_via_reload() {
+    let store = ConfigStore::open_in_memory().unwrap();
+
+    let mut route = make_route("r1", "toggle.test", "/");
+    route.maintenance_mode = false;
+    store.create_route(&route).unwrap();
+    store
+        .create_backend(&make_backend("b1", "10.0.0.1:80"))
+        .unwrap();
+    store.link_route_backend("r1", "b1").unwrap();
+
+    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let proxy_config = Arc::new(arc_swap::ArcSwap::from_pointee(
+        lorica::proxy_wiring::ProxyConfig::default(),
+    ));
+
+    // Initial load: maintenance_mode = false
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+    {
+        let config = proxy_config.load();
+        let r = &config.routes_by_host.get("toggle.test").unwrap()[0].route;
+        assert!(!r.maintenance_mode, "should start as false");
+    }
+
+    // Update to maintenance_mode = true
+    {
+        let s = store.lock().await;
+        let mut r = s.get_route("r1").unwrap().unwrap();
+        r.maintenance_mode = true;
+        s.update_route(&r).unwrap();
+    }
+
+    // Reload: maintenance_mode should now be true
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+    {
+        let config = proxy_config.load();
+        let r = &config.routes_by_host.get("toggle.test").unwrap()[0].route;
+        assert!(r.maintenance_mode, "should be true after update + reload");
+    }
+
+    // Toggle back to false
+    {
+        let s = store.lock().await;
+        let mut r = s.get_route("r1").unwrap().unwrap();
+        r.maintenance_mode = false;
+        s.update_route(&r).unwrap();
+    }
+
+    lorica::reload::reload_proxy_config(&store, &proxy_config)
+        .await
+        .unwrap();
+    {
+        let config = proxy_config.load();
+        let r = &config.routes_by_host.get("toggle.test").unwrap()[0].route;
+        assert!(!r.maintenance_mode, "should be false after toggle back");
+    }
+}
