@@ -229,7 +229,7 @@
   {/if}
 
   {#if showForm}
-    <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showForm = false; }}>
+    <div class="overlay" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) showForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showForm = false; }}>
       <div class="modal">
         <h2>{editingProbe ? 'Edit Probe' : 'Add Probe'}</h2>
 

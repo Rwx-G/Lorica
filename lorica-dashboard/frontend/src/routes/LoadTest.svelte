@@ -506,7 +506,7 @@
   {/if}
 
   {#if showForm}
-    <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) { showForm = false; editingConfig = null; } }}>
+    <div class="overlay" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) { showForm = false; editingConfig = null; } }} onkeydown={(e) => { if (e.key === 'Escape') { showForm = false; editingConfig = null; } }}>
       <div class="modal">
         <h2>{editingConfig ? 'Edit Load Test' : 'New Load Test'}</h2>
         {#if formError}

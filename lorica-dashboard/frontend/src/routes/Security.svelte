@@ -455,7 +455,7 @@
     {/if}
 
     {#if showCustomForm}
-      <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showCustomForm = false; }}>
+      <div class="overlay" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) showCustomForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showCustomForm = false; }}>
         <div class="modal">
           <h2>Add Custom WAF Rule</h2>
           {#if crError}

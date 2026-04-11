@@ -6,7 +6,7 @@ Bug fixes, improvements, and maintenance tasks. For new features, see [ROADMAP.m
 
 | # | Item | Type | Notes |
 |---|------|------|-------|
-| 5 | Dashboard accessibility (a11y) | Improvement | 79 svelte-check a11y warnings: missing tabindex on dialogs, click handlers without keyboard events, form labels not associated. Affects keyboard navigation and screen readers. |
+| | | | |
 
 ## Resolved
 

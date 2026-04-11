@@ -164,21 +164,21 @@
       <table>
         <thead>
           <tr>
-            <th class="sortable" onclick={() => toggleSort('route')}>
+            <th class="sortable" tabindex="0" role="button" onclick={() => toggleSort('route')} onkeydown={(e) => { if (e.key === 'Enter') toggleSort('route'); }}>
               Route {sortColumn === 'route' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
             </th>
-            <th class="sortable" onclick={() => toggleSort('path')}>
+            <th class="sortable" tabindex="0" role="button" onclick={() => toggleSort('path')} onkeydown={(e) => { if (e.key === 'Enter') toggleSort('path'); }}>
               Path {sortColumn === 'path' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
             </th>
-            <th class="sortable" onclick={() => toggleSort('backends')}>
+            <th class="sortable" tabindex="0" role="button" onclick={() => toggleSort('backends')} onkeydown={(e) => { if (e.key === 'Enter') toggleSort('backends'); }}>
               Backends {sortColumn === 'backends' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
             </th>
             <th>TLS</th>
             <th>WAF</th>
-            <th class="sortable" onclick={() => toggleSort('health')}>
+            <th class="sortable" tabindex="0" role="button" onclick={() => toggleSort('health')} onkeydown={(e) => { if (e.key === 'Enter') toggleSort('health'); }}>
               Health {sortColumn === 'health' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
             </th>
-            <th class="sortable" onclick={() => toggleSort('enabled')}>
+            <th class="sortable" tabindex="0" role="button" onclick={() => toggleSort('enabled')} onkeydown={(e) => { if (e.key === 'Enter') toggleSort('enabled'); }}>
               Enabled {sortColumn === 'enabled' ? (sortDirection === 'asc' ? '\u2191' : '\u2193') : ''}
             </th>
             <th>Actions</th>

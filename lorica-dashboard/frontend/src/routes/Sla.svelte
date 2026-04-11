@@ -300,7 +300,7 @@
 
   <!-- Config modal -->
   {#if showConfigModal}
-    <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showConfigModal = false; }}>
+    <div class="overlay" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) showConfigModal = false; }} onkeydown={(e) => { if (e.key === 'Escape') showConfigModal = false; }}>
       <div class="modal">
         <h2>SLA Configuration</h2>
         <div class="form-group">
@@ -333,7 +333,7 @@
 
   <!-- Clear SLA confirmation modal -->
   {#if showClearModal}
-    <div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) showClearModal = false; }}>
+    <div class="overlay" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) showClearModal = false; }} onkeydown={(e) => { if (e.key === 'Escape') showClearModal = false; }}>
       <div class="modal">
         <h2>Clear SLA Data</h2>
         <p>This will permanently delete all SLA buckets for <strong>{getRouteHostname(selectedRouteId)}</strong>.</p>

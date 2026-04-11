@@ -177,7 +177,7 @@
 </script>
 
 <!-- ACME Provisioning Modal -->
-<div class="overlay" role="dialog" onclick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+<div class="overlay" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) onClose(); }} onkeydown={(e) => { if (e.key === 'Escape') onClose(); }}>
   <div class="modal">
     <h2>Let's Encrypt Certificate</h2>
 
