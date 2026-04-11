@@ -545,6 +545,9 @@ fn run_supervisor(cli: Cli) {
         // Spawn a per-worker task that handles both config reload and heartbeat
         // No shared Mutex - each worker has its own channel and task
         for (worker_id, worker_pid, raw_fd) in worker_fds {
+            // SAFETY: raw_fd is a valid file descriptor from the socketpair
+            // created by WorkerManager::spawn_workers(), passed to this task
+            // immediately after fork. The fd is exclusively owned by this task.
             let mut channel = match unsafe { CommandChannel::from_raw_fd(raw_fd) } {
                 Ok(ch) => ch,
                 Err(e) => {
@@ -1049,6 +1052,8 @@ fn run_supervisor(cli: Cli) {
                                 .map(|(_, pid)| pid.as_raw())
                                 .unwrap_or(0);
                             info!(worker_id = id, new_pid, reason = log_msg, "worker restarted, reconnecting channel");
+                            // SAFETY: new_fd is a fresh socketpair fd from
+                            // WorkerManager::restart_worker(), exclusively owned here.
                             match unsafe { CommandChannel::from_raw_fd(new_fd.into_raw_fd()) } {
                                 Ok(mut channel) => {
                                     let mut rx = monitor_reload_tx.subscribe();
@@ -1338,7 +1343,9 @@ fn run_worker(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create command channel runtime");
         rt.block_on(async move {
-            // Create the command channel from the socketpair FD
+            // SAFETY: cmd_fd is the socketpair file descriptor passed by the
+            // supervisor via --cmd-fd CLI arg. It is exclusively owned by this
+            // worker process after fork/exec.
             let mut channel = match unsafe { CommandChannel::from_raw_fd(cmd_fd) } {
                 Ok(ch) => ch,
                 Err(e) => {
