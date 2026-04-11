@@ -9,6 +9,21 @@ Author: Rwx-G
 
 ## Unreleased
 
+### Added
+
+- Cache lock for thundering herd protection: only one request fetches from upstream on cache miss, others wait for the cached response (10 s timeout)
+- Stale-while-error: serve cached responses when upstream fails (60 s) and during background revalidation (10 s), via `should_serve_stale()` hook
+- Cache PURGE method: HTTP PURGE requests invalidate cached entries matching the request URI
+- gRPC-Web bridge module: transparently converts HTTP/1.1 gRPC-web requests to HTTP/2 gRPC for upstream backends
+- Least Connections load balancing algorithm: routes traffic to the backend with the fewest active connections
+- HTTP Basic Auth per route: username/password (Argon2id-hashed) with 401 + WWW-Authenticate challenge. Configurable in Security tab
+- Maintenance mode per route: returns 503 with Retry-After header and optional custom HTML error page
+- Custom error pages: configurable HTML template for upstream errors (502/504) with `{{status}}` and `{{message}}` placeholders, served via `fail_to_proxy()` hook
+- Enriched retry policy: `retry_on_methods` field filters which HTTP methods are eligible for retry (e.g. GET, HEAD only), preventing duplicate side-effects on POST/PUT
+- Structured log output: `--log-format` CLI option (json/text) and `--log-file` for file output alongside stdout. Propagated to worker processes
+- OCSP stapling: automatic OCSP response fetch from CA responder (AIA extension), attached to TLS handshakes via rustls CertifiedKey. Best-effort with warning on failure
+- Production Dockerfile: multi-stage build (Node 22 + Rust + Debian slim), non-root user, volume mount at /var/lib/lorica
+
 ## [1.1.0] - 2026-04-10
 
 ### Added
