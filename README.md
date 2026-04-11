@@ -471,6 +471,12 @@ curl -fsSL https://github.com/Rwx-G/Lorica/raw/main/docs/lorica-signing-key.asc 
 gpg --verify lorica.deb.asc lorica.deb
 ```
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for planned features across upcoming releases (v1.2.0 - v2.0.0).
+
+See [COMPARISON.md](COMPARISON.md) for a detailed feature comparison with Nginx, Traefik, HAProxy, Caddy, BunkerWeb, Sozu, and Pingora.
+
 ## Not Supported
 
 | Feature | Status | Rationale |
