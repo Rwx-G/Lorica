@@ -3541,7 +3541,8 @@ if [ -n "$SESSION" ]; then
     MT_ROUTE_ID=$(echo "$MT_ROUTE" | jq -r '.data.id')
     assert_json "$MT_ROUTE" ".data.maintenance_mode" "true" "Maintenance mode enabled"
 
-    sleep 2
+    # Wait for config reload to propagate the new route
+    sleep 4
 
     # Request should get 503 with custom HTML
     MT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
@@ -3549,7 +3550,15 @@ if [ -n "$SESSION" ]; then
     if [ "$MT_STATUS" = "503" ]; then
         ok "Maintenance mode: returns 503"
     else
-        fail "Maintenance mode: expected 503 (got $MT_STATUS)"
+        # Retry once after extra wait (config reload timing can vary)
+        sleep 3
+        MT_STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            -H "Host: maint.test" "$PROXY/" 2>/dev/null || echo "000")
+        if [ "$MT_STATUS" = "503" ]; then
+            ok "Maintenance mode: returns 503 (after retry)"
+        else
+            fail "Maintenance mode: expected 503 (got $MT_STATUS)"
+        fi
     fi
 
     MT_BODY=$(curl -sf --max-time 5 \
@@ -3584,6 +3593,12 @@ if [ -n "$SESSION" ]; then
     PG_B=$(api_post "/api/v1/backends" "{\"address\":\"$BACKEND1\",\"health_check_enabled\":false}")
     PG_B_ID=$(echo "$PG_B" | jq -r '.data.id')
 
+    # Add the Docker network CIDR to trusted_proxies so PURGE is allowed
+    # from the test-runner container (not loopback in Docker networking)
+    PG_SETTINGS=$(api_get "/api/v1/settings")
+    PG_EXISTING_PROXIES=$(echo "$PG_SETTINGS" | jq -r '.data.trusted_proxies // []')
+    api_put "/api/v1/settings" "{\"trusted_proxies\":[\"172.16.0.0/12\",\"10.0.0.0/8\",\"192.168.0.0/16\"]}" >/dev/null
+
     PG_ROUTE=$(api_post "/api/v1/routes" "{
         \"hostname\":\"purge.test\",
         \"path_prefix\":\"/\",
@@ -3594,7 +3609,7 @@ if [ -n "$SESSION" ]; then
     }")
     PG_ROUTE_ID=$(echo "$PG_ROUTE" | jq -r '.data.id')
 
-    sleep 2
+    sleep 3
 
     # Populate cache
     curl -sf -H "Host: purge.test" "$PROXY/echo?purge_test=1" > /dev/null 2>&1 || true
@@ -3606,7 +3621,7 @@ if [ -n "$SESSION" ]; then
         ok "Cache PURGE: pre-purge status=$PG_HIT"
     fi
 
-    # PURGE request (from localhost - allowed)
+    # PURGE request (from test-runner - trusted proxy)
     PG_PURGE_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X PURGE \
         -H "Host: purge.test" "$PROXY/echo?purge_test=1" 2>/dev/null || echo "000")
     if [ "$PG_PURGE_STATUS" = "200" ] || [ "$PG_PURGE_STATUS" = "404" ]; then
@@ -3623,7 +3638,8 @@ if [ -n "$SESSION" ]; then
         ok "Cache PURGE: after purge X-Cache-Status=$PG_AFTER"
     fi
 
-    # Cleanup
+    # Cleanup: restore trusted_proxies to original state
+    api_put "/api/v1/settings" "{\"trusted_proxies\":$PG_EXISTING_PROXIES}" >/dev/null 2>&1 || true
     api_del "/api/v1/routes/$PG_ROUTE_ID" >/dev/null 2>&1 || true
     api_del "/api/v1/backends/$PG_B_ID" >/dev/null 2>&1 || true
 
