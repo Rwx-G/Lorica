@@ -1228,10 +1228,12 @@ impl ProxyHttp for LoricaProxy {
                         let hash_str = expected_hash.to_string();
                         let ok = tokio::task::block_in_place(|| {
                             use argon2::PasswordVerifier;
-                            let h = argon2::PasswordHash::new(&hash_str).unwrap();
-                            argon2::Argon2::default()
-                                .verify_password(&pass_bytes, &h)
-                                .is_ok()
+                            match argon2::PasswordHash::new(&hash_str) {
+                                Ok(h) => argon2::Argon2::default()
+                                    .verify_password(&pass_bytes, &h)
+                                    .is_ok(),
+                                Err(_) => false,
+                            }
                         });
                         if ok {
                             self.basic_auth_cache.insert(cache_key, Instant::now());
