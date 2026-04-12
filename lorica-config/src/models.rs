@@ -406,6 +406,23 @@ fn default_rewrite_max_body_bytes() -> u32 {
 /// responses are discarded, and any mirror failure must never affect
 /// the primary request.
 ///
+/// # Trust model
+///
+/// The shadow backend receives a byte-for-byte clone of the primary
+/// request INCLUDING Cookie, Authorization, and any custom session
+/// headers. This is industry-standard behaviour (Nginx `mirror`,
+/// Traefik `Mirroring`, Envoy `request_mirror_policies`) because
+/// shadow testing only produces meaningful results when the shadow
+/// sees the same authentication context as the primary. The
+/// consequence: **shadow backends must be part of the same trust
+/// boundary as the primary**. Do not mirror traffic to a backend
+/// you would not trust with a production session cookie. The
+/// `X-Lorica-Mirror: 1` marker is for log/metric filtering, not a
+/// security boundary - an attacker on the shadow can still replay
+/// the session against the primary.
+///
+/// # Behaviour
+///
 /// Typical use case: validate a new service version against real
 /// production traffic before promoting it. The shadow backend receives
 /// a clone of the request with an identifying `X-Lorica-Mirror: 1`

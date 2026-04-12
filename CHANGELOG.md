@@ -16,8 +16,14 @@ Author: Rwx-G
 - Forward-auth `http://` non-loopback warning: API validator logs a warn when the auth URL scheme is plain HTTP and the host isn't loopback (`localhost`, `127.*`, `[::1]`, `*.localhost`), reminding operators that Cookie and Authorization headers are forwarded to the auth service verbatim and will leak in cleartext on non-loopback paths
 - Dashboard badge for disabled header-routing rules: `HeaderRuleResponse.disabled` is computed at read time by attempting to compile each rule's regex; the route-form UI surfaces a red badge on rules the proxy skipped at load (e.g. regex-crate version drift after an upgrade, out-of-band DB edit) so the operator can republish
 
+### Security
+
+- Forward-auth verdict cache key is now the literal NUL-separated `"{route_id}\0{cookie}"` concatenation rather than a 64-bit `DefaultHasher` output. A truncated hash had a feasible birthday-collision cost (~2^32 distinct sessions) under which user B could receive user A's cached `Allow` response_headers. Raw-string keys use DashMap's full string-equality lookup, so two distinct (route_id, cookie) pairs can never alias. Memory cost is bounded by the same 16 384-entry cache cap
+- Mirror trust boundary documented loudly on `MirrorConfig`: shadow backends receive Cookie / Authorization / session headers verbatim by design (matching Nginx `mirror`, Traefik `Mirroring`, Envoy `request_mirror_policies`) so shadow testing reflects the primary. Operators must deploy shadows in the same trust boundary as the primary. The `X-Lorica-Mirror: 1` marker is for log/metric filtering, not a security boundary
+
 ### Fixed
 
+- Forward-auth verdict cache eviction is now a bounded FIFO via a sibling `VecDeque<String>` with O(1) amortised insert cost. The previous `iter().take(N)` strategy was O(n) per cap-overflow insert, creating a DoS surface under a cookie-flood attack where an attacker could sustain ~0.5 ms of per-request DashMap work
 - SWR refresh-failure dangling-permit bug: the forked `lorica-cache::WritePermit::Drop` replaced its `debug_assert!(false, "Dangling cache lock started!")` with a `warn!` log so debug-build tests no longer panic on the legitimate SWR subrequest-abandon path (e.g. parent session disconnected before the writer completed). Added a `LockCtx::Drop` safety net in `lorica-proxy::subrequest` that explicitly releases the inner `WritePermit` as `LockStatus::TransientError` when the subrequest future is dropped - a new writer is now correctly elected on the next request for that key, preventing any cache-state drift in both debug and release builds
 
 ### Added
