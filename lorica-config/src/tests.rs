@@ -1843,6 +1843,7 @@ cert_critical_days = 3
             backend_ids: vec!["shadow-a".into(), "shadow-b".into()],
             sample_percent: 10,
             timeout_ms: 3_000,
+            max_body_bytes: 524_288,
         });
         store.create_route(&route).unwrap();
 
@@ -1851,6 +1852,7 @@ cert_critical_days = 3
         assert_eq!(m.backend_ids, vec!["shadow-a".to_string(), "shadow-b".to_string()]);
         assert_eq!(m.sample_percent, 10);
         assert_eq!(m.timeout_ms, 3_000);
+        assert_eq!(m.max_body_bytes, 524_288);
 
         let via_list: Vec<_> = store
             .list_routes()

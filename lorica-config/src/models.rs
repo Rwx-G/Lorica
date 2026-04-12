@@ -342,10 +342,12 @@ impl HeaderRule {
 /// given request is mirrored to every configured shadow backend or to
 /// none - never split between them.
 ///
-/// **v1 scope**: the request body is NOT forwarded - only headers,
-/// method, and URL. This keeps memory bounded and avoids a second pass
-/// over large uploads. A future iteration can opt-in to buffered body
-/// mirroring for bounded requests.
+/// Request bodies on POST/PUT/PATCH are forwarded in full up to
+/// `max_body_bytes`. Requests whose body exceeds that cap are NOT
+/// mirrored - the shadow would see truncated data and report
+/// misleading behaviour, so it's safer to skip. The cap is also what
+/// prevents a single large upload from pinning memory for the length
+/// of the mirror timeout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MirrorConfig {
     /// One or more backend IDs that receive shadow copies of the
@@ -361,6 +363,13 @@ pub struct MirrorConfig {
     /// this are dropped silently. Default 5000.
     #[serde(default = "default_mirror_timeout_ms")]
     pub timeout_ms: u32,
+    /// Maximum request body size to buffer for mirroring, in bytes.
+    /// Requests with bodies larger than this are sent to the primary
+    /// normally but NOT mirrored (a truncated body would produce
+    /// misleading shadow behaviour). Default 1 MiB. Set to 0 to
+    /// explicitly skip body mirroring (headers-only mode).
+    #[serde(default = "default_mirror_max_body_bytes")]
+    pub max_body_bytes: u32,
 }
 
 fn default_mirror_sample_percent() -> u8 {
@@ -369,6 +378,10 @@ fn default_mirror_sample_percent() -> u8 {
 
 fn default_mirror_timeout_ms() -> u32 {
     5_000
+}
+
+fn default_mirror_max_body_bytes() -> u32 {
+    1_048_576 // 1 MiB
 }
 
 /// Forward-authentication config: before proxying to upstream, issue a

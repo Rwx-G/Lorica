@@ -88,6 +88,8 @@ pub struct MirrorConfigRequest {
     pub sample_percent: u8,
     #[serde(default = "default_mirror_timeout_ms")]
     pub timeout_ms: u32,
+    #[serde(default = "default_mirror_max_body_bytes")]
+    pub max_body_bytes: u32,
 }
 
 fn default_mirror_sample_percent() -> u8 {
@@ -95,6 +97,9 @@ fn default_mirror_sample_percent() -> u8 {
 }
 fn default_mirror_timeout_ms() -> u32 {
     5_000
+}
+fn default_mirror_max_body_bytes() -> u32 {
+    1_048_576
 }
 
 #[derive(Serialize)]
@@ -405,6 +410,7 @@ fn route_to_response(
             backend_ids: m.backend_ids.clone(),
             sample_percent: m.sample_percent,
             timeout_ms: m.timeout_ms,
+            max_body_bytes: m.max_body_bytes,
         }),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
@@ -439,6 +445,16 @@ fn build_mirror_config(
             "mirror.timeout_ms must be <= 60000 (60 seconds)".into(),
         ));
     }
+    // Cap max_body_bytes at 128 MiB to prevent an operator from
+    // unknowingly configuring memory amplification under the
+    // 256-concurrent-mirrors cap.
+    const MIRROR_MAX_BODY_CEILING: u32 = 128 * 1_048_576;
+    if body.max_body_bytes > MIRROR_MAX_BODY_CEILING {
+        return Err(ApiError::BadRequest(format!(
+            "mirror.max_body_bytes must be <= {MIRROR_MAX_BODY_CEILING} ({} MiB); larger bodies should be mirrored via a dedicated replay tool",
+            MIRROR_MAX_BODY_CEILING / 1_048_576
+        )));
+    }
     // Dedup and trim backend IDs so the engine doesn't spawn duplicate
     // sub-requests to the same shadow.
     let mut seen = std::collections::HashSet::new();
@@ -458,6 +474,7 @@ fn build_mirror_config(
         backend_ids: cleaned,
         sample_percent: body.sample_percent,
         timeout_ms: body.timeout_ms,
+        max_body_bytes: body.max_body_bytes,
     })
 }
 
@@ -1260,6 +1277,7 @@ mod tests {
             backend_ids: backends.into_iter().map(String::from).collect(),
             sample_percent: pct,
             timeout_ms: timeout,
+            max_body_bytes: 1_048_576,
         }
     }
 
@@ -1324,6 +1342,26 @@ mod tests {
     fn build_mirror_trims_backend_ids() {
         let built = build_mirror_config(&mirror_req(vec!["  b1  "], 50, 5000)).unwrap();
         assert_eq!(built.backend_ids, vec!["b1".to_string()]);
+    }
+
+    #[test]
+    fn build_mirror_rejects_excessive_max_body_bytes() {
+        // Cap is 128 MiB. Operator writing 512 MB would blow memory
+        // under the 256 concurrent-mirror cap.
+        let mut req = mirror_req(vec!["b"], 50, 5000);
+        req.max_body_bytes = 256 * 1_048_576;
+        let err = build_mirror_config(&req).err().unwrap();
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("128 MiB")));
+    }
+
+    #[test]
+    fn build_mirror_accepts_zero_max_body_bytes_as_headers_only() {
+        // 0 = opt into headers-only mirroring (the old v1 behaviour).
+        // Explicitly allowed, not an error.
+        let mut req = mirror_req(vec!["b"], 50, 5000);
+        req.max_body_bytes = 0;
+        let built = build_mirror_config(&req).unwrap();
+        assert_eq!(built.max_body_bytes, 0);
     }
 
     #[test]

@@ -90,6 +90,7 @@ export interface RouteFormState {
   mirror_backend_ids: string[];         // empty = feature off
   mirror_sample_percent: number;        // 0..100
   mirror_timeout_ms: number;            // 5000 default
+  mirror_max_body_bytes: number;        // 1048576 default; 0 = headers-only
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -155,6 +156,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   mirror_backend_ids: [],
   mirror_sample_percent: 100,
   mirror_timeout_ms: 5000,
+  mirror_max_body_bytes: 1048576,
 };
 
 // Tab field mappings for dot indicators
@@ -192,7 +194,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   path_rules: ['path_rules'],
   header_rules: ['header_rules'],
   traffic_splits: ['traffic_splits'],
-  mirror: ['mirror_backend_ids', 'mirror_sample_percent', 'mirror_timeout_ms'],
+  mirror: ['mirror_backend_ids', 'mirror_sample_percent', 'mirror_timeout_ms', 'mirror_max_body_bytes'],
 };
 
 function recordToText(rec: Record<string, string>): string {
@@ -305,6 +307,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     mirror_backend_ids: [...(route.mirror?.backend_ids ?? [])],
     mirror_sample_percent: route.mirror?.sample_percent ?? 100,
     mirror_timeout_ms: route.mirror?.timeout_ms ?? 5000,
+    mirror_max_body_bytes: route.mirror?.max_body_bytes ?? 1048576,
   };
 }
 
@@ -330,13 +333,14 @@ function mirrorFormToRequest(
     // On update, empty backends is the dashboard's "disable" signal.
     // On create, omit entirely so the row is inserted with NULL.
     return isUpdate
-      ? { backend_ids: [], sample_percent: 0, timeout_ms: 0 }
+      ? { backend_ids: [], sample_percent: 0, timeout_ms: 0, max_body_bytes: 0 }
       : undefined;
   }
   return {
     backend_ids: [...form.mirror_backend_ids],
     sample_percent: form.mirror_sample_percent,
     timeout_ms: form.mirror_timeout_ms,
+    max_body_bytes: form.mirror_max_body_bytes,
   };
 }
 
@@ -585,6 +589,10 @@ export function validateRouteForm(form: RouteFormState): string {
     const mt = Number(form.mirror_timeout_ms);
     if (!Number.isInteger(mt) || mt < 1 || mt > 60000) {
       return 'Mirror timeout must be 1..60000 ms';
+    }
+    const mb = Number(form.mirror_max_body_bytes);
+    if (!Number.isInteger(mb) || mb < 0 || mb > 128 * 1048576) {
+      return 'Mirror max body bytes must be 0..134217728 (128 MiB; 0 = headers only)';
     }
   }
   return '';

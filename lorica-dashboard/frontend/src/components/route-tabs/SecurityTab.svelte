@@ -188,6 +188,24 @@
       <span class="hint">Slow mirrors are dropped silently; never impacts the primary request.</span>
     </div>
   </div>
+
+  <div class="form-group" class:modified={form.mirror_max_body_bytes !== 1048576}>
+    <label for="mirror-max-body">Max body bytes</label>
+    <input
+      id="mirror-max-body"
+      type="number"
+      min="0"
+      max="134217728"
+      bind:value={form.mirror_max_body_bytes}
+      disabled={form.mirror_backend_ids.length === 0}
+    />
+    <span class="hint">
+      Max body size buffered for mirror sub-requests. Requests with a body
+      larger than this are sent to the primary normally but NOT mirrored
+      (a truncated body would mislead the shadow). Default 1 MiB
+      (1048576). Set to 0 for headers-only mirroring. Max 128 MiB.
+    </span>
+  </div>
 </div>
 
 <style>

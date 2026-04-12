@@ -206,12 +206,14 @@ export interface MirrorConfigResponse {
   backend_ids: string[];
   sample_percent: number;
   timeout_ms: number;
+  max_body_bytes: number;
 }
 
 export interface MirrorConfigRequest {
   backend_ids: string[];
   sample_percent: number;
   timeout_ms: number;
+  max_body_bytes: number;
 }
 
 export interface CreateRouteRequest {

@@ -894,6 +894,17 @@ pub struct RequestCtx {
     /// Headers harvested from a successful forward-auth response, to be
     /// injected into the upstream request (e.g. Remote-User).
     pub forward_auth_inject: Vec<(String, String)>,
+    /// Pending mirror sub-request awaiting the downstream request body.
+    /// Populated in `request_filter` when the route has mirroring
+    /// enabled and the request carries a body; fired in
+    /// `request_body_filter` on `end_of_stream`. `None` for requests
+    /// that don't mirror, or that have already fired (no-body methods
+    /// fire immediately from `request_filter`).
+    pub mirror_pending: Option<MirrorPending>,
+    /// Accumulating body state for a pending mirror. Separate from
+    /// `mirror_pending` so the buffer can be taken without disturbing
+    /// the pending metadata.
+    pub mirror_body_state: Option<MirrorBodyState>,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -1335,39 +1346,17 @@ pub(crate) fn build_mirror_url(backend_addr: &str, path_and_query: &str) -> Opti
     full.parse::<http::Uri>().ok().map(|_| full)
 }
 
-/// Spawn fire-and-forget shadow copies of the current request to each
-/// configured mirror backend. Runs under a global semaphore so a slow
-/// shadow cannot leak unbounded tasks. Never returns an error - mirror
-/// failures are logged at debug and forgotten.
-pub(crate) fn spawn_mirrors(
-    cfg: &lorica_config::models::MirrorConfig,
-    resolved_backends: &[Backend],
+/// Build the fixed forward-header set for a mirror sub-request: the
+/// whole request header bag minus hop-by-hop headers, plus the mirror
+/// tag and the propagated request id. Pure function so the filtering
+/// contract is unit-testable without a proxy setup.
+pub(crate) fn build_mirror_forward_headers(
     req: &lorica_http::RequestHeader,
-    request_id: String,
-) {
-    if !mirror_sample_hit(&request_id, cfg.sample_percent) {
-        return;
-    }
-    if resolved_backends.is_empty() {
-        return;
-    }
-
-    let method = req.method.clone();
-    let path_and_query = req
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-
-    // Collect headers to forward. Hop-by-hop headers are dropped; Host
-    // is rewritten to the mirror backend's address by reqwest so the
-    // TLS SNI (if applicable) matches. An `X-Lorica-Mirror: 1` flag
-    // lets the shadow backend filter mirror traffic from its own logs
-    // and metrics - critical so shadow traffic doesn't contaminate the
-    // real analytics.
+    request_id: &str,
+) -> Vec<(String, String)> {
     let mut forward_headers: Vec<(String, String)> = Vec::with_capacity(req.headers.len() + 2);
     forward_headers.push(("X-Lorica-Mirror".into(), "1".into()));
-    forward_headers.push(("X-Request-Id".into(), request_id.clone()));
+    forward_headers.push(("X-Request-Id".into(), request_id.to_string()));
     for (name, value) in req.headers.iter() {
         let n = name.as_str().to_ascii_lowercase();
         if matches!(
@@ -1391,6 +1380,79 @@ pub(crate) fn spawn_mirrors(
             forward_headers.push((name.as_str().to_string(), v.to_string()));
         }
     }
+    forward_headers
+}
+
+/// Classify whether a request carries (or will carry) a body based on
+/// RFC-mandated framing headers. Returns true for `Content-Length > 0`
+/// or `Transfer-Encoding: chunked`. Used to decide whether mirroring
+/// must wait for `request_body_filter` or can fire immediately.
+pub(crate) fn request_has_body(req: &lorica_http::RequestHeader) -> bool {
+    if let Some(te) = req.headers.get("transfer-encoding") {
+        if let Ok(v) = te.to_str() {
+            if v.to_ascii_lowercase().contains("chunked") {
+                return true;
+            }
+        }
+    }
+    if let Some(cl) = req.headers.get("content-length") {
+        if let Ok(v) = cl.to_str() {
+            if let Ok(n) = v.parse::<u64>() {
+                return n > 0;
+            }
+        }
+    }
+    false
+}
+
+/// Captured state of a pending mirror. Sits in `RequestCtx` while we
+/// wait for `request_body_filter` to collect the body.
+#[derive(Debug, Clone)]
+pub struct MirrorPending {
+    pub cfg: lorica_config::models::MirrorConfig,
+    pub backends: Vec<Backend>,
+    pub method: http::Method,
+    pub path_and_query: String,
+    pub headers: Vec<(String, String)>,
+    pub request_id: String,
+    pub max_body_bytes: usize,
+}
+
+/// Body-accumulation state for a mirror sub-request. `Overflowed`
+/// means the request body exceeded `max_body_bytes` and we have to
+/// drop the mirror (a truncated body would produce misleading shadow
+/// behaviour).
+#[derive(Debug)]
+pub enum MirrorBodyState {
+    Active(Vec<u8>),
+    Overflowed,
+}
+
+/// Spawn fire-and-forget shadow copies of the current request to each
+/// configured mirror backend. Runs under a global semaphore so a slow
+/// shadow cannot leak unbounded tasks. Never returns an error - mirror
+/// failures are logged at debug and forgotten.
+///
+/// The `body` parameter is the captured request body (already bounded
+/// by `max_body_bytes` at buffer time); `None` means "do not send a
+/// body" (GETs, HEADs, DELETE+no-body, or operator-configured
+/// headers-only mode via `max_body_bytes = 0`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_mirrors(
+    cfg: &lorica_config::models::MirrorConfig,
+    resolved_backends: &[Backend],
+    method: http::Method,
+    path_and_query: String,
+    forward_headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+    request_id: String,
+) {
+    if !mirror_sample_hit(&request_id, cfg.sample_percent) {
+        return;
+    }
+    if resolved_backends.is_empty() {
+        return;
+    }
 
     let timeout = Duration::from_millis(cfg.timeout_ms as u64);
     let sem = Arc::clone(&MIRROR_SEMAPHORE);
@@ -1405,6 +1467,7 @@ pub(crate) fn spawn_mirrors(
         };
         let method_c = method.clone();
         let headers_c = forward_headers.clone();
+        let body_c = body.clone();
         let sem_c = Arc::clone(&sem);
         tokio::spawn(async move {
             // try_acquire_owned is the right primitive here: if all 256
@@ -1425,6 +1488,9 @@ pub(crate) fn spawn_mirrors(
             let mut builder = MIRROR_CLIENT.request(method_r, &url).timeout(timeout);
             for (name, value) in headers_c {
                 builder = builder.header(name, value);
+            }
+            if let Some(body_bytes) = body_c {
+                builder = builder.body(body_bytes);
             }
             match builder.send().await {
                 Ok(_) => {
@@ -1612,6 +1678,8 @@ impl ProxyHttp for LoricaProxy {
             waf_body_buffer: None,
             sticky_backend_id: None,
             forward_auth_inject: Vec::new(),
+            mirror_pending: None,
+            mirror_body_state: None,
         }
     }
 
@@ -1969,21 +2037,54 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Request mirroring: spawn fire-and-forget shadow copies to the
-        // configured secondary backends. Fires after all routing
-        // decisions are locked in but before maintenance-mode /
-        // upstream, so a maintenance window doesn't mirror 503s and a
-        // successful request always produces a shadow. Mirror failures
-        // never affect the primary response - any error is swallowed
-        // inside the spawned task.
+        // Request mirroring: fire-and-forget shadow copies. For body-
+        // less requests (GET/HEAD/DELETE, or any request without
+        // Content-Length / Transfer-Encoding) we spawn immediately.
+        // For body-bearing requests we stash the metadata in
+        // `ctx.mirror_pending` and fire in `request_body_filter` once
+        // the body is buffered - so shadow backends see the same
+        // request body as the primary, up to the configured
+        // max_body_bytes cap.
         if let Some(ref mirror_cfg) = entry.route.mirror {
-            if !entry.mirror_backends.is_empty() {
-                spawn_mirrors(
-                    mirror_cfg,
-                    &entry.mirror_backends,
-                    req,
-                    ctx.request_id.clone(),
-                );
+            if !entry.mirror_backends.is_empty()
+                && mirror_sample_hit(&ctx.request_id, mirror_cfg.sample_percent)
+            {
+                let headers = build_mirror_forward_headers(req, &ctx.request_id);
+                let path = req
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_else(|| "/".to_string());
+                let method = req.method.clone();
+                let max_body = mirror_cfg.max_body_bytes as usize;
+                let body_expected = max_body > 0 && request_has_body(req);
+
+                if body_expected {
+                    // Defer mirror firing until request_body_filter has
+                    // buffered the full body.
+                    ctx.mirror_pending = Some(MirrorPending {
+                        cfg: mirror_cfg.clone(),
+                        backends: entry.mirror_backends.clone(),
+                        method,
+                        path_and_query: path,
+                        headers,
+                        request_id: ctx.request_id.clone(),
+                        max_body_bytes: max_body,
+                    });
+                    ctx.mirror_body_state = Some(MirrorBodyState::Active(Vec::new()));
+                } else {
+                    // No body to buffer (or operator opted into
+                    // headers-only via max_body_bytes = 0): fire now.
+                    spawn_mirrors(
+                        mirror_cfg,
+                        &entry.mirror_backends,
+                        method,
+                        path,
+                        headers,
+                        None,
+                        ctx.request_id.clone(),
+                    );
+                }
             }
         }
 
@@ -2490,6 +2591,61 @@ impl ProxyHttp for LoricaProxy {
                         let remaining = WAF_BODY_SCAN_MAX - buf.len();
                         let to_copy = chunk.len().min(remaining);
                         buf.extend_from_slice(&chunk[..to_copy]);
+                    }
+                }
+            }
+
+            // Buffer body for mirror sub-request. Independent of WAF
+            // buffering: WAF caps at 1 MiB hardcoded, mirror uses the
+            // route's configurable max_body_bytes. Overflow switches
+            // the state to Overflowed so the mirror is skipped at
+            // end_of_stream (a truncated body would lie to the shadow).
+            if let Some(ref pending) = ctx.mirror_pending {
+                if let Some(state) = ctx.mirror_body_state.take() {
+                    match state {
+                        MirrorBodyState::Active(mut buf) => {
+                            if buf.len() + chunk.len() > pending.max_body_bytes {
+                                tracing::debug!(
+                                    max = pending.max_body_bytes,
+                                    "mirror: body exceeded max_body_bytes, skipping"
+                                );
+                                ctx.mirror_body_state = Some(MirrorBodyState::Overflowed);
+                            } else {
+                                buf.extend_from_slice(chunk);
+                                ctx.mirror_body_state = Some(MirrorBodyState::Active(buf));
+                            }
+                        }
+                        MirrorBodyState::Overflowed => {
+                            ctx.mirror_body_state = Some(MirrorBodyState::Overflowed);
+                        }
+                    }
+                }
+            }
+        }
+
+        // End of stream: fire the mirror sub-request with the buffered
+        // body (or skip it on overflow). Must happen regardless of
+        // WAF status - WAF may allow the request while the mirror has
+        // overflowed, or vice versa.
+        if end_of_stream {
+            if let (Some(pending), Some(body_state)) =
+                (ctx.mirror_pending.take(), ctx.mirror_body_state.take())
+            {
+                match body_state {
+                    MirrorBodyState::Active(buf) => {
+                        spawn_mirrors(
+                            &pending.cfg,
+                            &pending.backends,
+                            pending.method,
+                            pending.path_and_query,
+                            pending.headers,
+                            Some(buf),
+                            pending.request_id,
+                        );
+                    }
+                    MirrorBodyState::Overflowed => {
+                        // Buffer exceeded max_body_bytes: skip silently.
+                        // Already logged at overflow time.
                     }
                 }
             }

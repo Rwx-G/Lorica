@@ -768,13 +768,37 @@ describe('mirror', () => {
         mirror_backend_ids: ['shadow-a', 'shadow-b'],
         mirror_sample_percent: 25,
         mirror_timeout_ms: 3000,
+        mirror_max_body_bytes: 524288,
       }),
     );
     expect(req.mirror).toEqual({
       backend_ids: ['shadow-a', 'shadow-b'],
       sample_percent: 25,
       timeout_ms: 3000,
+      max_body_bytes: 524288,
     });
+  });
+
+  it('validateRouteForm rejects max_body_bytes over 128 MiB', () => {
+    expect(
+      validateRouteForm(
+        mf({
+          mirror_backend_ids: ['b'],
+          mirror_max_body_bytes: 200 * 1048576,
+        }),
+      ),
+    ).toMatch(/128 MiB/);
+  });
+
+  it('validateRouteForm accepts max_body_bytes = 0 (headers-only)', () => {
+    expect(
+      validateRouteForm(
+        mf({
+          mirror_backend_ids: ['b'],
+          mirror_max_body_bytes: 0,
+        }),
+      ),
+    ).toBe('');
   });
 
   it('validateRouteForm rejects sample percent out of range', () => {
