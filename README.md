@@ -25,6 +25,9 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 - HTTP/HTTPS reverse proxy with host-based and path-prefix routing
 - **Path rules** - ordered sub-path overrides within a route for backends, cache, headers, rate limits, or direct HTTP status responses
+- **Header-based routing** - per-route rules that pick a backend group by request header value (Exact / Prefix / Regex). A/B testing (`X-Version: beta`), multi-tenant isolation (`X-Tenant: acme`), no upstream URL changes
+- **Canary traffic split** - send `X%` of requests to an alternate backend group with sticky-per-IP deterministic bucketing. Multiple splits per route; weights capped at 100 cumulative
+- **Response body rewriting** - ordered search-and-replace rules (literal or regex with capture groups) applied to upstream response bodies. Configurable content-type filter, max body cap, streams verbatim over the cap
 - TLS termination via rustls (no OpenSSL dependency)
 - SNI-based certificate selection with wildcard domain support (`*.example.com`)
 - Path rewriting (strip/add prefix, regex with capture groups), hostname aliases, HTTP-to-HTTPS redirect
@@ -38,6 +41,9 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :lock: Security
 
 - **WAF engine** - 49 OWASP CRS-inspired rules (SQLi, XSS, path traversal, command injection, SSRF, Log4Shell, XXE, CRLF)
+- **mTLS client verification** - per-route CA bundle + optional organization allowlist. Chain validated at the TLS handshake (rustls `WebPkiClientVerifier`), per-route enforcement returns 496 ("cert required") or 495 ("cert error"). `required` and org-allowlist hot-reload; CA edits take effect on restart
+- **Forward authentication** - per-route sub-request to Authelia / Authentik / Keycloak / oauth2-proxy before proxying; 2xx injects response headers into upstream, 401/403/3xx forwarded verbatim to the client, timeout = fail-closed 503. Optional opt-in verdict cache (TTL-capped at 60s, Cookie-keyed) to shortcut hot paths
+- **Connection pre-filter** - global IP allow/deny CIDR policy enforced at TCP accept, before the TLS handshake. Deny always wins; non-empty allow switches to default-deny. Hot-reloaded via arc-swap in single-process and worker modes
 - **IP blocklist** - auto-fetched from Data-Shield IPv4 Blocklist (~80,000 entries, O(1) lookup, updated every 6h)
 - **Rate limiting** - per-route, per-client-IP with configurable RPS and burst tolerance
 - **Auto-ban** - IPs that repeatedly exceed rate limits are banned automatically (configurable threshold and duration)
@@ -52,7 +58,8 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 - **Passive SLA** - per-route uptime, latency percentiles (p50/p95/p99), rolling windows (1h/24h/7d/30d)
 - **Active SLA** - synthetic HTTP probes at configurable intervals, detects outages during low-traffic periods
-- **Prometheus metrics** - `/metrics` endpoint with request counts, latency histograms, backend health, WAF events, cert expiry
+- **Prometheus metrics** - `/metrics` endpoint with request counts, latency histograms, backend health, WAF events, cert expiry. Per-feature counters for cache-predictor bypass, header-rule matches, canary split selection, mirror outcomes (spawned / dropped / errored), forward-auth verdict cache hit rate - all bounded by route count
+- **Request mirroring (shadow testing)** - duplicate every request to one or more secondary backends (deterministic per `X-Request-Id` sampling, 256-slot concurrency cap, body mirroring up to a configurable cap). Fire-and-forget: mirror failure can never impact the primary
 - **Real-time access logs** - WebSocket streaming to the dashboard with filtering
 - **Load testing** - built-in load test engine with SSE streaming, cron scheduling, CPU circuit breaker, and result comparison
 - **SLA breach alerts** - automatic notifications when SLA drops below target
@@ -71,7 +78,9 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :zap: Performance
 
 - **Pingora engine** - forked from Cloudflare's production proxy framework
-- **HTTP cache** - in-memory response caching with LRU eviction (128 MiB cap), TinyUFO algorithm, cache lock (thundering herd protection), stale-while-revalidate/stale-if-error, HTTP PURGE method support
+- **HTTP cache** - in-memory response caching with LRU eviction (128 MiB cap), TinyUFO algorithm, cache lock (thundering herd protection), stale-while-revalidate **with background refresh** (serves stale immediately, fetches fresh in parallel) and stale-if-error, HTTP PURGE method support
+- **Cache Vary** - per-route `cache_vary_headers` partitions the cache by request-header values (e.g. `Accept-Encoding`) merged with the origin's `Vary` response; `Vary: *` anchors on URI to bound cardinality
+- **Cache predictor** - 16-shard LRU (32K keys) remembers deterministically-uncacheable responses and short-circuits the cache state machine on subsequent hits, avoiding cache-lock contention on known-bypass traffic
 - **Peak EWMA load balancing** - latency-aware backend selection alongside Round Robin, Consistent Hash, Random, Least Connections
 - **DashMap** - lock-free concurrent reads for ban list and route connections in the hot path
 - **Sub-0.5ms WAF evaluation** - precompiled regex patterns with zero overhead when disabled
@@ -168,7 +177,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 <p align="center">
   <img src="docs/screenshots/routesDrawer.png" alt="Route Configuration Drawer" width="100%">
-  <br><em>Route editor with 25+ settings across 7 tabs (General, Timeouts, Security, Headers, CORS, Caching, Protection)</em>
+  <br><em>Route editor with 50+ settings across 11 tabs (General, Timeouts, Security, Headers, CORS, Caching, Protection, Path Rules, Header Rules, Canary, Rewrite)</em>
 </p>
 
 <p align="center">
@@ -301,6 +310,8 @@ All endpoints are served on the management port (default `9443`) over HTTPS. Pro
 | `GET` | `/api/v1/routes/:id` | Get route |
 | `PUT` | `/api/v1/routes/:id` | Update route |
 | `DELETE` | `/api/v1/routes/:id` | Delete route |
+| `POST` | `/api/v1/validate/mtls-pem` | Parse a candidate client-CA PEM and return per-cert subjects |
+| `POST` | `/api/v1/validate/forward-auth` | Probe a candidate forward-auth URL (one GET, status + elapsed) |
 
 ### Backends
 
