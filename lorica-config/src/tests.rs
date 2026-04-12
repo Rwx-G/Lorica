@@ -72,6 +72,7 @@ mod tests {
             traffic_splits: vec![],
             forward_auth: None,
             mirror: None,
+            response_rewrite: None,
             created_at: now,
             updated_at: now,
         }
@@ -1869,6 +1870,67 @@ cert_critical_days = 3
         store.update_route(&cleared).unwrap();
         let after = store.get_route(&route.id).unwrap().unwrap();
         assert!(after.mirror.is_none());
+    }
+
+    #[test]
+    fn test_response_rewrite_roundtrip() {
+        // Schema V30: response_rewrite stored as nullable JSON at column
+        // 60. Regression guard against SELECT / UPDATE drift across the
+        // 60 columns the row now carries.
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.response_rewrite = Some(ResponseRewriteConfig {
+            rules: vec![
+                ResponseRewriteRule {
+                    pattern: "internal.local".into(),
+                    replacement: "api.example.com".into(),
+                    is_regex: false,
+                    max_replacements: None,
+                },
+                ResponseRewriteRule {
+                    pattern: r"\d+".into(),
+                    replacement: "***".into(),
+                    is_regex: true,
+                    max_replacements: Some(5),
+                },
+            ],
+            max_body_bytes: 524_288,
+            content_type_prefixes: vec!["text/".into(), "application/json".into()],
+        });
+        store.create_route(&route).unwrap();
+
+        let via_get = store.get_route(&route.id).unwrap().unwrap();
+        let rr = via_get.response_rewrite.as_ref().unwrap();
+        assert_eq!(rr.rules.len(), 2);
+        assert_eq!(rr.rules[0].pattern, "internal.local");
+        assert_eq!(rr.rules[1].is_regex, true);
+        assert_eq!(rr.rules[1].max_replacements, Some(5));
+        assert_eq!(rr.max_body_bytes, 524_288);
+        assert_eq!(rr.content_type_prefixes.len(), 2);
+
+        let via_list: Vec<_> = store
+            .list_routes()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.id == route.id)
+            .collect();
+        assert_eq!(via_list.len(), 1);
+        assert!(via_list[0].response_rewrite.is_some());
+
+        let mut cleared = via_get.clone();
+        cleared.response_rewrite = None;
+        store.update_route(&cleared).unwrap();
+        let after = store.get_route(&route.id).unwrap().unwrap();
+        assert!(after.response_rewrite.is_none());
+    }
+
+    #[test]
+    fn test_response_rewrite_default_none() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.response_rewrite.is_none());
     }
 
     #[test]

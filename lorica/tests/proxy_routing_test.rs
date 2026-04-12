@@ -79,6 +79,7 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str) -> Route {
         traffic_splits: vec![],
         forward_auth: None,
         mirror: None,
+        response_rewrite: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

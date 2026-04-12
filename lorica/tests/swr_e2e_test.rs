@@ -229,6 +229,7 @@ fn cacheable_route(ttl_s: i32, swr_s: i32, sie_s: i32) -> Route {
         traffic_splits: vec![],
         forward_auth: None,
         mirror: None,
+        response_rewrite: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

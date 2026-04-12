@@ -416,6 +416,7 @@ mod tests {
             traffic_splits: vec![],
             forward_auth: None,
             mirror: None,
+            response_rewrite: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -520,6 +521,7 @@ mod tests {
             traffic_splits: vec![],
             forward_auth: None,
             mirror: None,
+            response_rewrite: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

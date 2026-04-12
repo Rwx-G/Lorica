@@ -1,4 +1,4 @@
-import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest, MirrorConfigRequest } from './api';
+import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest, MirrorConfigRequest, ResponseRewriteConfigRequest } from './api';
 
 export interface PathRuleFormState {
   path: string;
@@ -25,6 +25,13 @@ export interface TrafficSplitFormState {
   name: string;
   weight_percent: number;
   backend_ids: string[];
+}
+
+export interface ResponseRewriteRuleFormState {
+  pattern: string;
+  replacement: string;
+  is_regex: boolean;
+  max_replacements: string; // "" = unlimited; otherwise parseable int
 }
 
 export interface RouteFormState {
@@ -91,6 +98,9 @@ export interface RouteFormState {
   mirror_sample_percent: number;        // 0..100
   mirror_timeout_ms: number;            // 5000 default
   mirror_max_body_bytes: number;        // 1048576 default; 0 = headers-only
+  response_rewrite_rules: ResponseRewriteRuleFormState[]; // empty = feature off
+  response_rewrite_max_body_bytes: number;
+  response_rewrite_content_type_prefixes: string; // CSV
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -157,6 +167,9 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   mirror_sample_percent: 100,
   mirror_timeout_ms: 5000,
   mirror_max_body_bytes: 1048576,
+  response_rewrite_rules: [],
+  response_rewrite_max_body_bytes: 1048576,
+  response_rewrite_content_type_prefixes: '',
 };
 
 // Tab field mappings for dot indicators
@@ -195,6 +208,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   header_rules: ['header_rules'],
   traffic_splits: ['traffic_splits'],
   mirror: ['mirror_backend_ids', 'mirror_sample_percent', 'mirror_timeout_ms', 'mirror_max_body_bytes'],
+  response_rewrite: ['response_rewrite_rules', 'response_rewrite_max_body_bytes', 'response_rewrite_content_type_prefixes'],
 };
 
 function recordToText(rec: Record<string, string>): string {
@@ -308,6 +322,14 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     mirror_sample_percent: route.mirror?.sample_percent ?? 100,
     mirror_timeout_ms: route.mirror?.timeout_ms ?? 5000,
     mirror_max_body_bytes: route.mirror?.max_body_bytes ?? 1048576,
+    response_rewrite_rules: (route.response_rewrite?.rules ?? []).map((r) => ({
+      pattern: r.pattern,
+      replacement: r.replacement,
+      is_regex: r.is_regex,
+      max_replacements: r.max_replacements != null ? String(r.max_replacements) : '',
+    })),
+    response_rewrite_max_body_bytes: route.response_rewrite?.max_body_bytes ?? 1048576,
+    response_rewrite_content_type_prefixes: (route.response_rewrite?.content_type_prefixes ?? []).join(', '),
   };
 }
 
@@ -323,6 +345,42 @@ function headerRuleFormToRequest(rules: HeaderRuleFormState[]): HeaderRuleReques
       value: r.value,
       backend_ids: [...r.backend_ids],
     }));
+}
+
+function responseRewriteFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): ResponseRewriteConfigRequest | undefined {
+  // An operator clicking "+ Add rule" then not filling anything in
+  // produces an all-blank rule; drop those silently so they don't
+  // trip API-layer validation.
+  const rules = form.response_rewrite_rules
+    .filter((r) => r.pattern.trim().length > 0)
+    .map((r) => {
+      const maxStr = r.max_replacements.trim();
+      const max = maxStr === '' ? null : Number(maxStr);
+      return {
+        pattern: r.pattern,
+        replacement: r.replacement,
+        is_regex: r.is_regex,
+        max_replacements: max,
+      };
+    });
+  if (rules.length === 0) {
+    // On update, empty rules = "disable the feature". On create,
+    // omit so the row is inserted with NULL.
+    return isUpdate
+      ? { rules: [], max_body_bytes: 0, content_type_prefixes: [] }
+      : undefined;
+  }
+  return {
+    rules,
+    max_body_bytes: form.response_rewrite_max_body_bytes,
+    content_type_prefixes: form.response_rewrite_content_type_prefixes
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  };
 }
 
 function mirrorFormToRequest(
@@ -459,6 +517,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     traffic_splits: trafficSplitFormToRequest(form.traffic_splits) ?? (isUpdate ? [] : undefined),
     forward_auth: forwardAuthFormToRequest(form, isUpdate),
     mirror: mirrorFormToRequest(form, isUpdate),
+    response_rewrite: responseRewriteFormToRequest(form, isUpdate),
   };
 }
 
@@ -502,6 +561,10 @@ export function getModifiedFields(form: RouteFormState): Set<string> {
     }
     if (key === 'traffic_splits') {
       if (form.traffic_splits.length > 0) modified.add(key);
+      continue;
+    }
+    if (key === 'response_rewrite_rules') {
+      if (form.response_rewrite_rules.length > 0) modified.add(key);
       continue;
     }
     const defaultVal = ROUTE_DEFAULTS[key];
@@ -593,6 +656,34 @@ export function validateRouteForm(form: RouteFormState): string {
     const mb = Number(form.mirror_max_body_bytes);
     if (!Number.isInteger(mb) || mb < 0 || mb > 128 * 1048576) {
       return 'Mirror max body bytes must be 0..134217728 (128 MiB; 0 = headers only)';
+    }
+  }
+  // Response rewrite sanity. Empty rules = feature off.
+  if (form.response_rewrite_rules.length > 0) {
+    const mb = Number(form.response_rewrite_max_body_bytes);
+    if (!Number.isInteger(mb) || mb < 1 || mb > 128 * 1048576) {
+      return 'Response rewrite max body bytes must be 1..134217728 (128 MiB)';
+    }
+    for (let i = 0; i < form.response_rewrite_rules.length; i++) {
+      const r = form.response_rewrite_rules[i];
+      if (!r.pattern.trim()) {
+        return `Response rewrite rule ${i + 1}: pattern must not be empty`;
+      }
+      if (r.is_regex) {
+        try {
+          // eslint-disable-next-line no-new
+          new RegExp(r.pattern);
+        } catch (e) {
+          return `Response rewrite rule ${i + 1}: invalid regex (${(e as Error).message})`;
+        }
+      }
+      const maxStr = r.max_replacements.trim();
+      if (maxStr !== '') {
+        const n = Number(maxStr);
+        if (!Number.isInteger(n) || n < 1) {
+          return `Response rewrite rule ${i + 1}: max_replacements must be a positive integer (or empty for unlimited)`;
+        }
+      }
     }
   }
   return '';

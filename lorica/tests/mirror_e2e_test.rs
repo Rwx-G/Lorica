@@ -256,6 +256,7 @@ fn test_route(mirror: Option<MirrorConfig>) -> Route {
         traffic_splits: vec![],
         forward_auth: None,
         mirror,
+        response_rewrite: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

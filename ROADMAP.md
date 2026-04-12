@@ -39,7 +39,7 @@ Major feature additions that close the gap with Traefik and Nginx.
 | Header-based routing | Done | Low-Medium | Route by HTTP headers (X-Version, X-Tenant). A/B testing, multi-tenant. Traefik, Caddy, HAProxy all support it |
 | Canary / traffic split | Done | Medium | Route X% traffic to backend group A, Y% to group B. Zero-risk deployments |
 | mTLS client verification | Planned | Medium | `ClientCertVerifier` trait support exists in rustls layer. Zero-trust, B2B |
-| Response body rewriting | Planned | Medium | Implement `response_body_filter()` hook. Nginx `sub_filter` equivalent |
+| Response body rewriting | Done | Medium | Implement `response_body_filter()` hook. Nginx `sub_filter` equivalent |
 | Request mirroring | Done | Medium | Duplicate traffic to secondary backend (fire-and-forget). Shadow testing |
 | Cache Vary support | Done | Medium | Implement `cache_vary_filter()`. `VarianceBuilder` exists in `lorica-cache/src/variance.rs` |
 | Stale-while-revalidate | Done | Low | `stale_writer` support exists in cache lock module. Serve stale while background refresh |

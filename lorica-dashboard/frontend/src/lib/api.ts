@@ -160,6 +160,7 @@ export interface RouteResponse {
   traffic_splits: TrafficSplitResponse[];
   forward_auth?: ForwardAuthConfigResponse | null;
   mirror?: MirrorConfigResponse | null;
+  response_rewrite?: ResponseRewriteConfigResponse | null;
   created_at: string;
   updated_at: string;
 }
@@ -207,6 +208,32 @@ export interface MirrorConfigResponse {
   sample_percent: number;
   timeout_ms: number;
   max_body_bytes: number;
+}
+
+export interface ResponseRewriteRuleResponse {
+  pattern: string;
+  replacement: string;
+  is_regex: boolean;
+  max_replacements?: number | null;
+}
+
+export interface ResponseRewriteConfigResponse {
+  rules: ResponseRewriteRuleResponse[];
+  max_body_bytes: number;
+  content_type_prefixes: string[];
+}
+
+export interface ResponseRewriteRuleRequest {
+  pattern: string;
+  replacement: string;
+  is_regex: boolean;
+  max_replacements?: number | null;
+}
+
+export interface ResponseRewriteConfigRequest {
+  rules: ResponseRewriteRuleRequest[];
+  max_body_bytes: number;
+  content_type_prefixes: string[];
 }
 
 export interface MirrorConfigRequest {
@@ -274,6 +301,7 @@ export interface CreateRouteRequest {
   traffic_splits?: TrafficSplitRequest[];
   forward_auth?: ForwardAuthConfigRequest;
   mirror?: MirrorConfigRequest;
+  response_rewrite?: ResponseRewriteConfigRequest;
 }
 
 
@@ -336,6 +364,7 @@ export interface UpdateRouteRequest {
   traffic_splits?: TrafficSplitRequest[];
   forward_auth?: ForwardAuthConfigRequest;
   mirror?: MirrorConfigRequest;
+  response_rewrite?: ResponseRewriteConfigRequest;
 }
 
 export interface BackendResponse {

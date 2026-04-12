@@ -163,6 +163,11 @@ pub struct RouteEntry {
     /// when all configured IDs dangle - either way, `spawn_mirrors` is
     /// a no-op.
     pub mirror_backends: Vec<Backend>,
+    /// Pre-compiled response-rewrite rules (parallel to
+    /// `route.response_rewrite.rules`). An entry is `None` when the
+    /// source rule's regex failed to compile - that rule is silently
+    /// skipped at runtime. Empty vec when the feature is off.
+    pub response_rewrite_compiled: Vec<Option<CompiledRewriteRule>>,
 }
 
 /// In-memory configuration snapshot used by the proxy.
@@ -353,6 +358,18 @@ impl ProxyConfig {
                 })
                 .collect();
 
+            let response_rewrite_compiled: Vec<Option<CompiledRewriteRule>> = route
+                .response_rewrite
+                .as_ref()
+                .map(|cfg| {
+                    cfg.rules
+                        .iter()
+                        .enumerate()
+                        .map(|(i, rule)| compile_rewrite_rule(rule, &route.id, i))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let mirror_backends: Vec<Backend> = route
                 .mirror
                 .as_ref()
@@ -417,6 +434,7 @@ impl ProxyConfig {
                 header_rule_backends,
                 traffic_split_backends,
                 mirror_backends,
+                response_rewrite_compiled,
             };
 
             routes_by_host
@@ -894,6 +912,14 @@ pub struct RequestCtx {
     /// Headers harvested from a successful forward-auth response, to be
     /// injected into the upstream request (e.g. Remote-User).
     pub forward_auth_inject: Vec<(String, String)>,
+    /// Response-body rewrite state. `Some(Active(buf))` while we're
+    /// buffering the upstream response to rewrite it at end-of-stream;
+    /// `Some(Overflowed)` if the body exceeded `max_body_bytes` (we
+    /// then flush the buffer and stream the rest verbatim - better
+    /// than a half-rewritten body). `None` means the feature is off
+    /// for this response (Content-Type/Encoding didn't qualify).
+    pub response_rewrite_state: Option<ResponseRewriteState>,
+
     /// Pending mirror sub-request awaiting the downstream request body.
     /// Populated in `request_filter` when the route has mirroring
     /// enabled and the request carries a body; fired in
@@ -1346,6 +1372,105 @@ pub(crate) fn build_mirror_url(backend_addr: &str, path_and_query: &str) -> Opti
     full.parse::<http::Uri>().ok().map(|_| full)
 }
 
+/// Compiled form of a single response-rewrite rule. Pre-compiling the
+/// `regex::bytes::Regex` at route-load time avoids re-parsing the
+/// pattern for every response, and lets us report malformed regex
+/// patterns once (at reload) rather than once per request.
+#[derive(Debug, Clone)]
+pub struct CompiledRewriteRule {
+    pub regex: regex::bytes::Regex,
+    pub replacement: Vec<u8>,
+    pub max_replacements: Option<u32>,
+}
+
+/// Compile a raw `ResponseRewriteRule` to its engine form. Literal
+/// patterns are regex-escaped so the same code path handles both. An
+/// invalid regex is logged and returns `None` so the rule is silently
+/// skipped at runtime - callers aggregate these into a
+/// `Vec<Option<_>>` parallel to the declared rules.
+pub(crate) fn compile_rewrite_rule(
+    rule: &lorica_config::models::ResponseRewriteRule,
+    route_id: &str,
+    index: usize,
+) -> Option<CompiledRewriteRule> {
+    let pattern = if rule.is_regex {
+        rule.pattern.clone()
+    } else {
+        regex::escape(&rule.pattern)
+    };
+    match regex::bytes::Regex::new(&pattern) {
+        Ok(re) => Some(CompiledRewriteRule {
+            regex: re,
+            replacement: rule.replacement.as_bytes().to_vec(),
+            max_replacements: rule.max_replacements,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                route_id = %route_id,
+                rule_index = index,
+                pattern = %rule.pattern,
+                is_regex = rule.is_regex,
+                error = %e,
+                "invalid response_rewrite pattern, skipping rule"
+            );
+            None
+        }
+    }
+}
+
+/// Apply all rewrite rules to a response body in declaration order.
+/// Each rule operates on the output of the previous one, so rules
+/// compose. `max_replacements` caps substitutions per rule; `None`
+/// means unlimited.
+///
+/// Pure function over bytes, so the composition rules, cross-chunk
+/// correctness (since we run on the full buffered body), and
+/// per-rule replacement limits are all unit-testable.
+pub(crate) fn apply_response_rewrites(body: &[u8], rules: &[Option<CompiledRewriteRule>]) -> Vec<u8> {
+    let mut out: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(body);
+    for rule in rules.iter().flatten() {
+        let rewritten = match rule.max_replacements {
+            Some(n) => rule.regex.replacen(&out, n as usize, rule.replacement.as_slice()),
+            None => rule.regex.replace_all(&out, rule.replacement.as_slice()),
+        };
+        // `replace_all` returns a Cow - promote to owned if it modified.
+        out = std::borrow::Cow::Owned(rewritten.into_owned());
+    }
+    out.into_owned()
+}
+
+/// Decide whether a given response should be rewritten. Returns true
+/// when:
+///   - the route has a rewrite config
+///   - the response is not compressed (Content-Encoding is absent,
+///     empty, or explicitly "identity")
+///   - the Content-Type matches one of the configured prefixes
+///     (case-insensitive), or defaults to "text/" when the list is empty
+pub(crate) fn should_rewrite_response(
+    cfg: &lorica_config::models::ResponseRewriteConfig,
+    content_type: &str,
+    content_encoding: &str,
+) -> bool {
+    // Skip compressed bodies: rewriting raw gzip/br would corrupt them.
+    let enc = content_encoding.trim();
+    if !enc.is_empty() && !enc.eq_ignore_ascii_case("identity") {
+        return false;
+    }
+    // Default to text/* when the operator list is empty. A typo-proof
+    // defensive default: operators who enable rewriting almost always
+    // mean "for HTML/text responses".
+    let lower_ct = content_type.to_ascii_lowercase();
+    let allowed_list: Vec<String> = if cfg.content_type_prefixes.is_empty() {
+        vec!["text/".into()]
+    } else {
+        cfg.content_type_prefixes
+            .iter()
+            .map(|p| p.to_ascii_lowercase())
+            .collect()
+    };
+    allowed_list.iter().any(|p| lower_ct.starts_with(p))
+}
+
 /// Build the fixed forward-header set for a mirror sub-request: the
 /// whole request header bag minus hop-by-hop headers, plus the mirror
 /// tag and the propagated request id. Pure function so the filtering
@@ -1424,6 +1549,17 @@ pub struct MirrorPending {
 /// behaviour).
 #[derive(Debug)]
 pub enum MirrorBodyState {
+    Active(Vec<u8>),
+    Overflowed,
+}
+
+/// Response-body buffering state for rewriting. Active while below
+/// `max_body_bytes`; flipped to Overflowed once the buffer would
+/// exceed the cap. Overflowed means "flush what we have and stream
+/// the rest unchanged" - a partial rewrite would corrupt the output
+/// worse than no rewrite.
+#[derive(Debug)]
+pub enum ResponseRewriteState {
     Active(Vec<u8>),
     Overflowed,
 }
@@ -1680,6 +1816,7 @@ impl ProxyHttp for LoricaProxy {
             forward_auth_inject: Vec::new(),
             mirror_pending: None,
             mirror_body_state: None,
+            response_rewrite_state: None,
         }
     }
 
@@ -3431,7 +3568,135 @@ impl ProxyHttp for LoricaProxy {
             let _ = upstream_response.append_header("Set-Cookie", &cookie);
         }
 
+        // Decide if response-body rewriting will fire for this response.
+        // Done at header-phase so we can drop Content-Length (our
+        // rewritten body will have a different length) before the
+        // response line is sent.
+        if let Some(ref rr_cfg) = route.response_rewrite {
+            let ct = upstream_response
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let ce = upstream_response
+                .headers
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if should_rewrite_response(rr_cfg, ct, ce) {
+                // Strip Content-Length; the framework will emit the
+                // rewritten body as chunked. Transfer-Encoding is
+                // likewise re-derived by the server.
+                upstream_response.remove_header("content-length");
+                ctx.response_rewrite_state = Some(ResponseRewriteState::Active(Vec::new()));
+            }
+        }
+
         Ok(())
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<std::time::Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Fast path: feature off for this response.
+        if ctx.response_rewrite_state.is_none() {
+            return Ok(None);
+        }
+
+        // Resolve the configured cap and compiled rules. Config absent
+        // would be an engine bug (we only set state when config exists)
+        // but guard anyway so we fail open (stream unchanged).
+        let (max_body_bytes, compiled) = {
+            let route = match ctx.route_snapshot.as_ref() {
+                Some(r) => r,
+                None => {
+                    ctx.response_rewrite_state = None;
+                    return Ok(None);
+                }
+            };
+            let cfg = match route.response_rewrite.as_ref() {
+                Some(c) => c,
+                None => {
+                    ctx.response_rewrite_state = None;
+                    return Ok(None);
+                }
+            };
+            (cfg.max_body_bytes as usize, route.clone())
+        };
+        // We only need the compiled rules, which live on the RouteEntry
+        // not the Route snapshot. Look them up via the current
+        // ProxyConfig. This is a per-chunk lookup but the hashmap
+        // read is cheap and avoids duplicating the compiled rules on
+        // the route snapshot.
+        let cfg_load = self.config.load();
+        let route_id = compiled.id.as_str();
+        let rules: Vec<Option<CompiledRewriteRule>> = cfg_load
+            .routes_by_host
+            .values()
+            .flatten()
+            .find(|e| e.route.id == route_id)
+            .map(|e| e.response_rewrite_compiled.clone())
+            .unwrap_or_default();
+        drop(cfg_load);
+
+        // Accumulate or overflow.
+        let state = ctx.response_rewrite_state.take();
+        let (mut buffer, was_overflowed) = match state {
+            Some(ResponseRewriteState::Active(buf)) => (buf, false),
+            Some(ResponseRewriteState::Overflowed) => (Vec::new(), true),
+            None => return Ok(None),
+        };
+
+        if was_overflowed {
+            // Already overflowed: stream chunks verbatim, state stays
+            // Overflowed until end_of_stream when we clear it.
+            if end_of_stream {
+                // no-op; drop state
+            } else {
+                ctx.response_rewrite_state = Some(ResponseRewriteState::Overflowed);
+            }
+            return Ok(None);
+        }
+
+        if let Some(chunk) = body.take() {
+            if buffer.len().saturating_add(chunk.len()) > max_body_bytes {
+                tracing::debug!(
+                    route_id = %route_id,
+                    max = max_body_bytes,
+                    "response_rewrite: body exceeded max_body_bytes, streaming verbatim"
+                );
+                // Flush what we buffered so far plus the current chunk.
+                // The downstream already received no bytes for this
+                // response (we've suppressed previous chunks), so the
+                // entire response body must be emitted now.
+                let mut flush = std::mem::take(&mut buffer);
+                flush.extend_from_slice(&chunk);
+                *body = Some(bytes::Bytes::from(flush));
+                ctx.response_rewrite_state = Some(ResponseRewriteState::Overflowed);
+                return Ok(None);
+            }
+            buffer.extend_from_slice(&chunk);
+            // Suppress the chunk: we'll emit the rewritten body at
+            // end_of_stream in one go.
+            *body = None;
+        }
+
+        if end_of_stream {
+            let rewritten = apply_response_rewrites(&buffer, &rules);
+            *body = Some(bytes::Bytes::from(rewritten));
+            // Drop state; no more chunks expected.
+        } else {
+            ctx.response_rewrite_state = Some(ResponseRewriteState::Active(buffer));
+        }
+
+        Ok(None)
     }
 
     fn response_compression_level(
@@ -3687,6 +3952,7 @@ mod tests {
             traffic_splits: vec![],
             forward_auth: None,
             mirror: None,
+            response_rewrite: None,
             created_at: now,
             updated_at: now,
         }
@@ -5220,6 +5486,175 @@ mod tests {
         let backends = vec![Some(vec![mk_backend_with_id("b1")])];
         let headers = hmap(&[("x-tenant", "anything")]);
         assert!(match_header_rule_backends(&rules, &regexes, &backends, &headers).is_none());
+    }
+
+    // ---- Response body rewriting ----
+
+    fn rewrite_rule(
+        pattern: &str,
+        replacement: &str,
+        is_regex: bool,
+        max: Option<u32>,
+    ) -> lorica_config::models::ResponseRewriteRule {
+        lorica_config::models::ResponseRewriteRule {
+            pattern: pattern.into(),
+            replacement: replacement.into(),
+            is_regex,
+            max_replacements: max,
+        }
+    }
+
+    fn compile(
+        rules: Vec<lorica_config::models::ResponseRewriteRule>,
+    ) -> Vec<Option<CompiledRewriteRule>> {
+        rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| compile_rewrite_rule(r, "test-route", i))
+            .collect()
+    }
+
+    #[test]
+    fn test_apply_response_rewrites_literal_single_match() {
+        let rules = compile(vec![rewrite_rule("internal.svc", "api.example.com", false, None)]);
+        let body = b"GET http://internal.svc/path HTTP/1.1";
+        let out = apply_response_rewrites(body, &rules);
+        assert_eq!(out, b"GET http://api.example.com/path HTTP/1.1");
+    }
+
+    #[test]
+    fn test_apply_response_rewrites_literal_multiple_matches() {
+        let rules = compile(vec![rewrite_rule("cat", "dog", false, None)]);
+        let body = b"cat sat on a cat mat";
+        let out = apply_response_rewrites(body, &rules);
+        assert_eq!(out, b"dog sat on a dog mat");
+    }
+
+    #[test]
+    fn test_apply_response_rewrites_literal_no_match_leaves_body_intact() {
+        let rules = compile(vec![rewrite_rule("needle", "yarn", false, None)]);
+        let body = b"haystack without any n33dle";
+        let out = apply_response_rewrites(body, &rules);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn test_apply_response_rewrites_regex_substitution() {
+        // Redact numbers.
+        let rules = compile(vec![rewrite_rule(r"\d+", "***", true, None)]);
+        let body = b"account 12345 balance 67";
+        let out = apply_response_rewrites(body, &rules);
+        assert_eq!(out, b"account *** balance ***");
+    }
+
+    #[test]
+    fn test_apply_response_rewrites_regex_with_capture_groups() {
+        // regex::bytes::Regex supports $N substitution.
+        let rules = compile(vec![rewrite_rule(r"v(\d+)", r"version-$1", true, None)]);
+        let body = b"upgrade from v1 to v22";
+        let out = apply_response_rewrites(body, &rules);
+        assert_eq!(out, b"upgrade from version-1 to version-22");
+    }
+
+    #[test]
+    fn test_apply_response_rewrites_max_replacements_caps_substitutions() {
+        let rules = compile(vec![rewrite_rule("a", "X", false, Some(3))]);
+        let body = b"aaaaaaaaaa"; // 10 a's
+        let out = apply_response_rewrites(body, &rules);
+        assert_eq!(out, b"XXXaaaaaaa", "only first 3 should be rewritten");
+    }
+
+    #[test]
+    fn test_apply_response_rewrites_rules_compose_in_order() {
+        // Rule 1 produces text rule 2 then consumes.
+        let rules = compile(vec![
+            rewrite_rule("alpha", "beta", false, None),
+            rewrite_rule("beta", "gamma", false, None),
+        ]);
+        let body = b"alpha and beta walk in";
+        let out = apply_response_rewrites(body, &rules);
+        // alpha -> beta first, then both "beta"s -> gamma
+        assert_eq!(out, b"gamma and gamma walk in");
+    }
+
+    #[test]
+    fn test_apply_response_rewrites_invalid_regex_is_skipped() {
+        // Compile fails; rule yields None; apply treats as no-op.
+        let cfg_rules = vec![
+            rewrite_rule("(unclosed", "x", true, None),
+            rewrite_rule("good", "ok", false, None),
+        ];
+        let compiled = compile(cfg_rules);
+        assert!(compiled[0].is_none(), "bad regex must yield None");
+        assert!(compiled[1].is_some());
+
+        let body = b"good and (unclosed";
+        let out = apply_response_rewrites(body, &compiled);
+        // Only the "good" rule applied; "(unclosed" is literal in the
+        // body and the broken rule is skipped.
+        assert_eq!(out, b"ok and (unclosed");
+    }
+
+    #[test]
+    fn test_apply_response_rewrites_binary_safe_on_non_utf8() {
+        // Invalid UTF-8 bytes with a literal ASCII marker in the middle.
+        // The rewrite must operate on bytes, not strings, so the non-
+        // UTF-8 bytes pass through untouched.
+        let rules = compile(vec![rewrite_rule("mark", "MARK", false, None)]);
+        let mut body: Vec<u8> = vec![0xFF, 0xFE, 0x00];
+        body.extend_from_slice(b"mark");
+        body.extend_from_slice(&[0xFF, 0xFE]);
+        let out = apply_response_rewrites(&body, &rules);
+        let expected: Vec<u8> = {
+            let mut v = vec![0xFF, 0xFE, 0x00];
+            v.extend_from_slice(b"MARK");
+            v.extend_from_slice(&[0xFF, 0xFE]);
+            v
+        };
+        assert_eq!(out, expected);
+    }
+
+    fn rewrite_cfg(prefixes: Vec<&str>) -> lorica_config::models::ResponseRewriteConfig {
+        lorica_config::models::ResponseRewriteConfig {
+            rules: vec![],
+            max_body_bytes: 1024,
+            content_type_prefixes: prefixes.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn test_should_rewrite_response_default_text_prefix() {
+        let cfg = rewrite_cfg(vec![]); // empty -> default to "text/"
+        assert!(should_rewrite_response(&cfg, "text/html", ""));
+        assert!(should_rewrite_response(&cfg, "text/plain; charset=utf-8", ""));
+        assert!(!should_rewrite_response(&cfg, "application/json", ""));
+    }
+
+    #[test]
+    fn test_should_rewrite_response_explicit_prefixes() {
+        let cfg = rewrite_cfg(vec!["application/json", "application/xml"]);
+        assert!(should_rewrite_response(&cfg, "application/json", ""));
+        assert!(should_rewrite_response(&cfg, "application/xml", ""));
+        assert!(!should_rewrite_response(&cfg, "text/html", ""));
+    }
+
+    #[test]
+    fn test_should_rewrite_response_skips_compressed_content() {
+        let cfg = rewrite_cfg(vec!["text/"]);
+        assert!(!should_rewrite_response(&cfg, "text/html", "gzip"));
+        assert!(!should_rewrite_response(&cfg, "text/html", "br"));
+        // `identity` is explicitly NOT compressed.
+        assert!(should_rewrite_response(&cfg, "text/html", "identity"));
+        // Empty / missing encoding ok too.
+        assert!(should_rewrite_response(&cfg, "text/html", ""));
+        assert!(should_rewrite_response(&cfg, "text/html", "   "));
+    }
+
+    #[test]
+    fn test_should_rewrite_response_case_insensitive_content_type() {
+        let cfg = rewrite_cfg(vec!["text/"]);
+        assert!(should_rewrite_response(&cfg, "TEXT/HTML", ""));
+        assert!(should_rewrite_response(&cfg, "Text/Plain", ""));
     }
 
     // ---- Request mirroring ----

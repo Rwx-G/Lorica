@@ -180,6 +180,7 @@ describe('routeToFormState', () => {
     traffic_splits: [],
     forward_auth: null,
     mirror: null,
+    response_rewrite: null,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
   };
@@ -743,6 +744,7 @@ describe('forward_auth', () => {
       traffic_splits: [],
       forward_auth: null,
     mirror: null,
+    response_rewrite: null,
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
     });
@@ -908,12 +910,122 @@ describe('mirror', () => {
       traffic_splits: [],
       forward_auth: null,
       mirror: null,
+    response_rewrite: null,
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
     });
     expect(form.mirror_backend_ids).toEqual([]);
     expect(form.mirror_sample_percent).toBe(100);
     expect(form.mirror_timeout_ms).toBe(5000);
+  });
+});
+
+describe('response_rewrite', () => {
+  function rr(overrides: Partial<RouteFormState> = {}): RouteFormState {
+    return { ...ROUTE_DEFAULTS, hostname: 'a.com', ...overrides };
+  }
+
+  it('omits response_rewrite from create when rules are empty', () => {
+    const req = formStateToCreateRequest(rr({ response_rewrite_rules: [] }));
+    expect(req.response_rewrite).toBeUndefined();
+  });
+
+  it('drops blank-pattern rules silently on save', () => {
+    const req = formStateToCreateRequest(
+      rr({
+        response_rewrite_rules: [
+          { pattern: '', replacement: 'x', is_regex: false, max_replacements: '' },
+          { pattern: 'real', replacement: 'fake', is_regex: false, max_replacements: '' },
+        ],
+      }),
+    );
+    expect(req.response_rewrite?.rules).toHaveLength(1);
+    expect(req.response_rewrite?.rules[0].pattern).toBe('real');
+  });
+
+  it('parses empty max_replacements as null (unlimited)', () => {
+    const req = formStateToCreateRequest(
+      rr({
+        response_rewrite_rules: [
+          { pattern: 'p', replacement: 'r', is_regex: false, max_replacements: '' },
+        ],
+      }),
+    );
+    expect(req.response_rewrite?.rules[0].max_replacements).toBeNull();
+  });
+
+  it('parses numeric max_replacements', () => {
+    const req = formStateToCreateRequest(
+      rr({
+        response_rewrite_rules: [
+          { pattern: 'p', replacement: 'r', is_regex: false, max_replacements: '5' },
+        ],
+      }),
+    );
+    expect(req.response_rewrite?.rules[0].max_replacements).toBe(5);
+  });
+
+  it('validateRouteForm rejects empty pattern', () => {
+    expect(
+      validateRouteForm(
+        rr({
+          response_rewrite_rules: [
+            { pattern: '  ', replacement: 'r', is_regex: false, max_replacements: '' },
+          ],
+        }),
+      ),
+    ).toMatch(/pattern must not be empty/);
+  });
+
+  it('validateRouteForm rejects invalid regex', () => {
+    expect(
+      validateRouteForm(
+        rr({
+          response_rewrite_rules: [
+            { pattern: '(unclosed', replacement: 'r', is_regex: true, max_replacements: '' },
+          ],
+        }),
+      ),
+    ).toMatch(/invalid regex/);
+  });
+
+  it('validateRouteForm rejects zero max_replacements', () => {
+    expect(
+      validateRouteForm(
+        rr({
+          response_rewrite_rules: [
+            { pattern: 'p', replacement: 'r', is_regex: false, max_replacements: '0' },
+          ],
+        }),
+      ),
+    ).toMatch(/max_replacements/);
+  });
+
+  it('validateRouteForm rejects max_body_bytes out of range', () => {
+    expect(
+      validateRouteForm(
+        rr({
+          response_rewrite_rules: [
+            { pattern: 'p', replacement: 'r', is_regex: false, max_replacements: '' },
+          ],
+          response_rewrite_max_body_bytes: 200 * 1048576,
+        }),
+      ),
+    ).toMatch(/134217728/);
+  });
+
+  it('validateRouteForm accepts valid config', () => {
+    expect(
+      validateRouteForm(
+        rr({
+          response_rewrite_rules: [
+            { pattern: 'internal', replacement: 'public', is_regex: false, max_replacements: '' },
+            { pattern: '\\d+', replacement: '***', is_regex: true, max_replacements: '10' },
+          ],
+          response_rewrite_content_type_prefixes: 'text/, application/json',
+        }),
+      ),
+    ).toBe('');
   });
 });
 

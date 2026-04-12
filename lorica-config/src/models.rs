@@ -327,6 +327,62 @@ impl HeaderRule {
     }
 }
 
+/// Single response-body rewrite rule (Nginx `sub_filter` equivalent).
+///
+/// `pattern` is treated as a literal string by default; setting
+/// `is_regex = true` compiles it with the `regex` crate and runs it
+/// against the response body as bytes (so non-UTF-8 content like
+/// tightly encoded binary JSON still works predictably).
+///
+/// `max_replacements` caps how many matches are substituted per
+/// response. Useful defence against pathological rules like
+/// `pattern: "a" replacement: "aa"` which would otherwise double the
+/// body length on every pass. `None` = unlimited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseRewriteRule {
+    pub pattern: String,
+    pub replacement: String,
+    #[serde(default)]
+    pub is_regex: bool,
+    #[serde(default)]
+    pub max_replacements: Option<u32>,
+}
+
+/// Per-route response-body rewriting. Buffers the response body up to
+/// `max_body_bytes`, then applies each rule in declaration order to
+/// the full buffered body before streaming it to the client. Responses
+/// with compressed encodings (`Content-Encoding: gzip` etc.) are NOT
+/// rewritten - doing so would need to decode/re-encode, which is out
+/// of v1 scope. Operators who want rewriting on compressed upstreams
+/// should disable compression on the route or upstream.
+///
+/// Content-type filtering: rewrite only applies when the response
+/// `Content-Type` starts with one of `content_type_prefixes` (e.g.
+/// `text/`, `application/json`). Empty list defaults to `["text/"]`.
+///
+/// Responses whose body exceeds `max_body_bytes` stream through
+/// verbatim (no partial rewrite) - a half-rewritten body would be
+/// worse than none. Matches the mirror-body-overflow stance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseRewriteConfig {
+    /// Ordered list of rewrite rules. Each rule runs against the body
+    /// after the previous one, so composition is possible (rule A
+    /// renames an internal host, rule B strips a trailing marker).
+    pub rules: Vec<ResponseRewriteRule>,
+    /// Maximum buffered body size, in bytes. Responses larger than
+    /// this stream through unchanged. Default 1 MiB.
+    #[serde(default = "default_rewrite_max_body_bytes")]
+    pub max_body_bytes: u32,
+    /// Response Content-Type prefixes that enable rewriting. Empty
+    /// list falls back to `["text/"]`. Matches are prefix-insensitive.
+    #[serde(default)]
+    pub content_type_prefixes: Vec<String>,
+}
+
+fn default_rewrite_max_body_bytes() -> u32 {
+    1_048_576 // 1 MiB
+}
+
 /// Request mirroring: duplicate incoming requests to one or more
 /// secondary backends for shadow testing. Fire-and-forget - the mirror
 /// responses are discarded, and any mirror failure must never affect
@@ -672,6 +728,11 @@ pub struct Route {
     /// mirror failures never affect the primary response.
     #[serde(default)]
     pub mirror: Option<MirrorConfig>,
+    /// Response-body rewriting: buffer and apply search-and-replace
+    /// rules to the upstream response body before it reaches the
+    /// client (Nginx `sub_filter` equivalent). `None` = disabled.
+    #[serde(default)]
+    pub response_rewrite: Option<ResponseRewriteConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1621,6 +1682,7 @@ mod tests {
             traffic_splits: Vec::new(),
             forward_auth: None,
             mirror: None,
+            response_rewrite: None,
             created_at: now,
             updated_at: now,
         };

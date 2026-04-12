@@ -198,6 +198,7 @@ fn test_route(
         traffic_splits,
         forward_auth: None,
         mirror: None,
+        response_rewrite: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
