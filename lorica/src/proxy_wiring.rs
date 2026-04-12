@@ -658,17 +658,25 @@ impl EwmaTracker {
     }
 }
 
-/// Per-backend circuit breaker.
+/// Per-(route, backend) circuit breaker.
 ///
-/// Tracks consecutive failures per backend. When the failure count reaches the
-/// threshold, the circuit opens and all traffic is redirected to other backends
-/// for a cooldown period. After the cooldown, one probe request is allowed
-/// through (half-open). If it succeeds the circuit closes; if it fails the
-/// circuit re-opens.
+/// Tracks consecutive failures per (route, backend) pair rather than per
+/// backend alone. This matters when several routes share the same upstream
+/// IP:port but exercise different paths on it - for example two virtual
+/// hosts both pointing at `10.0.0.1:3080` where one path always succeeds
+/// and the other structurally fails. Keying on the route prevents failures
+/// on one route from tripping the breaker for siblings that are actually
+/// healthy against the same physical backend.
+///
+/// When the failure count reaches the threshold, the circuit opens for that
+/// (route, backend) pair and traffic on that route is redirected to other
+/// backends for a cooldown period. After the cooldown, one probe request is
+/// allowed through (half-open). If it succeeds the circuit closes; if it
+/// fails the circuit re-opens.
 #[derive(Debug)]
 pub struct CircuitBreaker {
-    /// Per-backend state: (consecutive_failures, state, last_state_change)
-    states: dashmap::DashMap<String, CircuitBreakerState>,
+    /// Per-(route_id, backend) state: (consecutive_failures, state, last_state_change)
+    states: dashmap::DashMap<(String, String), CircuitBreakerState>,
     /// Number of consecutive errors before opening the circuit.
     threshold: u32,
     /// How long the circuit stays open before moving to half-open (seconds).
@@ -698,10 +706,11 @@ impl CircuitBreaker {
         }
     }
 
-    /// Check if a backend is available (not in Open state).
+    /// Check if a backend is available for the given route (not in Open state).
     /// Open circuits that have exceeded the cooldown move to HalfOpen.
-    pub fn is_available(&self, addr: &str) -> bool {
-        let mut entry = match self.states.get_mut(addr) {
+    pub fn is_available(&self, route_id: &str, addr: &str) -> bool {
+        let key = (route_id.to_string(), addr.to_string());
+        let mut entry = match self.states.get_mut(&key) {
             Some(e) => e,
             None => return true, // no state = closed = available
         };
@@ -720,8 +729,9 @@ impl CircuitBreaker {
     }
 
     /// Record a successful response. Resets the failure count and closes the circuit.
-    pub fn record_success(&self, addr: &str) {
-        if let Some(mut entry) = self.states.get_mut(addr) {
+    pub fn record_success(&self, route_id: &str, addr: &str) {
+        let key = (route_id.to_string(), addr.to_string());
+        if let Some(mut entry) = self.states.get_mut(&key) {
             if entry.failures > 0 || entry.state != CircuitStatus::Closed {
                 entry.failures = 0;
                 entry.state = CircuitStatus::Closed;
@@ -731,24 +741,23 @@ impl CircuitBreaker {
     }
 
     /// Record a failure. Increments the counter and opens the circuit if threshold is reached.
-    pub fn record_failure(&self, addr: &str) {
-        let mut entry = self
-            .states
-            .entry(addr.to_string())
-            .or_insert(CircuitBreakerState {
-                failures: 0,
-                state: CircuitStatus::Closed,
-                changed_at: Instant::now(),
-            });
+    pub fn record_failure(&self, route_id: &str, addr: &str) {
+        let key = (route_id.to_string(), addr.to_string());
+        let mut entry = self.states.entry(key).or_insert(CircuitBreakerState {
+            failures: 0,
+            state: CircuitStatus::Closed,
+            changed_at: Instant::now(),
+        });
         entry.failures += 1;
         if entry.failures >= self.threshold && entry.state != CircuitStatus::Open {
             entry.state = CircuitStatus::Open;
             entry.changed_at = Instant::now();
             tracing::warn!(
+                route_id = %route_id,
                 backend = %addr,
                 failures = entry.failures,
                 cooldown_s = self.cooldown_s,
-                "circuit breaker opened - backend removed from rotation"
+                "circuit breaker opened - backend removed from rotation for this route"
             );
         }
     }
@@ -3598,7 +3607,9 @@ impl ProxyHttp for LoricaProxy {
             .filter(|b| {
                 b.health_status != HealthStatus::Down
                     && b.lifecycle_state == LifecycleState::Normal
-                    && self.circuit_breaker.is_available(&b.address)
+                    && self
+                        .circuit_breaker
+                        .is_available(&entry.route.id, &b.address)
             })
             .collect();
 
@@ -4240,11 +4251,15 @@ impl ProxyHttp for LoricaProxy {
             self.active_connections.fetch_sub(1, Ordering::Relaxed);
             self.backend_connections.decrement(addr);
 
-            // Update circuit breaker: 5xx or connection error = failure, else success
-            if e.is_some() || status >= 500 {
-                self.circuit_breaker.record_failure(addr);
-            } else {
-                self.circuit_breaker.record_success(addr);
+            // Update circuit breaker: 5xx or connection error = failure, else success.
+            // Keyed by (route_id, backend) so a failing route does not punish
+            // sibling routes that share the same upstream IP:port.
+            if let Some(ref route_id) = ctx.route_id {
+                if e.is_some() || status >= 500 {
+                    self.circuit_breaker.record_failure(route_id, addr);
+                } else {
+                    self.circuit_breaker.record_success(route_id, addr);
+                }
             }
         }
 
@@ -7230,5 +7245,94 @@ mod tests {
         // Re-cacheable after mark_cacheable clears the entry.
         predictor.mark_cacheable(&key);
         assert!(predictor.cacheable_prediction(&key));
+    }
+
+    // ------------------------------------------------------------------
+    // Circuit breaker scoping tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn breaker_isolates_routes_sharing_a_backend() {
+        // Two routes pointing at the same backend IP:port. One route fails
+        // structurally (all 5xx) while the other is healthy. The breaker
+        // must only open for the failing (route, backend) pair - the
+        // sibling route must still see the backend as available.
+        let breaker = CircuitBreaker::new(5, 10);
+        let backend = "10.0.0.1:3080";
+        let route_failing = "route-dashboard";
+        let route_healthy = "route-webapi";
+
+        for _ in 0..5 {
+            breaker.record_failure(route_failing, backend);
+        }
+
+        assert!(
+            !breaker.is_available(route_failing, backend),
+            "breaker must be open for the failing route"
+        );
+        assert!(
+            breaker.is_available(route_healthy, backend),
+            "sibling route must not inherit the failure state"
+        );
+    }
+
+    #[test]
+    fn breaker_opens_after_threshold_failures() {
+        let breaker = CircuitBreaker::new(3, 10);
+        let route = "r1";
+        let backend = "10.0.0.1:3080";
+
+        breaker.record_failure(route, backend);
+        breaker.record_failure(route, backend);
+        assert!(
+            breaker.is_available(route, backend),
+            "should still be closed at 2 < threshold"
+        );
+        breaker.record_failure(route, backend);
+        assert!(
+            !breaker.is_available(route, backend),
+            "should open at threshold"
+        );
+    }
+
+    #[test]
+    fn breaker_success_resets_failure_count() {
+        let breaker = CircuitBreaker::new(3, 10);
+        let route = "r1";
+        let backend = "10.0.0.1:3080";
+
+        breaker.record_failure(route, backend);
+        breaker.record_failure(route, backend);
+        breaker.record_success(route, backend);
+        breaker.record_failure(route, backend);
+        breaker.record_failure(route, backend);
+        assert!(
+            breaker.is_available(route, backend),
+            "two failures after a success should not reach threshold"
+        );
+    }
+
+    #[test]
+    fn breaker_cooldown_moves_to_half_open() {
+        // Tiny cooldown so the test does not sleep for seconds.
+        let breaker = CircuitBreaker::new(1, 0);
+        let route = "r1";
+        let backend = "10.0.0.1:3080";
+
+        breaker.record_failure(route, backend);
+        assert!(
+            breaker.is_available(route, backend),
+            "0s cooldown allows probe"
+        );
+
+        // A success on the probe closes the breaker again.
+        breaker.record_success(route, backend);
+        assert!(breaker.is_available(route, backend));
+    }
+
+    #[test]
+    fn breaker_unknown_route_is_available_by_default() {
+        let breaker = CircuitBreaker::new(5, 10);
+        assert!(breaker.is_available("never-seen", "10.0.0.1:3080"));
     }
 }

@@ -24,6 +24,10 @@ Author: Rwx-G
 - Prometheus counters for every v1.3.0 feature with non-trivial activity, exposed on the existing `GET /metrics` endpoint: `lorica_cache_predictor_bypass_total{route_id}`, `lorica_header_rule_match_total{route_id, rule_index}` (with `rule_index = "default"` for fallthrough), `lorica_canary_split_selected_total{route_id, split_name}` (with `"default"` / `"unnamed"` labels), `lorica_mirror_outcome_total{route_id, outcome}` (outcomes: `spawned`, `dropped_saturated`, `dropped_oversize_body`, `errored`), `lorica_forward_auth_cache_total{route_id, outcome}` (outcomes: `hit`, `miss`). Cardinality is bounded by route count - no user-input-derived labels
 - Config-validation endpoints to shorten the save-fail-retry loop when configuring auth and mTLS: `POST /api/v1/validate/mtls-pem` parses a candidate CA PEM and returns the per-cert subjects so operators can confirm their bundle before committing; `POST /api/v1/validate/forward-auth` issues one GET to a candidate auth URL and reports status, elapsed time, and a whitelisted subset of response headers (Location, Remote-User, Remote-Groups, Remote-Email, Content-Type). Surfaced in the dashboard Security tab as inline "Validate PEM" / "Test connection" buttons
 
+### Changed
+
+- Circuit breaker now scopes state by `(route_id, backend)` instead of by backend alone. Two routes that share the same upstream IP:port (common when a single Teleport / nginx front-door multiplexes several virtual hosts on one port) no longer punish each other: failures on one route open the breaker only for that route, leaving sibling routes routable to the same physical backend
+
 ## [1.2.0] - 2026-04-11
 
 ### Added
