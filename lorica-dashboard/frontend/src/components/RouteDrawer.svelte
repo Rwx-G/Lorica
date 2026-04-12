@@ -21,6 +21,7 @@
   import CachingTab from './route-tabs/CachingTab.svelte';
   import ProtectionTab from './route-tabs/ProtectionTab.svelte';
   import PathRulesTab from './route-tabs/PathRulesTab.svelte';
+  import HeaderRulesTab from './route-tabs/HeaderRulesTab.svelte';
 
   interface Props {
     open: boolean;
@@ -50,6 +51,7 @@
     { id: 'caching', label: 'Caching' },
     { id: 'protection', label: 'Protection' },
     { id: 'path_rules', label: 'Path Rules' },
+    { id: 'header_rules', label: 'Header Rules' },
   ];
 
   // Reset form when drawer opens - untrack body so form/editing changes
@@ -202,6 +204,8 @@
           <ProtectionTab bind:form={form} {importedFields} />
         {:else if activeTab === 'path_rules'}
           <PathRulesTab bind:form={form} {backends} {importedFields} />
+        {:else if activeTab === 'header_rules'}
+          <HeaderRulesTab bind:form={form} {backends} {importedFields} />
         {/if}
       </div>
 

@@ -255,6 +255,78 @@ impl PathRule {
     }
 }
 
+/// Match semantics for a [`HeaderRule`].
+///
+/// `Regex` is compiled at route-load time; a malformed regex produces a
+/// warning and disables the rule rather than failing the whole reload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderMatchType {
+    #[default]
+    Exact,
+    Prefix,
+    Regex,
+}
+
+impl HeaderMatchType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Prefix => "prefix",
+            Self::Regex => "regex",
+        }
+    }
+}
+
+impl FromStr for HeaderMatchType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "exact" => Ok(Self::Exact),
+            "prefix" => Ok(Self::Prefix),
+            "regex" => Ok(Self::Regex),
+            other => Err(format!("unknown header match type: {other}")),
+        }
+    }
+}
+
+/// Route a request to a specific backend group based on one of its HTTP
+/// request headers. Enables A/B testing (`X-Version: beta`), tenant
+/// isolation (`X-Tenant: acme`), and similar content-negotiation-adjacent
+/// patterns without changing upstream URLs.
+///
+/// Rules are evaluated in declaration order; first match wins. Header
+/// names are matched case-insensitively as required by RFC 7230. An
+/// empty `backend_ids` is allowed and means "match this rule but keep
+/// the route's default backends" - useful when future fields (canary
+/// split, headers override) extend this struct without requiring an
+/// explicit backend set.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HeaderRule {
+    pub header_name: String,
+    #[serde(default)]
+    pub match_type: HeaderMatchType,
+    pub value: String,
+    #[serde(default)]
+    pub backend_ids: Vec<String>,
+}
+
+impl HeaderRule {
+    /// Test this rule against a single header value. The `regex_match`
+    /// closure is invoked only for `HeaderMatchType::Regex` rules; the
+    /// proxy engine passes a closure wrapping a precompiled `regex::Regex`,
+    /// and tests that don't care about regex semantics can pass
+    /// `|_| false`. `lorica-config` deliberately does not depend on the
+    /// `regex` crate so the schema stays light.
+    pub fn matches<F: FnOnce(&str) -> bool>(&self, value: &str, regex_match: F) -> bool {
+        match self.match_type {
+            HeaderMatchType::Exact => value == self.value,
+            HeaderMatchType::Prefix => value.starts_with(&self.value),
+            HeaderMatchType::Regex => regex_match(value),
+        }
+    }
+}
+
 // --- Security Header Presets ---
 
 /// A named collection of HTTP security headers that can be applied to routes.
@@ -444,6 +516,11 @@ pub struct Route {
     /// Merged with any `Vary` header the origin returns.
     #[serde(default)]
     pub cache_vary_headers: Vec<String>,
+    /// Header-based routing rules. Evaluated before path rules; first match
+    /// selects `matched_backends`. A later path rule with its own
+    /// `backend_ids` overrides the header rule's selection.
+    #[serde(default)]
+    pub header_rules: Vec<HeaderRule>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1389,6 +1466,7 @@ mod tests {
             maintenance_mode: false,
             error_page_html: None,
             cache_vary_headers: Vec::new(),
+            header_rules: Vec::new(),
             created_at: now,
             updated_at: now,
         };

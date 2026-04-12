@@ -68,6 +68,7 @@ mod tests {
             maintenance_mode: false,
             error_page_html: None,
             cache_vary_headers: vec![],
+            header_rules: vec![],
             created_at: now,
             updated_at: now,
         }
@@ -1669,5 +1670,88 @@ cert_critical_days = 3
         let reloaded = store.get_route(&route.id).unwrap().unwrap();
         assert!(reloaded.basic_auth_username.is_none());
         assert!(reloaded.basic_auth_password_hash.is_none());
+    }
+
+    #[test]
+    fn test_cache_vary_headers_roundtrip() {
+        // Regression guard: Phase 1.3 added cache_vary_headers via a
+        // replace_all edit that skipped the get_route SELECT due to
+        // differing indentation. The list_routes path happened to work;
+        // get_route returned empty. This test exercises get_route
+        // specifically so the two SELECTs can't drift again.
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.cache_vary_headers = vec!["Accept-Encoding".into(), "Accept-Language".into()];
+        store.create_route(&route).unwrap();
+
+        let via_get = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(
+            via_get.cache_vary_headers,
+            vec!["Accept-Encoding".to_string(), "Accept-Language".to_string()]
+        );
+
+        let via_list: Vec<_> = store
+            .list_routes()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.id == route.id)
+            .collect();
+        assert_eq!(via_list.len(), 1);
+        assert_eq!(via_list[0].cache_vary_headers, via_get.cache_vary_headers);
+    }
+
+    #[test]
+    fn test_header_rules_roundtrip() {
+        // Schema V26: header_rules persists as a JSON array. Confirms the
+        // migration is applied on a fresh DB and that the SELECT column
+        // index (currently row index 56) stays in sync with create/update.
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.header_rules = vec![
+            HeaderRule {
+                header_name: "X-Tenant".into(),
+                match_type: HeaderMatchType::Exact,
+                value: "acme".into(),
+                backend_ids: vec!["b1".into()],
+            },
+            HeaderRule {
+                header_name: "User-Agent".into(),
+                match_type: HeaderMatchType::Regex,
+                value: "^Mobile".into(),
+                backend_ids: vec![],
+            },
+        ];
+        store.create_route(&route).unwrap();
+
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(loaded.header_rules.len(), 2);
+        assert_eq!(loaded.header_rules[0].header_name, "X-Tenant");
+        assert!(matches!(
+            loaded.header_rules[0].match_type,
+            HeaderMatchType::Exact
+        ));
+        assert_eq!(loaded.header_rules[0].backend_ids, vec!["b1".to_string()]);
+        assert!(matches!(
+            loaded.header_rules[1].match_type,
+            HeaderMatchType::Regex
+        ));
+        assert!(loaded.header_rules[1].backend_ids.is_empty());
+
+        // Update clears the rules.
+        let mut cleared = loaded.clone();
+        cleared.header_rules.clear();
+        store.update_route(&cleared).unwrap();
+        let after_update = store.get_route(&route.id).unwrap().unwrap();
+        assert!(after_update.header_rules.is_empty());
+    }
+
+    #[test]
+    fn test_header_rules_default_empty() {
+        // Default Route ctor: no header_rules persisted or loaded.
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.header_rules.is_empty());
     }
 }

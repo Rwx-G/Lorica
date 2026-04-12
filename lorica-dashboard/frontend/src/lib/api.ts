@@ -156,8 +156,23 @@ export interface RouteResponse {
   maintenance_mode: boolean;
   error_page_html: string | null;
   cache_vary_headers: string[];
+  header_rules: HeaderRuleResponse[];
   created_at: string;
   updated_at: string;
+}
+
+export interface HeaderRuleResponse {
+  header_name: string;
+  match_type?: string;
+  value: string;
+  backend_ids: string[];
+}
+
+export interface HeaderRuleRequest {
+  header_name: string;
+  match_type?: string;
+  value: string;
+  backend_ids: string[];
 }
 
 export interface CreateRouteRequest {
@@ -214,6 +229,7 @@ export interface CreateRouteRequest {
   maintenance_mode?: boolean;
   error_page_html?: string;
   cache_vary_headers?: string[];
+  header_rules?: HeaderRuleRequest[];
 }
 
 
@@ -272,6 +288,7 @@ export interface UpdateRouteRequest {
   maintenance_mode?: boolean;
   error_page_html?: string;
   cache_vary_headers?: string[];
+  header_rules?: HeaderRuleRequest[];
 }
 
 export interface BackendResponse {

@@ -14,6 +14,11 @@ Author: Rwx-G
 - Connection pre-filter: IP allow/deny CIDR policy enforced at TCP accept, before TLS handshake. Configurable via new `connection_allow_cidrs` and `connection_deny_cidrs` `GlobalSettings` fields; editable in the dashboard Settings tab. Deny always wins; a non-empty allow list switches the filter to default-deny. Hot-reloaded via arc-swap - listener-state stays consistent without rebuilding endpoints, in both single-process and worker modes
 - Cache predictor: shared 16-shard LRU (32K keys total) remembers cache keys whose origin responded uncacheable (OriginNotCache, ResponseTooLarge, or user-defined custom reason) and short-circuits the cache state machine on the next request. Reduces cache-lock contention and variance-key computation on known-bypass traffic. Transient errors (InternalError, UpstreamError, storage failures, lock timeouts) are not remembered
 - Cache Vary support: per-route `cache_vary_headers` partition the cache by request header values (e.g. Accept-Encoding, Accept-Language) so different clients get separate cache entries under the same URL. Merged with the origin's `Vary` response header so both operator config and RFC 7234 semantics take effect. `Vary: *` anchors the variance on the request URI to keep cache cardinality bounded. Editable in the dashboard Caching tab. Schema migration V25 adds the column with a default of `[]`
+- Header-based routing: per-route `header_rules` select a specific backend group based on a request header's value. Supports Exact, Prefix and Regex match types with regex compiled once per route at load time (a malformed regex disables only that rule, never the whole route). Evaluated before path rules so a path rule with its own `backend_ids` can still override. Enables A/B testing (`X-Version: beta`), multi-tenant routing (`X-Tenant: acme`), and similar content-negotiation patterns without touching upstream URLs. New dashboard Header Rules tab. Schema migration V26 adds the column with a default of `[]`
+
+### Fixed
+
+- Route `get_route` SQL SELECT did not include `cache_vary_headers` (introduced in 1.2.0's unreleased migration), so loading a single route by ID returned an empty list even though the data was persisted correctly. `list_routes` was unaffected. Added a regression test exercising both code paths.
 
 ## [1.2.0] - 2026-04-11
 

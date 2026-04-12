@@ -1,4 +1,4 @@
-import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest } from './api';
+import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest } from './api';
 
 export interface PathRuleFormState {
   path: string;
@@ -12,6 +12,13 @@ export interface PathRuleFormState {
   rate_limit_burst: string;
   redirect_to: string;
   return_status: string;
+}
+
+export interface HeaderRuleFormState {
+  header_name: string;
+  match_type: string;   // 'exact' | 'prefix' | 'regex'
+  value: string;
+  backend_ids: string[];
 }
 
 export interface RouteFormState {
@@ -69,6 +76,7 @@ export interface RouteFormState {
   maintenance_mode: boolean;
   error_page_html: string;
   cache_vary_headers: string;
+  header_rules: HeaderRuleFormState[];
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -126,6 +134,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   maintenance_mode: false,
   error_page_html: '',
   cache_vary_headers: '',
+  header_rules: [],
 };
 
 // Tab field mappings for dot indicators
@@ -160,6 +169,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'auto_ban_threshold', 'auto_ban_duration_s',
   ],
   path_rules: ['path_rules'],
+  header_rules: ['header_rules'],
 };
 
 function recordToText(rec: Record<string, string>): string {
@@ -255,7 +265,27 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     maintenance_mode: route.maintenance_mode ?? false,
     error_page_html: route.error_page_html ?? '',
     cache_vary_headers: (route.cache_vary_headers ?? []).join(', '),
+    header_rules: (route.header_rules ?? []).map((r) => ({
+      header_name: r.header_name,
+      match_type: r.match_type ?? 'exact',
+      value: r.value,
+      backend_ids: [...(r.backend_ids ?? [])],
+    })),
   };
+}
+
+function headerRuleFormToRequest(rules: HeaderRuleFormState[]): HeaderRuleRequest[] | undefined {
+  if (rules.length === 0) return undefined;
+  return rules
+    // Drop empty rules silently so an operator who clicks "+ Add" and then
+    // navigates away doesn't send a malformed rule to the API.
+    .filter((r) => r.header_name.trim().length > 0)
+    .map((r) => ({
+      header_name: r.header_name.trim(),
+      match_type: r.match_type,
+      value: r.value,
+      backend_ids: [...r.backend_ids],
+    }));
 }
 
 function pathRuleFormToRequest(rules: PathRuleFormState[]): PathRuleRequest[] | undefined {
@@ -330,6 +360,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     cache_vary_headers: csvToArray(form.cache_vary_headers).length > 0
       ? csvToArray(form.cache_vary_headers)
       : empty([]),
+    header_rules: headerRuleFormToRequest(form.header_rules) ?? (isUpdate ? [] : undefined),
   };
 }
 
@@ -365,6 +396,10 @@ export function getModifiedFields(form: RouteFormState): Set<string> {
   for (const key of Object.keys(ROUTE_DEFAULTS) as (keyof RouteFormState)[]) {
     if (key === 'path_rules') {
       if (form.path_rules.length > 0) modified.add(key);
+      continue;
+    }
+    if (key === 'header_rules') {
+      if (form.header_rules.length > 0) modified.add(key);
       continue;
     }
     const defaultVal = ROUTE_DEFAULTS[key];

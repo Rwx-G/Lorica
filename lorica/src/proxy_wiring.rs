@@ -144,6 +144,15 @@ pub struct RouteEntry {
     /// Resolved backends per path rule (parallel to route.path_rules).
     /// None = inherit route backends, Some = override with these backends.
     pub path_rule_backends: Vec<Option<Vec<Backend>>>,
+    /// Precompiled regex per header rule (parallel to route.header_rules).
+    /// `None` when the rule's match_type is Exact/Prefix, or when the regex
+    /// failed to compile (in which case the rule is logged-and-disabled at
+    /// load time rather than failing the whole reload).
+    pub header_rule_regexes: Vec<Option<Arc<regex::Regex>>>,
+    /// Resolved backends per header rule (parallel to route.header_rules).
+    /// None = rule matches but keeps default backends; Some = override.
+    /// Empty backend_ids on a rule also yields None here.
+    pub header_rule_backends: Vec<Option<Vec<Backend>>>,
 }
 
 /// In-memory configuration snapshot used by the proxy.
@@ -288,6 +297,52 @@ impl ProxyConfig {
                 }
             });
 
+            // Precompile regex rules and pre-resolve backends so the hot
+            // path in `request_filter` can iterate without allocating or
+            // recompiling. A bad regex logs a warning and disables the
+            // single rule - a broken header rule must not poison the rest
+            // of the route's config.
+            let header_rule_regexes: Vec<Option<Arc<regex::Regex>>> = route
+                .header_rules
+                .iter()
+                .map(|rule| match rule.match_type {
+                    lorica_config::models::HeaderMatchType::Regex => {
+                        match regex::Regex::new(&rule.value) {
+                            Ok(re) => Some(Arc::new(re)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    route_id = %route.id,
+                                    header = %rule.header_name,
+                                    pattern = %rule.value,
+                                    error = %e,
+                                    "invalid header_rule regex, disabling this rule"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            let header_rule_backends: Vec<Option<Vec<Backend>>> = route
+                .header_rules
+                .iter()
+                .map(|rule| {
+                    if rule.backend_ids.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            rule.backend_ids
+                                .iter()
+                                .filter_map(|id| backend_map.get(id).cloned())
+                                .collect::<Vec<_>>(),
+                        )
+                        .filter(|v: &Vec<_>| !v.is_empty())
+                    }
+                })
+                .collect();
+
             let entry = RouteEntry {
                 route: Arc::new(route.clone()),
                 backends: route_backends,
@@ -295,6 +350,8 @@ impl ProxyConfig {
                 wrr_state: Arc::new(SmoothWrrState::new(std::process::id() as usize)),
                 path_rewrite_regex: path_rewrite_regex.map(Arc::new),
                 path_rule_backends,
+                header_rule_regexes,
+                header_rule_backends,
             };
 
             routes_by_host
@@ -890,6 +947,42 @@ fn extract_host(req: &lorica_http::RequestHeader) -> &str {
         .unwrap_or("")
 }
 
+/// Evaluate header-based routing rules against a request's headers.
+/// Returns pre-resolved backends from the first rule that matches and
+/// carries an override. A rule with an empty `backend_ids` ("match but
+/// keep route defaults") is treated as not-an-override: the caller should
+/// leave `matched_backends` alone when this returns `None`.
+///
+/// Extracted so the matching + extraction path is exercised by unit
+/// tests without needing a Session or ProxyConfig.
+pub(crate) fn match_header_rule_backends<'a>(
+    rules: &[lorica_config::models::HeaderRule],
+    regexes: &[Option<Arc<regex::Regex>>],
+    backends: &'a [Option<Vec<Backend>>],
+    headers: &http::HeaderMap,
+) -> Option<&'a [Backend]> {
+    for (i, rule) in rules.iter().enumerate() {
+        // Missing / non-UTF-8 header values act as the empty string. A
+        // Prefix rule with `value = ""` would otherwise spuriously match
+        // every request, so Exact and Prefix rules must set a non-empty
+        // `value` to be useful - this is documented on `HeaderRule`.
+        let value = headers
+            .get(rule.header_name.as_str())
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let regex: Option<&regex::Regex> =
+            regexes.get(i).and_then(|opt| opt.as_deref());
+        if rule.matches(value, |v| regex.is_some_and(|re| re.is_match(v))) {
+            // Matched. If this rule has an override, return it; otherwise
+            // the rule matched but inherits the route's default backend
+            // set, which the caller expresses by NOT touching
+            // matched_backends.
+            return backends.get(i).and_then(|b| b.as_deref());
+        }
+    }
+    None
+}
+
 /// Glue used by `cache_vary_filter`: pull the three inputs - route config,
 /// response Vary, request headers+URI - out of a session-level state and
 /// hand them to [`compute_cache_variance`]. Extracted from the trait method
@@ -1257,6 +1350,20 @@ impl ProxyHttp for LoricaProxy {
                     .write_response_header(Box::new(header), true)
                     .await?;
                 return Ok(true);
+            }
+        }
+
+        // Header rule matching (first match wins; sets backend override
+        // before path rules so a later path rule with its own backend_ids
+        // can still take precedence - "more specific wins").
+        if !entry.route.header_rules.is_empty() {
+            if let Some(backends) = match_header_rule_backends(
+                &entry.route.header_rules,
+                &entry.header_rule_regexes,
+                &entry.header_rule_backends,
+                &req.headers,
+            ) {
+                ctx.matched_backends = Some(backends.to_vec());
             }
         }
 
@@ -2805,6 +2912,7 @@ mod tests {
             maintenance_mode: false,
             error_page_html: None,
             cache_vary_headers: vec![],
+            header_rules: vec![],
             created_at: now,
             updated_at: now,
         }
@@ -2940,6 +3048,89 @@ mod tests {
             ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].certificate.is_none());
+    }
+
+    #[test]
+    fn test_from_store_header_rules_precompile_regex_and_resolve_backends() {
+        use lorica_config::models::{HeaderMatchType, HeaderRule};
+        let mut route = make_route("r1", "example.com", "/", true);
+        route.header_rules = vec![
+            HeaderRule {
+                header_name: "X-Tenant".into(),
+                match_type: HeaderMatchType::Exact,
+                value: "acme".into(),
+                backend_ids: vec!["b-acme".into()],
+            },
+            HeaderRule {
+                header_name: "User-Agent".into(),
+                match_type: HeaderMatchType::Regex,
+                value: r"^Mobile".into(),
+                backend_ids: vec!["b-mobile".into(), "b-mobile2".into()],
+            },
+            HeaderRule {
+                // Flag rule: matches but keeps route defaults.
+                header_name: "X-Dark-Mode".into(),
+                match_type: HeaderMatchType::Exact,
+                value: "on".into(),
+                backend_ids: vec![],
+            },
+            HeaderRule {
+                // Broken regex: rule must load (warning logged), but the
+                // precompiled entry for it is None, so it never matches.
+                header_name: "X-Bad".into(),
+                match_type: HeaderMatchType::Regex,
+                value: "(unclosed".into(),
+                backend_ids: vec!["b-whatever".into()],
+            },
+            HeaderRule {
+                // Dangling backend id: gets filtered out on resolution.
+                // The rule itself is retained (so operators can fix it
+                // later) but with an empty resolved list, which normalises
+                // to `None` (match-but-keep-defaults) in RouteEntry.
+                header_name: "X-Dangling".into(),
+                match_type: HeaderMatchType::Exact,
+                value: "yes".into(),
+                backend_ids: vec!["does-not-exist".into()],
+            },
+        ];
+
+        let b_acme = make_backend("b-acme", "10.0.1.1:80");
+        let b_mobile = make_backend("b-mobile", "10.0.2.1:80");
+        let b_mobile2 = make_backend("b-mobile2", "10.0.2.2:80");
+        let b_default = make_backend("b-default", "10.0.0.1:80");
+        let links = vec![("r1".into(), "b-default".into())];
+
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![b_acme, b_mobile, b_mobile2, b_default],
+            vec![],
+            links,
+            ProxyConfigGlobals::default(),
+        );
+        let entry = &config.routes_by_host.get("example.com").unwrap()[0];
+
+        // Regex precompile: index 1 (Mobile) must be Some, index 3 (bad)
+        // must be None, Exact/Prefix indices are always None.
+        assert!(entry.header_rule_regexes[0].is_none(), "Exact rule -> no regex");
+        assert!(entry.header_rule_regexes[1].is_some(), "Regex rule compiles");
+        assert!(entry.header_rule_regexes[2].is_none(), "Exact rule -> no regex");
+        assert!(
+            entry.header_rule_regexes[3].is_none(),
+            "broken regex was logged-and-disabled, not propagated"
+        );
+
+        // Backend resolution:
+        //  - b-acme -> 1 backend
+        //  - b-mobile+b-mobile2 -> 2 backends
+        //  - empty backend_ids -> None
+        //  - dangling backend id -> filtered to empty, normalised to None
+        assert_eq!(entry.header_rule_backends[0].as_ref().unwrap().len(), 1);
+        assert_eq!(entry.header_rule_backends[1].as_ref().unwrap().len(), 2);
+        assert!(entry.header_rule_backends[2].is_none(), "flag rule: keep defaults");
+        assert!(
+            entry.header_rule_backends[4].is_none(),
+            "all backend_ids dangling -> normalised to None"
+        );
     }
 
     #[test]
@@ -4089,6 +4280,172 @@ mod tests {
         route.stale_if_error_s = 0;
         assert_eq!(route.stale_while_revalidate_s as u32, 0);
         assert_eq!(route.stale_if_error_s as u32, 0);
+    }
+
+    // ---- Header-based routing ----
+
+    fn mk_backend_with_id(id: &str) -> Backend {
+        let mut b = make_backend(id, &format!("10.0.0.{}:80", id.as_bytes()[0]));
+        b.id = id.to_string();
+        b
+    }
+
+    #[test]
+    fn test_header_rule_exact_match() {
+        use lorica_config::models::{HeaderMatchType, HeaderRule};
+        let rule = HeaderRule {
+            header_name: "X-Tenant".into(),
+            match_type: HeaderMatchType::Exact,
+            value: "acme".into(),
+            backend_ids: vec![],
+        };
+        assert!(rule.matches("acme", |_| false));
+        assert!(!rule.matches("Acme", |_| false)); // case-sensitive on value
+        assert!(!rule.matches("acmeco", |_| false));
+        assert!(!rule.matches("", |_| false));
+    }
+
+    #[test]
+    fn test_header_rule_prefix_match() {
+        use lorica_config::models::{HeaderMatchType, HeaderRule};
+        let rule = HeaderRule {
+            header_name: "X-Version".into(),
+            match_type: HeaderMatchType::Prefix,
+            value: "v2".into(),
+            backend_ids: vec![],
+        };
+        assert!(rule.matches("v2", |_| false));
+        assert!(rule.matches("v2.1.3", |_| false));
+        assert!(!rule.matches("v1.9", |_| false));
+    }
+
+    #[test]
+    fn test_header_rule_regex_closure() {
+        use lorica_config::models::{HeaderMatchType, HeaderRule};
+        let rule = HeaderRule {
+            header_name: "User-Agent".into(),
+            match_type: HeaderMatchType::Regex,
+            value: r"^Mozilla/.*Chrome".into(),
+            backend_ids: vec![],
+        };
+        let re = regex::Regex::new(&rule.value).unwrap();
+        assert!(rule.matches(
+            "Mozilla/5.0 ... Chrome/120",
+            |v| re.is_match(v)
+        ));
+        assert!(!rule.matches("curl/8.0", |v| re.is_match(v)));
+        // Closure never called for Exact/Prefix types: `|_| panic!()`
+        // would be tempting but verify by constructing a non-panic closure
+        // and swapping the match_type.
+        let mut exact = rule.clone();
+        exact.match_type = HeaderMatchType::Exact;
+        exact.value = "curl/8.0".into();
+        assert!(exact.matches("curl/8.0", |_| panic!("closure must not run for Exact")));
+    }
+
+    #[test]
+    fn test_match_header_rule_backends_case_insensitive_header_lookup() {
+        use lorica_config::models::{HeaderMatchType, HeaderRule};
+        // Header names are compared case-insensitively per RFC 7230; we
+        // rely on http::HeaderMap's canonical lookup, but the lookup key
+        // we pass in is the operator's raw string. Verify the contract.
+        let rules = vec![HeaderRule {
+            header_name: "X-Tenant".into(),
+            match_type: HeaderMatchType::Exact,
+            value: "acme".into(),
+            backend_ids: vec!["b1".into()],
+        }];
+        let regexes: Vec<Option<Arc<regex::Regex>>> = vec![None];
+        let backends: Vec<Option<Vec<Backend>>> = vec![Some(vec![mk_backend_with_id("b1")])];
+
+        // Request uses lowercase header name; must still match.
+        let headers = hmap(&[("x-tenant", "acme")]);
+        assert!(match_header_rule_backends(&rules, &regexes, &backends, &headers).is_some());
+
+        // Request uses different case; still matches.
+        let headers2 = hmap(&[("X-TENANT", "acme")]);
+        assert!(match_header_rule_backends(&rules, &regexes, &backends, &headers2).is_some());
+    }
+
+    #[test]
+    fn test_match_header_rule_backends_first_match_wins() {
+        use lorica_config::models::{HeaderMatchType, HeaderRule};
+        let rules = vec![
+            HeaderRule {
+                header_name: "X-Version".into(),
+                match_type: HeaderMatchType::Prefix,
+                value: "v2".into(),
+                backend_ids: vec!["v2".into()],
+            },
+            HeaderRule {
+                header_name: "X-Version".into(),
+                match_type: HeaderMatchType::Prefix,
+                value: "v".into(), // would also match "v2..." but comes second
+                backend_ids: vec!["fallback".into()],
+            },
+        ];
+        let regexes = vec![None, None];
+        let backends = vec![
+            Some(vec![mk_backend_with_id("v2")]),
+            Some(vec![mk_backend_with_id("fallback")]),
+        ];
+        let headers = hmap(&[("x-version", "v2.3")]);
+        let result = match_header_rule_backends(&rules, &regexes, &backends, &headers)
+            .expect("should match first rule");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "v2");
+    }
+
+    #[test]
+    fn test_match_header_rule_backends_missing_header_skips_rule() {
+        use lorica_config::models::{HeaderMatchType, HeaderRule};
+        // Exact match on a header that isn't present must not match
+        // (otherwise a rule `value=""` would match absence).
+        let rules = vec![HeaderRule {
+            header_name: "X-Tenant".into(),
+            match_type: HeaderMatchType::Exact,
+            value: "acme".into(),
+            backend_ids: vec!["b1".into()],
+        }];
+        let regexes = vec![None];
+        let backends = vec![Some(vec![mk_backend_with_id("b1")])];
+        let headers = hmap(&[]);
+        assert!(match_header_rule_backends(&rules, &regexes, &backends, &headers).is_none());
+    }
+
+    #[test]
+    fn test_match_header_rule_backends_match_without_override_returns_none() {
+        use lorica_config::models::{HeaderMatchType, HeaderRule};
+        // A rule that matches but has no backend_ids means "match but use
+        // route defaults" - caller must not set matched_backends.
+        let rules = vec![HeaderRule {
+            header_name: "X-Flag".into(),
+            match_type: HeaderMatchType::Exact,
+            value: "on".into(),
+            backend_ids: vec![],
+        }];
+        let regexes = vec![None];
+        let backends: Vec<Option<Vec<Backend>>> = vec![None];
+        let headers = hmap(&[("x-flag", "on")]);
+        assert!(match_header_rule_backends(&rules, &regexes, &backends, &headers).is_none());
+    }
+
+    #[test]
+    fn test_match_header_rule_backends_regex_rule_without_compiled_is_fail_closed() {
+        use lorica_config::models::{HeaderMatchType, HeaderRule};
+        // Regex failed to compile at load time -> regexes[i] = None. The
+        // rule must NOT match (fail closed) so a broken regex doesn't
+        // send traffic to the wrong backend.
+        let rules = vec![HeaderRule {
+            header_name: "X-Tenant".into(),
+            match_type: HeaderMatchType::Regex,
+            value: "(unclosed".into(),
+            backend_ids: vec!["b1".into()],
+        }];
+        let regexes: Vec<Option<Arc<regex::Regex>>> = vec![None];
+        let backends = vec![Some(vec![mk_backend_with_id("b1")])];
+        let headers = hmap(&[("x-tenant", "anything")]);
+        assert!(match_header_rule_backends(&rules, &regexes, &backends, &headers).is_none());
     }
 
     fn hmap(pairs: &[(&str, &str)]) -> http::HeaderMap {

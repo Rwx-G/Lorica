@@ -36,7 +36,7 @@ Major feature additions that close the gap with Traefik and Nginx.
 | Feature | Status | Effort | Notes |
 |---|---|---|---|
 | Forward auth (external authentication) | Planned | Medium | Sub-request to auth service (Authelia, Authentik, Keycloak). Subrequest pipe exists in `lorica-proxy/src/subrequest/`. Enable `allow_spawning_subrequest()` + `early_request_filter()` |
-| Header-based routing | Planned | Low-Medium | Route by HTTP headers (X-Version, X-Tenant). A/B testing, multi-tenant. Traefik, Caddy, HAProxy all support it |
+| Header-based routing | Done | Low-Medium | Route by HTTP headers (X-Version, X-Tenant). A/B testing, multi-tenant. Traefik, Caddy, HAProxy all support it |
 | Canary / traffic split | Planned | Medium | Route X% traffic to backend group A, Y% to group B. Zero-risk deployments |
 | mTLS client verification | Planned | Medium | `ClientCertVerifier` trait support exists in rustls layer. Zero-trust, B2B |
 | Response body rewriting | Planned | Medium | Implement `response_body_filter()` hook. Nginx `sub_filter` equivalent |

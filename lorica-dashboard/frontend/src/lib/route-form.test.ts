@@ -176,6 +176,7 @@ describe('routeToFormState', () => {
     maintenance_mode: false,
     error_page_html: null,
     cache_vary_headers: [],
+    header_rules: [],
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
   };
@@ -358,6 +359,125 @@ describe('formStateToCreateRequest', () => {
 // ---------------------------------------------------------------------------
 // routeToFormState -> formState -> request round-trip
 // ---------------------------------------------------------------------------
+
+describe('header_rules', () => {
+  it('drops empty-header_name rules silently', () => {
+    const form = {
+      ...ROUTE_DEFAULTS,
+      hostname: 'test.com',
+      header_rules: [
+        { header_name: '  ', match_type: 'exact', value: 'v', backend_ids: [] },
+        { header_name: 'X-Tenant', match_type: 'exact', value: 'acme', backend_ids: ['b1'] },
+      ],
+    };
+    const req = formStateToCreateRequest(form);
+    expect(req.header_rules).toHaveLength(1);
+    expect(req.header_rules![0].header_name).toBe('X-Tenant');
+  });
+
+  it('trims header_name but keeps value verbatim', () => {
+    // Values can have meaningful leading/trailing spaces (regex patterns
+    // especially). Header names cannot (HTTP grammar) so we trim.
+    const form = {
+      ...ROUTE_DEFAULTS,
+      hostname: 'test.com',
+      header_rules: [
+        { header_name: ' X-Tenant ', match_type: 'prefix', value: ' acme', backend_ids: [] },
+      ],
+    };
+    const req = formStateToCreateRequest(form);
+    expect(req.header_rules![0].header_name).toBe('X-Tenant');
+    expect(req.header_rules![0].value).toBe(' acme');
+  });
+
+  it('excludes header_rules from create when empty', () => {
+    const form = { ...ROUTE_DEFAULTS, hostname: 'test.com', header_rules: [] };
+    const req = formStateToCreateRequest(form);
+    expect(req.header_rules).toBeUndefined();
+  });
+
+  it('routeToFormState maps header_rules preserving match_type and backend_ids', () => {
+    const mock: RouteResponse = {
+      id: 'r1',
+      hostname: 'a.com',
+      path_prefix: '/',
+      backends: [],
+      certificate_id: null,
+      load_balancing: 'round_robin',
+      waf_enabled: false,
+      waf_mode: 'detection',
+      enabled: true,
+      force_https: false,
+      redirect_hostname: null,
+      redirect_to: null,
+      hostname_aliases: [],
+      proxy_headers: {},
+      response_headers: {},
+      security_headers: 'moderate',
+      connect_timeout_s: 5,
+      read_timeout_s: 60,
+      send_timeout_s: 60,
+      strip_path_prefix: null,
+      add_path_prefix: null,
+      path_rewrite_pattern: null,
+      path_rewrite_replacement: null,
+      access_log_enabled: true,
+      proxy_headers_remove: [],
+      response_headers_remove: [],
+      max_request_body_bytes: null,
+      websocket_enabled: true,
+      rate_limit_rps: null,
+      rate_limit_burst: null,
+      ip_allowlist: [],
+      ip_denylist: [],
+      cors_allowed_origins: [],
+      cors_allowed_methods: [],
+      cors_max_age_s: null,
+      compression_enabled: false,
+      retry_attempts: null,
+      cache_enabled: false,
+      cache_ttl_s: 300,
+      cache_max_bytes: 52428800,
+      max_connections: null,
+      slowloris_threshold_ms: 5000,
+      auto_ban_threshold: null,
+      auto_ban_duration_s: 3600,
+      path_rules: [],
+      return_status: null,
+      sticky_session: false,
+      basic_auth_username: null,
+      stale_while_revalidate_s: 10,
+      stale_if_error_s: 60,
+      retry_on_methods: [],
+      maintenance_mode: false,
+      error_page_html: null,
+      cache_vary_headers: [],
+      header_rules: [
+        { header_name: 'X-Tenant', match_type: 'exact', value: 'acme', backend_ids: ['b1'] },
+        { header_name: 'User-Agent', match_type: 'regex', value: '^Mobile', backend_ids: [] },
+      ],
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    };
+
+    const form = routeToFormState(mock);
+    expect(form.header_rules).toHaveLength(2);
+    expect(form.header_rules[0]).toEqual({
+      header_name: 'X-Tenant',
+      match_type: 'exact',
+      value: 'acme',
+      backend_ids: ['b1'],
+    });
+    expect(form.header_rules[1].match_type).toBe('regex');
+    expect(form.header_rules[1].backend_ids).toEqual([]);
+
+    const req = formStateToCreateRequest(form);
+    expect(req.header_rules).toEqual([
+      { header_name: 'X-Tenant', match_type: 'exact', value: 'acme', backend_ids: ['b1'] },
+      { header_name: 'User-Agent', match_type: 'regex', value: '^Mobile', backend_ids: [] },
+    ]);
+  });
+});
 
 describe('cache_vary_headers round-trip', () => {
   it('maps route response -> form -> create request preserving order', () => {

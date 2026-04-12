@@ -48,6 +48,16 @@ pub struct PathRuleRequest {
     pub return_status: Option<u16>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct HeaderRuleRequest {
+    pub header_name: String,
+    #[serde(default)]
+    pub match_type: Option<String>,
+    pub value: String,
+    #[serde(default)]
+    pub backend_ids: Vec<String>,
+}
+
 #[derive(Serialize)]
 pub struct RouteResponse {
     pub id: String,
@@ -107,6 +117,7 @@ pub struct RouteResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_page_html: Option<String>,
     pub cache_vary_headers: Vec<String>,
+    pub header_rules: Vec<HeaderRuleRequest>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -169,6 +180,7 @@ pub struct CreateRouteRequest {
     pub maintenance_mode: Option<bool>,
     pub error_page_html: Option<String>,
     pub cache_vary_headers: Option<Vec<String>>,
+    pub header_rules: Option<Vec<HeaderRuleRequest>>,
 }
 
 #[derive(Deserialize)]
@@ -228,6 +240,7 @@ pub struct UpdateRouteRequest {
     pub maintenance_mode: Option<bool>,
     pub error_page_html: Option<String>,
     pub cache_vary_headers: Option<Vec<String>>,
+    pub header_rules: Option<Vec<HeaderRuleRequest>>,
 }
 
 fn route_to_response(
@@ -305,9 +318,62 @@ fn route_to_response(
         maintenance_mode: route.maintenance_mode,
         error_page_html: route.error_page_html.clone(),
         cache_vary_headers: route.cache_vary_headers.clone(),
+        header_rules: route
+            .header_rules
+            .iter()
+            .map(|hr| HeaderRuleRequest {
+                header_name: hr.header_name.clone(),
+                match_type: Some(hr.match_type.as_str().to_string()),
+                value: hr.value.clone(),
+                backend_ids: hr.backend_ids.clone(),
+            })
+            .collect(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
+}
+
+/// Parse and validate an incoming `HeaderRuleRequest`. Rejects empty header
+/// names, empty Exact/Prefix values (would otherwise match every request),
+/// and malformed regex patterns. Returns the fully-typed `HeaderRule` the
+/// store can persist.
+fn build_header_rule(
+    body: &HeaderRuleRequest,
+) -> Result<lorica_config::models::HeaderRule, ApiError> {
+    let header_name = body.header_name.trim();
+    if header_name.is_empty() {
+        return Err(ApiError::BadRequest("header_rules: header_name must not be empty".into()));
+    }
+    let match_type: lorica_config::models::HeaderMatchType = body
+        .match_type
+        .as_deref()
+        .unwrap_or("exact")
+        .parse()
+        .map_err(ApiError::BadRequest)?;
+    if matches!(
+        match_type,
+        lorica_config::models::HeaderMatchType::Exact
+            | lorica_config::models::HeaderMatchType::Prefix
+    ) && body.value.is_empty()
+    {
+        return Err(ApiError::BadRequest(format!(
+            "header_rules: {} match requires a non-empty value (use regex '.*' if you really want match-all)",
+            match_type.as_str()
+        )));
+    }
+    if matches!(match_type, lorica_config::models::HeaderMatchType::Regex) {
+        regex::Regex::new(&body.value).map_err(|e| {
+            ApiError::BadRequest(format!(
+                "header_rules: invalid regex for header {header_name}: {e}"
+            ))
+        })?;
+    }
+    Ok(lorica_config::models::HeaderRule {
+        header_name: header_name.to_string(),
+        match_type,
+        value: body.value.clone(),
+        backend_ids: body.backend_ids.clone(),
+    })
 }
 
 /// GET /api/v1/routes
@@ -443,6 +509,13 @@ pub async fn create_route(
         maintenance_mode: body.maintenance_mode.unwrap_or(false),
         error_page_html: body.error_page_html.clone(),
         cache_vary_headers: body.cache_vary_headers.clone().unwrap_or_default(),
+        header_rules: body
+            .header_rules
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(build_header_rule)
+            .collect::<Result<Vec<_>, _>>()?,
         created_at: now,
         updated_at: now,
     };
@@ -710,6 +783,12 @@ pub async fn update_route(
             .map(|h| h.trim().to_string())
             .filter(|h| !h.is_empty())
             .collect();
+    }
+    if let Some(ref rules) = body.header_rules {
+        route.header_rules = rules
+            .iter()
+            .map(build_header_rule)
+            .collect::<Result<Vec<_>, _>>()?;
     }
     route.updated_at = Utc::now();
 
