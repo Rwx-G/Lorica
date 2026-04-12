@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.2.0-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.3.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Lorica%20Tests-985-brightgreen.svg" alt="Lorica Tests">
@@ -524,7 +524,7 @@ gpg --verify lorica.deb.asc lorica.deb
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for planned features across upcoming releases (v1.2.0 - v2.0.0).
+See [ROADMAP.md](ROADMAP.md) for planned features across upcoming releases (v1.3.0 - v2.0.0).
 
 See [COMPARISON.md](COMPARISON.md) for a detailed feature comparison with Nginx, Traefik, HAProxy, Caddy, BunkerWeb, Sozu, and Pingora.
 

@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-04-12 | Current release: v1.2.0 | In progress: v1.3.0
+> Last updated: 2026-04-12 | Current release: v1.3.0 | In progress: v1.4.0
 >
 > See [COMPARISON.md](COMPARISON.md) for the full competitive feature matrix.
 >
