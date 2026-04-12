@@ -890,6 +890,32 @@ fn extract_host(req: &lorica_http::RequestHeader) -> &str {
         .unwrap_or("")
 }
 
+/// Glue used by `cache_vary_filter`: pull the three inputs - route config,
+/// response Vary, request headers+URI - out of a session-level state and
+/// hand them to [`compute_cache_variance`]. Extracted from the trait method
+/// so the full extraction path is exercised by unit tests, without needing
+/// to build a `Session` or a `LoricaProxy` instance.
+pub(crate) fn cache_vary_for_request(
+    route: Option<&Route>,
+    meta: &CacheMeta,
+    req: &lorica_http::RequestHeader,
+) -> Option<HashBinary> {
+    let route_headers: &[String] = route
+        .map(|r| r.cache_vary_headers.as_slice())
+        .unwrap_or(&[]);
+    let response_vary = meta
+        .headers()
+        .get("vary")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let request_uri = req
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    compute_cache_variance(route_headers, response_vary, &req.headers, request_uri)
+}
+
 /// Compute a cache variance hash from a union of operator-configured vary
 /// headers (route config) and the origin response's `Vary` header.
 ///
@@ -1938,23 +1964,7 @@ impl ProxyHttp for LoricaProxy {
         ctx: &mut Self::CTX,
         req: &lorica_http::RequestHeader,
     ) -> Option<HashBinary> {
-        let route_headers: &[String] = ctx
-            .route_snapshot
-            .as_ref()
-            .map(|r| r.cache_vary_headers.as_slice())
-            .unwrap_or(&[]);
-        let response_vary = meta
-            .headers()
-            .get("vary")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let request_uri = req
-            .uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-
-        compute_cache_variance(route_headers, response_vary, &req.headers, request_uri)
+        cache_vary_for_request(ctx.route_snapshot.as_deref(), meta, req)
     }
 
     /// Decide whether the upstream response should be admitted to cache.
@@ -4191,6 +4201,99 @@ mod tests {
 
         assert!(v_empty.is_some());
         assert_ne!(v_empty, v_gzip);
+    }
+
+    fn vary_req(method: &str, path: &str, headers: &[(&str, &str)]) -> lorica_http::RequestHeader {
+        let mut req = lorica_http::RequestHeader::build(method, path.as_bytes(), None).unwrap();
+        for (k, v) in headers {
+            req.insert_header((*k).to_string(), *v).unwrap();
+        }
+        req
+    }
+
+    fn vary_resp(vary: Option<&str>) -> lorica_http::ResponseHeader {
+        let mut resp = lorica_http::ResponseHeader::build(200, None).unwrap();
+        if let Some(v) = vary {
+            resp.insert_header("vary", v).unwrap();
+        }
+        resp
+    }
+
+    fn vary_meta(vary: Option<&str>) -> CacheMeta {
+        let now = std::time::SystemTime::now();
+        CacheMeta::new(
+            now + std::time::Duration::from_secs(300),
+            now,
+            0,
+            0,
+            vary_resp(vary),
+        )
+    }
+
+    #[test]
+    fn test_cache_vary_for_request_plumbs_route_and_meta() {
+        // Real route with operator-configured vary header + a CacheMeta that
+        // also advertises a different Vary header. Proves the glue reads
+        // from both inputs, not just one.
+        let mut route = make_route("r-vary", "example.com", "/", true);
+        route.cache_vary_headers = vec!["Accept-Encoding".into()];
+
+        let meta = vary_meta(Some("Accept-Language"));
+        let req_gzip_en = vary_req("GET", "/x", &[("accept-encoding", "gzip"), ("accept-language", "en")]);
+        let req_gzip_fr = vary_req("GET", "/x", &[("accept-encoding", "gzip"), ("accept-language", "fr")]);
+        let req_br_en = vary_req("GET", "/x", &[("accept-encoding", "br"), ("accept-language", "en")]);
+
+        let v_ge = cache_vary_for_request(Some(&route), &meta, &req_gzip_en);
+        let v_gf = cache_vary_for_request(Some(&route), &meta, &req_gzip_fr);
+        let v_be = cache_vary_for_request(Some(&route), &meta, &req_br_en);
+
+        assert!(v_ge.is_some());
+        assert_ne!(v_ge, v_gf, "language change must partition the cache");
+        assert_ne!(v_ge, v_be, "encoding change must partition the cache");
+    }
+
+    #[test]
+    fn test_cache_vary_for_request_without_route_falls_back_to_response_vary() {
+        // No route context (e.g. catch-all path without a Route attached in
+        // ctx): the response's Vary header is still honoured so RFC 7234
+        // semantics survive regardless of operator configuration.
+        let meta = vary_meta(Some("Accept-Encoding"));
+        let req_a = vary_req("GET", "/", &[("accept-encoding", "gzip")]);
+        let req_b = vary_req("GET", "/", &[("accept-encoding", "br")]);
+
+        let a = cache_vary_for_request(None, &meta, &req_a);
+        let b = cache_vary_for_request(None, &meta, &req_b);
+        assert!(a.is_some());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_cache_vary_for_request_no_config_no_response_yields_none() {
+        // Feature unused: zero cost, no variance, asset caches under its
+        // primary key alone.
+        let route = make_route("r-novary", "example.com", "/", true);
+        let meta = vary_meta(None);
+        let req = vary_req("GET", "/", &[]);
+        assert!(cache_vary_for_request(Some(&route), &meta, &req).is_none());
+    }
+
+    #[test]
+    fn test_cache_vary_for_request_star_anchors_on_path_and_query() {
+        // `Vary: *` -> variance anchored on URI so two URLs don't share a
+        // slot but repeat requests to the same URL still hit a stable
+        // variant.
+        let meta = vary_meta(Some("*"));
+        let req_a = vary_req("GET", "/a?v=1", &[]);
+        let req_a_repeat = vary_req("GET", "/a?v=1", &[]);
+        let req_b = vary_req("GET", "/b", &[]);
+
+        let v_a = cache_vary_for_request(None, &meta, &req_a);
+        let v_a2 = cache_vary_for_request(None, &meta, &req_a_repeat);
+        let v_b = cache_vary_for_request(None, &meta, &req_b);
+
+        assert!(v_a.is_some());
+        assert_eq!(v_a, v_a2);
+        assert_ne!(v_a, v_b);
     }
 
     #[test]

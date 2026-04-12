@@ -325,6 +325,107 @@ describe('formStateToCreateRequest', () => {
     const req = formStateToCreateRequest(form);
     expect(req.cors_allowed_origins).toEqual(['*', 'https://example.com']);
   });
+
+  it('converts cache_vary_headers CSV to string array', () => {
+    const form = {
+      ...ROUTE_DEFAULTS,
+      hostname: 'test.com',
+      cache_vary_headers: 'Accept-Encoding, Accept-Language',
+    };
+    const req = formStateToCreateRequest(form);
+    expect(req.cache_vary_headers).toEqual(['Accept-Encoding', 'Accept-Language']);
+  });
+
+  it('excludes cache_vary_headers from create when empty', () => {
+    const form = { ...ROUTE_DEFAULTS, hostname: 'test.com', cache_vary_headers: '' };
+    const req = formStateToCreateRequest(form);
+    // Create uses undefined (so backend falls back to default) rather than
+    // sending an empty array.
+    expect(req.cache_vary_headers).toBeUndefined();
+  });
+
+  it('trims whitespace and drops blank entries from cache_vary_headers', () => {
+    const form = {
+      ...ROUTE_DEFAULTS,
+      hostname: 'test.com',
+      cache_vary_headers: '  Accept-Encoding ,, ,Accept-Language  ',
+    };
+    const req = formStateToCreateRequest(form);
+    expect(req.cache_vary_headers).toEqual(['Accept-Encoding', 'Accept-Language']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// routeToFormState -> formState -> request round-trip
+// ---------------------------------------------------------------------------
+
+describe('cache_vary_headers round-trip', () => {
+  it('maps route response -> form -> create request preserving order', () => {
+    const mockRoute: RouteResponse = {
+      id: 'r1',
+      hostname: 'a.com',
+      path_prefix: '/',
+      backends: [],
+      certificate_id: null,
+      load_balancing: 'round_robin',
+      waf_enabled: false,
+      waf_mode: 'detection',
+      enabled: true,
+      force_https: false,
+      redirect_hostname: null,
+      redirect_to: null,
+      hostname_aliases: [],
+      proxy_headers: {},
+      response_headers: {},
+      security_headers: 'moderate',
+      connect_timeout_s: 5,
+      read_timeout_s: 60,
+      send_timeout_s: 60,
+      strip_path_prefix: null,
+      add_path_prefix: null,
+      path_rewrite_pattern: null,
+      path_rewrite_replacement: null,
+      access_log_enabled: true,
+      proxy_headers_remove: [],
+      response_headers_remove: [],
+      max_request_body_bytes: null,
+      websocket_enabled: true,
+      rate_limit_rps: null,
+      rate_limit_burst: null,
+      ip_allowlist: [],
+      ip_denylist: [],
+      cors_allowed_origins: [],
+      cors_allowed_methods: [],
+      cors_max_age_s: null,
+      compression_enabled: false,
+      retry_attempts: null,
+      cache_enabled: true,
+      cache_ttl_s: 300,
+      cache_max_bytes: 52428800,
+      max_connections: null,
+      slowloris_threshold_ms: 5000,
+      auto_ban_threshold: null,
+      auto_ban_duration_s: 3600,
+      path_rules: [],
+      return_status: null,
+      sticky_session: false,
+      basic_auth_username: null,
+      stale_while_revalidate_s: 10,
+      stale_if_error_s: 60,
+      retry_on_methods: [],
+      maintenance_mode: false,
+      error_page_html: null,
+      cache_vary_headers: ['Accept-Encoding', 'X-Tenant'],
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    };
+
+    const form = routeToFormState(mockRoute);
+    expect(form.cache_vary_headers).toBe('Accept-Encoding, X-Tenant');
+
+    const req = formStateToCreateRequest(form);
+    expect(req.cache_vary_headers).toEqual(['Accept-Encoding', 'X-Tenant']);
+  });
 });
 
 // ---------------------------------------------------------------------------
