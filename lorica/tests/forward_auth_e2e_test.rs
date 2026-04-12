@@ -361,6 +361,7 @@ fn test_route(hostname: &str, forward_auth: Option<ForwardAuthConfig>) -> Route 
         header_rules: vec![],
         traffic_splits: vec![],
         forward_auth,
+        mirror: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

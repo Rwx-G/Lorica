@@ -157,6 +157,7 @@ fn test_route(id: &str, hostname: &str, header_rules: Vec<HeaderRule>) -> Route 
         header_rules,
         traffic_splits: vec![],
         forward_auth: None,
+        mirror: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

@@ -195,7 +195,7 @@
         {:else if activeTab === 'timeouts'}
           <TimeoutsTab bind:form={form} {importedFields} />
         {:else if activeTab === 'security'}
-          <SecurityTab bind:form={form} {importedFields} {customPresets} />
+          <SecurityTab bind:form={form} {importedFields} {customPresets} {backends} />
         {:else if activeTab === 'headers'}
           <HeadersTab bind:form={form} {importedFields} />
         {:else if activeTab === 'cors'}

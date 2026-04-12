@@ -327,6 +327,50 @@ impl HeaderRule {
     }
 }
 
+/// Request mirroring: duplicate incoming requests to one or more
+/// secondary backends for shadow testing. Fire-and-forget - the mirror
+/// responses are discarded, and any mirror failure must never affect
+/// the primary request.
+///
+/// Typical use case: validate a new service version against real
+/// production traffic before promoting it. The shadow backend receives
+/// a clone of the request with an identifying `X-Lorica-Mirror: 1`
+/// header so its logs and metrics can be distinguished from primary
+/// traffic.
+///
+/// Sampling is deterministic per-request (hash of `X-Request-Id`) so a
+/// given request is mirrored to every configured shadow backend or to
+/// none - never split between them.
+///
+/// **v1 scope**: the request body is NOT forwarded - only headers,
+/// method, and URL. This keeps memory bounded and avoids a second pass
+/// over large uploads. A future iteration can opt-in to buffered body
+/// mirroring for bounded requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MirrorConfig {
+    /// One or more backend IDs that receive shadow copies of the
+    /// request. Each eligible request spawns one sub-request per
+    /// backend in this list. Must be non-empty.
+    pub backend_ids: Vec<String>,
+    /// Percentage of eligible requests to mirror. 0..=100. 0 disables
+    /// the mirror without removing the config (useful for staged
+    /// rollouts); 100 mirrors every request.
+    #[serde(default = "default_mirror_sample_percent")]
+    pub sample_percent: u8,
+    /// Per-mirror-request timeout in milliseconds. Mirrors slower than
+    /// this are dropped silently. Default 5000.
+    #[serde(default = "default_mirror_timeout_ms")]
+    pub timeout_ms: u32,
+}
+
+fn default_mirror_sample_percent() -> u8 {
+    100
+}
+
+fn default_mirror_timeout_ms() -> u32 {
+    5_000
+}
+
 /// Forward-authentication config: before proxying to upstream, issue a
 /// sub-request to an external authentication service (Authelia,
 /// Authentik, Keycloak, oauth2-proxy, ...) and honour its verdict.
@@ -610,6 +654,11 @@ pub struct Route {
     /// request never touches the upstream.
     #[serde(default)]
     pub forward_auth: Option<ForwardAuthConfig>,
+    /// Request mirroring: fire-and-forget shadow copies to alternate
+    /// backends. Evaluated after the primary upstream is committed;
+    /// mirror failures never affect the primary response.
+    #[serde(default)]
+    pub mirror: Option<MirrorConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1558,6 +1607,7 @@ mod tests {
             header_rules: Vec::new(),
             traffic_splits: Vec::new(),
             forward_auth: None,
+            mirror: None,
             created_at: now,
             updated_at: now,
         };

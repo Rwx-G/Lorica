@@ -158,6 +158,11 @@ pub struct RouteEntry {
     /// become `None` and are silently skipped at match time, so a typo in
     /// the dashboard never dead-ends live traffic.
     pub traffic_split_backends: Vec<Option<Vec<Backend>>>,
+    /// Pre-resolved mirror backends (flattened from
+    /// `route.mirror.backend_ids`). Empty when the feature is off or
+    /// when all configured IDs dangle - either way, `spawn_mirrors` is
+    /// a no-op.
+    pub mirror_backends: Vec<Backend>,
 }
 
 /// In-memory configuration snapshot used by the proxy.
@@ -348,6 +353,30 @@ impl ProxyConfig {
                 })
                 .collect();
 
+            let mirror_backends: Vec<Backend> = route
+                .mirror
+                .as_ref()
+                .map(|cfg| {
+                    cfg.backend_ids
+                        .iter()
+                        .filter_map(|id| backend_map.get(id).cloned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if route.mirror.is_some()
+                && mirror_backends.is_empty()
+                && route
+                    .mirror
+                    .as_ref()
+                    .map(|m| !m.backend_ids.is_empty())
+                    .unwrap_or(false)
+            {
+                tracing::warn!(
+                    route_id = %route.id,
+                    "mirror.backend_ids all dangling, mirroring is inert for this route"
+                );
+            }
+
             let traffic_split_backends: Vec<Option<Vec<Backend>>> = route
                 .traffic_splits
                 .iter()
@@ -387,6 +416,7 @@ impl ProxyConfig {
                 header_rule_regexes,
                 header_rule_backends,
                 traffic_split_backends,
+                mirror_backends,
             };
 
             routes_by_host
@@ -752,6 +782,28 @@ static FORWARD_AUTH_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .build()
         .expect("build forward-auth reqwest client")
 });
+
+/// Shared HTTP client for request mirroring. Kept separate from the
+/// forward-auth client so a saturated shadow backend cannot impact the
+/// auth path (different connection pools, different timeouts).
+static MIRROR_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(16)
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+        .expect("build mirror reqwest client")
+});
+
+/// Global cap on in-flight mirror sub-requests. Prevents a misconfigured
+/// shadow backend (slow or dead) from leaking unbounded tokio tasks and
+/// file descriptors. When the permit can't be acquired immediately, the
+/// mirror is dropped - shadow testing is best-effort by design.
+///
+/// 256 is generous for a single-node deployment and still bounded
+/// enough that a hung shadow can't take the process down.
+static MIRROR_SEMAPHORE: Lazy<Arc<tokio::sync::Semaphore>> =
+    Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(256)));
 
 /// Cacheability predictor. Remembers keys whose origin recently responded as
 /// uncacheable (OriginNotCache, ResponseTooLarge, or a user-defined custom
@@ -1233,6 +1285,157 @@ pub(crate) async fn run_forward_auth(
     // through.
     ForwardAuthOutcome::FailClosed {
         reason: format!("forward-auth unexpected status {status}"),
+    }
+}
+
+/// Deterministic per-request sampling decision for request mirroring.
+/// Hashes the `request_id` (a UUID assigned per request) and modulos to
+/// 100. This keeps sampling stable across retries of the same logical
+/// request - useful for debugging ("did this specific request ID get
+/// mirrored?"). Returns `true` when the request should be mirrored.
+pub(crate) fn mirror_sample_hit(request_id: &str, sample_percent: u8) -> bool {
+    let pct = sample_percent.min(100);
+    if pct == 0 {
+        return false;
+    }
+    if pct == 100 {
+        return true;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    request_id.hash(&mut h);
+    (h.finish() % 100) < (pct as u64)
+}
+
+/// Build the mirror request URL by combining the shadow backend address
+/// with the downstream request's path+query. The backend address can be
+/// bare `host:port` (then we prepend `http://`) or a full URL. Returns
+/// `None` if the resulting URL is unparseable (mirror is skipped, never
+/// fatal).
+pub(crate) fn build_mirror_url(backend_addr: &str, path_and_query: &str) -> Option<String> {
+    let trimmed = backend_addr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let base = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    // Ensure exactly one '/' between base and path.
+    let base = base.trim_end_matches('/');
+    let path = if path_and_query.starts_with('/') {
+        path_and_query.to_string()
+    } else {
+        format!("/{path_and_query}")
+    };
+    let full = format!("{base}{path}");
+    // Validate at the http::Uri level - reqwest will re-parse but this
+    // rejects obvious typos at spawn time.
+    full.parse::<http::Uri>().ok().map(|_| full)
+}
+
+/// Spawn fire-and-forget shadow copies of the current request to each
+/// configured mirror backend. Runs under a global semaphore so a slow
+/// shadow cannot leak unbounded tasks. Never returns an error - mirror
+/// failures are logged at debug and forgotten.
+pub(crate) fn spawn_mirrors(
+    cfg: &lorica_config::models::MirrorConfig,
+    resolved_backends: &[Backend],
+    req: &lorica_http::RequestHeader,
+    request_id: String,
+) {
+    if !mirror_sample_hit(&request_id, cfg.sample_percent) {
+        return;
+    }
+    if resolved_backends.is_empty() {
+        return;
+    }
+
+    let method = req.method.clone();
+    let path_and_query = req
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
+    // Collect headers to forward. Hop-by-hop headers are dropped; Host
+    // is rewritten to the mirror backend's address by reqwest so the
+    // TLS SNI (if applicable) matches. An `X-Lorica-Mirror: 1` flag
+    // lets the shadow backend filter mirror traffic from its own logs
+    // and metrics - critical so shadow traffic doesn't contaminate the
+    // real analytics.
+    let mut forward_headers: Vec<(String, String)> = Vec::with_capacity(req.headers.len() + 2);
+    forward_headers.push(("X-Lorica-Mirror".into(), "1".into()));
+    forward_headers.push(("X-Request-Id".into(), request_id.clone()));
+    for (name, value) in req.headers.iter() {
+        let n = name.as_str().to_ascii_lowercase();
+        if matches!(
+            n.as_str(),
+            "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "upgrade"
+                // Don't double-set the header we just injected.
+                | "x-lorica-mirror"
+                | "x-request-id"
+        ) {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            forward_headers.push((name.as_str().to_string(), v.to_string()));
+        }
+    }
+
+    let timeout = Duration::from_millis(cfg.timeout_ms as u64);
+    let sem = Arc::clone(&MIRROR_SEMAPHORE);
+
+    for backend in resolved_backends {
+        let url = match build_mirror_url(&backend.address, &path_and_query) {
+            Some(u) => u,
+            None => {
+                tracing::debug!(backend = %backend.address, "mirror: invalid URL, skipping");
+                continue;
+            }
+        };
+        let method_c = method.clone();
+        let headers_c = forward_headers.clone();
+        let sem_c = Arc::clone(&sem);
+        tokio::spawn(async move {
+            // try_acquire_owned is the right primitive here: if all 256
+            // slots are in-flight, drop the mirror silently instead of
+            // queuing (queuing would build a backlog behind a slow
+            // shadow that never drains).
+            let _permit = match sem_c.try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::debug!(url = %url, "mirror: semaphore saturated, dropping");
+                    return;
+                }
+            };
+            let method_r = match reqwest::Method::from_bytes(method_c.as_str().as_bytes()) {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let mut builder = MIRROR_CLIENT.request(method_r, &url).timeout(timeout);
+            for (name, value) in headers_c {
+                builder = builder.header(name, value);
+            }
+            match builder.send().await {
+                Ok(_) => {
+                    // Discard the response body to release the
+                    // connection back to the pool.
+                }
+                Err(e) => {
+                    tracing::debug!(url = %url, error = %e, "mirror request failed");
+                }
+            }
+        });
     }
 }
 
@@ -1763,6 +1966,24 @@ impl ProxyHttp for LoricaProxy {
                     }
                 }
                 break;
+            }
+        }
+
+        // Request mirroring: spawn fire-and-forget shadow copies to the
+        // configured secondary backends. Fires after all routing
+        // decisions are locked in but before maintenance-mode /
+        // upstream, so a maintenance window doesn't mirror 503s and a
+        // successful request always produces a shadow. Mirror failures
+        // never affect the primary response - any error is swallowed
+        // inside the spawned task.
+        if let Some(ref mirror_cfg) = entry.route.mirror {
+            if !entry.mirror_backends.is_empty() {
+                spawn_mirrors(
+                    mirror_cfg,
+                    &entry.mirror_backends,
+                    req,
+                    ctx.request_id.clone(),
+                );
             }
         }
 
@@ -3309,6 +3530,7 @@ mod tests {
             header_rules: vec![],
             traffic_splits: vec![],
             forward_auth: None,
+            mirror: None,
             created_at: now,
             updated_at: now,
         }
@@ -4842,6 +5064,90 @@ mod tests {
         let backends = vec![Some(vec![mk_backend_with_id("b1")])];
         let headers = hmap(&[("x-tenant", "anything")]);
         assert!(match_header_rule_backends(&rules, &regexes, &backends, &headers).is_none());
+    }
+
+    // ---- Request mirroring ----
+
+    #[test]
+    fn test_mirror_sample_hit_zero_always_false() {
+        for i in 0..1000 {
+            let id = format!("r-{i}");
+            assert!(!mirror_sample_hit(&id, 0));
+        }
+    }
+
+    #[test]
+    fn test_mirror_sample_hit_hundred_always_true() {
+        for i in 0..1000 {
+            let id = format!("r-{i}");
+            assert!(mirror_sample_hit(&id, 100));
+        }
+    }
+
+    #[test]
+    fn test_mirror_sample_hit_is_deterministic() {
+        let id = "req-abc-123";
+        let a = mirror_sample_hit(id, 25);
+        for _ in 0..100 {
+            assert_eq!(a, mirror_sample_hit(id, 25));
+        }
+    }
+
+    #[test]
+    fn test_mirror_sample_hit_distribution_roughly_uniform() {
+        // 20% sample over 1000 distinct request IDs should land in a
+        // wide ±7% window; a broken hash would fail dramatically.
+        let mut hits = 0u32;
+        for i in 0..1000u32 {
+            let id = format!("req-{i:08}");
+            if mirror_sample_hit(&id, 20) {
+                hits += 1;
+            }
+        }
+        let pct = hits as f64 / 1000.0 * 100.0;
+        assert!(
+            (13.0..=27.0).contains(&pct),
+            "20% mirror sample landed at {pct:.1}%, hash distribution bug?"
+        );
+    }
+
+    #[test]
+    fn test_build_mirror_url_bare_host() {
+        assert_eq!(
+            build_mirror_url("10.0.0.1:8080", "/api/v1?x=1"),
+            Some("http://10.0.0.1:8080/api/v1?x=1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_mirror_url_full_url() {
+        assert_eq!(
+            build_mirror_url("https://shadow.example.com", "/foo"),
+            Some("https://shadow.example.com/foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_mirror_url_strips_trailing_slash_on_base() {
+        assert_eq!(
+            build_mirror_url("http://h/", "/p"),
+            Some("http://h/p".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_mirror_url_adds_leading_slash_to_path() {
+        assert_eq!(
+            build_mirror_url("http://h", "p"),
+            Some("http://h/p".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_mirror_url_rejects_invalid() {
+        assert!(build_mirror_url("", "/").is_none());
+        // Space in host is invalid per URI grammar.
+        assert!(build_mirror_url("has spaces", "/").is_none());
     }
 
     // ---- Forward auth ----

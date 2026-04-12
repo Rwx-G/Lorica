@@ -159,6 +159,7 @@ export interface RouteResponse {
   header_rules: HeaderRuleResponse[];
   traffic_splits: TrafficSplitResponse[];
   forward_auth?: ForwardAuthConfigResponse | null;
+  mirror?: MirrorConfigResponse | null;
   created_at: string;
   updated_at: string;
 }
@@ -199,6 +200,18 @@ export interface ForwardAuthConfigRequest {
   address: string;
   timeout_ms: number;
   response_headers: string[];
+}
+
+export interface MirrorConfigResponse {
+  backend_ids: string[];
+  sample_percent: number;
+  timeout_ms: number;
+}
+
+export interface MirrorConfigRequest {
+  backend_ids: string[];
+  sample_percent: number;
+  timeout_ms: number;
 }
 
 export interface CreateRouteRequest {
@@ -258,6 +271,7 @@ export interface CreateRouteRequest {
   header_rules?: HeaderRuleRequest[];
   traffic_splits?: TrafficSplitRequest[];
   forward_auth?: ForwardAuthConfigRequest;
+  mirror?: MirrorConfigRequest;
 }
 
 
@@ -319,6 +333,7 @@ export interface UpdateRouteRequest {
   header_rules?: HeaderRuleRequest[];
   traffic_splits?: TrafficSplitRequest[];
   forward_auth?: ForwardAuthConfigRequest;
+  mirror?: MirrorConfigRequest;
 }
 
 export interface BackendResponse {

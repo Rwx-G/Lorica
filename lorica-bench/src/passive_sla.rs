@@ -600,6 +600,7 @@ mod tests {
             header_rules: vec![],
             traffic_splits: vec![],
             forward_auth: None,
+            mirror: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -701,6 +702,7 @@ mod tests {
             header_rules: vec![],
             traffic_splits: vec![],
             forward_auth: None,
+            mirror: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -817,6 +819,7 @@ mod tests {
             header_rules: vec![],
             traffic_splits: vec![],
             forward_auth: None,
+            mirror: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -918,6 +921,7 @@ mod tests {
             header_rules: vec![],
             traffic_splits: vec![],
             forward_auth: None,
+            mirror: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1002,6 +1006,7 @@ mod tests {
             header_rules: vec![],
             traffic_splits: vec![],
             forward_auth: None,
+            mirror: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

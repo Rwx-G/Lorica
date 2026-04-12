@@ -80,6 +80,23 @@ fn default_forward_auth_timeout_ms() -> u32 {
     5_000
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MirrorConfigRequest {
+    #[serde(default)]
+    pub backend_ids: Vec<String>,
+    #[serde(default = "default_mirror_sample_percent")]
+    pub sample_percent: u8,
+    #[serde(default = "default_mirror_timeout_ms")]
+    pub timeout_ms: u32,
+}
+
+fn default_mirror_sample_percent() -> u8 {
+    100
+}
+fn default_mirror_timeout_ms() -> u32 {
+    5_000
+}
+
 #[derive(Serialize)]
 pub struct RouteResponse {
     pub id: String,
@@ -143,6 +160,8 @@ pub struct RouteResponse {
     pub traffic_splits: Vec<TrafficSplitRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forward_auth: Option<ForwardAuthConfigRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<MirrorConfigRequest>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -208,6 +227,7 @@ pub struct CreateRouteRequest {
     pub header_rules: Option<Vec<HeaderRuleRequest>>,
     pub traffic_splits: Option<Vec<TrafficSplitRequest>>,
     pub forward_auth: Option<ForwardAuthConfigRequest>,
+    pub mirror: Option<MirrorConfigRequest>,
 }
 
 #[derive(Deserialize)]
@@ -273,6 +293,10 @@ pub struct UpdateRouteRequest {
     /// present with empty `address` = clear; present with non-empty
     /// address = validate + install/replace.
     pub forward_auth: Option<ForwardAuthConfigRequest>,
+    /// Update semantics: missing field = leave alone; present with
+    /// empty `backend_ids` = clear; present with non-empty = validate
+    /// + install/replace.
+    pub mirror: Option<MirrorConfigRequest>,
 }
 
 fn route_to_response(
@@ -377,9 +401,64 @@ fn route_to_response(
                 timeout_ms: fa.timeout_ms,
                 response_headers: fa.response_headers.clone(),
             }),
+        mirror: route.mirror.as_ref().map(|m| MirrorConfigRequest {
+            backend_ids: m.backend_ids.clone(),
+            sample_percent: m.sample_percent,
+            timeout_ms: m.timeout_ms,
+        }),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
+}
+
+/// Validate a MirrorConfigRequest and convert to stored model. Rejects
+/// the two operator mistakes that make the feature silently broken:
+/// non-existent backend IDs (caught at reload via a warning too, but
+/// better to fail the write) and out-of-range weights.
+fn build_mirror_config(
+    body: &MirrorConfigRequest,
+) -> Result<lorica_config::models::MirrorConfig, ApiError> {
+    if body.backend_ids.is_empty() {
+        return Err(ApiError::BadRequest(
+            "mirror.backend_ids must not be empty (use null/missing to disable)".into(),
+        ));
+    }
+    if body.sample_percent > 100 {
+        return Err(ApiError::BadRequest(format!(
+            "mirror.sample_percent must be 0..=100, got {}",
+            body.sample_percent
+        )));
+    }
+    if body.timeout_ms == 0 {
+        return Err(ApiError::BadRequest(
+            "mirror.timeout_ms must be > 0".into(),
+        ));
+    }
+    if body.timeout_ms > 60_000 {
+        return Err(ApiError::BadRequest(
+            "mirror.timeout_ms must be <= 60000 (60 seconds)".into(),
+        ));
+    }
+    // Dedup and trim backend IDs so the engine doesn't spawn duplicate
+    // sub-requests to the same shadow.
+    let mut seen = std::collections::HashSet::new();
+    let mut cleaned = Vec::with_capacity(body.backend_ids.len());
+    for id in &body.backend_ids {
+        let t = id.trim();
+        if t.is_empty() {
+            return Err(ApiError::BadRequest(
+                "mirror.backend_ids entries must be non-empty".into(),
+            ));
+        }
+        if seen.insert(t.to_string()) {
+            cleaned.push(t.to_string());
+        }
+    }
+    Ok(lorica_config::models::MirrorConfig {
+        backend_ids: cleaned,
+        sample_percent: body.sample_percent,
+        timeout_ms: body.timeout_ms,
+    })
 }
 
 /// Validate and convert a `ForwardAuthConfigRequest` to the stored
@@ -681,6 +760,10 @@ pub async fn create_route(
             Some(fa) if !fa.address.trim().is_empty() => Some(build_forward_auth(fa)?),
             _ => None,
         },
+        mirror: match body.mirror.as_ref() {
+            Some(m) if !m.backend_ids.is_empty() => Some(build_mirror_config(m)?),
+            _ => None,
+        },
         created_at: now,
         updated_at: now,
     };
@@ -972,6 +1055,13 @@ pub async fn update_route(
             route.forward_auth = Some(build_forward_auth(fa)?);
         }
     }
+    if let Some(ref m) = body.mirror {
+        if m.backend_ids.is_empty() {
+            route.mirror = None;
+        } else {
+            route.mirror = Some(build_mirror_config(m)?);
+        }
+    }
     route.updated_at = Utc::now();
 
     store.update_route(&route)?;
@@ -1161,6 +1251,79 @@ mod tests {
             built.response_headers,
             vec!["Remote-User".to_string(), "Remote-Groups".to_string()]
         );
+    }
+
+    // ---- Mirror validation ----
+
+    fn mirror_req(backends: Vec<&str>, pct: u8, timeout: u32) -> MirrorConfigRequest {
+        MirrorConfigRequest {
+            backend_ids: backends.into_iter().map(String::from).collect(),
+            sample_percent: pct,
+            timeout_ms: timeout,
+        }
+    }
+
+    #[test]
+    fn build_mirror_accepts_valid() {
+        let built = build_mirror_config(&mirror_req(vec!["b1", "b2"], 25, 3000)).unwrap();
+        assert_eq!(built.backend_ids, vec!["b1".to_string(), "b2".to_string()]);
+        assert_eq!(built.sample_percent, 25);
+        assert_eq!(built.timeout_ms, 3000);
+    }
+
+    #[test]
+    fn build_mirror_rejects_empty_backend_list() {
+        let err = build_mirror_config(&mirror_req(vec![], 100, 5000))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("must not be empty")));
+    }
+
+    #[test]
+    fn build_mirror_rejects_sample_over_100() {
+        let err = build_mirror_config(&mirror_req(vec!["b"], 101, 5000))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("0..=100")));
+    }
+
+    #[test]
+    fn build_mirror_rejects_zero_timeout() {
+        let err = build_mirror_config(&mirror_req(vec!["b"], 50, 0))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("> 0")));
+    }
+
+    #[test]
+    fn build_mirror_rejects_over_60s_timeout() {
+        let err = build_mirror_config(&mirror_req(vec!["b"], 50, 60_001))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("60000")));
+    }
+
+    #[test]
+    fn build_mirror_rejects_blank_backend_id() {
+        let err = build_mirror_config(&mirror_req(vec!["   "], 50, 5000))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("non-empty")));
+    }
+
+    #[test]
+    fn build_mirror_dedups_backend_ids() {
+        // Duplicate backend IDs would spawn two sub-requests to the same
+        // shadow per primary request, which is wasteful and skews any
+        // load/error metrics the operator is watching on the shadow.
+        let built = build_mirror_config(&mirror_req(vec!["b1", "b2", "b1"], 50, 5000)).unwrap();
+        assert_eq!(built.backend_ids, vec!["b1".to_string(), "b2".to_string()]);
+    }
+
+    #[test]
+    fn build_mirror_trims_backend_ids() {
+        let built = build_mirror_config(&mirror_req(vec!["  b1  "], 50, 5000)).unwrap();
+        assert_eq!(built.backend_ids, vec!["b1".to_string()]);
     }
 
     #[test]

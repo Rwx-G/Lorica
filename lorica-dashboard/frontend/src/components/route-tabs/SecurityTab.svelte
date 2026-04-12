@@ -2,15 +2,24 @@
   import type { RouteFormState } from '../../lib/route-form';
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
 
-  import type { SecurityHeaderPreset } from '../../lib/api';
+  import type { SecurityHeaderPreset, BackendResponse } from '../../lib/api';
 
   interface Props {
     form: RouteFormState;
     importedFields?: Set<string>;
     customPresets?: SecurityHeaderPreset[];
+    backends?: BackendResponse[];
   }
 
-  let { form = $bindable(), importedFields, customPresets = [] }: Props = $props();
+  let { form = $bindable(), importedFields, customPresets = [], backends = [] }: Props = $props();
+
+  function toggleMirrorBackend(id: string) {
+    if (form.mirror_backend_ids.includes(id)) {
+      form.mirror_backend_ids = form.mirror_backend_ids.filter((b) => b !== id);
+    } else {
+      form.mirror_backend_ids = [...form.mirror_backend_ids, id];
+    }
+  }
 
   function isModified(field: keyof RouteFormState): boolean {
     return ROUTE_DEFAULTS[field] !== form[field];
@@ -126,6 +135,59 @@
       <span class="hint">Comma-separated; copied from the auth response into the upstream request on 2xx only.</span>
     </div>
   </div>
+
+  <h3 class="subsection-title">Request mirroring (shadow testing)</h3>
+  <p class="subsection-hint">
+    Fire-and-forget shadow copies of every request to alternate backends.
+    Mirror responses are discarded. Shadow backends receive
+    <code>X-Lorica-Mirror: 1</code> so they can filter this traffic out of
+    their normal analytics. v1 mirrors headers + method + URL only, not
+    the request body.
+  </p>
+
+  <div class="form-group" class:modified={form.mirror_backend_ids.length > 0}>
+    <label>Shadow backends</label>
+    {#if backends.length === 0}
+      <p class="text-muted small">No backends available.</p>
+    {:else}
+      <div class="checkbox-list">
+        {#each backends as b (b.id)}
+          <label class="checkbox-item">
+            <input type="checkbox" checked={form.mirror_backend_ids.includes(b.id)} onchange={() => toggleMirrorBackend(b.id)} />
+            <span>{b.name ? `${b.name} (${b.address})` : b.address}</span>
+          </label>
+        {/each}
+      </div>
+    {/if}
+    <span class="hint">Leave empty to disable mirroring.</span>
+  </div>
+
+  <div class="form-row">
+    <div class="form-group" class:modified={form.mirror_sample_percent !== 100}>
+      <label for="mirror-sample">Sample percent</label>
+      <input
+        id="mirror-sample"
+        type="number"
+        min="0"
+        max="100"
+        bind:value={form.mirror_sample_percent}
+        disabled={form.mirror_backend_ids.length === 0}
+      />
+      <span class="hint">0..100. Sticky per X-Request-Id so retries of the same request stay in or out.</span>
+    </div>
+    <div class="form-group" class:modified={form.mirror_timeout_ms !== 5000}>
+      <label for="mirror-timeout">Timeout (ms)</label>
+      <input
+        id="mirror-timeout"
+        type="number"
+        min="1"
+        max="60000"
+        bind:value={form.mirror_timeout_ms}
+        disabled={form.mirror_backend_ids.length === 0}
+      />
+      <span class="hint">Slow mirrors are dropped silently; never impacts the primary request.</span>
+    </div>
+  </div>
 </div>
 
 <style>
@@ -157,6 +219,13 @@
     line-height: 1.4;
   }
   .form-group input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .checkbox-list { display: flex; flex-direction: column; gap: 0.25rem; max-height: 10rem; overflow-y: auto; }
+  .checkbox-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8125rem; cursor: pointer; padding: 0.25rem 0; }
+  .checkbox-item input[type="checkbox"] { accent-color: var(--color-primary); }
+  .text-muted { color: var(--color-text-muted); }
+  .small { font-size: 0.75rem; }
+  code { font-family: ui-monospace, monospace; font-size: 0.75rem; background: var(--color-bg-input); padding: 0.05rem 0.25rem; border-radius: 0.25rem; }
 
   .form-group select,
   .form-group input[type="number"],

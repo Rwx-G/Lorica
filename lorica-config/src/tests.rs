@@ -71,6 +71,7 @@ mod tests {
             header_rules: vec![],
             traffic_splits: vec![],
             forward_auth: None,
+            mirror: None,
             created_at: now,
             updated_at: now,
         }
@@ -1831,6 +1832,50 @@ cert_critical_days = 3
         store.update_route(&cleared).unwrap();
         let after = store.get_route(&route.id).unwrap().unwrap();
         assert!(after.forward_auth.is_none());
+    }
+
+    #[test]
+    fn test_mirror_roundtrip() {
+        // Schema V29: mirror stored as nullable JSON at column 59.
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.mirror = Some(MirrorConfig {
+            backend_ids: vec!["shadow-a".into(), "shadow-b".into()],
+            sample_percent: 10,
+            timeout_ms: 3_000,
+        });
+        store.create_route(&route).unwrap();
+
+        let via_get = store.get_route(&route.id).unwrap().unwrap();
+        let m = via_get.mirror.as_ref().unwrap();
+        assert_eq!(m.backend_ids, vec!["shadow-a".to_string(), "shadow-b".to_string()]);
+        assert_eq!(m.sample_percent, 10);
+        assert_eq!(m.timeout_ms, 3_000);
+
+        let via_list: Vec<_> = store
+            .list_routes()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.id == route.id)
+            .collect();
+        assert_eq!(via_list.len(), 1);
+        assert!(via_list[0].mirror.is_some());
+
+        // Clear via update.
+        let mut cleared = via_get.clone();
+        cleared.mirror = None;
+        store.update_route(&cleared).unwrap();
+        let after = store.get_route(&route.id).unwrap().unwrap();
+        assert!(after.mirror.is_none());
+    }
+
+    #[test]
+    fn test_mirror_default_none() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.mirror.is_none());
     }
 
     #[test]

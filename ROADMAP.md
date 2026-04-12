@@ -40,7 +40,7 @@ Major feature additions that close the gap with Traefik and Nginx.
 | Canary / traffic split | Done | Medium | Route X% traffic to backend group A, Y% to group B. Zero-risk deployments |
 | mTLS client verification | Planned | Medium | `ClientCertVerifier` trait support exists in rustls layer. Zero-trust, B2B |
 | Response body rewriting | Planned | Medium | Implement `response_body_filter()` hook. Nginx `sub_filter` equivalent |
-| Request mirroring | Planned | Medium | Duplicate traffic to secondary backend (fire-and-forget). Shadow testing |
+| Request mirroring | Done | Medium | Duplicate traffic to secondary backend (fire-and-forget). Shadow testing |
 | Cache Vary support | Done | Medium | Implement `cache_vary_filter()`. `VarianceBuilder` exists in `lorica-cache/src/variance.rs` |
 | Stale-while-revalidate | Planned | Low | `stale_writer` support exists in cache lock module. Serve stale while background refresh |
 | Cache predictor | Done | Medium | `lorica-cache/src/predictor.rs` exists. Learn which assets are cacheable |

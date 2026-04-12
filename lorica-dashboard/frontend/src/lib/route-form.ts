@@ -1,4 +1,4 @@
-import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest } from './api';
+import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest, MirrorConfigRequest } from './api';
 
 export interface PathRuleFormState {
   path: string;
@@ -87,6 +87,9 @@ export interface RouteFormState {
   forward_auth_address: string;        // empty = feature off
   forward_auth_timeout_ms: number;     // 5000 default
   forward_auth_response_headers: string; // CSV
+  mirror_backend_ids: string[];         // empty = feature off
+  mirror_sample_percent: number;        // 0..100
+  mirror_timeout_ms: number;            // 5000 default
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -149,6 +152,9 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   forward_auth_address: '',
   forward_auth_timeout_ms: 5000,
   forward_auth_response_headers: '',
+  mirror_backend_ids: [],
+  mirror_sample_percent: 100,
+  mirror_timeout_ms: 5000,
 };
 
 // Tab field mappings for dot indicators
@@ -186,6 +192,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   path_rules: ['path_rules'],
   header_rules: ['header_rules'],
   traffic_splits: ['traffic_splits'],
+  mirror: ['mirror_backend_ids', 'mirror_sample_percent', 'mirror_timeout_ms'],
 };
 
 function recordToText(rec: Record<string, string>): string {
@@ -295,6 +302,9 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     forward_auth_address: route.forward_auth?.address ?? '',
     forward_auth_timeout_ms: route.forward_auth?.timeout_ms ?? 5000,
     forward_auth_response_headers: (route.forward_auth?.response_headers ?? []).join(', '),
+    mirror_backend_ids: [...(route.mirror?.backend_ids ?? [])],
+    mirror_sample_percent: route.mirror?.sample_percent ?? 100,
+    mirror_timeout_ms: route.mirror?.timeout_ms ?? 5000,
   };
 }
 
@@ -310,6 +320,24 @@ function headerRuleFormToRequest(rules: HeaderRuleFormState[]): HeaderRuleReques
       value: r.value,
       backend_ids: [...r.backend_ids],
     }));
+}
+
+function mirrorFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): MirrorConfigRequest | undefined {
+  if (form.mirror_backend_ids.length === 0) {
+    // On update, empty backends is the dashboard's "disable" signal.
+    // On create, omit entirely so the row is inserted with NULL.
+    return isUpdate
+      ? { backend_ids: [], sample_percent: 0, timeout_ms: 0 }
+      : undefined;
+  }
+  return {
+    backend_ids: [...form.mirror_backend_ids],
+    sample_percent: form.mirror_sample_percent,
+    timeout_ms: form.mirror_timeout_ms,
+  };
 }
 
 function forwardAuthFormToRequest(
@@ -426,6 +454,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     header_rules: headerRuleFormToRequest(form.header_rules) ?? (isUpdate ? [] : undefined),
     traffic_splits: trafficSplitFormToRequest(form.traffic_splits) ?? (isUpdate ? [] : undefined),
     forward_auth: forwardAuthFormToRequest(form, isUpdate),
+    mirror: mirrorFormToRequest(form, isUpdate),
   };
 }
 
@@ -545,6 +574,17 @@ export function validateRouteForm(form: RouteFormState): string {
     const t = Number(form.forward_auth_timeout_ms);
     if (!Number.isInteger(t) || t < 1 || t > 60000) {
       return 'Forward auth timeout must be 1..60000 ms';
+    }
+  }
+  // Mirror sanity. Empty backend list = feature off (OK).
+  if (form.mirror_backend_ids.length > 0) {
+    const pct = Number(form.mirror_sample_percent);
+    if (!Number.isInteger(pct) || pct < 0 || pct > 100) {
+      return 'Mirror sample percent must be 0..100';
+    }
+    const mt = Number(form.mirror_timeout_ms);
+    if (!Number.isInteger(mt) || mt < 1 || mt > 60000) {
+      return 'Mirror timeout must be 1..60000 ms';
     }
   }
   return '';
