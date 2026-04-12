@@ -1249,9 +1249,7 @@ fn run_worker(
     // Load initial proxy configuration
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
-        if let Err(e) =
-            reload_proxy_config(&store, &proxy_config, Some(&connection_filter)).await
-        {
+        if let Err(e) = reload_proxy_config(&store, &proxy_config, Some(&connection_filter)).await {
             error!(error = %e, "worker failed to load proxy configuration");
             std::process::exit(1);
         }
@@ -1576,9 +1574,12 @@ fn run_worker(
 
             // IP blocklist: initial load + periodic refresh (every 6h)
             if waf_fwd_engine.ip_blocklist().is_enabled() {
-                match lorica_api::waf::fetch_and_load_blocklist(waf_fwd_engine.ip_blocklist()).await {
+                match lorica_api::waf::fetch_and_load_blocklist(waf_fwd_engine.ip_blocklist()).await
+                {
                     Ok(count) => tracing::info!(count, "worker: IP blocklist loaded at startup"),
-                    Err(e) => tracing::warn!(error = %e, "worker: IP blocklist initial load failed"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "worker: IP blocklist initial load failed")
+                    }
                 }
             }
             let blocklist_engine = Arc::clone(&waf_fwd_engine);
@@ -1682,12 +1683,16 @@ fn run_worker(
         }
     };
     // ACME challenge store backed by SQLite - workers can read challenges set by supervisor
-    lorica_proxy.acme_challenge_store = Some(
-        lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone()),
-    );
+    lorica_proxy.acme_challenge_store = Some(lorica_api::acme::AcmeChallengeStore::with_db_path(
+        db_path.clone(),
+    ));
 
     let pool_size = {
-        let backend_count = store.blocking_lock().list_backends().map(|b| b.len()).unwrap_or(0);
+        let backend_count = store
+            .blocking_lock()
+            .list_backends()
+            .map(|b| b.len())
+            .unwrap_or(0);
         lorica::proxy_wiring::compute_pool_size(backend_count)
     };
     info!(pool_size, "upstream keepalive pool size");
@@ -1699,8 +1704,9 @@ fn run_worker(
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
     // Install the TCP-level pre-filter. Held by Arc inside the listener, so
     // subsequent reloads take effect without rebuilding endpoints.
-    proxy_service
-        .set_connection_filter(connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>);
+    proxy_service.set_connection_filter(
+        connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>
+    );
 
     // Build the optional mTLS client-cert verifier from the union of
     // per-route CA bundles. This is done once here; rustls
@@ -1816,9 +1822,7 @@ fn run_single_process(cli: Cli) {
         let connection_filter =
             Arc::new(lorica::connection_filter::GlobalConnectionFilter::empty());
 
-        if let Err(e) =
-            reload_proxy_config(&store, &proxy_config, Some(&connection_filter)).await
-        {
+        if let Err(e) = reload_proxy_config(&store, &proxy_config, Some(&connection_filter)).await {
             error!(error = %e, "failed to load initial proxy configuration");
             std::process::exit(1);
         }
@@ -1862,7 +1866,8 @@ fn run_single_process(cli: Cli) {
             if let Ok(settings) = s.get_global_settings() {
                 if settings.ip_blocklist_enabled {
                     waf_engine.ip_blocklist().set_enabled(true);
-                    match lorica_api::waf::fetch_and_load_blocklist(waf_engine.ip_blocklist()).await {
+                    match lorica_api::waf::fetch_and_load_blocklist(waf_engine.ip_blocklist()).await
+                    {
                         Ok(count) => info!(count, "IP blocklist loaded at startup"),
                         Err(e) => warn!(error = %e, "IP blocklist initial load failed"),
                     }
@@ -1935,7 +1940,8 @@ fn run_single_process(cli: Cli) {
         lorica_bench::scheduler::start_scheduler(lt_scheduler_store, lt_scheduler_engine);
 
         // Create shared ACME challenge store backed by SQLite for cross-process access
-        let acme_challenge_store = lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone());
+        let acme_challenge_store =
+            lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone());
 
         // Start the HTTP proxy service
         let mut lorica_proxy = LoricaProxy::new(
@@ -1967,7 +1973,7 @@ fn run_single_process(cli: Cli) {
         });
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
         proxy_service.set_connection_filter(
-            connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>,
+            connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>
         );
         let mut tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
         tcp_opts.so_reuseport = Some(true);

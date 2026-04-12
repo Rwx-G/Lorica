@@ -379,7 +379,7 @@ impl ConfigStore {
                     provider_type TEXT NOT NULL,
                     config TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
-                );"
+                );",
             )?;
             if let Err(e) = self.conn.execute(
                 "ALTER TABLE certificates ADD COLUMN acme_dns_provider_id TEXT DEFAULT NULL",
@@ -464,10 +464,9 @@ impl ConfigStore {
         );
 
         // V29: request mirroring (shadow testing). JSON blob or NULL.
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN mirror TEXT DEFAULT NULL",
-            [],
-        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE routes ADD COLUMN mirror TEXT DEFAULT NULL", []);
 
         // V30: response body rewriting (Nginx sub_filter equivalent).
         // JSON blob or NULL (feature off by default).
@@ -478,10 +477,9 @@ impl ConfigStore {
 
         // V31: mTLS client verification (per-route CA + required flag +
         // org allowlist). JSON blob or NULL.
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN mtls TEXT DEFAULT NULL",
-            [],
-        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE routes ADD COLUMN mtls TEXT DEFAULT NULL", []);
 
         Ok(())
     }
@@ -593,14 +591,13 @@ impl ConfigStore {
             ),
             None => None,
         };
-        let response_rewrite_json = match &route.response_rewrite {
-            Some(rr) => Some(
-                serde_json::to_string(rr).map_err(|e| {
+        let response_rewrite_json =
+            match &route.response_rewrite {
+                Some(rr) => Some(serde_json::to_string(rr).map_err(|e| {
                     ConfigError::Validation(format!("invalid response_rewrite: {e}"))
-                })?,
-            ),
-            None => None,
-        };
+                })?),
+                None => None,
+            };
         let mtls_json = match &route.mtls {
             Some(m) => Some(
                 serde_json::to_string(m)
@@ -846,14 +843,13 @@ impl ConfigStore {
             ),
             None => None,
         };
-        let response_rewrite_json = match &route.response_rewrite {
-            Some(rr) => Some(
-                serde_json::to_string(rr).map_err(|e| {
+        let response_rewrite_json =
+            match &route.response_rewrite {
+                Some(rr) => Some(serde_json::to_string(rr).map_err(|e| {
                     ConfigError::Validation(format!("invalid response_rewrite: {e}"))
-                })?,
-            ),
-            None => None,
-        };
+                })?),
+                None => None,
+            };
         let mtls_json = match &route.mtls {
             Some(m) => Some(
                 serde_json::to_string(m)
@@ -1451,7 +1447,10 @@ impl ConfigStore {
             ],
         )?;
         if changed == 0 {
-            return Err(ConfigError::NotFound(format!("dns_provider {}", provider.id)));
+            return Err(ConfigError::NotFound(format!(
+                "dns_provider {}",
+                provider.id
+            )));
         }
         Ok(())
     }
@@ -1740,28 +1739,19 @@ impl ConfigStore {
                     settings.sla_purge_schedule = value;
                 }
                 "trusted_proxies" => {
-                    settings.trusted_proxies =
-                        serde_json::from_str(&value).map_err(|e| {
-                            ConfigError::Validation(format!(
-                                "invalid trusted_proxies JSON: {e}"
-                            ))
-                        })?;
+                    settings.trusted_proxies = serde_json::from_str(&value).map_err(|e| {
+                        ConfigError::Validation(format!("invalid trusted_proxies JSON: {e}"))
+                    })?;
                 }
                 "waf_whitelist_ips" => {
-                    settings.waf_whitelist_ips =
-                        serde_json::from_str(&value).map_err(|e| {
-                            ConfigError::Validation(format!(
-                                "invalid waf_whitelist_ips JSON: {e}"
-                            ))
-                        })?;
+                    settings.waf_whitelist_ips = serde_json::from_str(&value).map_err(|e| {
+                        ConfigError::Validation(format!("invalid waf_whitelist_ips JSON: {e}"))
+                    })?;
                 }
                 "connection_deny_cidrs" => {
-                    settings.connection_deny_cidrs =
-                        serde_json::from_str(&value).map_err(|e| {
-                            ConfigError::Validation(format!(
-                                "invalid connection_deny_cidrs JSON: {e}"
-                            ))
-                        })?;
+                    settings.connection_deny_cidrs = serde_json::from_str(&value).map_err(|e| {
+                        ConfigError::Validation(format!("invalid connection_deny_cidrs JSON: {e}"))
+                    })?;
                 }
                 "connection_allow_cidrs" => {
                     settings.connection_allow_cidrs =
@@ -1861,19 +1851,15 @@ impl ConfigStore {
         )?;
         let connection_deny_json =
             serde_json::to_string(&settings.connection_deny_cidrs).map_err(|e| {
-                ConfigError::Validation(format!(
-                    "failed to serialize connection_deny_cidrs: {e}"
-                ))
+                ConfigError::Validation(format!("failed to serialize connection_deny_cidrs: {e}"))
             })?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('connection_deny_cidrs', ?1)",
             params![connection_deny_json],
         )?;
-        let connection_allow_json =
-            serde_json::to_string(&settings.connection_allow_cidrs).map_err(|e| {
-                ConfigError::Validation(format!(
-                    "failed to serialize connection_allow_cidrs: {e}"
-                ))
+        let connection_allow_json = serde_json::to_string(&settings.connection_allow_cidrs)
+            .map_err(|e| {
+                ConfigError::Validation(format!("failed to serialize connection_allow_cidrs: {e}"))
             })?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('connection_allow_cidrs', ?1)",
@@ -3009,21 +2995,29 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         stale_while_revalidate_s: row.get::<_, i32>(50).unwrap_or(10),
         stale_if_error_s: row.get::<_, i32>(51).unwrap_or(60),
         retry_on_methods: {
-            let json: String = row.get::<_, String>(52).unwrap_or_else(|_| "[]".to_string());
+            let json: String = row
+                .get::<_, String>(52)
+                .unwrap_or_else(|_| "[]".to_string());
             serde_json::from_str(&json).unwrap_or_default()
         },
         maintenance_mode: row.get::<_, bool>(53).unwrap_or(false),
         error_page_html: row.get::<_, Option<String>>(54).unwrap_or(None),
         cache_vary_headers: {
-            let json: String = row.get::<_, String>(55).unwrap_or_else(|_| "[]".to_string());
+            let json: String = row
+                .get::<_, String>(55)
+                .unwrap_or_else(|_| "[]".to_string());
             serde_json::from_str(&json).unwrap_or_default()
         },
         header_rules: {
-            let json: String = row.get::<_, String>(56).unwrap_or_else(|_| "[]".to_string());
+            let json: String = row
+                .get::<_, String>(56)
+                .unwrap_or_else(|_| "[]".to_string());
             serde_json::from_str(&json).unwrap_or_default()
         },
         traffic_splits: {
-            let json: String = row.get::<_, String>(57).unwrap_or_else(|_| "[]".to_string());
+            let json: String = row
+                .get::<_, String>(57)
+                .unwrap_or_else(|_| "[]".to_string());
             serde_json::from_str(&json).unwrap_or_default()
         },
         forward_auth: {

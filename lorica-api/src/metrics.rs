@@ -287,6 +287,7 @@ pub fn inc_canary_split_selected(route_id: &str, split_name: &str) {
 ///   was exhausted (shadow fleet overloaded)
 /// - `"dropped_oversize_body"`: dropped because request body
 ///   exceeded `max_body_bytes`
+///
 /// Labels: `route_id`, `outcome`.
 static MIRROR_OUTCOME_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let counter = IntCounterVec::new(

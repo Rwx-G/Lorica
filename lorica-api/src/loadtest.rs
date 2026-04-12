@@ -61,10 +61,7 @@ pub struct CreateLoadTestConfig {
 
 /// Validate that the load test target URL points to a configured route.
 /// This prevents using the load test engine to attack external hosts.
-fn validate_target_url(
-    url: &str,
-    store: &lorica_config::ConfigStore,
-) -> Result<(), ApiError> {
+fn validate_target_url(url: &str, store: &lorica_config::ConfigStore) -> Result<(), ApiError> {
     let without_scheme = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))

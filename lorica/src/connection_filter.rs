@@ -185,10 +185,7 @@ mod tests {
 
     #[test]
     fn allow_nonempty_is_default_deny() {
-        let p = ConnectionFilterPolicy::from_cidrs(
-            &["192.168.0.0/16".to_string()],
-            &[],
-        );
+        let p = ConnectionFilterPolicy::from_cidrs(&["192.168.0.0/16".to_string()], &[]);
         assert!(p.accepts(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
         assert!(!p.accepts(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
     }
@@ -206,13 +203,8 @@ mod tests {
 
     #[test]
     fn ipv6_cidrs() {
-        let p = ConnectionFilterPolicy::from_cidrs(
-            &[],
-            &["2001:db8::/32".to_string()],
-        );
-        assert!(!p.accepts(
-            "2001:db8::1".parse().unwrap()
-        ));
+        let p = ConnectionFilterPolicy::from_cidrs(&[], &["2001:db8::/32".to_string()]);
+        assert!(!p.accepts("2001:db8::1".parse().unwrap()));
         assert!(p.accepts("2001:db9::1".parse().unwrap()));
     }
 
@@ -231,9 +223,10 @@ mod tests {
 
     #[tokio::test]
     async fn filter_accepts_missing_addr() {
-        let f = GlobalConnectionFilter::new(
-            ConnectionFilterPolicy::from_cidrs(&[], &["0.0.0.0/0".to_string()]),
-        );
+        let f = GlobalConnectionFilter::new(ConnectionFilterPolicy::from_cidrs(
+            &[],
+            &["0.0.0.0/0".to_string()],
+        ));
         // Missing peer addr (e.g. Unix socket accept): be permissive since
         // the deny policy cannot be evaluated against an IP.
         assert!(f.should_accept(None).await);

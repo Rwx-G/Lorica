@@ -50,10 +50,7 @@ pub fn extract_ocsp_responder_url(cert_pem: &str) -> Option<String> {
 /// Builds a minimal OCSP request containing the certificate serial number,
 /// issuer name hash and issuer key hash, then POSTs it to the responder.
 /// Returns the raw OCSP response bytes on success.
-pub async fn fetch_ocsp_response(
-    cert_pem: &str,
-    responder_url: &str,
-) -> Result<Vec<u8>, String> {
+pub async fn fetch_ocsp_response(cert_pem: &str, responder_url: &str) -> Result<Vec<u8>, String> {
     use x509_parser::pem::parse_x509_pem;
 
     // Parse end-entity cert
@@ -64,8 +61,7 @@ pub async fn fetch_ocsp_response(
 
     // Parse issuer cert (second cert in chain)
     let issuer_der = if !rem.is_empty() {
-        let (_, pem_issuer) =
-            parse_x509_pem(rem).map_err(|e| format!("parse issuer PEM: {e}"))?;
+        let (_, pem_issuer) = parse_x509_pem(rem).map_err(|e| format!("parse issuer PEM: {e}"))?;
         pem_issuer.contents
     } else {
         return Err("no issuer certificate in chain - cannot build OCSP request".to_string());
@@ -77,22 +73,16 @@ pub async fn fetch_ocsp_response(
     // Build OCSP request (minimal: SHA-1 hash of issuer name + key + serial)
     use ring::digest;
 
-    let issuer_name_hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, ee_cert.issuer().as_raw());
+    let issuer_name_hash =
+        digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, ee_cert.issuer().as_raw());
     let issuer_key_hash = digest::digest(
         &digest::SHA1_FOR_LEGACY_USE_ONLY,
-        issuer_cert
-            .public_key()
-            .subject_public_key
-            .as_ref(),
+        issuer_cert.public_key().subject_public_key.as_ref(),
     );
     let serial = ee_cert.raw_serial();
 
     // ASN.1 DER encode the OCSP request manually (RFC 6960)
-    let cert_id = build_cert_id(
-        issuer_name_hash.as_ref(),
-        issuer_key_hash.as_ref(),
-        serial,
-    );
+    let cert_id = build_cert_id(issuer_name_hash.as_ref(), issuer_key_hash.as_ref(), serial);
     let ocsp_request = build_ocsp_request(&cert_id);
 
     // POST to OCSP responder
@@ -174,7 +164,10 @@ pub async fn try_fetch_ocsp(cert_pem: &str) -> Option<Vec<u8>> {
 fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     let len = content.len();
-    debug_assert!(len <= 0xFFFF, "DER TLV content exceeds 2-byte length encoding");
+    debug_assert!(
+        len <= 0xFFFF,
+        "DER TLV content exceeds 2-byte length encoding"
+    );
     if len < 128 {
         out.push(len as u8);
     } else if len < 256 {

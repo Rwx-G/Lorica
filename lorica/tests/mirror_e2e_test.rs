@@ -81,10 +81,7 @@ async fn spawn_counting_origin(id: &'static str) -> (SocketAddr, Arc<OriginStats
                         Ok(0) => return,
                         Ok(n) => {
                             buf.extend_from_slice(&tmp[..n]);
-                            if let Some(pos) = buf
-                                .windows(4)
-                                .position(|w| w == b"\r\n\r\n")
-                            {
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                                 header_end = pos + 4;
                                 break;
                             }
@@ -98,10 +95,7 @@ async fn spawn_counting_origin(id: &'static str) -> (SocketAddr, Arc<OriginStats
                 let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
                 let mut content_length: usize = 0;
                 for line in header_text.lines() {
-                    if let Some(v) = line
-                        .to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                    {
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                         content_length = v.trim().parse().unwrap_or(0);
                     }
                 }
@@ -119,7 +113,9 @@ async fn spawn_counting_origin(id: &'static str) -> (SocketAddr, Arc<OriginStats
                 let _ = already_body;
 
                 stats.total.fetch_add(1, Ordering::SeqCst);
-                stats.body_bytes.fetch_add(body_buf.len() as u64, Ordering::SeqCst);
+                stats
+                    .body_bytes
+                    .fetch_add(body_buf.len() as u64, Ordering::SeqCst);
                 {
                     let mut lb = stats.last_body.lock().unwrap();
                     *lb = body_buf.clone();
@@ -735,7 +731,10 @@ async fn mirror_max_body_bytes_zero_is_headers_only() {
         0,
         "max_body_bytes=0 -> shadow receives zero body bytes"
     );
-    assert_eq!(primary_stats.body_bytes.load(Ordering::SeqCst), payload.len() as u64);
+    assert_eq!(
+        primary_stats.body_bytes.load(Ordering::SeqCst),
+        payload.len() as u64
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

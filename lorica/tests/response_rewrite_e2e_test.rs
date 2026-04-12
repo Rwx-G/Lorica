@@ -446,7 +446,10 @@ async fn rewrite_skips_non_text_content_type() {
         static_response("image/png", b"\x89PNG\r\n\x1a\nsecret-bytes-inside")
     }))
     .await;
-    let route = test_route(Some(simple_cfg(vec![literal("secret-bytes-inside", "[R]")])));
+    let route = test_route(Some(simple_cfg(vec![literal(
+        "secret-bytes-inside",
+        "[R]",
+    )])));
     let backends = vec![test_backend("b1", origin)];
     let links = vec![("r-rw".into(), "b1".into())];
     let config = ProxyConfig::from_store(
@@ -627,7 +630,13 @@ async fn rewrite_skipped_for_head_requests_preserves_content_length() {
     // HEAD just because the route has a rewrite config, clients
     // sizing range requests off HEAD responses would break.
     let origin = spawn_scripted_origin(Arc::new(|req| {
-        let method = req.lines().next().unwrap_or("").split_whitespace().next().unwrap_or("GET");
+        let method = req
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .next()
+            .unwrap_or("GET");
         if method == "HEAD" {
             // HEAD: headers only, no body (origin server-side we
             // send empty body + matching Content-Length).
@@ -664,7 +673,9 @@ async fn rewrite_skipped_for_head_requests_preserves_content_length() {
     let resp = client.head(&harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("content-length").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok()),
         Some("42"),
         "HEAD response must preserve Content-Length even on rewrite-enabled routes"
     );

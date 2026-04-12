@@ -446,10 +446,9 @@ fn route_to_response(
                 // export, regex-crate version drift on upgrade) so
                 // the dashboard can show a red badge and the operator
                 // can republish the rule.
-                let disabled = matches!(
-                    hr.match_type,
-                    lorica_config::models::HeaderMatchType::Regex
-                ) && regex::Regex::new(&hr.value).is_err();
+                let disabled =
+                    matches!(hr.match_type, lorica_config::models::HeaderMatchType::Regex)
+                        && regex::Regex::new(&hr.value).is_err();
                 HeaderRuleRequest {
                     header_name: hr.header_name.clone(),
                     match_type: Some(hr.match_type.as_str().to_string()),
@@ -483,8 +482,10 @@ fn route_to_response(
             timeout_ms: m.timeout_ms,
             max_body_bytes: m.max_body_bytes,
         }),
-        response_rewrite: route.response_rewrite.as_ref().map(|rr| {
-            ResponseRewriteConfigRequest {
+        response_rewrite: route
+            .response_rewrite
+            .as_ref()
+            .map(|rr| ResponseRewriteConfigRequest {
                 rules: rr
                     .rules
                     .iter()
@@ -497,8 +498,7 @@ fn route_to_response(
                     .collect(),
                 max_body_bytes: rr.max_body_bytes,
                 content_type_prefixes: rr.content_type_prefixes.clone(),
-            }
-        }),
+            }),
         mtls: route.mtls.as_ref().map(|m| MtlsConfigRequest {
             ca_cert_pem: m.ca_cert_pem.clone(),
             required: m.required,
@@ -549,9 +549,7 @@ fn build_response_rewrite(
         if rule.is_regex {
             // Pre-compile: catches "(unclosed" before a reload.
             regex::Regex::new(&rule.pattern).map_err(|e| {
-                ApiError::BadRequest(format!(
-                    "response_rewrite.rules[{i}]: invalid regex: {e}"
-                ))
+                ApiError::BadRequest(format!("response_rewrite.rules[{i}]: invalid regex: {e}"))
             })?;
         }
         if let Some(n) = rule.max_replacements {
@@ -609,9 +607,8 @@ fn build_mtls_config(
     // Parse once to catch malformed PEM before a reload. We also
     // require at least one CERTIFICATE block; keys or other labels
     // alone are not a CA bundle.
-    let parsed = pem::parse_many(pem_text.as_bytes()).map_err(|e| {
-        ApiError::BadRequest(format!("mtls.ca_cert_pem could not be parsed: {e}"))
-    })?;
+    let parsed = pem::parse_many(pem_text.as_bytes())
+        .map_err(|e| ApiError::BadRequest(format!("mtls.ca_cert_pem could not be parsed: {e}")))?;
     let mut cert_count = 0usize;
     for block in &parsed {
         if block.tag() == "CERTIFICATE" {
@@ -671,9 +668,7 @@ fn build_mirror_config(
         )));
     }
     if body.timeout_ms == 0 {
-        return Err(ApiError::BadRequest(
-            "mirror.timeout_ms must be > 0".into(),
-        ));
+        return Err(ApiError::BadRequest("mirror.timeout_ms must be > 0".into()));
     }
     if body.timeout_ms > 60_000 {
         return Err(ApiError::BadRequest(
@@ -859,7 +854,9 @@ fn build_header_rule(
 ) -> Result<lorica_config::models::HeaderRule, ApiError> {
     let header_name = body.header_name.trim();
     if header_name.is_empty() {
-        return Err(ApiError::BadRequest("header_rules: header_name must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "header_rules: header_name must not be empty".into(),
+        ));
     }
     let match_type: lorica_config::models::HeaderMatchType = body
         .match_type
@@ -1135,7 +1132,11 @@ pub async fn update_route(
         route.force_https = force_https;
     }
     if let Some(redirect_hostname) = body.redirect_hostname {
-        route.redirect_hostname = if redirect_hostname.is_empty() { None } else { Some(redirect_hostname) };
+        route.redirect_hostname = if redirect_hostname.is_empty() {
+            None
+        } else {
+            Some(redirect_hostname)
+        };
     }
     if let Some(redirect_to) = body.redirect_to {
         if redirect_to.is_empty() {
@@ -1166,10 +1167,18 @@ pub async fn update_route(
         route.send_timeout_s = send_timeout_s;
     }
     if let Some(strip_path_prefix) = body.strip_path_prefix {
-        route.strip_path_prefix = if strip_path_prefix.is_empty() { None } else { Some(strip_path_prefix) };
+        route.strip_path_prefix = if strip_path_prefix.is_empty() {
+            None
+        } else {
+            Some(strip_path_prefix)
+        };
     }
     if let Some(add_path_prefix) = body.add_path_prefix {
-        route.add_path_prefix = if add_path_prefix.is_empty() { None } else { Some(add_path_prefix) };
+        route.add_path_prefix = if add_path_prefix.is_empty() {
+            None
+        } else {
+            Some(add_path_prefix)
+        };
     }
     if let Some(ref pattern) = body.path_rewrite_pattern {
         if pattern.is_empty() {
@@ -1203,16 +1212,28 @@ pub async fn update_route(
         route.response_headers_remove = response_headers_remove;
     }
     if let Some(max_request_body_bytes) = body.max_request_body_bytes {
-        route.max_request_body_bytes = if max_request_body_bytes == 0 { None } else { Some(max_request_body_bytes) };
+        route.max_request_body_bytes = if max_request_body_bytes == 0 {
+            None
+        } else {
+            Some(max_request_body_bytes)
+        };
     }
     if let Some(websocket_enabled) = body.websocket_enabled {
         route.websocket_enabled = websocket_enabled;
     }
     if let Some(rate_limit_rps) = body.rate_limit_rps {
-        route.rate_limit_rps = if rate_limit_rps == 0 { None } else { Some(rate_limit_rps) };
+        route.rate_limit_rps = if rate_limit_rps == 0 {
+            None
+        } else {
+            Some(rate_limit_rps)
+        };
     }
     if let Some(rate_limit_burst) = body.rate_limit_burst {
-        route.rate_limit_burst = if rate_limit_burst == 0 { None } else { Some(rate_limit_burst) };
+        route.rate_limit_burst = if rate_limit_burst == 0 {
+            None
+        } else {
+            Some(rate_limit_burst)
+        };
     }
     if let Some(ip_allowlist) = body.ip_allowlist {
         route.ip_allowlist = ip_allowlist;
@@ -1227,13 +1248,21 @@ pub async fn update_route(
         route.cors_allowed_methods = cors_allowed_methods;
     }
     if let Some(cors_max_age_s) = body.cors_max_age_s {
-        route.cors_max_age_s = if cors_max_age_s == 0 { None } else { Some(cors_max_age_s) };
+        route.cors_max_age_s = if cors_max_age_s == 0 {
+            None
+        } else {
+            Some(cors_max_age_s)
+        };
     }
     if let Some(compression_enabled) = body.compression_enabled {
         route.compression_enabled = compression_enabled;
     }
     if let Some(retry_attempts) = body.retry_attempts {
-        route.retry_attempts = if retry_attempts == 0 { None } else { Some(retry_attempts) };
+        route.retry_attempts = if retry_attempts == 0 {
+            None
+        } else {
+            Some(retry_attempts)
+        };
     }
     if let Some(cache_enabled) = body.cache_enabled {
         route.cache_enabled = cache_enabled;
@@ -1245,13 +1274,21 @@ pub async fn update_route(
         route.cache_max_bytes = cache_max_bytes;
     }
     if let Some(max_connections) = body.max_connections {
-        route.max_connections = if max_connections == 0 { None } else { Some(max_connections) };
+        route.max_connections = if max_connections == 0 {
+            None
+        } else {
+            Some(max_connections)
+        };
     }
     if let Some(slowloris_threshold_ms) = body.slowloris_threshold_ms {
         route.slowloris_threshold_ms = slowloris_threshold_ms;
     }
     if let Some(auto_ban_threshold) = body.auto_ban_threshold {
-        route.auto_ban_threshold = if auto_ban_threshold == 0 { None } else { Some(auto_ban_threshold) };
+        route.auto_ban_threshold = if auto_ban_threshold == 0 {
+            None
+        } else {
+            Some(auto_ban_threshold)
+        };
     }
     if let Some(auto_ban_duration_s) = body.auto_ban_duration_s {
         route.auto_ban_duration_s = auto_ban_duration_s;
@@ -1288,13 +1325,21 @@ pub async fn update_route(
         route.path_rules = rules;
     }
     if let Some(return_status) = body.return_status {
-        route.return_status = if return_status == 0 { None } else { Some(return_status) };
+        route.return_status = if return_status == 0 {
+            None
+        } else {
+            Some(return_status)
+        };
     }
     if let Some(sticky) = body.sticky_session {
         route.sticky_session = sticky;
     }
     if let Some(ref username) = body.basic_auth_username {
-        route.basic_auth_username = if username.is_empty() { None } else { Some(username.clone()) };
+        route.basic_auth_username = if username.is_empty() {
+            None
+        } else {
+            Some(username.clone())
+        };
     }
     if let Some(ref password) = body.basic_auth_password {
         route.basic_auth_password_hash = if password.is_empty() {
@@ -1316,7 +1361,11 @@ pub async fn update_route(
         route.maintenance_mode = maintenance;
     }
     if let Some(ref html) = body.error_page_html {
-        route.error_page_html = if html.is_empty() { None } else { Some(html.clone()) };
+        route.error_page_html = if html.is_empty() {
+            None
+        } else {
+            Some(html.clone())
+        };
     }
     if let Some(ref headers) = body.cache_vary_headers {
         // Normalise on write: trim whitespace, drop empties. Downstream
@@ -1515,7 +1564,9 @@ pub async fn validate_forward_auth(
 
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_millis(cfg.timeout_ms.min(5_000) as u64))
+        .connect_timeout(std::time::Duration::from_millis(
+            cfg.timeout_ms.min(5_000) as u64
+        ))
         .build()
         .map_err(|e| ApiError::Internal(format!("reqwest build: {e}")))?;
     let start = std::time::Instant::now();
@@ -1528,7 +1579,13 @@ pub async fn validate_forward_auth(
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let status = resp.status().as_u16();
     let mut headers = std::collections::HashMap::new();
-    for name in ["location", "remote-user", "remote-groups", "remote-email", "content-type"] {
+    for name in [
+        "location",
+        "remote-user",
+        "remote-groups",
+        "remote-email",
+        "content-type",
+    ] {
         if let Some(v) = resp.headers().get(name) {
             if let Ok(s) = v.to_str() {
                 headers.insert(name.to_string(), s.to_string());
@@ -1558,7 +1615,7 @@ mod tests {
     #[test]
     fn build_traffic_split_rejects_weight_over_100() {
         let req = split("bad", 150, &["b"]);
-        let err = build_traffic_split(&req).err().expect("should reject");
+        let err = build_traffic_split(&req).expect_err("should reject");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("must be 0..=100")));
     }
 
@@ -1568,7 +1625,7 @@ mod tests {
         // operator typo; surface as 400 instead of silently swallowing
         // traffic on reload.
         let req = split("typo", 5, &[]);
-        let err = build_traffic_split(&req).err().expect("should reject");
+        let err = build_traffic_split(&req).expect_err("should reject");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("at least one backend")));
     }
 
@@ -1593,7 +1650,7 @@ mod tests {
             build_traffic_split(&split("a", 60, &["x"])).unwrap(),
             build_traffic_split(&split("b", 50, &["y"])).unwrap(),
         ];
-        let err = validate_traffic_splits(&splits).err().expect("should reject");
+        let err = validate_traffic_splits(&splits).expect_err("should reject");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("<= 100")));
     }
 
@@ -1613,7 +1670,11 @@ mod tests {
 
     // ---- Forward auth validation ----
 
-    fn fa_req(address: &str, timeout_ms: u32, response_headers: Vec<&str>) -> ForwardAuthConfigRequest {
+    fn fa_req(
+        address: &str,
+        timeout_ms: u32,
+        response_headers: Vec<&str>,
+    ) -> ForwardAuthConfigRequest {
         ForwardAuthConfigRequest {
             address: address.into(),
             timeout_ms,
@@ -1651,12 +1712,9 @@ mod tests {
 
     #[test]
     fn build_forward_auth_accepts_https_url() {
-        assert!(build_forward_auth(&fa_req(
-            "https://auth.example.com/v1/verify",
-            500,
-            vec![],
-        ))
-        .is_ok());
+        assert!(
+            build_forward_auth(&fa_req("https://auth.example.com/v1/verify", 500, vec![],)).is_ok()
+        );
     }
 
     #[test]
@@ -1667,7 +1725,9 @@ mod tests {
 
     #[test]
     fn build_forward_auth_rejects_non_absolute_url() {
-        let err = build_forward_auth(&fa_req("/verify", 1000, vec![])).err().unwrap();
+        let err = build_forward_auth(&fa_req("/verify", 1000, vec![]))
+            .err()
+            .unwrap();
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
@@ -1683,7 +1743,9 @@ mod tests {
 
     #[test]
     fn build_forward_auth_rejects_zero_timeout() {
-        let err = build_forward_auth(&fa_req("http://a/", 0, vec![])).err().unwrap();
+        let err = build_forward_auth(&fa_req("http://a/", 0, vec![]))
+            .err()
+            .unwrap();
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("> 0")));
     }
 
@@ -1857,7 +1919,9 @@ mod tests {
     fn build_response_rewrite_rejects_empty_pattern() {
         let cfg = rr_cfg(vec![rr_rule("", "x", false)]);
         let err = build_response_rewrite(&cfg).err().unwrap();
-        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("pattern must not be empty")));
+        assert!(
+            matches!(err, ApiError::BadRequest(ref m) if m.contains("pattern must not be empty"))
+        );
     }
 
     #[test]
@@ -1881,9 +1945,13 @@ mod tests {
     #[test]
     fn build_response_rewrite_trims_and_drops_blank_content_types() {
         let mut cfg = rr_cfg(vec![rr_rule("a", "b", false)]);
-        cfg.content_type_prefixes = vec!["  text/  ".into(), "   ".into(), "application/json".into()];
+        cfg.content_type_prefixes =
+            vec!["  text/  ".into(), "   ".into(), "application/json".into()];
         let built = build_response_rewrite(&cfg).unwrap();
-        assert_eq!(built.content_type_prefixes, vec!["text/".to_string(), "application/json".to_string()]);
+        assert_eq!(
+            built.content_type_prefixes,
+            vec!["text/".to_string(), "application/json".to_string()]
+        );
     }
 
     #[test]
@@ -1898,25 +1966,22 @@ mod tests {
 
     #[test]
     fn build_forward_auth_trims_address() {
-        let built = build_forward_auth(&fa_req("  http://a/verify  ", 1000, vec![]))
-            .unwrap();
+        let built = build_forward_auth(&fa_req("  http://a/verify  ", 1000, vec![])).unwrap();
         assert_eq!(built.address, "http://a/verify");
     }
 
     #[test]
     fn build_forward_auth_accepts_verdict_cache_within_cap() {
         let built =
-            build_forward_auth(&fa_req_with_cache("https://a/v", 1000, vec![], 30_000))
-                .unwrap();
+            build_forward_auth(&fa_req_with_cache("https://a/v", 1000, vec![], 30_000)).unwrap();
         assert_eq!(built.verdict_cache_ttl_ms, 30_000);
     }
 
     #[test]
     fn build_forward_auth_rejects_verdict_cache_over_cap() {
-        let err =
-            build_forward_auth(&fa_req_with_cache("https://a/v", 1000, vec![], 60_001))
-                .err()
-                .unwrap();
+        let err = build_forward_auth(&fa_req_with_cache("https://a/v", 1000, vec![], 60_001))
+            .err()
+            .unwrap();
         assert!(
             matches!(err, ApiError::BadRequest(ref m) if m.contains("60s") || m.contains("60000")),
             "expected 60s cap message, got: {err:?}"
@@ -1937,8 +2002,7 @@ mod tests {
         // tracing subscriber, so this test documents the acceptance
         // path; the warn-on-non-loopback path is covered in e2e.
         let built =
-            build_forward_auth(&fa_req("http://127.0.0.1:9091/verify", 1000, vec![]))
-                .unwrap();
+            build_forward_auth(&fa_req("http://127.0.0.1:9091/verify", 1000, vec![])).unwrap();
         assert_eq!(built.address, "http://127.0.0.1:9091/verify");
     }
 
@@ -1972,13 +2036,15 @@ mod tests {
         let pem = gen_ca_pem();
         let built = build_mtls_config(&mtls_req(&pem, true, vec!["Acme"])).unwrap();
         assert!(built.ca_cert_pem.contains("BEGIN CERTIFICATE"));
-        assert_eq!(built.required, true);
+        assert!(built.required);
         assert_eq!(built.allowed_organizations, vec!["Acme".to_string()]);
     }
 
     #[test]
     fn build_mtls_rejects_empty_pem() {
-        let err = build_mtls_config(&mtls_req("", false, vec![])).err().unwrap();
+        let err = build_mtls_config(&mtls_req("", false, vec![]))
+            .err()
+            .unwrap();
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
@@ -2016,9 +2082,7 @@ mod tests {
         // random junk between BEGIN/END markers.
         use base64::Engine as _;
         let junk = base64::engine::general_purpose::STANDARD.encode(b"not-x509-der-bytes");
-        let pem = format!(
-            "-----BEGIN CERTIFICATE-----\n{junk}\n-----END CERTIFICATE-----\n"
-        );
+        let pem = format!("-----BEGIN CERTIFICATE-----\n{junk}\n-----END CERTIFICATE-----\n");
         let err = build_mtls_config(&mtls_req(&pem, false, vec![]))
             .err()
             .unwrap();
@@ -2032,7 +2096,10 @@ mod tests {
         let single = gen_ca_pem();
         let copies = (1_048_577 / single.len()) + 1;
         let pem = single.repeat(copies);
-        assert!(pem.trim().len() > 1_048_576, "test did not actually exceed cap");
+        assert!(
+            pem.trim().len() > 1_048_576,
+            "test did not actually exceed cap"
+        );
         let err = build_mtls_config(&mtls_req(&pem, false, vec![]))
             .err()
             .unwrap();
@@ -2042,12 +2109,8 @@ mod tests {
     #[test]
     fn build_mtls_dedup_and_trims_organizations() {
         let pem = gen_ca_pem();
-        let built = build_mtls_config(&mtls_req(
-            &pem,
-            false,
-            vec!["  Acme  ", "Beta", "Acme"],
-        ))
-        .unwrap();
+        let built =
+            build_mtls_config(&mtls_req(&pem, false, vec!["  Acme  ", "Beta", "Acme"])).unwrap();
         assert_eq!(
             built.allowed_organizations,
             vec!["Acme".to_string(), "Beta".to_string()]

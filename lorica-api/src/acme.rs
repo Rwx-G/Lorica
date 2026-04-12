@@ -86,11 +86,17 @@ impl AcmeChallengeStore {
                     "INSERT OR REPLACE INTO acme_challenges (token, key_auth) VALUES (?1, ?2)",
                     rusqlite::params![token, key_authorization],
                 ) {
-                    Ok(_) => tracing::info!(token = %token, db = %self.db_path.display(), "ACME challenge persisted to SQLite"),
-                    Err(e) => tracing::warn!(token = %token, error = %e, "failed to persist ACME challenge to SQLite"),
+                    Ok(_) => {
+                        tracing::info!(token = %token, db = %self.db_path.display(), "ACME challenge persisted to SQLite")
+                    }
+                    Err(e) => {
+                        tracing::warn!(token = %token, error = %e, "failed to persist ACME challenge to SQLite")
+                    }
                 }
             }
-            Err(e) => tracing::warn!(error = %e, db = %self.db_path.display(), "failed to open SQLite for ACME challenge"),
+            Err(e) => {
+                tracing::warn!(error = %e, db = %self.db_path.display(), "failed to open SQLite for ACME challenge")
+            }
         }
     }
 
@@ -258,7 +264,10 @@ pub async fn provision_certificate(
                 status: "provisioned".into(),
                 domain: primary_domain,
                 staging: config.staging,
-                message: format!("Certificate provisioned for {} domain(s) (id: {cert_id})", domains.len()),
+                message: format!(
+                    "Certificate provisioned for {} domain(s) (id: {cert_id})",
+                    domains.len()
+                ),
             }))
         }
         Err(e) => {
@@ -316,10 +325,7 @@ async fn provision_with_acme(
     .await?;
 
     // Create order with all domains as identifiers
-    let identifiers: Vec<Identifier> = domains
-        .iter()
-        .map(|d| Identifier::Dns(d.clone()))
-        .collect();
+    let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
     let mut order = account
         .new_order(&NewOrder {
             identifiers: &identifiers,
@@ -594,10 +600,7 @@ pub fn spawn_renewal_task(
 /// This is a pure logic function (no loop, no sleep) so it can be unit-tested.
 /// It reads `cert_warning_days` and `cert_critical_days` from `GlobalSettings`
 /// and sends `CertExpiring` alerts for every certificate within those thresholds.
-pub async fn check_cert_expiry(
-    state: &AppState,
-    alert_sender: &lorica_notify::AlertSender,
-) {
+pub async fn check_cert_expiry(state: &AppState, alert_sender: &lorica_notify::AlertSender) {
     let (certs, settings) = {
         let store = state.store.lock().await;
         let certs = match store.list_certificates() {
@@ -648,14 +651,11 @@ pub async fn check_cert_expiry(
         );
 
         alert_sender.send(
-            lorica_notify::AlertEvent::new(
-                lorica_notify::events::AlertType::CertExpiring,
-                summary,
-            )
-            .with_detail("domain", cert.domain.clone())
-            .with_detail("days_remaining", days_remaining.to_string())
-            .with_detail("cert_id", cert.id.clone())
-            .with_detail("is_acme", cert.is_acme.to_string()),
+            lorica_notify::AlertEvent::new(lorica_notify::events::AlertType::CertExpiring, summary)
+                .with_detail("domain", cert.domain.clone())
+                .with_detail("days_remaining", days_remaining.to_string())
+                .with_detail("cert_id", cert.id.clone())
+                .with_detail("is_acme", cert.is_acme.to_string()),
         );
     }
 }
@@ -758,11 +758,9 @@ async fn renew_with_method(
 
     match method {
         "http01" => provision_with_acme(state, config, domains).await,
-        "dns01-manual" => Err(
-            "manual DNS-01 certificates require manual renewal - \
+        "dns01-manual" => Err("manual DNS-01 certificates require manual renewal - \
              use the provision-dns-manual endpoint"
-                .into(),
-        ),
+            .into()),
         m if m.starts_with("dns01-") => {
             // Extract provider name from "dns01-provider"
             let provider = &m[6..];
@@ -770,9 +768,9 @@ async fn renew_with_method(
             // Try new approach first: global DNS provider reference
             let (dns_config, dns_provider_id) = if let Some(ref pid) = cert.acme_dns_provider_id {
                 let store = state.store.lock().await;
-                let dp = store.get_dns_provider(pid).map_err(|e| {
-                    format!("failed to fetch DNS provider '{pid}': {e}")
-                })?;
+                let dp = store
+                    .get_dns_provider(pid)
+                    .map_err(|e| format!("failed to fetch DNS provider '{pid}': {e}"))?;
                 drop(store);
                 let dp = dp.ok_or_else(|| {
                     format!(
@@ -800,9 +798,9 @@ async fn renew_with_method(
                 .into());
             }
 
-            let challenger = build_dns_challenger(&dns_config).await.map_err(|e| {
-                format!("failed to build DNS challenger for renewal: {e}")
-            })?;
+            let challenger = build_dns_challenger(&dns_config)
+                .await
+                .map_err(|e| format!("failed to build DNS challenger for renewal: {e}"))?;
 
             provision_with_acme_dns(
                 state,
@@ -875,11 +873,7 @@ impl DnsChallengeConfig {
                 if self.api_secret.as_ref().is_none_or(|s| s.is_empty()) {
                     return Err("api_secret (application_secret) is required for OVH".into());
                 }
-                if self
-                    .ovh_consumer_key
-                    .as_ref()
-                    .is_none_or(|s| s.is_empty())
-                {
+                if self.ovh_consumer_key.as_ref().is_none_or(|s| s.is_empty()) {
                     return Err("ovh_consumer_key is required for OVH".into());
                 }
             }
@@ -1195,26 +1189,14 @@ impl OvhDnsChallenger {
 
     /// Compute the OVH API signature.
     /// Format: "$1$" + SHA1(application_secret+"+"+consumer_key+"+"+method+"+"+url+"+"+body+"+"+timestamp)
-    fn sign(
-        &self,
-        method: &str,
-        url: &str,
-        body: &str,
-        timestamp: i64,
-    ) -> String {
+    fn sign(&self, method: &str, url: &str, body: &str, timestamp: i64) -> String {
         let to_sign = format!(
             "{}+{}+{}+{}+{}+{}",
             self.application_secret, self.consumer_key, method, url, body, timestamp
         );
-        let digest = ring::digest::digest(
-            &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-            to_sign.as_bytes(),
-        );
-        let hex: String = digest
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let digest =
+            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, to_sign.as_bytes());
+        let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         format!("$1${hex}")
     }
 
@@ -1253,9 +1235,7 @@ impl OvhDnsChallenger {
     /// Refresh the DNS zone to apply changes.
     async fn refresh_zone(&self, zone: &str) -> Result<(), String> {
         let path = format!("/domain/zone/{zone}/refresh");
-        let resp = self
-            .ovh_request(reqwest::Method::POST, &path, None)
-            .await?;
+        let resp = self.ovh_request(reqwest::Method::POST, &path, None).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -1294,9 +1274,7 @@ impl DnsChallenger for OvhDnsChallenger {
 
         // Store record ID for later deletion
         if let Some(id) = body.get("id").and_then(|v| v.as_u64()) {
-            self.created_records
-                .lock()
-                .insert(domain.to_string(), id);
+            self.created_records.lock().insert(domain.to_string(), id);
         }
 
         // Refresh zone to apply changes
@@ -1469,7 +1447,10 @@ pub async fn provision_certificate_dns(
                 status: "provisioned".into(),
                 domain: primary_domain,
                 staging: config.staging,
-                message: format!("Certificate provisioned via DNS-01 for {} domain(s) (id: {cert_id})", domains.len()),
+                message: format!(
+                    "Certificate provisioned via DNS-01 for {} domain(s) (id: {cert_id})",
+                    domains.len()
+                ),
             }))
         }
         Err(e) => {
@@ -1523,10 +1504,7 @@ async fn provision_with_acme_dns(
     .await?;
 
     // Create order with all domains as identifiers
-    let identifiers: Vec<Identifier> = domains
-        .iter()
-        .map(|d| Identifier::Dns(d.clone()))
-        .collect();
+    let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
     let mut order = account
         .new_order(&NewOrder {
             identifiers: &identifiers,
@@ -1612,9 +1590,11 @@ async fn provision_with_acme_dns(
                 .filter(|a| matches!(a.status, AuthorizationStatus::Invalid))
                 .map(|a| format!("{:?}", a.identifier))
                 .collect();
-            return Err(
-                format!("DNS-01 challenge validation failed for: {}", failed.join(", ")).into(),
-            );
+            return Err(format!(
+                "DNS-01 challenge validation failed for: {}",
+                failed.join(", ")
+            )
+            .into());
         }
 
         attempts += 1;
@@ -1809,10 +1789,7 @@ pub async fn provision_dns_manual(
     .map_err(|e| ApiError::Internal(format!("ACME account creation failed: {e}")))?;
 
     // Create order with all domains as identifiers
-    let identifiers: Vec<Identifier> = domains
-        .iter()
-        .map(|d| Identifier::Dns(d.clone()))
-        .collect();
+    let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
     let mut order = account
         .new_order(&NewOrder {
             identifiers: &identifiers,
@@ -1964,13 +1941,23 @@ fn is_valid_dns_server(server: &str) -> bool {
         return false;
     }
     // Allow only alphanumeric, dots, hyphens, colons (for IPv6), and square brackets
-    server.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+    server
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
 }
 
 /// Check if a TXT record contains the expected value.
 /// If dns_server is provided, queries that specific server (e.g. the authoritative NS).
-async fn check_txt_record(record_name: &str, expected_value: &str, dns_server: Option<&str>) -> bool {
-    let mut args = vec!["+short".to_string(), "TXT".to_string(), record_name.to_string()];
+async fn check_txt_record(
+    record_name: &str,
+    expected_value: &str,
+    dns_server: Option<&str>,
+) -> bool {
+    let mut args = vec![
+        "+short".to_string(),
+        "TXT".to_string(),
+        record_name.to_string(),
+    ];
     if let Some(server) = dns_server {
         if !is_valid_dns_server(server) {
             tracing::warn!(server, "rejecting invalid DNS server parameter");
@@ -1980,10 +1967,7 @@ async fn check_txt_record(record_name: &str, expected_value: &str, dns_server: O
     }
     let expected = expected_value.to_string();
     let result = tokio::task::spawn_blocking(move || {
-        match std::process::Command::new("dig")
-            .args(&args)
-            .output()
-        {
+        match std::process::Command::new("dig").args(&args).output() {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 stdout.contains(&expected)
@@ -2195,7 +2179,10 @@ pub async fn provision_dns_manual_confirm(
         status: "provisioned".into(),
         domain: primary_domain,
         staging: pending.staging,
-        message: format!("Certificate provisioned via manual DNS-01 for {} domain(s) (id: {cert_id})", domains.len()),
+        message: format!(
+            "Certificate provisioned via manual DNS-01 for {} domain(s) (id: {cert_id})",
+            domains.len()
+        ),
     }))
 }
 
@@ -2505,10 +2492,7 @@ mod tests {
     fn test_acme_dns_base_domain() {
         assert_eq!(acme_dns_base_domain("example.com"), "example.com");
         assert_eq!(acme_dns_base_domain("*.example.com"), "example.com");
-        assert_eq!(
-            acme_dns_base_domain("*.sub.example.com"),
-            "sub.example.com"
-        );
+        assert_eq!(acme_dns_base_domain("*.sub.example.com"), "sub.example.com");
         assert_eq!(acme_dns_base_domain("www.example.com"), "www.example.com");
     }
 
@@ -2551,9 +2535,11 @@ mod tests {
         let store = lorica_config::ConfigStore::open_in_memory().unwrap();
 
         // Set warning=14, critical=3
-        let mut settings = GlobalSettings::default();
-        settings.cert_warning_days = 14;
-        settings.cert_critical_days = 3;
+        let settings = GlobalSettings {
+            cert_warning_days: 14,
+            cert_critical_days: 3,
+            ..GlobalSettings::default()
+        };
         store.update_global_settings(&settings).unwrap();
 
         let now = chrono::Utc::now();
@@ -2573,7 +2559,7 @@ mod tests {
             acme_auto_renew: false,
             created_at: now - chrono::Duration::days(80),
             acme_method: None,
-    
+
             acme_dns_provider_id: None,
         };
 
@@ -2592,7 +2578,7 @@ mod tests {
             acme_auto_renew: false,
             created_at: now - chrono::Duration::days(88),
             acme_method: None,
-    
+
             acme_dns_provider_id: None,
         };
 
@@ -2611,7 +2597,7 @@ mod tests {
             acme_auto_renew: true,
             created_at: now - chrono::Duration::days(60),
             acme_method: Some("http01".into()),
-    
+
             acme_dns_provider_id: None,
         };
 
@@ -2667,10 +2653,7 @@ mod tests {
             .find(|a| a.summary.contains("CRITICAL"))
             .expect("should have a CRITICAL alert");
         assert!(crit.summary.contains("crit.example.com"));
-        assert_eq!(
-            crit.details.get("cert_id").unwrap(),
-            "cert-crit"
-        );
+        assert_eq!(crit.details.get("cert_id").unwrap(), "cert-crit");
 
         // Find the warning alert
         let warn = alerts
@@ -2678,10 +2661,7 @@ mod tests {
             .find(|a| !a.summary.contains("CRITICAL"))
             .expect("should have a warning alert");
         assert!(warn.summary.contains("warn.example.com"));
-        assert_eq!(
-            warn.details.get("cert_id").unwrap(),
-            "cert-warn"
-        );
+        assert_eq!(warn.details.get("cert_id").unwrap(), "cert-warn");
     }
 
     #[test]

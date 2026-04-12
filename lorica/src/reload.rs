@@ -160,10 +160,8 @@ pub async fn reload_proxy_config_with_mtls(
     proxy_config.store(Arc::new(new_config));
 
     if let Some(filter) = connection_filter {
-        let policy = ConnectionFilterPolicy::from_cidrs(
-            &connection_allow_cidrs,
-            &connection_deny_cidrs,
-        );
+        let policy =
+            ConnectionFilterPolicy::from_cidrs(&connection_allow_cidrs, &connection_deny_cidrs);
         let allow_count = policy.allow.len();
         let deny_count = policy.deny.len();
         filter.reload(policy);

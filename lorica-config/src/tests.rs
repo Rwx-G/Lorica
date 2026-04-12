@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use std::str::FromStr;
 
@@ -128,7 +129,9 @@ mod tests {
             id: new_id(),
             name: "Test OVH Provider".into(),
             provider_type: "ovh".into(),
-            config: r#"{"provider":"ovh","api_token":"ak","api_secret":"as","ovh_consumer_key":"ck"}"#.into(),
+            config:
+                r#"{"provider":"ovh","api_token":"ak","api_secret":"as","ovh_consumer_key":"ck"}"#
+                    .into(),
             created_at: Utc::now(),
         }
     }
@@ -530,10 +533,7 @@ mod tests {
 
         // Store trusted proxies
         let mut updated = settings;
-        updated.trusted_proxies = vec![
-            "192.168.0.0/16".to_string(),
-            "10.0.0.1".to_string(),
-        ];
+        updated.trusted_proxies = vec!["192.168.0.0/16".to_string(), "10.0.0.1".to_string()];
         store.update_global_settings(&updated).unwrap();
 
         // Read back
@@ -1530,7 +1530,10 @@ cert_critical_days = 3
         store.create_route(&route).unwrap();
 
         let loaded = store.get_route(&route.id).unwrap().unwrap();
-        assert!(loaded.sticky_session, "sticky_session should persist as true");
+        assert!(
+            loaded.sticky_session,
+            "sticky_session should persist as true"
+        );
 
         // Toggle off
         let mut updated = loaded;
@@ -1538,7 +1541,10 @@ cert_critical_days = 3
         store.update_route(&updated).unwrap();
 
         let reloaded = store.get_route(&route.id).unwrap().unwrap();
-        assert!(!reloaded.sticky_session, "sticky_session should persist as false");
+        assert!(
+            !reloaded.sticky_session,
+            "sticky_session should persist as false"
+        );
     }
 
     #[test]
@@ -1548,7 +1554,10 @@ cert_critical_days = 3
         store.create_route(&route).unwrap();
 
         let loaded = store.get_route(&route.id).unwrap().unwrap();
-        assert!(!loaded.sticky_session, "sticky_session should default to false");
+        assert!(
+            !loaded.sticky_session,
+            "sticky_session should default to false"
+        );
     }
 
     #[test]
@@ -1586,7 +1595,8 @@ cert_critical_days = 3
         let store = ConfigStore::open_in_memory().unwrap();
         let mut route = make_route();
         route.basic_auth_username = Some("admin".to_string());
-        route.basic_auth_password_hash = Some("$argon2id$v=19$m=19456,t=2,p=1$salt$hash".to_string());
+        route.basic_auth_password_hash =
+            Some("$argon2id$v=19$m=19456,t=2,p=1$salt$hash".to_string());
         store.create_route(&route).unwrap();
 
         let loaded = store.get_route(&route.id).unwrap().unwrap();
@@ -1655,8 +1665,14 @@ cert_critical_days = 3
         store.create_route(&route).unwrap();
 
         let loaded = store.get_route(&route.id).unwrap().unwrap();
-        assert_eq!(loaded.stale_while_revalidate_s, 10, "default stale-while-revalidate should be 10s");
-        assert_eq!(loaded.stale_if_error_s, 60, "default stale-if-error should be 60s");
+        assert_eq!(
+            loaded.stale_while_revalidate_s, 10,
+            "default stale-while-revalidate should be 10s"
+        );
+        assert_eq!(
+            loaded.stale_if_error_s, 60,
+            "default stale-if-error should be 60s"
+        );
     }
 
     #[test]
@@ -1776,7 +1792,10 @@ cert_critical_days = 3
         assert_eq!(via_get.traffic_splits.len(), 2);
         assert_eq!(via_get.traffic_splits[0].name, "v2-canary");
         assert_eq!(via_get.traffic_splits[0].weight_percent, 5);
-        assert_eq!(via_get.traffic_splits[0].backend_ids, vec!["b-v2".to_string()]);
+        assert_eq!(
+            via_get.traffic_splits[0].backend_ids,
+            vec!["b-v2".to_string()]
+        );
         assert_eq!(via_get.traffic_splits[1].weight_percent, 0);
 
         let via_list: Vec<_> = store
@@ -1856,7 +1875,10 @@ cert_critical_days = 3
 
         let via_get = store.get_route(&route.id).unwrap().unwrap();
         let m = via_get.mirror.as_ref().unwrap();
-        assert_eq!(m.backend_ids, vec!["shadow-a".to_string(), "shadow-b".to_string()]);
+        assert_eq!(
+            m.backend_ids,
+            vec!["shadow-a".to_string(), "shadow-b".to_string()]
+        );
         assert_eq!(m.sample_percent, 10);
         assert_eq!(m.timeout_ms, 3_000);
         assert_eq!(m.max_body_bytes, 524_288);
@@ -1909,7 +1931,7 @@ cert_critical_days = 3
         let rr = via_get.response_rewrite.as_ref().unwrap();
         assert_eq!(rr.rules.len(), 2);
         assert_eq!(rr.rules[0].pattern, "internal.local");
-        assert_eq!(rr.rules[1].is_regex, true);
+        assert!(rr.rules[1].is_regex);
         assert_eq!(rr.rules[1].max_replacements, Some(5));
         assert_eq!(rr.max_body_bytes, 524_288);
         assert_eq!(rr.content_type_prefixes.len(), 2);
@@ -1947,8 +1969,8 @@ cert_critical_days = 3
         let store = ConfigStore::open_in_memory().unwrap();
         let mut route = make_route();
         route.mtls = Some(MtlsConfig {
-            ca_cert_pem:
-                "-----BEGIN CERTIFICATE-----\nMIIBdummy\n-----END CERTIFICATE-----\n".into(),
+            ca_cert_pem: "-----BEGIN CERTIFICATE-----\nMIIBdummy\n-----END CERTIFICATE-----\n"
+                .into(),
             required: true,
             allowed_organizations: vec!["Acme Corp".into(), "Beta Inc".into()],
         });
@@ -1957,7 +1979,7 @@ cert_critical_days = 3
         let via_get = store.get_route(&route.id).unwrap().unwrap();
         let m = via_get.mtls.as_ref().unwrap();
         assert!(m.ca_cert_pem.contains("BEGIN CERTIFICATE"));
-        assert_eq!(m.required, true);
+        assert!(m.required);
         assert_eq!(m.allowed_organizations, vec!["Acme Corp", "Beta Inc"]);
 
         let via_list: Vec<_> = store

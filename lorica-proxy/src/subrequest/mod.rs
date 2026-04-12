@@ -162,7 +162,9 @@ impl Ctx {
     pub fn take_write_lock(&mut self) -> Option<WritePermit> {
         // also clear out lock ctx; move the permit out of Option so
         // LockCtx::Drop sees None and skips the safety-net release.
-        self.lock.take().and_then(|mut lock| lock.write_permit.take())
+        self.lock
+            .take()
+            .and_then(|mut lock| lock.write_permit.take())
     }
 
     /// Get the `BodyMode` when this subrequest was created.

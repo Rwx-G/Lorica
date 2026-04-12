@@ -79,8 +79,7 @@ async fn setup_admin_and_login(
 ) -> String {
     let password = {
         let store = state.store.lock().await;
-        let pw = ensure_admin_user(&store).unwrap().unwrap();
-        pw
+        ensure_admin_user(&store).unwrap().unwrap()
     };
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -324,7 +323,7 @@ async fn test_routes_crud() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("GET")
-        .uri(&format!("/api/v1/routes/{route_id}"))
+        .uri(format!("/api/v1/routes/{route_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -341,7 +340,7 @@ async fn test_routes_crud() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(&format!("/api/v1/routes/{route_id}"))
+        .uri(format!("/api/v1/routes/{route_id}"))
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
         .body(Body::from(serde_json::to_string(&body).unwrap()))
@@ -360,7 +359,7 @@ async fn test_routes_crud() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/routes/{route_id}"))
+        .uri(format!("/api/v1/routes/{route_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -372,7 +371,7 @@ async fn test_routes_crud() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("GET")
-        .uri(&format!("/api/v1/routes/{route_id}"))
+        .uri(format!("/api/v1/routes/{route_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -437,7 +436,7 @@ async fn test_backends_crud() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(&format!("/api/v1/backends/{backend_id}"))
+        .uri(format!("/api/v1/backends/{backend_id}"))
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
         .body(Body::from(serde_json::to_string(&body).unwrap()))
@@ -456,7 +455,7 @@ async fn test_backends_crud() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/backends/{backend_id}"))
+        .uri(format!("/api/v1/backends/{backend_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -514,7 +513,7 @@ async fn test_certificates_crud() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("GET")
-        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .uri(format!("/api/v1/certificates/{cert_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -535,7 +534,7 @@ async fn test_certificates_crud() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .uri(format!("/api/v1/certificates/{cert_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -594,7 +593,7 @@ async fn test_certificate_delete_blocked_by_route() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .uri(format!("/api/v1/certificates/{cert_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -820,7 +819,7 @@ async fn test_certificate_update() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .uri(format!("/api/v1/certificates/{cert_id}"))
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
         .body(Body::from(serde_json::to_string(&body).unwrap()))
@@ -896,7 +895,7 @@ async fn test_generate_self_signed_certificate() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("GET")
-        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .uri(format!("/api/v1/certificates/{cert_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -1006,9 +1005,9 @@ async fn test_logs_endpoint_filtering() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
         })
         .await;
     state
@@ -1025,9 +1024,9 @@ async fn test_logs_endpoint_filtering() {
             error: Some("internal error".into()),
             client_ip: String::new(),
             is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
         })
         .await;
 
@@ -1085,9 +1084,9 @@ async fn test_clear_logs_endpoint() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
         })
         .await;
 
@@ -1185,9 +1184,9 @@ async fn test_logs_endpoint_time_range() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
         })
         .await;
     state
@@ -1204,9 +1203,9 @@ async fn test_logs_endpoint_time_range() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
         })
         .await;
 
@@ -1431,7 +1430,7 @@ async fn test_notification_crud() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let notif_id = json["data"]["id"].as_str().unwrap().to_string();
     assert_eq!(json["data"]["channel"], "email");
-    assert_eq!(json["data"]["enabled"], true);
+    assert_eq!(json["data"]["enabled"], serde_json::json!(true));
 
     // List
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1461,7 +1460,7 @@ async fn test_notification_crud() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(&format!("/api/v1/notifications/{notif_id}"))
+        .uri(format!("/api/v1/notifications/{notif_id}"))
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
         .body(Body::from(serde_json::to_string(&body).unwrap()))
@@ -1474,13 +1473,13 @@ async fn test_notification_crud() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["data"]["channel"], "webhook");
-    assert_eq!(json["data"]["enabled"], false);
+    assert_eq!(json["data"]["enabled"], serde_json::json!(false));
 
     // Delete
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/notifications/{notif_id}"))
+        .uri(format!("/api/v1/notifications/{notif_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -2425,7 +2424,7 @@ async fn test_test_notification_email_missing_smtp_host_returns_400() {
     let router = app(state, session_store, rate_limiter);
     let req = Request::builder()
         .method("POST")
-        .uri(&format!("/api/v1/notifications/{notif_id}/test"))
+        .uri(format!("/api/v1/notifications/{notif_id}/test"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -2465,7 +2464,7 @@ async fn test_test_notification_webhook_missing_url_returns_400() {
     let router = app(state, session_store, rate_limiter);
     let req = Request::builder()
         .method("POST")
-        .uri(&format!("/api/v1/notifications/{notif_id}/test"))
+        .uri(format!("/api/v1/notifications/{notif_id}/test"))
         .header("Cookie", &cookie)
         .body(Body::empty())
         .unwrap();
@@ -2683,7 +2682,7 @@ async fn test_update_route_backend_associations() {
     });
     let req = Request::builder()
         .method("PUT")
-        .uri(&format!("/api/v1/routes/{route_id}"))
+        .uri(format!("/api/v1/routes/{route_id}"))
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
         .body(Body::from(serde_json::to_string(&body).unwrap()))
@@ -2911,7 +2910,7 @@ async fn test_waf_clear_events() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["data"]["cleared"], true);
+    assert_eq!(json["data"]["cleared"], serde_json::json!(true));
 }
 
 #[tokio::test]
@@ -2962,7 +2961,7 @@ async fn test_waf_rules_disable() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["data"]["rule_id"], 942100);
-    assert_eq!(json["data"]["enabled"], false);
+    assert_eq!(json["data"]["enabled"], serde_json::json!(false));
 }
 
 #[tokio::test]
@@ -3001,7 +3000,7 @@ async fn test_waf_rules_enable() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["data"]["rule_id"], 942100);
-    assert_eq!(json["data"]["enabled"], true);
+    assert_eq!(json["data"]["enabled"], serde_json::json!(true));
 }
 
 #[tokio::test]
@@ -3100,5 +3099,5 @@ async fn test_workers_with_metrics() {
     assert_eq!(workers.len(), 1);
     assert_eq!(workers[0]["worker_id"], 1);
     assert_eq!(workers[0]["pid"], 12345);
-    assert_eq!(workers[0]["healthy"], true);
+    assert_eq!(workers[0]["healthy"], serde_json::json!(true));
 }

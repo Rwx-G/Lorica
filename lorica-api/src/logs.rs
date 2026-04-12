@@ -301,11 +301,7 @@ pub async fn export_logs(
     Extension(state): Extension<AppState>,
     Query(params): Query<LogExportQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let format = params
-        .format
-        .as_deref()
-        .unwrap_or("csv")
-        .to_lowercase();
+    let format = params.format.as_deref().unwrap_or("csv").to_lowercase();
 
     if format != "csv" && format != "json" {
         return Err(ApiError::BadRequest(
@@ -361,8 +357,7 @@ pub async fn export_logs(
                         || e.path.to_lowercase().contains(&s)
                         || e.host.to_lowercase().contains(&s)
                         || e.backend.to_lowercase().contains(&s)
-                        || e
-                            .error
+                        || e.error
                             .as_ref()
                             .is_some_and(|err| err.to_lowercase().contains(&s));
                     if !matches {
@@ -393,7 +388,9 @@ pub async fn export_logs(
         ))
     } else {
         let mut csv = String::with_capacity(entries.len() * 120);
-        csv.push_str("timestamp,method,path,host,status,latency_ms,backend,client_ip,error,request_id\n");
+        csv.push_str(
+            "timestamp,method,path,host,status,latency_ms,backend,client_ip,error,request_id\n",
+        );
         for e in &entries {
             csv.push_str(&csv_escape(&e.timestamp));
             csv.push(',');

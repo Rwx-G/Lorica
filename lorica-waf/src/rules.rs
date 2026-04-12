@@ -883,7 +883,9 @@ mod tests {
     fn test_sqli_info_schema() {
         let rs = RuleSet::default_crs();
         let rule = rs.rules().iter().find(|r| r.id == 942180).unwrap();
-        assert!(rule.pattern.is_match("SELECT * FROM information_schema.tables"));
+        assert!(rule
+            .pattern
+            .is_match("SELECT * FROM information_schema.tables"));
         assert!(rule.pattern.is_match("sqlite_master"));
         assert!(rule.pattern.is_match("pg_catalog"));
         assert!(!rule.pattern.is_match("SELECT name FROM users"));
@@ -951,7 +953,9 @@ mod tests {
         let rs = RuleSet::default_crs();
         let rule = rs.rules().iter().find(|r| r.id == 920140).unwrap();
         assert!(rule.pattern.is_match("transfer-encoding: chunked chunked"));
-        assert!(rule.pattern.is_match("transfer-encoding: chunked, identity"));
+        assert!(rule
+            .pattern
+            .is_match("transfer-encoding: chunked, identity"));
     }
 
     #[test]

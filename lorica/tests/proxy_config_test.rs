@@ -68,7 +68,7 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str, enabled: bool) -> Rou
         auto_ban_duration_s: 3600,
         path_rules: vec![],
         return_status: None,
-            sticky_session: false,
+        sticky_session: false,
         basic_auth_username: None,
         basic_auth_password_hash: None,
         stale_while_revalidate_s: 10,

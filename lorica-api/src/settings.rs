@@ -203,8 +203,7 @@ fn validate_cidr_list(entries: &[String], field: &str) -> Result<(), ApiError> {
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed.parse::<std::net::IpAddr>().is_err()
-            && trimmed.parse::<ipnet::IpNet>().is_err()
+        if trimmed.parse::<std::net::IpAddr>().is_err() && trimmed.parse::<ipnet::IpNet>().is_err()
         {
             return Err(ApiError::BadRequest(format!(
                 "invalid {field} CIDR or IP: {trimmed}"

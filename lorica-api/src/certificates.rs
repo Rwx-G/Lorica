@@ -320,10 +320,18 @@ pub async fn update_certificate(
         cert.key_pem = key_pem;
     }
     if let Some(method) = body.acme_method {
-        cert.acme_method = if method.is_empty() { None } else { Some(method) };
+        cert.acme_method = if method.is_empty() {
+            None
+        } else {
+            Some(method)
+        };
     }
     if let Some(provider_id) = body.acme_dns_provider_id {
-        cert.acme_dns_provider_id = if provider_id.is_empty() { None } else { Some(provider_id) };
+        cert.acme_dns_provider_id = if provider_id.is_empty() {
+            None
+        } else {
+            Some(provider_id)
+        };
     }
     if let Some(auto_renew) = body.acme_auto_renew {
         cert.acme_auto_renew = auto_renew;

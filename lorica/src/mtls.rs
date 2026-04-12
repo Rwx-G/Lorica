@@ -21,9 +21,7 @@
 use std::sync::Arc;
 
 use lorica_config::models::Route;
-use lorica_tls::{
-    ClientCertVerifier, RootCertStore, WebPkiClientVerifier,
-};
+use lorica_tls::{ClientCertVerifier, RootCertStore, WebPkiClientVerifier};
 
 /// Aggregate all mTLS CA PEMs found across `routes` into a single
 /// rustls `RootCertStore`. Returns `None` when no route has mTLS
@@ -227,8 +225,7 @@ mod tests {
     }
 
     fn gen_ca_pem() -> String {
-        let mut params =
-            rcgen::CertificateParams::new(vec!["Test CA".into()]).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["Test CA".into()]).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let key = rcgen::KeyPair::generate().unwrap();
         params.self_signed(&key).unwrap().pem()
@@ -261,16 +258,22 @@ mod tests {
         let pem_b = gen_ca_pem();
         assert_ne!(pem_a, pem_b, "rcgen generated identical PEMs");
         let routes = vec![
-            make_route("a", Some(MtlsConfig {
-                ca_cert_pem: pem_a,
-                required: false,
-                allowed_organizations: Vec::new(),
-            })),
-            make_route("b", Some(MtlsConfig {
-                ca_cert_pem: pem_b,
-                required: true,
-                allowed_organizations: Vec::new(),
-            })),
+            make_route(
+                "a",
+                Some(MtlsConfig {
+                    ca_cert_pem: pem_a,
+                    required: false,
+                    allowed_organizations: Vec::new(),
+                }),
+            ),
+            make_route(
+                "b",
+                Some(MtlsConfig {
+                    ca_cert_pem: pem_b,
+                    required: true,
+                    allowed_organizations: Vec::new(),
+                }),
+            ),
         ];
         let store = build_union_root_store(&routes).expect("store");
         assert!(store.len() >= 2, "expected both CAs, got {}", store.len());
@@ -279,11 +282,14 @@ mod tests {
     #[test]
     fn union_store_tolerates_garbage_pem() {
         init_crypto_once();
-        let routes = vec![make_route("a", Some(MtlsConfig {
-            ca_cert_pem: "not-a-pem".into(),
-            required: true,
-            allowed_organizations: Vec::new(),
-        }))];
+        let routes = vec![make_route(
+            "a",
+            Some(MtlsConfig {
+                ca_cert_pem: "not-a-pem".into(),
+                required: true,
+                allowed_organizations: Vec::new(),
+            }),
+        )];
         // Garbage yields no cert; function returns None with a warn log.
         assert!(build_union_root_store(&routes).is_none());
     }

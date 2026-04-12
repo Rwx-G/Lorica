@@ -38,9 +38,7 @@ use chrono::Utc;
 use lorica::proxy_wiring::{LoricaProxy, ProxyConfig, ProxyConfigGlobals};
 use lorica_config::models::*;
 use lorica_tls::{RootCertStore, TlsAcceptor};
-use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
-};
+use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
 use rustls::ClientConfig as RusTlsClientConfig;
 use rustls::ServerConfig as RusTlsServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -99,17 +97,20 @@ fn sign_cert(
     let key = KeyPair::generate().unwrap();
     let cert = params.signed_by(&key, ca, ca_key).unwrap();
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        key.serialize_der(),
-    ));
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
     (cert_der, key_der)
 }
 
 fn build_pki() -> TestPki {
     let (ca_cert, ca_key, ca_pem) = build_ca("Lorica Test CA");
     let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
-    let (server_cert_der, server_key_der) =
-        sign_cert(&ca_cert, &ca_key, "localhost", None, vec!["localhost".into()]);
+    let (server_cert_der, server_key_der) = sign_cert(
+        &ca_cert,
+        &ca_key,
+        "localhost",
+        None,
+        vec!["localhost".into()],
+    );
     let (client_cert_der, client_key_der) =
         sign_cert(&ca_cert, &ca_key, "client-a", Some("Acme Corp"), vec![]);
 
@@ -144,8 +145,7 @@ fn server_config(pki: &TestPki, routes: &[Route]) -> Arc<RusTlsServerConfig> {
     let verifier = lorica::mtls::build_from_routes(routes)
         .expect("verifier should build when a route has mtls");
 
-    let builder = RusTlsServerConfig::builder()
-        .with_client_cert_verifier(verifier);
+    let builder = RusTlsServerConfig::builder().with_client_cert_verifier(verifier);
     Arc::new(
         builder
             .with_single_cert(
@@ -156,10 +156,7 @@ fn server_config(pki: &TestPki, routes: &[Route]) -> Arc<RusTlsServerConfig> {
     )
 }
 
-async fn spawn_tls_echo_listener(
-    pki: &TestPki,
-    routes: Vec<Route>,
-) -> std::net::SocketAddr {
+async fn spawn_tls_echo_listener(pki: &TestPki, routes: Vec<Route>) -> std::net::SocketAddr {
     let cfg = server_config(pki, &routes);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -360,7 +357,10 @@ async fn handshake_with_untrusted_client_cert_fails() {
         pki.rogue_client_cert_der.clone(),
         pki.rogue_client_key_der.clone_key(),
     );
-    let err = attempt_tls_connect(addr, cc).await.err().expect("expected handshake failure");
+    let err = attempt_tls_connect(addr, cc)
+        .await
+        .err()
+        .expect("expected handshake failure");
     assert!(
         err.to_lowercase().contains("cert")
             || err.to_lowercase().contains("tls")
@@ -399,7 +399,9 @@ async fn union_store_accepts_clients_from_either_ca() {
         pki.rogue_client_cert_der.clone(),
         pki.rogue_client_key_der.clone_key(),
     );
-    let resp = attempt_tls_connect(addr, cc).await.expect("union should accept");
+    let resp = attempt_tls_connect(addr, cc)
+        .await
+        .expect("union should accept");
     assert!(resp.starts_with("HTTP/1.1 200"), "got: {resp}");
 }
 
@@ -435,15 +437,9 @@ fn policy_grid_matches_spec() {
     // required=false, no cert -> pass (opportunistic)
     assert_eq!(evaluate_mtls(&e(false, &[]), None), None);
     // required=true, allowlisted org -> pass
-    assert_eq!(
-        evaluate_mtls(&e(true, &["Acme"]), Some("Acme")),
-        None
-    );
+    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), Some("Acme")), None);
     // required=true, not in allowlist -> 495
-    assert_eq!(
-        evaluate_mtls(&e(true, &["Acme"]), Some("Gamma")),
-        Some(495)
-    );
+    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), Some("Gamma")), Some(495));
     // required=false, cert present but not in allowlist -> still 495
     // (allowlist always wins when a cert is presented)
     assert_eq!(
@@ -451,10 +447,7 @@ fn policy_grid_matches_spec() {
         Some(495)
     );
     // empty org on cert vs. non-empty allowlist -> 495
-    assert_eq!(
-        evaluate_mtls(&e(true, &["Acme"]), Some("")),
-        Some(495)
-    );
+    assert_eq!(evaluate_mtls(&e(true, &["Acme"]), Some("")), Some(495));
 }
 
 // A smoke test that proves a LoricaProxy configured with an mtls_enforcer
@@ -485,7 +478,10 @@ async fn lorica_proxy_accepts_mtls_route_in_snapshot() {
         .as_ref()
         .expect("mtls_enforcer populated");
     assert_eq!(enforcer.required, true);
-    assert_eq!(enforcer.allowed_organizations, vec!["Acme Corp".to_string()]);
+    assert_eq!(
+        enforcer.allowed_organizations,
+        vec!["Acme Corp".to_string()]
+    );
 
     // And the LoricaProxy is constructible with that snapshot - proves
     // the whole RouteEntry shape is still valid for the proxy runtime.
@@ -678,8 +674,7 @@ impl TlsProxyHarness {
             s
         };
 
-        let cert_resolver =
-            Arc::new(lorica_tls::cert_resolver::CertResolver::new());
+        let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
         cert_resolver
             .reload(vec![lorica_tls::cert_resolver::CertData {
                 domain: "localhost".into(),
@@ -720,9 +715,7 @@ impl TlsProxyHarness {
             });
             let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, proxy);
             let mut tls_settings =
-                lorica_core::listeners::tls::TlsSettings::with_resolver(
-                    cert_resolver.clone(),
-                );
+                lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
             tls_settings.enable_h2();
             tls_settings.set_client_cert_verifier(mtls_verifier);
             proxy_service.add_tls_with_settings(&proxy_addr, None, tls_settings);
@@ -856,8 +849,7 @@ async fn fullstack_allowlist_miss_returns_495_on_wire() {
     let upstream = spawn_plain_upstream().await;
     // Our client_cert_der has O=Acme Corp; allowlist "Only Other Org"
     // must miss.
-    let route =
-        build_test_route_with_mtls("u", &pki.ca_pem, true, vec!["Only Other Org"]);
+    let route = build_test_route_with_mtls("u", &pki.ca_pem, true, vec!["Only Other Org"]);
     let backends = vec![upstream_backend("u", upstream)];
     let links = vec![(route.id.clone(), "u".into())];
     let harness = TlsProxyHarness::start(&pki, vec![route], backends, links).await;

@@ -546,7 +546,9 @@ async fn forward_auth_deny_forwards_status_and_body_verbatim() {
         .unwrap();
     assert_eq!(resp.status(), 403);
     assert_eq!(
-        resp.headers().get("x-auth-reason").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("x-auth-reason")
+            .and_then(|v| v.to_str().ok()),
         Some("denied"),
         "auth response headers must be forwarded to the client"
     );

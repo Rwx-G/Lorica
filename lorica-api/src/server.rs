@@ -10,8 +10,8 @@ use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use http::Method;
-use tower_http::cors::{Any, CorsLayer};
 use tokio::sync::{watch, Mutex};
+use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::logs::LogBuffer;
@@ -344,10 +344,7 @@ pub fn build_router(
             post(crate::loadtest::start_test_confirmed),
         )
         .route("/api/v1/loadtest/status", get(crate::loadtest::get_status))
-        .route(
-            "/api/v1/loadtest/ws",
-            get(crate::loadtest::loadtest_ws),
-        )
+        .route("/api/v1/loadtest/ws", get(crate::loadtest::loadtest_ws))
         .route("/api/v1/loadtest/abort", post(crate::loadtest::abort_test))
         .route(
             "/api/v1/loadtest/results/:config_id",

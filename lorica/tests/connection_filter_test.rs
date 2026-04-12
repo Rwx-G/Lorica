@@ -129,11 +129,8 @@ async fn serve_with_filter(
 
     tokio::spawn(async move {
         while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-            let accept = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                listener.accept(),
-            )
-            .await;
+            let accept =
+                tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept()).await;
             let (mut stream, peer) = match accept {
                 Ok(Ok(pair)) => pair,
                 _ => continue,
@@ -160,12 +157,7 @@ async fn read_one_byte(addr: std::net::SocketAddr) -> Option<u8> {
         Err(_) => return None,
     };
     let mut buf = [0u8; 1];
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.read(&mut buf),
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut buf)).await {
         Ok(Ok(n)) if n >= 1 => Some(buf[0]),
         Ok(Ok(_)) => None, // EOF: filter dropped the stream
         Ok(Err(_)) => None,
@@ -203,12 +195,15 @@ async fn tcp_accept_hot_reload_flips_behaviour_midstream() {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let bound = serve_with_filter(Arc::clone(&filter), Arc::clone(&stop)).await;
 
-    assert_eq!(read_one_byte(bound).await, Some(b'K'), "allow-all must pass");
+    assert_eq!(
+        read_one_byte(bound).await,
+        Some(b'K'),
+        "allow-all must pass"
+    );
 
-    filter.reload(lorica::connection_filter::ConnectionFilterPolicy::from_cidrs(
-        &[],
-        &["127.0.0.0/8".into()],
-    ));
+    filter.reload(
+        lorica::connection_filter::ConnectionFilterPolicy::from_cidrs(&[], &["127.0.0.0/8".into()]),
+    );
     assert_eq!(
         read_one_byte(bound).await,
         None,
@@ -236,10 +231,12 @@ async fn reload_without_filter_leaves_filter_untouched() {
     let proxy_config = Arc::new(arc_swap::ArcSwap::from_pointee(ProxyConfig::default()));
     let filter = Arc::new(GlobalConnectionFilter::empty());
 
-    filter.reload(lorica::connection_filter::ConnectionFilterPolicy::from_cidrs(
-        &[],
-        &["203.0.113.0/24".into()],
-    ));
+    filter.reload(
+        lorica::connection_filter::ConnectionFilterPolicy::from_cidrs(
+            &[],
+            &["203.0.113.0/24".into()],
+        ),
+    );
 
     reload_proxy_config(&store, &proxy_config, None)
         .await

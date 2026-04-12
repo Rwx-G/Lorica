@@ -597,13 +597,8 @@ async fn canary_split_hot_reload_reshuffles_buckets_end_to_end() {
 
     // Swap back to 0% canary.
     let route_none = test_route(route_id, "_", vec![], vec![]);
-    let final_config = ProxyConfig::from_store(
-        vec![route_none],
-        backends_vec,
-        vec![],
-        links,
-        globals,
-    );
+    let final_config =
+        ProxyConfig::from_store(vec![route_none], backends_vec, vec![], links, globals);
     config_ref.store(Arc::new(final_config));
 
     let resp = client

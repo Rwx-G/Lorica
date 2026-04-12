@@ -30,8 +30,7 @@ pub async fn list_dns_providers(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     let providers = store.list_dns_providers()?;
-    let responses: Vec<DnsProviderResponse> =
-        providers.iter().map(provider_to_response).collect();
+    let responses: Vec<DnsProviderResponse> = providers.iter().map(provider_to_response).collect();
     Ok(json_data(serde_json::json!({ "dns_providers": responses })))
 }
 
@@ -212,9 +211,8 @@ pub async fn test_dns_provider(
         .ok_or_else(|| ApiError::NotFound(format!("dns_provider {id}")))?;
     drop(store);
 
-    let dns_config: crate::acme::DnsChallengeConfig =
-        serde_json::from_str(&provider.config)
-            .map_err(|e| ApiError::Internal(format!("invalid DNS provider config: {e}")))?;
+    let dns_config: crate::acme::DnsChallengeConfig = serde_json::from_str(&provider.config)
+        .map_err(|e| ApiError::Internal(format!("invalid DNS provider config: {e}")))?;
 
     if let Err(e) = dns_config.validate() {
         return Err(ApiError::BadRequest(format!("invalid DNS config: {e}")));

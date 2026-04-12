@@ -26,8 +26,8 @@ use lorica_bench::SlaCollector;
 use lorica_cache::cache_control::CacheControl;
 use lorica_cache::eviction::simple_lru;
 use lorica_cache::filters::resp_cacheable;
-use lorica_cache::lock::CacheLock;
 use lorica_cache::key::HashBinary;
+use lorica_cache::lock::CacheLock;
 use lorica_cache::predictor::Predictor;
 use lorica_cache::{
     CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable,
@@ -732,11 +732,14 @@ impl CircuitBreaker {
 
     /// Record a failure. Increments the counter and opens the circuit if threshold is reached.
     pub fn record_failure(&self, addr: &str) {
-        let mut entry = self.states.entry(addr.to_string()).or_insert(CircuitBreakerState {
-            failures: 0,
-            state: CircuitStatus::Closed,
-            changed_at: Instant::now(),
-        });
+        let mut entry = self
+            .states
+            .entry(addr.to_string())
+            .or_insert(CircuitBreakerState {
+                failures: 0,
+                state: CircuitStatus::Closed,
+                changed_at: Instant::now(),
+            });
         entry.failures += 1;
         if entry.failures >= self.threshold && entry.state != CircuitStatus::Open {
             entry.state = CircuitStatus::Open;
@@ -1204,12 +1207,17 @@ fn escape_html(s: &str) -> String {
 /// that could execute JavaScript (XSS). Keeps safe formatting tags intact.
 /// Precompiled regexes for HTML sanitization (compiled once, used on every
 /// error page render). Avoids ~300-500us of regex compilation per call.
-static RE_SCRIPT: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r"(?is)<script[\s>].*?</script>").expect("sanitize: script regex"));
-static RE_EVENTS: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)"#).expect("sanitize: event handler regex"));
-static RE_JS_URI: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r#"(?i)(href|src|action)\s*=\s*["']?\s*javascript:"#).expect("sanitize: javascript URI regex"));
+static RE_SCRIPT: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"(?is)<script[\s>].*?</script>").expect("sanitize: script regex")
+});
+static RE_EVENTS: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)"#)
+        .expect("sanitize: event handler regex")
+});
+static RE_JS_URI: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r#"(?i)(href|src|action)\s*=\s*["']?\s*javascript:"#)
+        .expect("sanitize: javascript URI regex")
+});
 
 fn sanitize_html(html: &str) -> String {
     let out = RE_SCRIPT.replace_all(html, "");
@@ -1249,8 +1257,7 @@ pub(crate) fn match_header_rule_backends<'a>(
             .get(rule.header_name.as_str())
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let regex: Option<&regex::Regex> =
-            regexes.get(i).and_then(|opt| opt.as_deref());
+        let regex: Option<&regex::Regex> = regexes.get(i).and_then(|opt| opt.as_deref());
         if rule.matches(value, |v| regex.is_some_and(|re| re.is_match(v))) {
             // Matched. If this rule has an override, return it; otherwise
             // the rule matched but inherits the route's default backend
@@ -1352,11 +1359,7 @@ pub(crate) fn build_forward_auth_headers(
     }
 
     // User-Agent: some auth services log or rate-limit by UA.
-    if let Some(ua) = req
-        .headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(ua) = req.headers.get("user-agent").and_then(|v| v.to_str().ok()) {
         out.push(("User-Agent".into(), ua.to_string()));
     }
 
@@ -1516,11 +1519,7 @@ pub(crate) async fn run_forward_auth_keyed(
                 fwd_headers.push((n.to_string(), v.to_string()));
             }
         }
-        let body = resp
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
+        let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
         return ForwardAuthOutcome::Deny {
             status,
             headers: fwd_headers,
@@ -1554,10 +1553,7 @@ pub(crate) async fn run_forward_auth_keyed(
 /// listener's WebPkiClientVerifier; the organization string arrives
 /// pre-extracted in `client_organization` (None when no cert was
 /// presented, Some("") for a cert without an O= field).
-pub fn evaluate_mtls(
-    enforcer: &MtlsEnforcer,
-    client_organization: Option<&str>,
-) -> Option<u16> {
+pub fn evaluate_mtls(enforcer: &MtlsEnforcer, client_organization: Option<&str>) -> Option<u16> {
     match client_organization {
         None => {
             if enforcer.required {
@@ -1701,11 +1697,16 @@ pub(crate) fn compile_rewrite_rule(
 /// Pure function over bytes, so the composition rules, cross-chunk
 /// correctness (since we run on the full buffered body), and
 /// per-rule replacement limits are all unit-testable.
-pub(crate) fn apply_response_rewrites(body: &[u8], rules: &[Option<CompiledRewriteRule>]) -> Vec<u8> {
+pub(crate) fn apply_response_rewrites(
+    body: &[u8],
+    rules: &[Option<CompiledRewriteRule>],
+) -> Vec<u8> {
     let mut out: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(body);
     for rule in rules.iter().flatten() {
         let rewritten = match rule.max_replacements {
-            Some(n) => rule.regex.replacen(&out, n as usize, rule.replacement.as_slice()),
+            Some(n) => rule
+                .regex
+                .replacen(&out, n as usize, rule.replacement.as_slice()),
             None => rule.regex.replace_all(&out, rule.replacement.as_slice()),
         };
         // `replace_all` returns a Cow - promote to owned if it modified.
@@ -2112,7 +2113,10 @@ impl ProxyHttp for LoricaProxy {
         if let Some(ref challenge_store) = self.acme_challenge_store {
             let path = session.req_header().uri.path();
             if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-                info!(token = token, "ACME challenge request intercepted, looking up token");
+                info!(
+                    token = token,
+                    "ACME challenge request intercepted, looking up token"
+                );
                 if let Some(key_auth) = challenge_store.get(token).await {
                     let mut header = ResponseHeader::build(200, None)?;
                     header.insert_header("Content-Type", "text/plain")?;
@@ -2202,66 +2206,74 @@ impl ProxyHttp for LoricaProxy {
 
         // Ban list + IP blocklist checks (skipped for whitelisted IPs)
         if !is_whitelisted {
-          if let Some(ref ip) = check_ip {
-            let banned = if let Some(entry) = self.ban_list.get(ip) {
-                let (banned_at, duration_s) = entry.value();
-                if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
-                    drop(entry);
-                    // Ban expired - lazy cleanup
-                    self.ban_list.remove(ip);
-                    false
+            if let Some(ref ip) = check_ip {
+                let banned = if let Some(entry) = self.ban_list.get(ip) {
+                    let (banned_at, duration_s) = entry.value();
+                    if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
+                        drop(entry);
+                        // Ban expired - lazy cleanup
+                        self.ban_list.remove(ip);
+                        false
+                    } else {
+                        true
+                    }
                 } else {
-                    true
+                    false
+                };
+                if banned {
+                    ctx.block_reason = Some("IP banned".to_string());
+                    let header = lorica_http::ResponseHeader::build(403, None)?;
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(true);
                 }
-            } else {
-                false
-            };
-            if banned {
-                ctx.block_reason = Some("IP banned".to_string());
-                let header = lorica_http::ResponseHeader::build(403, None)?;
-                session
-                    .write_response_header(Box::new(header), true)
-                    .await?;
-                return Ok(true);
-            }
 
-            if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
-                warn!(
-                    ip = %ip,
-                    "request blocked by IP blocklist"
-                );
-                ctx.waf_blocked = true;
-                // Record as WAF event + Prometheus metric + persist
-                let path = req.uri.path();
-                let host_val = extract_host(req);
-                self.waf_engine.record_blocklist_event(ip, host_val, path);
-                lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
-                self.waf_counts
-                    .entry(("ip_blocklist".to_string(), "blocked".to_string()))
-                    .or_insert_with(|| AtomicU64::new(0))
-                    .fetch_add(1, Ordering::Relaxed);
-                if let Some(ref store) = self.log_store {
-                    let ev = lorica_waf::WafEvent {
-                        rule_id: 0,
-                        description: format!("IP {ip} blocked by IP blocklist"),
-                        category: lorica_waf::RuleCategory::IpBlocklist,
-                        severity: 5,
-                        matched_field: "client_ip".to_string(),
-                        matched_value: ip.to_string(),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        client_ip: ip.to_string(),
-                        route_hostname: { let h = extract_host(req); if h.is_empty() { "-" } else { h } }.to_string(),
-                        action: "blocked".to_string(),
-                    };
-                    let _ = store.insert_waf_event(&ev);
+                if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
+                    warn!(
+                        ip = %ip,
+                        "request blocked by IP blocklist"
+                    );
+                    ctx.waf_blocked = true;
+                    // Record as WAF event + Prometheus metric + persist
+                    let path = req.uri.path();
+                    let host_val = extract_host(req);
+                    self.waf_engine.record_blocklist_event(ip, host_val, path);
+                    lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
+                    self.waf_counts
+                        .entry(("ip_blocklist".to_string(), "blocked".to_string()))
+                        .or_insert_with(|| AtomicU64::new(0))
+                        .fetch_add(1, Ordering::Relaxed);
+                    if let Some(ref store) = self.log_store {
+                        let ev = lorica_waf::WafEvent {
+                            rule_id: 0,
+                            description: format!("IP {ip} blocked by IP blocklist"),
+                            category: lorica_waf::RuleCategory::IpBlocklist,
+                            severity: 5,
+                            matched_field: "client_ip".to_string(),
+                            matched_value: ip.to_string(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            client_ip: ip.to_string(),
+                            route_hostname: {
+                                let h = extract_host(req);
+                                if h.is_empty() {
+                                    "-"
+                                } else {
+                                    h
+                                }
+                            }
+                            .to_string(),
+                            action: "blocked".to_string(),
+                        };
+                        let _ = store.insert_waf_event(&ev);
+                    }
+                    let header = lorica_http::ResponseHeader::build(403, None)?;
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(true);
                 }
-                let header = lorica_http::ResponseHeader::build(403, None)?;
-                session
-                    .write_response_header(Box::new(header), true)
-                    .await?;
-                return Ok(true);
             }
-        }
         } // end if !is_whitelisted (ban + blocklist)
 
         let host_raw = extract_host(req);
@@ -2408,10 +2420,7 @@ impl ProxyHttp for LoricaProxy {
                     for (name, value) in &headers {
                         let _ = resp_header.insert_header(name.clone(), value);
                     }
-                    let _ = resp_header.insert_header(
-                        "Content-Length",
-                        body.len().to_string(),
-                    );
+                    let _ = resp_header.insert_header("Content-Length", body.len().to_string());
                     session
                         .write_response_header(Box::new(resp_header), false)
                         .await?;
@@ -2469,13 +2478,10 @@ impl ProxyHttp for LoricaProxy {
                 }
             }
             match matched_idx {
-                Some(i) => lorica_api::metrics::inc_header_rule_match(
-                    &entry.route.id,
-                    &i.to_string(),
-                ),
-                None => {
-                    lorica_api::metrics::inc_header_rule_match(&entry.route.id, "default")
+                Some(i) => {
+                    lorica_api::metrics::inc_header_rule_match(&entry.route.id, &i.to_string())
                 }
+                None => lorica_api::metrics::inc_header_rule_match(&entry.route.id, "default"),
             }
         }
 
@@ -2504,32 +2510,26 @@ impl ProxyHttp for LoricaProxy {
                     }
                     cumulative = cumulative.saturating_add(w).min(100);
                     if (bucket as u32) < cumulative {
-                        if let Some(backends) = entry
-                            .traffic_split_backends
-                            .get(i)
-                            .and_then(|b| b.as_ref())
+                        if let Some(backends) =
+                            entry.traffic_split_backends.get(i).and_then(|b| b.as_ref())
                         {
                             ctx.matched_backends = Some(backends.clone());
-                            matched_split_name = Some(
-                                if split.name.is_empty() {
-                                    "unnamed"
-                                } else {
-                                    split.name.as_str()
-                                },
-                            );
+                            matched_split_name = Some(if split.name.is_empty() {
+                                "unnamed"
+                            } else {
+                                split.name.as_str()
+                            });
                         }
                         break;
                     }
                 }
                 match matched_split_name {
-                    Some(name) => lorica_api::metrics::inc_canary_split_selected(
-                        &entry.route.id,
-                        name,
-                    ),
-                    None => lorica_api::metrics::inc_canary_split_selected(
-                        &entry.route.id,
-                        "default",
-                    ),
+                    Some(name) => {
+                        lorica_api::metrics::inc_canary_split_selected(&entry.route.id, name)
+                    }
+                    None => {
+                        lorica_api::metrics::inc_canary_split_selected(&entry.route.id, "default")
+                    }
                 }
             }
         }
@@ -2685,7 +2685,8 @@ impl ProxyHttp for LoricaProxy {
                         if ok {
                             self.basic_auth_cache.insert(cache_key, Instant::now());
                             // Evict expired entries to prevent unbounded growth
-                            self.basic_auth_cache.retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
+                            self.basic_auth_cache
+                                .retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
                         }
                         ok
                     })
@@ -2706,7 +2707,10 @@ impl ProxyHttp for LoricaProxy {
         // Direct status response (return_status)
         if let Some(status) = ctx.route_snapshot.as_ref().and_then(|r| r.return_status) {
             ctx.block_reason = Some(format!("return_status {status}"));
-            if let Some(ref target) = ctx.route_snapshot.as_ref().and_then(|r| r.redirect_to.clone())
+            if let Some(ref target) = ctx
+                .route_snapshot
+                .as_ref()
+                .and_then(|r| r.redirect_to.clone())
             {
                 // return_status + redirect_to = redirect with specific status code
                 let redir_path = req.uri.path();
@@ -2729,7 +2733,11 @@ impl ProxyHttp for LoricaProxy {
         }
 
         // Redirect to external URL (read from snapshot, path rules may have overridden it)
-        if let Some(ref target) = ctx.route_snapshot.as_ref().and_then(|r| r.redirect_to.clone()) {
+        if let Some(ref target) = ctx
+            .route_snapshot
+            .as_ref()
+            .and_then(|r| r.redirect_to.clone())
+        {
             let redir_path = req.uri.path();
             let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
             let base = target.trim_end_matches('/');
@@ -2834,83 +2842,83 @@ impl ProxyHttp for LoricaProxy {
 
         // Per-route rate limiting (skipped for whitelisted IPs)
         if !is_whitelisted {
-          if let Some(rps) = entry.route.rate_limit_rps {
-            if let Some(ref ip) = check_ip {
-                let key = format!("{}:{}", entry.route.id, ip);
-                self.rate_limiter.observe(&key, 1);
-                let current_rate = self.rate_limiter.rate(&key);
-                let mut effective_limit = match entry.route.rate_limit_burst {
-                    Some(burst) => (rps + burst) as f64,
-                    None => rps as f64,
-                };
+            if let Some(rps) = entry.route.rate_limit_rps {
+                if let Some(ref ip) = check_ip {
+                    let key = format!("{}:{}", entry.route.id, ip);
+                    self.rate_limiter.observe(&key, 1);
+                    let current_rate = self.rate_limiter.rate(&key);
+                    let mut effective_limit = match entry.route.rate_limit_burst {
+                        Some(burst) => (rps + burst) as f64,
+                        None => rps as f64,
+                    };
 
-                // Adaptive flood defense: when global RPS exceeds the
-                // configured threshold, halve per-IP rate limits.
-                let threshold = config.flood_threshold_rps;
-                if threshold > 0 {
-                    let global_rps = self.global_rate.rate(&"global");
-                    if global_rps > threshold as f64 {
-                        effective_limit *= 0.5;
-                    }
-                }
-                // Store rate info for response headers (even if not throttled)
-                ctx.rate_limit_info = Some((rps, current_rate));
-
-                if current_rate > effective_limit {
-                    warn!(
-                        route_id = %entry.route.id,
-                        client_ip = %ip,
-                        current_rate = %current_rate,
-                        limit_rps = %rps,
-                        "request rate-limited (429)"
-                    );
-
-                    // Track rate limit violations for auto-ban
-                    if let Some(ban_threshold) = entry.route.auto_ban_threshold {
-                        let violation_key = format!("violation:{}", ip);
-                        self.rate_violations.observe(&violation_key, 1);
-                        let violations = self.rate_violations.rate(&violation_key);
-                        if violations > ban_threshold as f64 {
-                            let ban_duration = entry.route.auto_ban_duration_s;
-                            self.ban_list
-                                .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
-                            warn!(
-                                ip = %ip,
-                                violations = %violations,
-                                ban_duration_s = %ban_duration,
-                                "IP auto-banned for rate limit abuse"
-                            );
-                            // Dispatch ip_banned notification
-                            if let Some(ref sender) = self.alert_sender {
-                                sender.send(
-                                    lorica_notify::AlertEvent::new(
-                                        lorica_notify::events::AlertType::IpBanned,
-                                        format!("IP {} auto-banned for rate limit abuse", ip),
-                                    )
-                                    .with_detail("ip", ip.to_string())
-                                    .with_detail("violations", violations.to_string())
-                                    .with_detail("ban_duration_s", ban_duration.to_string()),
-                                );
-                            }
+                    // Adaptive flood defense: when global RPS exceeds the
+                    // configured threshold, halve per-IP rate limits.
+                    let threshold = config.flood_threshold_rps;
+                    if threshold > 0 {
+                        let global_rps = self.global_rate.rate(&"global");
+                        if global_rps > threshold as f64 {
+                            effective_limit *= 0.5;
                         }
                     }
+                    // Store rate info for response headers (even if not throttled)
+                    ctx.rate_limit_info = Some((rps, current_rate));
 
-                    let reset_ts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        + 1;
-                    ctx.block_reason = Some("rate limited".to_string());
-                    let mut header = lorica_http::ResponseHeader::build(429, None)?;
-                    header.insert_header("Retry-After", "1")?;
-                    header.insert_header("X-RateLimit-Reset", reset_ts.to_string())?;
-                    session
-                        .write_response_header(Box::new(header), true)
-                        .await?;
-                    return Ok(true);
+                    if current_rate > effective_limit {
+                        warn!(
+                            route_id = %entry.route.id,
+                            client_ip = %ip,
+                            current_rate = %current_rate,
+                            limit_rps = %rps,
+                            "request rate-limited (429)"
+                        );
+
+                        // Track rate limit violations for auto-ban
+                        if let Some(ban_threshold) = entry.route.auto_ban_threshold {
+                            let violation_key = format!("violation:{}", ip);
+                            self.rate_violations.observe(&violation_key, 1);
+                            let violations = self.rate_violations.rate(&violation_key);
+                            if violations > ban_threshold as f64 {
+                                let ban_duration = entry.route.auto_ban_duration_s;
+                                self.ban_list
+                                    .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
+                                warn!(
+                                    ip = %ip,
+                                    violations = %violations,
+                                    ban_duration_s = %ban_duration,
+                                    "IP auto-banned for rate limit abuse"
+                                );
+                                // Dispatch ip_banned notification
+                                if let Some(ref sender) = self.alert_sender {
+                                    sender.send(
+                                        lorica_notify::AlertEvent::new(
+                                            lorica_notify::events::AlertType::IpBanned,
+                                            format!("IP {} auto-banned for rate limit abuse", ip),
+                                        )
+                                        .with_detail("ip", ip.to_string())
+                                        .with_detail("violations", violations.to_string())
+                                        .with_detail("ban_duration_s", ban_duration.to_string()),
+                                    );
+                                }
+                            }
+                        }
+
+                        let reset_ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                            + 1;
+                        ctx.block_reason = Some("rate limited".to_string());
+                        let mut header = lorica_http::ResponseHeader::build(429, None)?;
+                        header.insert_header("Retry-After", "1")?;
+                        header.insert_header("X-RateLimit-Reset", reset_ts.to_string())?;
+                        session
+                            .write_response_header(Box::new(header), true)
+                            .await?;
+                        return Ok(true);
+                    }
                 }
             }
-        }
         } // end if !is_whitelisted (rate limiting)
 
         // Skip WAF evaluation entirely if not enabled or IP is whitelisted (zero overhead)
@@ -3079,7 +3087,11 @@ impl ProxyHttp for LoricaProxy {
             // Chunked transfer body size enforcement.
             // Content-Length based check is in request_filter; this catches
             // Transfer-Encoding: chunked requests that have no Content-Length.
-            if let Some(max) = ctx.route_snapshot.as_ref().and_then(|r| r.max_request_body_bytes) {
+            if let Some(max) = ctx
+                .route_snapshot
+                .as_ref()
+                .and_then(|r| r.max_request_body_bytes)
+            {
                 if ctx.body_bytes_received > max {
                     warn!(
                         received = ctx.body_bytes_received,
@@ -3181,12 +3193,9 @@ impl ProxyHttp for LoricaProxy {
                         _ => lorica_waf::WafMode::Detection,
                     };
 
-                    let mut verdict = self.waf_engine.evaluate_body(
-                        waf_mode,
-                        buf,
-                        host,
-                        client_ip,
-                    );
+                    let mut verdict = self
+                        .waf_engine
+                        .evaluate_body(waf_mode, buf, host, client_ip);
 
                     match verdict {
                         lorica_waf::WafVerdict::Blocked(ref mut events) => {
@@ -3518,9 +3527,7 @@ impl ProxyHttp for LoricaProxy {
                     if let Ok(mut header) = ResponseHeader::build(code, None) {
                         let _ = header.insert_header("Content-Type", "text/html; charset=utf-8");
                         let _ = header.insert_header("Content-Length", body.len().to_string());
-                        let r1 = session
-                            .write_response_header(Box::new(header), false)
-                            .await;
+                        let r1 = session.write_response_header(Box::new(header), false).await;
                         let r2 = session
                             .write_response_body(Some(bytes::Bytes::from(body)), true)
                             .await;
@@ -3613,11 +3620,7 @@ impl ProxyHttp for LoricaProxy {
                 .get("cookie")
                 .and_then(|v| v.to_str().ok())
                 .and_then(extract_sticky_backend)
-                .and_then(|backend_id| {
-                    healthy_backends
-                        .iter()
-                        .position(|b| b.id == backend_id)
-                })
+                .and_then(|backend_id| healthy_backends.iter().position(|b| b.id == backend_id))
         } else {
             None
         };
@@ -3627,34 +3630,34 @@ impl ProxyHttp for LoricaProxy {
         let idx = if let Some(sticky_idx) = sticky_backend_idx {
             sticky_idx
         } else {
-        match entry.route.load_balancing {
-            LoadBalancing::PeakEwma => self.ewma_tracker.select_best(&healthy_backends),
-            LoadBalancing::Random => {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                ctx.start_time.hash(&mut hasher);
-                (hasher.finish() as usize) % healthy_backends.len()
+            match entry.route.load_balancing {
+                LoadBalancing::PeakEwma => self.ewma_tracker.select_best(&healthy_backends),
+                LoadBalancing::Random => {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    ctx.start_time.hash(&mut hasher);
+                    (hasher.finish() as usize) % healthy_backends.len()
+                }
+                LoadBalancing::LeastConn => {
+                    // Select the backend with the fewest active connections
+                    healthy_backends
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, b)| self.backend_connections.get(&b.address))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0)
+                }
+                _ => {
+                    // Smooth weighted round-robin (Nginx algorithm) - covers
+                    // RoundRobin and ConsistentHash
+                    let bw: Vec<(&str, i64)> = healthy_backends
+                        .iter()
+                        .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
+                        .collect();
+                    entry.wrr_state.next(&bw)
+                }
             }
-            LoadBalancing::LeastConn => {
-                // Select the backend with the fewest active connections
-                healthy_backends
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, b)| self.backend_connections.get(&b.address))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            }
-            _ => {
-                // Smooth weighted round-robin (Nginx algorithm) - covers
-                // RoundRobin and ConsistentHash
-                let bw: Vec<(&str, i64)> = healthy_backends
-                    .iter()
-                    .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
-                    .collect();
-                entry.wrr_state.next(&bw)
-            }
-        }
         };
         let backend = healthy_backends[idx];
 
@@ -4287,11 +4290,7 @@ impl ProxyHttp for LoricaProxy {
         // errors (downstream/upstream resets, timeouts) as their latency
         // is not representative of backend performance.
         if let Some(ref route_id) = ctx.route_id {
-            if status != 101
-                && ctx.block_reason.is_none()
-                && !ctx.waf_blocked
-                && e.is_none()
-            {
+            if status != 101 && ctx.block_reason.is_none() && !ctx.waf_blocked && e.is_none() {
                 self.sla_collector.record(route_id, status, latency_ms);
             }
         }
@@ -4439,7 +4438,13 @@ mod tests {
 
     #[test]
     fn test_from_store_empty() {
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         assert!(config.routes_by_host.is_empty());
     }
 
@@ -4467,8 +4472,13 @@ mod tests {
         let r1 = make_route("r1", "example.com", "/", true);
         let r2 = make_route("r2", "disabled.com", "/", false);
 
-        let config =
-            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![r1, r2],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         assert!(config.routes_by_host.contains_key("example.com"));
         assert!(!config.routes_by_host.contains_key("disabled.com"));
     }
@@ -4479,8 +4489,13 @@ mod tests {
         let r2 = make_route("r2", "example.com", "/api", true);
         let r3 = make_route("r3", "example.com", "/api/v1", true);
 
-        let config =
-            ProxyConfig::from_store(vec![r1, r2, r3], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![r1, r2, r3],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].route.path_prefix, "/api/v1");
@@ -4492,8 +4507,13 @@ mod tests {
     fn test_from_store_route_without_backends() {
         let route = make_route("r1", "example.com", "/", true);
 
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].backends.is_empty());
     }
@@ -4504,8 +4524,13 @@ mod tests {
         route.certificate_id = Some("c1".into());
         let cert = make_certificate("c1", "example.com");
 
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![cert], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![],
+            vec![cert],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].certificate.is_some());
         assert_eq!(
@@ -4519,8 +4544,13 @@ mod tests {
         let mut route = make_route("r1", "example.com", "/", true);
         route.certificate_id = Some("nonexistent".into());
 
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].certificate.is_none());
     }
@@ -4586,9 +4616,18 @@ mod tests {
 
         // Regex precompile: index 1 (Mobile) must be Some, index 3 (bad)
         // must be None, Exact/Prefix indices are always None.
-        assert!(entry.header_rule_regexes[0].is_none(), "Exact rule -> no regex");
-        assert!(entry.header_rule_regexes[1].is_some(), "Regex rule compiles");
-        assert!(entry.header_rule_regexes[2].is_none(), "Exact rule -> no regex");
+        assert!(
+            entry.header_rule_regexes[0].is_none(),
+            "Exact rule -> no regex"
+        );
+        assert!(
+            entry.header_rule_regexes[1].is_some(),
+            "Regex rule compiles"
+        );
+        assert!(
+            entry.header_rule_regexes[2].is_none(),
+            "Exact rule -> no regex"
+        );
         assert!(
             entry.header_rule_regexes[3].is_none(),
             "broken regex was logged-and-disabled, not propagated"
@@ -4601,7 +4640,10 @@ mod tests {
         //  - dangling backend id -> filtered to empty, normalised to None
         assert_eq!(entry.header_rule_backends[0].as_ref().unwrap().len(), 1);
         assert_eq!(entry.header_rule_backends[1].as_ref().unwrap().len(), 2);
-        assert!(entry.header_rule_backends[2].is_none(), "flag rule: keep defaults");
+        assert!(
+            entry.header_rule_backends[2].is_none(),
+            "flag rule: keep defaults"
+        );
         assert!(
             entry.header_rule_backends[4].is_none(),
             "all backend_ids dangling -> normalised to None"
@@ -4615,8 +4657,13 @@ mod tests {
         let b2 = make_backend("b2", "10.0.0.2:8080");
         let links = vec![("r1".into(), "b1".into()), ("r1".into(), "b2".into())];
 
-        let config =
-            ProxyConfig::from_store(vec![route], vec![b1, b2], vec![], links, ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![b1, b2],
+            vec![],
+            links,
+            ProxyConfigGlobals::default(),
+        );
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert_eq!(entries[0].backends.len(), 2);
     }
@@ -4626,8 +4673,13 @@ mod tests {
         let r1 = make_route("r1", "foo.com", "/", true);
         let r2 = make_route("r2", "bar.com", "/", true);
 
-        let config =
-            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![r1, r2],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         assert_eq!(config.routes_by_host.len(), 2);
         assert!(config.routes_by_host.contains_key("foo.com"));
         assert!(config.routes_by_host.contains_key("bar.com"));
@@ -4638,8 +4690,13 @@ mod tests {
         let route = make_route("r1", "example.com", "/", true);
         let links = vec![("r1".into(), "nonexistent-backend".into())];
 
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], links, ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![],
+            vec![],
+            links,
+            ProxyConfigGlobals::default(),
+        );
         let entries = config.routes_by_host.get("example.com").unwrap();
         assert!(entries[0].backends.is_empty());
     }
@@ -4648,7 +4705,11 @@ mod tests {
     fn test_smooth_wrr_distribution() {
         // 3 backends with equal weight: should distribute evenly
         let state = SmoothWrrState::new(0);
-        let backends: Vec<(&str, i64)> = vec![("10.0.0.1:80", 100), ("10.0.0.2:80", 100), ("10.0.0.3:80", 100)];
+        let backends: Vec<(&str, i64)> = vec![
+            ("10.0.0.1:80", 100),
+            ("10.0.0.2:80", 100),
+            ("10.0.0.3:80", 100),
+        ];
         let mut counts = [0usize; 3];
         for _ in 0..30 {
             let idx = state.next(&backends);
@@ -4664,7 +4725,8 @@ mod tests {
     fn test_smooth_wrr_weighted() {
         // Weights 5,3,2: should distribute proportionally
         let state = SmoothWrrState::new(0);
-        let backends: Vec<(&str, i64)> = vec![("10.0.0.1:80", 5), ("10.0.0.2:80", 3), ("10.0.0.3:80", 2)];
+        let backends: Vec<(&str, i64)> =
+            vec![("10.0.0.1:80", 5), ("10.0.0.2:80", 3), ("10.0.0.3:80", 2)];
         let mut counts = [0usize; 3];
         for _ in 0..10 {
             let idx = state.next(&backends);
@@ -4680,10 +4742,17 @@ mod tests {
         // Two workers with different offsets should start on different backends
         let state0 = SmoothWrrState::new(0);
         let state1 = SmoothWrrState::new(1);
-        let backends: Vec<(&str, i64)> = vec![("10.0.0.1:80", 100), ("10.0.0.2:80", 100), ("10.0.0.3:80", 100)];
+        let backends: Vec<(&str, i64)> = vec![
+            ("10.0.0.1:80", 100),
+            ("10.0.0.2:80", 100),
+            ("10.0.0.3:80", 100),
+        ];
         let first0 = state0.next(&backends);
         let first1 = state1.next(&backends);
-        assert_ne!(first0, first1, "different workers should start on different backends");
+        assert_ne!(
+            first0, first1,
+            "different workers should start on different backends"
+        );
     }
 
     // ---- Least Connections ----
@@ -4856,8 +4925,13 @@ mod tests {
         let mut route = make_route("r1", "example.com", "/", true);
         route.hostname_aliases = vec!["www.example.com".into(), "alias.example.com".into()];
 
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         assert!(config.routes_by_host.contains_key("example.com"));
         assert!(config.routes_by_host.contains_key("www.example.com"));
         assert!(config.routes_by_host.contains_key("alias.example.com"));
@@ -4891,7 +4965,13 @@ mod tests {
 
     #[test]
     fn test_proxy_config_has_builtin_presets_by_default() {
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         let names: Vec<&str> = config
             .security_presets
             .iter()
@@ -4911,7 +4991,16 @@ mod tests {
                 "yes".to_string(),
             )]),
         };
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { custom_security_presets: vec![custom], ..Default::default() });
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals {
+                custom_security_presets: vec![custom],
+                ..Default::default()
+            },
+        );
         let found = config
             .security_presets
             .iter()
@@ -4929,8 +5018,16 @@ mod tests {
                 "SAMEORIGIN".to_string(),
             )]),
         };
-        let config =
-            ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { custom_security_presets: vec![custom_strict], ..Default::default() });
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals {
+                custom_security_presets: vec![custom_strict],
+                ..Default::default()
+            },
+        );
         let strict = config
             .security_presets
             .iter()
@@ -4947,8 +5044,13 @@ mod tests {
     #[test]
     fn test_wildcard_hostname_matching() {
         let route = make_route("r1", "*.example.com", "/", true);
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
 
         // Should match subdomains
         assert!(config.find_route("foo.example.com", "/").is_some());
@@ -4965,8 +5067,13 @@ mod tests {
     fn test_exact_match_takes_precedence_over_wildcard() {
         let r1 = make_route("r1", "*.example.com", "/", true);
         let r2 = make_route("r2", "specific.example.com", "/", true);
-        let config =
-            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![r1, r2],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
 
         let entry = config.find_route("specific.example.com", "/").unwrap();
         assert_eq!(entry.route.id, "r2"); // exact match wins
@@ -5336,7 +5443,16 @@ mod tests {
     fn test_flood_threshold_halves_effective_limit() {
         // When flood_threshold_rps > 0 and global RPS exceeds it,
         // the effective per-IP rate limit should be halved.
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { flood_threshold_rps: 100, ..Default::default() });
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals {
+                flood_threshold_rps: 100,
+                ..Default::default()
+            },
+        );
         assert_eq!(config.flood_threshold_rps, 100);
 
         // Simulate: route has rate_limit_rps=50, burst=10 -> effective=60
@@ -5364,7 +5480,13 @@ mod tests {
     #[test]
     fn test_flood_threshold_zero_disables_defense() {
         // When flood_threshold_rps is 0, adaptive defense is disabled
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         assert_eq!(config.flood_threshold_rps, 0);
 
         let base_limit: f64 = 100.0;
@@ -5402,8 +5524,13 @@ mod tests {
     #[test]
     fn test_catch_all_hostname() {
         let route = make_route("r_catch", "_", "/", true);
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
 
         // Catch-all "_" should match any hostname
         assert!(config.find_route("anything.example.com", "/").is_some());
@@ -5468,8 +5595,13 @@ mod tests {
             },
         ];
 
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
 
         let entry = config.find_route("example.com", "/api/v2/users").unwrap();
         assert_eq!(entry.route.id, "r1");
@@ -5484,11 +5616,7 @@ mod tests {
         assert_eq!(matched.unwrap().path, "/api/v2");
 
         // Verify exact match rule
-        let matched = entry
-            .route
-            .path_rules
-            .iter()
-            .find(|r| r.matches("/health"));
+        let matched = entry.route.path_rules.iter().find(|r| r.matches("/health"));
         assert!(matched.is_some());
         assert_eq!(matched.unwrap().return_status, Some(200));
 
@@ -5505,36 +5633,63 @@ mod tests {
 
     #[test]
     fn test_trusted_proxies_empty_by_default() {
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals::default(),
+        );
         assert!(config.trusted_proxies.is_empty());
     }
 
     #[test]
     fn test_trusted_proxies_cidr_parsed() {
-        let cidrs = vec![
-            "192.168.0.0/16".to_string(),
-            "10.0.0.0/8".to_string(),
-        ];
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
+        let cidrs = vec!["192.168.0.0/16".to_string(), "10.0.0.0/8".to_string()];
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals {
+                trusted_proxy_cidrs: cidrs,
+                ..Default::default()
+            },
+        );
         assert_eq!(config.trusted_proxies.len(), 2);
         // 192.168.1.1 is in 192.168.0.0/16
         let addr: std::net::IpAddr = "192.168.1.1".parse().unwrap();
         assert!(config.trusted_proxies.iter().any(|net| net.contains(&addr)));
         // 172.16.0.1 is NOT in the configured ranges
         let addr2: std::net::IpAddr = "172.16.0.1".parse().unwrap();
-        assert!(!config.trusted_proxies.iter().any(|net| net.contains(&addr2)));
+        assert!(!config
+            .trusted_proxies
+            .iter()
+            .any(|net| net.contains(&addr2)));
     }
 
     #[test]
     fn test_trusted_proxies_bare_ip_converted() {
         let cidrs = vec!["10.0.0.1".to_string()];
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals {
+                trusted_proxy_cidrs: cidrs,
+                ..Default::default()
+            },
+        );
         assert_eq!(config.trusted_proxies.len(), 1);
         let addr: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         assert!(config.trusted_proxies.iter().any(|net| net.contains(&addr)));
         // Different IP should not match
         let addr2: std::net::IpAddr = "10.0.0.2".parse().unwrap();
-        assert!(!config.trusted_proxies.iter().any(|net| net.contains(&addr2)));
+        assert!(!config
+            .trusted_proxies
+            .iter()
+            .any(|net| net.contains(&addr2)));
     }
 
     #[test]
@@ -5545,7 +5700,16 @@ mod tests {
             "".to_string(),
             "10.0.0.1".to_string(),
         ];
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
+        let config = ProxyConfig::from_store(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            ProxyConfigGlobals {
+                trusted_proxy_cidrs: cidrs,
+                ..Default::default()
+            },
+        );
         // Only the valid CIDR and the valid bare IP should be parsed
         assert_eq!(config.trusted_proxies.len(), 2);
     }
@@ -5570,10 +5734,7 @@ mod tests {
 
     #[test]
     fn test_extract_sticky_backend_absent() {
-        assert_eq!(
-            extract_sticky_backend("session=xyz; lang=en"),
-            None
-        );
+        assert_eq!(extract_sticky_backend("session=xyz; lang=en"), None);
     }
 
     #[test]
@@ -5673,11 +5834,11 @@ mod tests {
         // Insert with a timestamp in the past (simulate expired entry)
         cache.insert(key, Instant::now() - Duration::from_secs(120));
         let ttl = Duration::from_secs(60);
-        let is_valid = cache
-            .get(&key)
-            .map(|t| t.elapsed() < ttl)
-            .unwrap_or(false);
-        assert!(!is_valid, "Entry older than TTL should be considered expired");
+        let is_valid = cache.get(&key).map(|t| t.elapsed() < ttl).unwrap_or(false);
+        assert!(
+            !is_valid,
+            "Entry older than TTL should be considered expired"
+        );
     }
 
     #[test]
@@ -5695,7 +5856,10 @@ mod tests {
         "$argon2id$hash1".hash(&mut h2);
         let key2 = h2.finish();
 
-        assert_ne!(key1, key2, "Different passwords should produce different cache keys");
+        assert_ne!(
+            key1, key2,
+            "Different passwords should produce different cache keys"
+        );
     }
 
     // ---- Retry on methods filtering ----
@@ -5720,13 +5884,19 @@ mod tests {
         // POST is not in the list - should be filtered out
         let method = "POST";
         let eligible = route.retry_on_methods.is_empty()
-            || route.retry_on_methods.iter().any(|m| m.eq_ignore_ascii_case(method));
+            || route
+                .retry_on_methods
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(method));
         assert!(!eligible, "POST should not be eligible for retry");
 
         // GET is in the list - should be eligible
         let method = "GET";
         let eligible = route.retry_on_methods.is_empty()
-            || route.retry_on_methods.iter().any(|m| m.eq_ignore_ascii_case(method));
+            || route
+                .retry_on_methods
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(method));
         assert!(eligible, "GET should be eligible for retry");
     }
 
@@ -5804,10 +5974,7 @@ mod tests {
             backend_ids: vec![],
         };
         let re = regex::Regex::new(&rule.value).unwrap();
-        assert!(rule.matches(
-            "Mozilla/5.0 ... Chrome/120",
-            |v| re.is_match(v)
-        ));
+        assert!(rule.matches("Mozilla/5.0 ... Chrome/120", |v| re.is_match(v)));
         assert!(!rule.matches("curl/8.0", |v| re.is_match(v)));
         // Closure never called for Exact/Prefix types: `|_| panic!()`
         // would be tempting but verify by constructing a non-panic closure
@@ -5951,7 +6118,12 @@ mod tests {
 
     #[test]
     fn test_apply_response_rewrites_literal_single_match() {
-        let rules = compile(vec![rewrite_rule("internal.svc", "api.example.com", false, None)]);
+        let rules = compile(vec![rewrite_rule(
+            "internal.svc",
+            "api.example.com",
+            false,
+            None,
+        )]);
         let body = b"GET http://internal.svc/path HTTP/1.1";
         let out = apply_response_rewrites(body, &rules);
         assert_eq!(out, b"GET http://api.example.com/path HTTP/1.1");
@@ -6061,7 +6233,11 @@ mod tests {
     fn test_should_rewrite_response_default_text_prefix() {
         let cfg = rewrite_cfg(vec![]); // empty -> default to "text/"
         assert!(should_rewrite_response(&cfg, "text/html", ""));
-        assert!(should_rewrite_response(&cfg, "text/plain; charset=utf-8", ""));
+        assert!(should_rewrite_response(
+            &cfg,
+            "text/plain; charset=utf-8",
+            ""
+        ));
         assert!(!should_rewrite_response(&cfg, "application/json", ""));
     }
 
@@ -6291,8 +6467,14 @@ mod tests {
         );
         let out = build_forward_auth_headers(&req, Some("203.0.113.9"), "https");
 
-        assert_eq!(header_by(&out, "X-Forwarded-Method").as_deref(), Some("POST"));
-        assert_eq!(header_by(&out, "X-Forwarded-Proto").as_deref(), Some("https"));
+        assert_eq!(
+            header_by(&out, "X-Forwarded-Method").as_deref(),
+            Some("POST")
+        );
+        assert_eq!(
+            header_by(&out, "X-Forwarded-Proto").as_deref(),
+            Some("https")
+        );
         assert_eq!(
             header_by(&out, "X-Forwarded-Host").as_deref(),
             Some("app.example.com")
@@ -6325,8 +6507,14 @@ mod tests {
         assert!(header_by(&out, "Authorization").is_none());
         assert!(header_by(&out, "X-Forwarded-For").is_none());
         // Required headers still present.
-        assert_eq!(header_by(&out, "X-Forwarded-Method").as_deref(), Some("GET"));
-        assert_eq!(header_by(&out, "X-Forwarded-Proto").as_deref(), Some("http"));
+        assert_eq!(
+            header_by(&out, "X-Forwarded-Method").as_deref(),
+            Some("GET")
+        );
+        assert_eq!(
+            header_by(&out, "X-Forwarded-Proto").as_deref(),
+            Some("http")
+        );
         assert_eq!(header_by(&out, "X-Forwarded-Uri").as_deref(), Some("/"));
     }
 
@@ -6450,7 +6638,8 @@ mod tests {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 2048];
                     let _ = stream.read(&mut buf).await;
-                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                    let resp =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                     let _ = stream.write_all(resp).await;
                     let _ = stream.shutdown().await;
                 });
@@ -6573,7 +6762,8 @@ mod tests {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 2048];
                     let _ = stream.read(&mut buf).await;
-                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                    let resp =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                     let _ = stream.write_all(resp).await;
                     let _ = stream.shutdown().await;
                 });
@@ -6626,7 +6816,10 @@ mod tests {
                 break;
             }
         }
-        assert!(differs, "changing route_id should change at least one bucket");
+        assert!(
+            differs,
+            "changing route_id should change at least one bucket"
+        );
     }
 
     fn split(name: &str, pct: u8, backends: &[&str]) -> lorica_config::models::TrafficSplit {
@@ -6721,9 +6914,11 @@ mod tests {
         // band MUST fall back to route defaults (None), not steal the
         // next split's bucket. Otherwise a typo would silently rebalance
         // 20% of traffic to the wrong backend.
-        let splits = vec![split("broken", 20, &["does-not-exist"]), split("good", 20, &["g"])];
-        let backends: Vec<Option<Vec<Backend>>> =
-            vec![None, Some(vec![mk_backend_with_id("g")])];
+        let splits = vec![
+            split("broken", 20, &["does-not-exist"]),
+            split("good", 20, &["g"]),
+        ];
+        let backends: Vec<Option<Vec<Backend>>> = vec![None, Some(vec![mk_backend_with_id("g")])];
         assert!(pick_traffic_split_backends(&splits, &backends, 0).is_none());
         assert!(pick_traffic_split_backends(&splits, &backends, 19).is_none());
         assert_eq!(
@@ -6745,7 +6940,7 @@ mod tests {
             split("v2", 10, &["b-v2"]),
             split("dangling", 5, &["missing"]), // all dangling -> None
             split("v3", 5, &["b-v3a", "b-v3b"]),
-            split("zero", 0, &["b-v2"]),        // weight 0 -> None
+            split("zero", 0, &["b-v2"]), // weight 0 -> None
         ];
 
         let b_default = make_backend("b-default", "10.0.0.1:80");
@@ -6817,22 +7012,12 @@ mod tests {
     #[test]
     fn test_variance_route_headers_only() {
         let headers = hmap(&[("accept-encoding", "gzip")]);
-        let v1 = compute_cache_variance(
-            &["Accept-Encoding".to_string()],
-            "",
-            &headers,
-            "/",
-        );
+        let v1 = compute_cache_variance(&["Accept-Encoding".to_string()], "", &headers, "/");
         assert!(v1.is_some());
 
         // Different header value -> different variance.
         let headers2 = hmap(&[("accept-encoding", "br")]);
-        let v2 = compute_cache_variance(
-            &["Accept-Encoding".to_string()],
-            "",
-            &headers2,
-            "/",
-        );
+        let v2 = compute_cache_variance(&["Accept-Encoding".to_string()], "", &headers2, "/");
         assert_ne!(v1, v2);
     }
 
@@ -6841,12 +7026,7 @@ mod tests {
         let headers = hmap(&[("accept-encoding", "gzip"), ("accept-language", "en")]);
 
         // Only route-configured.
-        let v_route = compute_cache_variance(
-            &["accept-encoding".to_string()],
-            "",
-            &headers,
-            "/",
-        );
+        let v_route = compute_cache_variance(&["accept-encoding".to_string()], "", &headers, "/");
 
         // Only response-signalled.
         let v_resp = compute_cache_variance(&[], "Accept-Encoding", &headers, "/");
@@ -6873,12 +7053,7 @@ mod tests {
             &headers,
             "/",
         );
-        let b = compute_cache_variance(
-            &["accept-encoding".to_string()],
-            "",
-            &headers,
-            "/",
-        );
+        let b = compute_cache_variance(&["accept-encoding".to_string()], "", &headers, "/");
         assert_eq!(a, b);
     }
 
@@ -6946,9 +7121,21 @@ mod tests {
         route.cache_vary_headers = vec!["Accept-Encoding".into()];
 
         let meta = vary_meta(Some("Accept-Language"));
-        let req_gzip_en = vary_req("GET", "/x", &[("accept-encoding", "gzip"), ("accept-language", "en")]);
-        let req_gzip_fr = vary_req("GET", "/x", &[("accept-encoding", "gzip"), ("accept-language", "fr")]);
-        let req_br_en = vary_req("GET", "/x", &[("accept-encoding", "br"), ("accept-language", "en")]);
+        let req_gzip_en = vary_req(
+            "GET",
+            "/x",
+            &[("accept-encoding", "gzip"), ("accept-language", "en")],
+        );
+        let req_gzip_fr = vary_req(
+            "GET",
+            "/x",
+            &[("accept-encoding", "gzip"), ("accept-language", "fr")],
+        );
+        let req_br_en = vary_req(
+            "GET",
+            "/x",
+            &[("accept-encoding", "br"), ("accept-language", "en")],
+        );
 
         let v_ge = cache_vary_for_request(Some(&route), &meta, &req_gzip_en);
         let v_gf = cache_vary_for_request(Some(&route), &meta, &req_gzip_fr);
@@ -7012,7 +7199,11 @@ mod tests {
         // predictor lookups.
         use lorica_cache::predictor::CacheablePredictor;
         let predictor = *CACHE_PREDICTOR;
-        let key = CacheKey::new(String::new(), "predictor-test.example/foo".to_string(), String::new());
+        let key = CacheKey::new(
+            String::new(),
+            "predictor-test.example/foo".to_string(),
+            String::new(),
+        );
 
         // Fresh key -> cacheable until proven otherwise.
         assert!(predictor.cacheable_prediction(&key));

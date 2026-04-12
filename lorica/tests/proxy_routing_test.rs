@@ -66,7 +66,7 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str) -> Route {
         auto_ban_duration_s: 3600,
         path_rules: vec![],
         return_status: None,
-            sticky_session: false,
+        sticky_session: false,
         basic_auth_username: None,
         basic_auth_password_hash: None,
         stale_while_revalidate_s: 10,
@@ -367,7 +367,10 @@ async fn test_v120_fields_survive_reload() {
     assert!(r.maintenance_mode, "maintenance_mode must survive reload");
     assert_eq!(r.error_page_html.as_deref(), Some("<h1>Down</h1>"));
     assert_eq!(r.basic_auth_username.as_deref(), Some("admin"));
-    assert_eq!(r.basic_auth_password_hash.as_deref(), Some("$argon2id$hash"));
+    assert_eq!(
+        r.basic_auth_password_hash.as_deref(),
+        Some("$argon2id$hash")
+    );
     assert_eq!(r.stale_while_revalidate_s, 30);
     assert_eq!(r.stale_if_error_s, 120);
     assert_eq!(r.retry_on_methods, vec!["GET", "HEAD"]);

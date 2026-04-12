@@ -461,6 +461,7 @@ describe('header_rules', () => {
         { header_name: 'X-Tenant', match_type: 'exact', value: 'acme', backend_ids: ['b1'] },
         { header_name: 'User-Agent', match_type: 'regex', value: '^Mobile', backend_ids: [] },
       ],
+      traffic_splits: [],
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
     };
@@ -1296,6 +1297,8 @@ describe('cache_vary_headers round-trip', () => {
       maintenance_mode: false,
       error_page_html: null,
       cache_vary_headers: ['Accept-Encoding', 'X-Tenant'],
+      header_rules: [],
+      traffic_splits: [],
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
     };
