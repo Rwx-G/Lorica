@@ -106,6 +106,7 @@ pub struct RouteResponse {
     pub maintenance_mode: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_page_html: Option<String>,
+    pub cache_vary_headers: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -167,6 +168,7 @@ pub struct CreateRouteRequest {
     pub retry_on_methods: Option<Vec<String>>,
     pub maintenance_mode: Option<bool>,
     pub error_page_html: Option<String>,
+    pub cache_vary_headers: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -225,6 +227,7 @@ pub struct UpdateRouteRequest {
     pub retry_on_methods: Option<Vec<String>>,
     pub maintenance_mode: Option<bool>,
     pub error_page_html: Option<String>,
+    pub cache_vary_headers: Option<Vec<String>>,
 }
 
 fn route_to_response(
@@ -301,6 +304,7 @@ fn route_to_response(
         retry_on_methods: route.retry_on_methods.clone(),
         maintenance_mode: route.maintenance_mode,
         error_page_html: route.error_page_html.clone(),
+        cache_vary_headers: route.cache_vary_headers.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -438,6 +442,7 @@ pub async fn create_route(
         retry_on_methods: body.retry_on_methods.clone().unwrap_or_default(),
         maintenance_mode: body.maintenance_mode.unwrap_or(false),
         error_page_html: body.error_page_html.clone(),
+        cache_vary_headers: body.cache_vary_headers.clone().unwrap_or_default(),
         created_at: now,
         updated_at: now,
     };
@@ -695,6 +700,16 @@ pub async fn update_route(
     }
     if let Some(ref html) = body.error_page_html {
         route.error_page_html = if html.is_empty() { None } else { Some(html.clone()) };
+    }
+    if let Some(ref headers) = body.cache_vary_headers {
+        // Normalise on write: trim whitespace, drop empties. Downstream
+        // variance logic lowercases on the hot path so no need to do it
+        // here - keeps the dashboard showing exactly what the operator typed.
+        route.cache_vary_headers = headers
+            .iter()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
     }
     route.updated_at = Utc::now();
 

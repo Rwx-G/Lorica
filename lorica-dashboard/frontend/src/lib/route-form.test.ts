@@ -175,6 +175,7 @@ describe('routeToFormState', () => {
     retry_on_methods: [],
     maintenance_mode: false,
     error_page_html: null,
+    cache_vary_headers: [],
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
   };

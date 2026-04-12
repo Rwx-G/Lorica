@@ -68,6 +68,7 @@ export interface RouteFormState {
   retry_on_methods: string;
   maintenance_mode: boolean;
   error_page_html: string;
+  cache_vary_headers: string;
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -124,6 +125,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   retry_on_methods: '',
   maintenance_mode: false,
   error_page_html: '',
+  cache_vary_headers: '',
 };
 
 // Tab field mappings for dot indicators
@@ -151,6 +153,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   ],
   caching: [
     'cache_enabled', 'cache_ttl_s', 'cache_max_mb', 'stale_while_revalidate_s', 'stale_if_error_s',
+    'cache_vary_headers',
   ],
   protection: [
     'max_connections', 'slowloris_threshold_ms',
@@ -251,6 +254,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     retry_on_methods: (route.retry_on_methods ?? []).join(', '),
     maintenance_mode: route.maintenance_mode ?? false,
     error_page_html: route.error_page_html ?? '',
+    cache_vary_headers: (route.cache_vary_headers ?? []).join(', '),
   };
 }
 
@@ -323,6 +327,9 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     retry_on_methods: csvToArray(form.retry_on_methods).length > 0 ? csvToArray(form.retry_on_methods) : empty([]),
     maintenance_mode: form.maintenance_mode,
     error_page_html: form.error_page_html || undefined,
+    cache_vary_headers: csvToArray(form.cache_vary_headers).length > 0
+      ? csvToArray(form.cache_vary_headers)
+      : empty([]),
   };
 }
 

@@ -53,6 +53,12 @@
       <span class="hint">Serve stale cached content when upstream returns an error. 0 = disabled.</span>
     </div>
   </div>
+
+  <div class="form-group" class:modified={isModified('cache_vary_headers')}>
+    <label for="cache-vary">Vary headers</label>
+    <input id="cache-vary" type="text" bind:value={form.cache_vary_headers} placeholder="Accept-Encoding, Accept-Language" />
+    <span class="hint">Comma-separated request header names. Each header value partitions the cache so different clients (gzip vs identity, en vs fr) get separate entries. Merged with the origin's Vary response header.</span>
+  </div>
 </div>
 
 <style>
@@ -69,7 +75,8 @@
     margin-bottom: 0.375rem;
   }
 
-  .form-group input[type="number"] {
+  .form-group input[type="number"],
+  .form-group input[type="text"] {
     width: 100%;
     padding: 0.5rem 0.75rem;
     border: 1px solid var(--color-border);

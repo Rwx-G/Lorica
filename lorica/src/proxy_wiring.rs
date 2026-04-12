@@ -27,9 +27,11 @@ use lorica_cache::cache_control::CacheControl;
 use lorica_cache::eviction::simple_lru;
 use lorica_cache::filters::resp_cacheable;
 use lorica_cache::lock::CacheLock;
+use lorica_cache::key::HashBinary;
 use lorica_cache::predictor::Predictor;
 use lorica_cache::{
     CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable,
+    VarianceBuilder,
 };
 use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route, WafMode};
 use lorica_core::protocols::Digest;
@@ -886,6 +888,64 @@ fn extract_host(req: &lorica_http::RequestHeader) -> &str {
         .and_then(|v| v.to_str().ok())
         .or_else(|| req.uri.authority().map(|a| a.as_str()))
         .unwrap_or("")
+}
+
+/// Compute a cache variance hash from a union of operator-configured vary
+/// headers (route config) and the origin response's `Vary` header.
+///
+/// Returns `None` when there is no variance to apply - the caller then
+/// caches the asset under its primary key. Extracted from
+/// `cache_vary_filter` as a pure helper so the merging, `Vary: *` handling,
+/// and case-insensitive deduplication are unit-testable without a full
+/// proxy session.
+pub(crate) fn compute_cache_variance(
+    route_headers: &[String],
+    response_vary: &str,
+    request_headers: &http::HeaderMap,
+    request_uri: &str,
+) -> Option<HashBinary> {
+    // Lower-case and deduplicate header names across both sources.
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for h in route_headers {
+        let trimmed = h.trim();
+        if !trimmed.is_empty() {
+            names.insert(trimmed.to_ascii_lowercase());
+        }
+    }
+
+    for part in response_vary.split(',') {
+        let t = part.trim();
+        if t == "*" {
+            // Per RFC 7234, `Vary: *` means every request is a unique
+            // variant. Anchor the variance on the request URI so repeat
+            // requests to the same URL still hit a stable slot - prevents
+            // unbounded cardinality growth while respecting the contract
+            // that two different URLs must not share a variant.
+            let mut vb = VarianceBuilder::new();
+            vb.add_value("*uri", request_uri);
+            return vb.finalize();
+        }
+        if !t.is_empty() {
+            names.insert(t.to_ascii_lowercase());
+        }
+    }
+
+    if names.is_empty() {
+        return None;
+    }
+
+    let mut vb = VarianceBuilder::new();
+    for name in names {
+        // Bytes (not only valid UTF-8) so request headers carrying
+        // binary-encoded values still partition the cache deterministically.
+        let value = request_headers
+            .get(name.as_str())
+            .map(|v| v.as_bytes().to_vec())
+            .unwrap_or_default();
+        vb.add_owned_name_value(name, value);
+    }
+    vb.finalize()
 }
 
 #[async_trait]
@@ -1857,6 +1917,46 @@ impl ProxyHttp for LoricaProxy {
         ))
     }
 
+    /// Partition the cache by request header values so responses that differ
+    /// based on client capabilities (content negotiation, localization,
+    /// auth tier, tenancy) stay separated under the same URL.
+    ///
+    /// Header names come from two sources, merged case-insensitively:
+    ///   1. The route's `cache_vary_headers` - operator-controlled, set
+    ///      regardless of what the origin advertises.
+    ///   2. The origin response's `Vary` header captured in the cached
+    ///      [`CacheMeta`] - respected as required by RFC 7234. `Vary: *`
+    ///      forces a URI-anchored variance so each URL keeps its own slot
+    ///      without sharing a variant across unrelated requests.
+    ///
+    /// Returning `None` (no headers contribute, or all target headers are
+    /// absent) means "no variance" and the asset is cached under its
+    /// primary key - the default state when this feature is unused.
+    fn cache_vary_filter(
+        &self,
+        meta: &CacheMeta,
+        ctx: &mut Self::CTX,
+        req: &lorica_http::RequestHeader,
+    ) -> Option<HashBinary> {
+        let route_headers: &[String] = ctx
+            .route_snapshot
+            .as_ref()
+            .map(|r| r.cache_vary_headers.as_slice())
+            .unwrap_or(&[]);
+        let response_vary = meta
+            .headers()
+            .get("vary")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let request_uri = req
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+
+        compute_cache_variance(route_headers, response_vary, &req.headers, request_uri)
+    }
+
     /// Decide whether the upstream response should be admitted to cache.
     ///
     /// When the origin sends Cache-Control, the standard resp_cacheable
@@ -2694,6 +2794,7 @@ mod tests {
             retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
+            cache_vary_headers: vec![],
             created_at: now,
             updated_at: now,
         }
@@ -3978,6 +4079,118 @@ mod tests {
         route.stale_if_error_s = 0;
         assert_eq!(route.stale_while_revalidate_s as u32, 0);
         assert_eq!(route.stale_if_error_s as u32, 0);
+    }
+
+    fn hmap(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut m = http::HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(
+                http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                http::header::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn test_variance_no_headers_yields_none() {
+        assert!(compute_cache_variance(&[], "", &hmap(&[]), "/").is_none());
+    }
+
+    #[test]
+    fn test_variance_route_headers_only() {
+        let headers = hmap(&[("accept-encoding", "gzip")]);
+        let v1 = compute_cache_variance(
+            &["Accept-Encoding".to_string()],
+            "",
+            &headers,
+            "/",
+        );
+        assert!(v1.is_some());
+
+        // Different header value -> different variance.
+        let headers2 = hmap(&[("accept-encoding", "br")]);
+        let v2 = compute_cache_variance(
+            &["Accept-Encoding".to_string()],
+            "",
+            &headers2,
+            "/",
+        );
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn test_variance_route_and_response_vary_merge() {
+        let headers = hmap(&[("accept-encoding", "gzip"), ("accept-language", "en")]);
+
+        // Only route-configured.
+        let v_route = compute_cache_variance(
+            &["accept-encoding".to_string()],
+            "",
+            &headers,
+            "/",
+        );
+
+        // Only response-signalled.
+        let v_resp = compute_cache_variance(&[], "Accept-Encoding", &headers, "/");
+
+        // Same header from either source should produce the same variance.
+        assert_eq!(v_route, v_resp);
+
+        // Union picks up both; a new header changes the hash.
+        let v_both = compute_cache_variance(
+            &["accept-encoding".to_string()],
+            "Accept-Language",
+            &headers,
+            "/",
+        );
+        assert_ne!(v_route, v_both);
+    }
+
+    #[test]
+    fn test_variance_case_insensitive_and_dedup() {
+        let headers = hmap(&[("accept-encoding", "gzip")]);
+        let a = compute_cache_variance(
+            &["Accept-Encoding".to_string()],
+            "accept-encoding, ACCEPT-ENCODING",
+            &headers,
+            "/",
+        );
+        let b = compute_cache_variance(
+            &["accept-encoding".to_string()],
+            "",
+            &headers,
+            "/",
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_variance_star_anchors_on_uri() {
+        let headers = hmap(&[]);
+        let v_a = compute_cache_variance(&[], "*", &headers, "/a");
+        let v_b = compute_cache_variance(&[], "*", &headers, "/b");
+        let v_a_again = compute_cache_variance(&[], "*", &headers, "/a");
+        assert!(v_a.is_some());
+        assert_ne!(v_a, v_b);
+        assert_eq!(v_a, v_a_again);
+    }
+
+    #[test]
+    fn test_variance_missing_request_header_uses_empty_value() {
+        // When the client does not send the vary header, it must still
+        // produce a deterministic variance distinct from the case where the
+        // header is present - otherwise clients without the header would
+        // collide with whichever variant the first sender populated.
+        let no_header = hmap(&[]);
+        let with_header = hmap(&[("accept-encoding", "gzip")]);
+        let route = vec!["accept-encoding".to_string()];
+
+        let v_empty = compute_cache_variance(&route, "", &no_header, "/");
+        let v_gzip = compute_cache_variance(&route, "", &with_header, "/");
+
+        assert!(v_empty.is_some());
+        assert_ne!(v_empty, v_gzip);
     }
 
     #[test]

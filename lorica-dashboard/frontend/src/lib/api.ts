@@ -155,6 +155,7 @@ export interface RouteResponse {
   retry_on_methods: string[];
   maintenance_mode: boolean;
   error_page_html: string | null;
+  cache_vary_headers: string[];
   created_at: string;
   updated_at: string;
 }
@@ -212,6 +213,7 @@ export interface CreateRouteRequest {
   retry_on_methods?: string[];
   maintenance_mode?: boolean;
   error_page_html?: string;
+  cache_vary_headers?: string[];
 }
 
 
@@ -269,6 +271,7 @@ export interface UpdateRouteRequest {
   retry_on_methods?: string[];
   maintenance_mode?: boolean;
   error_page_html?: string;
+  cache_vary_headers?: string[];
 }
 
 export interface BackendResponse {

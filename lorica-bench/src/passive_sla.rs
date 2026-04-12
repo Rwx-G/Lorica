@@ -596,6 +596,7 @@ mod tests {
             retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
+            cache_vary_headers: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -693,6 +694,7 @@ mod tests {
             retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
+            cache_vary_headers: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -805,6 +807,7 @@ mod tests {
             retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
+            cache_vary_headers: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -902,6 +905,7 @@ mod tests {
             retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
+            cache_vary_headers: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -982,6 +986,7 @@ mod tests {
             retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
+            cache_vary_headers: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

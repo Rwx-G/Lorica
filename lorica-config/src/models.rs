@@ -437,6 +437,13 @@ pub struct Route {
     pub maintenance_mode: bool,
     #[serde(default)]
     pub error_page_html: Option<String>,
+    /// Request header names that partition the cache for this route.
+    /// Each listed header contributes its value to a variance key so
+    /// different values get separate cache entries (e.g.
+    /// `["Accept-Encoding"]` keeps gzip and identity responses separate).
+    /// Merged with any `Vary` header the origin returns.
+    #[serde(default)]
+    pub cache_vary_headers: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1381,6 +1388,7 @@ mod tests {
             retry_on_methods: vec![],
             maintenance_mode: false,
             error_page_html: None,
+            cache_vary_headers: Vec::new(),
             created_at: now,
             updated_at: now,
         };

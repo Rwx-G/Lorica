@@ -74,6 +74,7 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str) -> Route {
         retry_on_methods: vec![],
         maintenance_mode: false,
         error_page_html: None,
+        cache_vary_headers: vec![],
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
