@@ -593,7 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_history_ring_buffer_overflow() {
-        let mut d = NotifyDispatcher::new();
+        let d = NotifyDispatcher::new();
         // Default max_history is 100
         for i in 0..110 {
             let event = AlertEvent::new(AlertType::BackendDown, format!("event {i}"));

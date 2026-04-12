@@ -452,7 +452,7 @@ async fn mirror_zero_percent_disables_mirroring() {
         .unwrap();
 
     for _ in 0..5 {
-        let resp = client.get(&harness.url()).send().await.unwrap();
+        let resp = client.get(harness.url()).send().await.unwrap();
         assert_eq!(resp.status(), 200);
     }
 
@@ -502,7 +502,7 @@ async fn mirror_dead_shadow_does_not_affect_primary() {
         .unwrap();
 
     let t0 = Instant::now();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     let elapsed = t0.elapsed();
     assert_eq!(resp.status(), 200);
     assert_eq!(
@@ -546,7 +546,7 @@ async fn mirror_disabled_route_never_produces_shadow_traffic() {
         .unwrap();
 
     for _ in 0..3 {
-        let resp = client.get(&harness.url()).send().await.unwrap();
+        let resp = client.get(harness.url()).send().await.unwrap();
         assert_eq!(resp.status(), 200);
     }
 
@@ -593,7 +593,7 @@ async fn mirror_post_body_is_forwarded_to_shadow() {
     // drift is easy to see in test failure output.
     let payload = b"hello-shadow-this-is-a-specific-payload-1234567";
     let resp = client
-        .post(&harness.url())
+        .post(harness.url())
         .body(payload.to_vec())
         .send()
         .await
@@ -658,7 +658,7 @@ async fn mirror_oversize_body_is_not_mirrored() {
 
     let payload = vec![b'x'; 2048];
     let resp = client
-        .post(&harness.url())
+        .post(harness.url())
         .body(payload.clone())
         .send()
         .await
@@ -716,7 +716,7 @@ async fn mirror_max_body_bytes_zero_is_headers_only() {
 
     let payload = b"some-body-the-operator-doesnt-want-mirrored";
     let resp = client
-        .post(&harness.url())
+        .post(harness.url())
         .body(payload.to_vec())
         .send()
         .await
@@ -765,7 +765,7 @@ async fn mirror_dangling_backend_id_is_inert() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(primary_stats.total.load(Ordering::SeqCst), 1);
 }

@@ -354,7 +354,7 @@ async fn swr_serves_stale_immediately_and_refreshes_in_background() {
         .unwrap();
 
     // Request 1: cache miss, populates cache with v1-hit1. Origin = 1.
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let body1 = r.text().await.unwrap();
     assert_eq!(body1, "v1-hit1");
@@ -370,7 +370,7 @@ async fn swr_serves_stale_immediately_and_refreshes_in_background() {
     // Request 2: stale hit within SWR. The client MUST see the still-
     // cached v1 body immediately; the background refresh will bump the
     // origin hit counter to 2 asynchronously.
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let body2 = r.text().await.unwrap();
     assert_eq!(
@@ -393,7 +393,7 @@ async fn swr_serves_stale_immediately_and_refreshes_in_background() {
 
     // Request 3: cache is fresh again. Client sees v2 content. Origin
     // is NOT hit a third time (stays at 2).
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let body3 = r.text().await.unwrap();
     assert_eq!(body3, "v2-hit2", "post-refresh hit must serve the fresh v2");
@@ -433,7 +433,7 @@ async fn swr_disabled_route_revalidates_synchronously() {
         .build()
         .unwrap();
 
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(r.text().await.unwrap(), "v1-hit1");
 
     state.version.store(2, Ordering::SeqCst);
@@ -442,7 +442,7 @@ async fn swr_disabled_route_revalidates_synchronously() {
     // With SWR=0, the expired-but-within-SIE window uses stale-if-
     // error semantics only (and there's no error), so the proxy has
     // to revalidate synchronously. The client sees v2 immediately.
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(
         r.text().await.unwrap(),
         "v2-hit2",
@@ -489,7 +489,7 @@ async fn stale_if_error_serves_cached_body_when_upstream_fails() {
         .unwrap();
 
     // Populate cache with v1.
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(r.text().await.unwrap(), "v1-hit1");
 
     // Flip the origin into "fail mode" by setting version=0. The mock
@@ -500,7 +500,7 @@ async fn stale_if_error_serves_cached_body_when_upstream_fails() {
 
     // Origin is now returning 503 -> stale-if-error must kick in and
     // the client gets the cached v1-hit1 body.
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(
         r.status(),
         200,
@@ -536,7 +536,7 @@ async fn swr_concurrent_requests_spawn_exactly_one_background_refresh() {
         .unwrap();
 
     // Populate cache (hit 1).
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(r.text().await.unwrap(), "v1-hit1");
     state.version.store(2, Ordering::SeqCst);
 
@@ -604,7 +604,7 @@ async fn swr_background_refresh_failure_does_not_poison_cache() {
         .build()
         .unwrap();
 
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(r.text().await.unwrap(), "v1-hit1");
 
     // Flip origin to failure mode.
@@ -612,7 +612,7 @@ async fn swr_background_refresh_failure_does_not_poison_cache() {
     tokio::time::sleep(Duration::from_millis(1_300)).await;
 
     // Request 2: stale hit, SWR refresh fires, refresh fails.
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(
         r.text().await.unwrap(),
         "v1-hit1",
@@ -627,7 +627,7 @@ async fn swr_background_refresh_failure_does_not_poison_cache() {
     // Request 3: entry is still within SIE (60s). A failed refresh
     // must NOT have written a 503 over the cached v1. The client
     // must still see v1, not an error body.
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(
         r.status(),
         200,
@@ -660,7 +660,7 @@ async fn swr_window_expiry_falls_back_to_synchronous_fetch() {
         .build()
         .unwrap();
 
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(r.text().await.unwrap(), "v1-hit1");
 
     state.version.store(2, Ordering::SeqCst);
@@ -671,7 +671,7 @@ async fn swr_window_expiry_falls_back_to_synchronous_fetch() {
     // Outside the SWR window, the stale hit doesn't qualify for
     // background refresh - the response must be the fresh v2 fetched
     // synchronously.
-    let r = client.get(&harness.url()).send().await.unwrap();
+    let r = client.get(harness.url()).send().await.unwrap();
     assert_eq!(
         r.text().await.unwrap(),
         "v2-hit2",

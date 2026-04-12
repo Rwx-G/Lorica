@@ -1250,7 +1250,10 @@ fn extract_host(req: &lorica_http::RequestHeader) -> &str {
 /// leave `matched_backends` alone when this returns `None`.
 ///
 /// Extracted so the matching + extraction path is exercised by unit
-/// tests without needing a Session or ProxyConfig.
+/// tests without needing a Session or ProxyConfig. The production path
+/// in `request_filter` inlines the same logic to capture the matched
+/// rule index for the Prometheus metric label.
+#[cfg(test)]
 pub(crate) fn match_header_rule_backends<'a>(
     rules: &[lorica_config::models::HeaderRule],
     regexes: &[Option<Arc<regex::Regex>>],
@@ -1379,6 +1382,11 @@ pub(crate) fn build_forward_auth_headers(
 /// network I/O is contained here so the surrounding `request_filter`
 /// stays a straight pipeline - the caller only has to match on
 /// `ForwardAuthOutcome`.
+///
+/// Thin wrapper over `run_forward_auth_keyed` with cache disabled.
+/// Production callers invoke the keyed variant directly; this one exists
+/// for tests that predate the verdict cache.
+#[cfg(test)]
 pub(crate) async fn run_forward_auth(
     cfg: &lorica_config::models::ForwardAuthConfig,
     req: &lorica_http::RequestHeader,
@@ -1572,9 +1580,10 @@ pub fn evaluate_mtls(enforcer: &MtlsEnforcer, client_organization: Option<&str>)
             }
         }
         Some(org) => {
-            if enforcer.allowed_organizations.is_empty() {
-                None
-            } else if enforcer.allowed_organizations.iter().any(|a| a == org) {
+            // Empty allowlist = accept any authenticated client.
+            if enforcer.allowed_organizations.is_empty()
+                || enforcer.allowed_organizations.iter().any(|a| a == org)
+            {
                 None
             } else {
                 Some(495)
@@ -1963,7 +1972,10 @@ pub fn canary_bucket(route_id: &str, client_ip: &str) -> u8 {
 ///
 /// The caller is responsible for computing `bucket`; extracting this
 /// function keeps weighted-selection math independent of the actual
-/// client-IP hash, so both are trivially unit-testable.
+/// client-IP hash, so both are trivially unit-testable. The production
+/// path in `request_filter` inlines the same logic to capture the
+/// matched split name for the Prometheus metric label.
+#[cfg(test)]
 pub(crate) fn pick_traffic_split_backends<'a>(
     splits: &[lorica_config::models::TrafficSplit],
     resolved: &'a [Option<Vec<Backend>>],
@@ -2673,11 +2685,11 @@ impl ProxyHttp for LoricaProxy {
                         }
 
                         // Cache miss or expired - run full Argon2 verification.
-                        // Parse the hash first; if it's corrupt, deny immediately.
-                        let parsed_hash = match argon2::PasswordHash::new(expected_hash) {
-                            Ok(h) => h,
-                            Err(_) => return false, // corrupt hash -> deny
-                        };
+                        // Parse the hash first; if it's corrupt, deny immediately
+                        // without paying the cost of block_in_place.
+                        if argon2::PasswordHash::new(expected_hash).is_err() {
+                            return false;
+                        }
                         // Offload CPU-intensive Argon2 to the blocking thread
                         // pool to avoid stalling the async proxy runtime.
                         let pass_bytes = pass.as_bytes().to_vec();
@@ -4781,7 +4793,7 @@ mod tests {
         bc.increment("10.0.0.2:80");
 
         // 10.0.0.3:80 has 0 connections, should be selected
-        let backends = vec![
+        let backends = [
             make_backend("b1", "10.0.0.1:80"),
             make_backend("b2", "10.0.0.2:80"),
             make_backend("b3", "10.0.0.3:80"),
@@ -4804,7 +4816,7 @@ mod tests {
     fn test_least_conn_with_equal_connections() {
         let bc = BackendConnections::new();
         // All have 0 connections - should select index 0 (first min)
-        let backends = vec![
+        let backends = [
             make_backend("b1", "10.0.0.1:80"),
             make_backend("b2", "10.0.0.2:80"),
         ];

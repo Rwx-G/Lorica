@@ -359,8 +359,7 @@ async fn handshake_with_untrusted_client_cert_fails() {
     );
     let err = attempt_tls_connect(addr, cc)
         .await
-        .err()
-        .expect("expected handshake failure");
+        .expect_err("expected handshake failure");
     assert!(
         err.to_lowercase().contains("cert")
             || err.to_lowercase().contains("tls")
@@ -477,7 +476,7 @@ async fn lorica_proxy_accepts_mtls_route_in_snapshot() {
         .mtls_enforcer
         .as_ref()
         .expect("mtls_enforcer populated");
-    assert_eq!(enforcer.required, true);
+    assert!(enforcer.required);
     assert_eq!(
         enforcer.allowed_organizations,
         vec!["Acme Corp".to_string()]

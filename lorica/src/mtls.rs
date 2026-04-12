@@ -248,7 +248,7 @@ mod tests {
         };
         let routes = vec![make_route("a", Some(mtls))];
         let store = build_union_root_store(&routes).expect("store");
-        assert!(store.len() >= 1);
+        assert!(!store.is_empty());
     }
 
     #[test]

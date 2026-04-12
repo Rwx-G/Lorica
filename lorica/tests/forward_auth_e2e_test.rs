@@ -483,7 +483,7 @@ async fn forward_auth_allow_injects_response_headers_and_reaches_upstream() {
         .unwrap();
 
     let resp = client
-        .get(&harness.url())
+        .get(harness.url())
         .header("Cookie", "verdict=allow")
         .send()
         .await
@@ -539,7 +539,7 @@ async fn forward_auth_deny_forwards_status_and_body_verbatim() {
 
     // Explicit 403 from auth.
     let resp = client
-        .get(&harness.url())
+        .get(harness.url())
         .header("Cookie", "verdict=deny")
         .send()
         .await
@@ -556,7 +556,7 @@ async fn forward_auth_deny_forwards_status_and_body_verbatim() {
 
     // 401 (default branch in the mock).
     let resp = client
-        .get(&harness.url())
+        .get(harness.url())
         .header("Cookie", "verdict=unknown")
         .send()
         .await
@@ -608,7 +608,7 @@ async fn forward_auth_redirect_is_forwarded_verbatim_to_client() {
         .unwrap();
 
     let resp = client
-        .get(&harness.url())
+        .get(harness.url())
         .header("Cookie", "verdict=redirect")
         .send()
         .await
@@ -655,7 +655,7 @@ async fn forward_auth_timeout_fails_closed_503() {
         .unwrap();
 
     let resp = client
-        .get(&harness.url())
+        .get(harness.url())
         .header("Cookie", "verdict=slow")
         .send()
         .await
@@ -700,7 +700,7 @@ async fn forward_auth_unreachable_fails_closed_503() {
         .build()
         .unwrap();
 
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 503);
 }
 
@@ -727,7 +727,7 @@ async fn forward_auth_disabled_route_skips_auth_altogether() {
         .build()
         .unwrap();
 
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     // No Remote-User was injected (no auth was consulted).
     assert_eq!(
@@ -781,7 +781,7 @@ async fn forward_auth_forwards_client_context_headers_to_auth() {
     // POST should still be supported: auth receives X-Forwarded-Method=POST
     // and allows; upstream sees Remote-User.
     let resp = client
-        .post(&harness.url())
+        .post(harness.url())
         .header("Cookie", "verdict=allow")
         .body("payload")
         .send()

@@ -33,6 +33,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Scripted-origin responder: maps the raw request bytes to the raw
+/// response bytes the mock should send back.
+type ScriptedResponder = Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
+
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use lorica::proxy_wiring::{LoricaProxy, ProxyConfig, ProxyConfigGlobals};
@@ -51,9 +55,7 @@ use tokio::net::TcpListener;
 // scaffolding.
 // ---------------------------------------------------------------------------
 
-async fn spawn_scripted_origin(
-    responder: Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>,
-) -> SocketAddr {
+async fn spawn_scripted_origin(responder: ScriptedResponder) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -386,7 +388,7 @@ async fn rewrite_literal_html_body_end_to_end() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     // Content-Length must be gone: the rewrite produces a body of
     // different length, so the header would lie.
@@ -431,7 +433,7 @@ async fn rewrite_across_chunk_boundaries() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(resp.text().await.unwrap(), "before-[redacted]-after");
 }
 
@@ -466,7 +468,7 @@ async fn rewrite_skips_non_text_content_type() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     let body = resp.bytes().await.unwrap();
     assert_eq!(
         body.as_ref(),
@@ -508,7 +510,7 @@ async fn rewrite_skips_gzip_encoded_responses() {
         .no_deflate()
         .build()
         .unwrap();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     let body = resp.bytes().await.unwrap();
     assert_eq!(
         body.as_ref(),
@@ -546,7 +548,7 @@ async fn rewrite_regex_with_capture_groups_end_to_end() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(
         resp.text().await.unwrap(),
         "user=alice email=[redacted:alice@example.com]"
@@ -584,7 +586,7 @@ async fn rewrite_oversize_body_streams_unchanged() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     let body = resp.bytes().await.unwrap();
     assert_eq!(
         body.as_ref(),
@@ -616,7 +618,7 @@ async fn rewrite_disabled_route_passes_body_through() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     // Content-Length MUST still be present when rewrite is off -
     // proves we only drop it on the rewrite path.
     assert!(resp.headers().get("content-length").is_some());
@@ -640,14 +642,13 @@ async fn rewrite_skipped_for_head_requests_preserves_content_length() {
         if method == "HEAD" {
             // HEAD: headers only, no body (origin server-side we
             // send empty body + matching Content-Length).
-            format!(
-                "HTTP/1.1 200 OK\r\n\
+            "HTTP/1.1 200 OK\r\n\
                  Content-Type: text/html\r\n\
                  Content-Length: 42\r\n\
                  Connection: close\r\n\
                  \r\n"
-            )
-            .into_bytes()
+                .to_string()
+                .into_bytes()
         } else {
             static_response("text/html", b"<html>backend response body</html>")
         }
@@ -670,7 +671,7 @@ async fn rewrite_skipped_for_head_requests_preserves_content_length() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let resp = client.head(&harness.url()).send().await.unwrap();
+    let resp = client.head(harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.headers()
@@ -713,7 +714,7 @@ async fn rewrite_is_disabled_when_cache_enabled_on_same_route() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     // Rewrite is suppressed: the original "backend" substring must
@@ -753,7 +754,7 @@ async fn rewrite_multiple_rules_compose_in_declaration_order() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let resp = client.get(&harness.url()).send().await.unwrap();
+    let resp = client.get(harness.url()).send().await.unwrap();
     assert_eq!(
         resp.text().await.unwrap(),
         "one bird, two bird, crow, blue bird"

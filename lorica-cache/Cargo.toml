@@ -51,6 +51,7 @@ tokio-test = "0.4"
 tokio = { workspace = true, features = ["fs"] }
 env_logger = "0.11"
 futures = "0.3"
+dhat = "0.3"
 
 [features]
 default = []

@@ -2192,7 +2192,7 @@ mod tests {
 
     fn temp_challenge_store() -> AcmeChallengeStore {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.into_path().join("test-acme.db");
+        let db_path = dir.keep().join("test-acme.db");
         AcmeChallengeStore::with_db_path(db_path)
     }
 
