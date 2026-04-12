@@ -691,7 +691,7 @@ fn run_supervisor(cli: Cli) {
         // resolve backend topologies for health check decisions. It also triggers
         // reload_proxy_config so the health loop sees updated backends.
         let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
-        if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
+        if let Err(e) = reload_proxy_config(&store, &proxy_config, None).await {
             warn!(error = %e, "supervisor: failed to load initial proxy config for health checks");
         }
 
@@ -905,7 +905,7 @@ fn run_supervisor(cli: Cli) {
         let mut reload_rx = reload_bc_tx.subscribe();
         tokio::spawn(async move {
             while reload_rx.recv().await.is_ok() {
-                if let Err(e) = reload_proxy_config(&reload_store, &reload_config).await {
+                if let Err(e) = reload_proxy_config(&reload_store, &reload_config, None).await {
                     tracing::error!(error = %e, "supervisor: failed to reload proxy config");
                 }
                 reload_probe_scheduler.reload().await;
@@ -1240,11 +1240,18 @@ fn run_worker(
     let log_buffer = Arc::new(LogBuffer::new(10_000));
     let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+    // Listener-level connection filter with hot-reloadable CIDR policy.
+    // The supervisor broadcasts settings changes via the command channel; the
+    // filter is refreshed inline with ProxyConfig so listener state never
+    // drifts from the rest of the configuration.
+    let connection_filter = Arc::new(lorica::connection_filter::GlobalConnectionFilter::empty());
 
     // Load initial proxy configuration
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
-        if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
+        if let Err(e) =
+            reload_proxy_config(&store, &proxy_config, Some(&connection_filter)).await
+        {
             error!(error = %e, "worker failed to load proxy configuration");
             std::process::exit(1);
         }
@@ -1340,6 +1347,7 @@ fn run_worker(
     let cmd_backend_conns = Arc::clone(&worker_backend_conns);
     let cmd_request_counts = Arc::clone(&worker_request_counts);
     let cmd_waf_counts = Arc::clone(&worker_waf_counts);
+    let cmd_connection_filter = Arc::clone(&connection_filter);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create command channel runtime");
         rt.block_on(async move {
@@ -1403,7 +1411,13 @@ fn run_worker(
                                 }
                             }
                         }
-                        match reload_proxy_config(&cmd_store, &cmd_config).await {
+                        match reload_proxy_config(
+                            &cmd_store,
+                            &cmd_config,
+                            Some(&cmd_connection_filter),
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 let resp = Response::ok(cmd.sequence);
                                 if let Err(e) = channel.send(&resp).await {
@@ -1683,6 +1697,10 @@ fn run_worker(
         ..Default::default()
     });
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
+    // Install the TCP-level pre-filter. Held by Arc inside the listener, so
+    // subsequent reloads take effect without rebuilding endpoints.
+    proxy_service
+        .set_connection_filter(connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>);
 
     // Register listeners - TCP for HTTP, TLS for HTTPS
     let https_suffix = format!(":{https_port}");
@@ -1774,8 +1792,12 @@ fn run_single_process(cli: Cli) {
         let log_buffer = Arc::new(LogBuffer::new(10_000));
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+        let connection_filter =
+            Arc::new(lorica::connection_filter::GlobalConnectionFilter::empty());
 
-        if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
+        if let Err(e) =
+            reload_proxy_config(&store, &proxy_config, Some(&connection_filter)).await
+        {
             error!(error = %e, "failed to load initial proxy configuration");
             std::process::exit(1);
         }
@@ -1923,6 +1945,9 @@ fn run_single_process(cli: Cli) {
             ..Default::default()
         });
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
+        proxy_service.set_connection_filter(
+            connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>,
+        );
         let mut tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
         tcp_opts.so_reuseport = Some(true);
         proxy_service.add_tcp_with_settings(&format!("0.0.0.0:{}", cli.http_port), tcp_opts);
@@ -2064,9 +2089,16 @@ fn run_single_process(cli: Cli) {
         let reload_config = Arc::clone(&proxy_config);
         let reload_cert_resolver = Arc::clone(&cert_resolver);
         let reload_probe_scheduler = Arc::clone(&probe_scheduler);
+        let reload_connection_filter = Arc::clone(&connection_filter);
         let _reload_handle = tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
-                if let Err(e) = reload_proxy_config(&reload_store, &reload_config).await {
+                if let Err(e) = reload_proxy_config(
+                    &reload_store,
+                    &reload_config,
+                    Some(&reload_connection_filter),
+                )
+                .await
+                {
                     tracing::error!(error = %e, "failed to reload proxy configuration");
                 }
                 lorica::reload::reload_cert_resolver(&reload_store, &reload_cert_resolver).await;

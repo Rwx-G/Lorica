@@ -129,7 +129,7 @@ async fn test_reload_builds_proxy_config() {
         lorica::proxy_wiring::ProxyConfig::default(),
     ));
 
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
 
@@ -171,7 +171,7 @@ async fn test_multiple_hostnames_routed_independently() {
         lorica::proxy_wiring::ProxyConfig::default(),
     ));
 
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
 
@@ -204,7 +204,7 @@ async fn test_disabled_routes_excluded() {
         lorica::proxy_wiring::ProxyConfig::default(),
     ));
 
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
 
@@ -230,7 +230,7 @@ async fn test_route_with_no_backends() {
         lorica::proxy_wiring::ProxyConfig::default(),
     ));
 
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
 
@@ -259,7 +259,7 @@ async fn test_reload_atomic_swap() {
     ));
 
     // First load
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
 
@@ -274,7 +274,7 @@ async fn test_reload_atomic_swap() {
         s.link_route_backend("r2", "b1").unwrap();
     }
 
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
 
@@ -306,7 +306,7 @@ async fn test_down_backends_filtered() {
         lorica::proxy_wiring::ProxyConfig::default(),
     ));
 
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
 
@@ -349,7 +349,7 @@ async fn test_v120_fields_survive_reload() {
         lorica::proxy_wiring::ProxyConfig::default(),
     ));
 
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
 
@@ -385,7 +385,7 @@ async fn test_maintenance_mode_toggle_via_reload() {
     ));
 
     // Initial load: maintenance_mode = false
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
     {
@@ -403,7 +403,7 @@ async fn test_maintenance_mode_toggle_via_reload() {
     }
 
     // Reload: maintenance_mode should now be true
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
     {
@@ -420,7 +420,7 @@ async fn test_maintenance_mode_toggle_via_reload() {
         s.update_route(&r).unwrap();
     }
 
-    lorica::reload::reload_proxy_config(&store, &proxy_config)
+    lorica::reload::reload_proxy_config(&store, &proxy_config, None)
         .await
         .unwrap();
     {

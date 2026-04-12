@@ -71,7 +71,7 @@ bytes = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 
 [features]
-default = ["rustls", "lb"]
+default = ["rustls", "lb", "connection_filter"]
 
 rustls = [
     "lorica-core/rustls",

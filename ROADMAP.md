@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-04-11 | Current release: v1.1.0 | In progress: v1.2.0
+> Last updated: 2026-04-12 | Current release: v1.2.0 | In progress: v1.3.0
 >
 > See [COMPARISON.md](COMPARISON.md) for the full competitive feature matrix.
 >
@@ -35,15 +35,15 @@ Major feature additions that close the gap with Traefik and Nginx.
 
 | Feature | Status | Effort | Notes |
 |---|---|---|---|
-| Forward auth (external authentication) | Done | Medium | Sub-request to auth service (Authelia, Authentik, Keycloak). Subrequest pipe exists in `lorica-proxy/src/subrequest/`. Enable `allow_spawning_subrequest()` + `early_request_filter()` |
-| Header-based routing | Done | Low-Medium | Route by HTTP headers (X-Version, X-Tenant). A/B testing, multi-tenant. Traefik, Caddy, HAProxy all support it |
-| Canary / traffic split | Done | Medium | Route X% traffic to backend group A, Y% to group B. Zero-risk deployments |
-| mTLS client verification | Done | Medium | `ClientCertVerifier` trait support exists in rustls layer. Zero-trust, B2B |
-| Response body rewriting | Done | Medium | Implement `response_body_filter()` hook. Nginx `sub_filter` equivalent |
-| Request mirroring | Done | Medium | Duplicate traffic to secondary backend (fire-and-forget). Shadow testing |
-| Cache Vary support | Done | Medium | Implement `cache_vary_filter()`. `VarianceBuilder` exists in `lorica-cache/src/variance.rs` |
-| Stale-while-revalidate | Done | Low | `stale_writer` support exists in cache lock module. Serve stale while background refresh |
-| Cache predictor | Done | Medium | `lorica-cache/src/predictor.rs` exists. Learn which assets are cacheable |
+| Forward auth (external authentication) | Planned | Medium | Sub-request to auth service (Authelia, Authentik, Keycloak). Subrequest pipe exists in `lorica-proxy/src/subrequest/`. Enable `allow_spawning_subrequest()` + `early_request_filter()` |
+| Header-based routing | Planned | Low-Medium | Route by HTTP headers (X-Version, X-Tenant). A/B testing, multi-tenant. Traefik, Caddy, HAProxy all support it |
+| Canary / traffic split | Planned | Medium | Route X% traffic to backend group A, Y% to group B. Zero-risk deployments |
+| mTLS client verification | Planned | Medium | `ClientCertVerifier` trait support exists in rustls layer. Zero-trust, B2B |
+| Response body rewriting | Planned | Medium | Implement `response_body_filter()` hook. Nginx `sub_filter` equivalent |
+| Request mirroring | Planned | Medium | Duplicate traffic to secondary backend (fire-and-forget). Shadow testing |
+| Cache Vary support | Planned | Medium | Implement `cache_vary_filter()`. `VarianceBuilder` exists in `lorica-cache/src/variance.rs` |
+| Stale-while-revalidate | Planned | Low | `stale_writer` support exists in cache lock module. Serve stale while background refresh |
+| Cache predictor | Planned | Medium | `lorica-cache/src/predictor.rs` exists. Learn which assets are cacheable |
 | Connection pre-filter | Done | Low | Replace `AcceptAllFilter` with configurable filter. IP-level filtering before TLS handshake |
 
 ---
@@ -54,9 +54,9 @@ Production observability and operational tooling.
 
 | Feature | Status | Effort | Notes |
 |---|---|---|---|
-| OpenTelemetry tracing | Done | Medium | OTLP export for distributed tracing. Traefik, HAProxy, Sozu support it |
-| Country blocking (GeoIP) | Done | Medium | Filter by country code. Useful for compliance and attack surface reduction |
-| Bot detection (JS challenge) | Done | Medium-High | JavaScript challenge / captcha before proxying. BunkerWeb differentiator |
+| OpenTelemetry tracing | Planned | Medium | OTLP export for distributed tracing. Traefik, HAProxy, Sozu support it |
+| Country blocking (GeoIP) | Planned | Medium | Filter by country code. Useful for compliance and attack surface reduction |
+| Bot detection (JS challenge) | Planned | Medium-High | JavaScript challenge / captcha before proxying. BunkerWeb differentiator |
 
 ---
 
@@ -66,8 +66,8 @@ Major protocol additions.
 
 | Feature | Status | Effort | Notes |
 |---|---|---|---|
-| TCP/L4 proxying | Done | High | Stream proxy for databases, MQTT, SSH. SNI-based routing without TLS termination. Supported by Nginx, Traefik, HAProxy, Sozu |
-| HTTP/3 (QUIC) | Done | High | Blocked on [Pingora PR #524](https://github.com/cloudflare/pingora/pull/524) (tokio-quiche integration). Traefik and HAProxy have production support |
+| TCP/L4 proxying | Planned | High | Stream proxy for databases, MQTT, SSH. SNI-based routing without TLS termination. Supported by Nginx, Traefik, HAProxy, Sozu |
+| HTTP/3 (QUIC) | Planned | High | Blocked on [Pingora PR #524](https://github.com/cloudflare/pingora/pull/524) (tokio-quiche integration). Traefik and HAProxy have production support |
 
 ---
 

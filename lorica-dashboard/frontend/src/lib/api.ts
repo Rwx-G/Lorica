@@ -418,6 +418,8 @@ export interface GlobalSettingsResponse {
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies: string[];
   waf_whitelist_ips: string[];
+  connection_deny_cidrs: string[];
+  connection_allow_cidrs: string[];
 }
 
 export interface UpdateSettingsRequest {
@@ -437,6 +439,8 @@ export interface UpdateSettingsRequest {
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies?: string[];
   waf_whitelist_ips?: string[];
+  connection_deny_cidrs?: string[];
+  connection_allow_cidrs?: string[];
 }
 
 export interface NotificationConfigResponse {

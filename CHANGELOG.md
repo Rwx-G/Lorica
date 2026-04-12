@@ -9,6 +9,10 @@ Author: Rwx-G
 
 ## Unreleased
 
+### Added
+
+- Connection pre-filter: IP allow/deny CIDR policy enforced at TCP accept, before TLS handshake. Configurable via new `connection_allow_cidrs` and `connection_deny_cidrs` `GlobalSettings` fields; editable in the dashboard Settings tab. Deny always wins; a non-empty allow list switches the filter to default-deny. Hot-reloaded via arc-swap - listener-state stays consistent without rebuilding endpoints, in both single-process and worker modes
+
 ## [1.2.0] - 2026-04-11
 
 ### Added

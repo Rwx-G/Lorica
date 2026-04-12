@@ -20,13 +20,19 @@ use lorica_tls::cert_resolver::{CertData, CertResolver};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::connection_filter::{ConnectionFilterPolicy, GlobalConnectionFilter};
 use crate::proxy_wiring::ProxyConfig;
 
 /// Load all routes, backends, certificates and route-backend links from the store
 /// and build a new ProxyConfig, then atomically swap it in.
+///
+/// When `connection_filter` is provided, its CIDR policy is refreshed in the
+/// same transaction as the ProxyConfig swap, so listener-level filtering
+/// stays coherent with route/backend state after a settings change.
 pub async fn reload_proxy_config(
     store: &Arc<Mutex<ConfigStore>>,
     proxy_config: &Arc<ArcSwap<ProxyConfig>>,
+    connection_filter: Option<&Arc<GlobalConnectionFilter>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let store = store.lock().await;
 
@@ -62,6 +68,14 @@ pub async fn reload_proxy_config(
     let waf_whitelist_ips = settings
         .as_ref()
         .map(|s| s.waf_whitelist_ips.clone())
+        .unwrap_or_default();
+    let connection_allow_cidrs = settings
+        .as_ref()
+        .map(|s| s.connection_allow_cidrs.clone())
+        .unwrap_or_default();
+    let connection_deny_cidrs = settings
+        .as_ref()
+        .map(|s| s.connection_deny_cidrs.clone())
         .unwrap_or_default();
 
     let links: Vec<(String, String)> = route_backends
@@ -102,6 +116,22 @@ pub async fn reload_proxy_config(
     info!(routes = route_count, "proxy configuration reloaded");
 
     proxy_config.store(Arc::new(new_config));
+
+    if let Some(filter) = connection_filter {
+        let policy = ConnectionFilterPolicy::from_cidrs(
+            &connection_allow_cidrs,
+            &connection_deny_cidrs,
+        );
+        let allow_count = policy.allow.len();
+        let deny_count = policy.deny.len();
+        filter.reload(policy);
+        info!(
+            allow_cidrs = allow_count,
+            deny_cidrs = deny_count,
+            "connection filter reloaded"
+        );
+    }
+
     Ok(())
 }
 

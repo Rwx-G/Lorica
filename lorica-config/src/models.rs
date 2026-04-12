@@ -646,6 +646,19 @@ pub struct GlobalSettings {
     /// Examples: `["203.0.113.50", "10.0.0.0/8"]`.
     #[serde(default)]
     pub waf_whitelist_ips: Vec<String>,
+    /// IP addresses or CIDR ranges denied at TCP accept time, before TLS
+    /// handshake. Matching connections are dropped immediately. Evaluated
+    /// after `connection_allow_cidrs` so a deny entry always wins.
+    /// Examples: `["198.51.100.0/24"]`.
+    #[serde(default)]
+    pub connection_deny_cidrs: Vec<String>,
+    /// IP addresses or CIDR ranges allowed at TCP accept time. When non-empty,
+    /// this switches the pre-filter to default-deny: only listed IPs are
+    /// accepted, all other connections are dropped before TLS handshake.
+    /// Leave empty for default-allow (only `connection_deny_cidrs` applies).
+    /// Examples: `["10.0.0.0/8", "192.168.0.0/16"]`.
+    #[serde(default)]
+    pub connection_allow_cidrs: Vec<String>,
 }
 
 fn default_security_headers() -> String {
@@ -768,6 +781,8 @@ impl Default for GlobalSettings {
             sla_purge_schedule: default_sla_purge_schedule(),
             trusted_proxies: Vec::new(),
             waf_whitelist_ips: Vec::new(),
+            connection_deny_cidrs: Vec::new(),
+            connection_allow_cidrs: Vec::new(),
         }
     }
 }

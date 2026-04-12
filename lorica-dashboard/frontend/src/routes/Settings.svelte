@@ -16,7 +16,7 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, max_global_connections: 0, flood_threshold_rps: 0, waf_ban_threshold: 5, waf_ban_duration_s: 3600, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month', trusted_proxies: '', waf_whitelist_ips: '' });
+  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, max_global_connections: 0, flood_threshold_rps: 0, waf_ban_threshold: 5, waf_ban_duration_s: 3600, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month', trusted_proxies: '', waf_whitelist_ips: '', connection_deny_cidrs: '', connection_allow_cidrs: '' });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -138,7 +138,7 @@
       error = settingsRes.error.message;
     } else if (settingsRes.data) {
       settings = settingsRes.data;
-      settingsForm = { ...settingsRes.data, trusted_proxies: (settingsRes.data.trusted_proxies ?? []).join('\n'), waf_whitelist_ips: (settingsRes.data.waf_whitelist_ips ?? []).join('\n') };
+      settingsForm = { ...settingsRes.data, trusted_proxies: (settingsRes.data.trusted_proxies ?? []).join('\n'), waf_whitelist_ips: (settingsRes.data.waf_whitelist_ips ?? []).join('\n'), connection_deny_cidrs: (settingsRes.data.connection_deny_cidrs ?? []).join('\n'), connection_allow_cidrs: (settingsRes.data.connection_allow_cidrs ?? []).join('\n') };
       customPresets = settingsRes.data.custom_security_presets ?? [];
     }
     if (notifRes.data) {
@@ -195,13 +195,21 @@
         .split('\n')
         .map((s: string) => s.trim())
         .filter((s: string) => s.length > 0),
+      connection_deny_cidrs: settingsForm.connection_deny_cidrs
+        .split('\n')
+        .map((s: string) => s.trim())
+        .filter((s: string) => s.length > 0),
+      connection_allow_cidrs: settingsForm.connection_allow_cidrs
+        .split('\n')
+        .map((s: string) => s.trim())
+        .filter((s: string) => s.length > 0),
     };
     const res = await api.updateSettings(payload);
     if (res.error) {
       settingsError = res.error.message;
     } else if (res.data) {
       settings = res.data;
-      settingsForm = { ...res.data, trusted_proxies: (res.data.trusted_proxies ?? []).join('\n'), waf_whitelist_ips: (res.data.waf_whitelist_ips ?? []).join('\n') };
+      settingsForm = { ...res.data, trusted_proxies: (res.data.trusted_proxies ?? []).join('\n'), waf_whitelist_ips: (res.data.waf_whitelist_ips ?? []).join('\n'), connection_deny_cidrs: (res.data.connection_deny_cidrs ?? []).join('\n'), connection_allow_cidrs: (res.data.connection_allow_cidrs ?? []).join('\n') };
       settingsMsg = 'Settings saved.';
       setTimeout(() => settingsMsg = '', 3000);
     }
@@ -476,6 +484,16 @@
           <label for="waf-whitelist">WAF Whitelist IPs</label>
           <textarea id="waf-whitelist" rows="3" bind:value={settingsForm.waf_whitelist_ips} placeholder="203.0.113.50&#10;10.0.0.0/8"></textarea>
           <span class="hint">One IP or CIDR per line. These IPs bypass WAF, rate limiting, IP blocklist, and auto-ban entirely. Use for admin/operator IPs.</span>
+        </div>
+        <div class="settings-form-row">
+          <label for="conn-deny">Connection Deny CIDRs</label>
+          <textarea id="conn-deny" rows="3" bind:value={settingsForm.connection_deny_cidrs} placeholder="198.51.100.0/24&#10;2001:db8::/32"></textarea>
+          <span class="hint">One IP or CIDR per line. Matching connections are dropped at TCP accept, before TLS handshake. Evaluated after the allow list; deny always wins.</span>
+        </div>
+        <div class="settings-form-row">
+          <label for="conn-allow">Connection Allow CIDRs</label>
+          <textarea id="conn-allow" rows="3" bind:value={settingsForm.connection_allow_cidrs} placeholder="10.0.0.0/8&#10;192.168.0.0/16"></textarea>
+          <span class="hint">One IP or CIDR per line. Leave empty for default-allow. When non-empty, switches the pre-filter to default-deny: only listed IPs are accepted.</span>
         </div>
         <div class="settings-form-row">
           <label for="s-log-retention">Access Log Retention (entries)</label>

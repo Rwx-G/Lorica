@@ -227,6 +227,18 @@ paths:
                     type: string
                   description: IPs or CIDRs that bypass WAF, rate limiting, IP blocklist, and auto-ban
                   example: ["203.0.113.50", "10.0.0.0/8"]
+                connection_deny_cidrs:
+                  type: array
+                  items:
+                    type: string
+                  description: IPs or CIDRs dropped at TCP accept time, before TLS handshake. Evaluated after the allow list; deny always wins.
+                  example: ["198.51.100.0/24"]
+                connection_allow_cidrs:
+                  type: array
+                  items:
+                    type: string
+                  description: When non-empty, only listed IPs are accepted at TCP accept (default-deny mode). Leave empty for default-allow.
+                  example: ["10.0.0.0/8", "192.168.0.0/16"]
       responses:
         "200":
           description: Settings updated

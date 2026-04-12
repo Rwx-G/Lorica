@@ -35,6 +35,8 @@ pub struct UpdateSettingsRequest {
     pub custom_security_presets: Option<Vec<lorica_config::models::SecurityHeaderPreset>>,
     pub trusted_proxies: Option<Vec<String>>,
     pub waf_whitelist_ips: Option<Vec<String>>,
+    pub connection_deny_cidrs: Option<Vec<String>>,
+    pub connection_allow_cidrs: Option<Vec<String>>,
 }
 
 /// PUT /api/v1/settings
@@ -180,11 +182,36 @@ pub async fn update_settings(
         }
         settings.waf_whitelist_ips = ips.clone();
     }
+    if let Some(ref cidrs) = body.connection_deny_cidrs {
+        validate_cidr_list(cidrs, "connection_deny_cidrs")?;
+        settings.connection_deny_cidrs = cidrs.clone();
+    }
+    if let Some(ref cidrs) = body.connection_allow_cidrs {
+        validate_cidr_list(cidrs, "connection_allow_cidrs")?;
+        settings.connection_allow_cidrs = cidrs.clone();
+    }
 
     store.update_global_settings(&settings)?;
     drop(store);
     state.notify_config_changed();
     Ok(json_data(settings))
+}
+
+fn validate_cidr_list(entries: &[String], field: &str) -> Result<(), ApiError> {
+    for entry in entries {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.parse::<std::net::IpAddr>().is_err()
+            && trimmed.parse::<ipnet::IpNet>().is_err()
+        {
+            return Err(ApiError::BadRequest(format!(
+                "invalid {field} CIDR or IP: {trimmed}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---- Notification Configs ----

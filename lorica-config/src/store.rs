@@ -1598,6 +1598,22 @@ impl ConfigStore {
                             ))
                         })?;
                 }
+                "connection_deny_cidrs" => {
+                    settings.connection_deny_cidrs =
+                        serde_json::from_str(&value).map_err(|e| {
+                            ConfigError::Validation(format!(
+                                "invalid connection_deny_cidrs JSON: {e}"
+                            ))
+                        })?;
+                }
+                "connection_allow_cidrs" => {
+                    settings.connection_allow_cidrs =
+                        serde_json::from_str(&value).map_err(|e| {
+                            ConfigError::Validation(format!(
+                                "invalid connection_allow_cidrs JSON: {e}"
+                            ))
+                        })?;
+                }
                 _ => {}
             }
         }
@@ -1685,6 +1701,26 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_whitelist_ips', ?1)",
             params![waf_whitelist_json],
+        )?;
+        let connection_deny_json =
+            serde_json::to_string(&settings.connection_deny_cidrs).map_err(|e| {
+                ConfigError::Validation(format!(
+                    "failed to serialize connection_deny_cidrs: {e}"
+                ))
+            })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('connection_deny_cidrs', ?1)",
+            params![connection_deny_json],
+        )?;
+        let connection_allow_json =
+            serde_json::to_string(&settings.connection_allow_cidrs).map_err(|e| {
+                ConfigError::Validation(format!(
+                    "failed to serialize connection_allow_cidrs: {e}"
+                ))
+            })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('connection_allow_cidrs', ?1)",
+            params![connection_allow_json],
         )?;
         Ok(())
     }
