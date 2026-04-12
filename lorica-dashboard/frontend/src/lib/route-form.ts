@@ -239,6 +239,27 @@ function textToRecord(text: string): Record<string, string> {
   return result;
 }
 
+/**
+ * Parse a token list that accepts BOTH comma AND newline separators.
+ *
+ * Lorica's form inputs are inconsistent in which separator they
+ * advertise (CSV for header names, one-per-line for IPs / CIDRs).
+ * Accepting both here means a user who pastes from docs / a spread-
+ * sheet / a previous route's export doesn't get surprised. Tokens
+ * are trimmed and empty ones are dropped; this matches the behaviour
+ * operators expect from similar fields in kubectl / nginx.conf.
+ *
+ * Kept alongside the legacy `csvToArray` / `linesToArray` because
+ * some callers rely on the strict single-separator semantics (e.g.
+ * preserving user-typed empty entries for validation surfacing).
+ */
+function tokenListToArray(text: string): string[] {
+  return text
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
 function csvToArray(text: string): string[] {
   return text.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
 }
@@ -433,10 +454,7 @@ function forwardAuthFormToRequest(
   return {
     address: addr,
     timeout_ms: form.forward_auth_timeout_ms,
-    response_headers: form.forward_auth_response_headers
-      .split(',')
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0),
+    response_headers: tokenListToArray(form.forward_auth_response_headers),
   };
 }
 
@@ -483,7 +501,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     force_https: form.force_https,
     redirect_hostname: form.redirect_hostname || (isUpdate ? '' : undefined),
     redirect_to: form.redirect_to || (isUpdate ? '' : undefined),
-    hostname_aliases: csvToArray(form.hostname_aliases).length > 0 ? csvToArray(form.hostname_aliases) : empty([]),
+    hostname_aliases: tokenListToArray(form.hostname_aliases).length > 0 ? tokenListToArray(form.hostname_aliases) : empty([]),
     websocket_enabled: form.websocket_enabled,
     access_log_enabled: form.access_log_enabled,
     connect_timeout_s: form.connect_timeout_s,
@@ -525,8 +543,8 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     retry_on_methods: csvToArray(form.retry_on_methods).length > 0 ? csvToArray(form.retry_on_methods) : empty([]),
     maintenance_mode: form.maintenance_mode,
     error_page_html: form.error_page_html || undefined,
-    cache_vary_headers: csvToArray(form.cache_vary_headers).length > 0
-      ? csvToArray(form.cache_vary_headers)
+    cache_vary_headers: tokenListToArray(form.cache_vary_headers).length > 0
+      ? tokenListToArray(form.cache_vary_headers)
       : empty([]),
     header_rules: headerRuleFormToRequest(form.header_rules) ?? (isUpdate ? [] : undefined),
     traffic_splits: trafficSplitFormToRequest(form.traffic_splits) ?? (isUpdate ? [] : undefined),
@@ -552,10 +570,7 @@ function mtlsFormToRequest(
   return {
     ca_cert_pem: pem,
     required: form.mtls_required,
-    allowed_organizations: form.mtls_allowed_organizations
-      .split(',')
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0),
+    allowed_organizations: tokenListToArray(form.mtls_allowed_organizations),
   };
 }
 
@@ -635,6 +650,137 @@ export function validateHostname(value: string): string {
   if (value.trim() === '_') return ''; // catch-all hostname
   if (!HOSTNAME_PATTERN.test(value.trim())) return 'Invalid hostname';
   return '';
+}
+
+/**
+ * Result shape for `validateRouteFormWithTab`. `tab` names the drawer
+ * tab that owns the offending field so the caller can auto-switch
+ * the view and put the user in front of the problem; `null` means
+ * the error spans multiple tabs or couldn't be attributed (fall back
+ * to just displaying the message).
+ */
+export interface ValidationResult {
+  message: string;
+  tab: string | null;
+}
+
+/**
+ * Same checks as `validateRouteForm` but returns an object that
+ * includes the owning tab id. RouteDrawer uses this to auto-switch
+ * to the correct tab when a submit fails so users don't have to hunt
+ * for the offending field (F-02 UX review finding).
+ *
+ * Kept alongside the legacy string-returning `validateRouteForm`
+ * because 75 existing unit tests depend on the string contract.
+ */
+export function validateRouteFormWithTab(form: RouteFormState): ValidationResult {
+  const r = (message: string, tab: string | null = null): ValidationResult => ({ message, tab });
+
+  const hostErr = validateHostname(form.hostname);
+  if (hostErr) return r(hostErr, 'general');
+  if (form.path_prefix && !form.path_prefix.startsWith('/')) return r('Path prefix must start with /', 'general');
+  if (form.connect_timeout_s < 1 || form.connect_timeout_s > 3600) return r('Connect timeout must be between 1 and 3600', 'timeouts');
+  if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return r('Read timeout must be between 1 and 3600', 'timeouts');
+  if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return r('Send timeout must be between 1 and 3600', 'timeouts');
+  if (form.max_body_mb && Number(form.max_body_mb) <= 0) return r('Max body size must be greater than 0', 'security');
+  if (form.rate_limit_rps && Number(form.rate_limit_rps) <= 0) return r('Rate limit RPS must be greater than 0', 'security');
+  if (form.rate_limit_burst && Number(form.rate_limit_burst) <= 0) return r('Rate limit burst must be greater than 0', 'security');
+  if (form.rate_limit_rps && form.rate_limit_burst && Number(form.rate_limit_burst) < Number(form.rate_limit_rps)) {
+    return r('Rate limit burst must be >= RPS', 'security');
+  }
+  if (form.cors_max_age_s && Number(form.cors_max_age_s) <= 0) return r('CORS max age must be greater than 0', 'cors');
+  const allowErr = validateIpList(form.ip_allowlist);
+  if (allowErr) return r(`IP allowlist: ${allowErr}`, 'security');
+  const denyErr = validateIpList(form.ip_denylist);
+  if (denyErr) return r(`IP denylist: ${denyErr}`, 'security');
+  // Traffic splits
+  let totalWeight = 0;
+  for (const s of form.traffic_splits) {
+    if (!Number.isInteger(s.weight_percent) || s.weight_percent < 0 || s.weight_percent > 100) {
+      return r(`Traffic split weight must be 0..100 (got ${s.weight_percent})`, 'traffic_splits');
+    }
+    if (s.weight_percent > 0 && s.backend_ids.length === 0) {
+      return r('Traffic split with non-zero weight must select at least one backend', 'traffic_splits');
+    }
+    totalWeight += s.weight_percent;
+  }
+  if (totalWeight > 100) {
+    return r(`Traffic splits: cumulative weight must be <= 100 (got ${totalWeight})`, 'traffic_splits');
+  }
+  // Forward auth
+  if (form.forward_auth_address.trim() !== '') {
+    const addr = form.forward_auth_address.trim();
+    if (!/^https?:\/\/[^\s/]+/.test(addr)) {
+      return r('Forward auth URL must start with http:// or https:// and include a host', 'security');
+    }
+    const t = Number(form.forward_auth_timeout_ms);
+    if (!Number.isInteger(t) || t < 1 || t > 60000) {
+      return r('Forward auth timeout must be 1..60000 ms', 'security');
+    }
+  }
+  // Mirror
+  if (form.mirror_backend_ids.length > 0) {
+    const pct = Number(form.mirror_sample_percent);
+    if (!Number.isInteger(pct) || pct < 0 || pct > 100) {
+      return r('Mirror sample percent must be 0..100', 'security');
+    }
+    const mt = Number(form.mirror_timeout_ms);
+    if (!Number.isInteger(mt) || mt < 1 || mt > 60000) {
+      return r('Mirror timeout must be 1..60000 ms', 'security');
+    }
+    const mb = Number(form.mirror_max_body_bytes);
+    if (!Number.isInteger(mb) || mb < 0 || mb > 128 * 1048576) {
+      return r('Mirror max body bytes must be 0..134217728 (128 MiB; 0 = headers only)', 'security');
+    }
+  }
+  // Response rewrite
+  if (form.response_rewrite_rules.length > 0) {
+    const mb = Number(form.response_rewrite_max_body_bytes);
+    if (!Number.isInteger(mb) || mb < 1 || mb > 128 * 1048576) {
+      return r('Response rewrite max body bytes must be 1..134217728 (128 MiB)', 'response_rewrite');
+    }
+    for (let i = 0; i < form.response_rewrite_rules.length; i++) {
+      const rule = form.response_rewrite_rules[i];
+      if (!rule.pattern.trim()) {
+        return r(`Response rewrite rule ${i + 1}: pattern must not be empty`, 'response_rewrite');
+      }
+      if (rule.is_regex) {
+        try {
+          // eslint-disable-next-line no-new
+          new RegExp(rule.pattern);
+        } catch (e) {
+          return r(`Response rewrite rule ${i + 1}: invalid regex (${(e as Error).message})`, 'response_rewrite');
+        }
+      }
+      const maxStr = rule.max_replacements.trim();
+      if (maxStr !== '') {
+        const n = Number(maxStr);
+        if (!Number.isInteger(n) || n < 1) {
+          return r(`Response rewrite rule ${i + 1}: max_replacements must be a positive integer (or empty for unlimited)`, 'response_rewrite');
+        }
+      }
+    }
+  }
+  // mTLS
+  const mtlsPem = form.mtls_ca_cert_pem.trim();
+  if (mtlsPem !== '') {
+    if (!/-----BEGIN CERTIFICATE-----/.test(mtlsPem)) {
+      return r('mTLS CA PEM must contain at least one "-----BEGIN CERTIFICATE-----" block', 'security');
+    }
+    if (mtlsPem.length > 1048576) {
+      return r('mTLS CA PEM must be 1 MiB or smaller; trim the bundle to issuing CAs only', 'security');
+    }
+    const raw = form.mtls_allowed_organizations;
+    if (raw.trim() !== '') {
+      const parts = raw.split(/[,\n]/);
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i].trim() === '') {
+          return r(`mTLS allowed organization #${i + 1} must not be empty`, 'security');
+        }
+      }
+    }
+  }
+  return r('', null);
 }
 
 export function validateRouteForm(form: RouteFormState): string {

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { RouteResponse } from './api';
 import {
   validateRouteForm,
+  validateRouteFormWithTab,
   validateHostname,
   routeToFormState,
   formStateToCreateRequest,
@@ -1132,6 +1133,30 @@ describe('mtls', () => {
     expect(req.mtls?.allowed_organizations).toEqual(['Acme', 'Beta']);
   });
 
+  it('accepts newline-separated organizations as well as commas', () => {
+    // F-04: the field advertises CSV but users pasting from a docs
+    // table / kubectl output often paste one-per-line. Both must work.
+    const req = formStateToCreateRequest(
+      mt({
+        mtls_ca_cert_pem: DUMMY_PEM,
+        mtls_required: false,
+        mtls_allowed_organizations: 'Acme\nBeta\nGamma',
+      }),
+    );
+    expect(req.mtls?.allowed_organizations).toEqual(['Acme', 'Beta', 'Gamma']);
+  });
+
+  it('accepts mixed comma and newline separators for organizations', () => {
+    const req = formStateToCreateRequest(
+      mt({
+        mtls_ca_cert_pem: DUMMY_PEM,
+        mtls_required: false,
+        mtls_allowed_organizations: 'Acme, Beta\nGamma,Delta',
+      }),
+    );
+    expect(req.mtls?.allowed_organizations).toEqual(['Acme', 'Beta', 'Gamma', 'Delta']);
+  });
+
   it('validateRouteForm rejects PEM without a CERTIFICATE block', () => {
     expect(
       validateRouteForm(mt({ mtls_ca_cert_pem: 'totally not a pem' })),
@@ -1342,5 +1367,57 @@ describe('getModifiedFields', () => {
     const form = { ...ROUTE_DEFAULTS, connect_timeout_s: 5 }; // same as default
     const modified = getModifiedFields(form);
     expect(modified.has('connect_timeout_s')).toBe(false);
+  });
+});
+
+describe('validateRouteFormWithTab', () => {
+  function base(overrides: Partial<RouteFormState> = {}): RouteFormState {
+    return { ...ROUTE_DEFAULTS, hostname: 'a.com', ...overrides };
+  }
+
+  it('returns empty message + null tab on valid form', () => {
+    const r = validateRouteFormWithTab(base());
+    expect(r.message).toBe('');
+    expect(r.tab).toBeNull();
+  });
+
+  it('attributes timeout errors to the timeouts tab', () => {
+    const r = validateRouteFormWithTab(base({ connect_timeout_s: 9999 }));
+    expect(r.message).toMatch(/Connect timeout/);
+    expect(r.tab).toBe('timeouts');
+  });
+
+  it('attributes traffic split errors to the traffic_splits tab', () => {
+    const r = validateRouteFormWithTab(
+      base({
+        traffic_splits: [{ name: 'bad', weight_percent: 150, backend_ids: ['b1'] }],
+      }),
+    );
+    expect(r.message).toMatch(/weight/);
+    expect(r.tab).toBe('traffic_splits');
+  });
+
+  it('attributes forward auth errors to the security tab', () => {
+    const r = validateRouteFormWithTab(
+      base({ forward_auth_address: 'not-a-url' }),
+    );
+    expect(r.tab).toBe('security');
+  });
+
+  it('attributes response rewrite errors to the response_rewrite tab', () => {
+    const r = validateRouteFormWithTab(
+      base({
+        response_rewrite_rules: [
+          { pattern: '(unclosed', replacement: '', is_regex: true, max_replacements: '' },
+        ],
+      }),
+    );
+    expect(r.message).toMatch(/invalid regex/);
+    expect(r.tab).toBe('response_rewrite');
+  });
+
+  it('attributes hostname errors to the general tab', () => {
+    const r = validateRouteFormWithTab(base({ hostname: '' }));
+    expect(r.tab).toBe('general');
   });
 });

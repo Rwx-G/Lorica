@@ -662,6 +662,20 @@ export const api = {
   updateRoute: (id: string, body: UpdateRouteRequest) =>
     request<RouteResponse>('PUT', `/routes/${id}`, body),
 
+  validateMtlsPem: (ca_cert_pem: string) =>
+    request<{ ca_count: number; subjects: string[] }>(
+      'POST',
+      '/validate/mtls-pem',
+      { ca_cert_pem },
+    ),
+
+  validateForwardAuth: (address: string, timeout_ms: number) =>
+    request<{ status: number; elapsed_ms: number; headers: Record<string, string> }>(
+      'POST',
+      '/validate/forward-auth',
+      { address, timeout_ms },
+    ),
+
   deleteRoute: (id: string) =>
     request<{ message: string }>('DELETE', `/routes/${id}`),
 

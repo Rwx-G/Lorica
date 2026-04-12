@@ -110,6 +110,14 @@ pub fn build_router(
         .route("/api/v1/routes/:id", put(crate::routes::update_route))
         .route("/api/v1/routes/:id", delete(crate::routes::delete_route))
         .route(
+            "/api/v1/validate/mtls-pem",
+            post(crate::routes::validate_mtls_pem),
+        )
+        .route(
+            "/api/v1/validate/forward-auth",
+            post(crate::routes::validate_forward_auth),
+        )
+        .route(
             "/api/v1/cache/routes/:id",
             delete(crate::cache::purge_route_cache),
         )

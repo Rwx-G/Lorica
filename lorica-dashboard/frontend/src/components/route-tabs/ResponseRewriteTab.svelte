@@ -19,10 +19,26 @@
     expandedIndex = form.response_rewrite_rules.length - 1;
   }
 
-  function removeRule(index: number) {
-    form.response_rewrite_rules = form.response_rewrite_rules.filter((_, i) => i !== index);
-    if (expandedIndex === index) expandedIndex = null;
-    else if (expandedIndex != null && expandedIndex > index) expandedIndex--;
+  // Two-click inline confirm - see HeaderRulesTab for the pattern.
+  let pendingRemoveIndex: number | null = $state(null);
+  let pendingRemoveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function requestRemove(index: number) {
+    if (pendingRemoveIndex === index) {
+      if (pendingRemoveTimer) clearTimeout(pendingRemoveTimer);
+      pendingRemoveTimer = null;
+      pendingRemoveIndex = null;
+      form.response_rewrite_rules = form.response_rewrite_rules.filter((_, i) => i !== index);
+      if (expandedIndex === index) expandedIndex = null;
+      else if (expandedIndex != null && expandedIndex > index) expandedIndex--;
+      return;
+    }
+    pendingRemoveIndex = index;
+    if (pendingRemoveTimer) clearTimeout(pendingRemoveTimer);
+    pendingRemoveTimer = setTimeout(() => {
+      pendingRemoveIndex = null;
+      pendingRemoveTimer = null;
+    }, 3_000);
   }
 
   function moveUp(index: number) {
@@ -115,7 +131,11 @@
             <button class="btn-icon" title="Move up" aria-label="Move up" disabled={index === 0} onclick={() => moveUp(index)}>{@html upIcon}</button>
             <button class="btn-icon" title="Move down" aria-label="Move down" disabled={index === form.response_rewrite_rules.length - 1} onclick={() => moveDown(index)}>{@html downIcon}</button>
             <button class="btn-icon btn-expand" title={expandedIndex === index ? 'Collapse' : 'Expand'} aria-label={expandedIndex === index ? 'Collapse' : 'Expand'} onclick={() => toggleExpand(index)}>{@html expandedIndex === index ? collapseIcon : expandIcon}</button>
-            <button class="btn-icon btn-delete" title="Remove" aria-label="Remove" onclick={() => removeRule(index)}>{@html deleteIcon}</button>
+            {#if pendingRemoveIndex === index}
+              <button class="btn-icon btn-delete btn-delete-confirm" title="Click again within 3 s to remove" aria-label="Confirm remove" onclick={() => requestRemove(index)}>Confirm?</button>
+            {:else}
+              <button class="btn-icon btn-delete" title="Remove" aria-label="Remove" onclick={() => requestRemove(index)}>{@html deleteIcon}</button>
+            {/if}
           </div>
         </div>
 
@@ -178,6 +198,8 @@
   .btn-icon:hover:not(:disabled) { background: rgba(255, 255, 255, 0.05); color: var(--color-text); }
   .btn-icon:disabled { opacity: 0.3; cursor: not-allowed; }
   .btn-icon.btn-delete:hover { color: var(--color-danger); }
+  .btn-delete-confirm { width: auto; padding: 0 0.5rem; font-size: 0.6875rem; font-weight: 600; color: white; background: var(--color-danger, #dc2626); border-radius: 0.25rem; animation: pulse-arm 1s ease-in-out infinite; }
+  @keyframes pulse-arm { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
 
   .rule-body { padding: 0.75rem; border-top: 1px solid var(--color-border); display: flex; flex-direction: column; gap: 0.75rem; }
 

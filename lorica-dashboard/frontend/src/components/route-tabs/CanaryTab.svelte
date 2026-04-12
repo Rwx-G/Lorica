@@ -21,10 +21,26 @@
     expandedIndex = form.traffic_splits.length - 1;
   }
 
-  function removeSplit(index: number) {
-    form.traffic_splits = form.traffic_splits.filter((_, i) => i !== index);
-    if (expandedIndex === index) expandedIndex = null;
-    else if (expandedIndex != null && expandedIndex > index) expandedIndex--;
+  // Two-click inline confirm - see HeaderRulesTab for the pattern.
+  let pendingRemoveIndex: number | null = $state(null);
+  let pendingRemoveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function requestRemoveSplit(index: number) {
+    if (pendingRemoveIndex === index) {
+      if (pendingRemoveTimer) clearTimeout(pendingRemoveTimer);
+      pendingRemoveTimer = null;
+      pendingRemoveIndex = null;
+      form.traffic_splits = form.traffic_splits.filter((_, i) => i !== index);
+      if (expandedIndex === index) expandedIndex = null;
+      else if (expandedIndex != null && expandedIndex > index) expandedIndex--;
+      return;
+    }
+    pendingRemoveIndex = index;
+    if (pendingRemoveTimer) clearTimeout(pendingRemoveTimer);
+    pendingRemoveTimer = setTimeout(() => {
+      pendingRemoveIndex = null;
+      pendingRemoveTimer = null;
+    }, 3_000);
   }
 
   function moveUp(index: number) {
@@ -100,7 +116,9 @@
       <div class="rule-card">
         <div class="rule-header">
           <div class="rule-header-left">
+            <label class="sr-only" for="canary-name-{index}">Traffic split name</label>
             <input
+              id="canary-name-{index}"
               type="text"
               class="name-input"
               bind:value={split.name}
@@ -108,14 +126,16 @@
               onchange={() => { form.traffic_splits = [...form.traffic_splits]; }}
             />
             <div class="weight-field">
+              <label class="sr-only" for="canary-weight-{index}">Weight percent</label>
               <input
+                id="canary-weight-{index}"
                 type="number"
                 min="0"
                 max="100"
                 bind:value={split.weight_percent}
                 onchange={() => { form.traffic_splits = [...form.traffic_splits]; }}
               />
-              <span>%</span>
+              <span aria-hidden="true">%</span>
             </div>
           </div>
           <div class="rule-overrides-summary">
@@ -129,7 +149,11 @@
             <button class="btn-icon" title="Move up" aria-label="Move up" disabled={index === 0} onclick={() => moveUp(index)}>{@html upIcon}</button>
             <button class="btn-icon" title="Move down" aria-label="Move down" disabled={index === form.traffic_splits.length - 1} onclick={() => moveDown(index)}>{@html downIcon}</button>
             <button class="btn-icon btn-expand" title={expandedIndex === index ? 'Collapse' : 'Expand'} aria-label={expandedIndex === index ? 'Collapse' : 'Expand'} onclick={() => toggleExpand(index)}>{@html expandedIndex === index ? collapseIcon : expandIcon}</button>
-            <button class="btn-icon btn-delete" title="Remove" aria-label="Remove" onclick={() => removeSplit(index)}>{@html deleteIcon}</button>
+            {#if pendingRemoveIndex === index}
+              <button class="btn-icon btn-delete btn-delete-confirm" title="Click again within 3 s to remove" aria-label="Confirm remove" onclick={() => requestRemoveSplit(index)}>Confirm?</button>
+            {:else}
+              <button class="btn-icon btn-delete" title="Remove" aria-label="Remove" onclick={() => requestRemoveSplit(index)}>{@html deleteIcon}</button>
+            {/if}
           </div>
         </div>
 
@@ -207,6 +231,8 @@
   .btn-icon:hover:not(:disabled) { background: rgba(255, 255, 255, 0.05); color: var(--color-text); }
   .btn-icon:disabled { opacity: 0.3; cursor: not-allowed; }
   .btn-icon.btn-delete:hover { color: var(--color-danger); }
+  .btn-delete-confirm { width: auto; padding: 0 0.5rem; font-size: 0.6875rem; font-weight: 600; color: white; background: var(--color-danger, #dc2626); border-radius: 0.25rem; animation: pulse-arm 1s ease-in-out infinite; }
+  @keyframes pulse-arm { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
 
   .rule-body { padding: 0.75rem; border-top: 1px solid var(--color-border); display: flex; flex-direction: column; gap: 0.75rem; }
   .override-section { padding: 0.5rem; background: var(--color-bg); border-radius: 0.25rem; }

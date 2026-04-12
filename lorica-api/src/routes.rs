@@ -1408,6 +1408,141 @@ pub async fn delete_route(
     Ok(json_data(serde_json::json!({"message": "route deleted"})))
 }
 
+// ---------------------------------------------------------------------------
+// Test / validate helpers used by the dashboard to shorten the
+// config -> save -> observe loop. These endpoints are admin-only
+// (mounted behind the existing auth middleware) and do not mutate
+// any store state.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct ValidateMtlsPemRequest {
+    pub ca_cert_pem: String,
+}
+
+#[derive(Serialize)]
+pub struct ValidateMtlsPemResponse {
+    pub ca_count: usize,
+    /// Subject summaries for each CERTIFICATE block found. One entry
+    /// per cert so the operator can cross-check their bundle ("yes,
+    /// these are the two CAs I expected").
+    pub subjects: Vec<String>,
+}
+
+/// POST /api/v1/validate/mtls-pem - run the same validator used on
+/// route save, return a human-readable summary of what's in the
+/// bundle so the operator can confirm BEFORE committing the route.
+pub async fn validate_mtls_pem(
+    Extension(_state): Extension<AppState>,
+    Json(body): Json<ValidateMtlsPemRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let req = MtlsConfigRequest {
+        ca_cert_pem: body.ca_cert_pem,
+        required: false,
+        allowed_organizations: Vec::new(),
+    };
+    // Shape check: hits all the same failure paths (empty, garbage
+    // PEM, non-X.509 block, oversize).
+    let _cfg = build_mtls_config(&req)?;
+
+    // Re-parse to extract the per-cert summary. The validator above
+    // already confirmed every block is a valid X.509 DER so this
+    // shouldn't fail; if it does we surface a 400 rather than 500.
+    let parsed = pem::parse_many(req.ca_cert_pem.trim().as_bytes())
+        .map_err(|e| ApiError::BadRequest(format!("PEM parse: {e}")))?;
+    let mut subjects = Vec::new();
+    for block in &parsed {
+        if block.tag() != "CERTIFICATE" {
+            continue;
+        }
+        match x509_parser::parse_x509_certificate(block.contents()) {
+            Ok((_, cert)) => {
+                subjects.push(cert.subject().to_string());
+            }
+            Err(_) => {
+                subjects.push("<unparseable subject>".into());
+            }
+        }
+    }
+
+    Ok(json_data(ValidateMtlsPemResponse {
+        ca_count: subjects.len(),
+        subjects,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct ValidateForwardAuthRequest {
+    pub address: String,
+    #[serde(default = "default_forward_auth_timeout_ms")]
+    pub timeout_ms: u32,
+}
+
+#[derive(Serialize)]
+pub struct ValidateForwardAuthResponse {
+    /// Status returned by the auth service.
+    pub status: u16,
+    /// Round-trip time in milliseconds (connect + response).
+    pub elapsed_ms: u64,
+    /// Small whitelist of response headers likely useful for
+    /// diagnostics (Location, Remote-User, Content-Type). We do not
+    /// echo arbitrary headers to avoid leaking internal service info
+    /// if an operator accidentally pointed this at a sensitive URL.
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+/// POST /api/v1/validate/forward-auth - shape-validate the address
+/// and make ONE GET to confirm the auth service is reachable. No
+/// body is sent; the caller is expected to be a dashboard admin
+/// confirming their config, not automating anything.
+///
+/// Note: this allows an admin to trigger a single outbound GET to
+/// any URL. That is the same capability the forward_auth route
+/// feature already provides on every request, so this endpoint does
+/// not widen the attack surface - it just shortens the feedback loop.
+pub async fn validate_forward_auth(
+    Extension(_state): Extension<AppState>,
+    Json(body): Json<ValidateForwardAuthRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Shape check first so we fail the same way the route save would.
+    let fa_req = ForwardAuthConfigRequest {
+        address: body.address.clone(),
+        timeout_ms: body.timeout_ms,
+        response_headers: Vec::new(),
+        verdict_cache_ttl_ms: 0,
+    };
+    let cfg = build_forward_auth(&fa_req)?;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_millis(cfg.timeout_ms.min(5_000) as u64))
+        .build()
+        .map_err(|e| ApiError::Internal(format!("reqwest build: {e}")))?;
+    let start = std::time::Instant::now();
+    let resp = client
+        .get(&cfg.address)
+        .timeout(std::time::Duration::from_millis(cfg.timeout_ms as u64))
+        .send()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("request to auth service failed: {e}")))?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let status = resp.status().as_u16();
+    let mut headers = std::collections::HashMap::new();
+    for name in ["location", "remote-user", "remote-groups", "remote-email", "content-type"] {
+        if let Some(v) = resp.headers().get(name) {
+            if let Ok(s) = v.to_str() {
+                headers.insert(name.to_string(), s.to_string());
+            }
+        }
+    }
+
+    Ok(json_data(ValidateForwardAuthResponse {
+        status,
+        elapsed_ms,
+        headers,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

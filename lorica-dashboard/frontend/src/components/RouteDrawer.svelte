@@ -10,7 +10,7 @@
     formStateToCreateRequest,
     formStateToUpdateRequest,
     getModifiedFields,
-    validateRouteForm,
+    validateRouteFormWithTab,
   } from '../lib/route-form';
   import { showToast } from '../lib/toast';
   import GeneralTab from './route-tabs/GeneralTab.svelte';
@@ -108,9 +108,15 @@
   }
 
   async function handleSubmit() {
-    const err = validateRouteForm(form);
-    if (err) {
-      formError = err;
+    const { message, tab } = validateRouteFormWithTab(form);
+    if (message) {
+      formError = message;
+      // Auto-switch to the tab that owns the offending field so the
+      // user doesn't have to hunt for it. Falls back to staying put
+      // when the validator couldn't attribute the error.
+      if (tab && tab !== activeTab) {
+        activeTab = tab;
+      }
       return;
     }
     formSubmitting = true;
@@ -332,6 +338,10 @@
     flex-shrink: 0;
   }
 
+  /* Horizontally scrollable tab bar with a right-edge fade to hint
+     at off-screen tabs. The CSS mask keeps ~1.5rem of tab area
+     faded, nudging the user to scroll right when they don't see
+     the rule / canary / rewrite tabs that were added in v1.3.0. */
   .tab-bar {
     display: flex;
     gap: 0;
@@ -339,6 +349,19 @@
     border-bottom: 1px solid var(--color-border);
     overflow-x: auto;
     flex-shrink: 0;
+    scrollbar-width: thin;
+    mask-image: linear-gradient(
+      to right,
+      black 0,
+      black calc(100% - 2rem),
+      transparent 100%
+    );
+    -webkit-mask-image: linear-gradient(
+      to right,
+      black 0,
+      black calc(100% - 2rem),
+      transparent 100%
+    );
   }
 
   .tab-btn {
