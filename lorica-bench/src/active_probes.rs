@@ -417,6 +417,7 @@ mod tests {
             forward_auth: None,
             mirror: None,
             response_rewrite: None,
+            mtls: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -522,6 +523,7 @@ mod tests {
             forward_auth: None,
             mirror: None,
             response_rewrite: None,
+            mtls: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

@@ -100,6 +100,15 @@ pub struct ResponseRewriteConfigRequest {
     pub content_type_prefixes: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MtlsConfigRequest {
+    pub ca_cert_pem: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub allowed_organizations: Vec<String>,
+}
+
 fn default_rewrite_max_body_bytes() -> u32 {
     1_048_576
 }
@@ -193,6 +202,8 @@ pub struct RouteResponse {
     pub mirror: Option<MirrorConfigRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtls: Option<MtlsConfigRequest>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -260,6 +271,7 @@ pub struct CreateRouteRequest {
     pub forward_auth: Option<ForwardAuthConfigRequest>,
     pub mirror: Option<MirrorConfigRequest>,
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
+    pub mtls: Option<MtlsConfigRequest>,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +344,9 @@ pub struct UpdateRouteRequest {
     /// Update semantics: missing = leave alone; present with empty
     /// `rules` = clear; non-empty = validate + install/replace.
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
+    /// Update semantics: missing = leave alone; present with empty
+    /// `ca_cert_pem` = clear; non-empty = validate + install/replace.
+    pub mtls: Option<MtlsConfigRequest>,
 }
 
 fn route_to_response(
@@ -458,6 +473,11 @@ fn route_to_response(
                 content_type_prefixes: rr.content_type_prefixes.clone(),
             }
         }),
+        mtls: route.mtls.as_ref().map(|m| MtlsConfigRequest {
+            ca_cert_pem: m.ca_cert_pem.clone(),
+            required: m.required,
+            allowed_organizations: m.allowed_organizations.clone(),
+        }),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -533,6 +553,76 @@ fn build_response_rewrite(
         rules,
         max_body_bytes: body.max_body_bytes,
         content_type_prefixes: prefixes,
+    })
+}
+
+/// Validate and convert a `MtlsConfigRequest` to the stored model.
+/// Catches PEM that doesn't decode or carries zero CERTIFICATE blocks
+/// (operator pasted junk) before a reload applies it to the listener,
+/// and rejects oversized bundles that would bloat the shared root
+/// store. The allowed-organizations list is trimmed and deduplicated;
+/// empty entries are rejected because they would silently widen the
+/// allowlist in unexpected ways.
+fn build_mtls_config(
+    body: &MtlsConfigRequest,
+) -> Result<lorica_config::models::MtlsConfig, ApiError> {
+    let pem_text = body.ca_cert_pem.trim();
+    if pem_text.is_empty() {
+        return Err(ApiError::BadRequest(
+            "mtls.ca_cert_pem must not be empty (use null/missing to disable)".into(),
+        ));
+    }
+    // 1 MiB covers a deep CA bundle; well above normal single-CA use.
+    const MTLS_PEM_CEILING: usize = 1_048_576;
+    if pem_text.len() > MTLS_PEM_CEILING {
+        return Err(ApiError::BadRequest(format!(
+            "mtls.ca_cert_pem must be <= {MTLS_PEM_CEILING} bytes ({} MiB); trim the bundle to just the issuing CAs",
+            MTLS_PEM_CEILING / 1_048_576
+        )));
+    }
+    // Parse once to catch malformed PEM before a reload. We also
+    // require at least one CERTIFICATE block; keys or other labels
+    // alone are not a CA bundle.
+    let parsed = pem::parse_many(pem_text.as_bytes()).map_err(|e| {
+        ApiError::BadRequest(format!("mtls.ca_cert_pem could not be parsed: {e}"))
+    })?;
+    let mut cert_count = 0usize;
+    for block in &parsed {
+        if block.tag() == "CERTIFICATE" {
+            cert_count += 1;
+            // X.509 sanity - rejects CERTIFICATE blocks whose bytes are
+            // not actually DER-encoded certs.
+            x509_parser::parse_x509_certificate(block.contents()).map_err(|e| {
+                ApiError::BadRequest(format!(
+                    "mtls.ca_cert_pem contains a CERTIFICATE block that is not a valid X.509 cert: {e}"
+                ))
+            })?;
+        }
+    }
+    if cert_count == 0 {
+        return Err(ApiError::BadRequest(
+            "mtls.ca_cert_pem must contain at least one CERTIFICATE block".into(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut orgs = Vec::with_capacity(body.allowed_organizations.len());
+    for (i, org) in body.allowed_organizations.iter().enumerate() {
+        let t = org.trim();
+        if t.is_empty() {
+            return Err(ApiError::BadRequest(format!(
+                "mtls.allowed_organizations[{i}] must not be empty"
+            )));
+        }
+        if seen.insert(t.to_string()) {
+            orgs.push(t.to_string());
+        }
+    }
+
+    Ok(lorica_config::models::MtlsConfig {
+        ca_cert_pem: pem_text.to_string(),
+        required: body.required,
+        allowed_organizations: orgs,
     })
 }
 
@@ -904,6 +994,10 @@ pub async fn create_route(
             Some(rr) if !rr.rules.is_empty() => Some(build_response_rewrite(rr)?),
             _ => None,
         },
+        mtls: match body.mtls.as_ref() {
+            Some(m) if !m.ca_cert_pem.trim().is_empty() => Some(build_mtls_config(m)?),
+            _ => None,
+        },
         created_at: now,
         updated_at: now,
     };
@@ -1207,6 +1301,17 @@ pub async fn update_route(
             route.response_rewrite = None;
         } else {
             route.response_rewrite = Some(build_response_rewrite(rr)?);
+        }
+    }
+    if let Some(ref m) = body.mtls {
+        // Empty ca_cert_pem = explicit "disable" signal from dashboard.
+        // Non-empty = validate + install/replace. Changes to the PEM
+        // take effect on next restart (rustls ServerConfig is immutable
+        // after build); required/allowed_organizations hot-reload.
+        if m.ca_cert_pem.trim().is_empty() {
+            route.mtls = None;
+        } else {
+            route.mtls = Some(build_mtls_config(m)?);
         }
     }
     route.updated_at = Utc::now();
@@ -1584,5 +1689,126 @@ mod tests {
         let built = build_forward_auth(&fa_req("  http://a/verify  ", 1000, vec![]))
             .unwrap();
         assert_eq!(built.address, "http://a/verify");
+    }
+
+    // ---- mTLS config validator ----
+
+    fn gen_ca_pem() -> String {
+        // Build a self-signed CA with rcgen so parsers have something
+        // real to chew on. Generated per-test so we never leak key bytes
+        // into the repo.
+        let mut params = rcgen::CertificateParams::new(vec!["Test CA".to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test CA");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        cert.pem()
+    }
+
+    fn mtls_req(pem: &str, required: bool, orgs: Vec<&str>) -> MtlsConfigRequest {
+        MtlsConfigRequest {
+            ca_cert_pem: pem.to_string(),
+            required,
+            allowed_organizations: orgs.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn build_mtls_accepts_well_formed_bundle() {
+        let pem = gen_ca_pem();
+        let built = build_mtls_config(&mtls_req(&pem, true, vec!["Acme"])).unwrap();
+        assert!(built.ca_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(built.required, true);
+        assert_eq!(built.allowed_organizations, vec!["Acme".to_string()]);
+    }
+
+    #[test]
+    fn build_mtls_rejects_empty_pem() {
+        let err = build_mtls_config(&mtls_req("", false, vec![])).err().unwrap();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn build_mtls_rejects_whitespace_pem() {
+        let err = build_mtls_config(&mtls_req("    \n  ", false, vec![]))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn build_mtls_rejects_garbage_pem() {
+        let err = build_mtls_config(&mtls_req("not a pem file at all", false, vec![]))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn build_mtls_rejects_non_certificate_blocks() {
+        // PEM with only a PRIVATE KEY block - no CERTIFICATE = not a
+        // CA bundle. Operator probably pasted the wrong file.
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ==\n-----END PRIVATE KEY-----\n";
+        let err = build_mtls_config(&mtls_req(pem, false, vec![]))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn build_mtls_rejects_bad_der_inside_certificate_block() {
+        // Well-formed PEM wrapper, but the bytes inside are not a
+        // valid X.509 DER encoding. Catches an operator who base64'd
+        // random junk between BEGIN/END markers.
+        use base64::Engine as _;
+        let junk = base64::engine::general_purpose::STANDARD.encode(b"not-x509-der-bytes");
+        let pem = format!(
+            "-----BEGIN CERTIFICATE-----\n{junk}\n-----END CERTIFICATE-----\n"
+        );
+        let err = build_mtls_config(&mtls_req(&pem, false, vec![]))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn build_mtls_rejects_oversize_pem() {
+        // Pad above the 1 MiB cap by repeating the PEM itself, since
+        // the validator trims outer whitespace before measuring.
+        let single = gen_ca_pem();
+        let copies = (1_048_577 / single.len()) + 1;
+        let pem = single.repeat(copies);
+        assert!(pem.trim().len() > 1_048_576, "test did not actually exceed cap");
+        let err = build_mtls_config(&mtls_req(&pem, false, vec![]))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn build_mtls_dedup_and_trims_organizations() {
+        let pem = gen_ca_pem();
+        let built = build_mtls_config(&mtls_req(
+            &pem,
+            false,
+            vec!["  Acme  ", "Beta", "Acme"],
+        ))
+        .unwrap();
+        assert_eq!(
+            built.allowed_organizations,
+            vec!["Acme".to_string(), "Beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_mtls_rejects_empty_organization_entry() {
+        let pem = gen_ca_pem();
+        let err = build_mtls_config(&mtls_req(&pem, false, vec!["Acme", "   "]))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 }

@@ -206,6 +206,64 @@
       (1048576). Set to 0 for headers-only mirroring. Max 128 MiB.
     </span>
   </div>
+
+  <h3 class="subsection-title">mTLS client verification</h3>
+  <p class="subsection-hint">
+    Require connecting clients to present an X.509 certificate signed by
+    the configured CA bundle. Chain validation happens at the TLS
+    handshake; this route gates the request with
+    <code>required</code> (no-cert &rarr; 496) and an optional
+    organization allowlist (non-matching O= &rarr; 495). Changes to the
+    CA PEM need a restart; toggling <code>required</code> or editing the
+    allowlist hot-reloads.
+  </p>
+
+  <div class="form-group" class:modified={form.mtls_ca_cert_pem !== ''}>
+    <label for="mtls-ca">Client CA bundle (PEM)</label>
+    <textarea
+      id="mtls-ca"
+      rows="6"
+      bind:value={form.mtls_ca_cert_pem}
+      placeholder={'-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----'}
+    ></textarea>
+    <span class="hint">
+      One or more <code>-----BEGIN CERTIFICATE-----</code> blocks. Empty = feature
+      disabled. Max 1 MiB.
+    </span>
+  </div>
+
+  <div class="form-row">
+    <div class="form-group" class:modified={form.mtls_required}>
+      <label class="checkbox-item">
+        <input
+          type="checkbox"
+          bind:checked={form.mtls_required}
+          disabled={form.mtls_ca_cert_pem.trim() === ''}
+        />
+        <span>Required (reject if no client cert)</span>
+      </label>
+      <span class="hint">
+        On &rarr; no cert presented returns 496. Off &rarr; opportunistic
+        (no cert passes through; a presented cert must still pass the
+        allowlist if one is configured).
+      </span>
+    </div>
+    <div class="form-group" class:modified={form.mtls_allowed_organizations !== ''}>
+      <label for="mtls-orgs">Allowed organizations</label>
+      <input
+        id="mtls-orgs"
+        type="text"
+        bind:value={form.mtls_allowed_organizations}
+        placeholder="Acme Corp, Beta Inc"
+        disabled={form.mtls_ca_cert_pem.trim() === ''}
+      />
+      <span class="hint">
+        Comma-separated exact matches against the cert subject's
+        <code>O=</code> field. Empty = accept any cert that chains to the
+        bundle.
+      </span>
+    </div>
+  </div>
 </div>
 
 <style>

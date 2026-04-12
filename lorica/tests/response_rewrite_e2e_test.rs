@@ -252,6 +252,7 @@ fn test_route(rewrite: Option<ResponseRewriteConfig>) -> Route {
         forward_auth: None,
         mirror: None,
         response_rewrite: rewrite,
+        mtls: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

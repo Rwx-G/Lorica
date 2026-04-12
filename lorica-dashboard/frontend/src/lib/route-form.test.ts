@@ -1029,6 +1029,67 @@ describe('response_rewrite', () => {
   });
 });
 
+describe('mtls', () => {
+  const DUMMY_PEM = '-----BEGIN CERTIFICATE-----\nMIIBdummy\n-----END CERTIFICATE-----\n';
+
+  function mt(overrides: Partial<RouteFormState> = {}): RouteFormState {
+    return { ...ROUTE_DEFAULTS, hostname: 'a.com', ...overrides };
+  }
+
+  it('omits mtls from create when ca_cert_pem is empty', () => {
+    const req = formStateToCreateRequest(mt({ mtls_ca_cert_pem: '' }));
+    expect(req.mtls).toBeUndefined();
+  });
+
+  it('includes mtls on create with trimmed PEM and parsed orgs', () => {
+    const req = formStateToCreateRequest(
+      mt({
+        mtls_ca_cert_pem: `  ${DUMMY_PEM}  `,
+        mtls_required: true,
+        mtls_allowed_organizations: 'Acme,  Beta , ',
+      }),
+    );
+    expect(req.mtls?.ca_cert_pem).toBe(DUMMY_PEM.trim());
+    expect(req.mtls?.required).toBe(true);
+    expect(req.mtls?.allowed_organizations).toEqual(['Acme', 'Beta']);
+  });
+
+  it('validateRouteForm rejects PEM without a CERTIFICATE block', () => {
+    expect(
+      validateRouteForm(mt({ mtls_ca_cert_pem: 'totally not a pem' })),
+    ).toMatch(/BEGIN CERTIFICATE/);
+  });
+
+  it('validateRouteForm rejects oversize PEM', () => {
+    expect(
+      validateRouteForm(mt({ mtls_ca_cert_pem: DUMMY_PEM + 'x'.repeat(1_048_600) })),
+    ).toMatch(/1 MiB/);
+  });
+
+  it('validateRouteForm rejects empty organization entry between commas', () => {
+    expect(
+      validateRouteForm(
+        mt({
+          mtls_ca_cert_pem: DUMMY_PEM,
+          mtls_allowed_organizations: 'Acme,,Beta',
+        }),
+      ),
+    ).toMatch(/must not be empty/);
+  });
+
+  it('validateRouteForm accepts valid config', () => {
+    expect(
+      validateRouteForm(
+        mt({
+          mtls_ca_cert_pem: DUMMY_PEM,
+          mtls_required: true,
+          mtls_allowed_organizations: 'Acme, Beta',
+        }),
+      ),
+    ).toBe('');
+  });
+});
+
 describe('cache_vary_headers round-trip', () => {
   it('maps route response -> form -> create request preserving order', () => {
     const mockRoute: RouteResponse = {

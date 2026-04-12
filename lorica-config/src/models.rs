@@ -480,6 +480,51 @@ fn default_forward_auth_timeout_ms() -> u32 {
     5_000
 }
 
+/// Mutual-TLS client verification: require connecting clients to
+/// present an X.509 certificate signed by the configured CA bundle and,
+/// optionally, constrain which certificate subjects are allowed.
+///
+/// The CA bundle is used by the TLS listener to validate the chain;
+/// whether a missing cert counts as a failure is driven by `required`.
+/// rustls is configured with `allow_unauthenticated` so the handshake
+/// always succeeds - final allow/deny lives in the proxy layer, which
+/// lets different routes on the same listener have different policies.
+///
+/// Two enforcement levels:
+/// - `required = true`: the request is denied with 496
+///   (RFC-reserved "SSL certificate required" status) if the client
+///   did not present a cert. This is the zero-trust mode.
+/// - `required = false`: requests without a cert pass through; requests
+///   WITH a cert still get their organization checked against the
+///   allowlist if one is configured. Useful for routes that want to
+///   prefer-but-not-require client certs (mixed public + B2B).
+///
+/// `allowed_organizations` is an optional allowlist matched against the
+/// cert subject's `O=` field. An empty list accepts any cert that
+/// chains to the bundle. When non-empty, the organization is a
+/// case-sensitive exact match.
+///
+/// Changes to `ca_cert_pem` require a proxy restart because rustls
+/// server configs are immutable after build. Toggling `required` and
+/// editing `allowed_organizations` are both hot-reloadable since those
+/// are enforced in the request path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MtlsConfig {
+    /// Concatenated PEM-encoded CA certificates that are allowed to
+    /// issue client certs. Must contain at least one valid CERTIFICATE
+    /// block. Empty / garbage PEM is rejected by the API validator.
+    pub ca_cert_pem: String,
+    /// When true, requests without a validated client certificate are
+    /// rejected with 496. When false, unauthenticated requests pass
+    /// through but any presented cert must still match the allowlist.
+    #[serde(default)]
+    pub required: bool,
+    /// Optional subject-organization allowlist. Empty = accept any
+    /// cert that chains to `ca_cert_pem`. Case-sensitive exact match.
+    #[serde(default)]
+    pub allowed_organizations: Vec<String>,
+}
+
 /// Canary traffic split: send `weight_percent` of a route's requests to
 /// a specific backend group, the rest fall through to the next split or
 /// (if cumulative weights < 100) to the route's default backends.
@@ -733,6 +778,12 @@ pub struct Route {
     /// client (Nginx `sub_filter` equivalent). `None` = disabled.
     #[serde(default)]
     pub response_rewrite: Option<ResponseRewriteConfig>,
+    /// mTLS client verification. When set, the TLS listener requires
+    /// or accepts client certs signed by `ca_cert_pem`; the proxy then
+    /// gates the request per route based on `required` and
+    /// `allowed_organizations`. `None` = disabled (current default).
+    #[serde(default)]
+    pub mtls: Option<MtlsConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1683,6 +1734,7 @@ mod tests {
             forward_auth: None,
             mirror: None,
             response_rewrite: None,
+            mtls: None,
             created_at: now,
             updated_at: now,
         };

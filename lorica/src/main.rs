@@ -1702,6 +1702,17 @@ fn run_worker(
     proxy_service
         .set_connection_filter(connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>);
 
+    // Build the optional mTLS client-cert verifier from the union of
+    // per-route CA bundles. This is done once here; rustls
+    // ServerConfig is immutable so reloading a CA requires a restart.
+    let mtls_verifier = {
+        let routes = store.blocking_lock().list_routes().unwrap_or_default();
+        lorica::mtls::build_from_routes(&routes)
+    };
+    if mtls_verifier.is_some() {
+        info!(worker_id = id, "mTLS enabled at listener: per-route enforcement applies");
+    }
+
     // Register listeners - TCP for HTTP, TLS for HTTPS
     let https_suffix = format!(":{https_port}");
     for addr in &listener_addrs {
@@ -1709,6 +1720,9 @@ fn run_worker(
             let mut tls_settings =
                 lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
             tls_settings.enable_h2();
+            if let Some(ref v) = mtls_verifier {
+                tls_settings.set_client_cert_verifier(v.clone());
+            }
             proxy_service.add_tls_with_settings(addr, None, tls_settings);
             info!(worker_id = id, addr = %addr, "registered TLS listener");
         } else {
@@ -1959,9 +1973,23 @@ fn run_single_process(cli: Cli) {
         // and the resolver is reloaded, TLS starts working without restart.
         let https_port = cli.https_port;
         {
+            // Build the optional mTLS verifier from the union of per-route
+            // CA bundles. Rustls ServerConfig is immutable after build,
+            // so changes to any mtls.ca_cert_pem require a restart -
+            // the API surfaces that via a warning on reload.
+            let mtls_verifier = {
+                let routes = store.blocking_lock().list_routes().unwrap_or_default();
+                lorica::mtls::build_from_routes(&routes)
+            };
+            if mtls_verifier.is_some() {
+                info!("mTLS enabled at listener: per-route enforcement applies");
+            }
             let mut tls_settings =
                 lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
             tls_settings.enable_h2();
+            if let Some(ref v) = mtls_verifier {
+                tls_settings.set_client_cert_verifier(v.clone());
+            }
             let mut tls_tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
             tls_tcp_opts.so_reuseport = Some(true);
             proxy_service.add_tls_with_settings(

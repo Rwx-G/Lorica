@@ -363,6 +363,7 @@ fn test_route(hostname: &str, forward_auth: Option<ForwardAuthConfig>) -> Route 
         forward_auth,
         mirror: None,
         response_rewrite: None,
+        mtls: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

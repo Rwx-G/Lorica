@@ -199,6 +199,7 @@ fn test_route(
         forward_auth: None,
         mirror: None,
         response_rewrite: None,
+        mtls: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

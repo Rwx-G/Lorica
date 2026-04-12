@@ -476,6 +476,13 @@ impl ConfigStore {
             [],
         );
 
+        // V31: mTLS client verification (per-route CA + required flag +
+        // org allowlist). JSON blob or NULL.
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN mtls TEXT DEFAULT NULL",
+            [],
+        );
+
         Ok(())
     }
 
@@ -594,6 +601,13 @@ impl ConfigStore {
             ),
             None => None,
         };
+        let mtls_json = match &route.mtls {
+            Some(m) => Some(
+                serde_json::to_string(m)
+                    .map_err(|e| ConfigError::Validation(format!("invalid mtls: {e}")))?,
+            ),
+            None => None,
+        };
 
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
@@ -624,12 +638,13 @@ impl ConfigStore {
              traffic_splits,
              forward_auth,
              mirror,
-             response_rewrite)
+             response_rewrite,
+             mtls)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
                      ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45,
-                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60, ?61)",
+                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60, ?61, ?62)",
             params![
                 route.id,
                 route.hostname,
@@ -692,6 +707,7 @@ impl ConfigStore {
                 forward_auth_json,
                 mirror_json,
                 response_rewrite_json,
+                mtls_json,
             ],
         )?;
         Ok(())
@@ -729,7 +745,8 @@ impl ConfigStore {
                  traffic_splits,
                  forward_auth,
                  mirror,
-                 response_rewrite
+                 response_rewrite,
+                 mtls
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
@@ -769,7 +786,8 @@ impl ConfigStore {
              traffic_splits,
              forward_auth,
              mirror,
-             response_rewrite
+             response_rewrite,
+             mtls
              FROM routes ORDER BY hostname, path_prefix",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_route(row)))?;
@@ -836,6 +854,13 @@ impl ConfigStore {
             ),
             None => None,
         };
+        let mtls_json = match &route.mtls {
+            Some(m) => Some(
+                serde_json::to_string(m)
+                    .map_err(|e| ConfigError::Validation(format!("invalid mtls: {e}")))?,
+            ),
+            None => None,
+        };
 
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,
@@ -865,7 +890,8 @@ impl ConfigStore {
              traffic_splits=?57,
              forward_auth=?58,
              mirror=?59,
-             response_rewrite=?60 WHERE id=?1",
+             response_rewrite=?60,
+             mtls=?61 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -927,6 +953,7 @@ impl ConfigStore {
                 forward_auth_json,
                 mirror_json,
                 response_rewrite_json,
+                mtls_json,
             ],
         )?;
         if changed == 0 {
@@ -3009,6 +3036,10 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         },
         response_rewrite: {
             let raw: Option<String> = row.get::<_, Option<String>>(60).unwrap_or(None);
+            raw.and_then(|s| serde_json::from_str(&s).ok())
+        },
+        mtls: {
+            let raw: Option<String> = row.get::<_, Option<String>>(61).unwrap_or(None);
             raw.and_then(|s| serde_json::from_str(&s).ok())
         },
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,

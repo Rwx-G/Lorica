@@ -73,6 +73,7 @@ mod tests {
             forward_auth: None,
             mirror: None,
             response_rewrite: None,
+            mtls: None,
             created_at: now,
             updated_at: now,
         }
@@ -1931,6 +1932,52 @@ cert_critical_days = 3
         store.create_route(&route).unwrap();
         let loaded = store.get_route(&route.id).unwrap().unwrap();
         assert!(loaded.response_rewrite.is_none());
+    }
+
+    #[test]
+    fn test_mtls_roundtrip() {
+        // Schema V31: mtls stored as nullable JSON at column 61.
+        // Regression guard against SELECT / UPDATE drift now that the
+        // row carries 61 columns.
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.mtls = Some(MtlsConfig {
+            ca_cert_pem:
+                "-----BEGIN CERTIFICATE-----\nMIIBdummy\n-----END CERTIFICATE-----\n".into(),
+            required: true,
+            allowed_organizations: vec!["Acme Corp".into(), "Beta Inc".into()],
+        });
+        store.create_route(&route).unwrap();
+
+        let via_get = store.get_route(&route.id).unwrap().unwrap();
+        let m = via_get.mtls.as_ref().unwrap();
+        assert!(m.ca_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(m.required, true);
+        assert_eq!(m.allowed_organizations, vec!["Acme Corp", "Beta Inc"]);
+
+        let via_list: Vec<_> = store
+            .list_routes()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.id == route.id)
+            .collect();
+        assert_eq!(via_list.len(), 1);
+        assert!(via_list[0].mtls.is_some());
+
+        let mut cleared = via_get.clone();
+        cleared.mtls = None;
+        store.update_route(&cleared).unwrap();
+        let after = store.get_route(&route.id).unwrap().unwrap();
+        assert!(after.mtls.is_none());
+    }
+
+    #[test]
+    fn test_mtls_default_none() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.mtls.is_none());
     }
 
     #[test]

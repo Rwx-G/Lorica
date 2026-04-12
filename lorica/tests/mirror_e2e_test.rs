@@ -257,6 +257,7 @@ fn test_route(mirror: Option<MirrorConfig>) -> Route {
         forward_auth: None,
         mirror,
         response_rewrite: None,
+        mtls: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

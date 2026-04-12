@@ -161,6 +161,7 @@ export interface RouteResponse {
   forward_auth?: ForwardAuthConfigResponse | null;
   mirror?: MirrorConfigResponse | null;
   response_rewrite?: ResponseRewriteConfigResponse | null;
+  mtls?: MtlsConfigResponse | null;
   created_at: string;
   updated_at: string;
 }
@@ -243,6 +244,18 @@ export interface MirrorConfigRequest {
   max_body_bytes: number;
 }
 
+export interface MtlsConfigResponse {
+  ca_cert_pem: string;
+  required: boolean;
+  allowed_organizations: string[];
+}
+
+export interface MtlsConfigRequest {
+  ca_cert_pem: string;
+  required: boolean;
+  allowed_organizations: string[];
+}
+
 export interface CreateRouteRequest {
   hostname: string;
   path_prefix?: string;
@@ -302,6 +315,7 @@ export interface CreateRouteRequest {
   forward_auth?: ForwardAuthConfigRequest;
   mirror?: MirrorConfigRequest;
   response_rewrite?: ResponseRewriteConfigRequest;
+  mtls?: MtlsConfigRequest;
 }
 
 
@@ -365,6 +379,7 @@ export interface UpdateRouteRequest {
   forward_auth?: ForwardAuthConfigRequest;
   mirror?: MirrorConfigRequest;
   response_rewrite?: ResponseRewriteConfigRequest;
+  mtls?: MtlsConfigRequest;
 }
 
 export interface BackendResponse {

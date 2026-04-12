@@ -1,4 +1,4 @@
-import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest, MirrorConfigRequest, ResponseRewriteConfigRequest } from './api';
+import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest, MirrorConfigRequest, ResponseRewriteConfigRequest, MtlsConfigRequest } from './api';
 
 export interface PathRuleFormState {
   path: string;
@@ -101,6 +101,9 @@ export interface RouteFormState {
   response_rewrite_rules: ResponseRewriteRuleFormState[]; // empty = feature off
   response_rewrite_max_body_bytes: number;
   response_rewrite_content_type_prefixes: string; // CSV
+  mtls_ca_cert_pem: string;              // empty = feature off
+  mtls_required: boolean;
+  mtls_allowed_organizations: string;    // CSV
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -170,6 +173,9 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   response_rewrite_rules: [],
   response_rewrite_max_body_bytes: 1048576,
   response_rewrite_content_type_prefixes: '',
+  mtls_ca_cert_pem: '',
+  mtls_required: false,
+  mtls_allowed_organizations: '',
 };
 
 // Tab field mappings for dot indicators
@@ -188,6 +194,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'rate_limit_burst', 'ip_allowlist', 'ip_denylist',
     'basic_auth_username', 'basic_auth_password',
     'forward_auth_address', 'forward_auth_timeout_ms', 'forward_auth_response_headers',
+    'mtls_ca_cert_pem', 'mtls_required', 'mtls_allowed_organizations',
   ],
   headers: [
     'proxy_headers', 'proxy_headers_remove',
@@ -330,6 +337,9 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     })),
     response_rewrite_max_body_bytes: route.response_rewrite?.max_body_bytes ?? 1048576,
     response_rewrite_content_type_prefixes: (route.response_rewrite?.content_type_prefixes ?? []).join(', '),
+    mtls_ca_cert_pem: route.mtls?.ca_cert_pem ?? '',
+    mtls_required: route.mtls?.required ?? false,
+    mtls_allowed_organizations: (route.mtls?.allowed_organizations ?? []).join(', '),
   };
 }
 
@@ -518,6 +528,29 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     forward_auth: forwardAuthFormToRequest(form, isUpdate),
     mirror: mirrorFormToRequest(form, isUpdate),
     response_rewrite: responseRewriteFormToRequest(form, isUpdate),
+    mtls: mtlsFormToRequest(form, isUpdate),
+  };
+}
+
+function mtlsFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): MtlsConfigRequest | undefined {
+  const pem = form.mtls_ca_cert_pem.trim();
+  if (pem === '') {
+    // On update, empty PEM = clear the feature (API treats an
+    // empty ca_cert_pem as "disable"). On create, omit entirely.
+    return isUpdate
+      ? { ca_cert_pem: '', required: false, allowed_organizations: [] }
+      : undefined;
+  }
+  return {
+    ca_cert_pem: pem,
+    required: form.mtls_required,
+    allowed_organizations: form.mtls_allowed_organizations
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
   };
 }
 
@@ -683,6 +716,24 @@ export function validateRouteForm(form: RouteFormState): string {
         if (!Number.isInteger(n) || n < 1) {
           return `Response rewrite rule ${i + 1}: max_replacements must be a positive integer (or empty for unlimited)`;
         }
+      }
+    }
+  }
+  // mTLS sanity. Empty ca_cert_pem = feature off.
+  const mtlsPem = form.mtls_ca_cert_pem.trim();
+  if (mtlsPem !== '') {
+    if (!/-----BEGIN CERTIFICATE-----/.test(mtlsPem)) {
+      return 'mTLS CA PEM must contain at least one "-----BEGIN CERTIFICATE-----" block';
+    }
+    if (mtlsPem.length > 1048576) {
+      return 'mTLS CA PEM must be 1 MiB or smaller; trim the bundle to issuing CAs only';
+    }
+    const orgs = form.mtls_allowed_organizations
+      .split(',')
+      .map((s) => s.trim());
+    for (let i = 0; i < orgs.length; i++) {
+      if (orgs[i] === '' && form.mtls_allowed_organizations.split(',').length > 1) {
+        return `mTLS allowed organization #${i + 1} must not be empty`;
       }
     }
   }

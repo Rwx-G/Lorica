@@ -168,6 +168,22 @@ pub struct RouteEntry {
     /// source rule's regex failed to compile - that rule is silently
     /// skipped at runtime. Empty vec when the feature is off.
     pub response_rewrite_compiled: Vec<Option<CompiledRewriteRule>>,
+    /// Pre-compiled mTLS enforcement state (required flag + a
+    /// pre-lowercased org allowlist). `None` when mTLS is disabled
+    /// for this route. Chain validation itself is done by the
+    /// listener-level rustls verifier; per-request decisions (does
+    /// this route require a cert, did it present one, does the
+    /// organization match) happen in `request_filter`.
+    pub mtls_enforcer: Option<MtlsEnforcer>,
+}
+
+/// Runtime-side view of a route's mTLS policy: the bits we check at
+/// request time. The CA bundle itself is installed on the listener at
+/// startup and is not needed here.
+#[derive(Debug, Clone)]
+pub struct MtlsEnforcer {
+    pub required: bool,
+    pub allowed_organizations: Vec<String>,
 }
 
 /// In-memory configuration snapshot used by the proxy.
@@ -423,6 +439,11 @@ impl ProxyConfig {
                 })
                 .collect();
 
+            let mtls_enforcer = route.mtls.as_ref().map(|m| MtlsEnforcer {
+                required: m.required,
+                allowed_organizations: m.allowed_organizations.clone(),
+            });
+
             let entry = RouteEntry {
                 route: Arc::new(route.clone()),
                 backends: route_backends,
@@ -435,6 +456,7 @@ impl ProxyConfig {
                 traffic_split_backends,
                 mirror_backends,
                 response_rewrite_compiled,
+                mtls_enforcer,
             };
 
             routes_by_host
@@ -1325,6 +1347,70 @@ pub(crate) async fn run_forward_auth(
     }
 }
 
+/// Evaluate the per-route mTLS policy against the connection's client
+/// certificate organization. Returns `None` when the request passes,
+/// and `Some(status)` with the HTTP status the caller should reject
+/// with. Pure so it is trivially unit-testable against synthesized
+/// ssl digests.
+///
+/// Status contract:
+/// - `required = true` and no cert → 496 ("SSL certificate required")
+/// - `allowed_organizations` non-empty, cert org not in list → 495
+///   ("SSL certificate error"). The org check applies whether
+///   required is true or false: an operator who configured an
+///   allowlist meant to enforce it on presented certs.
+/// - `required = false` and no cert presented → pass (opportunistic).
+///
+/// The cert chain itself is validated at the TLS layer by the
+/// listener's WebPkiClientVerifier; the organization string arrives
+/// pre-extracted in `client_organization` (None when no cert was
+/// presented, Some("") for a cert without an O= field).
+pub fn evaluate_mtls(
+    enforcer: &MtlsEnforcer,
+    client_organization: Option<&str>,
+) -> Option<u16> {
+    match client_organization {
+        None => {
+            if enforcer.required {
+                Some(496)
+            } else {
+                None
+            }
+        }
+        Some(org) => {
+            if enforcer.allowed_organizations.is_empty() {
+                None
+            } else if enforcer.allowed_organizations.iter().any(|a| a == org) {
+                None
+            } else {
+                Some(495)
+            }
+        }
+    }
+}
+
+/// Extract the client-certificate organization (O= DN field) from a
+/// downstream TLS session, or None when the session is plaintext / the
+/// client did not present a cert / the cert has no O= field.
+///
+/// We go through `downstream_session.digest().ssl_digest` because that
+/// is the only shared abstraction over rustls / boringssl; rustls
+/// populates `organization` from the first cert in the peer chain.
+fn downstream_ssl_digest(session: &Session) -> Option<String> {
+    let digest = session.as_downstream().digest()?;
+    let ssl = digest.ssl_digest.as_ref()?;
+    // cert_digest empty = no client cert was presented (rustls leaves
+    // the digest empty when the handshake completed via
+    // allow_unauthenticated).
+    if ssl.cert_digest.is_empty() {
+        return None;
+    }
+    // An authenticated cert may still lack an O= field. Return Some("")
+    // in that case so the route-level allowlist check correctly fails
+    // (empty string is never in a non-empty allowlist).
+    Some(ssl.organization.clone().unwrap_or_default())
+}
+
 /// Deterministic per-request sampling decision for request mirroring.
 /// Hashes the `request_id` (a UUID assigned per request) and modulos to
 /// 100. This keeps sampling stable across retries of the same logical
@@ -2058,6 +2144,39 @@ impl ProxyHttp for LoricaProxy {
                 header.insert_header("Location", &location)?;
                 session
                     .write_response_header(Box::new(header), true)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        // mTLS client verification: runs before forward_auth so a
+        // request that failed to present a valid client cert is
+        // rejected cheaply (no auth sub-request spawned). The listener
+        // has already validated the cert chain against the union CA
+        // bundle; we just check presence and the per-route org
+        // allowlist.
+        //
+        // 495 / 496 are the semi-standard "SSL cert error" / "SSL cert
+        // required" codes used by Nginx; reqwest and common clients
+        // surface them as meaningful errors and they don't collide
+        // with our other rejection paths.
+        if let Some(ref enforcer) = entry.mtls_enforcer {
+            let verdict = evaluate_mtls(enforcer, downstream_ssl_digest(session).as_deref());
+            if let Some(status) = verdict {
+                ctx.block_reason = Some(format!("mtls rejected ({status})"));
+                let mut resp_header = ResponseHeader::build(status, None)?;
+                let body: &[u8] = match status {
+                    496 => b"SSL certificate required",
+                    495 => b"SSL certificate error",
+                    _ => b"Forbidden",
+                };
+                let _ = resp_header.insert_header("Content-Type", "text/plain; charset=utf-8");
+                let _ = resp_header.insert_header("Content-Length", body.len().to_string());
+                session
+                    .write_response_header(Box::new(resp_header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
                     .await?;
                 return Ok(true);
             }
@@ -3988,6 +4107,7 @@ mod tests {
             forward_auth: None,
             mirror: None,
             response_rewrite: None,
+            mtls: None,
             created_at: now,
             updated_at: now,
         }
@@ -5750,6 +5870,90 @@ mod tests {
         assert_eq!(
             build_mirror_url("https://shadow.example.com", "/foo"),
             Some("https://shadow.example.com/foo".to_string())
+        );
+    }
+
+    // ---- evaluate_mtls ----
+
+    fn enforcer(required: bool, orgs: Vec<&str>) -> MtlsEnforcer {
+        MtlsEnforcer {
+            required,
+            allowed_organizations: orgs.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_mtls_required_no_cert_denies_496() {
+        // required = true with an absent client cert is the canonical
+        // zero-trust denial. 496 matches Nginx's reserved status.
+        assert_eq!(evaluate_mtls(&enforcer(true, vec![]), None), Some(496));
+    }
+
+    #[test]
+    fn test_evaluate_mtls_required_with_cert_and_empty_allowlist_passes() {
+        // Allowlist empty = trust the chain verifier. Any verified
+        // cert passes.
+        assert_eq!(
+            evaluate_mtls(&enforcer(true, vec![]), Some("Acme Corp")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_evaluate_mtls_optional_no_cert_passes() {
+        // required = false is the opportunistic mode: a missing cert
+        // is allowed through to the upstream.
+        assert_eq!(evaluate_mtls(&enforcer(false, vec![]), None), None);
+    }
+
+    #[test]
+    fn test_evaluate_mtls_allowlist_match_passes() {
+        assert_eq!(
+            evaluate_mtls(&enforcer(true, vec!["Acme", "Beta"]), Some("Acme")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_evaluate_mtls_allowlist_miss_denies_495() {
+        // Cert chains to the CA but the subject O= isn't on the
+        // allowlist - 495 ("SSL certificate error") is the right
+        // status code.
+        assert_eq!(
+            evaluate_mtls(&enforcer(true, vec!["Acme"]), Some("Gamma")),
+            Some(495)
+        );
+    }
+
+    #[test]
+    fn test_evaluate_mtls_allowlist_miss_denies_even_when_not_required() {
+        // Opportunistic + allowlist is still enforcing: if a cert is
+        // presented but doesn't match, deny. Otherwise the allowlist
+        // would be silently bypassable by omitting the cert.
+        assert_eq!(
+            evaluate_mtls(&enforcer(false, vec!["Acme"]), Some("Gamma")),
+            Some(495)
+        );
+    }
+
+    #[test]
+    fn test_evaluate_mtls_allowlist_is_case_sensitive() {
+        // Exact match, no case folding. Organization strings come
+        // from the X.509 subject verbatim.
+        assert_eq!(
+            evaluate_mtls(&enforcer(true, vec!["Acme"]), Some("acme")),
+            Some(495)
+        );
+    }
+
+    #[test]
+    fn test_evaluate_mtls_empty_org_on_cert_fails_non_empty_allowlist() {
+        // Cert present but carries no O= field (Some("") per
+        // downstream_ssl_digest contract) vs a non-empty allowlist:
+        // empty string never matches, so deny.
+        assert_eq!(
+            evaluate_mtls(&enforcer(true, vec!["Acme"]), Some("")),
+            Some(495)
         );
     }
 
