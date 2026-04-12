@@ -87,17 +87,33 @@ async fn spawn_versioned_origin() -> (SocketAddr, Arc<OriginState>) {
                 }
                 let hit = state.hits.fetch_add(1, Ordering::SeqCst) + 1;
                 let v = state.version.load(Ordering::SeqCst);
-                let body = format!("v{v}-hit{hit}");
-                // NO Cache-Control header; the proxy's route config
-                // dictates TTL + SWR via its CacheMeta defaults.
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                     Content-Type: text/plain\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\
-                     \r\n{body}",
-                    body.len()
-                );
+                // version=0 is a test-controlled "failure mode": the
+                // origin emits 503 so stale-if-error and failed-SWR-
+                // refresh scenarios can be driven deterministically
+                // by the test.
+                let resp = if v == 0 {
+                    let body = "service unavailable";
+                    format!(
+                        "HTTP/1.1 503 Service Unavailable\r\n\
+                         Content-Type: text/plain\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    let body = format!("v{v}-hit{hit}");
+                    // NO Cache-Control header; the proxy's route config
+                    // dictates TTL + SWR via its CacheMeta defaults.
+                    format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/plain\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n{body}",
+                        body.len()
+                    )
+                };
                 let _ = stream.write_all(resp.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
@@ -431,6 +447,191 @@ async fn swr_disabled_route_revalidates_synchronously() {
         "without SWR, the stale hit must block on a fresh fetch"
     );
     assert_eq!(state.hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_if_error_serves_cached_body_when_upstream_fails() {
+    // TTL 1s, SWR 0, SIE 60s. After expiry the cache entry is stale
+    // but still serveable under stale-if-error. If the origin returns
+    // an upstream error, the client must get the cached body (not the
+    // error).
+    let (origin, state) = spawn_versioned_origin().await;
+
+    // Switch the mock to a failing origin after the first hit: we
+    // bring it down by setting a "fail" flag. Simpler: just close the
+    // listener by dropping it. But we need to keep the origin address
+    // bound... Instead, the mock can be extended to emit 5xx based on
+    // state.version = 0 (or similar). Let me use a dedicated signal.
+    // Simplest: bind a new mock that always 500s after we populate
+    // the cache via the first request; then shut down the good origin
+    // and the route's backend address switches? That's too complex.
+    //
+    // Pragmatic workaround: use a single origin that returns 503 when
+    // a flag is set. Piggyback on `state.version = 0` as the signal.
+    let route = cacheable_route(1, 0, 60);
+    let backends = vec![test_backend("b-origin", origin)];
+    let links = vec![("r-swr".into(), "b-origin".into())];
+    let config = ProxyConfig::from_store(
+        vec![route],
+        backends,
+        vec![],
+        links,
+        ProxyConfigGlobals::default(),
+    );
+    let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // Populate cache with v1.
+    let r = client.get(&harness.url()).send().await.unwrap();
+    assert_eq!(r.text().await.unwrap(), "v1-hit1");
+
+    // Flip the origin into "fail mode" by setting version=0. The mock
+    // treats 0 as "emit 503"; see failure-mode branch in
+    // spawn_versioned_origin (added below).
+    state.version.store(0, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+
+    // Origin is now returning 503 -> stale-if-error must kick in and
+    // the client gets the cached v1-hit1 body.
+    let r = client.get(&harness.url()).send().await.unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "stale-if-error must mask upstream failures with the cached body"
+    );
+    assert_eq!(r.text().await.unwrap(), "v1-hit1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swr_concurrent_requests_spawn_exactly_one_background_refresh() {
+    // Ten clients race on the stale entry within the SWR window.
+    // Anti-thundering-herd: the cache lock must let exactly one
+    // background refresh through while the other nine serve stale
+    // from cache. Origin hit count must go from 1 (initial populate)
+    // to 2 (single refresh) - never to 11.
+    let (origin, state) = spawn_versioned_origin().await;
+    let route = cacheable_route(1, 30, 60);
+    let backends = vec![test_backend("b-origin", origin)];
+    let links = vec![("r-swr".into(), "b-origin".into())];
+    let config = ProxyConfig::from_store(
+        vec![route],
+        backends,
+        vec![],
+        links,
+        ProxyConfigGlobals::default(),
+    );
+    let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // Populate cache (hit 1).
+    let r = client.get(&harness.url()).send().await.unwrap();
+    assert_eq!(r.text().await.unwrap(), "v1-hit1");
+    state.version.store(2, Ordering::SeqCst);
+
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+
+    // Fire 10 concurrent requests at the stale entry.
+    let url = harness.url();
+    let mut handles = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let c = client.clone();
+        let u = url.clone();
+        handles.push(tokio::spawn(async move {
+            let r = c.get(&u).send().await.unwrap();
+            r.text().await.unwrap()
+        }));
+    }
+    for h in handles {
+        let body = h.await.unwrap();
+        // Every concurrent request must receive the stale v1 body
+        // (the refresh doesn't finish synchronously on the critical
+        // path of any of them).
+        assert_eq!(
+            body, "v1-hit1",
+            "concurrent SWR readers must all see stale v1"
+        );
+    }
+
+    // Wait for the background refresh to reach the origin, then
+    // assert exactly ONE refresh was spawned regardless of how many
+    // clients raced.
+    wait_for_origin_hits(&state, 2, Duration::from_secs(3)).await;
+    // Give a brief settle window in case any late refresh arrives.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        state.hits.load(Ordering::SeqCst),
+        2,
+        "concurrent SWR readers must share ONE background refresh, not spawn one each"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swr_background_refresh_failure_does_not_poison_cache() {
+    // TTL 1s, SWR 10s, SIE 60s. Populate cache with v1. Flip origin
+    // to fail mode. Trigger a stale read: client gets stale v1
+    // (SWR path), background refresh fires and fails. The cache
+    // entry should NOT be overwritten with an error response - a
+    // subsequent read (still inside SWR+SIE windows) must still
+    // return v1, not the 503 body.
+    let (origin, state) = spawn_versioned_origin().await;
+    let route = cacheable_route(1, 10, 60);
+    let backends = vec![test_backend("b-origin", origin)];
+    let links = vec![("r-swr".into(), "b-origin".into())];
+    let config = ProxyConfig::from_store(
+        vec![route],
+        backends,
+        vec![],
+        links,
+        ProxyConfigGlobals::default(),
+    );
+    let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let r = client.get(&harness.url()).send().await.unwrap();
+    assert_eq!(r.text().await.unwrap(), "v1-hit1");
+
+    // Flip origin to failure mode.
+    state.version.store(0, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+
+    // Request 2: stale hit, SWR refresh fires, refresh fails.
+    let r = client.get(&harness.url()).send().await.unwrap();
+    assert_eq!(
+        r.text().await.unwrap(),
+        "v1-hit1",
+        "SWR must serve stale even when the forthcoming refresh is doomed"
+    );
+
+    // Wait for the failed refresh to have happened and the write
+    // lock to release.
+    wait_for_origin_hits(&state, 2, Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Request 3: entry is still within SIE (60s). A failed refresh
+    // must NOT have written a 503 over the cached v1. The client
+    // must still see v1, not an error body.
+    let r = client.get(&harness.url()).send().await.unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "failed SWR refresh must not corrupt the cached entry"
+    );
+    assert_eq!(r.text().await.unwrap(), "v1-hit1");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
