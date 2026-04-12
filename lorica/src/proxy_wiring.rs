@@ -3572,23 +3572,58 @@ impl ProxyHttp for LoricaProxy {
         // Done at header-phase so we can drop Content-Length (our
         // rewritten body will have a different length) before the
         // response line is sent.
+        //
+        // Skip HEAD requests: the response MUST report the Content-Length
+        // a GET would produce (RFC 7231 s4.3.2), and HEAD carries no
+        // body for us to rewrite. Stripping Content-Length here would
+        // break clients that size their follow-up GET based on HEAD.
+        //
+        // Also skip 1xx / 204 / 304 responses: they are defined as
+        // having no body, and stripping Content-Length on a 304 would
+        // corrupt the revalidation contract.
+        let is_head = session
+            .req_header()
+            .method
+            .as_str()
+            .eq_ignore_ascii_case("HEAD");
+        let status = upstream_response.status.as_u16();
+        let body_forbidden = matches!(status, 100..=199 | 204 | 304);
+        // v1 scope: response rewriting is mutually exclusive with
+        // caching. Pingora's cache captures raw upstream bytes and
+        // replays them through response_body_filter on cache hits,
+        // so naively combining the two would either double-rewrite
+        // (if the cache stored rewritten bytes) or silently break
+        // the stream framing (the cache relies on the
+        // upstream-reported Content-Length we would strip). Pick
+        // one per route; rewriting wins over caching with a loud
+        // warning, because rewriting is typically the stricter
+        // security / integrity requirement.
+        let cache_active = session.cache.enabled();
+        if cache_active && route.response_rewrite.is_some() {
+            tracing::warn!(
+                route_id = %route.id,
+                "response_rewrite disabled for this response because the route also has cache_enabled; caching + rewriting are mutually exclusive in v1"
+            );
+        }
         if let Some(ref rr_cfg) = route.response_rewrite {
-            let ct = upstream_response
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let ce = upstream_response
-                .headers
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if should_rewrite_response(rr_cfg, ct, ce) {
-                // Strip Content-Length; the framework will emit the
-                // rewritten body as chunked. Transfer-Encoding is
-                // likewise re-derived by the server.
-                upstream_response.remove_header("content-length");
-                ctx.response_rewrite_state = Some(ResponseRewriteState::Active(Vec::new()));
+            if !is_head && !body_forbidden && !cache_active {
+                let ct = upstream_response
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let ce = upstream_response
+                    .headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if should_rewrite_response(rr_cfg, ct, ce) {
+                    // Strip Content-Length; the framework will emit the
+                    // rewritten body as chunked. Transfer-Encoding is
+                    // likewise re-derived by the server.
+                    upstream_response.remove_header("content-length");
+                    ctx.response_rewrite_state = Some(ResponseRewriteState::Active(Vec::new()));
+                }
             }
         }
 

@@ -620,6 +620,101 @@ async fn rewrite_disabled_route_passes_body_through() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewrite_skipped_for_head_requests_preserves_content_length() {
+    // HEAD responses MUST report the same Content-Length a GET would
+    // produce (RFC 7231 §4.3.2). If we stripped Content-Length on
+    // HEAD just because the route has a rewrite config, clients
+    // sizing range requests off HEAD responses would break.
+    let origin = spawn_scripted_origin(Arc::new(|req| {
+        let method = req.lines().next().unwrap_or("").split_whitespace().next().unwrap_or("GET");
+        if method == "HEAD" {
+            // HEAD: headers only, no body (origin server-side we
+            // send empty body + matching Content-Length).
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/html\r\n\
+                 Content-Length: 42\r\n\
+                 Connection: close\r\n\
+                 \r\n"
+            )
+            .into_bytes()
+        } else {
+            static_response("text/html", b"<html>backend response body</html>")
+        }
+    }))
+    .await;
+    let route = test_route(Some(simple_cfg(vec![literal("backend", "frontend")])));
+    let backends = vec![test_backend("b1", origin)];
+    let links = vec![("r-rw".into(), "b1".into())];
+    let config = ProxyConfig::from_store(
+        vec![route],
+        backends,
+        vec![],
+        links,
+        ProxyConfigGlobals::default(),
+    );
+    let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client.head(&harness.url()).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-length").and_then(|v| v.to_str().ok()),
+        Some("42"),
+        "HEAD response must preserve Content-Length even on rewrite-enabled routes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewrite_is_disabled_when_cache_enabled_on_same_route() {
+    // v1 contract: response_rewrite and cache_enabled are mutually
+    // exclusive per route (the cache captures raw upstream bytes and
+    // re-streams them through response_body_filter, which would
+    // either double-rewrite or collide with our Content-Length
+    // stripping). The engine logs a warning and disables rewrite
+    // for that response - rather than silently emitting corrupt
+    // output. This test pins that escape hatch.
+    let origin = spawn_scripted_origin(Arc::new(|_req| {
+        static_response("text/html", b"<html>backend response body</html>")
+    }))
+    .await;
+    let mut route = test_route(Some(simple_cfg(vec![literal("backend", "frontend")])));
+    route.cache_enabled = true;
+    route.cache_ttl_s = 60;
+    let backends = vec![test_backend("b1", origin)];
+    let links = vec![("r-rw".into(), "b1".into())];
+    let config = ProxyConfig::from_store(
+        vec![route],
+        backends,
+        vec![],
+        links,
+        ProxyConfigGlobals::default(),
+    );
+    let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client.get(&harness.url()).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    // Rewrite is suppressed: the original "backend" substring must
+    // still appear in the client-visible body. If a future version
+    // wires cache + rewrite together this test will fail - that's
+    // the signal to remove the warning and update the contract.
+    assert_eq!(
+        body, "<html>backend response body</html>",
+        "cache_enabled must suppress response_rewrite in v1"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rewrite_multiple_rules_compose_in_declaration_order() {
     let origin = spawn_scripted_origin(Arc::new(|_req| {
         static_response("text/plain", b"one fish, two fish, red fish, blue fish")
