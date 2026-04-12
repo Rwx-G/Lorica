@@ -43,7 +43,7 @@ Major feature additions that close the gap with Traefik and Nginx.
 | Request mirroring | Planned | Medium | Duplicate traffic to secondary backend (fire-and-forget). Shadow testing |
 | Cache Vary support | Planned | Medium | Implement `cache_vary_filter()`. `VarianceBuilder` exists in `lorica-cache/src/variance.rs` |
 | Stale-while-revalidate | Planned | Low | `stale_writer` support exists in cache lock module. Serve stale while background refresh |
-| Cache predictor | Planned | Medium | `lorica-cache/src/predictor.rs` exists. Learn which assets are cacheable |
+| Cache predictor | Done | Medium | `lorica-cache/src/predictor.rs` exists. Learn which assets are cacheable |
 | Connection pre-filter | Done | Low | Replace `AcceptAllFilter` with configurable filter. IP-level filtering before TLS handshake |
 
 ---

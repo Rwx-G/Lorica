@@ -27,6 +27,7 @@ use lorica_cache::cache_control::CacheControl;
 use lorica_cache::eviction::simple_lru;
 use lorica_cache::filters::resp_cacheable;
 use lorica_cache::lock::CacheLock;
+use lorica_cache::predictor::Predictor;
 use lorica_cache::{
     CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable,
 };
@@ -640,6 +641,26 @@ static CACHE_EVICTION: Lazy<simple_lru::Manager> =
 static CACHE_LOCK: Lazy<&'static CacheLock> = Lazy::new(|| {
     let lock = CacheLock::new_boxed(Duration::from_secs(10));
     Box::leak(lock)
+});
+
+/// Cacheability predictor. Remembers keys whose origin recently responded as
+/// uncacheable (OriginNotCache, ResponseTooLarge, or a user-defined custom
+/// reason) and short-circuits the cache state machine on the next request,
+/// avoiding cache-lock contention and variance-key computation for assets
+/// that have proved they would bypass the cache anyway.
+///
+/// `16 * 2048 = 32_768` keys are remembered across 16 LRU shards. A shard is
+/// selected by hash so concurrent writers only contend within their shard.
+/// Internal errors (InternalError, StorageError, UpstreamError, lock
+/// timeouts) are not remembered - those are transient and should not poison
+/// future cacheability decisions.
+const CACHE_PREDICTOR_SHARDS: usize = 16;
+const CACHE_PREDICTOR_SHARD_CAPACITY: usize = 2048;
+static CACHE_PREDICTOR: Lazy<&'static Predictor<CACHE_PREDICTOR_SHARDS>> = Lazy::new(|| {
+    Box::leak(Box::new(Predictor::<CACHE_PREDICTOR_SHARDS>::new(
+        CACHE_PREDICTOR_SHARD_CAPACITY,
+        None,
+    )))
 });
 
 /// Default cache TTL for cacheable status codes when the origin does not send
@@ -1791,11 +1812,15 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Enable the cache state machine with MemCache storage + LRU eviction
+        // Enable the cache state machine with MemCache storage + LRU eviction.
+        // The predictor is shared across all cache-enabled routes: responses
+        // marked uncacheable by the origin skip the cache state machine on
+        // the next request, avoiding cache-lock contention on known-bypass
+        // traffic.
         session.cache.enable(
             &*CACHE_BACKEND,
             Some(&*CACHE_EVICTION),
-            None, // no predictor
+            Some(*CACHE_PREDICTOR),
             Some(*CACHE_LOCK),
             None, // no option overrides
         );
@@ -3953,5 +3978,43 @@ mod tests {
         route.stale_if_error_s = 0;
         assert_eq!(route.stale_while_revalidate_s as u32, 0);
         assert_eq!(route.stale_if_error_s as u32, 0);
+    }
+
+    #[test]
+    fn test_cache_predictor_remembers_uncacheable() {
+        // Confirm the shared CACHE_PREDICTOR static boots correctly and
+        // behaves as expected against the CacheKey layout used by
+        // `cache_key_callback` (empty namespace, "host+path" primary). This
+        // guards against accidental changes to that layout silently breaking
+        // predictor lookups.
+        use lorica_cache::predictor::CacheablePredictor;
+        let predictor = *CACHE_PREDICTOR;
+        let key = CacheKey::new(String::new(), "predictor-test.example/foo".to_string(), String::new());
+
+        // Fresh key -> cacheable until proven otherwise.
+        assert!(predictor.cacheable_prediction(&key));
+
+        // Origin says uncacheable -> predictor remembers.
+        assert_eq!(
+            predictor.mark_uncacheable(&key, NoCacheReason::OriginNotCache),
+            Some(true)
+        );
+        assert!(!predictor.cacheable_prediction(&key));
+
+        // Transient errors must NOT poison the prediction.
+        let transient_key = CacheKey::new(
+            String::new(),
+            "predictor-test.example/transient".to_string(),
+            String::new(),
+        );
+        assert_eq!(
+            predictor.mark_uncacheable(&transient_key, NoCacheReason::InternalError),
+            None
+        );
+        assert!(predictor.cacheable_prediction(&transient_key));
+
+        // Re-cacheable after mark_cacheable clears the entry.
+        predictor.mark_cacheable(&key);
+        assert!(predictor.cacheable_prediction(&key));
     }
 }
