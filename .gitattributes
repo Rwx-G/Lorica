@@ -2,3 +2,5 @@
 *.sh text eol=lf
 entrypoint* text eol=lf
 Dockerfile* text eol=lf
+# RPM spec files must use LF (rpmbuild fails on CRLF)
+*.spec text eol=lf
