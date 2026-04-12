@@ -6,7 +6,7 @@ Bug fixes, improvements, and maintenance tasks. For new features, see [ROADMAP.m
 
 | # | Item | Type | Notes |
 |---|------|------|-------|
-| | | | |
+| 5 | Worker drain timeout too short for long-poll clients | Improvement | Observed in prod during v1.1.0 -> v1.2.0 upgrade: all 6 workers got SIGKILL after the 30 s drain timeout because GitLab runner long-polls (`POST /api/v4/jobs/request`) held connections open past the deadline. Not a bug but hurts graceful upgrades. Options: (a) make drain timeout configurable, (b) close idle keepalives aggressively on SIGTERM, (c) force-close long-polls after a grace period. Impacts zero-downtime deploys. |
 
 ## Resolved
 
