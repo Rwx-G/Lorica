@@ -16,10 +16,16 @@ health checks, certificate management, Prometheus metrics.
 %install
 mkdir -p %{buildroot}/usr/bin
 mkdir -p %{buildroot}/usr/lib/systemd/system
+mkdir -p %{buildroot}/usr/share/doc/lorica
+mkdir -p %{buildroot}/usr/share/licenses/lorica
 mkdir -p %{buildroot}/var/lib/lorica
 
 install -m 755 %{_sourcedir}/lorica %{buildroot}/usr/bin/lorica
 install -m 644 %{_sourcedir}/dist/lorica.service %{buildroot}/usr/lib/systemd/system/lorica.service
+
+# LICENSE and NOTICE (Apache-2.0 section 4(d) compliance)
+install -m 644 %{_sourcedir}/LICENSE %{buildroot}/usr/share/licenses/lorica/LICENSE
+install -m 644 %{_sourcedir}/NOTICE %{buildroot}/usr/share/licenses/lorica/NOTICE
 
 %pre
 getent group lorica >/dev/null || groupadd -r lorica
@@ -72,6 +78,8 @@ systemctl disable lorica.service 2>/dev/null || true
 systemctl daemon-reload
 
 %files
+%license /usr/share/licenses/lorica/LICENSE
+%license /usr/share/licenses/lorica/NOTICE
 %attr(755, root, root) /usr/bin/lorica
 %attr(644, root, root) /usr/lib/systemd/system/lorica.service
 %dir %attr(750, lorica, lorica) /var/lib/lorica

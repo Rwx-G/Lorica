@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BINARY="${1:-./lorica}"
-VERSION=$(grep '^version' lorica/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+VERSION=$(grep '^version' lorica/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/' | tr -d '\r')
 ARCH="amd64"
 PKG_NAME="lorica_${VERSION}_${ARCH}"
 PKG_DIR="dist/${PKG_NAME}"
@@ -19,6 +19,7 @@ rm -rf "$PKG_DIR"
 mkdir -p "$PKG_DIR/DEBIAN"
 mkdir -p "$PKG_DIR/usr/bin"
 mkdir -p "$PKG_DIR/lib/systemd/system"
+mkdir -p "$PKG_DIR/usr/share/doc/lorica"
 mkdir -p "$PKG_DIR/var/lib/lorica"
 
 # Copy binary
@@ -27,6 +28,38 @@ chmod 755 "$PKG_DIR/usr/bin/lorica"
 
 # Copy systemd service
 cp dist/lorica.service "$PKG_DIR/lib/systemd/system/"
+
+# Copy LICENSE and NOTICE (Apache-2.0 section 4(d) compliance)
+cp LICENSE "$PKG_DIR/usr/share/doc/lorica/"
+cp NOTICE "$PKG_DIR/usr/share/doc/lorica/"
+chmod 644 "$PKG_DIR/usr/share/doc/lorica/LICENSE"
+chmod 644 "$PKG_DIR/usr/share/doc/lorica/NOTICE"
+
+# Debian requires a copyright file summarizing the licensing
+cat > "$PKG_DIR/usr/share/doc/lorica/copyright" << 'EOF'
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Lorica
+Upstream-Contact: Romain G. <noreply@github.com>
+Source: https://github.com/Rwx-G/Lorica
+
+Files: *
+Copyright: 2026 Romain G.
+License: Apache-2.0
+
+Files: lorica-core/* lorica-proxy/* lorica-http/* lorica-error/*
+ lorica-pool/* lorica-runtime/* lorica-timeout/* lorica-tls/*
+ lorica-lb/* lorica-ketama/* lorica-limits/* lorica-header-serde/*
+ lorica-cache/* lorica-memory-cache/* lorica-lru/* tinyufo/*
+Copyright: 2024-2026 Cloudflare, Inc.
+License: Apache-2.0
+Comment: Forked from Cloudflare Pingora (https://github.com/cloudflare/pingora).
+ See /usr/share/doc/lorica/NOTICE for attribution.
+
+License: Apache-2.0
+ On Debian systems, the complete text of the Apache License 2.0 can be
+ found in /usr/share/doc/lorica/LICENSE or /usr/share/common-licenses/Apache-2.0.
+EOF
+chmod 644 "$PKG_DIR/usr/share/doc/lorica/copyright"
 
 # Control file
 cat > "$PKG_DIR/DEBIAN/control" << EOF
