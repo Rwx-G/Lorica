@@ -9,9 +9,31 @@
     importedFields?: Set<string>;
     customPresets?: SecurityHeaderPreset[];
     backends?: BackendResponse[];
+    /**
+     * The `mtls.ca_cert_pem` value loaded from the server for this
+     * route, or an empty string when creating or when mTLS is off.
+     * Used to surface a "requires restart" hint when the operator
+     * edits the CA bundle at runtime - rustls ServerConfig is
+     * immutable after the listener is built.
+     */
+    initialMtlsCaCertPem?: string;
   }
 
-  let { form = $bindable(), importedFields, customPresets = [], backends = [] }: Props = $props();
+  let {
+    form = $bindable(),
+    importedFields,
+    customPresets = [],
+    backends = [],
+    initialMtlsCaCertPem = '',
+  }: Props = $props();
+
+  // True only when the operator is editing an already-configured
+  // mtls route and changed the CA PEM bytes. Required + org
+  // allowlist edits hot-reload, so they don't trigger this hint.
+  let mtlsCaChangedFromInitial = $derived(
+    initialMtlsCaCertPem.trim() !== '' &&
+      form.mtls_ca_cert_pem.trim() !== initialMtlsCaCertPem.trim(),
+  );
 
   function toggleMirrorBackend(id: string) {
     if (form.mirror_backend_ids.includes(id)) {
@@ -230,6 +252,16 @@
       One or more <code>-----BEGIN CERTIFICATE-----</code> blocks. Empty = feature
       disabled. Max 1 MiB.
     </span>
+    {#if mtlsCaChangedFromInitial}
+      <div class="warn-banner">
+        <strong>Restart required.</strong> The TLS listener's client-CA
+        bundle is fixed after startup (rustls
+        <code>ServerConfig</code> is immutable). Saving will persist the
+        new bundle, but the change won't take effect on handshakes
+        until Lorica is restarted. Toggling <em>Required</em> and
+        editing <em>Allowed organizations</em> hot-reload normally.
+      </div>
+    {/if}
   </div>
 
   <div class="form-row">
@@ -337,6 +369,18 @@
   .form-row-3 { grid-template-columns: 1fr 1fr 1fr; }
 
   .hint { font-weight: 400; color: var(--color-text-muted); font-size: 0.75rem; }
+
+  .warn-banner {
+    margin-top: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid rgba(234, 179, 8, 0.4);
+    background: rgba(234, 179, 8, 0.08);
+    border-radius: 4px;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: var(--color-text);
+  }
+  .warn-banner code { background: rgba(0,0,0,0.08); padding: 0 0.25rem; border-radius: 2px; }
 
   .imported-badge {
     display: inline-block;

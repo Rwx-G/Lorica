@@ -495,3 +495,424 @@ async fn lorica_proxy_accepts_mtls_route_in_snapshot() {
     let sla = Arc::new(lorica_bench::passive_sla::SlaCollector::new());
     let _proxy = LoricaProxy::new(proxy_config, log_buffer, active, sla);
 }
+
+// ===========================================================================
+// Full-stack e2e: real Pingora server + TLS listener with mTLS verifier +
+// plaintext upstream + tokio-rustls clients. Asserts the 200 / 495 / 496
+// statuses actually arrive on the wire (not just in the pure helper).
+// ===========================================================================
+
+use async_trait::async_trait;
+use lorica_core::server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch};
+use std::sync::atomic::AtomicU64;
+
+struct ManualShutdown {
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl ShutdownSignalWatch for ManualShutdown {
+    async fn recv(&self) -> ShutdownSignal {
+        let mut rx = self.rx.clone();
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                break;
+            }
+        }
+        ShutdownSignal::FastShutdown
+    }
+}
+
+fn reserve_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+async fn wait_for_port(port: u16) {
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("proxy never bound 127.0.0.1:{port}");
+}
+
+// Plaintext upstream the TLS-terminating proxy forwards to. Responds
+// "upstream-ok" so the test can distinguish a proxy-generated error
+// body (495/496) from a real pass-through.
+async fn spawn_plain_upstream() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            tokio::spawn(async move {
+                let mut buf = Vec::with_capacity(4096);
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match stream.read(&mut tmp).await {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                            if buf.len() > 32 * 1024 {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let body = b"upstream-ok";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+fn build_test_route_with_mtls(
+    upstream_id: &str,
+    ca_pem: &str,
+    required: bool,
+    orgs: Vec<&str>,
+) -> Route {
+    let mut r = mtls_route(ca_pem, required, orgs);
+    // The harness routes on exact hostname, so the test clients must
+    // send Host: localhost (which reqwest / raw TLS do by default to
+    // match the SNI).
+    r.id = "r-mtls-fs".into();
+    r.hostname = "localhost".into();
+    // Wire the route to the upstream via route_backend_links.
+    let _ = upstream_id;
+    r
+}
+
+fn upstream_backend(id: &str, addr: std::net::SocketAddr) -> Backend {
+    let now = Utc::now();
+    Backend {
+        id: id.into(),
+        address: addr.to_string(),
+        name: id.into(),
+        group_name: String::new(),
+        weight: 1,
+        health_status: HealthStatus::Healthy,
+        health_check_enabled: false,
+        health_check_interval_s: 10,
+        health_check_path: None,
+        lifecycle_state: LifecycleState::Normal,
+        active_connections: 0,
+        tls_upstream: false,
+        tls_skip_verify: false,
+        tls_sni: None,
+        h2_upstream: false,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+struct TlsProxyHarness {
+    port: u16,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TlsProxyHarness {
+    async fn start(
+        pki: &TestPki,
+        routes: Vec<Route>,
+        backends: Vec<Backend>,
+        links: Vec<(String, String)>,
+    ) -> Self {
+        init_crypto();
+
+        // Server cert for "localhost" signed by our test CA so the
+        // test client (configured to trust ca_pem as a server root)
+        // completes the TLS handshake against the proxy.
+        let server_cert_pem = {
+            let der = pki.server_cert_der.as_ref().to_vec();
+            let b64 = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(&der)
+            };
+            let mut s = String::from("-----BEGIN CERTIFICATE-----\n");
+            for chunk in b64.as_bytes().chunks(64) {
+                s.push_str(std::str::from_utf8(chunk).unwrap());
+                s.push('\n');
+            }
+            s.push_str("-----END CERTIFICATE-----\n");
+            s
+        };
+        let server_key_pem = {
+            // rustls_pki_types::PrivateKeyDer is an enum; here the
+            // fixture created Pkcs8 so extract accordingly. Fall back
+            // to the generic encoder if the variant shifts.
+            let der_bytes: Vec<u8> = match &pki.server_key_der {
+                PrivateKeyDer::Pkcs8(k) => k.secret_pkcs8_der().to_vec(),
+                other => other.secret_der().to_vec(),
+            };
+            let b64 = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(&der_bytes)
+            };
+            let mut s = String::from("-----BEGIN PRIVATE KEY-----\n");
+            for chunk in b64.as_bytes().chunks(64) {
+                s.push_str(std::str::from_utf8(chunk).unwrap());
+                s.push('\n');
+            }
+            s.push_str("-----END PRIVATE KEY-----\n");
+            s
+        };
+
+        let cert_resolver =
+            Arc::new(lorica_tls::cert_resolver::CertResolver::new());
+        cert_resolver
+            .reload(vec![lorica_tls::cert_resolver::CertData {
+                domain: "localhost".into(),
+                san_domains: vec!["localhost".into()],
+                cert_pem: server_cert_pem,
+                key_pem: server_key_pem,
+                not_after_epoch: i64::MAX,
+                ocsp_response: None,
+            }])
+            .expect("cert resolver reload");
+
+        // Build the mTLS verifier from the same routes the proxy will
+        // serve - mirrors production wiring exactly.
+        let mtls_verifier = lorica::mtls::build_from_routes(&routes)
+            .expect("routes carry mtls so verifier must build");
+
+        let config = ProxyConfig::from_store(
+            routes,
+            backends,
+            vec![],
+            links,
+            ProxyConfigGlobals::default(),
+        );
+        let proxy_config = Arc::new(ArcSwap::from_pointee(config));
+
+        let log_buffer = Arc::new(lorica_api::logs::LogBuffer::new(128));
+        let active_conns = Arc::new(AtomicU64::new(0));
+        let sla = Arc::new(lorica_bench::passive_sla::SlaCollector::new());
+        let proxy = LoricaProxy::new(proxy_config, log_buffer, active_conns, sla);
+
+        let port = reserve_port();
+        let proxy_addr = format!("127.0.0.1:{port}");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let thread = std::thread::spawn(move || {
+            let server_conf = Arc::new(lorica_core::server::configuration::ServerConf {
+                upstream_keepalive_pool_size: 0,
+                ..Default::default()
+            });
+            let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, proxy);
+            let mut tls_settings =
+                lorica_core::listeners::tls::TlsSettings::with_resolver(
+                    cert_resolver.clone(),
+                );
+            tls_settings.enable_h2();
+            tls_settings.set_client_cert_verifier(mtls_verifier);
+            proxy_service.add_tls_with_settings(&proxy_addr, None, tls_settings);
+            let mut server = Server::new(None).unwrap();
+            server.add_service(proxy_service);
+            server.bootstrap();
+            server.run(RunArgs {
+                shutdown_signal: Box::new(ManualShutdown { rx: shutdown_rx }),
+            });
+        });
+        wait_for_port(port).await;
+        Self {
+            port,
+            shutdown_tx,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for TlsProxyHarness {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(t) = self.thread.take() {
+            std::thread::spawn(move || {
+                let _ = t.join();
+            });
+        }
+    }
+}
+
+async fn tls_request(
+    port: u16,
+    client_config: Arc<RusTlsClientConfig>,
+) -> Result<(u16, String), String> {
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+    let connector = tokio_rustls::TlsConnector::from(client_config);
+    let server_name = rustls_pki_types::ServerName::try_from("localhost")
+        .unwrap()
+        .to_owned();
+    let mut tls = tokio::time::timeout(
+        Duration::from_secs(5),
+        connector.connect(server_name, stream),
+    )
+    .await
+    .map_err(|_| "handshake timeout".to_string())?
+    .map_err(|e| format!("handshake: {e}"))?;
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+    loop {
+        match tls.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.len() > 32 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| format!("no status in response: {text:?}"))?;
+    Ok((status, text))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_required_no_cert_returns_496_on_wire() {
+    // The canonical zero-trust denial: required=true, client sends no
+    // cert, the proxy writes 496 back through the TLS stream (the
+    // handshake completes thanks to allow_unauthenticated). Upstream
+    // must never be contacted.
+    let pki = build_pki();
+    let upstream = spawn_plain_upstream().await;
+    let route = build_test_route_with_mtls("u", &pki.ca_pem, true, vec![]);
+    let backends = vec![upstream_backend("u", upstream)];
+    let links = vec![(route.id.clone(), "u".into())];
+    let harness = TlsProxyHarness::start(&pki, vec![route], backends, links).await;
+
+    let cc = client_config_trusting(&pki.ca_cert_der);
+    let (status, body) = tls_request(harness.port, cc).await.expect("tls req");
+    assert_eq!(status, 496, "raw response: {body}");
+    assert!(
+        body.contains("SSL certificate required"),
+        "body must explain the denial: {body}"
+    );
+    assert!(
+        !body.contains("upstream-ok"),
+        "upstream must NOT be reached: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_required_with_trusted_cert_reaches_upstream() {
+    // required=true + empty allowlist: any cert that chains to the CA
+    // is accepted, request flows to upstream.
+    let pki = build_pki();
+    let upstream = spawn_plain_upstream().await;
+    let route = build_test_route_with_mtls("u", &pki.ca_pem, true, vec![]);
+    let backends = vec![upstream_backend("u", upstream)];
+    let links = vec![(route.id.clone(), "u".into())];
+    let harness = TlsProxyHarness::start(&pki, vec![route], backends, links).await;
+
+    let cc = client_config_with_cert(
+        &pki.ca_cert_der,
+        pki.client_cert_der.clone(),
+        pki.client_key_der.clone_key(),
+    );
+    let (status, body) = tls_request(harness.port, cc).await.expect("tls req");
+    assert_eq!(status, 200, "raw response: {body}");
+    assert!(
+        body.contains("upstream-ok"),
+        "body should be upstream pass-through: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_allowlist_miss_returns_495_on_wire() {
+    // Cert is chain-valid (so rustls accepts it at the handshake) but
+    // its O= field is not in the per-route allowlist. The proxy must
+    // reject with 495 at request-filter time, NOT forward to upstream.
+    let pki = build_pki();
+    let upstream = spawn_plain_upstream().await;
+    // Our client_cert_der has O=Acme Corp; allowlist "Only Other Org"
+    // must miss.
+    let route =
+        build_test_route_with_mtls("u", &pki.ca_pem, true, vec!["Only Other Org"]);
+    let backends = vec![upstream_backend("u", upstream)];
+    let links = vec![(route.id.clone(), "u".into())];
+    let harness = TlsProxyHarness::start(&pki, vec![route], backends, links).await;
+
+    let cc = client_config_with_cert(
+        &pki.ca_cert_der,
+        pki.client_cert_der.clone(),
+        pki.client_key_der.clone_key(),
+    );
+    let (status, body) = tls_request(harness.port, cc).await.expect("tls req");
+    assert_eq!(status, 495, "raw response: {body}");
+    assert!(
+        body.contains("SSL certificate error"),
+        "body must explain the denial: {body}"
+    );
+    assert!(
+        !body.contains("upstream-ok"),
+        "upstream must NOT be reached: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_allowlist_match_reaches_upstream() {
+    // Cert chain valid + O=Acme Corp + allowlist includes "Acme Corp"
+    // -> 200 pass-through.
+    let pki = build_pki();
+    let upstream = spawn_plain_upstream().await;
+    let route = build_test_route_with_mtls("u", &pki.ca_pem, true, vec!["Acme Corp"]);
+    let backends = vec![upstream_backend("u", upstream)];
+    let links = vec![(route.id.clone(), "u".into())];
+    let harness = TlsProxyHarness::start(&pki, vec![route], backends, links).await;
+
+    let cc = client_config_with_cert(
+        &pki.ca_cert_der,
+        pki.client_cert_der.clone(),
+        pki.client_key_der.clone_key(),
+    );
+    let (status, body) = tls_request(harness.port, cc).await.expect("tls req");
+    assert_eq!(status, 200, "raw response: {body}");
+    assert!(body.contains("upstream-ok"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fullstack_optional_no_cert_passes_through() {
+    // required=false + empty allowlist: handshake succeeds (allow_unauthenticated),
+    // request_filter lets it through, upstream is reached.
+    let pki = build_pki();
+    let upstream = spawn_plain_upstream().await;
+    let route = build_test_route_with_mtls("u", &pki.ca_pem, false, vec![]);
+    let backends = vec![upstream_backend("u", upstream)];
+    let links = vec![(route.id.clone(), "u".into())];
+    let harness = TlsProxyHarness::start(&pki, vec![route], backends, links).await;
+
+    let cc = client_config_trusting(&pki.ca_cert_der);
+    let (status, body) = tls_request(harness.port, cc).await.expect("tls req");
+    assert_eq!(status, 200, "raw response: {body}");
+    assert!(body.contains("upstream-ok"));
+}

@@ -197,7 +197,7 @@
         {:else if activeTab === 'timeouts'}
           <TimeoutsTab bind:form={form} {importedFields} />
         {:else if activeTab === 'security'}
-          <SecurityTab bind:form={form} {importedFields} {customPresets} {backends} />
+          <SecurityTab bind:form={form} {importedFields} {customPresets} {backends} initialMtlsCaCertPem={editing?.mtls?.ca_cert_pem ?? ''} />
         {:else if activeTab === 'headers'}
           <HeadersTab bind:form={form} {importedFields} />
         {:else if activeTab === 'cors'}

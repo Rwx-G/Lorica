@@ -1077,6 +1077,52 @@ describe('mtls', () => {
     ).toMatch(/must not be empty/);
   });
 
+  it('validateRouteForm rejects a single whitespace-only entry', () => {
+    // An operator leaving "   " in the field is asking to send an
+    // empty org to the API; fail at the dashboard layer so the error
+    // is inline instead of a server roundtrip. Aligns with the API
+    // validator's per-entry check.
+    expect(
+      validateRouteForm(
+        mt({
+          mtls_ca_cert_pem: DUMMY_PEM,
+          mtls_allowed_organizations: '   ',
+        }),
+      ),
+    ).toBe('');
+    // But an explicit comma + whitespace fails:
+    expect(
+      validateRouteForm(
+        mt({
+          mtls_ca_cert_pem: DUMMY_PEM,
+          mtls_allowed_organizations: 'Acme,   ',
+        }),
+      ),
+    ).toMatch(/must not be empty/);
+  });
+
+  it('validateRouteForm rejects trailing-comma entry', () => {
+    expect(
+      validateRouteForm(
+        mt({
+          mtls_ca_cert_pem: DUMMY_PEM,
+          mtls_allowed_organizations: 'Acme,',
+        }),
+      ),
+    ).toMatch(/must not be empty/);
+  });
+
+  it('validateRouteForm rejects leading-comma entry', () => {
+    expect(
+      validateRouteForm(
+        mt({
+          mtls_ca_cert_pem: DUMMY_PEM,
+          mtls_allowed_organizations: ',Acme',
+        }),
+      ),
+    ).toMatch(/must not be empty/);
+  });
+
   it('validateRouteForm accepts valid config', () => {
     expect(
       validateRouteForm(

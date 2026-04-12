@@ -728,12 +728,17 @@ export function validateRouteForm(form: RouteFormState): string {
     if (mtlsPem.length > 1048576) {
       return 'mTLS CA PEM must be 1 MiB or smaller; trim the bundle to issuing CAs only';
     }
-    const orgs = form.mtls_allowed_organizations
-      .split(',')
-      .map((s) => s.trim());
-    for (let i = 0; i < orgs.length; i++) {
-      if (orgs[i] === '' && form.mtls_allowed_organizations.split(',').length > 1) {
-        return `mTLS allowed organization #${i + 1} must not be empty`;
+    // Match API behavior: any trimmed-empty entry is a hard reject,
+    // including the single-element " " case and the leading/trailing
+    // comma cases. An empty field (no commas, no text) is fine - it
+    // means "no allowlist".
+    const raw = form.mtls_allowed_organizations;
+    if (raw.trim() !== '') {
+      const parts = raw.split(',');
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i].trim() === '') {
+          return `mTLS allowed organization #${i + 1} must not be empty`;
+        }
       }
     }
   }

@@ -1705,13 +1705,20 @@ fn run_worker(
     // Build the optional mTLS client-cert verifier from the union of
     // per-route CA bundles. This is done once here; rustls
     // ServerConfig is immutable so reloading a CA requires a restart.
-    let mtls_verifier = {
+    // We also snapshot the CA fingerprint so `reload_proxy_config`
+    // can warn if an operator edits `mtls.ca_cert_pem` at runtime.
+    let (mtls_verifier, mtls_installed_fingerprint) = {
         let routes = store.blocking_lock().list_routes().unwrap_or_default();
-        lorica::mtls::build_from_routes(&routes)
+        let fp = lorica::mtls::compute_ca_fingerprint(&routes);
+        (lorica::mtls::build_from_routes(&routes), fp)
     };
-    if mtls_verifier.is_some() {
-        info!(worker_id = id, "mTLS enabled at listener: per-route enforcement applies");
+    if let Some(ref fp) = mtls_installed_fingerprint {
+        info!(worker_id = id, fingerprint = %fp, "mTLS enabled at listener: per-route enforcement applies");
     }
+    // Note: the worker process doesn't drive reload_proxy_config
+    // directly (supervisor does via command channel), so no
+    // fingerprint slot is wired here - the supervisor side carries
+    // the drift-detection responsibility for the entire worker pool.
 
     // Register listeners - TCP for HTTP, TLS for HTTPS
     let https_suffix = format!(":{https_port}");
@@ -1972,17 +1979,25 @@ fn run_single_process(cli: Cli) {
         // Connections to unknown domains fail TLS handshake; when the first cert is uploaded
         // and the resolver is reloaded, TLS starts working without restart.
         let https_port = cli.https_port;
+        // Snapshot the CA fingerprint once at startup and pass the slot
+        // to the reload loop further down so it can warn the operator
+        // if an `mtls.ca_cert_pem` edit happens at runtime (rustls
+        // ServerConfig is immutable; an edit needs a restart).
+        let mtls_installed_fingerprint: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
         {
             // Build the optional mTLS verifier from the union of per-route
-            // CA bundles. Rustls ServerConfig is immutable after build,
-            // so changes to any mtls.ca_cert_pem require a restart -
-            // the API surfaces that via a warning on reload.
-            let mtls_verifier = {
+            // CA bundles.
+            let (mtls_verifier, startup_fp) = {
                 let routes = store.blocking_lock().list_routes().unwrap_or_default();
-                lorica::mtls::build_from_routes(&routes)
+                (
+                    lorica::mtls::build_from_routes(&routes),
+                    lorica::mtls::compute_ca_fingerprint(&routes),
+                )
             };
-            if mtls_verifier.is_some() {
-                info!("mTLS enabled at listener: per-route enforcement applies");
+            *mtls_installed_fingerprint.lock() = startup_fp.clone();
+            if let Some(ref fp) = startup_fp {
+                info!(fingerprint = %fp, "mTLS enabled at listener: per-route enforcement applies");
             }
             let mut tls_settings =
                 lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
@@ -2118,12 +2133,14 @@ fn run_single_process(cli: Cli) {
         let reload_cert_resolver = Arc::clone(&cert_resolver);
         let reload_probe_scheduler = Arc::clone(&probe_scheduler);
         let reload_connection_filter = Arc::clone(&connection_filter);
+        let reload_mtls_fp = Arc::clone(&mtls_installed_fingerprint);
         let _reload_handle = tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
-                if let Err(e) = reload_proxy_config(
+                if let Err(e) = lorica::reload::reload_proxy_config_with_mtls(
                     &reload_store,
                     &reload_config,
                     Some(&reload_connection_filter),
+                    Some(&*reload_mtls_fp),
                 )
                 .await
                 {

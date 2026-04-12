@@ -109,6 +109,41 @@ pub fn build_from_routes(routes: &[Route]) -> Option<Arc<dyn ClientCertVerifier>
     build_verifier(roots)
 }
 
+/// Deterministic fingerprint of the union CA bundle installed on the
+/// listener. Used by `reload_proxy_config` to detect post-startup
+/// edits to `mtls.ca_cert_pem` - those require a restart because
+/// rustls `ServerConfig` is immutable, and we want to surface that
+/// via a warn log instead of silently accepting stale CAs.
+///
+/// Returns `None` when no route has mTLS configured (fingerprint
+/// undefined; also how we distinguish "listener has no verifier" from
+/// "listener has a verifier with no CAs"). Two route sets with
+/// identical PEM bytes in identical order yield identical fingerprints.
+/// The fingerprint is stable across restarts with the same DB state.
+pub fn compute_ca_fingerprint(routes: &[Route]) -> Option<String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut pems: Vec<String> = routes
+        .iter()
+        .filter_map(|r| r.mtls.as_ref())
+        .map(|m| m.ca_cert_pem.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if pems.is_empty() {
+        return None;
+    }
+    // Sort so the fingerprint is insensitive to route order (two
+    // deployments with the same CAs but different route creation
+    // order produce the same fingerprint - easier to reason about in
+    // logs).
+    pems.sort();
+    let mut h = DefaultHasher::new();
+    for pem in &pems {
+        pem.hash(&mut h);
+    }
+    Some(format!("{:016x}", h.finish()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +298,118 @@ mod tests {
         };
         let routes = vec![make_route("a", Some(mtls))];
         assert!(build_from_routes(&routes).is_some());
+    }
+
+    #[test]
+    fn fingerprint_none_when_no_mtls_routes() {
+        let routes = vec![make_route("a", None)];
+        assert!(compute_ca_fingerprint(&routes).is_none());
+    }
+
+    #[test]
+    fn fingerprint_stable_across_route_order() {
+        // Same CAs in different route order must produce the same
+        // fingerprint - guards against spurious drift warnings when
+        // an operator reorders routes.
+        let pem_a = gen_ca_pem();
+        let pem_b = gen_ca_pem();
+        let r1 = make_route(
+            "a",
+            Some(MtlsConfig {
+                ca_cert_pem: pem_a.clone(),
+                required: false,
+                allowed_organizations: Vec::new(),
+            }),
+        );
+        let r2 = make_route(
+            "b",
+            Some(MtlsConfig {
+                ca_cert_pem: pem_b.clone(),
+                required: false,
+                allowed_organizations: Vec::new(),
+            }),
+        );
+        let fp1 = compute_ca_fingerprint(&[r1.clone(), r2.clone()]);
+        let fp2 = compute_ca_fingerprint(&[r2, r1]);
+        assert_eq!(fp1, fp2);
+        assert!(fp1.is_some());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_pem_changes() {
+        let pem_a = gen_ca_pem();
+        let pem_b = gen_ca_pem();
+        assert_ne!(pem_a, pem_b);
+        let r_a = make_route(
+            "a",
+            Some(MtlsConfig {
+                ca_cert_pem: pem_a,
+                required: false,
+                allowed_organizations: Vec::new(),
+            }),
+        );
+        let r_b = make_route(
+            "a",
+            Some(MtlsConfig {
+                ca_cert_pem: pem_b,
+                required: false,
+                allowed_organizations: Vec::new(),
+            }),
+        );
+        let fp_a = compute_ca_fingerprint(&[r_a]);
+        let fp_b = compute_ca_fingerprint(&[r_b]);
+        assert!(fp_a.is_some() && fp_b.is_some());
+        assert_ne!(fp_a, fp_b);
+    }
+
+    #[test]
+    fn fingerprint_insensitive_to_surrounding_whitespace() {
+        // Operators sometimes paste PEM with trailing newlines; the
+        // API validator trims, but if the DB got a value set via
+        // another path we still want the fingerprint to be stable
+        // across whitespace-only differences.
+        let pem = gen_ca_pem();
+        let fp1 = compute_ca_fingerprint(&[make_route(
+            "a",
+            Some(MtlsConfig {
+                ca_cert_pem: pem.clone(),
+                required: false,
+                allowed_organizations: Vec::new(),
+            }),
+        )]);
+        let fp2 = compute_ca_fingerprint(&[make_route(
+            "a",
+            Some(MtlsConfig {
+                ca_cert_pem: format!("\n\n  {pem}\n\n"),
+                required: false,
+                allowed_organizations: Vec::new(),
+            }),
+        )]);
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn fingerprint_ignores_required_and_org_flips() {
+        // Toggling required or editing allowed_organizations must NOT
+        // change the fingerprint - those are hot-reloadable and we
+        // don't want spurious "CA changed" warnings for them.
+        let pem = gen_ca_pem();
+        let fp_strict = compute_ca_fingerprint(&[make_route(
+            "a",
+            Some(MtlsConfig {
+                ca_cert_pem: pem.clone(),
+                required: true,
+                allowed_organizations: vec!["Acme".into()],
+            }),
+        )]);
+        let fp_loose = compute_ca_fingerprint(&[make_route(
+            "a",
+            Some(MtlsConfig {
+                ca_cert_pem: pem,
+                required: false,
+                allowed_organizations: Vec::new(),
+            }),
+        )]);
+        assert_eq!(fp_strict, fp_loose);
     }
 }

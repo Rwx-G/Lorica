@@ -34,6 +34,20 @@ pub async fn reload_proxy_config(
     proxy_config: &Arc<ArcSwap<ProxyConfig>>,
     connection_filter: Option<&Arc<GlobalConnectionFilter>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    reload_proxy_config_with_mtls(store, proxy_config, connection_filter, None).await
+}
+
+/// Variant of [`reload_proxy_config`] that also compares the current
+/// CA fingerprint against the one installed on the listener at startup
+/// and logs a warning when they differ. Kept as a separate entry
+/// point so existing callers (tests, internal call sites that never
+/// see a fingerprint) don't need to track a new argument.
+pub async fn reload_proxy_config_with_mtls(
+    store: &Arc<Mutex<ConfigStore>>,
+    proxy_config: &Arc<ArcSwap<ProxyConfig>>,
+    connection_filter: Option<&Arc<GlobalConnectionFilter>>,
+    installed_mtls_fingerprint: Option<&parking_lot::Mutex<Option<String>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let store = store.lock().await;
 
     let routes = store.list_routes()?;
@@ -114,6 +128,34 @@ pub async fn reload_proxy_config(
 
     let route_count: usize = new_config.routes_by_host.values().map(|v| v.len()).sum();
     info!(routes = route_count, "proxy configuration reloaded");
+
+    // mTLS CA bundle drift detection: rustls `ServerConfig` is
+    // immutable after the listener is built, so any edit to a
+    // route's `mtls.ca_cert_pem` at runtime won't take effect until
+    // the process is restarted. Surface that as a warn log so
+    // operators don't debug a "bundle update didn't apply" bug.
+    // Toggling `required` or editing `allowed_organizations` hot-
+    // reloads via the snapshot we just published, so those aren't
+    // flagged here.
+    if let Some(slot) = installed_mtls_fingerprint {
+        // Re-read routes from the snapshot we just built so we
+        // compare against the same Route instances the proxy is
+        // actually serving.
+        let current_routes: Vec<lorica_config::models::Route> = new_config
+            .routes_by_host
+            .values()
+            .flat_map(|v| v.iter().map(|e| (*e.route).clone()))
+            .collect();
+        let current_fp = crate::mtls::compute_ca_fingerprint(&current_routes);
+        let installed_fp = slot.lock().clone();
+        if installed_fp != current_fp {
+            warn!(
+                installed = ?installed_fp,
+                current = ?current_fp,
+                "mtls CA bundle changed since startup; restart Lorica to apply (rustls ServerConfig is immutable). Toggling mtls.required or editing allowed_organizations takes effect live."
+            );
+        }
+    }
 
     proxy_config.store(Arc::new(new_config));
 
