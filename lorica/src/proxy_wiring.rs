@@ -737,6 +737,22 @@ static CACHE_LOCK: Lazy<&'static CacheLock> = Lazy::new(|| {
     Box::leak(lock)
 });
 
+/// Shared HTTP client used for forward-auth sub-requests. Built once and
+/// reused across all routes so connection pooling and TLS sessions amortize
+/// across requests. Redirects are disabled - an auth service replying 302
+/// must be treated as a "deny" verdict we forward to the client, never
+/// transparently followed (that would turn a login-redirect into a
+/// back-to-the-proxy loop).
+static FORWARD_AUTH_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(32)
+        // Default connect timeout; per-request total timeout is set on each call.
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .expect("build forward-auth reqwest client")
+});
+
 /// Cacheability predictor. Remembers keys whose origin recently responded as
 /// uncacheable (OriginNotCache, ResponseTooLarge, or a user-defined custom
 /// reason) and short-circuits the cache state machine on the next request,
@@ -823,6 +839,9 @@ pub struct RequestCtx {
     pub waf_body_buffer: Option<Vec<u8>>,
     /// Backend ID for sticky session cookie injection (set in upstream_peer).
     pub sticky_backend_id: Option<String>,
+    /// Headers harvested from a successful forward-auth response, to be
+    /// injected into the upstream request (e.g. Remote-User).
+    pub forward_auth_inject: Vec<(String, String)>,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -1018,6 +1037,205 @@ pub(crate) fn match_header_rule_backends<'a>(
     None
 }
 
+/// Outcome of a forward-auth evaluation. Kept separate from `Result` so
+/// each variant carries the information the caller needs to act - the
+/// deny variants hold an owned status+body so the proxy can forward the
+/// auth service's response verbatim (critical for Authelia's login
+/// redirect, which ships a 302 + Location header).
+#[derive(Debug)]
+pub(crate) enum ForwardAuthOutcome {
+    /// Request is authorised. `response_headers` lists headers harvested
+    /// from the auth response that the caller should inject into the
+    /// upstream request (owner-configured whitelist).
+    Allow {
+        response_headers: Vec<(String, String)>,
+    },
+    /// The auth service rejected the request. Status + headers + body
+    /// are forwarded verbatim to the downstream client.
+    Deny {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+    /// The auth service is unreachable, timed out, or returned an
+    /// unexpected status. Fail closed with a 503 so the client never
+    /// accidentally proxies past a broken auth service.
+    FailClosed {
+        /// Short human-readable reason for logs / block_reason.
+        reason: String,
+    },
+}
+
+/// Build the fixed header set that Lorica forwards to the auth service.
+/// Matches the Traefik / Authelia convention (`X-Forwarded-*`) plus any
+/// identifying headers the client originally sent (Cookie, Authorization,
+/// User-Agent) so stateful auth can see the session.
+///
+/// Extracted as a pure function so the header-wiring contract is
+/// unit-testable without a live auth backend.
+pub(crate) fn build_forward_auth_headers(
+    req: &lorica_http::RequestHeader,
+    client_ip: Option<&str>,
+    scheme: &str,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(8);
+
+    // X-Forwarded-Method: original HTTP method so auth can distinguish a
+    // GET from a POST to the same path (Authelia's access control lists
+    // can match on method).
+    out.push(("X-Forwarded-Method".into(), req.method.as_str().to_string()));
+
+    // X-Forwarded-Proto: http vs https so auth can enforce TLS-only
+    // policies and generate correct login URLs.
+    out.push(("X-Forwarded-Proto".into(), scheme.to_string()));
+
+    // X-Forwarded-Host: the Host the client was trying to reach. Auth
+    // redirects the user back here after login.
+    if let Some(host) = req.headers.get("host").and_then(|v| v.to_str().ok()) {
+        out.push(("X-Forwarded-Host".into(), host.to_string()));
+    }
+
+    // X-Forwarded-Uri: the full original path+query so auth can enforce
+    // per-resource policies.
+    let uri = req
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    out.push(("X-Forwarded-Uri".into(), uri.to_string()));
+
+    // X-Forwarded-For: true client IP (already resolved upstream - may
+    // include XFF chain if trusted proxies are configured).
+    if let Some(ip) = client_ip {
+        out.push(("X-Forwarded-For".into(), ip.to_string()));
+    }
+
+    // Cookie: session cookies are how Authelia/Authentik identify users.
+    // Without this, every request looks unauthenticated.
+    if let Some(cookie) = req.headers.get("cookie").and_then(|v| v.to_str().ok()) {
+        out.push(("Cookie".into(), cookie.to_string()));
+    }
+
+    // Authorization: Bearer tokens (OAuth, API keys). Required for
+    // header-based auth flows.
+    if let Some(auth) = req
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+    {
+        out.push(("Authorization".into(), auth.to_string()));
+    }
+
+    // User-Agent: some auth services log or rate-limit by UA.
+    if let Some(ua) = req
+        .headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+    {
+        out.push(("User-Agent".into(), ua.to_string()));
+    }
+
+    out
+}
+
+/// Execute the forward-auth sub-request and classify the verdict. The
+/// network I/O is contained here so the surrounding `request_filter`
+/// stays a straight pipeline - the caller only has to match on
+/// `ForwardAuthOutcome`.
+pub(crate) async fn run_forward_auth(
+    cfg: &lorica_config::models::ForwardAuthConfig,
+    req: &lorica_http::RequestHeader,
+    client_ip: Option<&str>,
+    scheme: &str,
+) -> ForwardAuthOutcome {
+    let headers_out = build_forward_auth_headers(req, client_ip, scheme);
+
+    let mut builder = FORWARD_AUTH_CLIENT
+        .get(&cfg.address)
+        .timeout(Duration::from_millis(cfg.timeout_ms as u64));
+    for (name, value) in &headers_out {
+        builder = builder.header(name, value);
+    }
+
+    let resp = match builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return ForwardAuthOutcome::FailClosed {
+                reason: format!("forward-auth unreachable: {e}"),
+            };
+        }
+    };
+
+    let status = resp.status().as_u16();
+
+    // 2xx -> allow. Harvest configured response_headers verbatim so
+    // Authelia's Remote-User et al. propagate to the upstream.
+    if resp.status().is_success() {
+        let mut inject = Vec::new();
+        let resp_headers = resp.headers().clone();
+        for name in &cfg.response_headers {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(v) = resp_headers.get(trimmed) {
+                if let Ok(s) = v.to_str() {
+                    inject.push((trimmed.to_string(), s.to_string()));
+                }
+            }
+        }
+        return ForwardAuthOutcome::Allow {
+            response_headers: inject,
+        };
+    }
+
+    // 401 / 403 / 3xx (login redirect) -> forward verdict verbatim.
+    // Authelia returns 302 + Location for unauthenticated browser
+    // traffic, and we must propagate that response body+headers so the
+    // client is sent to the login page.
+    if matches!(status, 300..=399) || matches!(status, 401 | 403) {
+        let mut fwd_headers: Vec<(String, String)> = Vec::new();
+        for (name, value) in resp.headers().iter() {
+            // Skip hop-by-hop headers and Content-Length (re-computed
+            // from body below).
+            let n = name.as_str();
+            if matches!(
+                n.to_ascii_lowercase().as_str(),
+                "content-length"
+                    | "transfer-encoding"
+                    | "connection"
+                    | "keep-alive"
+                    | "proxy-connection"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+            ) {
+                continue;
+            }
+            if let Ok(v) = value.to_str() {
+                fwd_headers.push((n.to_string(), v.to_string()));
+            }
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        return ForwardAuthOutcome::Deny {
+            status,
+            headers: fwd_headers,
+            body,
+        };
+    }
+
+    // Anything else (5xx, 400, 418, ...) is an anomaly. Treat as deny-
+    // closed so a misbehaving auth service can't silently let traffic
+    // through.
+    ForwardAuthOutcome::FailClosed {
+        reason: format!("forward-auth unexpected status {status}"),
+    }
+}
+
 /// Compute a stable bucket in `0..100` for `(route_id, client_ip)`. Same
 /// inputs always map to the same bucket within a single process, which
 /// gives the canary its "sticky" property - one user stays on the same
@@ -1190,6 +1408,7 @@ impl ProxyHttp for LoricaProxy {
             body_bytes_received: 0,
             waf_body_buffer: None,
             sticky_backend_id: None,
+            forward_auth_inject: Vec::new(),
         }
     }
 
@@ -1433,6 +1652,67 @@ impl ProxyHttp for LoricaProxy {
                     .write_response_header(Box::new(header), true)
                     .await?;
                 return Ok(true);
+            }
+        }
+
+        // Forward authentication: gate the request on an external auth
+        // service (Authelia / Authentik / Keycloak / oauth2-proxy). Runs
+        // after route match but before header/canary/path rules so a
+        // denied request never leaks into the backend-selection phase.
+        if let Some(ref fa_cfg) = entry.route.forward_auth {
+            let scheme = if session.is_http2() { "https" } else { "http" };
+            let outcome = run_forward_auth(
+                fa_cfg,
+                req,
+                ctx.client_ip.as_deref(),
+                scheme,
+            )
+            .await;
+            match outcome {
+                ForwardAuthOutcome::Allow { response_headers } => {
+                    ctx.forward_auth_inject = response_headers;
+                }
+                ForwardAuthOutcome::Deny {
+                    status,
+                    headers,
+                    body,
+                } => {
+                    ctx.block_reason = Some(format!("forward auth denied ({status})"));
+                    let mut resp_header = ResponseHeader::build(status, None)?;
+                    for (name, value) in &headers {
+                        let _ = resp_header.insert_header(name.clone(), value);
+                    }
+                    let _ = resp_header.insert_header(
+                        "Content-Length",
+                        body.len().to_string(),
+                    );
+                    session
+                        .write_response_header(Box::new(resp_header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
+                ForwardAuthOutcome::FailClosed { reason } => {
+                    tracing::warn!(
+                        route_id = %entry.route.id,
+                        reason = %reason,
+                        "forward auth fail-closed"
+                    );
+                    ctx.block_reason = Some(format!("forward auth error: {reason}"));
+                    let mut resp_header = ResponseHeader::build(503, None)?;
+                    let body = b"Service Unavailable: authentication service error";
+                    let _ = resp_header.insert_header("Content-Type", "text/plain; charset=utf-8");
+                    let _ = resp_header.insert_header("Content-Length", body.len().to_string());
+                    session
+                        .write_response_header(Box::new(resp_header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from_static(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
             }
         }
 
@@ -2652,6 +2932,15 @@ impl ProxyHttp for LoricaProxy {
             upstream_request.remove_header(&name);
         }
 
+        // Forward-auth response headers: applied AFTER proxy_headers so
+        // auth-derived values like Remote-User take precedence over any
+        // static proxy_headers with the same name (an operator would be
+        // surprised if their basic `X-User: static` overrode the
+        // authenticated user's identity).
+        for (name, value) in &ctx.forward_auth_inject {
+            let _ = upstream_request.insert_header(name.clone(), value);
+        }
+
         Ok(())
     }
 
@@ -3019,6 +3308,7 @@ mod tests {
             cache_vary_headers: vec![],
             header_rules: vec![],
             traffic_splits: vec![],
+            forward_auth: None,
             created_at: now,
             updated_at: now,
         }
@@ -4552,6 +4842,137 @@ mod tests {
         let backends = vec![Some(vec![mk_backend_with_id("b1")])];
         let headers = hmap(&[("x-tenant", "anything")]);
         assert!(match_header_rule_backends(&rules, &regexes, &backends, &headers).is_none());
+    }
+
+    // ---- Forward auth ----
+
+    fn fauth_req(method: &str, path: &str, headers: &[(&str, &str)]) -> lorica_http::RequestHeader {
+        let mut req = lorica_http::RequestHeader::build(method, path.as_bytes(), None).unwrap();
+        for (k, v) in headers {
+            req.insert_header((*k).to_string(), *v).unwrap();
+        }
+        req
+    }
+
+    fn header_by(pairs: &[(String, String)], name: &str) -> Option<String> {
+        pairs
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn test_build_forward_auth_headers_includes_xff_and_context() {
+        let req = fauth_req(
+            "POST",
+            "/admin/delete?id=7",
+            &[
+                ("host", "app.example.com"),
+                ("cookie", "session=abc"),
+                ("authorization", "Bearer tok"),
+                ("user-agent", "curl/8"),
+            ],
+        );
+        let out = build_forward_auth_headers(&req, Some("203.0.113.9"), "https");
+
+        assert_eq!(header_by(&out, "X-Forwarded-Method").as_deref(), Some("POST"));
+        assert_eq!(header_by(&out, "X-Forwarded-Proto").as_deref(), Some("https"));
+        assert_eq!(
+            header_by(&out, "X-Forwarded-Host").as_deref(),
+            Some("app.example.com")
+        );
+        assert_eq!(
+            header_by(&out, "X-Forwarded-Uri").as_deref(),
+            Some("/admin/delete?id=7")
+        );
+        assert_eq!(
+            header_by(&out, "X-Forwarded-For").as_deref(),
+            Some("203.0.113.9")
+        );
+        assert_eq!(header_by(&out, "Cookie").as_deref(), Some("session=abc"));
+        assert_eq!(
+            header_by(&out, "Authorization").as_deref(),
+            Some("Bearer tok")
+        );
+        assert_eq!(header_by(&out, "User-Agent").as_deref(), Some("curl/8"));
+    }
+
+    #[test]
+    fn test_build_forward_auth_headers_omits_missing_optionals() {
+        // No cookie, no authorization, no client IP -> those headers
+        // must NOT appear at all. Sending an empty Cookie would
+        // intrude on auth services that look up sessions from that
+        // header - they would 401 instead of treating as "no session".
+        let req = fauth_req("GET", "/", &[("host", "h")]);
+        let out = build_forward_auth_headers(&req, None, "http");
+        assert!(header_by(&out, "Cookie").is_none());
+        assert!(header_by(&out, "Authorization").is_none());
+        assert!(header_by(&out, "X-Forwarded-For").is_none());
+        // Required headers still present.
+        assert_eq!(header_by(&out, "X-Forwarded-Method").as_deref(), Some("GET"));
+        assert_eq!(header_by(&out, "X-Forwarded-Proto").as_deref(), Some("http"));
+        assert_eq!(header_by(&out, "X-Forwarded-Uri").as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn test_build_forward_auth_headers_uses_slash_for_empty_uri() {
+        // `http::Uri` normalises an empty path to "". Check we still
+        // send "/" so the auth service sees something parseable.
+        let req = fauth_req("GET", "/", &[]);
+        let out = build_forward_auth_headers(&req, None, "http");
+        assert_eq!(header_by(&out, "X-Forwarded-Uri").as_deref(), Some("/"));
+    }
+
+    #[tokio::test]
+    async fn test_run_forward_auth_timeout_is_fail_closed() {
+        // Point at a never-responding TCP listener to drive the timeout
+        // branch. `run_forward_auth` must return FailClosed (not Deny),
+        // so the caller fails the request with 503 rather than the
+        // typical 401.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept but never reply.
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+                // swallow; connection stays open idle
+            }
+        });
+        let cfg = lorica_config::models::ForwardAuthConfig {
+            address: format!("http://{addr}/verify"),
+            timeout_ms: 150,
+            response_headers: vec![],
+        };
+        let req = fauth_req("GET", "/", &[("host", "x")]);
+        let outcome = run_forward_auth(&cfg, &req, None, "http").await;
+        match outcome {
+            ForwardAuthOutcome::FailClosed { reason } => {
+                assert!(
+                    reason.to_lowercase().contains("timeout")
+                        || reason.to_lowercase().contains("unreachable")
+                        || reason.to_lowercase().contains("operation timed out"),
+                    "reason should mention a timeout/unreachable, got: {reason}"
+                );
+            }
+            other => panic!("expected FailClosed on timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_forward_auth_unreachable_is_fail_closed() {
+        // Bind a port, immediately drop the listener -> next connect
+        // gets refused. Must fail closed, NOT bypass auth.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let cfg = lorica_config::models::ForwardAuthConfig {
+            address: format!("http://{addr}/verify"),
+            timeout_ms: 500,
+            response_headers: vec![],
+        };
+        let req = fauth_req("GET", "/", &[("host", "x")]);
+        let outcome = run_forward_auth(&cfg, &req, None, "http").await;
+        assert!(matches!(outcome, ForwardAuthOutcome::FailClosed { .. }));
     }
 
     // ---- Canary traffic split ----

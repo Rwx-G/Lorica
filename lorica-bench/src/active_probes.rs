@@ -414,6 +414,7 @@ mod tests {
             cache_vary_headers: vec![],
             header_rules: vec![],
             traffic_splits: vec![],
+            forward_auth: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -516,6 +517,7 @@ mod tests {
             cache_vary_headers: vec![],
             header_rules: vec![],
             traffic_splits: vec![],
+            forward_auth: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

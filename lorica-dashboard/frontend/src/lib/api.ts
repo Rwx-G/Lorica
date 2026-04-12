@@ -158,6 +158,7 @@ export interface RouteResponse {
   cache_vary_headers: string[];
   header_rules: HeaderRuleResponse[];
   traffic_splits: TrafficSplitResponse[];
+  forward_auth?: ForwardAuthConfigResponse | null;
   created_at: string;
   updated_at: string;
 }
@@ -186,6 +187,18 @@ export interface TrafficSplitRequest {
   name: string;
   weight_percent: number;
   backend_ids: string[];
+}
+
+export interface ForwardAuthConfigResponse {
+  address: string;
+  timeout_ms: number;
+  response_headers: string[];
+}
+
+export interface ForwardAuthConfigRequest {
+  address: string;
+  timeout_ms: number;
+  response_headers: string[];
 }
 
 export interface CreateRouteRequest {
@@ -244,6 +257,7 @@ export interface CreateRouteRequest {
   cache_vary_headers?: string[];
   header_rules?: HeaderRuleRequest[];
   traffic_splits?: TrafficSplitRequest[];
+  forward_auth?: ForwardAuthConfigRequest;
 }
 
 
@@ -304,6 +318,7 @@ export interface UpdateRouteRequest {
   cache_vary_headers?: string[];
   header_rules?: HeaderRuleRequest[];
   traffic_splits?: TrafficSplitRequest[];
+  forward_auth?: ForwardAuthConfigRequest;
 }
 
 export interface BackendResponse {

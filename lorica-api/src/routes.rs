@@ -67,6 +67,19 @@ pub struct TrafficSplitRequest {
     pub backend_ids: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ForwardAuthConfigRequest {
+    pub address: String,
+    #[serde(default = "default_forward_auth_timeout_ms")]
+    pub timeout_ms: u32,
+    #[serde(default)]
+    pub response_headers: Vec<String>,
+}
+
+fn default_forward_auth_timeout_ms() -> u32 {
+    5_000
+}
+
 #[derive(Serialize)]
 pub struct RouteResponse {
     pub id: String,
@@ -128,6 +141,8 @@ pub struct RouteResponse {
     pub cache_vary_headers: Vec<String>,
     pub header_rules: Vec<HeaderRuleRequest>,
     pub traffic_splits: Vec<TrafficSplitRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward_auth: Option<ForwardAuthConfigRequest>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -192,6 +207,7 @@ pub struct CreateRouteRequest {
     pub cache_vary_headers: Option<Vec<String>>,
     pub header_rules: Option<Vec<HeaderRuleRequest>>,
     pub traffic_splits: Option<Vec<TrafficSplitRequest>>,
+    pub forward_auth: Option<ForwardAuthConfigRequest>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +269,10 @@ pub struct UpdateRouteRequest {
     pub cache_vary_headers: Option<Vec<String>>,
     pub header_rules: Option<Vec<HeaderRuleRequest>>,
     pub traffic_splits: Option<Vec<TrafficSplitRequest>>,
+    /// Update semantics: missing field = leave current value alone;
+    /// present with empty `address` = clear; present with non-empty
+    /// address = validate + install/replace.
+    pub forward_auth: Option<ForwardAuthConfigRequest>,
 }
 
 fn route_to_response(
@@ -349,9 +369,79 @@ fn route_to_response(
                 backend_ids: ts.backend_ids.clone(),
             })
             .collect(),
+        forward_auth: route
+            .forward_auth
+            .as_ref()
+            .map(|fa| ForwardAuthConfigRequest {
+                address: fa.address.clone(),
+                timeout_ms: fa.timeout_ms,
+                response_headers: fa.response_headers.clone(),
+            }),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
+}
+
+/// Validate and convert a `ForwardAuthConfigRequest` to the stored
+/// model. Rejects obvious operator mistakes at write time rather than at
+/// the first request: empty address, non-absolute URL, zero or absurd
+/// timeout, malformed response-header names.
+fn build_forward_auth(
+    body: &ForwardAuthConfigRequest,
+) -> Result<lorica_config::models::ForwardAuthConfig, ApiError> {
+    let address = body.address.trim();
+    if address.is_empty() {
+        return Err(ApiError::BadRequest(
+            "forward_auth.address must not be empty (use null/missing to disable)".into(),
+        ));
+    }
+    let parsed: http::Uri = address.parse().map_err(|e| {
+        ApiError::BadRequest(format!("forward_auth.address must be an absolute URL: {e}"))
+    })?;
+    match parsed.scheme_str() {
+        Some("http") | Some("https") => {}
+        Some(s) => {
+            return Err(ApiError::BadRequest(format!(
+                "forward_auth.address must use http or https scheme, got {s}"
+            )));
+        }
+        None => {
+            return Err(ApiError::BadRequest(
+                "forward_auth.address must be an absolute URL (scheme://host/path)".into(),
+            ));
+        }
+    }
+    if parsed.authority().is_none() {
+        return Err(ApiError::BadRequest(
+            "forward_auth.address must include a host (scheme://host/path)".into(),
+        ));
+    }
+    if body.timeout_ms == 0 {
+        return Err(ApiError::BadRequest(
+            "forward_auth.timeout_ms must be > 0".into(),
+        ));
+    }
+    if body.timeout_ms > 60_000 {
+        return Err(ApiError::BadRequest(
+            "forward_auth.timeout_ms must be <= 60000 (60 seconds); longer timeouts stall the request pipeline".into(),
+        ));
+    }
+    for name in &body.response_headers {
+        if name.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "forward_auth.response_headers entries must be non-empty".into(),
+            ));
+        }
+    }
+    Ok(lorica_config::models::ForwardAuthConfig {
+        address: address.to_string(),
+        timeout_ms: body.timeout_ms,
+        response_headers: body
+            .response_headers
+            .iter()
+            .map(|h| h.trim().to_string())
+            .collect(),
+    })
 }
 
 /// Validate a traffic split request and convert it to the stored model.
@@ -586,6 +676,10 @@ pub async fn create_route(
                 .collect::<Result<Vec<_>, _>>()?;
             validate_traffic_splits(&splits)?;
             splits
+        },
+        forward_auth: match body.forward_auth.as_ref() {
+            Some(fa) if !fa.address.trim().is_empty() => Some(build_forward_auth(fa)?),
+            _ => None,
         },
         created_at: now,
         updated_at: now,
@@ -869,6 +963,15 @@ pub async fn update_route(
         validate_traffic_splits(&built)?;
         route.traffic_splits = built;
     }
+    if let Some(ref fa) = body.forward_auth {
+        // Empty address = explicit "disable" signal from the dashboard.
+        // Non-empty address = validate + install/replace.
+        if fa.address.trim().is_empty() {
+            route.forward_auth = None;
+        } else {
+            route.forward_auth = Some(build_forward_auth(fa)?);
+        }
+    }
     route.updated_at = Utc::now();
 
     store.update_route(&route)?;
@@ -967,5 +1070,103 @@ mod tests {
     #[test]
     fn validate_traffic_splits_empty_is_ok() {
         assert!(validate_traffic_splits(&[]).is_ok());
+    }
+
+    // ---- Forward auth validation ----
+
+    fn fa_req(address: &str, timeout_ms: u32, response_headers: Vec<&str>) -> ForwardAuthConfigRequest {
+        ForwardAuthConfigRequest {
+            address: address.into(),
+            timeout_ms,
+            response_headers: response_headers.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn build_forward_auth_accepts_http_url() {
+        let built = build_forward_auth(&fa_req(
+            "http://authelia.internal/api/verify",
+            2_000,
+            vec!["Remote-User"],
+        ))
+        .unwrap();
+        assert_eq!(built.address, "http://authelia.internal/api/verify");
+        assert_eq!(built.timeout_ms, 2_000);
+        assert_eq!(built.response_headers, vec!["Remote-User".to_string()]);
+    }
+
+    #[test]
+    fn build_forward_auth_accepts_https_url() {
+        assert!(build_forward_auth(&fa_req(
+            "https://auth.example.com/v1/verify",
+            500,
+            vec![],
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn build_forward_auth_rejects_empty_address() {
+        let err = build_forward_auth(&fa_req("", 1000, vec![])).err().unwrap();
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("must not be empty")));
+    }
+
+    #[test]
+    fn build_forward_auth_rejects_non_absolute_url() {
+        let err = build_forward_auth(&fa_req("/verify", 1000, vec![])).err().unwrap();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn build_forward_auth_rejects_non_http_scheme() {
+        let err = build_forward_auth(&fa_req("ftp://x.example.com/", 1000, vec![]))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref m) if m.contains("http") || m.contains("https"))
+        );
+    }
+
+    #[test]
+    fn build_forward_auth_rejects_zero_timeout() {
+        let err = build_forward_auth(&fa_req("http://a/", 0, vec![])).err().unwrap();
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("> 0")));
+    }
+
+    #[test]
+    fn build_forward_auth_rejects_over_one_minute_timeout() {
+        let err = build_forward_auth(&fa_req("http://a/", 60_001, vec![]))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("60000")));
+    }
+
+    #[test]
+    fn build_forward_auth_rejects_blank_response_header_entry() {
+        let err = build_forward_auth(&fa_req("http://a/", 1000, vec!["Remote-User", "   "]))
+            .err()
+            .unwrap();
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("non-empty")));
+    }
+
+    #[test]
+    fn build_forward_auth_trims_response_header_names() {
+        let built = build_forward_auth(&fa_req(
+            "http://a/",
+            1000,
+            vec![" Remote-User ", "Remote-Groups"],
+        ))
+        .unwrap();
+        assert_eq!(
+            built.response_headers,
+            vec!["Remote-User".to_string(), "Remote-Groups".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_forward_auth_trims_address() {
+        let built = build_forward_auth(&fa_req("  http://a/verify  ", 1000, vec![]))
+            .unwrap();
+        assert_eq!(built.address, "http://a/verify");
     }
 }

@@ -1,4 +1,4 @@
-import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest } from './api';
+import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest } from './api';
 
 export interface PathRuleFormState {
   path: string;
@@ -84,6 +84,9 @@ export interface RouteFormState {
   cache_vary_headers: string;
   header_rules: HeaderRuleFormState[];
   traffic_splits: TrafficSplitFormState[];
+  forward_auth_address: string;        // empty = feature off
+  forward_auth_timeout_ms: number;     // 5000 default
+  forward_auth_response_headers: string; // CSV
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -143,6 +146,9 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   cache_vary_headers: '',
   header_rules: [],
   traffic_splits: [],
+  forward_auth_address: '',
+  forward_auth_timeout_ms: 5000,
+  forward_auth_response_headers: '',
 };
 
 // Tab field mappings for dot indicators
@@ -160,6 +166,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'security_headers', 'max_body_mb', 'rate_limit_rps',
     'rate_limit_burst', 'ip_allowlist', 'ip_denylist',
     'basic_auth_username', 'basic_auth_password',
+    'forward_auth_address', 'forward_auth_timeout_ms', 'forward_auth_response_headers',
   ],
   headers: [
     'proxy_headers', 'proxy_headers_remove',
@@ -285,6 +292,9 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
       weight_percent: s.weight_percent,
       backend_ids: [...(s.backend_ids ?? [])],
     })),
+    forward_auth_address: route.forward_auth?.address ?? '',
+    forward_auth_timeout_ms: route.forward_auth?.timeout_ms ?? 5000,
+    forward_auth_response_headers: (route.forward_auth?.response_headers ?? []).join(', '),
   };
 }
 
@@ -300,6 +310,29 @@ function headerRuleFormToRequest(rules: HeaderRuleFormState[]): HeaderRuleReques
       value: r.value,
       backend_ids: [...r.backend_ids],
     }));
+}
+
+function forwardAuthFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): ForwardAuthConfigRequest | undefined {
+  const addr = form.forward_auth_address.trim();
+  if (addr === '') {
+    // On update, an empty address signals "clear the feature" - send
+    // an explicit empty-address object so the API disables it. On create,
+    // leave it undefined so the row is inserted with forward_auth = NULL.
+    return isUpdate
+      ? { address: '', timeout_ms: 0, response_headers: [] }
+      : undefined;
+  }
+  return {
+    address: addr,
+    timeout_ms: form.forward_auth_timeout_ms,
+    response_headers: form.forward_auth_response_headers
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  };
 }
 
 function trafficSplitFormToRequest(
@@ -392,6 +425,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
       : empty([]),
     header_rules: headerRuleFormToRequest(form.header_rules) ?? (isUpdate ? [] : undefined),
     traffic_splits: trafficSplitFormToRequest(form.traffic_splits) ?? (isUpdate ? [] : undefined),
+    forward_auth: forwardAuthFormToRequest(form, isUpdate),
   };
 }
 
@@ -501,6 +535,17 @@ export function validateRouteForm(form: RouteFormState): string {
   }
   if (totalWeight > 100) {
     return `Traffic splits: cumulative weight must be <= 100 (got ${totalWeight})`;
+  }
+  // Forward auth URL + timeout sanity. Empty address = feature off (OK).
+  if (form.forward_auth_address.trim() !== '') {
+    const addr = form.forward_auth_address.trim();
+    if (!/^https?:\/\/[^\s/]+/.test(addr)) {
+      return 'Forward auth URL must start with http:// or https:// and include a host';
+    }
+    const t = Number(form.forward_auth_timeout_ms);
+    if (!Number.isInteger(t) || t < 1 || t > 60000) {
+      return 'Forward auth timeout must be 1..60000 ms';
+    }
   }
   return '';
 }

@@ -196,6 +196,7 @@ fn test_route(
         cache_vary_headers: vec![],
         header_rules,
         traffic_splits,
+        forward_auth: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

@@ -327,6 +327,46 @@ impl HeaderRule {
     }
 }
 
+/// Forward-authentication config: before proxying to upstream, issue a
+/// sub-request to an external authentication service (Authelia,
+/// Authentik, Keycloak, oauth2-proxy, ...) and honour its verdict.
+///
+/// Semantics (matches Traefik / Nginx `auth_request` / Caddy
+/// `forward_auth` conventions):
+///
+/// - A `GET` request is sent to [`address`] with a standard header set
+///   (Host as `X-Forwarded-Host`, client IP as `X-Forwarded-For`, the
+///   original method and path as `X-Forwarded-Method`/`-Uri`, plus
+///   cookies, `Authorization`, and `User-Agent` verbatim). These are
+///   the five bits Authelia/Authentik need to identify the session and
+///   make a decision.
+/// - 2xx: the request is allowed to continue to the upstream. Any
+///   header named in [`response_headers`] is copied from the auth
+///   response into the upstream request (common: `Remote-User`,
+///   `Remote-Groups`, `Remote-Email`).
+/// - 401 / 403: denial is surfaced verbatim to the client, body and
+///   headers included. Critical for Authelia's login-redirect flow.
+/// - Timeout / connection error / unexpected status: fail closed with
+///   503.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardAuthConfig {
+    /// Absolute URL of the auth service endpoint (scheme + host +
+    /// optional port + path). Example: `http://authelia.internal:9091/api/verify`.
+    pub address: String,
+    /// Per-sub-request timeout in milliseconds. Applies to the total
+    /// round-trip (connect + response). Default 5000.
+    #[serde(default = "default_forward_auth_timeout_ms")]
+    pub timeout_ms: u32,
+    /// Header names to copy from the auth service's 2xx response into
+    /// the upstream request. Empty = do not copy any (default).
+    #[serde(default)]
+    pub response_headers: Vec<String>,
+}
+
+fn default_forward_auth_timeout_ms() -> u32 {
+    5_000
+}
+
 /// Canary traffic split: send `weight_percent` of a route's requests to
 /// a specific backend group, the rest fall through to the next split or
 /// (if cumulative weights < 100) to the route's default backends.
@@ -564,6 +604,12 @@ pub struct Route {
     /// rules are URL-specific and should win).
     #[serde(default)]
     pub traffic_splits: Vec<TrafficSplit>,
+    /// Forward-auth config. When set, every request on this route is
+    /// gated by a sub-request to the configured auth service. Evaluated
+    /// after route match but before any backend selection, so a denied
+    /// request never touches the upstream.
+    #[serde(default)]
+    pub forward_auth: Option<ForwardAuthConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1511,6 +1557,7 @@ mod tests {
             cache_vary_headers: Vec::new(),
             header_rules: Vec::new(),
             traffic_splits: Vec::new(),
+            forward_auth: None,
             created_at: now,
             updated_at: now,
         };

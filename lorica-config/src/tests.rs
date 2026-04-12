@@ -70,6 +70,7 @@ mod tests {
             cache_vary_headers: vec![],
             header_rules: vec![],
             traffic_splits: vec![],
+            forward_auth: None,
             created_at: now,
             updated_at: now,
         }
@@ -1790,6 +1791,55 @@ cert_critical_days = 3
         store.update_route(&cleared).unwrap();
         let after = store.get_route(&route.id).unwrap().unwrap();
         assert!(after.traffic_splits.is_empty());
+    }
+
+    #[test]
+    fn test_forward_auth_roundtrip() {
+        // Schema V28: forward_auth stored as nullable JSON at column 58.
+        // Confirms create/get/list/update stay in sync and that the NULL
+        // path (feature off by default) round-trips too.
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.forward_auth = Some(ForwardAuthConfig {
+            address: "http://authelia.internal/api/verify".into(),
+            timeout_ms: 2_500,
+            response_headers: vec!["Remote-User".into(), "Remote-Groups".into()],
+        });
+        store.create_route(&route).unwrap();
+
+        let via_get = store.get_route(&route.id).unwrap().unwrap();
+        let fa = via_get.forward_auth.as_ref().unwrap();
+        assert_eq!(fa.address, "http://authelia.internal/api/verify");
+        assert_eq!(fa.timeout_ms, 2_500);
+        assert_eq!(
+            fa.response_headers,
+            vec!["Remote-User".to_string(), "Remote-Groups".to_string()]
+        );
+
+        let via_list: Vec<_> = store
+            .list_routes()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.id == route.id)
+            .collect();
+        assert_eq!(via_list.len(), 1);
+        assert!(via_list[0].forward_auth.is_some());
+
+        // Clear via update: disable the feature on an existing route.
+        let mut cleared = via_get.clone();
+        cleared.forward_auth = None;
+        store.update_route(&cleared).unwrap();
+        let after = store.get_route(&route.id).unwrap().unwrap();
+        assert!(after.forward_auth.is_none());
+    }
+
+    #[test]
+    fn test_forward_auth_default_none() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.forward_auth.is_none());
     }
 
     #[test]

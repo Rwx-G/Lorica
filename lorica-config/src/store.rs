@@ -456,6 +456,13 @@ impl ConfigStore {
             [],
         );
 
+        // V28: forward-auth per route (Authelia / Authentik / Keycloak).
+        // Stored as a JSON blob or NULL (feature off by default).
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN forward_auth TEXT DEFAULT NULL",
+            [],
+        );
+
         Ok(())
     }
 
@@ -552,6 +559,13 @@ impl ConfigStore {
             .map_err(|e| ConfigError::Validation(format!("invalid header_rules: {e}")))?;
         let traffic_splits_json = serde_json::to_string(&route.traffic_splits)
             .map_err(|e| ConfigError::Validation(format!("invalid traffic_splits: {e}")))?;
+        let forward_auth_json = match &route.forward_auth {
+            Some(fa) => Some(
+                serde_json::to_string(fa)
+                    .map_err(|e| ConfigError::Validation(format!("invalid forward_auth: {e}")))?,
+            ),
+            None => None,
+        };
 
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
@@ -579,12 +593,13 @@ impl ConfigStore {
              maintenance_mode, error_page_html,
              cache_vary_headers,
              header_rules,
-             traffic_splits)
+             traffic_splits,
+             forward_auth)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
                      ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45,
-                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58)",
+                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59)",
             params![
                 route.id,
                 route.hostname,
@@ -644,6 +659,7 @@ impl ConfigStore {
                 cache_vary_headers_json,
                 header_rules_json,
                 traffic_splits_json,
+                forward_auth_json,
             ],
         )?;
         Ok(())
@@ -678,7 +694,8 @@ impl ConfigStore {
                  maintenance_mode, error_page_html,
                  cache_vary_headers,
                  header_rules,
-                 traffic_splits
+                 traffic_splits,
+                 forward_auth
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
@@ -715,7 +732,8 @@ impl ConfigStore {
              maintenance_mode, error_page_html,
              cache_vary_headers,
              header_rules,
-             traffic_splits
+             traffic_splits,
+             forward_auth
              FROM routes ORDER BY hostname, path_prefix",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_route(row)))?;
@@ -760,6 +778,13 @@ impl ConfigStore {
             .map_err(|e| ConfigError::Validation(format!("invalid header_rules: {e}")))?;
         let traffic_splits_json = serde_json::to_string(&route.traffic_splits)
             .map_err(|e| ConfigError::Validation(format!("invalid traffic_splits: {e}")))?;
+        let forward_auth_json = match &route.forward_auth {
+            Some(fa) => Some(
+                serde_json::to_string(fa)
+                    .map_err(|e| ConfigError::Validation(format!("invalid forward_auth: {e}")))?,
+            ),
+            None => None,
+        };
 
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,
@@ -786,7 +811,8 @@ impl ConfigStore {
              maintenance_mode=?53, error_page_html=?54,
              cache_vary_headers=?55,
              header_rules=?56,
-             traffic_splits=?57 WHERE id=?1",
+             traffic_splits=?57,
+             forward_auth=?58 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -845,6 +871,7 @@ impl ConfigStore {
                 cache_vary_headers_json,
                 header_rules_json,
                 traffic_splits_json,
+                forward_auth_json,
             ],
         )?;
         if changed == 0 {
@@ -2916,6 +2943,10 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         traffic_splits: {
             let json: String = row.get::<_, String>(57).unwrap_or_else(|_| "[]".to_string());
             serde_json::from_str(&json).unwrap_or_default()
+        },
+        forward_auth: {
+            let raw: Option<String> = row.get::<_, Option<String>>(58).unwrap_or(None);
+            raw.and_then(|s| serde_json::from_str(&s).ok())
         },
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,

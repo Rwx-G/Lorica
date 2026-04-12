@@ -81,6 +81,51 @@
       <span class="hint">Password is hashed (Argon2id) before storage. Send a new value to change it.</span>
     </div>
   </div>
+
+  <h3 class="subsection-title">Forward authentication</h3>
+  <p class="subsection-hint">
+    Before proxying to the upstream, issue a GET sub-request to an external
+    auth service (Authelia, Authentik, Keycloak, oauth2-proxy). 2xx = allow,
+    401/403/3xx = forwarded verbatim to the client (so Authelia's login
+    redirect works), other = fail closed 503.
+  </p>
+
+  <div class="form-group" class:modified={form.forward_auth_address !== ''}>
+    <label for="fa-address">Auth service URL</label>
+    <input
+      id="fa-address"
+      type="text"
+      bind:value={form.forward_auth_address}
+      placeholder="http://authelia.internal:9091/api/verify"
+    />
+    <span class="hint">Empty = feature disabled. Must be an absolute http(s):// URL.</span>
+  </div>
+
+  <div class="form-row">
+    <div class="form-group" class:modified={form.forward_auth_timeout_ms !== 5000}>
+      <label for="fa-timeout">Timeout (ms)</label>
+      <input
+        id="fa-timeout"
+        type="number"
+        min="1"
+        max="60000"
+        bind:value={form.forward_auth_timeout_ms}
+        disabled={!form.forward_auth_address}
+      />
+      <span class="hint">Per-request total timeout. 1..60000 ms. Default 5000.</span>
+    </div>
+    <div class="form-group" class:modified={form.forward_auth_response_headers !== ''}>
+      <label for="fa-response-headers">Response headers to inject</label>
+      <input
+        id="fa-response-headers"
+        type="text"
+        bind:value={form.forward_auth_response_headers}
+        placeholder="Remote-User, Remote-Groups, Remote-Email"
+        disabled={!form.forward_auth_address}
+      />
+      <span class="hint">Comma-separated; copied from the auth response into the upstream request on 2xx only.</span>
+    </div>
+  </div>
 </div>
 
 <style>
@@ -96,6 +141,22 @@
     color: var(--color-text-muted);
     margin-bottom: 0.375rem;
   }
+
+  .subsection-title {
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--color-text);
+    margin: 1.25rem 0 0.25rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--color-border);
+  }
+  .subsection-hint {
+    font-size: 0.75rem;
+    color: var(--color-text-muted);
+    margin: 0 0 0.75rem;
+    line-height: 1.4;
+  }
+  .form-group input:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .form-group select,
   .form-group input[type="number"],

@@ -178,6 +178,7 @@ describe('routeToFormState', () => {
     cache_vary_headers: [],
     header_rules: [],
     traffic_splits: [],
+    forward_auth: null,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
   };
@@ -617,6 +618,135 @@ describe('traffic_splits', () => {
     ]);
     const req = formStateToCreateRequest(form);
     expect(req.traffic_splits).toEqual(mock.traffic_splits);
+  });
+});
+
+describe('forward_auth', () => {
+  function fa(overrides: Partial<RouteFormState> = {}): RouteFormState {
+    return { ...ROUTE_DEFAULTS, hostname: 'a.com', ...overrides };
+  }
+
+  it('omits forward_auth from create when address is empty', () => {
+    const req = formStateToCreateRequest(fa({ forward_auth_address: '' }));
+    expect(req.forward_auth).toBeUndefined();
+  });
+
+  it('emits full ForwardAuthConfigRequest when address is set', () => {
+    const req = formStateToCreateRequest(
+      fa({
+        forward_auth_address: 'http://authelia/verify',
+        forward_auth_timeout_ms: 2000,
+        forward_auth_response_headers: 'Remote-User, Remote-Groups',
+      }),
+    );
+    expect(req.forward_auth).toEqual({
+      address: 'http://authelia/verify',
+      timeout_ms: 2000,
+      response_headers: ['Remote-User', 'Remote-Groups'],
+    });
+  });
+
+  it('validateRouteForm rejects non-absolute URL', () => {
+    const err = validateRouteForm(fa({ forward_auth_address: '/verify' }));
+    expect(err).toMatch(/http:\/\/.*host/);
+  });
+
+  it('validateRouteForm rejects scheme other than http(s)', () => {
+    const err = validateRouteForm(fa({ forward_auth_address: 'ftp://a/' }));
+    expect(err).toMatch(/http:\/\/.*host/);
+  });
+
+  it('validateRouteForm rejects timeout out of range', () => {
+    const err = validateRouteForm(
+      fa({
+        forward_auth_address: 'http://a/',
+        forward_auth_timeout_ms: 0,
+      }),
+    );
+    expect(err).toMatch(/timeout must be 1..60000/);
+  });
+
+  it('validateRouteForm accepts valid config', () => {
+    expect(
+      validateRouteForm(
+        fa({
+          forward_auth_address: 'https://auth.example.com:9091/api/verify',
+          forward_auth_timeout_ms: 3000,
+          forward_auth_response_headers: 'Remote-User',
+        }),
+      ),
+    ).toBe('');
+  });
+
+  it('validateRouteForm accepts empty address (feature disabled)', () => {
+    expect(validateRouteForm(fa({ forward_auth_address: '' }))).toBe('');
+  });
+
+  it('routeToFormState maps a null forward_auth to defaults', () => {
+    const form = routeToFormState({
+      id: 'r',
+      hostname: 'a.com',
+      path_prefix: '/',
+      backends: [],
+      certificate_id: null,
+      load_balancing: 'round_robin',
+      waf_enabled: false,
+      waf_mode: 'detection',
+      enabled: true,
+      force_https: false,
+      redirect_hostname: null,
+      redirect_to: null,
+      hostname_aliases: [],
+      proxy_headers: {},
+      response_headers: {},
+      security_headers: 'moderate',
+      connect_timeout_s: 5,
+      read_timeout_s: 60,
+      send_timeout_s: 60,
+      strip_path_prefix: null,
+      add_path_prefix: null,
+      path_rewrite_pattern: null,
+      path_rewrite_replacement: null,
+      access_log_enabled: true,
+      proxy_headers_remove: [],
+      response_headers_remove: [],
+      max_request_body_bytes: null,
+      websocket_enabled: true,
+      rate_limit_rps: null,
+      rate_limit_burst: null,
+      ip_allowlist: [],
+      ip_denylist: [],
+      cors_allowed_origins: [],
+      cors_allowed_methods: [],
+      cors_max_age_s: null,
+      compression_enabled: false,
+      retry_attempts: null,
+      cache_enabled: false,
+      cache_ttl_s: 300,
+      cache_max_bytes: 52428800,
+      max_connections: null,
+      slowloris_threshold_ms: 5000,
+      auto_ban_threshold: null,
+      auto_ban_duration_s: 3600,
+      path_rules: [],
+      return_status: null,
+      sticky_session: false,
+      basic_auth_username: null,
+      stale_while_revalidate_s: 10,
+      stale_if_error_s: 60,
+      retry_on_methods: [],
+      maintenance_mode: false,
+      error_page_html: null,
+      cache_vary_headers: [],
+      header_rules: [],
+      traffic_splits: [],
+      forward_auth: null,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    });
+    expect(form.forward_auth_address).toBe('');
+    expect(form.forward_auth_timeout_ms).toBe(5000);
+    expect(form.forward_auth_response_headers).toBe('');
   });
 });
 
