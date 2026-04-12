@@ -9,8 +9,8 @@
   <img src="https://img.shields.io/badge/version-1.2.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-582-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-429-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-985-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-568-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -446,18 +446,45 @@ cargo build --release
 ### Running tests
 
 ```bash
-# All Rust unit tests (892 tests across 25 crates)
-cargo test
+# All Rust unit tests (1553 tests across 19 crates)
+cargo test --workspace
 
-# Product crate tests only (463 tests)
-cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command
+# Product crate tests only (739 tests)
+cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
+           -p lorica-notify -p lorica-bench -p lorica-worker \
+           -p lorica-command -p lorica-limits
 
-# Frontend tests (119 Vitest tests)
+# Pingora-forked crate tests (568 tests)
+cargo test -p lorica-core -p lorica-proxy -p lorica-http \
+           -p lorica-error -p lorica-tls -p lorica-cache \
+           -p lorica-pool -p lorica-runtime -p lorica-timeout \
+           --features ring -p lorica-lb
+
+# End-to-end tests driving a real Pingora Server (68 tests, 10 binaries)
+cargo test -p lorica --test mtls_e2e_test \
+                     --test response_rewrite_e2e_test \
+                     --test mirror_e2e_test \
+                     --test forward_auth_e2e_test \
+                     --test swr_e2e_test \
+                     --test connection_filter_test \
+                     --test canary_e2e_test \
+                     --test header_routing_e2e_test \
+                     --test proxy_config_test \
+                     --test proxy_routing_test
+
+# Frontend tests (178 Vitest tests across 6 files)
 cd lorica-dashboard/frontend && npx vitest run
-
-# E2E tests (350+ assertions across 65+ sections, Docker required)
-cd tests-e2e-docker && ./run.sh --build
 ```
+
+#### Test coverage by layer
+
+| Layer | Count | Notes |
+|---|---|---|
+| Product unit (config, api, lib, waf, notify, bench, worker, command, limits) | 739 | Lorica-specific code |
+| Product e2e (real Pingora `Server` + mock backends) | 68 | 10 binaries: mTLS, response rewriting, mirroring, forward auth, SWR, connection filter, canary, header routing, config, routing |
+| Pingora-forked crates (core, proxy, http, error, tls, cache, pool, runtime, timeout, lb) | 568 | Inherited upstream coverage kept passing on every change |
+| Frontend (vitest / svelte-check) | 178 | Form validation, type safety, component wiring |
+| **Total shipping tests** | **1553** | |
 
 ## systemd Service
 
