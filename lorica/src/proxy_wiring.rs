@@ -823,6 +823,62 @@ static FORWARD_AUTH_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("build forward-auth reqwest client")
 });
 
+/// Per-route verdict cache for forward-auth. ONLY caches `Allow`
+/// outcomes keyed on the downstream session cookie hash. `Deny` and
+/// `FailClosed` are never cached - re-evaluating them is cheap and
+/// lets session revocation take effect immediately.
+///
+/// The cache is in-process (per worker). A ban-list-style cross-
+/// worker cache would be a significant complexity increase for
+/// bounded upside: auth services already cache session lookups
+/// internally, so we're only saving the sub-request round-trip for
+/// requests that the *same* worker sees in succession.
+///
+/// Opt-in via `ForwardAuthConfig.verdict_cache_ttl_ms > 0`, capped at
+/// 60s by the API validator. Default is 0 (off) - strict zero-trust.
+static FORWARD_AUTH_VERDICT_CACHE: Lazy<dashmap::DashMap<String, CachedVerdict>> =
+    Lazy::new(|| dashmap::DashMap::with_capacity(4096));
+
+#[derive(Clone)]
+struct CachedVerdict {
+    /// The injected headers that should be added to the upstream
+    /// request. Matches `ForwardAuthOutcome::Allow.response_headers`.
+    response_headers: Vec<(String, String)>,
+    /// Monotonic-time expiry; entry is treated as miss when
+    /// `Instant::now() >= expires_at`.
+    expires_at: std::time::Instant,
+}
+
+/// Soft cap on cache size; we evict the oldest 25% when exceeded so
+/// a flood of unique sessions can't drive memory unbounded. 16_384 is
+/// well above any single-node session count we expect in practice.
+const VERDICT_CACHE_MAX_ENTRIES: usize = 16_384;
+
+/// Build the verdict-cache lookup key. Hashes the session-identifying
+/// Cookie header together with the route ID so that different routes
+/// sharing the same auth service don't collide and so that the key
+/// doesn't carry PII in clear memory.
+pub(crate) fn verdict_cache_key(
+    route_id: &str,
+    req: &lorica_http::RequestHeader,
+) -> Option<String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    // We key on Cookie because Authelia / Authentik / Keycloak all
+    // use session cookies for identification. If the request has no
+    // Cookie header we refuse to cache - without a session identity
+    // we could collide unrelated users and leak one user's Allow
+    // verdict to another.
+    let cookie = req.headers.get("cookie").and_then(|v| v.to_str().ok())?;
+    if cookie.is_empty() {
+        return None;
+    }
+    let mut h = DefaultHasher::new();
+    route_id.hash(&mut h);
+    cookie.hash(&mut h);
+    Some(format!("{:x}", h.finish()))
+}
+
 /// Shared HTTP client for request mirroring. Kept separate from the
 /// forward-auth client so a saturated shadow backend cannot impact the
 /// auth path (different connection pools, different timeouts).
@@ -1259,6 +1315,56 @@ pub(crate) async fn run_forward_auth(
     client_ip: Option<&str>,
     scheme: &str,
 ) -> ForwardAuthOutcome {
+    run_forward_auth_keyed(cfg, req, client_ip, scheme, "").await
+}
+
+/// Internal variant that takes a `route_id` so the verdict cache can
+/// partition entries per route. The public helper keeps the old
+/// signature for cases where caching is definitely off (unit tests,
+/// ad-hoc validation) and simply passes an empty route id which
+/// `verdict_cache_key` treats as "no cache".
+pub(crate) async fn run_forward_auth_keyed(
+    cfg: &lorica_config::models::ForwardAuthConfig,
+    req: &lorica_http::RequestHeader,
+    client_ip: Option<&str>,
+    scheme: &str,
+    route_id: &str,
+) -> ForwardAuthOutcome {
+    // Verdict cache lookup. Only applies when:
+    //   - cache is enabled for this route (ttl > 0),
+    //   - we have a route_id to partition on, and
+    //   - the request carries a Cookie (session identity).
+    // Any of those missing = skip cache path entirely.
+    let cache_enabled = cfg.verdict_cache_ttl_ms > 0 && !route_id.is_empty();
+    let cache_key = if cache_enabled {
+        verdict_cache_key(route_id, req)
+    } else {
+        None
+    };
+
+    if let Some(ref key) = cache_key {
+        if let Some(entry) = FORWARD_AUTH_VERDICT_CACHE.get(key) {
+            if std::time::Instant::now() < entry.expires_at {
+                lorica_api::metrics::inc_forward_auth_cache(route_id, "hit");
+                return ForwardAuthOutcome::Allow {
+                    response_headers: entry.response_headers.clone(),
+                };
+            }
+            // Stale entry; drop the read ref so we can remove below.
+        }
+        // Lazy eviction: if the entry exists but is expired, remove
+        // it now so memory doesn't accumulate dead entries when a
+        // session goes idle.
+        let expired = FORWARD_AUTH_VERDICT_CACHE
+            .get(key)
+            .map(|e| std::time::Instant::now() >= e.expires_at)
+            .unwrap_or(false);
+        if expired {
+            FORWARD_AUTH_VERDICT_CACHE.remove(key);
+        }
+        lorica_api::metrics::inc_forward_auth_cache(route_id, "miss");
+    }
+
     let headers_out = build_forward_auth_headers(req, client_ip, scheme);
 
     let mut builder = FORWARD_AUTH_CLIENT
@@ -1282,6 +1388,18 @@ pub(crate) async fn run_forward_auth(
     // 2xx -> allow. Harvest configured response_headers verbatim so
     // Authelia's Remote-User et al. propagate to the upstream.
     if resp.status().is_success() {
+        // Honor `Cache-Control: no-store` / `no-cache` from the auth
+        // service: if Authelia explicitly asks us not to cache this
+        // verdict, we don't, even when the route opted in.
+        let cacheable = resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| {
+                let lower = s.to_ascii_lowercase();
+                !lower.contains("no-store") && !lower.contains("no-cache")
+            })
+            .unwrap_or(true);
         let mut inject = Vec::new();
         let resp_headers = resp.headers().clone();
         for name in &cfg.response_headers {
@@ -1293,6 +1411,36 @@ pub(crate) async fn run_forward_auth(
                 if let Ok(s) = v.to_str() {
                     inject.push((trimmed.to_string(), s.to_string()));
                 }
+            }
+        }
+        if cache_enabled && cacheable {
+            if let Some(key) = cache_key {
+                // Soft cap on cache size to bound memory under a
+                // flood of unique sessions. When we exceed the cap,
+                // clear out a quarter of the entries at random
+                // (DashMap iteration order is non-deterministic) so
+                // the feature degrades to "some fresh misses" rather
+                // than "unbounded growth".
+                if FORWARD_AUTH_VERDICT_CACHE.len() >= VERDICT_CACHE_MAX_ENTRIES {
+                    let target = VERDICT_CACHE_MAX_ENTRIES / 4;
+                    let victims: Vec<String> = FORWARD_AUTH_VERDICT_CACHE
+                        .iter()
+                        .take(target)
+                        .map(|e| e.key().clone())
+                        .collect();
+                    for v in victims {
+                        FORWARD_AUTH_VERDICT_CACHE.remove(&v);
+                    }
+                }
+                let expires_at = std::time::Instant::now()
+                    + Duration::from_millis(cfg.verdict_cache_ttl_ms as u64);
+                FORWARD_AUTH_VERDICT_CACHE.insert(
+                    key,
+                    CachedVerdict {
+                        response_headers: inject.clone(),
+                        expires_at,
+                    },
+                );
             }
         }
         return ForwardAuthOutcome::Allow {
@@ -1627,6 +1775,7 @@ pub struct MirrorPending {
     pub headers: Vec<(String, String)>,
     pub request_id: String,
     pub max_body_bytes: usize,
+    pub route_id: String,
 }
 
 /// Body-accumulation state for a mirror sub-request. `Overflowed`
@@ -1668,6 +1817,7 @@ pub(crate) fn spawn_mirrors(
     forward_headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
     request_id: String,
+    route_id: String,
 ) {
     if !mirror_sample_hit(&request_id, cfg.sample_percent) {
         return;
@@ -1691,6 +1841,7 @@ pub(crate) fn spawn_mirrors(
         let headers_c = forward_headers.clone();
         let body_c = body.clone();
         let sem_c = Arc::clone(&sem);
+        let route_id_c = route_id.clone();
         tokio::spawn(async move {
             // try_acquire_owned is the right primitive here: if all 256
             // slots are in-flight, drop the mirror silently instead of
@@ -1700,12 +1851,17 @@ pub(crate) fn spawn_mirrors(
                 Ok(p) => p,
                 Err(_) => {
                     tracing::debug!(url = %url, "mirror: semaphore saturated, dropping");
+                    lorica_api::metrics::inc_mirror_outcome(&route_id_c, "dropped_saturated");
                     return;
                 }
             };
+            lorica_api::metrics::inc_mirror_outcome(&route_id_c, "spawned");
             let method_r = match reqwest::Method::from_bytes(method_c.as_str().as_bytes()) {
                 Ok(m) => m,
-                Err(_) => return,
+                Err(_) => {
+                    lorica_api::metrics::inc_mirror_outcome(&route_id_c, "errored");
+                    return;
+                }
             };
             let mut builder = MIRROR_CLIENT.request(method_r, &url).timeout(timeout);
             for (name, value) in headers_c {
@@ -1721,6 +1877,7 @@ pub(crate) fn spawn_mirrors(
                 }
                 Err(e) => {
                     tracing::debug!(url = %url, error = %e, "mirror request failed");
+                    lorica_api::metrics::inc_mirror_outcome(&route_id_c, "errored");
                 }
             }
         });
@@ -2188,11 +2345,12 @@ impl ProxyHttp for LoricaProxy {
         // denied request never leaks into the backend-selection phase.
         if let Some(ref fa_cfg) = entry.route.forward_auth {
             let scheme = if session.is_http2() { "https" } else { "http" };
-            let outcome = run_forward_auth(
+            let outcome = run_forward_auth_keyed(
                 fa_cfg,
                 req,
                 ctx.client_ip.as_deref(),
                 scheme,
+                &entry.route.id,
             )
             .await;
             match outcome {
@@ -2245,15 +2403,38 @@ impl ProxyHttp for LoricaProxy {
 
         // Header rule matching (first match wins; sets backend override
         // before path rules so a later path rule with its own backend_ids
-        // can still take precedence - "more specific wins").
+        // can still take precedence - "more specific wins"). Also
+        // emits a Prometheus counter so operators can see rule-match
+        // activity in metrics, not just logs. `rule_index = "default"`
+        // means no rule matched.
         if !entry.route.header_rules.is_empty() {
-            if let Some(backends) = match_header_rule_backends(
-                &entry.route.header_rules,
-                &entry.header_rule_regexes,
-                &entry.header_rule_backends,
-                &req.headers,
-            ) {
-                ctx.matched_backends = Some(backends.to_vec());
+            let mut matched_idx: Option<usize> = None;
+            for (i, rule) in entry.route.header_rules.iter().enumerate() {
+                let value = req
+                    .headers
+                    .get(rule.header_name.as_str())
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let regex: Option<&regex::Regex> = entry
+                    .header_rule_regexes
+                    .get(i)
+                    .and_then(|opt| opt.as_deref());
+                if rule.matches(value, |v| regex.is_some_and(|re| re.is_match(v))) {
+                    matched_idx = Some(i);
+                    if let Some(b) = entry.header_rule_backends.get(i).and_then(|b| b.as_ref()) {
+                        ctx.matched_backends = Some(b.clone());
+                    }
+                    break;
+                }
+            }
+            match matched_idx {
+                Some(i) => lorica_api::metrics::inc_header_rule_match(
+                    &entry.route.id,
+                    &i.to_string(),
+                ),
+                None => {
+                    lorica_api::metrics::inc_header_rule_match(&entry.route.id, "default")
+                }
             }
         }
 
@@ -2269,12 +2450,45 @@ impl ProxyHttp for LoricaProxy {
         if ctx.matched_backends.is_none() && !entry.route.traffic_splits.is_empty() {
             if let Some(ref ip) = ctx.client_ip {
                 let bucket = canary_bucket(&entry.route.id, ip);
-                if let Some(backends) = pick_traffic_split_backends(
-                    &entry.route.traffic_splits,
-                    &entry.traffic_split_backends,
-                    bucket,
-                ) {
-                    ctx.matched_backends = Some(backends.to_vec());
+                // Inline walk so we know which split matched (for the
+                // split_name metric label). Mirrors
+                // `pick_traffic_split_backends` logic; the helper stays
+                // as-is for its unit-test callers.
+                let mut cumulative: u32 = 0;
+                let mut matched_split_name: Option<&str> = None;
+                for (i, split) in entry.route.traffic_splits.iter().enumerate() {
+                    let w = split.weight_percent.min(100) as u32;
+                    if w == 0 {
+                        continue;
+                    }
+                    cumulative = cumulative.saturating_add(w).min(100);
+                    if (bucket as u32) < cumulative {
+                        if let Some(backends) = entry
+                            .traffic_split_backends
+                            .get(i)
+                            .and_then(|b| b.as_ref())
+                        {
+                            ctx.matched_backends = Some(backends.clone());
+                            matched_split_name = Some(
+                                if split.name.is_empty() {
+                                    "unnamed"
+                                } else {
+                                    split.name.as_str()
+                                },
+                            );
+                        }
+                        break;
+                    }
+                }
+                match matched_split_name {
+                    Some(name) => lorica_api::metrics::inc_canary_split_selected(
+                        &entry.route.id,
+                        name,
+                    ),
+                    None => lorica_api::metrics::inc_canary_split_selected(
+                        &entry.route.id,
+                        "default",
+                    ),
                 }
             }
         }
@@ -2326,6 +2540,7 @@ impl ProxyHttp for LoricaProxy {
                         headers,
                         request_id: ctx.request_id.clone(),
                         max_body_bytes: max_body,
+                        route_id: entry.route.id.clone(),
                     });
                     ctx.mirror_body_state = Some(MirrorBodyState::Active(Vec::new()));
                 } else {
@@ -2339,6 +2554,7 @@ impl ProxyHttp for LoricaProxy {
                         headers,
                         None,
                         ctx.request_id.clone(),
+                        entry.route.id.clone(),
                     );
                 }
             }
@@ -2897,11 +3113,16 @@ impl ProxyHttp for LoricaProxy {
                             pending.headers,
                             Some(buf),
                             pending.request_id,
+                            pending.route_id,
                         );
                     }
                     MirrorBodyState::Overflowed => {
                         // Buffer exceeded max_body_bytes: skip silently.
                         // Already logged at overflow time.
+                        lorica_api::metrics::inc_mirror_outcome(
+                            &pending.route_id,
+                            "dropped_oversize_body",
+                        );
                     }
                 }
             }
@@ -2995,8 +3216,12 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
-        let route = match ctx.route_snapshot {
-            Some(ref r) if r.cache_enabled => r,
+        // Snapshot a few fields out of ctx.route_snapshot as owned
+        // values so we can re-borrow ctx mutably later in the function
+        // (cache_key_callback takes `&mut ctx`). Without this the
+        // short-lived immutable reborrow locks us out of the helper.
+        let (route_id, cache_max_bytes) = match ctx.route_snapshot {
+            Some(ref r) if r.cache_enabled => (r.id.clone(), r.cache_max_bytes),
             _ => return Ok(()),
         };
 
@@ -3023,6 +3248,20 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
+        // Observability: peek the predictor for this key and count
+        // bypass hits BEFORE enabling the cache. Pingora's cache
+        // state machine will consult the same predictor again
+        // internally, but doing the observation here is the only
+        // place we have the route_id in scope. The double read is
+        // cheap (sharded LRU) compared to the cache-lock work it
+        // saves.
+        if let Ok(observed_key) = self.cache_key_callback(session, ctx) {
+            use lorica_cache::predictor::CacheablePredictor as _;
+            if !(*CACHE_PREDICTOR).cacheable_prediction(&observed_key) {
+                lorica_api::metrics::inc_cache_predictor_bypass(&route_id);
+            }
+        }
+
         // Enable the cache state machine with MemCache storage + LRU eviction.
         // The predictor is shared across all cache-enabled routes: responses
         // marked uncacheable by the origin skip the cache state machine on
@@ -3037,10 +3276,10 @@ impl ProxyHttp for LoricaProxy {
         );
 
         // Set max cacheable response size from route config
-        if route.cache_max_bytes > 0 {
+        if cache_max_bytes > 0 {
             session
                 .cache
-                .set_max_file_size_bytes(route.cache_max_bytes as usize);
+                .set_max_file_size_bytes(cache_max_bytes as usize);
         }
 
         Ok(())
@@ -6078,6 +6317,7 @@ mod tests {
             address: format!("http://{addr}/verify"),
             timeout_ms: 150,
             response_headers: vec![],
+            verdict_cache_ttl_ms: 0,
         };
         let req = fauth_req("GET", "/", &[("host", "x")]);
         let outcome = run_forward_auth(&cfg, &req, None, "http").await;
@@ -6105,10 +6345,188 @@ mod tests {
             address: format!("http://{addr}/verify"),
             timeout_ms: 500,
             response_headers: vec![],
+            verdict_cache_ttl_ms: 0,
         };
         let req = fauth_req("GET", "/", &[("host", "x")]);
         let outcome = run_forward_auth(&cfg, &req, None, "http").await;
         assert!(matches!(outcome, ForwardAuthOutcome::FailClosed { .. }));
+    }
+
+    // ---- Forward auth verdict cache ----
+
+    #[test]
+    fn test_verdict_cache_key_without_cookie_is_none() {
+        // No cookie = no session identity = we must refuse to cache
+        // (otherwise an anonymous request could leak an earlier user's
+        // Allow verdict to another anonymous request).
+        let req = fauth_req("GET", "/", &[("host", "x")]);
+        assert!(verdict_cache_key("route-a", &req).is_none());
+    }
+
+    #[test]
+    fn test_verdict_cache_key_varies_by_route() {
+        // Same cookie on two different routes must produce different
+        // cache keys so a verdict allowed on route A cannot be served
+        // on route B (different mTLS / forward-auth policy).
+        let req = fauth_req("GET", "/", &[("host", "x"), ("cookie", "session=abc")]);
+        let k1 = verdict_cache_key("route-a", &req).unwrap();
+        let k2 = verdict_cache_key("route-b", &req).unwrap();
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_verdict_cache_key_varies_by_cookie() {
+        let req_a = fauth_req("GET", "/", &[("host", "x"), ("cookie", "session=aaa")]);
+        let req_b = fauth_req("GET", "/", &[("host", "x"), ("cookie", "session=bbb")]);
+        let k1 = verdict_cache_key("route-a", &req_a).unwrap();
+        let k2 = verdict_cache_key("route-a", &req_b).unwrap();
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_verdict_cache_key_stable_for_same_inputs() {
+        let req = fauth_req("GET", "/", &[("host", "x"), ("cookie", "session=abc")]);
+        let k1 = verdict_cache_key("route-a", &req).unwrap();
+        let k2 = verdict_cache_key("route-a", &req).unwrap();
+        assert_eq!(k1, k2);
+    }
+
+    #[tokio::test]
+    async fn test_verdict_cache_hit_served_without_upstream_call() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                    let _ = stream.write_all(resp).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let cfg = lorica_config::models::ForwardAuthConfig {
+            address: format!("http://{addr}/verify"),
+            timeout_ms: 2_000,
+            response_headers: vec![],
+            verdict_cache_ttl_ms: 30_000,
+        };
+        let req = fauth_req("GET", "/", &[("host", "x"), ("cookie", "session=abc")]);
+
+        FORWARD_AUTH_VERDICT_CACHE.clear();
+
+        let r1 = run_forward_auth_keyed(&cfg, &req, None, "http", "cache-hit-route").await;
+        assert!(matches!(r1, ForwardAuthOutcome::Allow { .. }));
+        let r2 = run_forward_auth_keyed(&cfg, &req, None, "http", "cache-hit-route").await;
+        assert!(matches!(r2, ForwardAuthOutcome::Allow { .. }));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second request must be served from cache (no auth call)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verdict_cache_honors_auth_no_store_directive() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = b"HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                    let _ = stream.write_all(resp).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let cfg = lorica_config::models::ForwardAuthConfig {
+            address: format!("http://{addr}/verify"),
+            timeout_ms: 2_000,
+            response_headers: vec![],
+            verdict_cache_ttl_ms: 30_000,
+        };
+        let req = fauth_req(
+            "GET",
+            "/",
+            &[("host", "x"), ("cookie", "session=no-store-abc")],
+        );
+
+        FORWARD_AUTH_VERDICT_CACHE.clear();
+
+        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "ns-route").await;
+        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "ns-route").await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "Cache-Control: no-store must prevent caching"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verdict_cache_off_when_ttl_zero() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                    let _ = stream.write_all(resp).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let cfg = lorica_config::models::ForwardAuthConfig {
+            address: format!("http://{addr}/verify"),
+            timeout_ms: 2_000,
+            response_headers: vec![],
+            verdict_cache_ttl_ms: 0,
+        };
+        let req = fauth_req("GET", "/", &[("host", "x"), ("cookie", "session=ttl0")]);
+
+        FORWARD_AUTH_VERDICT_CACHE.clear();
+
+        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "off-route").await;
+        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "off-route").await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "ttl=0 must disable caching (strict zero-trust default)"
+        );
     }
 
     // ---- Canary traffic split ----

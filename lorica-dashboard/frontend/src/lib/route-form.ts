@@ -19,6 +19,10 @@ export interface HeaderRuleFormState {
   match_type: string;   // 'exact' | 'prefix' | 'regex'
   value: string;
   backend_ids: string[];
+  // Read-only runtime signal from the server: true when the proxy
+  // skipped the rule because its regex failed to compile. The form
+  // never sends this back; we only use it to render a warning badge.
+  disabled?: boolean;
 }
 
 export interface TrafficSplitFormState {
@@ -316,6 +320,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
       match_type: r.match_type ?? 'exact',
       value: r.value,
       backend_ids: [...(r.backend_ids ?? [])],
+      disabled: r.disabled ?? false,
     })),
     traffic_splits: (route.traffic_splits ?? []).map((s) => ({
       name: s.name ?? '',

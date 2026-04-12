@@ -122,6 +122,12 @@
             {:else}
               <span class="override-pill muted">default backends</span>
             {/if}
+            {#if rule.disabled}
+              <span
+                class="override-pill disabled-pill"
+                title="The proxy skipped this rule at load time because its regex failed to compile. Re-save the rule to recompile it against the current regex engine."
+              >disabled</span>
+            {/if}
           </div>
           <div class="rule-header-right">
             <button class="btn-icon" title="Move up" aria-label="Move up" disabled={index === 0} onclick={() => moveUp(index)}>
@@ -285,6 +291,13 @@
   .override-pill.muted {
     background: rgba(128, 128, 128, 0.15);
     color: var(--color-text-muted);
+  }
+
+  .override-pill.disabled-pill {
+    background: rgba(220, 38, 38, 0.12);
+    color: #dc2626;
+    border: 1px solid rgba(220, 38, 38, 0.4);
+    font-weight: 600;
   }
 
   .rule-header-right {

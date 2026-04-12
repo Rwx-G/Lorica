@@ -1,0 +1,27 @@
+schema: 1
+story: "1.3.0-mtls"
+story_title: "v1.3.0 Phase 4.2 - mTLS client verification"
+gate: PASS
+status_reason: "Per-route mTLS with union CA listener + request-phase enforcement. 11 e2e (5 full-stack 200/495/496 on wire + 4 handshake + policy-grid + snapshot), 8 evaluate_mtls unit, 10 mtls.rs unit. Drift detection + UI restart-required banner. HTTP-only-listener caveat loudly documented on MtlsConfig."
+reviewer: "Romain G."
+updated: "2026-04-12T00:00:00Z"
+waiver: { active: false }
+quality_score: 98
+top_issues: []
+evidence:
+  tests_reviewed: 29
+  risks_identified: 3
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    ac_gaps: []
+nfr_validation:
+  security: { status: PASS, notes: "PEM validator + WebPkiClientVerifier + per-route policy; 496/495 proven on the wire" }
+  performance: { status: PASS, notes: "Verifier built once; O(allowlist) at request time" }
+  reliability: { status: PASS, notes: "Fail-safe fallback if verifier construction fails; drift warn at reload" }
+  maintainability: { status: PASS, notes: "Dedicated lorica::mtls module + pure helpers" }
+  observability: { status: PASS, notes: "Startup fingerprint info log + reload drift warn + block_reason in access log" }
+risk_summary:
+  totals: { critical: 0, high: 0, medium: 0, low: 0 }
+  recommendations:
+    must_fix: []
+    monitor: []

@@ -196,6 +196,144 @@ pub fn set_system_metrics(cpu_percent: f64, memory_used_bytes: i64) {
     SYSTEM_MEMORY_USED_BYTES.set(memory_used_bytes);
 }
 
+// ---- v1.3.0 feature counters ---------------------------------------------
+//
+// All four counters share a small design rule: label cardinality must
+// stay bounded so a Prometheus scrape doesn't explode under hostile
+// or accidental traffic. Route ids are stable, operator-controlled
+// strings. No user-input-derived label is added.
+
+/// Cache predictor bypass counter. Increments each time the predictor
+/// short-circuits the cache state machine because a prior origin
+/// response marked the key as uncacheable.
+/// Labels: `route_id` (bounded by the number of configured routes).
+static CACHE_PREDICTOR_BYPASS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "cache_predictor_bypass_total",
+            "Times the cache predictor short-circuited a request as uncacheable"
+        )
+        .namespace("lorica"),
+        &["route_id"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a cache-predictor bypass for a route.
+pub fn inc_cache_predictor_bypass(route_id: &str) {
+    CACHE_PREDICTOR_BYPASS_TOTAL
+        .with_label_values(&[route_id])
+        .inc();
+}
+
+/// Header-routing rule match counter. Increments each time a header
+/// rule selected a backend override. A separate label "fallthrough"
+/// is recorded when no rule matched, so operators can compare
+/// matched vs. default traffic without a second metric.
+/// Labels: `route_id`, `rule_index` (or `"default"` for fallthrough).
+static HEADER_RULE_MATCH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "header_rule_match_total",
+            "Header-based routing rule matches (rule_index=\"default\" when no rule matched)"
+        )
+        .namespace("lorica"),
+        &["route_id", "rule_index"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a header-routing rule match. Pass `"default"` as rule_index
+/// when no rule matched.
+pub fn inc_header_rule_match(route_id: &str, rule_index: &str) {
+    HEADER_RULE_MATCH_TOTAL
+        .with_label_values(&[route_id, rule_index])
+        .inc();
+}
+
+/// Canary traffic-split selection counter. `split_name` is the name
+/// the operator gave the split (or `""` for unnamed; `"default"` for
+/// the "didn't hit any split" bucket).
+/// Labels: `route_id`, `split_name`.
+static CANARY_SPLIT_SELECTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "canary_split_selected_total",
+            "Canary traffic split selections (split_name=\"default\" when no split matched)"
+        )
+        .namespace("lorica"),
+        &["route_id", "split_name"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a canary-split selection. Pass `"default"` as split_name
+/// when no split matched.
+pub fn inc_canary_split_selected(route_id: &str, split_name: &str) {
+    CANARY_SPLIT_SELECTED_TOTAL
+        .with_label_values(&[route_id, split_name])
+        .inc();
+}
+
+/// Request-mirroring outcome counter. Three outcomes:
+/// - `"spawned"`: mirror sub-request was launched
+/// - `"dropped_saturated"`: dropped because the 256-slot semaphore
+///   was exhausted (shadow fleet overloaded)
+/// - `"dropped_oversize_body"`: dropped because request body
+///   exceeded `max_body_bytes`
+/// Labels: `route_id`, `outcome`.
+static MIRROR_OUTCOME_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "mirror_outcome_total",
+            "Request-mirroring sub-request outcomes per route"
+        )
+        .namespace("lorica"),
+        &["route_id", "outcome"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a mirror outcome.
+pub fn inc_mirror_outcome(route_id: &str, outcome: &str) {
+    MIRROR_OUTCOME_TOTAL
+        .with_label_values(&[route_id, outcome])
+        .inc();
+}
+
+/// Forward-auth verdict-cache hit/miss counter. `"hit"` means we
+/// served a cached Allow verdict without calling the auth service;
+/// `"miss"` means we made the sub-request. Labels: `route_id`,
+/// `outcome` ("hit" | "miss").
+static FORWARD_AUTH_CACHE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "forward_auth_cache_total",
+            "Forward-auth verdict cache lookups (outcome=hit|miss)"
+        )
+        .namespace("lorica"),
+        &["route_id", "outcome"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a forward-auth verdict cache lookup outcome.
+pub fn inc_forward_auth_cache(route_id: &str, outcome: &str) {
+    FORWARD_AUTH_CACHE_TOTAL
+        .with_label_values(&[route_id, outcome])
+        .inc();
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,

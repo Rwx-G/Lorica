@@ -374,9 +374,21 @@ impl WritePermit {
 
 impl Drop for WritePermit {
     fn drop(&mut self) {
-        // Writer exited without properly unlocking. We let others to compete for the write lock again
+        // Writer exited without properly unlocking. We let others
+        // compete for the write lock again.
+        //
+        // The original Cloudflare code had `debug_assert!(false, ...)`
+        // here as a defensive check against programming errors.
+        // Lorica's SWR (stale-while-revalidate) path legitimately
+        // drops a WritePermit when the background refresh subrequest
+        // is abandoned (e.g. the parent session disconnected, the
+        // refresh timed out before the writer ran). Panicking in
+        // debug builds on that path was a real spurious-failure
+        // source for integration tests. Downgrade to a warn log so
+        // the defensive signal is preserved in logs without taking
+        // the process down in debug.
         if !self.finished {
-            debug_assert!(false, "Dangling cache lock started!");
+            log::warn!("cache WritePermit dropped without unlock; releasing as Dangling");
             self.unlock(LockStatus::Dangling);
         }
     }

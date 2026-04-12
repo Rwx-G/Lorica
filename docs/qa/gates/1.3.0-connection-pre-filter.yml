@@ -1,0 +1,27 @@
+schema: 1
+story: "1.3.0-connection-pre-filter"
+story_title: "v1.3.0 Phase 1.1 - Connection pre-filter"
+gate: PASS
+status_reason: "CIDR allow/deny at TCP accept with hot-reload. 5 e2e tests incl. midstream reload. Reload-safe via ArcSwap fallback on parse errors. Info log surfaces allow/deny counts on every reload."
+reviewer: "Romain G."
+updated: "2026-04-12T00:00:00Z"
+waiver: { active: false }
+quality_score: 98
+top_issues: []
+evidence:
+  tests_reviewed: 5
+  risks_identified: 2
+  trace:
+    ac_covered: [1, 2, 3, 4, 5]
+    ac_gaps: []
+nfr_validation:
+  security: { status: PASS, notes: "Default-deny opt-in via non-empty allow list; parse errors fall back rather than open the gate" }
+  performance: { status: PASS, notes: "O(log n) CIDR lookup per accept" }
+  reliability: { status: PASS, notes: "Parse errors fall back to previous policy" }
+  maintainability: { status: PASS, notes: "Focused module" }
+  observability: { status: PASS, notes: "Info log on reload with allow/deny counts" }
+risk_summary:
+  totals: { critical: 0, high: 0, medium: 0, low: 0 }
+  recommendations:
+    must_fix: []
+    monitor: []

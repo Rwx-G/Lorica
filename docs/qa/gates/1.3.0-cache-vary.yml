@@ -1,0 +1,27 @@
+schema: 1
+story: "1.3.0-cache-vary"
+story_title: "v1.3.0 Phase 1.3 - Cache Vary support"
+gate: PASS
+status_reason: "compute_cache_variance merges route config with origin Vary. Vary: * anchors on URI (bounded cardinality). Unit tests + store round-trip. Latent get_route SELECT drift caught during development and regression-tested."
+reviewer: "Romain G."
+updated: "2026-04-12T00:00:00Z"
+waiver: { active: false }
+quality_score: 98
+top_issues: []
+evidence:
+  tests_reviewed: 4
+  risks_identified: 1
+  trace:
+    ac_covered: [1, 2, 3, 4, 5]
+    ac_gaps: []
+nfr_validation:
+  security: { status: PASS, notes: "Operator curates vary header list" }
+  performance: { status: PASS, notes: "O(# vary headers) per request" }
+  reliability: { status: PASS, notes: "Malformed values degrade to no-variance" }
+  maintainability: { status: PASS, notes: "Pure helper, isolated unit tests" }
+  observability: { status: PASS, notes: "Variance keys visible via X-Cache-Status" }
+risk_summary:
+  totals: { critical: 0, high: 0, medium: 0, low: 0 }
+  recommendations:
+    must_fix: []
+    monitor: []

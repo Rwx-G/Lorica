@@ -471,15 +471,93 @@ describe('header_rules', () => {
       match_type: 'exact',
       value: 'acme',
       backend_ids: ['b1'],
+      disabled: false,
     });
     expect(form.header_rules[1].match_type).toBe('regex');
     expect(form.header_rules[1].backend_ids).toEqual([]);
+    expect(form.header_rules[1].disabled).toBe(false);
 
     const req = formStateToCreateRequest(form);
     expect(req.header_rules).toEqual([
       { header_name: 'X-Tenant', match_type: 'exact', value: 'acme', backend_ids: ['b1'] },
       { header_name: 'User-Agent', match_type: 'regex', value: '^Mobile', backend_ids: [] },
     ]);
+  });
+
+  it('routeToFormState carries disabled flag from API response', () => {
+    const route: RouteResponse = {
+      id: 'r-disabled',
+      hostname: 'a.com',
+      path_prefix: '/',
+      backends: [],
+      certificate_id: null,
+      load_balancing: 'round_robin',
+      waf_enabled: false,
+      waf_mode: 'detection',
+      enabled: true,
+      force_https: false,
+      redirect_hostname: null,
+      redirect_to: null,
+      hostname_aliases: [],
+      proxy_headers: {},
+      response_headers: {},
+      security_headers: 'moderate',
+      connect_timeout_s: 5,
+      read_timeout_s: 60,
+      send_timeout_s: 60,
+      strip_path_prefix: null,
+      add_path_prefix: null,
+      path_rewrite_pattern: null,
+      path_rewrite_replacement: null,
+      access_log_enabled: true,
+      proxy_headers_remove: [],
+      response_headers_remove: [],
+      max_request_body_bytes: null,
+      websocket_enabled: true,
+      rate_limit_rps: null,
+      rate_limit_burst: null,
+      ip_allowlist: [],
+      ip_denylist: [],
+      cors_allowed_origins: [],
+      cors_allowed_methods: [],
+      cors_max_age_s: null,
+      compression_enabled: false,
+      retry_attempts: null,
+      cache_enabled: false,
+      cache_ttl_s: 300,
+      cache_max_bytes: 52428800,
+      max_connections: null,
+      slowloris_threshold_ms: 5000,
+      auto_ban_threshold: null,
+      auto_ban_duration_s: 3600,
+      path_rules: [],
+      return_status: null,
+      sticky_session: false,
+      basic_auth_username: null,
+      stale_while_revalidate_s: 10,
+      stale_if_error_s: 60,
+      retry_on_methods: [],
+      maintenance_mode: false,
+      error_page_html: null,
+      cache_vary_headers: [],
+      // Third-party tool saved a rule with a regex that only an
+      // older regex-crate version could compile; server marks it
+      // disabled on read. Dashboard must surface that.
+      header_rules: [
+        {
+          header_name: 'X-Legacy',
+          match_type: 'regex',
+          value: '(?P<old>legacy)',
+          backend_ids: [],
+          disabled: true,
+        },
+      ],
+      traffic_splits: [],
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    };
+    const form = routeToFormState(route);
+    expect(form.header_rules[0].disabled).toBe(true);
   });
 });
 

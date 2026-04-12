@@ -363,6 +363,24 @@ pub struct ResponseRewriteRule {
 /// Responses whose body exceeds `max_body_bytes` stream through
 /// verbatim (no partial rewrite) - a half-rewritten body would be
 /// worse than none. Matches the mirror-body-overflow stance.
+/// # Mutual exclusion with caching
+///
+/// Response rewriting and cache (`cache_enabled = true`) are mutually
+/// exclusive on the same route in v1. When both are configured, the
+/// rewrite step is skipped and a warn log is emitted at response-
+/// filter time (origin body passes through verbatim). The constraint
+/// is a scope decision for v1, not a bug:
+/// - Caching rewritten bytes risks serving stale rewrites after a
+///   rule edit without an explicit purge.
+/// - Stripping `Content-Length` on rewrite breaks the cache writer's
+///   framing expectations.
+///
+/// Pick one per route; rewriting wins over caching with a warning
+/// because rewriting is typically the stricter correctness / security
+/// requirement (e.g. stripping internal hostnames from the origin
+/// body). To serve cached rewritten content, put Lorica behind a
+/// cache (or in front of a cache) - don't try to do both on the same
+/// route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseRewriteConfig {
     /// Ordered list of rewrite rules. Each rule runs against the body
@@ -474,15 +492,49 @@ pub struct ForwardAuthConfig {
     /// the upstream request. Empty = do not copy any (default).
     #[serde(default)]
     pub response_headers: Vec<String>,
+    /// Cache successful (`Allow`) verdicts for this many milliseconds,
+    /// keyed on the downstream session cookie. `0` (default) disables
+    /// caching so every request is verified by the auth service - the
+    /// correct behavior for strict zero-trust deployments.
+    ///
+    /// Only 2xx (`Allow`) verdicts are cached. `Deny` / `FailClosed`
+    /// are always re-evaluated so a newly revoked session starts
+    /// being denied immediately.
+    ///
+    /// Hard-capped at 60000 ms (60 s). Longer TTLs are rejected at
+    /// the API validator because "revoked-session still allowed"
+    /// grows more dangerous with TTL. Most Authelia / Authentik
+    /// deployments use session lifetimes in the minutes-to-hours
+    /// range; caching for up to 60 s is a good balance between
+    /// removing the auth-service round-trip on hot paths and
+    /// keeping revocation latency bounded.
+    #[serde(default)]
+    pub verdict_cache_ttl_ms: u32,
 }
 
 fn default_forward_auth_timeout_ms() -> u32 {
     5_000
 }
 
-/// Mutual-TLS client verification: require connecting clients to
-/// present an X.509 certificate signed by the configured CA bundle and,
-/// optionally, constrain which certificate subjects are allowed.
+/// Mutual-TLS client verification.
+///
+/// # HTTP-only listeners
+///
+/// mTLS enforcement is keyed on the downstream TLS digest
+/// (`session.as_downstream().digest().ssl_digest`). Plaintext HTTP
+/// connections have no TLS digest, so a route with `mtls.required =
+/// true` served over an HTTP listener returns 496 unconditionally -
+/// the request never carries a client cert to verify. This is
+/// intentional (fail-closed), but confusing if the operator forgot
+/// to also set `force_https = true` / `redirect_to`. Pair mTLS with
+/// either an HTTPS-only listener or `force_https` so plaintext
+/// clients are redirected to the TLS-terminating port.
+///
+/// # Requirements and constraints
+///
+/// Require connecting clients to present an X.509 certificate signed
+/// by the configured CA bundle and, optionally, constrain which
+/// certificate subjects are allowed.
 ///
 /// The CA bundle is used by the TLS listener to validate the chain;
 /// whether a missing cert counts as a failure is driven by `required`.

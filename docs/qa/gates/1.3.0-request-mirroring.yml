@@ -1,0 +1,27 @@
+schema: 1
+story: "1.3.0-request-mirroring"
+story_title: "v1.3.0 Phase 3.2 - Request mirroring"
+gate: PASS
+status_reason: "Fire-and-forget shadow with 256-slot semaphore, body mirroring up to max_body_bytes. 8 e2e incl. byte-for-byte body mirroring. Prometheus counter lorica_mirror_outcome_total{route_id, outcome} exposes spawned/dropped_saturated/dropped_oversize_body/errored so operators can size the semaphore."
+reviewer: "Romain G."
+updated: "2026-04-12T00:00:00Z"
+waiver: { active: false }
+quality_score: 98
+top_issues: []
+evidence:
+  tests_reviewed: 8
+  risks_identified: 3
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7, 8]
+    ac_gaps: []
+nfr_validation:
+  security: { status: PASS, notes: "X-Lorica-Mirror marker lets shadow filter traffic" }
+  performance: { status: PASS, notes: "Deterministic sampling; bounded by semaphore + max_body_bytes" }
+  reliability: { status: PASS, notes: "Mirror failure silently dropped; primary untouched" }
+  maintainability: { status: PASS, notes: "MirrorBodyState enum pattern mirrors response-rewrite design" }
+  observability: { status: PASS, notes: "lorica_mirror_outcome_total{route_id, outcome}" }
+risk_summary:
+  totals: { critical: 0, high: 0, medium: 0, low: 0 }
+  recommendations:
+    must_fix: []
+    monitor: []

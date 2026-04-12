@@ -1807,6 +1807,7 @@ cert_critical_days = 3
             address: "http://authelia.internal/api/verify".into(),
             timeout_ms: 2_500,
             response_headers: vec!["Remote-User".into(), "Remote-Groups".into()],
+            verdict_cache_ttl_ms: 15_000,
         });
         store.create_route(&route).unwrap();
 
@@ -1817,6 +1818,10 @@ cert_critical_days = 3
         assert_eq!(
             fa.response_headers,
             vec!["Remote-User".to_string(), "Remote-Groups".to_string()]
+        );
+        assert_eq!(
+            fa.verdict_cache_ttl_ms, 15_000,
+            "verdict_cache_ttl_ms must round-trip through the JSON column"
         );
 
         let via_list: Vec<_> = store

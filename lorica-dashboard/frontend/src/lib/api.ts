@@ -171,6 +171,11 @@ export interface HeaderRuleResponse {
   match_type?: string;
   value: string;
   backend_ids: string[];
+  // True when the proxy skipped this rule at load time because its
+  // regex failed to compile (e.g. regex-crate version drift after an
+  // upgrade, or out-of-band DB edit). The UI should surface a warning
+  // badge so the operator republishes the rule.
+  disabled?: boolean;
 }
 
 export interface HeaderRuleRequest {

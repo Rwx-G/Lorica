@@ -1,0 +1,27 @@
+schema: 1
+story: "1.3.0-canary"
+story_title: "v1.3.0 Phase 2.2 - Canary traffic split"
+gate: PASS
+status_reason: "Deterministic sticky-IP bucketing (route_id + ip mix). 3 e2e + unit on canary_bucket + split selection. API rejects weights > 100 and cumulative > 100. Prometheus counter lorica_canary_split_selected_total{route_id, split_name} exposes per-split traffic, with \"default\" for fallthrough and \"unnamed\" for nameless splits."
+reviewer: "Romain G."
+updated: "2026-04-12T00:00:00Z"
+waiver: { active: false }
+quality_score: 98
+top_issues: []
+evidence:
+  tests_reviewed: 3
+  risks_identified: 2
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6]
+    ac_gaps: []
+nfr_validation:
+  security: { status: PASS, notes: "IP-based bucketing not user-controllable" }
+  performance: { status: PASS, notes: "O(1) hash per request" }
+  reliability: { status: PASS, notes: "Dangling backends warned at load + fall through to defaults" }
+  maintainability: { status: PASS, notes: "Pure helper canary_bucket" }
+  observability: { status: PASS, notes: "lorica_canary_split_selected_total{route_id, split_name}" }
+risk_summary:
+  totals: { critical: 0, high: 0, medium: 0, low: 0 }
+  recommendations:
+    must_fix: []
+    monitor: []

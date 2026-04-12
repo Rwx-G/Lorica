@@ -462,6 +462,7 @@ async fn forward_auth_allow_injects_response_headers_and_reaches_upstream() {
             address: format!("http://{auth}/verify"),
             timeout_ms: 2_000,
             response_headers: vec!["Remote-User".into(), "Remote-Groups".into()],
+            verdict_cache_ttl_ms: 0,
         }),
     );
     let backends = vec![test_backend("b-upstream", upstream)];
@@ -516,6 +517,7 @@ async fn forward_auth_deny_forwards_status_and_body_verbatim() {
             address: format!("http://{auth}/verify"),
             timeout_ms: 2_000,
             response_headers: vec![],
+            verdict_cache_ttl_ms: 0,
         }),
     );
     let backends = vec![test_backend("b-upstream", upstream)];
@@ -582,6 +584,7 @@ async fn forward_auth_redirect_is_forwarded_verbatim_to_client() {
             address: format!("http://{auth}/verify"),
             timeout_ms: 2_000,
             response_headers: vec![],
+            verdict_cache_ttl_ms: 0,
         }),
     );
     let backends = vec![test_backend("b-upstream", upstream)];
@@ -629,6 +632,7 @@ async fn forward_auth_timeout_fails_closed_503() {
             // Timeout shorter than the mock's "slow" 600 ms reply.
             timeout_ms: 150,
             response_headers: vec![],
+            verdict_cache_ttl_ms: 0,
         }),
     );
     let backends = vec![test_backend("b-upstream", upstream)];
@@ -674,6 +678,7 @@ async fn forward_auth_unreachable_fails_closed_503() {
             address: format!("http://127.0.0.1:{auth_port}/verify"),
             timeout_ms: 1_000,
             response_headers: vec![],
+            verdict_cache_ttl_ms: 0,
         }),
     );
     let backends = vec![test_backend("b-upstream", upstream)];
@@ -751,6 +756,7 @@ async fn forward_auth_forwards_client_context_headers_to_auth() {
             address: format!("http://{auth}/verify"),
             timeout_ms: 2_000,
             response_headers: vec!["Remote-User".into()],
+            verdict_cache_ttl_ms: 0,
         }),
     );
     let backends = vec![test_backend("b-upstream", upstream)];

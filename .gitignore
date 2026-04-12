@@ -5,6 +5,7 @@ Cargo.lock
 
 # Working docs
 FIXLIST.md
+/tmp/
 
 # Build artifacts
 /.pnpm-store/

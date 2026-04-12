@@ -56,6 +56,14 @@ pub struct HeaderRuleRequest {
     pub value: String,
     #[serde(default)]
     pub backend_ids: Vec<String>,
+    /// Response-only indicator. Set to `true` by `route_to_response`
+    /// when the rule's regex fails to compile at read time (meaning
+    /// the proxy also skips this rule at runtime). Never read from
+    /// the body on write paths - `#[serde(default)]` makes it
+    /// ignored on deserialization so an attacker / stale dashboard
+    /// can't disable a rule by posting `disabled: true`.
+    #[serde(default, skip_deserializing)]
+    pub disabled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -74,6 +82,8 @@ pub struct ForwardAuthConfigRequest {
     pub timeout_ms: u32,
     #[serde(default)]
     pub response_headers: Vec<String>,
+    #[serde(default)]
+    pub verdict_cache_ttl_ms: u32,
 }
 
 fn default_forward_auth_timeout_ms() -> u32 {
@@ -427,11 +437,26 @@ fn route_to_response(
         header_rules: route
             .header_rules
             .iter()
-            .map(|hr| HeaderRuleRequest {
-                header_name: hr.header_name.clone(),
-                match_type: Some(hr.match_type.as_str().to_string()),
-                value: hr.value.clone(),
-                backend_ids: hr.backend_ids.clone(),
+            .map(|hr| {
+                // Recompute disabled state at read time by attempting
+                // to compile the regex. The write-path validator
+                // already rejects bad regex, so in normal operation
+                // this is always `false`. The flag exists for out-of-
+                // band edits (raw DB writes, TOML import of a stale
+                // export, regex-crate version drift on upgrade) so
+                // the dashboard can show a red badge and the operator
+                // can republish the rule.
+                let disabled = matches!(
+                    hr.match_type,
+                    lorica_config::models::HeaderMatchType::Regex
+                ) && regex::Regex::new(&hr.value).is_err();
+                HeaderRuleRequest {
+                    header_name: hr.header_name.clone(),
+                    match_type: Some(hr.match_type.as_str().to_string()),
+                    value: hr.value.clone(),
+                    backend_ids: hr.backend_ids.clone(),
+                    disabled,
+                }
             })
             .collect(),
         traffic_splits: route
@@ -450,6 +475,7 @@ fn route_to_response(
                 address: fa.address.clone(),
                 timeout_ms: fa.timeout_ms,
                 response_headers: fa.response_headers.clone(),
+                verdict_cache_ttl_ms: fa.verdict_cache_ttl_ms,
             }),
         mirror: route.mirror.as_ref().map(|m| MirrorConfigRequest {
             backend_ids: m.backend_ids.clone(),
@@ -704,7 +730,31 @@ fn build_forward_auth(
         ApiError::BadRequest(format!("forward_auth.address must be an absolute URL: {e}"))
     })?;
     match parsed.scheme_str() {
-        Some("http") | Some("https") => {}
+        Some("https") => {}
+        Some("http") => {
+            // Accepted for loopback / sidecar deployments (auth
+            // service on the same host, localhost) where the cost of
+            // TLS termination is not justified. Warn because the
+            // full downstream Cookie + Authorization is forwarded to
+            // the auth service verbatim; on anything other than
+            // loopback that leaks credentials in cleartext.
+            let host = parsed
+                .authority()
+                .map(|a| a.host().to_string())
+                .unwrap_or_default();
+            let is_loopback = host == "localhost"
+                || host == "127.0.0.1"
+                || host == "[::1]"
+                || host.starts_with("127.")
+                || host.ends_with(".localhost");
+            if !is_loopback {
+                tracing::warn!(
+                    address = %address,
+                    host = %host,
+                    "forward_auth.address uses http:// to a non-loopback host; downstream Cookie and Authorization headers will be forwarded in cleartext. Use https:// in production."
+                );
+            }
+        }
         Some(s) => {
             return Err(ApiError::BadRequest(format!(
                 "forward_auth.address must use http or https scheme, got {s}"
@@ -738,6 +788,17 @@ fn build_forward_auth(
             ));
         }
     }
+    // Verdict cache TTL cap. 60s is a hard ceiling because cached
+    // "Allow" verdicts survive session revocation for up to TTL;
+    // anything beyond 60s would turn the feature into an unbounded
+    // authentication bypass on session logout. 0 disables the cache
+    // entirely (strict zero-trust default).
+    const VERDICT_CACHE_TTL_CEILING_MS: u32 = 60_000;
+    if body.verdict_cache_ttl_ms > VERDICT_CACHE_TTL_CEILING_MS {
+        return Err(ApiError::BadRequest(format!(
+            "forward_auth.verdict_cache_ttl_ms must be <= {VERDICT_CACHE_TTL_CEILING_MS} (60s); longer TTLs delay session-revocation too much. Use 0 to disable caching."
+        )));
+    }
     Ok(lorica_config::models::ForwardAuthConfig {
         address: address.to_string(),
         timeout_ms: body.timeout_ms,
@@ -746,6 +807,7 @@ fn build_forward_auth(
             .iter()
             .map(|h| h.trim().to_string())
             .collect(),
+        verdict_cache_ttl_ms: body.verdict_cache_ttl_ms,
     })
 }
 
@@ -1421,6 +1483,21 @@ mod tests {
             address: address.into(),
             timeout_ms,
             response_headers: response_headers.into_iter().map(String::from).collect(),
+            verdict_cache_ttl_ms: 0,
+        }
+    }
+
+    fn fa_req_with_cache(
+        address: &str,
+        timeout_ms: u32,
+        response_headers: Vec<&str>,
+        verdict_cache_ttl_ms: u32,
+    ) -> ForwardAuthConfigRequest {
+        ForwardAuthConfigRequest {
+            address: address.into(),
+            timeout_ms,
+            response_headers: response_headers.into_iter().map(String::from).collect(),
+            verdict_cache_ttl_ms,
         }
     }
 
@@ -1689,6 +1766,45 @@ mod tests {
         let built = build_forward_auth(&fa_req("  http://a/verify  ", 1000, vec![]))
             .unwrap();
         assert_eq!(built.address, "http://a/verify");
+    }
+
+    #[test]
+    fn build_forward_auth_accepts_verdict_cache_within_cap() {
+        let built =
+            build_forward_auth(&fa_req_with_cache("https://a/v", 1000, vec![], 30_000))
+                .unwrap();
+        assert_eq!(built.verdict_cache_ttl_ms, 30_000);
+    }
+
+    #[test]
+    fn build_forward_auth_rejects_verdict_cache_over_cap() {
+        let err =
+            build_forward_auth(&fa_req_with_cache("https://a/v", 1000, vec![], 60_001))
+                .err()
+                .unwrap();
+        assert!(
+            matches!(err, ApiError::BadRequest(ref m) if m.contains("60s") || m.contains("60000")),
+            "expected 60s cap message, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_forward_auth_default_verdict_cache_is_zero() {
+        // Zero-trust default: caching must be opt-in.
+        let built = build_forward_auth(&fa_req("https://a/v", 1000, vec![])).unwrap();
+        assert_eq!(built.verdict_cache_ttl_ms, 0);
+    }
+
+    #[test]
+    fn build_forward_auth_accepts_http_loopback_without_warn_surface() {
+        // Loopback http:// is accepted silently (sidecar deployments).
+        // We can't observe the warn log from a unit test without a
+        // tracing subscriber, so this test documents the acceptance
+        // path; the warn-on-non-loopback path is covered in e2e.
+        let built =
+            build_forward_auth(&fa_req("http://127.0.0.1:9091/verify", 1000, vec![]))
+                .unwrap();
+        assert_eq!(built.address, "http://127.0.0.1:9091/verify");
     }
 
     // ---- mTLS config validator ----

@@ -1,0 +1,27 @@
+schema: 1
+story: "1.3.0-response-rewrite"
+story_title: "v1.3.0 Phase 4.1 - Response body rewriting"
+gate: PASS
+status_reason: "Nginx sub_filter equivalent with literal + regex + capture groups. 10 e2e incl. cross-chunk patterns, gzip skip, HEAD preservation, cache mutual-exclusion. Regex crate = ReDoS-safe. Cache + rewrite mutual exclusion is loudly documented on ResponseRewriteConfig and warn-logged at response_filter."
+reviewer: "Romain G."
+updated: "2026-04-12T00:00:00Z"
+waiver: { active: false }
+quality_score: 98
+top_issues: []
+evidence:
+  tests_reviewed: 10
+  risks_identified: 3
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    ac_gaps: []
+nfr_validation:
+  security: { status: PASS, notes: "regex crate linear-time + write-time compile catch" }
+  performance: { status: PASS, notes: "Full-body buffer capped at max_body_bytes; overflow streams verbatim" }
+  reliability: { status: PASS, notes: "HEAD preserved (RFC 7231), 1xx/204/304 skipped, cache mutual-exclusion (loudly documented)" }
+  maintainability: { status: PASS, notes: "ResponseRewriteState enum + pure helpers" }
+  observability: { status: PASS, notes: "Warn on overflow + mutual-exclusion with cache" }
+risk_summary:
+  totals: { critical: 0, high: 0, medium: 0, low: 0 }
+  recommendations:
+    must_fix: []
+    monitor: []
