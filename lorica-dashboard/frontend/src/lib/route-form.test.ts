@@ -177,6 +177,7 @@ describe('routeToFormState', () => {
     error_page_html: null,
     cache_vary_headers: [],
     header_rules: [],
+    traffic_splits: [],
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
   };
@@ -476,6 +477,146 @@ describe('header_rules', () => {
       { header_name: 'X-Tenant', match_type: 'exact', value: 'acme', backend_ids: ['b1'] },
       { header_name: 'User-Agent', match_type: 'regex', value: '^Mobile', backend_ids: [] },
     ]);
+  });
+});
+
+describe('traffic_splits', () => {
+  function canaryForm(overrides: Partial<RouteFormState> = {}): RouteFormState {
+    return { ...ROUTE_DEFAULTS, hostname: 'a.com', ...overrides };
+  }
+
+  it('drops the empty "just added" split when serialising a create request', () => {
+    const form = canaryForm({
+      traffic_splits: [
+        // Default state after clicking "+ Add" but before filling anything.
+        { name: '', weight_percent: 0, backend_ids: [] },
+        { name: 'v2', weight_percent: 10, backend_ids: ['b-v2'] },
+      ],
+    });
+    const req = formStateToCreateRequest(form);
+    expect(req.traffic_splits).toEqual([
+      { name: 'v2', weight_percent: 10, backend_ids: ['b-v2'] },
+    ]);
+  });
+
+  it('keeps non-zero-weight splits even when backend_ids is empty (API rejects)', () => {
+    // If the form is in a broken state (weight set, backends forgotten),
+    // we forward it so the API returns the actionable 400 rather than
+    // silently dropping it and leaving the operator puzzled.
+    const form = canaryForm({
+      traffic_splits: [{ name: 'typo', weight_percent: 5, backend_ids: [] }],
+    });
+    const req = formStateToCreateRequest(form);
+    expect(req.traffic_splits).toEqual([
+      { name: 'typo', weight_percent: 5, backend_ids: [] },
+    ]);
+  });
+
+  it('validateRouteForm rejects cumulative weight > 100', () => {
+    const form = canaryForm({
+      traffic_splits: [
+        { name: 'a', weight_percent: 60, backend_ids: ['a'] },
+        { name: 'b', weight_percent: 50, backend_ids: ['b'] },
+      ],
+    });
+    expect(validateRouteForm(form)).toMatch(/cumulative weight must be <= 100/);
+  });
+
+  it('validateRouteForm rejects weight > 100 on a single split', () => {
+    const form = canaryForm({
+      traffic_splits: [{ name: 'a', weight_percent: 150, backend_ids: ['a'] }],
+    });
+    expect(validateRouteForm(form)).toMatch(/weight must be 0\.\.100/);
+  });
+
+  it('validateRouteForm rejects non-zero weight without backends', () => {
+    const form = canaryForm({
+      traffic_splits: [{ name: 'a', weight_percent: 5, backend_ids: [] }],
+    });
+    expect(validateRouteForm(form)).toMatch(/must select at least one backend/);
+  });
+
+  it('validateRouteForm accepts cumulative = 100', () => {
+    const form = canaryForm({
+      traffic_splits: [
+        { name: 'a', weight_percent: 40, backend_ids: ['a'] },
+        { name: 'b', weight_percent: 60, backend_ids: ['b'] },
+      ],
+    });
+    expect(validateRouteForm(form)).toBe('');
+  });
+
+  it('routeToFormState maps response -> form and formStateToCreateRequest round-trips', () => {
+    const mock: RouteResponse = {
+      id: 'r1',
+      hostname: 'a.com',
+      path_prefix: '/',
+      backends: [],
+      certificate_id: null,
+      load_balancing: 'round_robin',
+      waf_enabled: false,
+      waf_mode: 'detection',
+      enabled: true,
+      force_https: false,
+      redirect_hostname: null,
+      redirect_to: null,
+      hostname_aliases: [],
+      proxy_headers: {},
+      response_headers: {},
+      security_headers: 'moderate',
+      connect_timeout_s: 5,
+      read_timeout_s: 60,
+      send_timeout_s: 60,
+      strip_path_prefix: null,
+      add_path_prefix: null,
+      path_rewrite_pattern: null,
+      path_rewrite_replacement: null,
+      access_log_enabled: true,
+      proxy_headers_remove: [],
+      response_headers_remove: [],
+      max_request_body_bytes: null,
+      websocket_enabled: true,
+      rate_limit_rps: null,
+      rate_limit_burst: null,
+      ip_allowlist: [],
+      ip_denylist: [],
+      cors_allowed_origins: [],
+      cors_allowed_methods: [],
+      cors_max_age_s: null,
+      compression_enabled: false,
+      retry_attempts: null,
+      cache_enabled: false,
+      cache_ttl_s: 300,
+      cache_max_bytes: 52428800,
+      max_connections: null,
+      slowloris_threshold_ms: 5000,
+      auto_ban_threshold: null,
+      auto_ban_duration_s: 3600,
+      path_rules: [],
+      return_status: null,
+      sticky_session: false,
+      basic_auth_username: null,
+      stale_while_revalidate_s: 10,
+      stale_if_error_s: 60,
+      retry_on_methods: [],
+      maintenance_mode: false,
+      error_page_html: null,
+      cache_vary_headers: [],
+      header_rules: [],
+      traffic_splits: [
+        { name: 'v2-canary', weight_percent: 5, backend_ids: ['b-v2'] },
+        { name: 'v3', weight_percent: 10, backend_ids: ['b-v3a', 'b-v3b'] },
+      ],
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    };
+    const form = routeToFormState(mock);
+    expect(form.traffic_splits).toEqual([
+      { name: 'v2-canary', weight_percent: 5, backend_ids: ['b-v2'] },
+      { name: 'v3', weight_percent: 10, backend_ids: ['b-v3a', 'b-v3b'] },
+    ]);
+    const req = formStateToCreateRequest(form);
+    expect(req.traffic_splits).toEqual(mock.traffic_splits);
   });
 });
 

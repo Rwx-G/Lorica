@@ -58,6 +58,15 @@ pub struct HeaderRuleRequest {
     pub backend_ids: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct TrafficSplitRequest {
+    #[serde(default)]
+    pub name: String,
+    pub weight_percent: u8,
+    #[serde(default)]
+    pub backend_ids: Vec<String>,
+}
+
 #[derive(Serialize)]
 pub struct RouteResponse {
     pub id: String,
@@ -118,6 +127,7 @@ pub struct RouteResponse {
     pub error_page_html: Option<String>,
     pub cache_vary_headers: Vec<String>,
     pub header_rules: Vec<HeaderRuleRequest>,
+    pub traffic_splits: Vec<TrafficSplitRequest>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -181,6 +191,7 @@ pub struct CreateRouteRequest {
     pub error_page_html: Option<String>,
     pub cache_vary_headers: Option<Vec<String>>,
     pub header_rules: Option<Vec<HeaderRuleRequest>>,
+    pub traffic_splits: Option<Vec<TrafficSplitRequest>>,
 }
 
 #[derive(Deserialize)]
@@ -241,6 +252,7 @@ pub struct UpdateRouteRequest {
     pub error_page_html: Option<String>,
     pub cache_vary_headers: Option<Vec<String>>,
     pub header_rules: Option<Vec<HeaderRuleRequest>>,
+    pub traffic_splits: Option<Vec<TrafficSplitRequest>>,
 }
 
 fn route_to_response(
@@ -328,9 +340,57 @@ fn route_to_response(
                 backend_ids: hr.backend_ids.clone(),
             })
             .collect(),
+        traffic_splits: route
+            .traffic_splits
+            .iter()
+            .map(|ts| TrafficSplitRequest {
+                name: ts.name.clone(),
+                weight_percent: ts.weight_percent,
+                backend_ids: ts.backend_ids.clone(),
+            })
+            .collect(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
+}
+
+/// Validate a traffic split request and convert it to the stored model.
+/// Rejects the two operator mistakes that would silently break the feature:
+/// weights outside 0..=100 (serde already caps at u8 max, but 101-255 still
+/// slips through), and non-zero weight with an empty backend list (would
+/// consume its weight band without diverting any traffic).
+fn build_traffic_split(
+    body: &TrafficSplitRequest,
+) -> Result<lorica_config::models::TrafficSplit, ApiError> {
+    if body.weight_percent > 100 {
+        return Err(ApiError::BadRequest(format!(
+            "traffic_splits: weight_percent must be 0..=100, got {}",
+            body.weight_percent
+        )));
+    }
+    if body.weight_percent > 0 && body.backend_ids.is_empty() {
+        return Err(ApiError::BadRequest(
+            "traffic_splits: a split with weight > 0 must list at least one backend".into(),
+        ));
+    }
+    Ok(lorica_config::models::TrafficSplit {
+        name: body.name.trim().to_string(),
+        weight_percent: body.weight_percent,
+        backend_ids: body.backend_ids.clone(),
+    })
+}
+
+/// Per-route global check: cumulative weights must not exceed 100%. The
+/// engine clamps silently but the operator experience is better if the
+/// API rejects the typo before it hits the DB.
+fn validate_traffic_splits(splits: &[lorica_config::models::TrafficSplit]) -> Result<(), ApiError> {
+    let total: u32 = splits.iter().map(|s| s.weight_percent as u32).sum();
+    if total > 100 {
+        return Err(ApiError::BadRequest(format!(
+            "traffic_splits: cumulative weight_percent must be <= 100, got {total}"
+        )));
+    }
+    Ok(())
 }
 
 /// Parse and validate an incoming `HeaderRuleRequest`. Rejects empty header
@@ -516,6 +576,17 @@ pub async fn create_route(
             .iter()
             .map(build_header_rule)
             .collect::<Result<Vec<_>, _>>()?,
+        traffic_splits: {
+            let splits = body
+                .traffic_splits
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(build_traffic_split)
+                .collect::<Result<Vec<_>, _>>()?;
+            validate_traffic_splits(&splits)?;
+            splits
+        },
         created_at: now,
         updated_at: now,
     };
@@ -790,6 +861,14 @@ pub async fn update_route(
             .map(build_header_rule)
             .collect::<Result<Vec<_>, _>>()?;
     }
+    if let Some(ref splits) = body.traffic_splits {
+        let built = splits
+            .iter()
+            .map(build_traffic_split)
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_traffic_splits(&built)?;
+        route.traffic_splits = built;
+    }
     route.updated_at = Utc::now();
 
     store.update_route(&route)?;
@@ -820,4 +899,73 @@ pub async fn delete_route(
     drop(store);
     state.notify_config_changed();
     Ok(json_data(serde_json::json!({"message": "route deleted"})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split(name: &str, w: u8, ids: &[&str]) -> TrafficSplitRequest {
+        TrafficSplitRequest {
+            name: name.into(),
+            weight_percent: w,
+            backend_ids: ids.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn build_traffic_split_rejects_weight_over_100() {
+        let req = split("bad", 150, &["b"]);
+        let err = build_traffic_split(&req).err().expect("should reject");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("must be 0..=100")));
+    }
+
+    #[test]
+    fn build_traffic_split_rejects_non_zero_weight_without_backends() {
+        // Split that would consume a weight band but divert to nothing -
+        // operator typo; surface as 400 instead of silently swallowing
+        // traffic on reload.
+        let req = split("typo", 5, &[]);
+        let err = build_traffic_split(&req).err().expect("should reject");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("at least one backend")));
+    }
+
+    #[test]
+    fn build_traffic_split_accepts_zero_weight_with_no_backends() {
+        // Zero-weight entry is a valid "prepared but disabled" state,
+        // used while staging a rollout.
+        let req = split("", 0, &[]);
+        assert!(build_traffic_split(&req).is_ok());
+    }
+
+    #[test]
+    fn build_traffic_split_trims_name() {
+        let req = split("  v2  ", 5, &["b"]);
+        let built = build_traffic_split(&req).unwrap();
+        assert_eq!(built.name, "v2");
+    }
+
+    #[test]
+    fn validate_traffic_splits_rejects_cumulative_over_100() {
+        let splits = vec![
+            build_traffic_split(&split("a", 60, &["x"])).unwrap(),
+            build_traffic_split(&split("b", 50, &["y"])).unwrap(),
+        ];
+        let err = validate_traffic_splits(&splits).err().expect("should reject");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("<= 100")));
+    }
+
+    #[test]
+    fn validate_traffic_splits_accepts_cumulative_exactly_100() {
+        let splits = vec![
+            build_traffic_split(&split("a", 40, &["x"])).unwrap(),
+            build_traffic_split(&split("b", 60, &["y"])).unwrap(),
+        ];
+        assert!(validate_traffic_splits(&splits).is_ok());
+    }
+
+    #[test]
+    fn validate_traffic_splits_empty_is_ok() {
+        assert!(validate_traffic_splits(&[]).is_ok());
+    }
 }

@@ -155,6 +155,7 @@ fn test_route(id: &str, hostname: &str, header_rules: Vec<HeaderRule>) -> Route 
         error_page_html: None,
         cache_vary_headers: vec![],
         header_rules,
+        traffic_splits: vec![],
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

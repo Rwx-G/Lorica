@@ -157,6 +157,7 @@ export interface RouteResponse {
   error_page_html: string | null;
   cache_vary_headers: string[];
   header_rules: HeaderRuleResponse[];
+  traffic_splits: TrafficSplitResponse[];
   created_at: string;
   updated_at: string;
 }
@@ -172,6 +173,18 @@ export interface HeaderRuleRequest {
   header_name: string;
   match_type?: string;
   value: string;
+  backend_ids: string[];
+}
+
+export interface TrafficSplitResponse {
+  name: string;
+  weight_percent: number;
+  backend_ids: string[];
+}
+
+export interface TrafficSplitRequest {
+  name: string;
+  weight_percent: number;
   backend_ids: string[];
 }
 
@@ -230,6 +243,7 @@ export interface CreateRouteRequest {
   error_page_html?: string;
   cache_vary_headers?: string[];
   header_rules?: HeaderRuleRequest[];
+  traffic_splits?: TrafficSplitRequest[];
 }
 
 
@@ -289,6 +303,7 @@ export interface UpdateRouteRequest {
   error_page_html?: string;
   cache_vary_headers?: string[];
   header_rules?: HeaderRuleRequest[];
+  traffic_splits?: TrafficSplitRequest[];
 }
 
 export interface BackendResponse {

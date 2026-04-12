@@ -22,6 +22,7 @@
   import ProtectionTab from './route-tabs/ProtectionTab.svelte';
   import PathRulesTab from './route-tabs/PathRulesTab.svelte';
   import HeaderRulesTab from './route-tabs/HeaderRulesTab.svelte';
+  import CanaryTab from './route-tabs/CanaryTab.svelte';
 
   interface Props {
     open: boolean;
@@ -52,6 +53,7 @@
     { id: 'protection', label: 'Protection' },
     { id: 'path_rules', label: 'Path Rules' },
     { id: 'header_rules', label: 'Header Rules' },
+    { id: 'traffic_splits', label: 'Canary' },
   ];
 
   // Reset form when drawer opens - untrack body so form/editing changes
@@ -206,6 +208,8 @@
           <PathRulesTab bind:form={form} {backends} {importedFields} />
         {:else if activeTab === 'header_rules'}
           <HeaderRulesTab bind:form={form} {backends} {importedFields} />
+        {:else if activeTab === 'traffic_splits'}
+          <CanaryTab bind:form={form} {backends} {importedFields} />
         {/if}
       </div>
 

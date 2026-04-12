@@ -153,6 +153,11 @@ pub struct RouteEntry {
     /// None = rule matches but keeps default backends; Some = override.
     /// Empty backend_ids on a rule also yields None here.
     pub header_rule_backends: Vec<Option<Vec<Backend>>>,
+    /// Resolved backends per traffic split (parallel to
+    /// route.traffic_splits). Splits whose `backend_ids` are all dangling
+    /// become `None` and are silently skipped at match time, so a typo in
+    /// the dashboard never dead-ends live traffic.
+    pub traffic_split_backends: Vec<Option<Vec<Backend>>>,
 }
 
 /// In-memory configuration snapshot used by the proxy.
@@ -186,7 +191,7 @@ pub struct ProxyConfig {
 }
 
 /// Global settings extracted from the config store for ProxyConfig construction.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ProxyConfigGlobals {
     pub custom_security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
     pub max_global_connections: u32,
@@ -343,6 +348,35 @@ impl ProxyConfig {
                 })
                 .collect();
 
+            let traffic_split_backends: Vec<Option<Vec<Backend>>> = route
+                .traffic_splits
+                .iter()
+                .map(|split| {
+                    if split.backend_ids.is_empty() || split.weight_percent == 0 {
+                        None
+                    } else {
+                        let resolved: Vec<_> = split
+                            .backend_ids
+                            .iter()
+                            .filter_map(|id| backend_map.get(id).cloned())
+                            .collect();
+                        if resolved.is_empty() {
+                            // All backend IDs dangled - log once at load
+                            // time so operators see the typo, but let the
+                            // route keep functioning on its defaults.
+                            tracing::warn!(
+                                route_id = %route.id,
+                                split_name = %split.name,
+                                "traffic_split backend_ids all dangling, skipping this split"
+                            );
+                            None
+                        } else {
+                            Some(resolved)
+                        }
+                    }
+                })
+                .collect();
+
             let entry = RouteEntry {
                 route: Arc::new(route.clone()),
                 backends: route_backends,
@@ -352,6 +386,7 @@ impl ProxyConfig {
                 path_rule_backends,
                 header_rule_regexes,
                 header_rule_backends,
+                traffic_split_backends,
             };
 
             routes_by_host
@@ -983,6 +1018,54 @@ pub(crate) fn match_header_rule_backends<'a>(
     None
 }
 
+/// Compute a stable bucket in `0..100` for `(route_id, client_ip)`. Same
+/// inputs always map to the same bucket within a single process, which
+/// gives the canary its "sticky" property - one user stays on the same
+/// version across multiple requests on the same route. Mixing the route
+/// ID into the hash means an unlucky client IP doesn't land in every
+/// service's canary bucket simultaneously.
+///
+/// `pub` so integration tests can pick synthetic client IPs that are
+/// guaranteed to fall in a specific bucket band without running the
+/// law-of-large-numbers gauntlet.
+pub fn canary_bucket(route_id: &str, client_ip: &str) -> u8 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    route_id.hash(&mut h);
+    client_ip.hash(&mut h);
+    (h.finish() % 100) as u8
+}
+
+/// Select the backends for a traffic split given a deterministic bucket
+/// value in `0..100`. Splits are consumed in declaration order and their
+/// weights accumulate: the first split whose cumulative ceiling strictly
+/// exceeds `bucket` wins. When a split in the range has been normalised
+/// away (e.g. dangling backend IDs, see `from_store`), it still consumes
+/// its weight band but yields `None`, so the caller keeps route defaults
+/// for that bucket rather than rebalancing the remaining traffic.
+///
+/// The caller is responsible for computing `bucket`; extracting this
+/// function keeps weighted-selection math independent of the actual
+/// client-IP hash, so both are trivially unit-testable.
+pub(crate) fn pick_traffic_split_backends<'a>(
+    splits: &[lorica_config::models::TrafficSplit],
+    resolved: &'a [Option<Vec<Backend>>],
+    bucket: u8,
+) -> Option<&'a [Backend]> {
+    let mut cumulative: u32 = 0;
+    for (i, split) in splits.iter().enumerate() {
+        let w = split.weight_percent.min(100) as u32;
+        if w == 0 {
+            continue;
+        }
+        cumulative = cumulative.saturating_add(w).min(100);
+        if (bucket as u32) < cumulative {
+            return resolved.get(i).and_then(|b| b.as_deref());
+        }
+    }
+    None
+}
+
 /// Glue used by `cache_vary_filter`: pull the three inputs - route config,
 /// response Vary, request headers+URI - out of a session-level state and
 /// hand them to [`compute_cache_variance`]. Extracted from the trait method
@@ -1364,6 +1447,28 @@ impl ProxyHttp for LoricaProxy {
                 &req.headers,
             ) {
                 ctx.matched_backends = Some(backends.to_vec());
+            }
+        }
+
+        // Canary traffic split: runs AFTER header rules (operator opt-in
+        // always wins) and BEFORE path rules (URL-specific overrides
+        // still win). The split is applied only when no earlier phase
+        // already set `matched_backends`, so a user with X-Version: beta
+        // is never accidentally rebalanced into the canary bucket for
+        // the default version. Requests without a client IP (Unix-socket
+        // listeners in tests, rare IPv6 edge cases) keep route defaults
+        // rather than being bucketed deterministically on an empty
+        // string.
+        if ctx.matched_backends.is_none() && !entry.route.traffic_splits.is_empty() {
+            if let Some(ref ip) = ctx.client_ip {
+                let bucket = canary_bucket(&entry.route.id, ip);
+                if let Some(backends) = pick_traffic_split_backends(
+                    &entry.route.traffic_splits,
+                    &entry.traffic_split_backends,
+                    bucket,
+                ) {
+                    ctx.matched_backends = Some(backends.to_vec());
+                }
             }
         }
 
@@ -2913,6 +3018,7 @@ mod tests {
             error_page_html: None,
             cache_vary_headers: vec![],
             header_rules: vec![],
+            traffic_splits: vec![],
             created_at: now,
             updated_at: now,
         }
@@ -4446,6 +4552,205 @@ mod tests {
         let backends = vec![Some(vec![mk_backend_with_id("b1")])];
         let headers = hmap(&[("x-tenant", "anything")]);
         assert!(match_header_rule_backends(&rules, &regexes, &backends, &headers).is_none());
+    }
+
+    // ---- Canary traffic split ----
+
+    #[test]
+    fn test_canary_bucket_is_deterministic_and_in_range() {
+        // Same inputs -> same bucket on every call within a process.
+        for i in 0..16 {
+            let ip = format!("10.0.0.{i}");
+            let a = canary_bucket("r1", &ip);
+            let b = canary_bucket("r1", &ip);
+            assert_eq!(a, b, "hash must be stable for {ip}");
+            assert!(a < 100, "bucket {a} out of range");
+        }
+    }
+
+    #[test]
+    fn test_canary_bucket_varies_by_route_and_ip() {
+        // Different routes -> a given IP lands on different buckets.
+        // Not a strict requirement but a smoke test: if it's always the
+        // same, we've broken the "per-route bucket" contract.
+        let mut differs = false;
+        for i in 0..32 {
+            let ip = format!("10.0.0.{i}");
+            if canary_bucket("r1", &ip) != canary_bucket("r2", &ip) {
+                differs = true;
+                break;
+            }
+        }
+        assert!(differs, "changing route_id should change at least one bucket");
+    }
+
+    fn split(name: &str, pct: u8, backends: &[&str]) -> lorica_config::models::TrafficSplit {
+        lorica_config::models::TrafficSplit {
+            name: name.into(),
+            weight_percent: pct,
+            backend_ids: backends.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_pick_traffic_split_backends_cumulative_bands() {
+        // 5% + 10% = 15% diverted. Buckets 0..=4 -> A, 5..=14 -> B,
+        // 15..=99 -> None (route default).
+        let splits = vec![split("a", 5, &["a"]), split("b", 10, &["b"])];
+        let backends: Vec<Option<Vec<Backend>>> = vec![
+            Some(vec![mk_backend_with_id("a")]),
+            Some(vec![mk_backend_with_id("b")]),
+        ];
+
+        assert_eq!(
+            pick_traffic_split_backends(&splits, &backends, 0).unwrap()[0].id,
+            "a"
+        );
+        assert_eq!(
+            pick_traffic_split_backends(&splits, &backends, 4).unwrap()[0].id,
+            "a"
+        );
+        assert_eq!(
+            pick_traffic_split_backends(&splits, &backends, 5).unwrap()[0].id,
+            "b"
+        );
+        assert_eq!(
+            pick_traffic_split_backends(&splits, &backends, 14).unwrap()[0].id,
+            "b"
+        );
+        assert!(pick_traffic_split_backends(&splits, &backends, 15).is_none());
+        assert!(pick_traffic_split_backends(&splits, &backends, 99).is_none());
+    }
+
+    #[test]
+    fn test_pick_traffic_split_backends_zero_weight_skipped() {
+        // A split with weight 0 must consume NO bucket range and not
+        // affect subsequent splits. This lets operators "disable" a
+        // split without deleting it (useful for staged rollout/rollback).
+        let splits = vec![split("a", 0, &["a"]), split("b", 30, &["b"])];
+        let backends = vec![
+            Some(vec![mk_backend_with_id("a")]),
+            Some(vec![mk_backend_with_id("b")]),
+        ];
+        assert_eq!(
+            pick_traffic_split_backends(&splits, &backends, 0).unwrap()[0].id,
+            "b"
+        );
+        assert_eq!(
+            pick_traffic_split_backends(&splits, &backends, 29).unwrap()[0].id,
+            "b"
+        );
+        assert!(pick_traffic_split_backends(&splits, &backends, 30).is_none());
+    }
+
+    #[test]
+    fn test_pick_traffic_split_backends_sum_over_100_clamped() {
+        // Operator typo: 60 + 60 = 120. The engine clamps at 100 so the
+        // second split's tail is effectively lost (buckets 0..=59 -> A,
+        // 60..=99 -> B). The API layer rejects this case at write-time;
+        // this test is the engine's defensive behaviour if a stale or
+        // externally-edited config slips through.
+        let splits = vec![split("a", 60, &["a"]), split("b", 60, &["b"])];
+        let backends = vec![
+            Some(vec![mk_backend_with_id("a")]),
+            Some(vec![mk_backend_with_id("b")]),
+        ];
+        assert_eq!(
+            pick_traffic_split_backends(&splits, &backends, 59).unwrap()[0].id,
+            "a"
+        );
+        assert_eq!(
+            pick_traffic_split_backends(&splits, &backends, 60).unwrap()[0].id,
+            "b"
+        );
+        assert_eq!(
+            pick_traffic_split_backends(&splits, &backends, 99).unwrap()[0].id,
+            "b"
+        );
+    }
+
+    #[test]
+    fn test_pick_traffic_split_backends_none_resolved_consumes_band() {
+        // A split whose backends all dangle normalises to `None` in
+        // `resolved` but keeps its declared weight band. Traffic in that
+        // band MUST fall back to route defaults (None), not steal the
+        // next split's bucket. Otherwise a typo would silently rebalance
+        // 20% of traffic to the wrong backend.
+        let splits = vec![split("broken", 20, &["does-not-exist"]), split("good", 20, &["g"])];
+        let backends: Vec<Option<Vec<Backend>>> =
+            vec![None, Some(vec![mk_backend_with_id("g")])];
+        assert!(pick_traffic_split_backends(&splits, &backends, 0).is_none());
+        assert!(pick_traffic_split_backends(&splits, &backends, 19).is_none());
+        assert_eq!(
+            pick_traffic_split_backends(&splits, &backends, 20).unwrap()[0].id,
+            "g"
+        );
+    }
+
+    #[test]
+    fn test_pick_traffic_split_backends_empty_list_yields_none() {
+        assert!(pick_traffic_split_backends(&[], &[], 0).is_none());
+        assert!(pick_traffic_split_backends(&[], &[], 99).is_none());
+    }
+
+    #[test]
+    fn test_from_store_traffic_splits_resolve_and_skip_broken() {
+        let mut route = make_route("rts", "example.com", "/", true);
+        route.traffic_splits = vec![
+            split("v2", 10, &["b-v2"]),
+            split("dangling", 5, &["missing"]), // all dangling -> None
+            split("v3", 5, &["b-v3a", "b-v3b"]),
+            split("zero", 0, &["b-v2"]),        // weight 0 -> None
+        ];
+
+        let b_default = make_backend("b-default", "10.0.0.1:80");
+        let b_v2 = make_backend("b-v2", "10.0.1.1:80");
+        let b_v3a = make_backend("b-v3a", "10.0.2.1:80");
+        let b_v3b = make_backend("b-v3b", "10.0.2.2:80");
+        let links = vec![("rts".into(), "b-default".into())];
+
+        let config = ProxyConfig::from_store(
+            vec![route],
+            vec![b_default, b_v2, b_v3a, b_v3b],
+            vec![],
+            links,
+            ProxyConfigGlobals::default(),
+        );
+        let entry = &config.routes_by_host.get("example.com").unwrap()[0];
+
+        assert_eq!(entry.traffic_split_backends[0].as_ref().unwrap().len(), 1);
+        assert!(
+            entry.traffic_split_backends[1].is_none(),
+            "all-dangling split must normalise to None"
+        );
+        assert_eq!(entry.traffic_split_backends[2].as_ref().unwrap().len(), 2);
+        assert!(
+            entry.traffic_split_backends[3].is_none(),
+            "zero-weight split stays None in resolved table"
+        );
+    }
+
+    #[test]
+    fn test_canary_bucket_distribution_roughly_uniform() {
+        // Sanity check: over 1000 distinct client IPs, a 20% split should
+        // grab roughly 20% of them. Tolerance is wide (±7%) because we
+        // use DefaultHasher and the sample is small; a bad hash (always
+        // returning the same bucket) would fail dramatically.
+        let splits = vec![split("canary", 20, &["canary"])];
+        let backends: Vec<Option<Vec<Backend>>> = vec![Some(vec![mk_backend_with_id("canary")])];
+        let mut hits = 0u32;
+        for i in 0..1000u32 {
+            let ip = format!("10.{}.{}.{}", (i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
+            let b = canary_bucket("r-dist", &ip);
+            if pick_traffic_split_backends(&splits, &backends, b).is_some() {
+                hits += 1;
+            }
+        }
+        let pct = hits as f64 / 1000.0 * 100.0;
+        assert!(
+            (13.0..=27.0).contains(&pct),
+            "20% split produced {pct:.1}% of hits, likely a hash distribution bug"
+        );
     }
 
     fn hmap(pairs: &[(&str, &str)]) -> http::HeaderMap {

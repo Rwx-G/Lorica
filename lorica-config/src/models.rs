@@ -327,6 +327,44 @@ impl HeaderRule {
     }
 }
 
+/// Canary traffic split: send `weight_percent` of a route's requests to
+/// a specific backend group, the rest fall through to the next split or
+/// (if cumulative weights < 100) to the route's default backends.
+///
+/// Splits are evaluated in cumulative order with buckets assigned by
+/// hashing the client IP together with the route ID:
+///
+/// ```text
+///   splits = [A: 5%, B: 10%]
+///   buckets = 0..=4 -> A, 5..=14 -> B, 15..=99 -> default
+/// ```
+///
+/// Using the client IP (not a per-request random) makes the assignment
+/// *sticky*: the same user stays on the same version across multiple
+/// requests on the same route. Mixing the route ID prevents an unlucky
+/// client from being in every service's canary bucket simultaneously
+/// (which would happen if we hashed the IP alone).
+///
+/// Requests with no client IP - e.g. Unix-socket listeners used in
+/// tests - skip the canary entirely and serve from the route defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TrafficSplit {
+    /// Human-readable label; surfaced in dashboards and access logs.
+    /// Optional but recommended so on-call can answer "which bucket?"
+    /// at a glance.
+    #[serde(default)]
+    pub name: String,
+    /// Percentage of eligible traffic that should hit this split.
+    /// Valid range 0..=100. 0 is allowed (rule kept but inactive -
+    /// useful while preparing a rollout).
+    pub weight_percent: u8,
+    /// Backends that serve this split. Must be non-empty for the split
+    /// to actually divert traffic; an empty list means "match but do
+    /// nothing" and is rejected by the API.
+    #[serde(default)]
+    pub backend_ids: Vec<String>,
+}
+
 // --- Security Header Presets ---
 
 /// A named collection of HTTP security headers that can be applied to routes.
@@ -521,6 +559,11 @@ pub struct Route {
     /// `backend_ids` overrides the header rule's selection.
     #[serde(default)]
     pub header_rules: Vec<HeaderRule>,
+    /// Canary traffic splits. Evaluated AFTER header rules (header rules
+    /// are explicit opt-in and should win) and BEFORE path rules (path
+    /// rules are URL-specific and should win).
+    #[serde(default)]
+    pub traffic_splits: Vec<TrafficSplit>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1467,6 +1510,7 @@ mod tests {
             error_page_html: None,
             cache_vary_headers: Vec::new(),
             header_rules: Vec::new(),
+            traffic_splits: Vec::new(),
             created_at: now,
             updated_at: now,
         };

@@ -69,6 +69,7 @@ mod tests {
             error_page_html: None,
             cache_vary_headers: vec![],
             header_rules: vec![],
+            traffic_splits: vec![],
             created_at: now,
             updated_at: now,
         }
@@ -1743,6 +1744,61 @@ cert_critical_days = 3
         store.update_route(&cleared).unwrap();
         let after_update = store.get_route(&route.id).unwrap().unwrap();
         assert!(after_update.header_rules.is_empty());
+    }
+
+    #[test]
+    fn test_traffic_splits_roundtrip() {
+        // Schema V27: traffic_splits persists as a JSON array. The column
+        // index for reads is 57 - this test pins both create/get paths
+        // and guards against a regression like the V25 cache_vary_headers
+        // one (SELECT drift between get_route and list_routes).
+        let store = ConfigStore::open_in_memory().unwrap();
+        let mut route = make_route();
+        route.traffic_splits = vec![
+            TrafficSplit {
+                name: "v2-canary".into(),
+                weight_percent: 5,
+                backend_ids: vec!["b-v2".into()],
+            },
+            TrafficSplit {
+                name: String::new(),
+                weight_percent: 0,
+                backend_ids: vec!["b-v3".into()],
+            },
+        ];
+        store.create_route(&route).unwrap();
+
+        let via_get = store.get_route(&route.id).unwrap().unwrap();
+        assert_eq!(via_get.traffic_splits.len(), 2);
+        assert_eq!(via_get.traffic_splits[0].name, "v2-canary");
+        assert_eq!(via_get.traffic_splits[0].weight_percent, 5);
+        assert_eq!(via_get.traffic_splits[0].backend_ids, vec!["b-v2".to_string()]);
+        assert_eq!(via_get.traffic_splits[1].weight_percent, 0);
+
+        let via_list: Vec<_> = store
+            .list_routes()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.id == route.id)
+            .collect();
+        assert_eq!(via_list.len(), 1);
+        assert_eq!(via_list[0].traffic_splits.len(), 2);
+
+        // Clear via update.
+        let mut cleared = via_get.clone();
+        cleared.traffic_splits.clear();
+        store.update_route(&cleared).unwrap();
+        let after = store.get_route(&route.id).unwrap().unwrap();
+        assert!(after.traffic_splits.is_empty());
+    }
+
+    #[test]
+    fn test_traffic_splits_default_empty() {
+        let store = ConfigStore::open_in_memory().unwrap();
+        let route = make_route();
+        store.create_route(&route).unwrap();
+        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        assert!(loaded.traffic_splits.is_empty());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest } from './api';
+import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest } from './api';
 
 export interface PathRuleFormState {
   path: string;
@@ -18,6 +18,12 @@ export interface HeaderRuleFormState {
   header_name: string;
   match_type: string;   // 'exact' | 'prefix' | 'regex'
   value: string;
+  backend_ids: string[];
+}
+
+export interface TrafficSplitFormState {
+  name: string;
+  weight_percent: number;
   backend_ids: string[];
 }
 
@@ -77,6 +83,7 @@ export interface RouteFormState {
   error_page_html: string;
   cache_vary_headers: string;
   header_rules: HeaderRuleFormState[];
+  traffic_splits: TrafficSplitFormState[];
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -135,6 +142,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   error_page_html: '',
   cache_vary_headers: '',
   header_rules: [],
+  traffic_splits: [],
 };
 
 // Tab field mappings for dot indicators
@@ -170,6 +178,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   ],
   path_rules: ['path_rules'],
   header_rules: ['header_rules'],
+  traffic_splits: ['traffic_splits'],
 };
 
 function recordToText(rec: Record<string, string>): string {
@@ -271,6 +280,11 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
       value: r.value,
       backend_ids: [...(r.backend_ids ?? [])],
     })),
+    traffic_splits: (route.traffic_splits ?? []).map((s) => ({
+      name: s.name ?? '',
+      weight_percent: s.weight_percent,
+      backend_ids: [...(s.backend_ids ?? [])],
+    })),
   };
 }
 
@@ -285,6 +299,22 @@ function headerRuleFormToRequest(rules: HeaderRuleFormState[]): HeaderRuleReques
       match_type: r.match_type,
       value: r.value,
       backend_ids: [...r.backend_ids],
+    }));
+}
+
+function trafficSplitFormToRequest(
+  splits: TrafficSplitFormState[],
+): TrafficSplitRequest[] | undefined {
+  if (splits.length === 0) return undefined;
+  // Drop splits with no backends AND zero weight (the "+ Add new" default
+  // before the operator fills anything in). A non-zero weight with empty
+  // backends is left intact so the API surfaces the validation error.
+  return splits
+    .filter((s) => !(s.backend_ids.length === 0 && s.weight_percent === 0))
+    .map((s) => ({
+      name: s.name.trim(),
+      weight_percent: s.weight_percent,
+      backend_ids: [...s.backend_ids],
     }));
 }
 
@@ -361,6 +391,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
       ? csvToArray(form.cache_vary_headers)
       : empty([]),
     header_rules: headerRuleFormToRequest(form.header_rules) ?? (isUpdate ? [] : undefined),
+    traffic_splits: trafficSplitFormToRequest(form.traffic_splits) ?? (isUpdate ? [] : undefined),
   };
 }
 
@@ -400,6 +431,10 @@ export function getModifiedFields(form: RouteFormState): Set<string> {
     }
     if (key === 'header_rules') {
       if (form.header_rules.length > 0) modified.add(key);
+      continue;
+    }
+    if (key === 'traffic_splits') {
+      if (form.traffic_splits.length > 0) modified.add(key);
       continue;
     }
     const defaultVal = ROUTE_DEFAULTS[key];
@@ -452,5 +487,20 @@ export function validateRouteForm(form: RouteFormState): string {
   if (allowErr) return `IP allowlist: ${allowErr}`;
   const denyErr = validateIpList(form.ip_denylist);
   if (denyErr) return `IP denylist: ${denyErr}`;
+  // Traffic splits: weights in range + cumulative <= 100. Catching this
+  // client-side gives an immediate red outline instead of a 400 round-trip.
+  let totalWeight = 0;
+  for (const s of form.traffic_splits) {
+    if (!Number.isInteger(s.weight_percent) || s.weight_percent < 0 || s.weight_percent > 100) {
+      return `Traffic split weight must be 0..100 (got ${s.weight_percent})`;
+    }
+    if (s.weight_percent > 0 && s.backend_ids.length === 0) {
+      return 'Traffic split with non-zero weight must select at least one backend';
+    }
+    totalWeight += s.weight_percent;
+  }
+  if (totalWeight > 100) {
+    return `Traffic splits: cumulative weight must be <= 100 (got ${totalWeight})`;
+  }
   return '';
 }
