@@ -28,6 +28,8 @@ members = [
     "lorica-bench",
 ]
 
+exclude = ["fuzz"]
+
 [workspace.dependencies]
 bstr = "1.12.0"
 tokio = "1"
