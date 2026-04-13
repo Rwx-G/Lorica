@@ -51,6 +51,12 @@ pub enum FdKind {
     Listener { addr: String },
     /// The anonymous memfd backing the `lorica_shmem::SharedRegion`.
     Shmem,
+    /// The worker's end of the dedicated pipelined-RPC socketpair
+    /// (separate from the legacy command channel). Used by the
+    /// `lorica_command::RpcEndpoint` to sync per-route token buckets,
+    /// verdict caches, and breaker state with the supervisor. See
+    /// `docs/architecture/worker-shared-state.md` § 4.
+    Rpc,
 }
 
 impl FdKind {
@@ -59,6 +65,7 @@ impl FdKind {
         match self {
             FdKind::Listener { addr } => format!("listener:{addr}"),
             FdKind::Shmem => "shmem".to_string(),
+            FdKind::Rpc => "rpc".to_string(),
         }
     }
 
@@ -66,6 +73,8 @@ impl FdKind {
     fn from_token(tok: &str) -> Result<Self, WorkerError> {
         if tok == "shmem" {
             Ok(FdKind::Shmem)
+        } else if tok == "rpc" {
+            Ok(FdKind::Rpc)
         } else if let Some(addr) = tok.strip_prefix("listener:") {
             Ok(FdKind::Listener {
                 addr: addr.to_string(),
@@ -183,7 +192,7 @@ pub fn recv_listener_fds(sock: RawFd) -> Result<Vec<(RawFd, String)>, WorkerErro
         .into_iter()
         .filter_map(|e| match e.kind {
             FdKind::Listener { addr } => Some((e.fd, addr)),
-            FdKind::Shmem => None,
+            FdKind::Shmem | FdKind::Rpc => None,
         })
         .collect())
 }
@@ -416,6 +425,7 @@ mod tests {
     fn test_fd_kind_token_roundtrip() {
         let cases = [
             FdKind::Shmem,
+            FdKind::Rpc,
             FdKind::Listener {
                 addr: "0.0.0.0:8080".to_string(),
             },

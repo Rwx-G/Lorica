@@ -1188,14 +1188,80 @@ pub struct LoricaProxy {
     /// because the mapping lives for the process lifetime.
     pub shmem: Option<&'static lorica_shmem::SharedRegion>,
     /// Per-route token-bucket rate limiters keyed by
-    /// `"{route_id}:{scope_key}"`. Created lazily on first request for
-    /// each key. Under multi-worker mode the buckets are per-process
-    /// (each worker has its own bucket), so the effective aggregate
-    /// admission rate is `N_workers * refill_per_sec`. The design
-    /// document's 100 ms cross-worker sync (§ 6) is a follow-up;
-    /// single-process deployments get exact semantics today.
-    pub rate_limit_buckets:
-        Arc<DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>>,
+    /// `"{route_id}|{scope_key}"`. In single-process mode each entry
+    /// is an [`lorica_limits::token_bucket::AuthoritativeBucket`]; in
+    /// worker mode each entry is a [`LocalBucket`] synced every 100 ms
+    /// with the supervisor via the pipelined RPC channel (see design
+    /// § 6). The [`RateLimitEngine`] enum hides the dispatch.
+    pub rate_limit_buckets: RateLimitEngine,
+}
+
+/// Per-route rate-limit engine: either the local authoritative state
+/// (single-process) or a CAS-based local cache synced with the
+/// supervisor (worker mode). `Clone` is cheap — the inner `DashMap` is
+/// wrapped in `Arc`.
+#[derive(Clone)]
+pub enum RateLimitEngine {
+    /// Owner of the bucket state lives in-process. Time-based refill
+    /// happens lazily inside each `try_consume` call.
+    Authoritative(Arc<DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>>),
+    /// Cache of buckets; supervisor holds the authoritative state. The
+    /// 100 ms sync task (see `spawn_rate_limit_sync`) drains delta
+    /// counters and refreshes token counts from the supervisor's reply.
+    Local(Arc<DashMap<String, Arc<lorica_limits::token_bucket::LocalBucket>>>),
+}
+
+impl RateLimitEngine {
+    /// Fresh single-process engine.
+    pub fn authoritative() -> Self {
+        Self::Authoritative(Arc::new(DashMap::new()))
+    }
+
+    /// Fresh worker-mode engine; caller is expected to spawn the
+    /// supervisor sync task.
+    pub fn local() -> Self {
+        Self::Local(Arc::new(DashMap::new()))
+    }
+
+    /// Attempt to consume `cost` tokens for the bucket keyed by `key`,
+    /// creating a fresh bucket on first-seen (seeded from `rl`). The
+    /// hot path is lock-free for the `Local` variant (CAS loop on a
+    /// single atomic); `Authoritative` takes the per-bucket mutex for
+    /// refill + drain.
+    pub fn try_consume(
+        &self,
+        key: &str,
+        rl: &lorica_config::models::RateLimit,
+        cost: u32,
+        now_ns: u64,
+    ) -> bool {
+        match self {
+            RateLimitEngine::Authoritative(map) => {
+                let bucket = map
+                    .entry(key.to_string())
+                    .or_insert_with(|| {
+                        Arc::new(
+                            lorica_limits::token_bucket::AuthoritativeBucket::new(
+                                rl.capacity,
+                                rl.refill_per_sec,
+                                now_ns,
+                            ),
+                        )
+                    })
+                    .clone();
+                bucket.try_consume(cost, now_ns)
+            }
+            RateLimitEngine::Local(map) => {
+                let bucket = map
+                    .entry(key.to_string())
+                    .or_insert_with(|| {
+                        Arc::new(lorica_limits::token_bucket::LocalBucket::new(rl.capacity))
+                    })
+                    .clone();
+                bucket.try_consume(cost)
+            }
+        }
+    }
 }
 
 impl LoricaProxy {
@@ -1229,7 +1295,7 @@ impl LoricaProxy {
             circuit_breaker: Arc::new(CircuitBreaker::new(5, 10)),
             basic_auth_cache: Arc::new(DashMap::new()),
             shmem: None,
-            rate_limit_buckets: Arc::new(DashMap::new()),
+            rate_limit_buckets: RateLimitEngine::authoritative(),
         }
     }
 
@@ -1274,7 +1340,7 @@ impl LoricaProxy {
         interval: Duration,
         idle_ttl: Duration,
     ) -> tokio::task::JoinHandle<()> {
-        let buckets = Arc::clone(&self.rate_limit_buckets);
+        let engine = self.rate_limit_buckets.clone();
         let idle_ttl_ns = idle_ttl.as_nanos() as u64;
         tracker.spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -1282,7 +1348,108 @@ impl LoricaProxy {
             loop {
                 ticker.tick().await;
                 let now = lorica_shmem::now_ns();
-                buckets.retain(|_, b| now.saturating_sub(b.last_activity_ns()) < idle_ttl_ns);
+                match &engine {
+                    RateLimitEngine::Authoritative(map) => {
+                        map.retain(|_, b| {
+                            now.saturating_sub(b.last_activity_ns()) < idle_ttl_ns
+                        });
+                    }
+                    RateLimitEngine::Local(_) => {
+                        // Worker mode: the supervisor sync task drops
+                        // entries via take_delta returning 0 — the local
+                        // cache is kept small by the sync loop walking
+                        // it. Eviction is supervisor-side (future
+                        // follow-up: forward idle-key hints from
+                        // supervisor). No-op here.
+                    }
+                }
+            }
+        })
+    }
+
+    /// Spawn a background task that syncs the worker-side `LocalBucket`
+    /// cache with the supervisor's authoritative bucket registry every
+    /// `interval`. Called on workers only (single-process mode uses
+    /// `RateLimitEngine::Authoritative`, no sync needed).
+    ///
+    /// Each tick the task walks every entry of the local map, pulls out
+    /// the accumulated `take_delta`, batches the non-zero entries into a
+    /// `RateLimitDelta` RPC payload, sends it to the supervisor, and on
+    /// the reply refreshes each bucket's token count with the
+    /// authoritative snapshot. See design § 6.
+    pub fn spawn_rate_limit_sync(
+        &self,
+        tracker: &tokio_util::task::TaskTracker,
+        rpc: lorica_command::RpcEndpoint,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let engine = self.rate_limit_buckets.clone();
+        tracker.spawn(async move {
+            let buckets = match engine {
+                RateLimitEngine::Local(map) => map,
+                RateLimitEngine::Authoritative(_) => {
+                    tracing::debug!(
+                        "rate-limit sync task launched on Authoritative engine; exiting"
+                    );
+                    return;
+                }
+            };
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate tick
+            loop {
+                ticker.tick().await;
+                // Phase 1: drain local deltas into a batched payload.
+                let mut entries: Vec<lorica_command::RateLimitEntry> = Vec::new();
+                for item in buckets.iter() {
+                    let consumed = item.value().take_delta();
+                    if consumed > 0 {
+                        entries.push(lorica_command::RateLimitEntry {
+                            key: item.key().clone(),
+                            consumed,
+                        });
+                    }
+                }
+                if entries.is_empty() {
+                    continue;
+                }
+                // Phase 2: push to the supervisor.
+                let payload = lorica_command::command::Payload::RateLimitDelta(
+                    lorica_command::RateLimitDelta {
+                        entries: entries.clone(),
+                    },
+                );
+                let resp = rpc
+                    .request_rpc(
+                        lorica_command::CommandType::RateLimitDelta,
+                        payload,
+                        Duration::from_millis(500),
+                    )
+                    .await;
+                match resp {
+                    Ok(resp) => match resp.payload {
+                        Some(lorica_command::response::Payload::RateLimitDeltaResult(r)) => {
+                            // Phase 3: refresh local buckets with the
+                            // authoritative snapshot.
+                            for snap in r.snapshots {
+                                if let Some(b) = buckets.get(&snap.key) {
+                                    b.value().refresh(snap.remaining);
+                                }
+                            }
+                        }
+                        _ => {
+                            tracing::debug!(
+                                "rate-limit sync: unexpected reply payload; buckets left stale"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            entries = entries.len(),
+                            "rate-limit sync: RPC failed; buckets left stale until next tick"
+                        );
+                    }
+                }
             }
         })
     }
@@ -2539,18 +2706,13 @@ impl ProxyHttp for LoricaProxy {
                     lorica_config::models::RateLimitScope::PerRoute => "__route__".to_string(),
                 };
                 let key = format!("{}|{}", entry.route.id, scope_key);
-                let bucket = self
-                    .rate_limit_buckets
-                    .entry(key)
-                    .or_insert_with(|| {
-                        Arc::new(lorica_limits::token_bucket::AuthoritativeBucket::new(
-                            rl.capacity,
-                            rl.refill_per_sec,
-                            lorica_shmem::now_ns(),
-                        ))
-                    })
-                    .clone();
-                if !bucket.try_consume(1, lorica_shmem::now_ns()) {
+                let admitted = self.rate_limit_buckets.try_consume(
+                    &key,
+                    rl,
+                    1,
+                    lorica_shmem::now_ns(),
+                );
+                if !admitted {
                     ctx.block_reason = Some("rate limited".to_string());
                     let mut header = lorica_http::ResponseHeader::build(429, None)?;
                     // Retry-After in seconds. For any configured refill

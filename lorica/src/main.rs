@@ -429,13 +429,22 @@ fn run_supervisor(cli: Cli) {
 
     // Extract raw FDs from worker handles before entering the tokio runtime.
     // CommandChannel::from_raw_fd requires a tokio runtime, so we take the raw FDs
-    // here and create channels inside block_on.
-    let worker_fds: Vec<(u32, i32, RawFd)> = manager
+    // here and create channels inside block_on. Each worker has two channels:
+    // the legacy `cmd` socketpair (for Heartbeat/ConfigReload/BanIp/Shutdown)
+    // and the pipelined `rpc` socketpair (for WPAR-1 token-bucket sync and
+    // future WPAR RPCs).
+    let worker_fds: Vec<(u32, i32, RawFd, RawFd)> = manager
         .workers_mut()
         .iter_mut()
         .filter_map(|w| {
-            let fd = w.take_cmd_fd()?;
-            Some((w.id(), w.pid().as_raw(), fd.into_raw_fd()))
+            let cmd = w.take_cmd_fd()?;
+            let rpc = w.take_rpc_fd()?;
+            Some((
+                w.id(),
+                w.pid().as_raw(),
+                cmd.into_raw_fd(),
+                rpc.into_raw_fd(),
+            ))
         })
         .collect();
 
@@ -600,9 +609,18 @@ fn run_supervisor(cli: Cli) {
         let worker_task_handles: Arc<parking_lot::Mutex<std::collections::HashMap<u32, tokio::task::JoinHandle<()>>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+        // Cross-worker authoritative token-bucket registry. Every
+        // `RateLimitDelta` RPC from a worker drains its consumption into
+        // the `AuthoritativeBucket` keyed here, then replies with the
+        // current token count for each key so the worker can refresh its
+        // local cache. See docs/architecture/worker-shared-state.md § 6.
+        let rl_registry: Arc<
+            dashmap::DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>,
+        > = Arc::new(dashmap::DashMap::new());
+
         // Spawn a per-worker task that handles both config reload and heartbeat
         // No shared Mutex - each worker has its own channel and task
-        for (worker_id, worker_pid, raw_fd) in worker_fds {
+        for (worker_id, worker_pid, raw_fd, rpc_raw_fd) in worker_fds {
             // SAFETY: raw_fd is a valid file descriptor from the socketpair
             // created by WorkerManager::spawn_workers(), passed to this task
             // immediately after fork. The fd is exclusively owned by this task.
@@ -618,6 +636,58 @@ fn run_supervisor(cli: Cli) {
             let hb_seq = Arc::clone(&sequence);
             let hb_metrics = Arc::clone(&worker_metrics);
             let agg_metrics = Arc::clone(&aggregated_metrics);
+
+            // Pipelined RPC channel task: consumes the per-worker
+            // RpcEndpoint stream and handles `RateLimitDelta` by applying
+            // each entry to the authoritative bucket registry. Spawned
+            // alongside the legacy channel task; dies with the worker.
+            {
+                let rpc_fd = rpc_raw_fd;
+                let registry = Arc::clone(&rl_registry);
+                let store_for_rpc = Arc::clone(&store);
+                tokio::spawn(async move {
+                    // SAFETY: rpc_fd is a valid socketpair end from
+                    // WorkerManager::spawn_worker, exclusively owned by
+                    // this task.
+                    let (_endpoint, mut incoming) = match unsafe {
+                        lorica_command::RpcEndpoint::from_raw_fd(rpc_fd)
+                    } {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            error!(
+                                worker_id,
+                                error = %e,
+                                "failed to create supervisor RpcEndpoint"
+                            );
+                            return;
+                        }
+                    };
+                    while let Some(inc) = incoming.recv().await {
+                        match inc.command_type() {
+                            lorica_command::CommandType::RateLimitDelta => {
+                                handle_rate_limit_delta(
+                                    inc,
+                                    &registry,
+                                    &store_for_rpc,
+                                    worker_id,
+                                )
+                                .await;
+                            }
+                            other => {
+                                tracing::debug!(
+                                    worker_id,
+                                    command_type = ?other,
+                                    "supervisor RPC: ignoring command (no handler)"
+                                );
+                                let _ = inc
+                                    .reply_error("no handler registered for this command")
+                                    .await;
+                            }
+                        }
+                    }
+                    tracing::debug!(worker_id, "supervisor RPC loop exiting");
+                });
+            }
 
             let handle = tokio::spawn(async move {
                 let heartbeat_interval = Duration::from_secs(5);
@@ -1308,6 +1378,99 @@ fn run_supervisor(cli: Cli) {
     });
 }
 
+/// Supervisor-side handler for `CommandType::RateLimitDelta`. Walks the
+/// batched entries, applies each consumption to the authoritative
+/// bucket for `{route_id}|{scope_key}`, and replies with a
+/// `RateLimitDeltaResult` carrying the current token count per key
+/// so the worker can refresh its local cache.
+///
+/// The `{route_id}|{scope_key}` key format is assembled by the worker
+/// in `proxy_wiring.rs`; the supervisor only splits it to look up the
+/// route config once per first-seen key (for capacity + refill rate).
+async fn handle_rate_limit_delta(
+    inc: lorica_command::IncomingCommand,
+    registry: &dashmap::DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>,
+    store: &Arc<Mutex<lorica_config::ConfigStore>>,
+    worker_id: u32,
+) {
+    use lorica_command::{command, response, RateLimitDeltaResult, RateLimitSnapshot};
+
+    let delta = match inc.command().payload.clone() {
+        Some(command::Payload::RateLimitDelta(d)) => d,
+        _ => {
+            let _ = inc.reply_error("malformed RateLimitDelta payload").await;
+            return;
+        }
+    };
+    if delta.entries.is_empty() {
+        let _ = inc
+            .reply(lorica_command::Response::ok_with(
+                0,
+                response::Payload::RateLimitDeltaResult(RateLimitDeltaResult {
+                    snapshots: Vec::new(),
+                }),
+            ))
+            .await;
+        return;
+    }
+    let now_ns = lorica_shmem::now_ns();
+    let mut snapshots = Vec::with_capacity(delta.entries.len());
+    for entry in &delta.entries {
+        // Key shape: "{route_id}|{scope_key}". Peel off the route id to
+        // fetch capacity/refill for a first-seen key.
+        let route_id = entry.key.split('|').next().unwrap_or("");
+        let bucket = match registry.get(&entry.key) {
+            Some(b) => Arc::clone(b.value()),
+            None => {
+                // Lookup route config to seed the authoritative bucket.
+                // A missing or unlimited route means any contribution
+                // the worker sent is a no-op (the worker's own
+                // LocalBucket should not have existed in the first
+                // place, but we handle it defensively).
+                let rl_cfg = {
+                    let s = store.lock().await;
+                    s.get_route(route_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|r| r.rate_limit.clone())
+                };
+                let Some(rl) = rl_cfg else {
+                    tracing::debug!(
+                        worker_id,
+                        key = %entry.key,
+                        "RateLimitDelta for route with no rate_limit; ignoring"
+                    );
+                    snapshots.push(RateLimitSnapshot {
+                        key: entry.key.clone(),
+                        remaining: 0,
+                    });
+                    continue;
+                };
+                let new = Arc::new(lorica_limits::token_bucket::AuthoritativeBucket::new(
+                    rl.capacity,
+                    rl.refill_per_sec,
+                    now_ns,
+                ));
+                let entry_ref = registry
+                    .entry(entry.key.clone())
+                    .or_insert_with(|| new.clone());
+                Arc::clone(entry_ref.value())
+            }
+        };
+        let remaining = bucket.apply_delta(entry.consumed, now_ns);
+        snapshots.push(RateLimitSnapshot {
+            key: entry.key.clone(),
+            remaining,
+        });
+    }
+    let _ = inc
+        .reply(lorica_command::Response::ok_with(
+            0,
+            response::Payload::RateLimitDeltaResult(RateLimitDeltaResult { snapshots }),
+        ))
+        .await;
+}
+
 // ---------------------------------------------------------------------------
 // Worker mode (Unix only): receives FDs from supervisor, runs proxy engine
 // ---------------------------------------------------------------------------
@@ -1339,6 +1502,7 @@ fn run_worker(
     let mut fds = Fds::new();
     let mut listener_addrs: Vec<String> = Vec::new();
     let mut shmem_region: Option<&'static lorica_shmem::SharedRegion> = None;
+    let mut rpc_fd: Option<i32> = None;
     let mut listener_count = 0usize;
     for entry in entries {
         match entry.kind {
@@ -1360,6 +1524,10 @@ fn run_worker(
                     }
                 }
             }
+            fd_passing::FdKind::Rpc => {
+                rpc_fd = Some(entry.fd);
+                info!(worker_id = id, fd = entry.fd, "adopted RPC channel FD");
+            }
         }
     }
 
@@ -1367,6 +1535,7 @@ fn run_worker(
         worker_id = id,
         listener_count,
         shmem = shmem_region.is_some(),
+        rpc = rpc_fd.is_some(),
         "received worker FDs"
     );
 
@@ -1874,6 +2043,10 @@ fn run_worker(
     lorica_proxy.waf_counts = worker_waf_counts;
     lorica_proxy.waf_engine = waf_engine;
     lorica_proxy.shmem = shmem_region;
+    // Worker mode: rate-limit engine runs as a local cache synced with
+    // the supervisor via the pipelined RPC channel every 100 ms. See
+    // `spawn_rate_limit_sync` below and design doc § 6.
+    lorica_proxy.rate_limit_buckets = lorica::proxy_wiring::RateLimitEngine::local();
     // Periodic basic-auth cache prune (PERF-8). Worker mode has no
     // supervisor TaskTracker available here; a local tracker is fine
     // because worker shutdown is orchestrated by the supervisor via
@@ -1890,6 +2063,44 @@ fn run_worker(
         Duration::from_secs(60),
         Duration::from_secs(5 * 60),
     );
+    // Spawn the cross-worker sync task when the supervisor provided
+    // an RPC socketpair (production worker mode). The task drains
+    // `LocalBucket::take_delta` every 100 ms, pushes the batch via
+    // `RateLimitDelta`, and refreshes each bucket with the
+    // authoritative snapshot from the reply.
+    if let Some(fd) = rpc_fd {
+        // SAFETY: fd is a valid socketpair end received via SCM_RIGHTS
+        // from the supervisor and exclusively owned by this worker.
+        match unsafe { lorica_command::RpcEndpoint::from_raw_fd(fd) } {
+            Ok((endpoint, _incoming)) => {
+                // We do not currently serve supervisor-initiated
+                // commands on this channel; drop the receiver to let
+                // the reader task exit cleanly if the supervisor ever
+                // sends one (it will see the channel closed).
+                let _sync_handle = lorica_proxy.spawn_rate_limit_sync(
+                    &worker_auth_prune_tracker,
+                    endpoint,
+                    Duration::from_millis(100),
+                );
+                info!(worker_id = id, "rate-limit sync task spawned");
+            }
+            Err(e) => {
+                error!(
+                    worker_id = id,
+                    error = %e,
+                    "failed to create worker RpcEndpoint; rate-limit sync disabled"
+                );
+            }
+        }
+    } else if shmem_region.is_some() {
+        // Worker mode without RPC FD: should not happen in current
+        // `WorkerManager::spawn_worker` which always sends one. Log
+        // loudly so the misconfiguration surfaces.
+        warn!(
+            worker_id = id,
+            "worker started with shmem but no RPC FD; rate-limit sync disabled"
+        );
+    }
     // Open a LogStore so the worker can persist WAF events directly (with
     // route_hostname and action stamped). SQLite WAL mode allows concurrent
     // writes from multiple worker processes.

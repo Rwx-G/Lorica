@@ -83,9 +83,16 @@ pub enum WorkerEvent {
 pub struct WorkerHandle {
     id: u32,
     pid: Pid,
-    /// Supervisor end of the command channel socketpair.
-    /// `None` after the FD has been taken via [`take_cmd_fd`].
+    /// Supervisor end of the legacy command channel socketpair (bare
+    /// `Command`/`Response` framing used for Heartbeat/ConfigReload/
+    /// Shutdown/MetricsRequest/BanIp). `None` after the FD has been
+    /// taken via [`take_cmd_fd`].
     cmd_fd: Option<OwnedFd>,
+    /// Supervisor end of the pipelined RPC channel (Envelope framing,
+    /// driven by `lorica_command::RpcEndpoint`). Used for per-route
+    /// token-bucket sync, verdict cache, breaker state, etc. `None`
+    /// after the FD has been taken via [`take_rpc_fd`].
+    rpc_fd: Option<OwnedFd>,
     /// When this worker was last spawned (for backoff calculation).
     spawned_at: Instant,
     /// Consecutive restart count (resets after stable run).
@@ -103,10 +110,16 @@ impl WorkerHandle {
         self.pid
     }
 
-    /// Take ownership of the command channel FD.
+    /// Take ownership of the legacy command channel FD.
     /// Returns `None` if already taken.
     pub fn take_cmd_fd(&mut self) -> Option<OwnedFd> {
         self.cmd_fd.take()
+    }
+
+    /// Take ownership of the pipelined RPC channel FD.
+    /// Returns `None` if already taken.
+    pub fn take_rpc_fd(&mut self) -> Option<OwnedFd> {
+        self.rpc_fd.take()
     }
 }
 
@@ -192,12 +205,16 @@ impl WorkerManager {
 
     /// Fork+exec a single worker process and send it the listening FDs.
     fn spawn_worker(&mut self, id: u32, restart_count: u32) -> Result<(), WorkerError> {
-        let (supervisor_fd, worker_fd) = fd_passing::create_socketpair()?;
+        // Two socketpairs per worker: the legacy `cmd` channel and the
+        // new pipelined `rpc` channel. Each side retains one end.
+        let (supervisor_cmd, worker_cmd) = fd_passing::create_socketpair()?;
+        let (supervisor_rpc, worker_rpc) = fd_passing::create_socketpair()?;
 
         match unsafe { fork() }.map_err(WorkerError::Fork)? {
             ForkResult::Parent { child } => {
-                // Parent: close worker end, send FDs, record handle
-                drop(worker_fd);
+                // Parent: close worker ends, send FDs (both listener + the
+                // worker's RPC end) via SCM_RIGHTS, record handle.
+                drop(worker_cmd);
 
                 let mut entries: Vec<FdEntry> = Vec::new();
                 if let Some(fd) = self.shmem_fd {
@@ -206,20 +223,28 @@ impl WorkerManager {
                         kind: FdKind::Shmem,
                     });
                 }
+                entries.push(FdEntry {
+                    fd: worker_rpc.as_raw_fd(),
+                    kind: FdKind::Rpc,
+                });
                 for (fd, addr) in self.listen_fds.iter().zip(&self.listen_addrs) {
                     entries.push(FdEntry {
                         fd: *fd,
                         kind: FdKind::Listener { addr: addr.clone() },
                     });
                 }
-                fd_passing::send_worker_fds(supervisor_fd.as_raw_fd(), &entries)?;
+                fd_passing::send_worker_fds(supervisor_cmd.as_raw_fd(), &entries)?;
+                // Supervisor no longer needs its copy of the worker's RPC
+                // FD — it was duplicated into the worker's table via SCM_RIGHTS.
+                drop(worker_rpc);
 
                 info!(worker_id = id, pid = child.as_raw(), "worker spawned");
 
                 self.workers.push(WorkerHandle {
                     id,
                     pid: child,
-                    cmd_fd: Some(supervisor_fd),
+                    cmd_fd: Some(supervisor_cmd),
+                    rpc_fd: Some(supervisor_rpc),
                     spawned_at: Instant::now(),
                     restart_count,
                 });
@@ -227,11 +252,16 @@ impl WorkerManager {
                 Ok(())
             }
             ForkResult::Child => {
-                // Child: close supervisor end, prepare for exec
-                drop(supervisor_fd);
+                // Child: close supervisor ends, prepare for exec. The worker's
+                // RPC FD is received via SCM_RIGHTS (inside `recv_worker_fds`),
+                // so the direct `worker_rpc` handle here is redundant — drop it
+                // so the child's fd table stays clean.
+                drop(supervisor_cmd);
+                drop(supervisor_rpc);
+                drop(worker_rpc);
 
                 // Clear CLOEXEC on the worker socketpair FD so it survives exec
-                let cmd_fd_raw = worker_fd.into_raw_fd();
+                let cmd_fd_raw = worker_cmd.into_raw_fd();
                 fd_passing::clear_cloexec(cmd_fd_raw)?;
 
                 // Build exec arguments
