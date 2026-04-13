@@ -23,6 +23,27 @@ pub struct Session {
 }
 
 /// Session store backed by SQLite with an in-memory cache for fast lookups.
+///
+/// # Consistency model
+///
+/// **Source of truth:** SQLite (`sessions` table). The in-memory
+/// `HashMap` is a cache rebuilt on startup from `load_all_sessions`.
+///
+/// **Writes:** `set()` mutates the cache synchronously (under the
+/// mutex) and spawns a blocking task to persist to SQLite. The HTTP
+/// response is returned as soon as the cache is updated; SQLite catches
+/// up asynchronously. A crash between the two writes can forget a
+/// session that the client has already received a cookie for - the
+/// next request will be unauthenticated and the user re-logs in. An
+/// accepted trade-off for login latency vs durability on a crash.
+///
+/// **Deletes:** `remove()` is async; the cache and SQLite are updated
+/// in the same task. A failed SQLite delete leaves the row dangling
+/// until the next startup rebuild filters it out by `expires_at`.
+///
+/// **Worker mode:** The supervisor owns the only `SessionStore`. Workers
+/// never read/write sessions; authentication happens in the supervisor
+/// and upstream requests carry no session state. See Epic 2 notes.
 #[derive(Clone)]
 pub struct SessionStore {
     pub(crate) sessions: Arc<Mutex<HashMap<String, Session>>>,

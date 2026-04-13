@@ -277,7 +277,7 @@
               <td>{b.name || '-'}</td>
               <td>{b.group_name || '-'}</td>
               <td class="mono">{b.address}</td>
-              <td><StatusBadge status={b.health_status} /></td>
+              <td><StatusBadge status={b.health_status as 'healthy' | 'degraded' | 'down' | 'unknown'} /></td>
               <td>{b.weight}</td>
               <td>
                 {#if b.health_check_enabled}
@@ -346,7 +346,7 @@
 
         <div class="form-group">
           <label>Address <span class="required">*</span></label>
-          <input type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" pattern="^[a-zA-Z0-9._-]+:\d{1,5}$" onblur={handleAddressBlur} />
+          <input type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" pattern={'^[a-zA-Z0-9._-]+:\\d{1,5}$'} onblur={handleAddressBlur} />
           {#if addressError}
             <span class="field-error">{addressError}</span>
           {/if}

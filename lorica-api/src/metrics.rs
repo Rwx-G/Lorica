@@ -335,6 +335,30 @@ pub fn inc_forward_auth_cache(route_id: &str, outcome: &str) {
         .inc();
 }
 
+/// Counter: notification events dropped by the bounded broadcast
+/// channel, labeled by drop reason (`lag` = subscriber fell behind,
+/// `closed` = channel closed). Bounded-cardinality: only two labels.
+static NOTIFIER_EVENTS_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "notifier_events_dropped_total",
+            "Alert events dropped by the notifier broadcast channel (reason=lag|closed)"
+        )
+        .namespace("lorica"),
+        &["reason"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one or more dropped notification events.
+pub fn inc_notifier_events_dropped(reason: &str, count: u64) {
+    NOTIFIER_EVENTS_DROPPED_TOTAL
+        .with_label_values(&[reason])
+        .inc_by(count);
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,

@@ -1,3 +1,14 @@
+//! Route CRUD HTTP handlers.
+//!
+//! **Validation split:** this module performs *type-shape* validation
+//! (enum parsing, range checks, field format like `host:port`, regex
+//! compilability) on the request body before handing off to the store
+//! layer. *Business-rule* validation (hostname uniqueness across routes,
+//! cross-field invariants that require the full DB view, encryption of
+//! sensitive fields) lives in `lorica-config::store`. The split keeps
+//! the API layer free of storage concerns and lets the store stay the
+//! single source of truth for rules that depend on existing rows.
+
 use std::collections::HashMap;
 
 use axum::extract::{Extension, Path};

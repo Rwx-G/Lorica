@@ -118,7 +118,9 @@ impl DnsProviderConfig {
                 )));
             }
         };
-        Ok(serde_json::to_string(&config).unwrap_or_default())
+        serde_json::to_string(&config).map_err(|e| {
+            ApiError::Internal(format!("failed to serialize DNS provider config: {e}"))
+        })
     }
 }
 

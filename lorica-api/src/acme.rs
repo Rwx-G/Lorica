@@ -39,6 +39,25 @@ use crate::server::AppState;
 /// Maps token -> key_authorization for /.well-known/acme-challenge/{token}.
 /// Uses SQLite so challenges are accessible across forked worker processes
 /// (workers share the same database file).
+///
+/// # Consistency model
+///
+/// **Source of truth:** SQLite (`acme_challenges` table). The in-memory
+/// `RwLock<HashMap>` is a supervisor-local read cache. Workers bypass the
+/// cache and hit SQLite directly on `/.well-known/acme-challenge/{token}`
+/// because they do not share the supervisor's memory.
+///
+/// **Writes:** `insert()` writes to SQLite first, then updates the cache
+/// on success. A crash between the two leaves SQLite with a valid
+/// challenge that the cache does not know about - the next lookup falls
+/// back to SQLite anyway, so the challenge still resolves.
+///
+/// **Deletes:** challenges are short-lived (ACME validates within
+/// seconds). Entries that outlive their useful life are purged on the
+/// provisioning path after the CA confirms success.
+///
+/// **Worker visibility:** updates made by the supervisor are visible to
+/// workers via SQLite (WAL mode), no IPC required.
 #[derive(Debug, Clone)]
 pub struct AcmeChallengeStore {
     /// In-memory cache for fast lookups in the supervisor process.
@@ -972,7 +991,10 @@ impl DnsChallenger for CloudflareDnsChallenger {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             return Err(format!("Cloudflare API returned {status}: {body}"));
         }
 
@@ -1002,7 +1024,10 @@ impl DnsChallenger for CloudflareDnsChallenger {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             return Err(format!("Cloudflare API delete returned {status}: {body}"));
         }
 
@@ -1106,15 +1131,13 @@ impl DnsChallenger for Route53DnsChallenger {
     }
 
     async fn delete_txt_record(&self, domain: &str) -> Result<(), String> {
-        let value = self
-            .created_values
-            .lock()
-            .remove(domain)
-            .unwrap_or_default();
-        if value.is_empty() {
-            warn!(domain = %domain, "Route53 delete: no tracked value, skipping");
-            return Ok(());
-        }
+        let value = match self.created_values.lock().remove(domain) {
+            Some(v) => v,
+            None => {
+                warn!(domain = %domain, "Route53 delete: no tracked value, skipping");
+                return Ok(());
+            }
+        };
         self.change_record(aws_sdk_route53::types::ChangeAction::Delete, domain, &value)
             .await?;
         info!(domain = %domain, "Route53 DNS TXT record deleted");
@@ -1208,9 +1231,11 @@ impl OvhDnsChallenger {
         body: Option<&serde_json::Value>,
     ) -> Result<reqwest::Response, String> {
         let url = format!("https://{}/1.0{}", self.endpoint, path);
-        let body_str = body
-            .map(|b| serde_json::to_string(b).unwrap_or_default())
-            .unwrap_or_default();
+        let body_str = match body {
+            Some(b) => serde_json::to_string(b)
+                .map_err(|e| format!("OVH: failed to serialize request body: {e}"))?,
+            None => String::new(),
+        };
         let timestamp = self.get_server_time().await?;
         let signature = self.sign(method.as_str(), &url, &body_str, timestamp);
 
@@ -1238,7 +1263,10 @@ impl OvhDnsChallenger {
         let resp = self.ovh_request(reqwest::Method::POST, &path, None).await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             return Err(format!("OVH zone refresh returned {status}: {body}"));
         }
         Ok(())
@@ -1300,7 +1328,10 @@ impl DnsChallenger for OvhDnsChallenger {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             return Err(format!("OVH delete TXT returned {status}: {body}"));
         }
 
@@ -1327,7 +1358,10 @@ pub async fn build_dns_challenger(
             Route53DnsChallenger::new(
                 config.zone_id.clone(),
                 config.api_token.clone(),
-                config.api_secret.clone().unwrap_or_default(),
+                config
+                    .api_secret
+                    .clone()
+                    .expect("validate() ensures api_secret is Some for route53"),
             )
             .await,
         )),
@@ -1339,8 +1373,14 @@ pub async fn build_dns_challenger(
                 .clone()
                 .unwrap_or_else(|| "eu.api.ovh.com".to_string()),
             config.api_token.clone(),
-            config.api_secret.clone().unwrap_or_default(),
-            config.ovh_consumer_key.clone().unwrap_or_default(),
+            config
+                .api_secret
+                .clone()
+                .expect("validate() ensures api_secret is Some for ovh"),
+            config
+                .ovh_consumer_key
+                .clone()
+                .expect("validate() ensures ovh_consumer_key is Some for ovh"),
         ))),
         other => Err(format!("unsupported DNS provider: {other}")),
     }
@@ -2191,7 +2231,7 @@ mod tests {
     use super::*;
 
     fn temp_challenge_store() -> AcmeChallengeStore {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir available for test");
         let db_path = dir.keep().join("test-acme.db");
         AcmeChallengeStore::with_db_path(db_path)
     }
@@ -2442,7 +2482,9 @@ mod tests {
         assert!(store.contains_key("example.com"));
         assert!(!store.contains_key("other.com"));
 
-        let (_, pending) = store.remove("example.com").unwrap();
+        let (_, pending) = store
+            .remove("example.com")
+            .expect("challenge was just inserted for example.com");
         assert_eq!(pending.txt_records[0].1, "abc123");
         assert_eq!(pending.challenge_urls[0], "https://acme.example/chall/1");
         assert!(pending.staging);
@@ -2480,7 +2522,9 @@ mod tests {
             },
         );
 
-        let (_, pending) = store.remove("example.com").unwrap();
+        let (_, pending) = store
+            .remove("example.com")
+            .expect("multi-domain challenge was inserted for example.com");
         assert_eq!(pending.domains.len(), 2);
         assert_eq!(pending.challenge_urls.len(), 2);
         assert_eq!(pending.txt_records.len(), 2);
@@ -2532,7 +2576,8 @@ mod tests {
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
-        let store = lorica_config::ConfigStore::open_in_memory().unwrap();
+        let store = lorica_config::ConfigStore::open_in_memory()
+            .expect("in-memory ConfigStore should open");
 
         // Set warning=14, critical=3
         let settings = GlobalSettings {
@@ -2540,7 +2585,9 @@ mod tests {
             cert_critical_days: 3,
             ..GlobalSettings::default()
         };
-        store.update_global_settings(&settings).unwrap();
+        store
+            .update_global_settings(&settings)
+            .expect("update_global_settings should succeed on fresh store");
 
         let now = chrono::Utc::now();
 
@@ -2601,9 +2648,15 @@ mod tests {
             acme_dns_provider_id: None,
         };
 
-        store.create_certificate(&warning_cert).unwrap();
-        store.create_certificate(&critical_cert).unwrap();
-        store.create_certificate(&safe_cert).unwrap();
+        store
+            .create_certificate(&warning_cert)
+            .expect("create warning_cert should succeed");
+        store
+            .create_certificate(&critical_cert)
+            .expect("create critical_cert should succeed");
+        store
+            .create_certificate(&safe_cert)
+            .expect("create safe_cert should succeed");
 
         let state = crate::server::AppState {
             store: Arc::new(Mutex::new(store)),

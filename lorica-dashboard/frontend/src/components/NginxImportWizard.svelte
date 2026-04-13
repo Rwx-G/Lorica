@@ -23,9 +23,9 @@
   // Wizard state
   let step = $state(1);
   let configText = $state('');
-  let parseResult: NginxParseResult | null = $state(null);
-  let importRoutes: LoricaRouteImport[] = $state([]);
-  let existingBackends: BackendResponse[] = $state([]);
+  let parseResult = $state<NginxParseResult | null>(null);
+  let importRoutes = $state<LoricaRouteImport[]>([]);
+  let existingBackends = $state<BackendResponse[]>([]);
 
   // Step 2: backend coherence
   interface BackendCheck {
@@ -392,7 +392,7 @@
 
   // Format a route field value for display
   function formatFieldValue(route: LoricaRouteImport, field: string): string {
-    const val = (route as Record<string, unknown>)[field];
+    const val = (route as unknown as Record<string, unknown>)[field];
     if (val === null || val === undefined) return '-';
     if (typeof val === 'boolean') return val ? 'Yes' : 'No';
     if (field === 'path_rules' && Array.isArray(val)) {

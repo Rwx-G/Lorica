@@ -2271,8 +2271,12 @@ fn spawn_persisted_alert_dispatcher(
                         dropped = n,
                         "alert dispatcher lagged, some notifications were dropped"
                     );
+                    lorica_api::metrics::inc_notifier_events_dropped("lag", n);
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    lorica_api::metrics::inc_notifier_events_dropped("closed", 1);
+                    break;
+                }
             }
         }
     })

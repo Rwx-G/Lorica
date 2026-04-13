@@ -496,7 +496,8 @@ impl LogStore {
         event: &lorica_notify::AlertEvent,
     ) -> Result<(), String> {
         let conn = self.conn.lock();
-        let details_json = serde_json::to_string(&event.details).unwrap_or_default();
+        let details_json = serde_json::to_string(&event.details)
+            .map_err(|e| format!("failed to serialize alert event details: {e}"))?;
         conn.execute(
             "INSERT INTO notification_history (alert_type, summary, details, timestamp)
              VALUES (?1, ?2, ?3, ?4)",
@@ -539,8 +540,19 @@ impl LogStore {
             let alert_type = alert_type_str
                 .parse()
                 .unwrap_or(lorica_notify::events::AlertType::ConfigChanged);
+            // Stored details JSON should always be parseable (written
+            // via serde_json::to_string in insert_notification_event).
+            // A parse failure at read time means storage corruption;
+            // surface it as an empty map + warn so the alert history
+            // stays viewable rather than blowing up the whole query.
             let details: std::collections::HashMap<String, String> =
-                serde_json::from_str(&details_json).unwrap_or_default();
+                serde_json::from_str(&details_json).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "notification history row has corrupt details JSON; returning empty map"
+                    );
+                    std::collections::HashMap::new()
+                });
             events.push(lorica_notify::AlertEvent {
                 alert_type,
                 summary,

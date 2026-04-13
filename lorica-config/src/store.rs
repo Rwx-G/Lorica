@@ -1,3 +1,13 @@
+//! SQLite-backed configuration store.
+//!
+//! **Validation split:** type-shape validation (enum parsing, range
+//! checks, regex compilability, `host:port` format) happens at the API
+//! boundary in `lorica-api::routes`. This module owns *business-rule*
+//! validation: hostname uniqueness across routes, invariants that
+//! need a DB read to evaluate, and any rule that must stay consistent
+//! with the existing persisted state. JSON (de)serialization of the
+//! column-typed fields lives here too (see `serialize_field` below).
+
 use std::path::Path;
 use std::str::FromStr;
 
@@ -10,6 +20,27 @@ use uuid::Uuid;
 use crate::crypto::EncryptionKey;
 use crate::error::{ConfigError, Result};
 use crate::models::*;
+
+/// Serialize a route/config field to JSON, mapping any error to a
+/// `ConfigError::Validation` that names the offending field. Used by
+/// `create_route` / `update_route` to dedupe ~60 lines of repeated
+/// `map_err` closures and to give operators a clear "which field"
+/// rather than a generic serde error.
+fn serialize_field<T: serde::Serialize + ?Sized>(name: &str, val: &T) -> Result<String> {
+    serde_json::to_string(val).map_err(|e| ConfigError::Validation(format!("invalid {name}: {e}")))
+}
+
+/// Optional variant: `None` passes through unchanged, `Some(_)` is
+/// serialized via `serialize_field`.
+fn serialize_optional_field<T: serde::Serialize>(
+    name: &str,
+    val: Option<&T>,
+) -> Result<Option<String>> {
+    match val {
+        Some(v) => serialize_field(name, v).map(Some),
+        None => Ok(None),
+    }
+}
 
 const MIGRATION_V1: &str = include_str!("migrations/001_initial.sql");
 const MIGRATION_V2: &str = include_str!("migrations/002_add_health_check_path.sql");
@@ -547,64 +578,31 @@ impl ConfigStore {
     pub fn create_route(&self, route: &Route) -> Result<()> {
         self.validate_hostname_uniqueness(&route.id, &route.hostname, &route.hostname_aliases)?;
 
-        let hostname_aliases_json = serde_json::to_string(&route.hostname_aliases)
-            .map_err(|e| ConfigError::Validation(format!("invalid hostname_aliases: {e}")))?;
-        let proxy_headers_json = serde_json::to_string(&route.proxy_headers)
-            .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers: {e}")))?;
-        let response_headers_json = serde_json::to_string(&route.response_headers)
-            .map_err(|e| ConfigError::Validation(format!("invalid response_headers: {e}")))?;
-        let proxy_headers_remove_json = serde_json::to_string(&route.proxy_headers_remove)
-            .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers_remove: {e}")))?;
-        let response_headers_remove_json = serde_json::to_string(&route.response_headers_remove)
-            .map_err(|e| {
-                ConfigError::Validation(format!("invalid response_headers_remove: {e}"))
-            })?;
-        let ip_allowlist_json = serde_json::to_string(&route.ip_allowlist)
-            .map_err(|e| ConfigError::Validation(format!("invalid ip_allowlist: {e}")))?;
-        let ip_denylist_json = serde_json::to_string(&route.ip_denylist)
-            .map_err(|e| ConfigError::Validation(format!("invalid ip_denylist: {e}")))?;
-        let cors_allowed_origins_json = serde_json::to_string(&route.cors_allowed_origins)
-            .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_origins: {e}")))?;
-        let cors_allowed_methods_json = serde_json::to_string(&route.cors_allowed_methods)
-            .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_methods: {e}")))?;
-        let path_rules_json = serde_json::to_string(&route.path_rules)
-            .map_err(|e| ConfigError::Validation(format!("invalid path_rules: {e}")))?;
-        let retry_on_methods_json = serde_json::to_string(&route.retry_on_methods)
-            .map_err(|e| ConfigError::Validation(format!("invalid retry_on_methods: {e}")))?;
-        let cache_vary_headers_json = serde_json::to_string(&route.cache_vary_headers)
-            .map_err(|e| ConfigError::Validation(format!("invalid cache_vary_headers: {e}")))?;
-        let header_rules_json = serde_json::to_string(&route.header_rules)
-            .map_err(|e| ConfigError::Validation(format!("invalid header_rules: {e}")))?;
-        let traffic_splits_json = serde_json::to_string(&route.traffic_splits)
-            .map_err(|e| ConfigError::Validation(format!("invalid traffic_splits: {e}")))?;
-        let forward_auth_json = match &route.forward_auth {
-            Some(fa) => Some(
-                serde_json::to_string(fa)
-                    .map_err(|e| ConfigError::Validation(format!("invalid forward_auth: {e}")))?,
-            ),
-            None => None,
-        };
-        let mirror_json = match &route.mirror {
-            Some(m) => Some(
-                serde_json::to_string(m)
-                    .map_err(|e| ConfigError::Validation(format!("invalid mirror: {e}")))?,
-            ),
-            None => None,
-        };
+        let hostname_aliases_json = serialize_field("hostname_aliases", &route.hostname_aliases)?;
+        let proxy_headers_json = serialize_field("proxy_headers", &route.proxy_headers)?;
+        let response_headers_json = serialize_field("response_headers", &route.response_headers)?;
+        let proxy_headers_remove_json =
+            serialize_field("proxy_headers_remove", &route.proxy_headers_remove)?;
+        let response_headers_remove_json =
+            serialize_field("response_headers_remove", &route.response_headers_remove)?;
+        let ip_allowlist_json = serialize_field("ip_allowlist", &route.ip_allowlist)?;
+        let ip_denylist_json = serialize_field("ip_denylist", &route.ip_denylist)?;
+        let cors_allowed_origins_json =
+            serialize_field("cors_allowed_origins", &route.cors_allowed_origins)?;
+        let cors_allowed_methods_json =
+            serialize_field("cors_allowed_methods", &route.cors_allowed_methods)?;
+        let path_rules_json = serialize_field("path_rules", &route.path_rules)?;
+        let retry_on_methods_json = serialize_field("retry_on_methods", &route.retry_on_methods)?;
+        let cache_vary_headers_json =
+            serialize_field("cache_vary_headers", &route.cache_vary_headers)?;
+        let header_rules_json = serialize_field("header_rules", &route.header_rules)?;
+        let traffic_splits_json = serialize_field("traffic_splits", &route.traffic_splits)?;
+        let forward_auth_json =
+            serialize_optional_field("forward_auth", route.forward_auth.as_ref())?;
+        let mirror_json = serialize_optional_field("mirror", route.mirror.as_ref())?;
         let response_rewrite_json =
-            match &route.response_rewrite {
-                Some(rr) => Some(serde_json::to_string(rr).map_err(|e| {
-                    ConfigError::Validation(format!("invalid response_rewrite: {e}"))
-                })?),
-                None => None,
-            };
-        let mtls_json = match &route.mtls {
-            Some(m) => Some(
-                serde_json::to_string(m)
-                    .map_err(|e| ConfigError::Validation(format!("invalid mtls: {e}")))?,
-            ),
-            None => None,
-        };
+            serialize_optional_field("response_rewrite", route.response_rewrite.as_ref())?;
+        let mtls_json = serialize_optional_field("mtls", route.mtls.as_ref())?;
 
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
@@ -799,64 +797,31 @@ impl ConfigStore {
     pub fn update_route(&self, route: &Route) -> Result<()> {
         self.validate_hostname_uniqueness(&route.id, &route.hostname, &route.hostname_aliases)?;
 
-        let hostname_aliases_json = serde_json::to_string(&route.hostname_aliases)
-            .map_err(|e| ConfigError::Validation(format!("invalid hostname_aliases: {e}")))?;
-        let proxy_headers_json = serde_json::to_string(&route.proxy_headers)
-            .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers: {e}")))?;
-        let response_headers_json = serde_json::to_string(&route.response_headers)
-            .map_err(|e| ConfigError::Validation(format!("invalid response_headers: {e}")))?;
-        let proxy_headers_remove_json = serde_json::to_string(&route.proxy_headers_remove)
-            .map_err(|e| ConfigError::Validation(format!("invalid proxy_headers_remove: {e}")))?;
-        let response_headers_remove_json = serde_json::to_string(&route.response_headers_remove)
-            .map_err(|e| {
-                ConfigError::Validation(format!("invalid response_headers_remove: {e}"))
-            })?;
-        let ip_allowlist_json = serde_json::to_string(&route.ip_allowlist)
-            .map_err(|e| ConfigError::Validation(format!("invalid ip_allowlist: {e}")))?;
-        let ip_denylist_json = serde_json::to_string(&route.ip_denylist)
-            .map_err(|e| ConfigError::Validation(format!("invalid ip_denylist: {e}")))?;
-        let cors_allowed_origins_json = serde_json::to_string(&route.cors_allowed_origins)
-            .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_origins: {e}")))?;
-        let cors_allowed_methods_json = serde_json::to_string(&route.cors_allowed_methods)
-            .map_err(|e| ConfigError::Validation(format!("invalid cors_allowed_methods: {e}")))?;
-        let path_rules_json = serde_json::to_string(&route.path_rules)
-            .map_err(|e| ConfigError::Validation(format!("invalid path_rules: {e}")))?;
-        let retry_on_methods_json = serde_json::to_string(&route.retry_on_methods)
-            .map_err(|e| ConfigError::Validation(format!("invalid retry_on_methods: {e}")))?;
-        let cache_vary_headers_json = serde_json::to_string(&route.cache_vary_headers)
-            .map_err(|e| ConfigError::Validation(format!("invalid cache_vary_headers: {e}")))?;
-        let header_rules_json = serde_json::to_string(&route.header_rules)
-            .map_err(|e| ConfigError::Validation(format!("invalid header_rules: {e}")))?;
-        let traffic_splits_json = serde_json::to_string(&route.traffic_splits)
-            .map_err(|e| ConfigError::Validation(format!("invalid traffic_splits: {e}")))?;
-        let forward_auth_json = match &route.forward_auth {
-            Some(fa) => Some(
-                serde_json::to_string(fa)
-                    .map_err(|e| ConfigError::Validation(format!("invalid forward_auth: {e}")))?,
-            ),
-            None => None,
-        };
-        let mirror_json = match &route.mirror {
-            Some(m) => Some(
-                serde_json::to_string(m)
-                    .map_err(|e| ConfigError::Validation(format!("invalid mirror: {e}")))?,
-            ),
-            None => None,
-        };
+        let hostname_aliases_json = serialize_field("hostname_aliases", &route.hostname_aliases)?;
+        let proxy_headers_json = serialize_field("proxy_headers", &route.proxy_headers)?;
+        let response_headers_json = serialize_field("response_headers", &route.response_headers)?;
+        let proxy_headers_remove_json =
+            serialize_field("proxy_headers_remove", &route.proxy_headers_remove)?;
+        let response_headers_remove_json =
+            serialize_field("response_headers_remove", &route.response_headers_remove)?;
+        let ip_allowlist_json = serialize_field("ip_allowlist", &route.ip_allowlist)?;
+        let ip_denylist_json = serialize_field("ip_denylist", &route.ip_denylist)?;
+        let cors_allowed_origins_json =
+            serialize_field("cors_allowed_origins", &route.cors_allowed_origins)?;
+        let cors_allowed_methods_json =
+            serialize_field("cors_allowed_methods", &route.cors_allowed_methods)?;
+        let path_rules_json = serialize_field("path_rules", &route.path_rules)?;
+        let retry_on_methods_json = serialize_field("retry_on_methods", &route.retry_on_methods)?;
+        let cache_vary_headers_json =
+            serialize_field("cache_vary_headers", &route.cache_vary_headers)?;
+        let header_rules_json = serialize_field("header_rules", &route.header_rules)?;
+        let traffic_splits_json = serialize_field("traffic_splits", &route.traffic_splits)?;
+        let forward_auth_json =
+            serialize_optional_field("forward_auth", route.forward_auth.as_ref())?;
+        let mirror_json = serialize_optional_field("mirror", route.mirror.as_ref())?;
         let response_rewrite_json =
-            match &route.response_rewrite {
-                Some(rr) => Some(serde_json::to_string(rr).map_err(|e| {
-                    ConfigError::Validation(format!("invalid response_rewrite: {e}"))
-                })?),
-                None => None,
-            };
-        let mtls_json = match &route.mtls {
-            Some(m) => Some(
-                serde_json::to_string(m)
-                    .map_err(|e| ConfigError::Validation(format!("invalid mtls: {e}")))?,
-            ),
-            None => None,
-        };
+            serialize_optional_field("response_rewrite", route.response_rewrite.as_ref())?;
+        let mtls_json = serialize_optional_field("mtls", route.mtls.as_ref())?;
 
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,

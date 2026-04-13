@@ -169,8 +169,8 @@ mod tests {
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            .expect("response body should fit in memory");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("response body is JSON");
         assert_eq!(json["error"]["code"], "not_found");
         assert_eq!(json["error"]["message"], "not found: route 42");
     }
