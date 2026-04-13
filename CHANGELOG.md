@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Author: Rwx-G
 
+## [Unreleased]
+
+### Added
+
+- `lorica-command` pipelined RPC framework (WPAR worker-parity audit, Phase 1): new `RpcEndpoint` demultiplexes concurrent in-flight requests on a single Unix socket via a background reader task and a per-sequence in-flight map, with a bounded outbound queue (capacity 256) that backpressures through a per-request timeout rather than growing unbounded. In-flight entries are removed on every exit path (Ok, Closed, Timeout) so dead senders cannot linger. Adds an `Envelope` wire frame that carries either a `Command` or a `Response` (required because the two shared leading prost tags), new `CommandType` variants for the upcoming WPAR RPCs (`RateLimitQuery/Delta`, `VerdictLookup/Push`, `BreakerQuery/Report`, `ConfigReloadPrepare/Commit`), typed payload oneofs on `Command` and `Response`, tri-state `BreakerDecision` (`Allow`/`Deny`/`AllowProbe`) per the supervisor-owned HalfOpen-probe model, a `Coalescer<K,V>` dedup primitive with TTL-bounded caching for the upcoming `/metrics` fan-out, and a `GenerationGate` atomic watermark enforcing strictly increasing reload generations. 37 unit tests including concurrency, adjacent-request isolation, peer-drop cleanup, and high-volume pipelining. See `docs/architecture/worker-shared-state.md` § 4
+
 ## [1.3.0] - 2026-04-12
 
 ### Added
