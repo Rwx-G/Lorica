@@ -7,7 +7,7 @@ This document specifies the cross-process shared-state mechanisms
 introduced to close the worker-parity audit findings WPAR-1 (rate
 limits), WPAR-2 (forward-auth verdict cache), WPAR-3 (circuit
 breaker), WPAR-7 (metrics freshness) and WPAR-8 (config reload
-window). It is the design floor for ~13 days of implementation work
+window). It is the design floor for ~14 days of implementation work
 and should be reviewed before code lands.
 
 ---
@@ -35,8 +35,13 @@ and should be reviewed before code lands.
 - **Hot-scalable workers** (WPAR-5). `N` stays fixed at startup.
 - **Online schema migration of the mmap layout**. A layout change
   requires a supervisor restart.
-- **Strict consistency for token buckets**. ~100 ms of skew per
-  worker is acceptable for rate-limit semantics.
+- **Strict consistency for token buckets**. The worker-cached +
+  supervisor-sync design admits a bounded imprecision of
+  `100 ms * N_workers` on the global rate. At `N=4` and a 100 req/s
+  cap, up to ~40 extra requests per second may slip through in
+  the worst case. Acceptable for rate-limit semantics, not for
+  billing or any accounting use case. This is a documented
+  feature guarantee, surfaced in the admin docs.
 
 ---
 
@@ -135,7 +140,7 @@ reply carries the request's sequence number; the dispatcher matches.
 pub struct ChannelClient {
     next_seq: AtomicU64,
     inflight: DashMap<u64, oneshot::Sender<Response>>,
-    tx: mpsc::Sender<Command>,
+    tx: mpsc::Sender<Command>,  // bounded, capacity 256
     // Background read loop owns the UnixStream
 }
 
@@ -147,13 +152,15 @@ impl ChannelClient {
         let (tx, rx) = oneshot::channel();
         self.inflight.insert(seq, tx);
         self.tx.send(Command::new(cmd, seq)).await?;
-        match tokio::time::timeout(timeout, rx).await {
+        let res = tokio::time::timeout(timeout, rx).await;
+        // Always drop the inflight entry on any exit path so a dead
+        // oneshot sender cannot linger in the map. On channel teardown
+        // the background read loop also drains `inflight` wholesale.
+        self.inflight.remove(&seq);
+        match res {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(_))   => Err(ChannelError::Closed),
-            Err(_) => {
-                self.inflight.remove(&seq);
-                Err(ChannelError::Timeout)
-            }
+            Err(_)       => Err(ChannelError::Timeout),
         }
     }
 }
@@ -162,6 +169,13 @@ impl ChannelClient {
 A single background task owns the read half of the socketpair and
 dispatches incoming `Response` to the matching oneshot from
 `inflight`.
+
+The outbound queue is a bounded `tokio::sync::mpsc::channel(256)`.
+Under supervisor slowness, `tx.send().await` backpressures the
+caller; the per-request timeout then triggers and returns
+`ChannelError::Timeout`. No silent unbounded queue growth. If
+backpressure is observed (send future pending > 10 ms), the worker
+logs a warning so operators can spot a stuck supervisor.
 
 ### 4.4 Supervisor-side handler
 
@@ -221,9 +235,13 @@ pub struct SharedRegion {
     pub magic: u64,                   // 0x4c4f5249434153484d ("LORICASHM")
     pub layout_version: u32,
     pub _reserved: u32,
+    /// siphash13 key, populated once at supervisor startup via
+    /// `getrandom`. Prevents HashDoS on the probe chain. Read-only
+    /// after fork. See § 5.3.
+    pub hash_key: [u64; 2],
 
-    pub waf_flood:    AtomicHashTable<128 * 1024>,  // ~3 MiB
-    pub waf_auto_ban: AtomicHashTable<128 * 1024>,  // ~3 MiB
+    pub waf_flood:    AtomicHashTable<128 * 1024>,  // 8 MiB
+    pub waf_auto_ban: AtomicHashTable<128 * 1024>,  // 8 MiB
 }
 
 #[repr(C, align(64))]
@@ -237,44 +255,64 @@ pub struct Slot {
     pub key: AtomicU64,
     /// counter value (request count, ban count, etc.)
     pub value: AtomicU64,
-    /// last update timestamp (monotonic ns since boot)
+    /// last update timestamp (monotonic ns since boot). Best-effort
+    /// precision: concurrent writers race on the store, so the value
+    /// is approximate within tens of microseconds. Only used to
+    /// drive eviction, which tolerates that imprecision.
     pub last_update_ns: AtomicU64,
-    /// version counter (incremented on each successful update; even =
-    /// stable, odd = mid-update). Used as a seqlock.
-    pub version: AtomicU64,
+    // Cache-line pad follows (align(64)).
 }
 ```
 
-Total: 32 B / slot * 128K slots * 2 tables = 8 MiB. Trivial.
+Three atomics = 24 B of data, padded to a 64 B cache line per slot
+(`align(64)` on `Slot`). Total: 64 B * 128K slots * 2 tables =
+16 MiB. Still trivial.
+
+Note: earlier drafts carried a `version` seqlock field so readers
+could observe (`value`, `last_update_ns`) atomically. The seqlock
+is not safe with multiple concurrent writers (two writers racing
+on `version.fetch_add(1)` can leave `version` even while both are
+mid-update, misleading readers). It is also unnecessary: readers
+consume `value` alone (a single `AtomicU64::load`), and
+`last_update_ns` is informative for eviction only. The seqlock has
+been removed. See § 8 for the full concurrency story.
 
 ### 5.3 Atomic operations
 
 Two operations:
 
+The siphash key is 128 bits, generated once by the supervisor at
+startup via `getrandom`, and passed to each worker at fork through
+the same `SharedRegion` header (reserved field, not shown in § 5.2
+for brevity; added as `pub hash_key: [u64; 2]` right after
+`layout_version`). This prevents HashDoS: an attacker cannot
+pre-compute IPs that collide into the same probe chain and saturate
+`MAX_PROBE`. The key is stable for the lifetime of the supervisor;
+a supervisor restart rotates it (workers are re-forked).
+
 ```rust
 pub fn increment(&self, key: u64, by: u64) -> u64 {
-    let h = siphash13(key) | 1;          // ensure non-zero
+    let h = siphash13_with_key(self.hash_key, key) | 1;  // ensure non-zero
     let start = (h as usize) & (N - 1);
     for probe in 0..MAX_PROBE {
         let i = (start + probe) & (N - 1);
         let s = &self.slots[i];
         let cur_key = s.key.load(Ordering::Acquire);
         if cur_key == 0 {
-            // Try to claim
+            // Try to claim. On claim we reset `value` to `by` and
+            // stamp `last_update_ns`. Reset matters because the slot
+            // may have been evicted and is being reused for a new key.
             if s.key.compare_exchange(0, h, Acquire, Relaxed).is_ok() {
                 s.value.store(by, Release);
                 s.last_update_ns.store(now_ns(), Release);
-                s.version.fetch_add(2, Release);  // even -> even
                 return by;
             }
             continue;  // someone else claimed; re-read
         }
         if cur_key == h {
-            // Existing: update in place. Bump version odd-then-even.
-            s.version.fetch_add(1, Release);  // mark mid-update
+            // Existing key: single commutative atomic add. No seqlock.
             let new = s.value.fetch_add(by, AcqRel) + by;
             s.last_update_ns.store(now_ns(), Release);
-            s.version.fetch_add(1, Release);  // mark stable
             return new;
         }
         // Collision: probe next slot.
@@ -287,7 +325,7 @@ pub fn increment(&self, key: u64, by: u64) -> u64 {
 }
 
 pub fn read(&self, key: u64) -> Option<u64> {
-    let h = siphash13(key) | 1;
+    let h = siphash13_with_key(self.hash_key, key) | 1;
     let start = (h as usize) & (N - 1);
     for probe in 0..MAX_PROBE {
         let i = (start + probe) & (N - 1);
@@ -295,14 +333,9 @@ pub fn read(&self, key: u64) -> Option<u64> {
         let k = s.key.load(Acquire);
         if k == 0 { return None; }
         if k != h { continue; }
-        // Seqlock read: spin while version is odd, retry if it changed
-        loop {
-            let v0 = s.version.load(Acquire);
-            if v0 & 1 != 0 { std::hint::spin_loop(); continue; }
-            let val = s.value.load(Acquire);
-            let v1 = s.version.load(Acquire);
-            if v0 == v1 { return Some(val); }
-        }
+        // Single atomic load, no seqlock. Readers only consume
+        // `value`; `last_update_ns` is eviction-only.
+        return Some(s.value.load(Acquire));
     }
     None
 }
@@ -314,17 +347,42 @@ slots) and a good hash, P(probe > 16) is well under 1e-9.
 ### 5.4 Eviction
 
 Background task on the supervisor walks every slot once per minute.
-For each slot whose `last_update_ns` is older than 5 min and whose
-`value` is below the active threshold, CAS `key` from `h` to 0 to
-release the slot. Workers will not see partial deletions thanks to
-the seqlock.
+A slot is evicted when `last_update_ns` is older than 5 minutes:
+the supervisor CAS's `key` from `h` to 0 to release the slot. No
+separate "active threshold" - staleness by age is the only
+criterion, and it works uniformly for monotonically-growing
+counters (WAF flood, WAF auto-ban) and hypothetical decaying
+counters alike.
+
+`value` and `last_update_ns` are **not** reset at eviction time.
+They are reset by the next `increment` that claims the slot (see
+§ 5.3), which is safe because the claim CAS serialises reuse.
+
+Race between eviction and a late writer: a writer may read
+`cur_key == h`, the eviction CAS may then flip `key` to 0, a new
+key `h'` may claim the slot and store its initial `by'`, and only
+then the late writer's `value.fetch_add(by, AcqRel)` lands - now
+polluting `h'`'s counter by `by`. The bound is **one stale
+increment per slot reuse**, not a duration: at most a single
+request's worth of count leaks from the evicted key to the
+reclaiming key. Given eviction targets slots idle for 5 min, the
+late-writer window is already vanishingly narrow (a writer that
+read `cur_key` only to `fetch_add` > 5 min later is pathological).
+Acceptable for WAF counters; would not be acceptable for billing.
 
 ### 5.5 Crash safety
 
-If the supervisor crashes mid-`increment`, the slot can be left with
-an odd `version`. Workers spin briefly in the seqlock and retry. If
-the supervisor never restarts, workers fall back to per-worker
-behaviour after a timeout (see § 7).
+If the supervisor crashes mid-`increment`, the worst case is that
+a single atomic store (`value` or `last_update_ns`) completed while
+the other did not - but each store is independently atomic, so
+readers never observe a torn value. No seqlock means no mid-update
+state to recover from.
+
+If the supervisor never restarts, workers fall back to per-worker
+behaviour after an RPC timeout (see § 7). The shmem region
+continues to be usable by workers for read/write; only the
+supervisor-driven eviction pauses until a new supervisor is elected
+(today: systemd respawn).
 
 The mmap region itself survives supervisor death: `MAP_SHARED` plus
 `memfd` semantics keep the pages alive as long as any process holds
@@ -389,10 +447,28 @@ with the same FIFO eviction the per-process cache uses today.
 
 ### WPAR-3 (circuit breaker)
 
-Same shape. `BreakerQuery(route, backend)` -> `bool` decides
-availability; `BreakerReport(route, backend, success)` updates the
-supervisor's state machine. Supervisor reuses the existing scoped
-breaker logic, just relocated.
+Same shape, but the RPC surface must preserve the tri-state nature
+of a breaker (Closed / Open / HalfOpen). The supervisor owns the
+state machine; the worker only asks "should I send this request?"
+and reports back.
+
+```protobuf
+enum BreakerDecision {
+    ALLOW       = 0;  // Closed or first HalfOpen probe: send request
+    DENY        = 1;  // Open: short-circuit with 503
+    ALLOW_PROBE = 2;  // HalfOpen subsequent slot granted: send and
+                     //   expect the Report to drive the transition
+}
+```
+
+`BreakerQuery(route, backend)` returns `BreakerDecision`. The
+supervisor decides when to admit a probe (HalfOpen) and which
+worker gets the probe token; workers do not race on probe admission.
+`BreakerReport(route, backend, success)` updates the supervisor's
+state machine; on success after `ALLOW_PROBE`, the breaker closes.
+
+Supervisor reuses the existing scoped breaker logic, just relocated
+behind the RPC boundary.
 
 ### WPAR-7 (metrics pull)
 
@@ -406,30 +482,60 @@ via `Mutex<watch::Receiver>` (§ 4.5).
 Supervisor coordinator:
 
 ```rust
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
+const COMMIT_TIMEOUT:  Duration = Duration::from_millis(500);
+
 let gen = next_generation();
-join_all(workers.map(|w| w.rpc.config_reload_prepare(gen))).await;
-// If all Ok:
-join_all(workers.map(|w| w.rpc.config_reload_commit(gen))).await;
-// If any Err in prepare phase:
-//   broadcast a no-op (drop pending). Operators see the failure
-//   surfaced via API.
+
+// Phase 1: Prepare. Per-worker timeout; any failure aborts.
+let prepare = workers.iter().map(|w| async move {
+    w.rpc.request(ConfigReloadPrepare { generation: gen }.into(),
+                  PREPARE_TIMEOUT).await
+});
+let prepare_results = join_all(prepare).await;
+if prepare_results.iter().any(Result::is_err) {
+    // Identify and log the slow/failed workers, broadcast a no-op
+    // drop for any worker that did reply Ok so they release their
+    // `pending_proxy_config`. Surface the failure via API.
+    abort_reload(gen, &workers, &prepare_results);
+    return Err(ReloadError::PrepareFailed);
+}
+
+// Phase 2: Commit. Shorter timeout since work is a single ArcSwap.
+let commit = workers.iter().map(|w| async move {
+    w.rpc.request(ConfigReloadCommit { generation: gen }.into(),
+                  COMMIT_TIMEOUT).await
+});
+join_all(commit).await;
 ```
 
 Worker side: `ConfigReloadPrepare` reads the DB, builds a new
 `ProxyConfig`, stores it in `ctx.pending_proxy_config`, replies Ok.
 `ConfigReloadCommit` does the atomic ArcSwap. Window where workers
-diverge collapses to RTT skew (microseconds on local UDS) instead of
-10-50 ms.
+diverge collapses to RTT skew (microseconds on local UDS) instead
+of 10-50 ms.
+
+The 2-second Prepare timeout is deliberately generous because the
+slow path involves a SQLite read and TLS material parsing. A worker
+that exceeds the budget is treated as failed; the reload is
+aborted rather than left in a half-committed state.
 
 ## 8. Concurrency invariants
 
 Stated explicitly so reviewers can sanity-check.
 
-1. **Shmem slot**: the seqlock guarantees readers either observe the
-   pre-update or post-update value, never a torn read. Writers do
-   not coordinate with each other beyond the slot's atomic ops; two
-   concurrent `increment` on the same key race on `value.fetch_add`,
-   which is correct (commutative).
+1. **Shmem slot**: each field is an independent atomic. Readers
+   perform a single `value.load(Acquire)` and observe some past
+   committed value, never a torn read. Writers do not coordinate
+   with each other beyond the slot's atomic ops; two concurrent
+   `increment` on the same key race on `value.fetch_add`, which is
+   correct (commutative). `last_update_ns` is best-effort: racing
+   writers may overwrite each other's timestamp, but the value is
+   always a real timestamp from one of them, bounded within a few
+   microseconds of "now", which is sufficient for 5-minute
+   eviction decisions. No seqlock: readers never consume
+   (`value`, `last_update_ns`) as a pair, so there is nothing to
+   tear across fields.
 2. **RPC sequence**: per-direction monotonic. Requests with seq `n`
    are replied to with seq `n`. Workers and supervisor must never
    reuse a seq.
@@ -463,12 +569,12 @@ Stated explicitly so reviewers can sanity-check.
 
 ## 11. Implementation phases
 
-Recap of the 13-day plan from the architecture discussion:
+Recap of the 14-day plan from the architecture discussion:
 
 | Phase | Deliverable | Effort |
 |---|---|---|
 | 1 | RPC framework: extend `lorica-command` (pipelining, dispatch, dedup), tests | 2 d |
-| 2 | `lorica-shmem` crate: memfd_create, FD passing, `AtomicHashTable`, eviction, crash-safety tests | 3 d |
+| 2 | `lorica-shmem` crate: memfd_create, FD passing, `AtomicHashTable`, eviction, multi-process crash-safety tests | 4 d |
 | 3 | WPAR-1 hybrid: WAF flood + auto-ban migrate to shmem; per-route token buckets via worker-cache + supervisor sync | 3 d |
 | 4 | WPAR-2: verdict cache RPC | 1 d |
 | 5 | WPAR-3: breaker RPC | 1 d |
@@ -493,24 +599,34 @@ the crate boundary make them reviewable in isolation.
   same-as-single-process semantics.
 - **Load test** (new in `bench/`): 10k+ QPS against a `--workers 4`
   setup with rate limits + WAF + forward auth on; measure
-  - p99 latency vs single-process baseline (target: < 10% overhead)
+  - p99 latency vs single-process baseline (target: < 10 % overhead)
   - rate-limit precision (configured 100 req/s -> measured <= 105 req/s globally, not 400)
   - shmem hashtable saturation rate (target: 0)
+- **RPC hit-latency micro-bench** (new in `lorica-bench/`): measure
+  the per-request cost added by the verdict-cache RPC on a
+  cache-hit path. Today the local `DashMap` lookup is ~ns; the RPC
+  path adds a UDS round trip (~10-50 us). The bench reports p50 /
+  p99 hit latency under concurrent load and asserts it stays below
+  100 us. Justification: WPAR-2 trades local cost for cross-worker
+  consistency, and we want a visible number to defend that
+  trade-off if it ever regresses.
 
 ## 13. Open questions for review
 
 1. **Token-bucket sync interval**: 100 ms is a guess. Reviewer:
-   acceptable, or do we need 50 ms?
+   acceptable, or do we need 50 ms? The documented guarantee is
+   `100 ms * N_workers` of imprecision on the global rate (see
+   § 2); halving the interval halves the imprecision at the cost
+   of doubling the RPC rate for `RateLimitDelta`.
 2. **Shmem table sizes**: 128 K slots = ~64 K live IPs at 50 % load.
    Lorica deployments typically see how many distinct client IPs
    concurrently? Confirm 128 K is enough.
 3. **RPC channel ordering vs the existing single-flight pattern**:
    today Heartbeat / ConfigReload assume ordered single-flight.
-   Switching to pipelined dispatcher should be backward-compatible
-   (those messages still complete in order from the supervisor's
-   point of view) but we need to verify.
-4. **Crash safety of the seqlock under high contention**: stress
-   test in Phase 2.
+   Switching to pipelined dispatcher is backward-compatible for
+   messages that must complete in order (generation numbers in
+   Prepare/Commit enforce the ordering explicitly, and Heartbeat
+   has no ordering requirement); to verify in Phase 1 tests.
 
 ---
 
