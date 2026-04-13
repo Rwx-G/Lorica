@@ -27,20 +27,18 @@
 //!
 //! ## Example with Connection Filtering
 //!
-//! ```rust,no_run
-//! # #[cfg(feature = "connection_filter")]
-//! # {
+//! ```rust,ignore
 //! use lorica_core::listeners::{Listeners, ConnectionFilter};
 //! use std::sync::Arc;
 //!
-//! // Create a custom filter
+//! // Create a custom filter (operator-supplied type implementing
+//! // `ConnectionFilter` — see `connection_filter.rs` for the example).
 //! let filter = Arc::new(MyCustomFilter::new());
 //!
 //! // Apply to listeners
 //! let mut listeners = Listeners::new();
 //! listeners.set_connection_filter(filter);
 //! listeners.add_tcp("0.0.0.0:8080");
-//! # }
 //! ```
 
 mod l4;

@@ -1240,13 +1240,11 @@ impl RateLimitEngine {
                 let bucket = map
                     .entry(key.to_string())
                     .or_insert_with(|| {
-                        Arc::new(
-                            lorica_limits::token_bucket::AuthoritativeBucket::new(
-                                rl.capacity,
-                                rl.refill_per_sec,
-                                now_ns,
-                            ),
-                        )
+                        Arc::new(lorica_limits::token_bucket::AuthoritativeBucket::new(
+                            rl.capacity,
+                            rl.refill_per_sec,
+                            now_ns,
+                        ))
                     })
                     .clone();
                 bucket.try_consume(cost, now_ns)
@@ -1350,9 +1348,7 @@ impl LoricaProxy {
                 let now = lorica_shmem::now_ns();
                 match &engine {
                     RateLimitEngine::Authoritative(map) => {
-                        map.retain(|_, b| {
-                            now.saturating_sub(b.last_activity_ns()) < idle_ttl_ns
-                        });
+                        map.retain(|_, b| now.saturating_sub(b.last_activity_ns()) < idle_ttl_ns);
                     }
                     RateLimitEngine::Local(_) => {
                         // Worker mode: the supervisor sync task drops
@@ -2706,12 +2702,9 @@ impl ProxyHttp for LoricaProxy {
                     lorica_config::models::RateLimitScope::PerRoute => "__route__".to_string(),
                 };
                 let key = format!("{}|{}", entry.route.id, scope_key);
-                let admitted = self.rate_limit_buckets.try_consume(
-                    &key,
-                    rl,
-                    1,
-                    lorica_shmem::now_ns(),
-                );
+                let admitted =
+                    self.rate_limit_buckets
+                        .try_consume(&key, rl, 1, lorica_shmem::now_ns());
                 if !admitted {
                     ctx.block_reason = Some("rate limited".to_string());
                     let mut header = lorica_http::ResponseHeader::build(429, None)?;

@@ -564,7 +564,7 @@ mod test {
         impl ConnectionFilter for CountingFilter {
             async fn should_accept(&self, _addr: Option<&SocketAddr>) -> bool {
                 let count = self.accept_count.fetch_add(1, Ordering::SeqCst);
-                if count % 2 == 0 {
+                if count.is_multiple_of(2) {
                     true
                 } else {
                     self.reject_count.fetch_add(1, Ordering::SeqCst);

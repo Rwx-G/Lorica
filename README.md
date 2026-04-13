@@ -45,8 +45,9 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Forward authentication** - per-route sub-request to Authelia / Authentik / Keycloak / oauth2-proxy before proxying; 2xx injects response headers into upstream, 401/403/3xx forwarded verbatim to the client, timeout = fail-closed 503. Optional opt-in verdict cache (TTL-capped at 60s, Cookie-keyed) to shortcut hot paths
 - **Connection pre-filter** - global IP allow/deny CIDR policy enforced at TCP accept, before the TLS handshake. Deny always wins; non-empty allow switches to default-deny. Hot-reloaded via arc-swap in single-process and worker modes
 - **IP blocklist** - auto-fetched from Data-Shield IPv4 Blocklist (~80,000 entries, O(1) lookup, updated every 6h)
-- **Rate limiting** - per-route, per-client-IP with configurable RPS and burst tolerance
-- **Auto-ban** - IPs that repeatedly exceed rate limits are banned automatically (configurable threshold and duration)
+- **Rate limiting** - per-route, per-client-IP with configurable RPS and burst tolerance (legacy event-rate estimator `rate_limit_rps` / `rate_limit_burst`)
+- **Per-route token-bucket limiter** - exact-semantic admission control via `rate_limit: { capacity, refill_per_sec, scope }`. Runs ahead of mTLS / forward-auth / WAF so abusive clients are rejected cheaply with `429 Too Many Requests` + `Retry-After`. `scope: per_ip` isolates individual clients; `scope: per_route` caps aggregate traffic to a fragile origin. Cross-worker under `--workers N`: each worker's CAS-based `LocalBucket` cache syncs every 100 ms with the supervisor's authoritative state over a dedicated pipelined RPC channel. Aggregate bound: `capacity + 100 ms × N_workers × refill_per_sec` (documented in `docs/architecture/worker-shared-state.md` § 6)
+- **Auto-ban** - IPs that repeatedly exceed rate limits (or trip the WAF) are banned automatically (configurable threshold and duration). Under `--workers N`, the WAF auto-ban counter lives in an anonymous `memfd` shared by all workers (no UDS round-trip per block), and the supervisor is the sole ban issuer, broadcasting `BanIp` on threshold crossing
 - **Trusted proxies** - CIDR list for X-Forwarded-For validation, prevents IP spoofing via header injection
 - **DDoS protection** - per-route max connections, global flood rate tracking
 - **Slowloris detection** - rejects slow-header attacks with configurable threshold
@@ -220,11 +221,12 @@ Lorica is a Rust workspace with 25 crates: 15 forked from Cloudflare Pingora and
 | `lorica-waf` | WAF engine, OWASP rules, IP blocklist |
 | `lorica-notify` | Alert dispatch (stdout, SMTP, webhook) |
 | `lorica-bench` | SLA monitoring, load testing engine |
-| `lorica-worker` | fork+exec worker isolation, socket passing |
-| `lorica-command` | Protobuf supervisor-worker command channel |
+| `lorica-worker` | fork+exec worker isolation, typed FD passing (Listener / Shmem / Rpc) |
+| `lorica-command` | Protobuf supervisor-worker command channel + pipelined RpcEndpoint (Envelope framing, in-flight demux, bounded backpressure), `Coalescer`, `GenerationGate` |
+| `lorica-shmem` | Anonymous `memfd` region shared across all workers; `AtomicHashTable` for per-IP WAF flood / auto-ban counters; SipHash-1-3 anti-HashDoS; 5-min eviction walker |
 | `lorica-lb` | Load balancing (Round Robin, Peak EWMA, Hash, Random, Least Conn) |
 | `lorica-cache` | HTTP response cache, LRU eviction |
-| `lorica-limits` | Rate estimator for rate limiting |
+| `lorica-limits` | Rate estimator + per-route `LocalBucket` / `AuthoritativeBucket` token-bucket primitives (lock-free CAS, 100 ms cross-worker sync) |
 
 Data plane (proxy) and control plane (API/dashboard) are fully separated. API mutations trigger config reload via arc-swap - the proxy picks up changes without restarting.
 
@@ -452,7 +454,7 @@ cargo test --workspace
 # Product crate tests only (739 tests)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
-           -p lorica-command -p lorica-limits
+           -p lorica-command -p lorica-limits -p lorica-shmem
 
 # Pingora-forked crate tests (568 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \

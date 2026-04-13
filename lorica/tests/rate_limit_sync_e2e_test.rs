@@ -256,12 +256,11 @@ async fn two_workers_aggregate_is_bounded_by_capacity() {
     // admissions in the first tick, then subsequent ticks converge.
     // The important invariant: the authoritative bucket never went
     // negative and the system eventually settles.
-    let auth_tokens = registry
-        .get("r|all")
-        .unwrap()
-        .value()
-        .snapshot(u64::MAX);
-    assert_eq!(auth_tokens, 0, "authoritative bucket drained and clamped at zero");
+    let auth_tokens = registry.get("r|all").unwrap().value().snapshot(u64::MAX);
+    assert_eq!(
+        auth_tokens, 0,
+        "authoritative bucket drained and clamped at zero"
+    );
     let total_admitted = admitted_a + admitted_b + a2 + b2;
     assert_eq!(total_admitted, 180);
 }
@@ -292,4 +291,3 @@ async fn push_delta(ep: &RpcEndpoint, local: &LocalBucket, key: &str) {
         }
     }
 }
-
