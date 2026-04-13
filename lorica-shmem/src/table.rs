@@ -218,27 +218,31 @@ pub fn tagged_hash(raw: u64) -> u64 {
     raw | 1
 }
 
-/// Current monotonic-ish timestamp in nanoseconds. Uses
-/// `std::time::Instant` via a process-wide anchor so values are
-/// comparable across workers that share the same supervisor parent (the
-/// anchor is the supervisor start time, passed through the shared
-/// region's init).
+/// Current monotonic timestamp in nanoseconds, reading the Linux
+/// kernel's `CLOCK_MONOTONIC` via `clock_gettime`.
 ///
-/// For tests and the eviction walker, any monotonic clock works — the
-/// anchor only matters for inter-process comparability.
+/// Chosen over `SystemTime` / `UNIX_EPOCH` so a wall-clock adjustment
+/// (NTP step, manual `settimeofday`, leap second) cannot make
+/// `last_update_ns` appear in the future relative to the eviction
+/// walker's `now_ns`, which would stall eviction until the clock
+/// caught up.
+///
+/// `CLOCK_MONOTONIC`'s reference is the kernel's boot time, so values
+/// written by the supervisor and by forked workers are directly
+/// comparable — both processes read the same clock.
 pub fn now_ns() -> u64 {
-    // CLOCK_MONOTONIC returns nanoseconds since an unspecified but
-    // monotonic reference. Across forked processes the reference is the
-    // same (both see the kernel's boot-time monotonic clock), so values
-    // written by the supervisor and by workers are directly comparable.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // On Linux, libc::CLOCK_MONOTONIC would be ideal. For portability
-    // and to avoid pulling libc directly, use SystemTime — close enough
-    // for minute-granularity eviction.
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+    use nix::sys::time::TimeValLike;
+    use nix::time::{clock_gettime, ClockId};
+    // clock_gettime(CLOCK_MONOTONIC) cannot fail in practice on Linux
+    // with a valid clockid. Fall back to 0 if it ever does; eviction
+    // walker will simply see every slot as "fresh" during that tick.
+    clock_gettime(ClockId::CLOCK_MONOTONIC)
+        .map(|ts| {
+            (ts.num_seconds() as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(ts.tv_nsec() as u64)
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

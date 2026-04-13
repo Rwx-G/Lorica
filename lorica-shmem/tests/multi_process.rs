@@ -198,6 +198,15 @@ fn probe_chain_saturation_returns_sentinel_across_processes() {
     // exhausts the chain. We synthesize 16 + 1 tagged hashes with
     // identical low bits but distinct high bits and have a child write
     // all 16 then the parent try the 17th.
+    //
+    // NB: this test *bypasses* siphash and constructs tagged hashes
+    // directly so we can control the probe-chain start bits. That is
+    // deliberate — the guarantee under test is that the `AtomicHashTable`
+    // probe loop saturates at `MAX_PROBE` regardless of how the hash
+    // was derived. If the table implementation ever changes to double
+    // hashing or Robin Hood, this test must be updated to reflect the
+    // new collision strategy; a simpler "flood with N+1 sequential IPs"
+    // would not reliably saturate under those schemes.
     let (region, fd) = SharedRegion::create_supervisor().expect("create");
     let fd_raw = fd.as_raw_fd();
     const SLOTS_MASK: u64 = (lorica_shmem::WAF_SLOTS as u64) - 1;
