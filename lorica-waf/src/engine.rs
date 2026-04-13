@@ -115,6 +115,15 @@ pub struct WafEngine {
     max_events: usize,
     /// IP address blocklist (e.g. Data-Shield IPv4 Blocklist).
     ip_blocklist: IpBlocklist,
+    /// Two-phase prefilter (PERF-9): an Aho-Corasick automaton over a
+    /// curated list of attack literals that covers every default rule.
+    /// Per-field, if the prefilter does not match, the regex pass is
+    /// skipped (clean traffic short-circuits to Pass without ever
+    /// touching the regex engine). Custom user rules always run -
+    /// they're outside the prefilter's coverage contract. See
+    /// `prefilter.rs` for the literal list and the
+    /// `prefilter_covers_*` regression tests.
+    prefilter: crate::prefilter::Prefilter,
 }
 
 impl WafEngine {
@@ -127,6 +136,7 @@ impl WafEngine {
             event_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(500))),
             max_events: 500,
             ip_blocklist: IpBlocklist::new(),
+            prefilter: crate::prefilter::Prefilter::build(),
         }
     }
 
@@ -325,21 +335,35 @@ impl WafEngine {
         let mut events = Vec::new();
         let now = chrono::Utc::now().to_rfc3339();
 
+        // PERF-9: two-phase eval. Per-field, run the cheap
+        // Aho-Corasick prefilter first; only fall through to the
+        // regex pass when the prefilter hits. Custom user rules are
+        // outside the prefilter contract so we still scan them
+        // regardless. Full-scan semantics (all events collected)
+        // are preserved for observability.
+        let has_custom_rules = !self.custom_rules.read().is_empty();
+
         // Check path (URL-decode to catch encoded traversal attacks)
         let decoded_path = Self::url_decode(path);
-        self.scan_field("path", &decoded_path, &now, &mut events);
+        if has_custom_rules || self.prefilter.matches(&decoded_path) {
+            self.scan_field("path", &decoded_path, &now, &mut events);
+        }
 
         // Check query string
         if let Some(q) = query {
             // URL-decode the query for better detection
             let decoded = Self::url_decode(q);
-            self.scan_field("query", &decoded, &now, &mut events);
+            if has_custom_rules || self.prefilter.matches(&decoded) {
+                self.scan_field("query", &decoded, &now, &mut events);
+            }
         }
 
         // Check relevant headers
         for (name, value) in headers {
             let decoded = Self::url_decode(value);
-            self.scan_field(&format!("header:{name}"), &decoded, &now, &mut events);
+            if has_custom_rules || self.prefilter.matches(&decoded) {
+                self.scan_field(&format!("header:{name}"), &decoded, &now, &mut events);
+            }
         }
 
         let elapsed = start.elapsed();
@@ -425,9 +449,14 @@ impl WafEngine {
         let mut events = Vec::new();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // URL-decode the body to catch encoded payloads
+        // URL-decode the body to catch encoded payloads. PERF-9:
+        // skip the regex pass entirely when neither the prefilter
+        // nor any custom user rule applies.
         let decoded = Self::url_decode(text);
-        self.scan_field("body", &decoded, &now, &mut events);
+        let has_custom_rules = !self.custom_rules.read().is_empty();
+        if has_custom_rules || self.prefilter.matches(&decoded) {
+            self.scan_field("body", &decoded, &now, &mut events);
+        }
 
         let elapsed = start.elapsed();
 

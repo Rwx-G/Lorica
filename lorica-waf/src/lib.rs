@@ -31,6 +31,7 @@
 
 pub mod engine;
 pub mod ip_blocklist;
+pub mod prefilter;
 pub mod rules;
 
 pub use engine::{RuleSummary, WafEngine, WafEvent, WafMode, WafVerdict};
