@@ -52,9 +52,13 @@ const SCALE: i64 = 1_000_000;
 /// [`Self::take_delta`] and push it to the supervisor.
 #[derive(Debug)]
 pub struct LocalBucket {
-    /// Cached tokens as of the last `refresh`. May temporarily go
-    /// negative in a CAS race; `try_consume` guards by rejecting when
-    /// the current observed value is below the cost.
+    /// Cached tokens as of the last `refresh`. Never negative:
+    /// `try_consume` rejects when `cur < cost` before the CAS, so a
+    /// decrement can only go through when the result is non-negative.
+    /// `AtomicI64` (rather than `AtomicU64`) is a future-proofing choice
+    /// so the supervisor can signal a "debt" state (e.g. the worker
+    /// overdrew between syncs) by passing a negative starting value to
+    /// `refresh` — not exercised today but preserves the headroom.
     tokens: AtomicI64,
     /// Accumulated successful consumption since the last `take_delta`.
     delta: AtomicU64,
@@ -98,6 +102,21 @@ impl LocalBucket {
     /// Take and reset the accumulated consumption since last call.
     /// Called by the background sync task before pushing to the
     /// supervisor.
+    ///
+    /// Direction-of-error under concurrency: a `try_consume` racing
+    /// with this `swap(0, AcqRel)` either (a) lands before the swap
+    /// and its increment is included in the returned value, or (b)
+    /// lands after and its increment survives for the next call. No
+    /// consumption is ever dropped; the only effect of a race is a
+    /// one-tick delay in the supervisor observing it. That makes the
+    /// authoritative bucket slightly more permissive than strict
+    /// semantics for ~100 ms — the direction the design § 6 already
+    /// documents as acceptable for rate-limiting.
+    ///
+    /// The `min(u32::MAX)` clamp is defensive: a pathological workload
+    /// would need to fire > 4 × 10^9 successful consumptions inside a
+    /// single 100 ms sync window to trip it (unreachable on current
+    /// hardware), but the clamp keeps the return type narrow.
     pub fn take_delta(&self) -> u32 {
         let d = self.delta.swap(0, Ordering::AcqRel);
         d.min(u32::MAX as u64) as u32
@@ -131,6 +150,10 @@ pub struct AuthoritativeBucket {
     capacity: u32,
     refill_per_sec: u32,
     state: Mutex<State>,
+    /// Monotonic timestamp of the most recent `try_consume` /
+    /// `apply_delta` / `snapshot`. Used by the caller's eviction task
+    /// to prune buckets that have been idle longer than some TTL.
+    last_activity_ns: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -153,7 +176,15 @@ impl AuthoritativeBucket {
                 tokens_fp: (capacity as i64).saturating_mul(SCALE),
                 last_refill_ns: now_ns,
             }),
+            last_activity_ns: AtomicU64::new(now_ns),
         }
+    }
+
+    /// Monotonic timestamp of the last operation on this bucket. Used
+    /// by the caller to decide when an entry is idle enough to evict
+    /// from the per-key map.
+    pub fn last_activity_ns(&self) -> u64 {
+        self.last_activity_ns.load(Ordering::Acquire)
     }
 
     pub fn capacity(&self) -> u32 {
@@ -166,6 +197,7 @@ impl AuthoritativeBucket {
 
     /// Return the current token count after applying any pending refill.
     pub fn snapshot(&self, now_ns: u64) -> u32 {
+        self.last_activity_ns.store(now_ns, Ordering::Release);
         let mut s = self.state.lock().expect("bucket state poisoned");
         self.refill_locked(&mut s, now_ns);
         Self::whole_tokens(s.tokens_fp, self.capacity)
@@ -175,6 +207,7 @@ impl AuthoritativeBucket {
     /// (post-delta, post-refill) authoritative token count, which the
     /// caller ships back to the worker as its next `refresh` value.
     pub fn apply_delta(&self, consumed: u32, now_ns: u64) -> u32 {
+        self.last_activity_ns.store(now_ns, Ordering::Release);
         let mut s = self.state.lock().expect("bucket state poisoned");
         self.refill_locked(&mut s, now_ns);
         let drain_fp = (consumed as i64).saturating_mul(SCALE);
@@ -191,6 +224,7 @@ impl AuthoritativeBucket {
     /// supervisor sync) where the request hot path drives the bucket
     /// directly instead of the worker-cache + delta-push pattern.
     pub fn try_consume(&self, cost: u32, now_ns: u64) -> bool {
+        self.last_activity_ns.store(now_ns, Ordering::Release);
         let mut s = self.state.lock().expect("bucket state poisoned");
         self.refill_locked(&mut s, now_ns);
         let cost_fp = (cost as i64).saturating_mul(SCALE);

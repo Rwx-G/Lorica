@@ -1257,6 +1257,38 @@ impl LoricaProxy {
         })
     }
 
+    /// Spawn a background prune task for `rate_limit_buckets`.
+    ///
+    /// For `scope = per_ip` every distinct client IP gets its own
+    /// `AuthoritativeBucket` (~100 B each). Without eviction, a scan
+    /// or high-cardinality traffic pattern leaks memory at the rate
+    /// of "one bucket per unique IP" until process restart. This
+    /// task walks the map on `interval` and drops any bucket whose
+    /// `last_activity_ns` is older than `idle_ttl`. A future request
+    /// from the same key reconstructs a fresh bucket, which starts
+    /// at full capacity — acceptable (and arguably desirable) since
+    /// the client has been idle past the TTL anyway.
+    pub fn spawn_rate_limit_prune(
+        &self,
+        tracker: &tokio_util::task::TaskTracker,
+        interval: Duration,
+        idle_ttl: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let buckets = Arc::clone(&self.rate_limit_buckets);
+        let idle_ttl_ns = idle_ttl.as_nanos() as u64;
+        tracker.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate tick
+            loop {
+                ticker.tick().await;
+                let now = lorica_shmem::now_ns();
+                buckets.retain(|_, b| {
+                    now.saturating_sub(b.last_activity_ns()) < idle_ttl_ns
+                });
+            }
+        })
+    }
+
     /// Return a reference to the WAF engine for API access.
     pub fn waf_engine(&self) -> &Arc<WafEngine> {
         &self.waf_engine
@@ -2529,15 +2561,12 @@ impl ProxyHttp for LoricaProxy {
                 if !bucket.try_consume(1, lorica_shmem::now_ns()) {
                     ctx.block_reason = Some("rate limited".to_string());
                     let mut header = lorica_http::ResponseHeader::build(429, None)?;
-                    // Retry-After in seconds, rounded up. Avoids 0 so
-                    // pedantic clients don't hot-loop.
-                    let retry_after = if rl.refill_per_sec > 0 {
-                        1u64.max(1_000 / (rl.refill_per_sec as u64))
-                    } else {
-                        // No refill configured: one-shot bucket. Advise
-                        // a generous backoff.
-                        60
-                    };
+                    // Retry-After in seconds. For any configured refill
+                    // rate >= 1 tok/s, 1 second is the right advice
+                    // (one token refills in <= 1 s). A zero refill means
+                    // a one-shot bucket that never refills — advise a
+                    // generous 60 s backoff instead of a tight loop.
+                    let retry_after: u64 = if rl.refill_per_sec >= 1 { 1 } else { 60 };
                     let _ = header.insert_header("Retry-After", retry_after.to_string());
                     let _ = header.insert_header("Content-Type", "text/plain; charset=utf-8");
                     session

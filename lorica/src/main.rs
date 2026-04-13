@@ -860,6 +860,18 @@ fn run_supervisor(cli: Cli) {
                                             // compares against the configured threshold and,
                                             // on the first crossing, broadcasts BanIp and
                                             // resets the slot so the next round starts at zero.
+                                            //
+                                            // Concurrent UDS events for the same IP can race:
+                                            // task A reads shmem >= threshold, decides to ban,
+                                            // resets; task B reads (post-A's read, pre-A's
+                                            // reset) ALSO sees >= threshold and broadcasts a
+                                            // duplicate BanIp. The race is bounded by the
+                                            // burst size of WAF events for one IP within a few
+                                            // microseconds, and the duplicate broadcast is
+                                            // idempotent (DashMap insert + same duration). The
+                                            // ban_list arrives at every worker exactly the
+                                            // same way; the only effect is one extra notify
+                                            // alert dispatch. Acceptable.
                                             if !event.client_ip.is_empty() && event.client_ip != "-" {
                                                 let s = ban_store.lock().await;
                                                 let (threshold, duration_s) = s.get_global_settings()
@@ -1869,6 +1881,15 @@ fn run_worker(
     let worker_auth_prune_tracker = tokio_util::task::TaskTracker::new();
     let _basic_auth_prune = lorica_proxy
         .spawn_basic_auth_cache_prune(&worker_auth_prune_tracker, Duration::from_secs(30));
+    // Per-IP rate-limit buckets need the same lazy-prune treatment:
+    // a scan or high-cardinality traffic pattern would otherwise
+    // accumulate one bucket per distinct IP forever. 5 min idle TTL
+    // matches the shmem WAF eviction cadence.
+    let _rate_limit_prune = lorica_proxy.spawn_rate_limit_prune(
+        &worker_auth_prune_tracker,
+        Duration::from_secs(60),
+        Duration::from_secs(5 * 60),
+    );
     // Open a LogStore so the worker can persist WAF events directly (with
     // route_hostname and action stamped). SQLite WAL mode allows concurrent
     // writes from multiple worker processes.
@@ -2163,6 +2184,13 @@ fn run_single_process(cli: Cli) {
         // cache unboundedly until next restart (PERF-8).
         let _basic_auth_prune = lorica_proxy
             .spawn_basic_auth_cache_prune(&single_task_tracker, Duration::from_secs(30));
+        // Same lazy-prune for per-IP rate-limit buckets; see worker
+        // path comment for rationale.
+        let _rate_limit_prune = lorica_proxy.spawn_rate_limit_prune(
+            &single_task_tracker,
+            Duration::from_secs(60),
+            Duration::from_secs(5 * 60),
+        );
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
