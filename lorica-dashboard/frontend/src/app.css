@@ -661,6 +661,11 @@ tbody tr:hover td {
   padding: var(--space-4);
 }
 
+.settings-section-body .btn-primary,
+.settings-section-body .btn-secondary {
+  min-width: 140px;
+}
+
 .settings-hint {
   color: var(--color-text-muted);
   font-size: 0.8125rem;
