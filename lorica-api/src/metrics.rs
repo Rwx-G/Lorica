@@ -359,6 +359,37 @@ pub fn inc_notifier_events_dropped(reason: &str, count: u64) {
         .inc_by(count);
 }
 
+/// Counter: BanIp commands dropped by the supervisor -> worker
+/// broadcast channel when a worker subscriber falls behind the
+/// bounded queue. Non-zero values signal that the ban channel
+/// capacity is too small for the ban burst rate or that a worker
+/// is stuck long enough to lag the channel. The auto-ban logic
+/// self-heals on subsequent WAF events + the next `ConfigReload`
+/// picks up the persisted state, so this is observability, not a
+/// correctness crisis.
+static BAN_BROADCAST_LAGGED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "ban_broadcast_lagged_total",
+            "BanIp commands missed by a worker subscriber due to broadcast channel lag"
+        )
+        .namespace("lorica"),
+        &["worker_id"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one or more BanIp commands lagged on a given worker's
+/// broadcast subscription. `count` is the number of missed messages
+/// reported by `RecvError::Lagged(n)`.
+pub fn inc_ban_broadcast_lagged(worker_id: &str, count: u64) {
+    BAN_BROADCAST_LAGGED_TOTAL
+        .with_label_values(&[worker_id])
+        .inc_by(count);
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,

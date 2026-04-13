@@ -47,17 +47,20 @@ use crate::server::AppState;
 /// cache and hit SQLite directly on `/.well-known/acme-challenge/{token}`
 /// because they do not share the supervisor's memory.
 ///
-/// **Writes:** `insert()` writes to SQLite first, then updates the cache
-/// on success. A crash between the two leaves SQLite with a valid
-/// challenge that the cache does not know about - the next lookup falls
-/// back to SQLite anyway, so the challenge still resolves.
+/// **Writes:** `set()` writes the cache first, then spawns a blocking
+/// SQLite INSERT so the call returns quickly. The CA polls the
+/// challenge endpoint seconds-to-minutes later, so the ~tens-of-ms
+/// write window is harmless in practice.
 ///
 /// **Deletes:** challenges are short-lived (ACME validates within
 /// seconds). Entries that outlive their useful life are purged on the
 /// provisioning path after the CA confirms success.
 ///
-/// **Worker visibility:** updates made by the supervisor are visible to
-/// workers via SQLite (WAL mode), no IPC required.
+/// **Worker visibility:** workers serve the HTTP-01 endpoint from the
+/// proxy data plane (port 80); their `request_filter` calls `get()`
+/// which falls back to SQLite when the in-process cache is empty
+/// (always, in the worker case). SQLite WAL mode makes the cross-process
+/// read safe under concurrent writes.
 #[derive(Debug, Clone)]
 pub struct AcmeChallengeStore {
     /// In-memory cache for fast lookups in the supervisor process.

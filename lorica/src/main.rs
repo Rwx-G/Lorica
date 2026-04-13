@@ -519,8 +519,15 @@ fn run_supervisor(cli: Cli) {
 
         // Broadcast channel: API config changes fan out to all per-worker tasks
         let (reload_bc_tx, _) = broadcast::channel::<u64>(16);
-        // Broadcast channel: supervisor sends BanIp commands to all per-worker tasks
-        let (ban_bc_tx, _) = broadcast::channel::<(String, u64)>(64);
+        // Broadcast channel: supervisor sends BanIp commands to all
+        // per-worker tasks. Capacity 1024: large enough to absorb a
+        // sweep-like burst from `/api/v1/bans/bulk` or a WAF flood
+        // without tripping `RecvError::Lagged` under normal load. If
+        // a worker still lags, the drop count is exported via the
+        // `lorica_ban_broadcast_lagged_total{worker_id}` Prometheus
+        // counter and the ban is still persisted to SQLite, so the
+        // next `ConfigReload` picks it up.
+        let (ban_bc_tx, _) = broadcast::channel::<(String, u64)>(1024);
         // Clone for the API's watch-based reload signal
         let reload_bc_tx_clone = reload_bc_tx.clone();
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
@@ -570,24 +577,46 @@ fn run_supervisor(cli: Cli) {
                 loop {
                     tokio::select! {
                         // BanIp command from supervisor's global WAF counter
-                        Ok((ip, duration_s)) = ban_rx.recv() => {
-                            let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
-                            let cmd = Command::ban_ip(seq, &ip, duration_s);
-                            if let Err(e) = channel.send(&cmd).await {
-                                warn!(worker_id, error = %e, "BanIp send failed");
-                                continue;
-                            }
-                            match channel.recv::<Response>().await {
-                                Ok(resp) => match resp.typed_status() {
-                                    lorica_command::ResponseStatus::Ok => {
-                                        info!(worker_id, ip = %ip, "worker applied BanIp");
+                        ban_result = ban_rx.recv() => {
+                            match ban_result {
+                                Ok((ip, duration_s)) => {
+                                    let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                                    let cmd = Command::ban_ip(seq, &ip, duration_s);
+                                    if let Err(e) = channel.send(&cmd).await {
+                                        warn!(worker_id, error = %e, "BanIp send failed");
+                                        continue;
                                     }
-                                    lorica_command::ResponseStatus::Error => {
-                                        error!(worker_id, message = %resp.message, "worker BanIp failed");
+                                    match channel.recv::<Response>().await {
+                                        Ok(resp) => match resp.typed_status() {
+                                            lorica_command::ResponseStatus::Ok => {
+                                                info!(worker_id, ip = %ip, "worker applied BanIp");
+                                            }
+                                            lorica_command::ResponseStatus::Error => {
+                                                error!(worker_id, message = %resp.message, "worker BanIp failed");
+                                            }
+                                            _ => {}
+                                        },
+                                        Err(e) => warn!(worker_id, error = %e, "BanIp response failed"),
                                     }
-                                    _ => {}
-                                },
-                                Err(e) => warn!(worker_id, error = %e, "BanIp response failed"),
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    // Subscriber fell behind the bounded channel.
+                                    // The missed bans are still in SQLite (auto-
+                                    // ban logic persists before broadcasting),
+                                    // and the next ConfigReload rehydrates them.
+                                    warn!(
+                                        worker_id,
+                                        dropped = n,
+                                        "BanIp broadcast lagged; missed bans will be applied via next ConfigReload"
+                                    );
+                                    lorica_api::metrics::inc_ban_broadcast_lagged(
+                                        &worker_id.to_string(),
+                                        n,
+                                    );
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
                             }
                         }
                         // Config reload triggered by API
@@ -1403,7 +1432,6 @@ fn run_worker(
                 match cmd.typed_command() {
                     CommandType::ConfigReload => {
                         info!(worker_id = id, seq = cmd.sequence, "applying config reload");
-                        lorica::reload::reload_cert_resolver(&cmd_store, &cmd_cert_resolver).await;
                         // Sync WAF state from persisted settings/DB
                         {
                             let s = cmd_store.lock().await;
@@ -1443,6 +1471,18 @@ fn run_worker(
                         .await
                         {
                             Ok(()) => {
+                                // Rebuild the cert resolver AFTER the
+                                // proxy config is committed so any new
+                                // routes referencing a cert are
+                                // resolvable on the first subsequent
+                                // handshake, and so any TLS-settings
+                                // change lands on the same snapshot
+                                // the proxy just adopted.
+                                lorica::reload::reload_cert_resolver(
+                                    &cmd_store,
+                                    &cmd_cert_resolver,
+                                )
+                                .await;
                                 let resp = Response::ok(cmd.sequence);
                                 if let Err(e) = channel.send(&resp).await {
                                     warn!(error = %e, "failed to send response");
