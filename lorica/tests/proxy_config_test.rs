@@ -83,6 +83,7 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str, enabled: bool) -> Rou
         mirror: None,
         response_rewrite: None,
         mtls: None,
+        rate_limit: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

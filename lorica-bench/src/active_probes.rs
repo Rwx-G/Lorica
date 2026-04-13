@@ -421,6 +421,7 @@ mod tests {
             mirror: None,
             response_rewrite: None,
             mtls: None,
+            rate_limit: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -550,6 +551,7 @@ mod tests {
             mirror: None,
             response_rewrite: None,
             mtls: None,
+            rate_limit: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

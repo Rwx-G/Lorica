@@ -168,6 +168,10 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             let raw: Option<String> = row.get::<_, Option<String>>(61).unwrap_or(None);
             raw.and_then(|s| serde_json::from_str(&s).ok())
         },
+        rate_limit: {
+            let raw: Option<String> = row.get::<_, Option<String>>(62).unwrap_or(None);
+            raw.and_then(|s| serde_json::from_str(&s).ok())
+        },
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

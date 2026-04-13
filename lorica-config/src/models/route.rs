@@ -336,6 +336,45 @@ fn default_forward_auth_timeout_ms() -> u32 {
 /// server configs are immutable after build. Toggling `required` and
 /// editing `allowed_organizations` are both hot-reloadable since those
 /// are enforced in the request path.
+/// Per-route token-bucket rate limit. Cross-worker under `--workers N`
+/// via the lorica-limits `LocalBucket` + supervisor-synced
+/// `AuthoritativeBucket` pair. See
+/// `docs/architecture/worker-shared-state.md` § 6.
+///
+/// `capacity` is the burst allowance (tokens in the bucket); every
+/// request consumes one token. `refill_per_sec` is the steady-state
+/// admission rate. A request whose worker finds the local cache empty
+/// is rejected with 429 `Too Many Requests`. Inter-worker drift is
+/// bounded at `100 ms * N_workers` worth of tokens (sync interval).
+///
+/// When `scope = PerIp`, each client IP gets its own bucket. When
+/// `scope = PerRoute`, a single shared bucket caps aggregate route
+/// traffic regardless of client — useful to protect an origin that
+/// cannot handle more than X rps total.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimit {
+    /// Burst / token-bucket capacity. Must be `> 0`; the API rejects 0.
+    pub capacity: u32,
+    /// Refill rate in tokens/second. `0` disables refill (one-shot).
+    pub refill_per_sec: u32,
+    /// Keying strategy for per-client isolation.
+    #[serde(default)]
+    pub scope: RateLimitScope,
+}
+
+/// How a `RateLimit` partitions traffic across clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitScope {
+    /// One bucket per `(route_id, client_ip)`. Default — protects
+    /// against a single abusive client without penalising the rest.
+    #[default]
+    PerIp,
+    /// Single bucket for the whole route. All clients compete for the
+    /// same tokens. Use to cap aggregate traffic to a fragile origin.
+    PerRoute,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MtlsConfig {
     /// Concatenated PEM-encoded CA certificates that are allowed to
@@ -550,6 +589,12 @@ pub struct Route {
     /// `allowed_organizations`. `None` = disabled (current default).
     #[serde(default)]
     pub mtls: Option<MtlsConfig>,
+    /// Token-bucket rate limit. When set, every request on this route
+    /// passes through a `LocalBucket::try_consume`. In worker mode the
+    /// bucket is synced cross-worker via the supervisor (see
+    /// `lorica_limits::AuthoritativeBucket`). `None` = unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimit>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

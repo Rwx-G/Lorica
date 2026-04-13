@@ -30,8 +30,8 @@ pub use notification::NotificationConfig;
 pub use preferences::{AdminUser, UserPreference};
 pub use probes::{ProbeConfig, ProbeResultRow};
 pub use route::{
-    ForwardAuthConfig, HeaderRule, MirrorConfig, MtlsConfig, PathRule, ResponseRewriteConfig,
-    ResponseRewriteRule, Route, TrafficSplit,
+    ForwardAuthConfig, HeaderRule, MirrorConfig, MtlsConfig, PathRule, RateLimit, RateLimitScope,
+    ResponseRewriteConfig, ResponseRewriteRule, Route, TrafficSplit,
 };
 pub use settings::{
     builtin_security_presets, resolve_security_preset, GlobalSettings, SecurityHeaderPreset,

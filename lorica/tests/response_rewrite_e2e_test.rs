@@ -255,6 +255,7 @@ fn test_route(rewrite: Option<ResponseRewriteConfig>) -> Route {
         mirror: None,
         response_rewrite: rewrite,
         mtls: None,
+        rate_limit: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

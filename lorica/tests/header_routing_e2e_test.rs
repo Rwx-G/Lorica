@@ -160,6 +160,7 @@ fn test_route(id: &str, hostname: &str, header_rules: Vec<HeaderRule>) -> Route 
         mirror: None,
         response_rewrite: None,
         mtls: None,
+        rate_limit: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

@@ -552,6 +552,15 @@ impl ConfigStore {
             [],
         );
 
+        // V33: per-route token-bucket rate limit (WPAR-1 / Phase 3d).
+        // JSON blob or NULL (feature off by default). Schema:
+        //   { "capacity": u32, "refill_per_sec": u32,
+        //     "scope": "per_ip" | "per_route" }
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN rate_limit TEXT DEFAULT NULL",
+            [],
+        );
+
         Ok(())
     }
 

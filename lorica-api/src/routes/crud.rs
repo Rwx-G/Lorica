@@ -26,6 +26,36 @@ use super::response_rewrite::{
 };
 use super::traffic_splits::{build_traffic_split, validate_traffic_splits, TrafficSplitRequest};
 
+/// Upper bound for `capacity` and `refill_per_sec`. Chosen to be large
+/// enough for any realistic proxy workload while still rejecting
+/// accidental values (e.g. u32::MAX) that would overflow downstream
+/// arithmetic in the token-bucket refill path.
+const RATE_LIMIT_MAX: u32 = 1_000_000;
+
+/// Validate a `RateLimit` config for API acceptance. Returns the
+/// config unchanged on success, `ApiError::BadRequest` with a clear
+/// message on validation failure.
+fn validate_rate_limit(
+    rl: &lorica_config::models::RateLimit,
+) -> Result<lorica_config::models::RateLimit, ApiError> {
+    if rl.capacity == 0 {
+        return Err(ApiError::BadRequest(
+            "rate_limit.capacity must be > 0 (use `rate_limit: null` or omit to disable)".into(),
+        ));
+    }
+    if rl.capacity > RATE_LIMIT_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "rate_limit.capacity must be <= {RATE_LIMIT_MAX}"
+        )));
+    }
+    if rl.refill_per_sec > RATE_LIMIT_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "rate_limit.refill_per_sec must be <= {RATE_LIMIT_MAX}"
+        )));
+    }
+    Ok(rl.clone())
+}
+
 /// Full JSON view of a route returned by list / get / create / update endpoints.
 #[derive(Serialize)]
 pub struct RouteResponse {
@@ -96,6 +126,8 @@ pub struct RouteResponse {
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtls: Option<MtlsConfigRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<lorica_config::models::RateLimit>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -165,6 +197,7 @@ pub struct CreateRouteRequest {
     pub mirror: Option<MirrorConfigRequest>,
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
     pub mtls: Option<MtlsConfigRequest>,
+    pub rate_limit: Option<lorica_config::models::RateLimit>,
 }
 
 /// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are mutated.
@@ -241,6 +274,10 @@ pub struct UpdateRouteRequest {
     /// Update semantics: missing = leave alone; present with empty
     /// `ca_cert_pem` = clear; non-empty = validate + install/replace.
     pub mtls: Option<MtlsConfigRequest>,
+    /// Update semantics: missing = leave alone; present with
+    /// `capacity = 0` = clear; present with `capacity > 0` =
+    /// validate + install/replace.
+    pub rate_limit: Option<lorica_config::models::RateLimit>,
 }
 
 fn route_to_response(
@@ -388,6 +425,7 @@ fn route_to_response(
             required: m.required,
             allowed_organizations: m.allowed_organizations.clone(),
         }),
+        rate_limit: route.rate_limit.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -534,6 +572,10 @@ pub async fn create_route(
         mtls: match body.mtls.as_ref() {
             Some(m) if !m.ca_cert_pem.trim().is_empty() => Some(build_mtls_config(m)?),
             _ => None,
+        },
+        rate_limit: match body.rate_limit.as_ref() {
+            Some(rl) => Some(validate_rate_limit(rl)?),
+            None => None,
         },
         created_at: now,
         updated_at: now,
@@ -873,6 +915,16 @@ pub async fn update_route(
             route.mtls = None;
         } else {
             route.mtls = Some(build_mtls_config(m)?);
+        }
+    }
+    if let Some(ref rl) = body.rate_limit {
+        // capacity == 0 = explicit "disable" signal; any positive value
+        // goes through validate_rate_limit and replaces the existing
+        // config.
+        if rl.capacity == 0 {
+            route.rate_limit = None;
+        } else {
+            route.rate_limit = Some(validate_rate_limit(rl)?);
         }
     }
     route.updated_at = Utc::now();
