@@ -238,6 +238,9 @@ pub fn now_ns() -> u64 {
     // walker will simply see every slot as "fresh" during that tick.
     clock_gettime(ClockId::CLOCK_MONOTONIC)
         .map(|ts| {
+            // tv_nsec is i64 but POSIX constrains CLOCK_MONOTONIC to
+            // 0..=999_999_999 — never negative in practice — so the
+            // `as u64` cast is well-defined.
             (ts.num_seconds() as u64)
                 .saturating_mul(1_000_000_000)
                 .saturating_add(ts.tv_nsec() as u64)
