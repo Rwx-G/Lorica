@@ -304,21 +304,21 @@
       <div class="modal">
         <h2>SLA Configuration</h2>
         <div class="form-group">
-          <label>Target SLA (%)</label>
-          <input type="number" bind:value={cfgTargetPct} step="0.1" min="0" max="100" />
+          <label for="sla-target-pct">Target SLA (%)</label>
+          <input id="sla-target-pct" type="number" bind:value={cfgTargetPct} step="0.1" min="0" max="100" />
         </div>
         <div class="form-group">
-          <label>Max Latency (ms)</label>
-          <input type="number" bind:value={cfgMaxLatency} min="1" />
+          <label for="sla-max-latency">Max Latency (ms)</label>
+          <input id="sla-max-latency" type="number" bind:value={cfgMaxLatency} min="1" />
         </div>
         <div class="form-row">
           <div class="form-group">
-            <label>Success Status Min</label>
-            <input type="number" bind:value={cfgStatusMin} min="100" max="599" />
+            <label for="sla-status-min">Success Status Min</label>
+            <input id="sla-status-min" type="number" bind:value={cfgStatusMin} min="100" max="599" />
           </div>
           <div class="form-group">
-            <label>Success Status Max</label>
-            <input type="number" bind:value={cfgStatusMax} min="100" max="599" />
+            <label for="sla-status-max">Success Status Max</label>
+            <input id="sla-status-max" type="number" bind:value={cfgStatusMax} min="100" max="599" />
           </div>
         </div>
         <div class="form-actions">

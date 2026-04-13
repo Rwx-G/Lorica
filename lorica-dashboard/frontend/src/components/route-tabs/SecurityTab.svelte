@@ -263,14 +263,14 @@
   </p>
 
   <div class="form-group" class:modified={form.mirror_backend_ids.length > 0}>
-    <label id="mirror-backends-label">Shadow backends</label>
+    <label id="mirror-backends-label" for="mirror-backend-{backends[0]?.id ?? 'none'}">Shadow backends</label>
     {#if backends.length === 0}
       <p class="text-muted small">No backends available.</p>
     {:else}
       <div class="checkbox-list" role="group" aria-labelledby="mirror-backends-label">
         {#each backends as b (b.id)}
           <label class="checkbox-item">
-            <input type="checkbox" checked={form.mirror_backend_ids.includes(b.id)} onchange={() => toggleMirrorBackend(b.id)} />
+            <input id="mirror-backend-{b.id}" type="checkbox" checked={form.mirror_backend_ids.includes(b.id)} onchange={() => toggleMirrorBackend(b.id)} />
             <span>{b.name ? `${b.name} (${b.address})` : b.address}</span>
           </label>
         {/each}

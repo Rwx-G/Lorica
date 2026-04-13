@@ -8,7 +8,7 @@ FIXLIST.md
 /tmp/
 
 # Build artifacts
-/.pnpm-store/
+.pnpm-store/
 dist/*.deb
 dist/*.rpm
 dist/lorica_*/

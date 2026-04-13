@@ -198,20 +198,20 @@
         <p>Add this TXT record at your DNS provider for <strong>{manualPendingDomain}</strong>, then click confirm.</p>
 
         <div class="form-group">
-          <label>TXT Record Name</label>
+          <label for="acme-manual-txt-name-copy">TXT Record Name</label>
           <div class="copyable-field">
             <code class="copyable-value">{manualTxtName}</code>
-            <button class="btn btn-small" onclick={() => copyToClipboard(manualTxtName, 'name')}>
+            <button id="acme-manual-txt-name-copy" class="btn btn-small" onclick={() => copyToClipboard(manualTxtName, 'name')}>
               {manualCopied === 'name' ? 'Copied' : 'Copy'}
             </button>
           </div>
         </div>
 
         <div class="form-group">
-          <label>TXT Record Value</label>
+          <label for="acme-manual-txt-value-copy">TXT Record Value</label>
           <div class="copyable-field">
             <code class="copyable-value">{manualTxtValue}</code>
-            <button class="btn btn-small" onclick={() => copyToClipboard(manualTxtValue, 'value')}>
+            <button id="acme-manual-txt-value-copy" class="btn btn-small" onclick={() => copyToClipboard(manualTxtValue, 'value')}>
               {manualCopied === 'value' ? 'Copied' : 'Copy'}
             </button>
           </div>
@@ -221,21 +221,21 @@
 
         {#each manualTxtRecords as rec, i}
           <div class="form-group" style="border-left: 3px solid var(--border-color); padding-left: 12px; margin-bottom: 16px;">
-            <label><strong>{rec.domain}</strong></label>
+            <div class="form-section-label"><strong>{rec.domain}</strong></div>
             <div style="margin-top: 4px;">
-              <label>TXT Record Name</label>
+              <label for="acme-manual-rec-name-copy-{i}">TXT Record Name</label>
               <div class="copyable-field">
                 <code class="copyable-value">{rec.name}</code>
-                <button class="btn btn-small" onclick={() => copyToClipboard(rec.name, `name-${i}`)}>
+                <button id="acme-manual-rec-name-copy-{i}" class="btn btn-small" onclick={() => copyToClipboard(rec.name, `name-${i}`)}>
                   {manualCopied === `name-${i}` ? 'Copied' : 'Copy'}
                 </button>
               </div>
             </div>
             <div style="margin-top: 4px;">
-              <label>TXT Record Value</label>
+              <label for="acme-manual-rec-value-copy-{i}">TXT Record Value</label>
               <div class="copyable-field">
                 <code class="copyable-value">{rec.value}</code>
-                <button class="btn btn-small" onclick={() => copyToClipboard(rec.value, `value-${i}`)}>
+                <button id="acme-manual-rec-value-copy-{i}" class="btn btn-small" onclick={() => copyToClipboard(rec.value, `value-${i}`)}>
                   {manualCopied === `value-${i}` ? 'Copied' : 'Copy'}
                 </button>
               </div>
@@ -258,21 +258,21 @@
       {/if}
 
       <div class="form-group">
-        <label>Domain(s) <span class="required">*</span></label>
-        <input type="text" bind:value={acmeDomain} placeholder="example.com, www.example.com" />
+        <label for="acme-domain">Domain(s) <span class="required">*</span></label>
+        <input id="acme-domain" type="text" bind:value={acmeDomain} placeholder="example.com, www.example.com" />
         <span class="hint">Separate multiple domains with commas for a SAN certificate. Use *.example.com for wildcards (DNS-01 only).</span>
       </div>
 
       <div class="form-group">
-        <label>Contact Email</label>
-        <input type="text" bind:value={acmeEmail} placeholder="admin@example.com" />
+        <label for="acme-email">Contact Email</label>
+        <input id="acme-email" type="text" bind:value={acmeEmail} placeholder="admin@example.com" />
       </div>
 
       <div class="form-group">
-        <label>Challenge Method</label>
+        <label for="acme-mode-http01">Challenge Method</label>
         <div class="radio-group">
           <label class="radio-item">
-            <input type="radio" bind:group={acmeMode} value="http01" />
+            <input id="acme-mode-http01" type="radio" bind:group={acmeMode} value="http01" />
             HTTP-01 (port 80 must be reachable)
           </label>
           <label class="radio-item">
@@ -289,8 +289,8 @@
       {#if acmeMode === 'dns01'}
         {#if dnsProviders.length > 0}
           <div class="form-group">
-            <label>DNS Provider</label>
-            <select bind:value={acmeDnsProviderId}>
+            <label for="acme-dns-provider-id">DNS Provider</label>
+            <select id="acme-dns-provider-id" bind:value={acmeDnsProviderId}>
               <option value="">-- Enter credentials manually --</option>
               {#each dnsProviders as dp}
                 <option value={dp.id}>{dp.name} ({dp.provider_type})</option>
@@ -303,8 +303,8 @@
 
         {#if !acmeDnsProviderId}
           <div class="form-group">
-            <label>DNS Provider Type</label>
-            <select bind:value={acmeDnsProvider}>
+            <label for="acme-dns-provider-type">DNS Provider Type</label>
+            <select id="acme-dns-provider-type" bind:value={acmeDnsProvider}>
               <option value="cloudflare">Cloudflare</option>
               <option value="route53">AWS Route53</option>
               <option value="ovh">OVH</option>
@@ -312,20 +312,20 @@
           </div>
           {#if acmeDnsProvider === 'ovh'}
             <div class="form-group">
-              <label>Application Key <span class="required">*</span></label>
-              <input type="text" bind:value={acmeDnsApiToken} placeholder="OVH Application Key" />
+              <label for="acme-ovh-app-key">Application Key <span class="required">*</span></label>
+              <input id="acme-ovh-app-key" type="text" bind:value={acmeDnsApiToken} placeholder="OVH Application Key" />
             </div>
             <div class="form-group">
-              <label>Application Secret <span class="required">*</span></label>
-              <input type="password" bind:value={acmeDnsApiSecret} placeholder="OVH Application Secret" />
+              <label for="acme-ovh-app-secret">Application Secret <span class="required">*</span></label>
+              <input id="acme-ovh-app-secret" type="password" bind:value={acmeDnsApiSecret} placeholder="OVH Application Secret" />
             </div>
             <div class="form-group">
-              <label>Consumer Key <span class="required">*</span></label>
-              <input type="password" bind:value={acmeOvhConsumerKey} placeholder="OVH Consumer Key" />
+              <label for="acme-ovh-consumer-key">Consumer Key <span class="required">*</span></label>
+              <input id="acme-ovh-consumer-key" type="password" bind:value={acmeOvhConsumerKey} placeholder="OVH Consumer Key" />
             </div>
             <div class="form-group">
-              <label>API Endpoint</label>
-              <select bind:value={acmeOvhEndpoint}>
+              <label for="acme-ovh-endpoint">API Endpoint</label>
+              <select id="acme-ovh-endpoint" bind:value={acmeOvhEndpoint}>
                 <option value="eu.api.ovh.com">Europe (eu.api.ovh.com)</option>
                 <option value="ca.api.ovh.com">Canada (ca.api.ovh.com)</option>
                 <option value="api.us.ovhcloud.com">US (api.us.ovhcloud.com)</option>
@@ -333,17 +333,17 @@
             </div>
           {:else}
             <div class="form-group">
-              <label>Zone ID <span class="required">*</span></label>
-              <input type="text" bind:value={acmeDnsZoneId} placeholder="Zone identifier" />
+              <label for="acme-dns-zone-id">Zone ID <span class="required">*</span></label>
+              <input id="acme-dns-zone-id" type="text" bind:value={acmeDnsZoneId} placeholder="Zone identifier" />
             </div>
             <div class="form-group">
-              <label>API Token <span class="required">*</span></label>
-              <input type="password" bind:value={acmeDnsApiToken} placeholder="API token" />
+              <label for="acme-dns-api-token">API Token <span class="required">*</span></label>
+              <input id="acme-dns-api-token" type="password" bind:value={acmeDnsApiToken} placeholder="API token" />
             </div>
             {#if acmeDnsProvider === 'route53'}
               <div class="form-group">
-                <label>AWS Secret Access Key</label>
-                <input type="password" bind:value={acmeDnsApiSecret} placeholder="Secret key" />
+                <label for="acme-route53-secret-key">AWS Secret Access Key</label>
+                <input id="acme-route53-secret-key" type="password" bind:value={acmeDnsApiSecret} placeholder="Secret key" />
               </div>
             {/if}
           {/if}

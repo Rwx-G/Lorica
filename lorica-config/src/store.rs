@@ -2913,9 +2913,10 @@ fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
         path_prefix: row.get(2)?,
         certificate_id: row.get(3)?,
         load_balancing: LoadBalancing::from_str(&row.get::<_, String>(4)?)
-            .map_err(ConfigError::Validation)?,
+            .map_err(|e| ConfigError::Validation(format!("invalid load_balancing: {e}")))?,
         waf_enabled: row.get(5)?,
-        waf_mode: WafMode::from_str(&row.get::<_, String>(6)?).map_err(ConfigError::Validation)?,
+        waf_mode: WafMode::from_str(&row.get::<_, String>(6)?)
+            .map_err(|e| ConfigError::Validation(format!("invalid waf_mode: {e}")))?,
         enabled: row.get(7)?,
         force_https: row.get(8)?,
         redirect_hostname: row.get(9)?,
@@ -3014,12 +3015,12 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> Result<Backend> {
         group_name: row.get(3)?,
         weight: row.get(4)?,
         health_status: HealthStatus::from_str(&row.get::<_, String>(5)?)
-            .map_err(ConfigError::Validation)?,
+            .map_err(|e| ConfigError::Validation(format!("invalid health_status: {e}")))?,
         health_check_enabled: row.get(6)?,
         health_check_interval_s: row.get(7)?,
         health_check_path: row.get(8)?,
         lifecycle_state: LifecycleState::from_str(&row.get::<_, String>(9)?)
-            .map_err(ConfigError::Validation)?,
+            .map_err(|e| ConfigError::Validation(format!("invalid lifecycle_state: {e}")))?,
         active_connections: row.get(10)?,
         tls_upstream: row.get(11)?,
         created_at: parse_datetime(&row.get::<_, String>(12)?)?,
@@ -3044,7 +3045,7 @@ fn row_to_notification_config(row: &rusqlite::Row<'_>) -> Result<NotificationCon
     Ok(NotificationConfig {
         id: row.get(0)?,
         channel: NotificationChannel::from_str(&row.get::<_, String>(1)?)
-            .map_err(ConfigError::Validation)?,
+            .map_err(|e| ConfigError::Validation(format!("invalid notification channel: {e}")))?,
         enabled: row.get(2)?,
         config: row.get(3)?,
         alert_types,
@@ -3056,7 +3057,7 @@ fn row_to_user_preference(row: &rusqlite::Row<'_>) -> Result<UserPreference> {
         id: row.get(0)?,
         preference_key: row.get(1)?,
         value: PreferenceValue::from_str(&row.get::<_, String>(2)?)
-            .map_err(ConfigError::Validation)?,
+            .map_err(|e| ConfigError::Validation(format!("invalid preference value: {e}")))?,
         created_at: parse_datetime(&row.get::<_, String>(3)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(4)?)?,
     })

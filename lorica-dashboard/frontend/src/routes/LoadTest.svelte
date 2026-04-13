@@ -514,13 +514,13 @@
         {/if}
 
         <div class="form-group">
-          <label>Name <span class="required">*</span></label>
-          <input type="text" bind:value={formName} placeholder="Weekly backend stress test" />
+          <label for="loadtest-name">Name <span class="required">*</span></label>
+          <input id="loadtest-name" type="text" bind:value={formName} placeholder="Weekly backend stress test" />
         </div>
 
         <div class="form-group">
-          <label>Route <span class="required">*</span></label>
-          <select bind:value={formRouteId}>
+          <label for="loadtest-route">Route <span class="required">*</span></label>
+          <select id="loadtest-route" bind:value={formRouteId}>
             <option value="">Select a route...</option>
             {#each routes as route}
               <option value={route.id}>{route.hostname}{route.path_prefix !== '/' ? route.path_prefix : ''}</option>
@@ -528,45 +528,45 @@
           </select>
         </div>
         <div class="form-group">
-          <label>Path</label>
-          <input type="text" bind:value={formPathSuffix} placeholder="/" />
+          <label for="loadtest-path">Path</label>
+          <input id="loadtest-path" type="text" bind:value={formPathSuffix} placeholder="/" />
           <span class="hint">Path suffix appended to the route (e.g., /api/health)</span>
         </div>
 
         <div class="form-row">
           <div class="form-group">
-            <label>Method</label>
-            <select bind:value={formMethod}>
+            <label for="loadtest-method">Method</label>
+            <select id="loadtest-method" bind:value={formMethod}>
               <option>GET</option><option>POST</option><option>PUT</option><option>HEAD</option>
             </select>
           </div>
           <div class="form-group">
-            <label>Duration (s)</label>
-            <input type="number" bind:value={formDuration} min="5" max="3600" />
+            <label for="loadtest-duration">Duration (s)</label>
+            <input id="loadtest-duration" type="number" bind:value={formDuration} min="5" max="3600" />
           </div>
         </div>
 
         <div class="form-row">
           <div class="form-group">
-            <label>Concurrency</label>
-            <input type="number" bind:value={formConcurrency} min="1" max="10000" />
+            <label for="loadtest-concurrency">Concurrency</label>
+            <input id="loadtest-concurrency" type="number" bind:value={formConcurrency} min="1" max="10000" />
             <span class="hint">Number of simultaneous connections to the target.</span>
           </div>
           <div class="form-group">
-            <label>Requests/sec</label>
-            <input type="number" bind:value={formRps} min="1" max="100000" />
+            <label for="loadtest-rps">Requests/sec</label>
+            <input id="loadtest-rps" type="number" bind:value={formRps} min="1" max="100000" />
             <span class="hint">Target throughput. Total requests = RPS x Duration.</span>
           </div>
         </div>
 
         <div class="form-group">
-          <label>Error Abort Threshold (%)</label>
-          <input type="number" bind:value={formErrorThreshold} min="1" max="100" step="0.5" />
+          <label for="loadtest-error-threshold">Error Abort Threshold (%)</label>
+          <input id="loadtest-error-threshold" type="number" bind:value={formErrorThreshold} min="1" max="100" step="0.5" />
         </div>
 
         <div class="form-group">
-          <label>Schedule (cron, optional)</label>
-          <input type="text" bind:value={formCron} placeholder="0 3 * * 1 (Mon 03:00)" />
+          <label for="loadtest-cron">Schedule (cron, optional)</label>
+          <input id="loadtest-cron" type="text" bind:value={formCron} placeholder="0 3 * * 1 (Mon 03:00)" />
           <span class="hint">5-field cron: min hour dom month dow</span>
         </div>
 

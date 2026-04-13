@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import {
     api,
     type CertificateResponse,
@@ -20,15 +21,16 @@
 
   const DOMAIN_PATTERN = /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
 
-  // Edit form state
-  let editDomain = $state(editingCert.domain);
+  // Edit form state - initialized from props once at mount; bind:value mutates locally.
+  // untrack() silences the "locally captured" warning since reading editingCert here is intentional.
+  let editDomain = $state(untrack(() => editingCert.domain));
   let editCertPem = $state('');
   let editKeyPem = $state('');
   let editError = $state('');
   let editSubmitting = $state(false);
-  let editDnsProviderId = $state(editingCert.acme_dns_provider_id ?? '');
-  let editAcmeMethod = $state(editingCert.acme_method ?? '');
-  let editAutoRenew = $state(editingCert.acme_auto_renew);
+  let editDnsProviderId = $state(untrack(() => editingCert.acme_dns_provider_id ?? ''));
+  let editAcmeMethod = $state(untrack(() => editingCert.acme_method ?? ''));
+  let editAutoRenew = $state(untrack(() => editingCert.acme_auto_renew));
 
   function handleEditKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') onClose();

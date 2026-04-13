@@ -805,7 +805,7 @@
                 <p class="step-hint">Paste the content of each included file to resolve them, then click "Re-parse".</p>
                 {#each unresolvedIncludes as inc, i}
                   <div class="include-entry">
-                    <label class="include-label">
+                    <label class="include-label" for="nginx-import-include-{i}">
                       <span class="badge badge-error">include</span>
                       <code>{inc.path}</code> (line {inc.line})
                     </label>
@@ -813,6 +813,7 @@
                       <code>{inc.path.includes('letsencrypt') || inc.path.includes('/etc/ssl') ? 'sudo ' : ''}cat {inc.path}</code>
                     </div>
                     <textarea
+                      id="nginx-import-include-{i}"
                       class="include-textarea"
                       bind:value={unresolvedIncludes[i].content}
                       placeholder="Paste file contents here..."
@@ -831,12 +832,12 @@
                 <h4>TLS certificates</h4>
                 {#each certEntries as cert, i}
                   <div class="cert-import-entry">
-                    <label class="include-label">
+                    <label class="include-label" for="nginx-import-cert-mode-acme-{i}">
                       <span class="badge badge-tls">TLS</span>
                       <code>{cert.hostname}{cert.aliases.length > 0 ? `, ${cert.aliases.join(', ')}` : ''}</code>
                     </label>
                     <div class="cert-mode-toggle">
-                      <button class="cert-mode-btn" class:active={cert.mode === 'acme'} onclick={() => { certEntries[i].mode = 'acme'; certEntries = [...certEntries]; }}>ACME (Let's Encrypt)</button>
+                      <button id="nginx-import-cert-mode-acme-{i}" class="cert-mode-btn" class:active={cert.mode === 'acme'} onclick={() => { certEntries[i].mode = 'acme'; certEntries = [...certEntries]; }}>ACME (Let's Encrypt)</button>
                       <button class="cert-mode-btn" class:active={cert.mode === 'import'} onclick={() => { certEntries[i].mode = 'import'; certEntries = [...certEntries]; }}>Import PEM</button>
                       <button class="cert-mode-btn" class:active={cert.mode === 'skip'} onclick={() => { certEntries[i].mode = 'skip'; certEntries = [...certEntries]; }}>Skip</button>
                     </div>

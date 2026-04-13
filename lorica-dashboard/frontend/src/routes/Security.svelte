@@ -464,18 +464,18 @@
 
           <div class="form-row">
             <div class="form-group">
-              <label>Rule ID</label>
-              <input type="number" bind:value={crId} min="10000" />
+              <label for="custom-rule-id">Rule ID</label>
+              <input id="custom-rule-id" type="number" bind:value={crId} min="10000" />
             </div>
             <div class="form-group">
-              <label>Severity (1-5)</label>
-              <input type="number" bind:value={crSeverity} min="1" max="5" />
+              <label for="custom-rule-severity">Severity (1-5)</label>
+              <input id="custom-rule-severity" type="number" bind:value={crSeverity} min="1" max="5" />
             </div>
           </div>
 
           <div class="form-group">
-            <label>Category</label>
-            <select bind:value={crCategory}>
+            <label for="custom-rule-category">Category</label>
+            <select id="custom-rule-category" bind:value={crCategory}>
               <option value="sql_injection">SQL Injection</option>
               <option value="xss">XSS</option>
               <option value="path_traversal">Path Traversal</option>
@@ -485,13 +485,13 @@
           </div>
 
           <div class="form-group">
-            <label>Description <span class="required">*</span></label>
-            <input type="text" bind:value={crDescription} placeholder="Block known exploit pattern" />
+            <label for="custom-rule-description">Description <span class="required">*</span></label>
+            <input id="custom-rule-description" type="text" bind:value={crDescription} placeholder="Block known exploit pattern" />
           </div>
 
           <div class="form-group">
-            <label>Regex Pattern <span class="required">*</span></label>
-            <input type="text" bind:value={crPattern} placeholder="(?i)malicious_pattern" />
+            <label for="custom-rule-pattern">Regex Pattern <span class="required">*</span></label>
+            <input id="custom-rule-pattern" type="text" bind:value={crPattern} placeholder="(?i)malicious_pattern" />
             <span class="hint">Rust regex syntax. Case-insensitive with (?i) prefix.</span>
           </div>
 

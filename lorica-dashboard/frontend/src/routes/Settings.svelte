@@ -667,7 +667,7 @@
             </div>
             <label class="toggle-label">
               <span>{helperGuideVisible ? 'Visible' : 'Hidden'}</span>
-              <button class="toggle" class:on={helperGuideVisible} onclick={toggleHelperGuide}>
+              <button class="toggle" class:on={helperGuideVisible} onclick={toggleHelperGuide} aria-label="Toggle helper guide visibility">
                 <span class="toggle-knob"></span>
               </button>
             </label>

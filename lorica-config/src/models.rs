@@ -1,13 +1,25 @@
 use std::collections::HashMap;
-use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use strum::{EnumString, IntoStaticStr};
 
 // --- Enums ---
+//
+// Each enum below derives `strum::EnumString` (provides `FromStr`) and
+// `strum::IntoStaticStr` (provides `impl From<&Self> for &'static str`),
+// with `#[strum(serialize_all = "snake_case")]` matching the existing
+// on-the-wire and on-disk representation. Callers use the
+// `as_str(&self) -> &'static str` accessor defined on each enum, which
+// simply delegates to the strum derive.
+//
+// Strum's `FromStr::Err` is `strum::ParseError`; callers that feed this
+// into `ConfigError::Validation` need `.map_err(|e| ConfigError::
+// Validation(e.to_string()))`, which is already the pattern.
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum LoadBalancing {
     RoundRobin,
     ConsistentHash,
@@ -18,32 +30,13 @@ pub enum LoadBalancing {
 
 impl LoadBalancing {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::RoundRobin => "round_robin",
-            Self::ConsistentHash => "consistent_hash",
-            Self::Random => "random",
-            Self::PeakEwma => "peak_ewma",
-            Self::LeastConn => "least_conn",
-        }
+        self.into()
     }
 }
 
-impl FromStr for LoadBalancing {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "round_robin" => Ok(Self::RoundRobin),
-            "consistent_hash" => Ok(Self::ConsistentHash),
-            "random" => Ok(Self::Random),
-            "peak_ewma" => Ok(Self::PeakEwma),
-            "least_conn" => Ok(Self::LeastConn),
-            other => Err(format!("unknown load balancing algorithm: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum WafMode {
     Detection,
     Blocking,
@@ -51,26 +44,13 @@ pub enum WafMode {
 
 impl WafMode {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Detection => "detection",
-            Self::Blocking => "blocking",
-        }
+        self.into()
     }
 }
 
-impl FromStr for WafMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "detection" => Ok(Self::Detection),
-            "blocking" => Ok(Self::Blocking),
-            other => Err(format!("unknown WAF mode: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum HealthStatus {
     Healthy,
     Degraded,
@@ -80,30 +60,13 @@ pub enum HealthStatus {
 
 impl HealthStatus {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Healthy => "healthy",
-            Self::Degraded => "degraded",
-            Self::Down => "down",
-            Self::Unknown => "unknown",
-        }
+        self.into()
     }
 }
 
-impl FromStr for HealthStatus {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "healthy" => Ok(Self::Healthy),
-            "degraded" => Ok(Self::Degraded),
-            "down" => Ok(Self::Down),
-            "unknown" => Ok(Self::Unknown),
-            other => Err(format!("unknown health status: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum LifecycleState {
     Normal,
     Closing,
@@ -112,28 +75,13 @@ pub enum LifecycleState {
 
 impl LifecycleState {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::Closing => "closing",
-            Self::Closed => "closed",
-        }
+        self.into()
     }
 }
 
-impl FromStr for LifecycleState {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "normal" => Ok(Self::Normal),
-            "closing" => Ok(Self::Closing),
-            "closed" => Ok(Self::Closed),
-            other => Err(format!("unknown lifecycle state: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum NotificationChannel {
     Email,
     Webhook,
@@ -142,28 +90,13 @@ pub enum NotificationChannel {
 
 impl NotificationChannel {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Email => "email",
-            Self::Webhook => "webhook",
-            Self::Slack => "slack",
-        }
+        self.into()
     }
 }
 
-impl FromStr for NotificationChannel {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "email" => Ok(Self::Email),
-            "webhook" => Ok(Self::Webhook),
-            "slack" => Ok(Self::Slack),
-            other => Err(format!("unknown notification channel: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum PreferenceValue {
     Never,
     Always,
@@ -172,28 +105,15 @@ pub enum PreferenceValue {
 
 impl PreferenceValue {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Never => "never",
-            Self::Always => "always",
-            Self::Once => "once",
-        }
+        self.into()
     }
 }
 
-impl FromStr for PreferenceValue {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "never" => Ok(Self::Never),
-            "always" => Ok(Self::Always),
-            "once" => Ok(Self::Once),
-            other => Err(format!("unknown preference value: {other}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, EnumString, IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum PathMatchType {
     #[default]
     Prefix,
@@ -202,21 +122,7 @@ pub enum PathMatchType {
 
 impl PathMatchType {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Prefix => "prefix",
-            Self::Exact => "exact",
-        }
-    }
-}
-
-impl FromStr for PathMatchType {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "prefix" => Ok(Self::Prefix),
-            "exact" => Ok(Self::Exact),
-            other => Err(format!("unknown path match type: {other}")),
-        }
+        self.into()
     }
 }
 
@@ -258,8 +164,11 @@ impl PathRule {
 ///
 /// `Regex` is compiled at route-load time; a malformed regex produces a
 /// warning and disables the rule rather than failing the whole reload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, EnumString, IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum HeaderMatchType {
     #[default]
     Exact,
@@ -269,23 +178,7 @@ pub enum HeaderMatchType {
 
 impl HeaderMatchType {
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Exact => "exact",
-            Self::Prefix => "prefix",
-            Self::Regex => "regex",
-        }
-    }
-}
-
-impl FromStr for HeaderMatchType {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "exact" => Ok(Self::Exact),
-            "prefix" => Ok(Self::Prefix),
-            "regex" => Ok(Self::Regex),
-            other => Err(format!("unknown header match type: {other}")),
-        }
+        self.into()
     }
 }
 

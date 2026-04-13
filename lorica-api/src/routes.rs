@@ -874,7 +874,7 @@ fn build_header_rule(
         .as_deref()
         .unwrap_or("exact")
         .parse()
-        .map_err(ApiError::BadRequest)?;
+        .map_err(|e: strum::ParseError| ApiError::BadRequest(e.to_string()))?;
     if matches!(
         match_type,
         lorica_config::models::HeaderMatchType::Exact
@@ -929,14 +929,14 @@ pub async fn create_route(
         .as_deref()
         .unwrap_or("round_robin")
         .parse::<lorica_config::models::LoadBalancing>()
-        .map_err(ApiError::BadRequest)?;
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let waf_mode = body
         .waf_mode
         .as_deref()
         .unwrap_or("detection")
         .parse::<lorica_config::models::WafMode>()
-        .map_err(ApiError::BadRequest)?;
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let path_rules = if let Some(ref prs) = body.path_rules {
         let mut rules = Vec::with_capacity(prs.len());
@@ -952,7 +952,7 @@ pub async fn create_route(
                 .as_deref()
                 .unwrap_or("prefix")
                 .parse::<lorica_config::models::PathMatchType>()
-                .map_err(ApiError::BadRequest)?;
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             rules.push(lorica_config::models::PathRule {
                 path: pr.path.clone(),
                 match_type,
@@ -1126,7 +1126,7 @@ pub async fn update_route(
     if let Some(lb) = body.load_balancing {
         route.load_balancing = lb
             .parse::<lorica_config::models::LoadBalancing>()
-            .map_err(ApiError::BadRequest)?;
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
     if let Some(waf_enabled) = body.waf_enabled {
         route.waf_enabled = waf_enabled;
@@ -1134,7 +1134,7 @@ pub async fn update_route(
     if let Some(waf_mode) = body.waf_mode {
         route.waf_mode = waf_mode
             .parse::<lorica_config::models::WafMode>()
-            .map_err(ApiError::BadRequest)?;
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
     if let Some(enabled) = body.enabled {
         route.enabled = enabled;
@@ -1318,7 +1318,7 @@ pub async fn update_route(
                 .as_deref()
                 .unwrap_or("prefix")
                 .parse::<lorica_config::models::PathMatchType>()
-                .map_err(ApiError::BadRequest)?;
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             rules.push(lorica_config::models::PathRule {
                 path: pr.path.clone(),
                 match_type,

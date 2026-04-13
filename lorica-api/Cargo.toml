@@ -46,6 +46,7 @@ http = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 parking_lot = "0.12"
 ipnet = "2"
+strum = "0.26"
 
 [features]
 default = ["route53"]

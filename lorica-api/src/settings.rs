@@ -243,7 +243,7 @@ pub async fn create_notification(
     let channel: lorica_config::models::NotificationChannel = body
         .channel
         .parse()
-        .map_err(|e: String| ApiError::BadRequest(e))?;
+        .map_err(|e: strum::ParseError| ApiError::BadRequest(e.to_string()))?;
 
     validate_notification_config(&body.config)?;
 
@@ -374,7 +374,7 @@ pub async fn update_notification(
     let channel: lorica_config::models::NotificationChannel = body
         .channel
         .parse()
-        .map_err(|e: String| ApiError::BadRequest(e))?;
+        .map_err(|e: strum::ParseError| ApiError::BadRequest(e.to_string()))?;
 
     validate_notification_config(&body.config)?;
 
@@ -471,7 +471,7 @@ pub async fn update_preference(
     let value: lorica_config::models::PreferenceValue = body
         .value
         .parse()
-        .map_err(|e: String| ApiError::BadRequest(e))?;
+        .map_err(|e: strum::ParseError| ApiError::BadRequest(e.to_string()))?;
 
     let store = state.store.lock().await;
     let existing = store
