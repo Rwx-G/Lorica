@@ -314,7 +314,10 @@ mod tests {
             }));
         }
         let total_ok: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
-        assert_eq!(total_ok, 1000, "exactly `capacity` consumptions may succeed");
+        assert_eq!(
+            total_ok, 1000,
+            "exactly `capacity` consumptions may succeed"
+        );
         assert_eq!(b.take_delta(), 1000);
         assert_eq!(b.tokens(), 0);
     }

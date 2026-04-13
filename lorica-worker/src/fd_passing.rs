@@ -347,8 +347,8 @@ mod tests {
         use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
         let (parent_fd, child_fd) = create_socketpair().expect("socketpair failed");
 
-        let memfd = memfd_create(c"lorica-shmem-test", MemFdCreateFlag::MFD_CLOEXEC)
-            .expect("memfd_create");
+        let memfd =
+            memfd_create(c"lorica-shmem-test", MemFdCreateFlag::MFD_CLOEXEC).expect("memfd_create");
         let dummy = socket::socket(
             AddressFamily::Unix,
             SockType::Stream,

@@ -1282,9 +1282,7 @@ impl LoricaProxy {
             loop {
                 ticker.tick().await;
                 let now = lorica_shmem::now_ns();
-                buckets.retain(|_, b| {
-                    now.saturating_sub(b.last_activity_ns()) < idle_ttl_ns
-                });
+                buckets.retain(|_, b| now.saturating_sub(b.last_activity_ns()) < idle_ttl_ns);
             }
         })
     }
@@ -2535,27 +2533,21 @@ impl ProxyHttp for LoricaProxy {
         if let Some(ref rl) = entry.route.rate_limit {
             if !is_whitelisted {
                 let scope_key = match rl.scope {
-                    lorica_config::models::RateLimitScope::PerIp => ctx
-                        .client_ip
-                        .as_deref()
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    lorica_config::models::RateLimitScope::PerRoute => {
-                        "__route__".to_string()
+                    lorica_config::models::RateLimitScope::PerIp => {
+                        ctx.client_ip.as_deref().unwrap_or("unknown").to_string()
                     }
+                    lorica_config::models::RateLimitScope::PerRoute => "__route__".to_string(),
                 };
                 let key = format!("{}|{}", entry.route.id, scope_key);
                 let bucket = self
                     .rate_limit_buckets
                     .entry(key)
                     .or_insert_with(|| {
-                        Arc::new(
-                            lorica_limits::token_bucket::AuthoritativeBucket::new(
-                                rl.capacity,
-                                rl.refill_per_sec,
-                                lorica_shmem::now_ns(),
-                            ),
-                        )
+                        Arc::new(lorica_limits::token_bucket::AuthoritativeBucket::new(
+                            rl.capacity,
+                            rl.refill_per_sec,
+                            lorica_shmem::now_ns(),
+                        ))
                     })
                     .clone();
                 if !bucket.try_consume(1, lorica_shmem::now_ns()) {
@@ -3243,13 +3235,11 @@ impl ProxyHttp for LoricaProxy {
                     if threshold > 0 {
                         if let Some(region) = self.shmem {
                             // Multi-worker: just bump the shmem counter.
-                            let tagged =
-                                region.tagged(ip_to_shmem_key(ip.as_str()));
-                            let _ = region.waf_auto_ban.increment(
-                                tagged,
-                                1,
-                                lorica_shmem::now_ns(),
-                            );
+                            let tagged = region.tagged(ip_to_shmem_key(ip.as_str()));
+                            let _ =
+                                region
+                                    .waf_auto_ban
+                                    .increment(tagged, 1, lorica_shmem::now_ns());
                         } else {
                             let violations = self
                                 .waf_violations
@@ -3259,10 +3249,8 @@ impl ProxyHttp for LoricaProxy {
                                 + 1;
                             if violations >= threshold as u64 {
                                 let ban_duration = config.waf_ban_duration_s;
-                                self.ban_list.insert(
-                                    ip.to_string(),
-                                    (Instant::now(), ban_duration as u64),
-                                );
+                                self.ban_list
+                                    .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
                                 self.waf_violations.remove(ip.as_str());
                                 warn!(
                                     ip = %ip,
@@ -3281,10 +3269,7 @@ impl ProxyHttp for LoricaProxy {
                                         )
                                         .with_detail("ip", ip.to_string())
                                         .with_detail("violations", violations.to_string())
-                                        .with_detail(
-                                            "ban_duration_s",
-                                            ban_duration.to_string(),
-                                        ),
+                                        .with_detail("ban_duration_s", ban_duration.to_string()),
                                     );
                                 }
                             }

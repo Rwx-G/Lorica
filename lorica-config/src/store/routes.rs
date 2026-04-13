@@ -84,8 +84,7 @@ impl ConfigStore {
         let response_rewrite_json =
             serialize_optional_field("response_rewrite", route.response_rewrite.as_ref())?;
         let mtls_json = serialize_optional_field("mtls", route.mtls.as_ref())?;
-        let rate_limit_json =
-            serialize_optional_field("rate_limit", route.rate_limit.as_ref())?;
+        let rate_limit_json = serialize_optional_field("rate_limit", route.rate_limit.as_ref())?;
 
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
@@ -308,8 +307,7 @@ impl ConfigStore {
         let response_rewrite_json =
             serialize_optional_field("response_rewrite", route.response_rewrite.as_ref())?;
         let mtls_json = serialize_optional_field("mtls", route.mtls.as_ref())?;
-        let rate_limit_json =
-            serialize_optional_field("rate_limit", route.rate_limit.as_ref())?;
+        let rate_limit_json = serialize_optional_field("rate_limit", route.rate_limit.as_ref())?;
 
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,

@@ -556,14 +556,18 @@ mod tests {
 
     #[test]
     fn test_backoff_calculation() {
-        // Verify that the backoff formula produces correct delays
+        // Verify the actual backoff formula `(1u64 << n.min(5)).min(30)`
+        // used in `restart_worker`. We exercise it via a closure so the
+        // test stays exactly the formula being shipped (and clippy does
+        // not see the `n.min(5)` reduce to a literal at each call site).
+        let backoff = |n: u32| -> u64 { (1u64 << n.min(5)).min(30) };
         // 2^0=1, 2^1=2, 2^2=4, 2^3=8, 2^4=16, 2^5=32->capped to 30
-        assert_eq!((1u64 << 0u32.min(5)).min(30), 1);
-        assert_eq!((1u64 << 1u32.min(5)).min(30), 2);
-        assert_eq!((1u64 << 2u32.min(5)).min(30), 4);
-        assert_eq!((1u64 << 3u32.min(5)).min(30), 8);
-        assert_eq!((1u64 << 4u32.min(5)).min(30), 16);
-        assert_eq!((1u64 << 5u32.min(5)).min(30), 30);
-        assert_eq!((1u64 << 6u32.min(5)).min(30), 30);
+        assert_eq!(backoff(0), 1);
+        assert_eq!(backoff(1), 2);
+        assert_eq!(backoff(2), 4);
+        assert_eq!(backoff(3), 8);
+        assert_eq!(backoff(4), 16);
+        assert_eq!(backoff(5), 30);
+        assert_eq!(backoff(6), 30);
     }
 }

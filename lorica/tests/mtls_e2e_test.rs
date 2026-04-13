@@ -252,6 +252,7 @@ fn mtls_route(ca_pem: &str, required: bool, orgs: Vec<&str>) -> Route {
             required,
             allowed_organizations: orgs.into_iter().map(String::from).collect(),
         }),
+        rate_limit: None,
         created_at: now,
         updated_at: now,
     }
