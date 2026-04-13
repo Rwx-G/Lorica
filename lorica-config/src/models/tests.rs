@@ -487,3 +487,159 @@ fn test_route_with_path_rule_overrides_applies_some_fields() {
     assert_eq!(overridden.hostname, "example.com");
     assert!(!overridden.force_https);
 }
+
+// ---------------------------------------------------------------------------
+// RateLimit (WPAR-1 Phase 3) serde + default coverage.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rate_limit_scope_serde_snake_case() {
+    use crate::models::RateLimitScope;
+    assert_eq!(
+        serde_json::to_string(&RateLimitScope::PerIp).unwrap(),
+        "\"per_ip\""
+    );
+    assert_eq!(
+        serde_json::to_string(&RateLimitScope::PerRoute).unwrap(),
+        "\"per_route\""
+    );
+    let parsed: RateLimitScope = serde_json::from_str("\"per_ip\"").unwrap();
+    assert_eq!(parsed, RateLimitScope::PerIp);
+    let parsed: RateLimitScope = serde_json::from_str("\"per_route\"").unwrap();
+    assert_eq!(parsed, RateLimitScope::PerRoute);
+}
+
+#[test]
+fn rate_limit_scope_default_is_per_ip() {
+    use crate::models::RateLimitScope;
+    assert_eq!(RateLimitScope::default(), RateLimitScope::PerIp);
+}
+
+#[test]
+fn rate_limit_struct_roundtrips() {
+    use crate::models::{RateLimit, RateLimitScope};
+    let rl = RateLimit {
+        capacity: 100,
+        refill_per_sec: 10,
+        scope: RateLimitScope::PerRoute,
+    };
+    let json = serde_json::to_string(&rl).unwrap();
+    assert!(json.contains("\"per_route\""));
+    let back: RateLimit = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.capacity, 100);
+    assert_eq!(back.refill_per_sec, 10);
+    assert_eq!(back.scope, RateLimitScope::PerRoute);
+}
+
+#[test]
+fn rate_limit_scope_defaults_when_missing() {
+    use crate::models::{RateLimit, RateLimitScope};
+    // Operator-friendly: scope can be omitted and falls back to per_ip.
+    let json = r#"{"capacity":50,"refill_per_sec":5}"#;
+    let rl: RateLimit = serde_json::from_str(json).unwrap();
+    assert_eq!(rl.capacity, 50);
+    assert_eq!(rl.refill_per_sec, 5);
+    assert_eq!(rl.scope, RateLimitScope::PerIp);
+}
+
+fn example_route_for_serde() -> Route {
+    let now = chrono::Utc::now();
+    Route {
+        id: "r1".to_string(),
+        hostname: "example.com".to_string(),
+        path_prefix: "/".to_string(),
+        certificate_id: None,
+        load_balancing: LoadBalancing::RoundRobin,
+        waf_enabled: false,
+        waf_mode: WafMode::Detection,
+        enabled: true,
+        force_https: false,
+        redirect_hostname: None,
+        redirect_to: None,
+        hostname_aliases: vec![],
+        proxy_headers: HashMap::new(),
+        response_headers: HashMap::new(),
+        security_headers: "moderate".to_string(),
+        connect_timeout_s: 5,
+        read_timeout_s: 60,
+        send_timeout_s: 60,
+        strip_path_prefix: None,
+        add_path_prefix: None,
+        path_rewrite_pattern: None,
+        path_rewrite_replacement: None,
+        access_log_enabled: true,
+        proxy_headers_remove: vec![],
+        response_headers_remove: vec![],
+        max_request_body_bytes: None,
+        websocket_enabled: true,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        ip_allowlist: vec![],
+        ip_denylist: vec![],
+        cors_allowed_origins: vec![],
+        cors_allowed_methods: vec![],
+        cors_max_age_s: None,
+        compression_enabled: false,
+        retry_attempts: None,
+        cache_enabled: false,
+        cache_ttl_s: 300,
+        cache_max_bytes: 52_428_800,
+        max_connections: None,
+        slowloris_threshold_ms: 5_000,
+        auto_ban_threshold: None,
+        auto_ban_duration_s: 3_600,
+        path_rules: vec![],
+        return_status: None,
+        sticky_session: false,
+        basic_auth_username: None,
+        basic_auth_password_hash: None,
+        stale_while_revalidate_s: 0,
+        stale_if_error_s: 0,
+        retry_on_methods: vec![],
+        maintenance_mode: false,
+        error_page_html: None,
+        cache_vary_headers: vec![],
+        header_rules: vec![],
+        traffic_splits: vec![],
+        forward_auth: None,
+        mirror: None,
+        response_rewrite: None,
+        mtls: None,
+        rate_limit: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+#[test]
+fn route_rate_limit_is_skipped_when_none() {
+    // The `skip_serializing_if = "Option::is_none"` keeps older tooling
+    // and dashboards happy — a route without rate_limit does not leak
+    // a `"rate_limit": null` field.
+    let route = example_route_for_serde();
+    assert!(route.rate_limit.is_none());
+    let json = serde_json::to_string(&route).unwrap();
+    assert!(
+        !json.contains("\"rate_limit\""),
+        "rate_limit should be omitted when None, got: {json}"
+    );
+}
+
+#[test]
+fn route_rate_limit_roundtrips_via_json() {
+    use crate::models::{RateLimit, RateLimitScope};
+    let mut route = example_route_for_serde();
+    route.rate_limit = Some(RateLimit {
+        capacity: 200,
+        refill_per_sec: 20,
+        scope: RateLimitScope::PerIp,
+    });
+    let json = serde_json::to_string(&route).unwrap();
+    let back: Route = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.rate_limit.as_ref().map(|r| r.capacity), Some(200));
+    assert_eq!(back.rate_limit.as_ref().map(|r| r.refill_per_sec), Some(20));
+    assert_eq!(
+        back.rate_limit.as_ref().map(|r| r.scope),
+        Some(RateLimitScope::PerIp)
+    );
+}

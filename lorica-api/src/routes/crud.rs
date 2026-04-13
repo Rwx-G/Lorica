@@ -56,6 +56,85 @@ fn validate_rate_limit(
     Ok(rl.clone())
 }
 
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use lorica_config::models::{RateLimit, RateLimitScope};
+
+    fn rl(capacity: u32, refill_per_sec: u32) -> RateLimit {
+        RateLimit {
+            capacity,
+            refill_per_sec,
+            scope: RateLimitScope::PerIp,
+        }
+    }
+
+    #[test]
+    fn accepts_minimal_valid_config() {
+        let out = validate_rate_limit(&rl(1, 0)).expect("capacity=1 refill=0 should pass");
+        assert_eq!(out.capacity, 1);
+        assert_eq!(out.refill_per_sec, 0);
+    }
+
+    #[test]
+    fn accepts_at_cap() {
+        assert!(validate_rate_limit(&rl(RATE_LIMIT_MAX, RATE_LIMIT_MAX)).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_capacity() {
+        match validate_rate_limit(&rl(0, 10)) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("capacity"), "msg={msg}");
+                assert!(msg.contains("> 0"), "msg should mention > 0: {msg}");
+            }
+            other => panic!("expected BadRequest on capacity=0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_capacity_above_cap() {
+        match validate_rate_limit(&rl(RATE_LIMIT_MAX + 1, 0)) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("capacity"));
+                assert!(msg.contains(&RATE_LIMIT_MAX.to_string()));
+            }
+            other => panic!("expected BadRequest on capacity overflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_refill_above_cap() {
+        match validate_rate_limit(&rl(1, RATE_LIMIT_MAX + 1)) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("refill_per_sec"));
+                assert!(msg.contains(&RATE_LIMIT_MAX.to_string()));
+            }
+            other => panic!("expected BadRequest on refill overflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_scope_across_validation() {
+        let input = RateLimit {
+            capacity: 42,
+            refill_per_sec: 7,
+            scope: RateLimitScope::PerRoute,
+        };
+        let out = validate_rate_limit(&input).unwrap();
+        assert_eq!(out.scope, RateLimitScope::PerRoute);
+    }
+
+    #[test]
+    fn does_not_mutate_input_on_success() {
+        let input = rl(50, 5);
+        let out = validate_rate_limit(&input).unwrap();
+        // out is a clone, input untouched (the function takes &RateLimit).
+        assert_eq!(input.capacity, 50);
+        assert_eq!(out.capacity, 50);
+    }
+}
+
 /// Full JSON view of a route returned by list / get / create / update endpoints.
 #[derive(Serialize)]
 pub struct RouteResponse {
