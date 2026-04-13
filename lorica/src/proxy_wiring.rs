@@ -1187,6 +1187,15 @@ pub struct LoricaProxy {
     /// `docs/architecture/worker-shared-state.md` § 5). `'static`
     /// because the mapping lives for the process lifetime.
     pub shmem: Option<&'static lorica_shmem::SharedRegion>,
+    /// Per-route token-bucket rate limiters keyed by
+    /// `"{route_id}:{scope_key}"`. Created lazily on first request for
+    /// each key. Under multi-worker mode the buckets are per-process
+    /// (each worker has its own bucket), so the effective aggregate
+    /// admission rate is `N_workers * refill_per_sec`. The design
+    /// document's 100 ms cross-worker sync (§ 6) is a follow-up;
+    /// single-process deployments get exact semantics today.
+    pub rate_limit_buckets:
+        Arc<DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>>,
 }
 
 impl LoricaProxy {
@@ -1220,6 +1229,7 @@ impl LoricaProxy {
             circuit_breaker: Arc::new(CircuitBreaker::new(5, 10)),
             basic_auth_cache: Arc::new(DashMap::new()),
             shmem: None,
+            rate_limit_buckets: Arc::new(DashMap::new()),
         }
     }
 
@@ -2479,6 +2489,62 @@ impl ProxyHttp for LoricaProxy {
                     .write_response_header(Box::new(header), true)
                     .await?;
                 return Ok(true);
+            }
+        }
+
+        // Per-route token-bucket rate limit. Runs after ban/blocklist
+        // and redirects so that an abusive client is rejected before
+        // we touch WAF / mtls / forward_auth. See design § 6 and
+        // `lorica_limits::token_bucket::AuthoritativeBucket`.
+        //
+        // Whitelisted IPs bypass the limiter (same policy as WAF ban
+        // checks — an operator who added an IP to the whitelist has
+        // made a deliberate trust decision).
+        if let Some(ref rl) = entry.route.rate_limit {
+            if !is_whitelisted {
+                let scope_key = match rl.scope {
+                    lorica_config::models::RateLimitScope::PerIp => ctx
+                        .client_ip
+                        .as_deref()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    lorica_config::models::RateLimitScope::PerRoute => {
+                        "__route__".to_string()
+                    }
+                };
+                let key = format!("{}|{}", entry.route.id, scope_key);
+                let bucket = self
+                    .rate_limit_buckets
+                    .entry(key)
+                    .or_insert_with(|| {
+                        Arc::new(
+                            lorica_limits::token_bucket::AuthoritativeBucket::new(
+                                rl.capacity,
+                                rl.refill_per_sec,
+                                lorica_shmem::now_ns(),
+                            ),
+                        )
+                    })
+                    .clone();
+                if !bucket.try_consume(1, lorica_shmem::now_ns()) {
+                    ctx.block_reason = Some("rate limited".to_string());
+                    let mut header = lorica_http::ResponseHeader::build(429, None)?;
+                    // Retry-After in seconds, rounded up. Avoids 0 so
+                    // pedantic clients don't hot-loop.
+                    let retry_after = if rl.refill_per_sec > 0 {
+                        1u64.max(1_000 / (rl.refill_per_sec as u64))
+                    } else {
+                        // No refill configured: one-shot bucket. Advise
+                        // a generous backoff.
+                        60
+                    };
+                    let _ = header.insert_header("Retry-After", retry_after.to_string());
+                    let _ = header.insert_header("Content-Type", "text/plain; charset=utf-8");
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(true);
+                }
             }
         }
 

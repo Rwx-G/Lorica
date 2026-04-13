@@ -182,6 +182,26 @@ impl AuthoritativeBucket {
         Self::whole_tokens(s.tokens_fp, self.capacity)
     }
 
+    /// Attempt to consume `cost` tokens in a single atomic step under
+    /// the bucket lock. Applies the time-based refill first. Returns
+    /// `true` on success (tokens drained), `false` if there were not
+    /// enough tokens at this instant.
+    ///
+    /// Used in single-process mode (and in multi-worker mode without
+    /// supervisor sync) where the request hot path drives the bucket
+    /// directly instead of the worker-cache + delta-push pattern.
+    pub fn try_consume(&self, cost: u32, now_ns: u64) -> bool {
+        let mut s = self.state.lock().expect("bucket state poisoned");
+        self.refill_locked(&mut s, now_ns);
+        let cost_fp = (cost as i64).saturating_mul(SCALE);
+        if s.tokens_fp >= cost_fp {
+            s.tokens_fp -= cost_fp;
+            true
+        } else {
+            false
+        }
+    }
+
     fn refill_locked(&self, s: &mut State, now_ns: u64) {
         if now_ns <= s.last_refill_ns {
             return;
@@ -304,6 +324,22 @@ mod tests {
         let b = AuthoritativeBucket::new(100, 100, 0);
         assert_eq!(b.apply_delta(10, 0), 90);
         assert_eq!(b.apply_delta(10, 500_000_000), 90);
+    }
+
+    #[test]
+    fn authoritative_try_consume_refills_and_rejects_when_empty() {
+        // capacity 5, refill 10/s. Start full.
+        let b = AuthoritativeBucket::new(5, 10, 0);
+        // Drain exactly.
+        for _ in 0..5 {
+            assert!(b.try_consume(1, 0));
+        }
+        // Now empty.
+        assert!(!b.try_consume(1, 0));
+        // 200 ms later: 2 tokens refilled.
+        assert!(b.try_consume(1, 200_000_000));
+        assert!(b.try_consume(1, 200_000_000));
+        assert!(!b.try_consume(1, 200_000_000));
     }
 
     #[test]
