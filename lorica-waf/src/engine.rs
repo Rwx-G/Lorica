@@ -36,6 +36,10 @@ pub enum WafVerdict {
 }
 
 /// A single WAF event recording a rule match.
+///
+/// One event is produced per rule that fires on a given field
+/// (path, query, header, or body). Events are stored in the engine's
+/// bounded ring buffer and surfaced to the dashboard / API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WafEvent {
     pub rule_id: u32,
@@ -57,13 +61,22 @@ pub struct WafEvent {
 }
 
 /// WAF operating mode for a specific evaluation.
+///
+/// `Detection` records matches but lets the request through (used for
+/// tuning new rules without breaking traffic). `Blocking` returns 403
+/// to the client when any rule matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WafMode {
+    /// Log matches but allow the request to proceed.
     Detection,
+    /// Reject the request with a 403 on any rule match.
     Blocking,
 }
 
 /// Summary of a WAF rule for API exposure.
+///
+/// Mirrors a [`crate::rules::WafRule`] but drops the compiled regex
+/// so it can be safely serialized over the admin API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleSummary {
     pub id: u32,
@@ -74,6 +87,10 @@ pub struct RuleSummary {
 }
 
 /// A user-defined custom WAF rule.
+///
+/// Custom rules are evaluated alongside the default ruleset on every
+/// scanned field. Their regex is compiled with a size cap (see
+/// [`WafEngine::MAX_CUSTOM_REGEX_SIZE`]) to bound admin attack surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomRule {
     pub id: u32,
@@ -85,6 +102,11 @@ pub struct CustomRule {
 }
 
 /// WAF engine with precompiled rules, IP blocklist, and event ring buffer.
+///
+/// Cheap to share across worker threads behind an `Arc`: all mutable
+/// state (disabled rule set, custom rules, event buffer, blocklist) is
+/// behind interior locks. The recent-event buffer is bounded to 500
+/// entries; older events are dropped FIFO.
 pub struct WafEngine {
     ruleset: RuleSet,
     disabled_rules: RwLock<HashSet<u32>>,
@@ -114,6 +136,12 @@ impl WafEngine {
     }
 
     /// Record an IP blocklist block as a WAF event.
+    ///
+    /// Synthesizes a pseudo-event with `rule_id = 0` and category
+    /// [`RuleCategory::IpBlocklist`] so blocklist hits show up in the
+    /// same dashboard timeline as regex matches. `host` and `path` are
+    /// accepted for symmetry with [`Self::evaluate`] but currently
+    /// only the IP is stored.
     pub fn record_blocklist_event(&self, ip: &str, _host: &str, _path: &str) {
         let event = WafEvent {
             rule_id: 0,
@@ -192,6 +220,10 @@ impl WafEngine {
     }
 
     /// Bulk-set which rules are disabled.
+    ///
+    /// Replaces the entire disabled set with `rule_ids`. IDs that do
+    /// not match any loaded rule are silently ignored so stale config
+    /// from disk does not poison the runtime state.
     pub fn set_disabled_rules(&self, rule_ids: &[u32]) {
         let mut disabled = self.disabled_rules.write();
         disabled.clear();
@@ -214,7 +246,12 @@ impl WafEngine {
     /// custom rule. Matches what `RegexBuilder::size_limit` gates.
     pub const MAX_CUSTOM_REGEX_SIZE: usize = 512 * 1024;
 
-    /// Add a custom user-defined WAF rule. Returns Err if the regex is invalid.
+    /// Add a custom user-defined WAF rule.
+    ///
+    /// Returns `Err` with a human-readable message if the pattern
+    /// exceeds [`Self::MAX_CUSTOM_PATTERN_LEN`], if the compiled regex
+    /// would exceed [`Self::MAX_CUSTOM_REGEX_SIZE`], or if the pattern
+    /// is not a valid regex. On success the rule starts enabled.
     pub fn add_custom_rule(
         &self,
         id: u32,
@@ -245,7 +282,7 @@ impl WafEngine {
         Ok(())
     }
 
-    /// Remove a custom rule by ID.
+    /// Remove a custom rule by ID. Returns `true` if a rule was removed.
     pub fn remove_custom_rule(&self, id: u32) -> bool {
         let mut rules = self.custom_rules.write();
         let before = rules.len();
@@ -269,8 +306,12 @@ impl WafEngine {
 
     /// Evaluate a request against the WAF ruleset.
     ///
-    /// Checks the URI path, query string, and specified header values.
-    /// Returns the verdict along with timing information logged via tracing.
+    /// Checks the URI path, query string, and the supplied header
+    /// values. Each field is URL-decoded (recursively, up to 3 passes)
+    /// before being scanned to defeat percent-encoded bypass attempts.
+    /// Matching events are appended to the engine's ring buffer and a
+    /// `latency_us` field is logged via tracing on every call - it
+    /// measures the regex scan only, not request wall-clock.
     pub fn evaluate(
         &self,
         mode: WafMode,
@@ -358,10 +399,13 @@ impl WafEngine {
 
     /// Evaluate a request body against the WAF ruleset.
     ///
-    /// Scans the body content using the same rules as `evaluate()`.
-    /// Intended to be called from `request_body_filter` once the full body
-    /// is buffered, complementing the header/path/query scan done in
-    /// `request_filter`.
+    /// Scans the body content using the same rules as
+    /// [`Self::evaluate`], but skips rules whose category does not
+    /// apply to bodies (path traversal, protocol violations) to avoid
+    /// false positives on CMS articles or JSON payloads. Non-UTF-8
+    /// bodies (binary uploads) short-circuit to [`WafVerdict::Pass`].
+    /// Intended to be called from `request_body_filter` once the full
+    /// body is buffered.
     pub fn evaluate_body(
         &self,
         mode: WafMode,
@@ -540,6 +584,8 @@ impl WafEngine {
     }
 
     /// Return recent WAF events from the ring buffer.
+    ///
+    /// Returns at most `limit` events, newest first.
     pub fn recent_events(&self, limit: usize) -> Vec<WafEvent> {
         let buf = self.event_buffer.lock();
         buf.iter().rev().take(limit).cloned().collect()

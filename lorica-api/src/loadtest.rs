@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Load test configuration CRUD plus run lifecycle (start, abort, results).
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -31,8 +33,7 @@ use std::time::Duration;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
 
-/// GET /api/v1/loadtest/configs
-/// List all load test configurations.
+/// GET /api/v1/loadtest/configs - list every saved load test configuration.
 pub async fn list_configs(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -43,8 +44,7 @@ pub async fn list_configs(
     Ok(json_data(configs))
 }
 
-/// POST /api/v1/loadtest/configs
-/// Create a new load test configuration.
+/// JSON body for `POST /api/v1/loadtest/configs`. Optional fields receive defaults.
 #[derive(Deserialize)]
 pub struct CreateLoadTestConfig {
     pub name: String,
@@ -99,6 +99,7 @@ fn validate_target_url(url: &str, store: &lorica_config::ConfigStore) -> Result<
     Ok(())
 }
 
+/// POST /api/v1/loadtest/configs - create a new load test configuration. Target must match a configured route.
 pub async fn create_config(
     Extension(state): Extension<AppState>,
     Json(body): Json<CreateLoadTestConfig>,
@@ -136,8 +137,7 @@ pub async fn create_config(
     ))
 }
 
-/// PUT /api/v1/loadtest/configs/:id
-/// Update an existing load test configuration.
+/// JSON body for `PUT /api/v1/loadtest/configs/:id`. Only supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateLoadTestConfig {
     pub name: Option<String>,
@@ -153,6 +153,7 @@ pub struct UpdateLoadTestConfig {
     pub enabled: Option<bool>,
 }
 
+/// PUT /api/v1/loadtest/configs/:id - patch fields on a saved load test configuration.
 pub async fn update_config(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -209,7 +210,7 @@ pub async fn update_config(
     Ok(json_data(config))
 }
 
-/// DELETE /api/v1/loadtest/configs/:id
+/// DELETE /api/v1/loadtest/configs/:id - delete a saved load test configuration.
 pub async fn delete_config(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -221,8 +222,7 @@ pub async fn delete_config(
     Ok(json_data(serde_json::json!({"deleted": id})))
 }
 
-/// POST /api/v1/loadtest/start/:config_id
-/// Start a load test.
+/// POST /api/v1/loadtest/start/:config_id - launch a load test, returning a confirmation requirement if it exceeds safe limits.
 pub async fn start_test(
     Extension(state): Extension<AppState>,
     Path(config_id): Path<String>,
@@ -272,8 +272,7 @@ pub async fn start_test(
     })))
 }
 
-/// POST /api/v1/loadtest/start/:config_id/confirm
-/// Start a load test that exceeds safe limits (user confirmed).
+/// POST /api/v1/loadtest/start/:config_id/confirm - launch a load test that exceeds safe limits, after explicit user confirmation.
 pub async fn start_test_confirmed(
     Extension(state): Extension<AppState>,
     Path(config_id): Path<String>,
@@ -308,8 +307,7 @@ pub async fn start_test_confirmed(
     })))
 }
 
-/// GET /api/v1/loadtest/status
-/// Get status of the currently running test.
+/// GET /api/v1/loadtest/status - return progress for the active test or `{"active":false}`.
 pub async fn get_status(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -327,8 +325,7 @@ pub async fn get_status(
     }
 }
 
-/// POST /api/v1/loadtest/abort
-/// Abort the currently running test.
+/// POST /api/v1/loadtest/abort - request that the running load test stop.
 pub async fn abort_test(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -341,8 +338,7 @@ pub async fn abort_test(
     Ok(json_data(serde_json::json!({"status": "abort_requested"})))
 }
 
-/// GET /api/v1/loadtest/results/:config_id
-/// Get historical results for a load test configuration.
+/// GET /api/v1/loadtest/results/:config_id - list every persisted result for a config (newest first).
 pub async fn get_results(
     Extension(state): Extension<AppState>,
     Path(config_id): Path<String>,
@@ -354,8 +350,7 @@ pub async fn get_results(
     Ok(json_data(results))
 }
 
-/// GET /api/v1/loadtest/results/:config_id/compare
-/// Compare the latest result with the previous one.
+/// GET /api/v1/loadtest/results/:config_id/compare - diff the latest and previous run for a config.
 pub async fn compare_results(
     Extension(state): Extension<AppState>,
     Path(config_id): Path<String>,
@@ -431,13 +426,13 @@ async fn handle_loadtest_stream(
     }
 }
 
-/// POST /api/v1/loadtest/configs/:id/clone
-/// Clone a load test configuration for reproducible comparisons.
+/// JSON body for `POST /api/v1/loadtest/configs/:id/clone` - optional new name.
 #[derive(Deserialize)]
 pub struct CloneConfig {
     pub name: Option<String>,
 }
 
+/// POST /api/v1/loadtest/configs/:id/clone - duplicate a configuration so successive runs are comparable.
 pub async fn clone_config(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,

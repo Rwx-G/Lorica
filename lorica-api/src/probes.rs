@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Active SLA probe configuration endpoints (CRUD plus per-probe history).
+
 use axum::extract::{Path, Query};
 use axum::Extension;
 use axum::Json;
@@ -51,8 +53,7 @@ pub async fn list_probes_for_route(
     Ok(json_data(probes))
 }
 
-/// POST /api/v1/probes
-/// Create a new probe configuration.
+/// JSON body for `POST /api/v1/probes`. Optional fields fall back to safe defaults.
 #[derive(Deserialize)]
 pub struct CreateProbe {
     pub route_id: String,
@@ -63,6 +64,7 @@ pub struct CreateProbe {
     pub timeout_ms: Option<i32>,
 }
 
+/// POST /api/v1/probes - create a new active probe attached to a route.
 pub async fn create_probe(
     Extension(state): Extension<AppState>,
     Json(body): Json<CreateProbe>,
@@ -105,8 +107,7 @@ pub async fn create_probe(
     ))
 }
 
-/// PUT /api/v1/probes/:id
-/// Update a probe configuration.
+/// JSON body for `PUT /api/v1/probes/:id`. Only supplied fields are applied.
 #[derive(Deserialize)]
 pub struct UpdateProbe {
     pub method: Option<String>,
@@ -117,6 +118,7 @@ pub struct UpdateProbe {
     pub enabled: Option<bool>,
 }
 
+/// PUT /api/v1/probes/:id - patch fields on an existing probe configuration.
 pub async fn update_probe(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -176,13 +178,13 @@ pub async fn delete_probe(
     Ok(json_data(serde_json::json!({"deleted": id})))
 }
 
-/// GET /api/v1/probes/:id/history
-/// Returns execution history for a specific probe.
+/// Optional `?limit=N` query parameter for probe history; capped at 1000.
 #[derive(Deserialize)]
 pub struct ProbeHistoryQuery {
     pub limit: Option<usize>,
 }
 
+/// GET /api/v1/probes/:id/history - return up to `limit` recent probe execution results.
 pub async fn probe_history(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,

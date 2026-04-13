@@ -10,6 +10,12 @@ const REDACTED: &str = "**REDACTED**";
 
 const EXPORT_FORMAT_VERSION: u32 = 1;
 
+/// Serializable snapshot of a store's full contents emitted by
+/// [`export_to_toml`]. `version` tags the export schema for
+/// forward-compatible reads from [`crate::import::ImportData`].
+/// Sensitive fields (admin password hashes, certificate private keys,
+/// SMTP passwords) are replaced with `**REDACTED**` before
+/// serialization and re-import is rejected if the placeholder remains.
 #[derive(Debug, Serialize)]
 pub struct ExportData {
     pub version: u32,

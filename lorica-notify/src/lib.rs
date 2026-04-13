@@ -16,7 +16,11 @@
 
 //! Notification channels for Lorica alert events.
 //!
-//! Supports stdout (always on), SMTP email, and HTTP webhook delivery.
+//! Supports stdout (always on), SMTP email, Slack/Discord webhooks, and
+//! generic HTTP webhook delivery. Producers emit [`AlertEvent`] values
+//! through an [`AlertSender`] (a non-blocking broadcast channel); a
+//! background task spawned via [`spawn_alert_dispatcher`] drains the
+//! channel and fans events out through a [`NotifyDispatcher`].
 
 pub mod channels;
 pub mod events;
@@ -35,25 +39,39 @@ pub struct AlertSender {
 }
 
 impl AlertSender {
-    /// Create a new alert sender with a bounded broadcast channel.
+    /// Create a new alert sender backed by a bounded broadcast channel.
+    ///
+    /// `capacity` is the per-receiver buffer size. Slow subscribers that
+    /// fall behind will observe `RecvError::Lagged` and skip events rather
+    /// than block producers.
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(capacity);
         Self { tx }
     }
 
-    /// Send an alert event (fire-and-forget, never blocks).
+    /// Send an alert event, fire-and-forget.
+    ///
+    /// Never blocks and never returns an error: if no receivers are
+    /// subscribed (or the channel is closed), the event is silently dropped.
     pub fn send(&self, event: AlertEvent) {
         let _ = self.tx.send(event);
     }
 
-    /// Subscribe to the alert channel (for the background dispatcher).
+    /// Subscribe a new receiver to the alert channel.
+    ///
+    /// Each subscriber gets its own bounded buffer of size `capacity`
+    /// (see [`AlertSender::new`]).
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AlertEvent> {
         self.tx.subscribe()
     }
 }
 
-/// Spawn a background task that reads from the AlertSender channel and
-/// dispatches events via the NotifyDispatcher.
+/// Spawn a background task that drains an [`AlertSender`] and dispatches
+/// each event through the shared [`NotifyDispatcher`].
+///
+/// The task exits when the broadcast channel is closed. `Lagged` errors are
+/// logged at warn level and the dropped count is reported, but the task
+/// keeps running.
 pub fn spawn_alert_dispatcher(
     alert_sender: &AlertSender,
     dispatcher: std::sync::Arc<tokio::sync::Mutex<NotifyDispatcher>>,

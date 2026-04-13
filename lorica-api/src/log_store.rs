@@ -1,3 +1,7 @@
+//! SQLite-backed persistent store for access logs, WAF events, and
+//! notification history. Used as the source of truth when present, with
+//! [`crate::logs::LogBuffer`] as a transient fallback in tests.
+
 use std::path::Path;
 
 use parking_lot::Mutex;
@@ -6,6 +10,7 @@ use rusqlite::{params, Connection};
 
 use crate::logs::{LogEntry, LogsQuery};
 
+/// Persistent log database wrapper. Cheaply cloneable through `Arc<LogStore>`.
 pub struct LogStore {
     conn: Mutex<Connection>,
 }
@@ -117,6 +122,7 @@ impl LogStore {
     }
 
     /// Insert a log entry.
+    /// Append one access log entry to the database.
     pub fn insert(&self, entry: &LogEntry) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
@@ -143,6 +149,7 @@ impl LogStore {
     }
 
     /// Query entries with filtering. Returns newest first.
+    /// Query log entries with pagination and filters; returns `(rows, total_match_count)`.
     pub fn query(&self, params: &LogsQuery) -> Result<(Vec<LogEntry>, usize), String> {
         let conn = self.conn.lock();
 
@@ -255,6 +262,7 @@ impl LogStore {
     }
 
     /// Query entries for export (up to `max` rows, no pagination). Returns oldest first.
+    /// Stream up to `max` matching entries for export (CSV / JSON).
     pub fn query_export(&self, params: &LogsQuery, max: usize) -> Result<Vec<LogEntry>, String> {
         let conn = self.conn.lock();
 
@@ -344,6 +352,7 @@ impl LogStore {
     }
 
     /// Delete entries older than the retention limit, keeping at most `max_entries` rows.
+    /// Trim the access log table to the most recent `max_entries`. Returns the number deleted.
     pub fn enforce_retention(&self, max_entries: u64) -> Result<u64, String> {
         let conn = self.conn.lock();
         let count: i64 = conn
@@ -365,6 +374,7 @@ impl LogStore {
     }
 
     /// Clear all entries.
+    /// Remove every access log row.
     pub fn clear(&self) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM access_logs", [])
@@ -373,6 +383,7 @@ impl LogStore {
     }
 
     /// Get total entry count.
+    /// Return the total number of access log rows in the database.
     pub fn count(&self) -> Result<u64, String> {
         let conn = self.conn.lock();
         let count: i64 = conn
@@ -384,6 +395,7 @@ impl LogStore {
     // ---- WAF Events ----
 
     /// Insert a WAF event.
+    /// Persist a single WAF event for later querying via the events endpoint.
     pub fn insert_waf_event(&self, event: &lorica_waf::WafEvent) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
@@ -409,6 +421,7 @@ impl LogStore {
     /// Query WAF events, newest first. When `category` is provided, only
     /// events matching that category are returned (filtered at the SQL level
     /// so that `limit` applies to the filtered set, not the full table).
+    /// Return up to `limit` recent WAF events, optionally filtered by category.
     pub fn list_waf_events(
         &self,
         limit: usize,
@@ -463,6 +476,7 @@ impl LogStore {
     }
 
     /// Clear all WAF events.
+    /// Remove every persisted WAF event row.
     pub fn clear_waf_events(&self) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM waf_events", [])
@@ -471,6 +485,7 @@ impl LogStore {
     }
 
     /// Purge old WAF events, keeping at most `max_entries`.
+    /// Trim the WAF events table to the most recent `max_entries`. Returns the number deleted.
     pub fn enforce_waf_retention(&self, max_entries: u64) -> Result<u64, String> {
         let conn = self.conn.lock();
         let count: i64 = conn
@@ -491,6 +506,7 @@ impl LogStore {
     // ---- Notification History ----
 
     /// Insert a notification event.
+    /// Persist a notification dispatch outcome for the history endpoint.
     pub fn insert_notification_event(
         &self,
         event: &lorica_notify::AlertEvent,
@@ -513,6 +529,7 @@ impl LogStore {
     }
 
     /// List recent notification events, newest first.
+    /// Return up to `limit` recent notification history rows.
     pub fn list_notification_history(
         &self,
         limit: usize,
@@ -564,6 +581,7 @@ impl LogStore {
     }
 
     /// Prune old notification events, keeping at most `max_entries`.
+    /// Trim the notification history table to the most recent `max_entries`.
     pub fn enforce_notification_retention(&self, max_entries: u64) -> Result<u64, String> {
         let conn = self.conn.lock();
         let count: i64 = conn

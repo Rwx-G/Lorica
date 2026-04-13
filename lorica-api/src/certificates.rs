@@ -1,3 +1,6 @@
+//! TLS certificate CRUD plus self-signed generation. ACME-issued certs are
+//! created via the [`crate::acme`] module but managed here once stored.
+
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
@@ -7,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
 
+/// Compact certificate view returned by list endpoints (no PEM body).
 #[derive(Serialize)]
 pub struct CertificateResponse {
     pub id: String,
@@ -25,6 +29,7 @@ pub struct CertificateResponse {
     pub acme_dns_provider_id: Option<String>,
 }
 
+/// JSON body for `POST /api/v1/certificates` - upload a PEM cert and key.
 #[derive(Deserialize)]
 pub struct CreateCertificateRequest {
     pub domain: String,
@@ -32,11 +37,13 @@ pub struct CreateCertificateRequest {
     pub key_pem: String,
 }
 
+/// JSON body for `POST /api/v1/certificates/self-signed`.
 #[derive(Deserialize)]
 pub struct GenerateSelfSignedRequest {
     pub domain: String,
 }
 
+/// JSON body for `PUT /api/v1/certificates/:id`. Only supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateCertificateRequest {
     pub domain: Option<String>,
@@ -47,6 +54,8 @@ pub struct UpdateCertificateRequest {
     pub acme_auto_renew: Option<bool>,
 }
 
+/// Detailed certificate view returned by `GET /api/v1/certificates/:id`,
+/// including the PEM body and the routes that reference it.
 #[derive(Serialize)]
 pub struct CertificateDetailResponse {
     pub id: String,
@@ -203,7 +212,7 @@ fn compute_fingerprint_from_pem(cert_pem: &str) -> String {
     hex
 }
 
-/// GET /api/v1/certificates
+/// GET /api/v1/certificates - list every stored certificate (without PEM bodies).
 pub async fn list_certificates(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -213,7 +222,7 @@ pub async fn list_certificates(
     Ok(json_data(serde_json::json!({ "certificates": responses })))
 }
 
-/// POST /api/v1/certificates
+/// POST /api/v1/certificates - upload a PEM cert + key. Metadata is parsed from the cert.
 pub async fn create_certificate(
     Extension(state): Extension<AppState>,
     Json(body): Json<CreateCertificateRequest>,
@@ -259,7 +268,7 @@ pub async fn create_certificate(
     ))
 }
 
-/// GET /api/v1/certificates/:id
+/// GET /api/v1/certificates/:id - return cert details, PEM body, and associated routes.
 pub async fn get_certificate(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -296,7 +305,7 @@ pub async fn get_certificate(
     Ok(json_data(response))
 }
 
-/// PUT /api/v1/certificates/:id
+/// PUT /api/v1/certificates/:id - replace the PEM body, domain, or ACME settings.
 pub async fn update_certificate(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -346,7 +355,7 @@ pub async fn update_certificate(
     Ok(json_data(cert_to_response(&cert)))
 }
 
-/// DELETE /api/v1/certificates/:id
+/// DELETE /api/v1/certificates/:id - delete a certificate, refusing if any route still references it.
 pub async fn delete_certificate(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -376,7 +385,7 @@ pub async fn delete_certificate(
     ))
 }
 
-/// POST /api/v1/certificates/self-signed
+/// POST /api/v1/certificates/self-signed - generate and store a self-signed cert for the given domain.
 pub async fn generate_self_signed(
     Extension(state): Extension<AppState>,
     Json(body): Json<GenerateSelfSignedRequest>,

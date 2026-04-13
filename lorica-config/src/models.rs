@@ -17,6 +17,11 @@ use strum::{EnumString, IntoStaticStr};
 // into `ConfigError::Validation` need `.map_err(|e| ConfigError::
 // Validation(e.to_string()))`, which is already the pattern.
 
+/// Backend selection strategy for a route's pool of upstream backends.
+///
+/// Used by [`Route::load_balancing`] and consumed by the proxy's load balancer.
+/// Parsed from snake_case strings via `FromStr`; an unknown variant produces
+/// a `strum::ParseError` that callers wrap into `ConfigError::Validation`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -24,16 +29,23 @@ pub enum LoadBalancing {
     RoundRobin,
     ConsistentHash,
     Random,
+    /// Peak EWMA: pick the backend with the lowest exponentially-weighted
+    /// moving average of recent response latencies.
     PeakEwma,
+    /// Least active in-flight connections at selection time.
     LeastConn,
 }
 
 impl LoadBalancing {
+    /// Snake_case wire representation of the variant (matches the
+    /// `serde` and `FromStr` form).
     pub fn as_str(&self) -> &'static str {
         self.into()
     }
 }
 
+/// WAF enforcement mode for a route. `Detection` logs hits but lets the
+/// request through; `Blocking` denies the request with a 403.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -43,11 +55,15 @@ pub enum WafMode {
 }
 
 impl WafMode {
+    /// Snake_case wire representation of the variant (matches the
+    /// `serde` and `FromStr` form).
     pub fn as_str(&self) -> &'static str {
         self.into()
     }
 }
 
+/// Last observed health probe outcome for a backend. `Unknown` is the
+/// pre-probe / probing-disabled default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -59,11 +75,19 @@ pub enum HealthStatus {
 }
 
 impl HealthStatus {
+    /// Snake_case wire representation of the variant (matches the
+    /// `serde` and `FromStr` form).
     pub fn as_str(&self) -> &'static str {
         self.into()
     }
 }
 
+/// Backend rotation state used for graceful drains.
+///
+/// - `Normal`: receives new connections.
+/// - `Closing`: drained by the load balancer; existing connections finish
+///   but no new traffic is sent.
+/// - `Closed`: fully out of rotation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -74,11 +98,14 @@ pub enum LifecycleState {
 }
 
 impl LifecycleState {
+    /// Snake_case wire representation of the variant (matches the
+    /// `serde` and `FromStr` form).
     pub fn as_str(&self) -> &'static str {
         self.into()
     }
 }
 
+/// Transport for an alert sent by a [`NotificationConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -89,11 +116,15 @@ pub enum NotificationChannel {
 }
 
 impl NotificationChannel {
+    /// Snake_case wire representation of the variant (matches the
+    /// `serde` and `FromStr` form).
     pub fn as_str(&self) -> &'static str {
         self.into()
     }
 }
 
+/// Tri-state value persisted in [`UserPreference`] for "always / never /
+/// once" UI dialogs (e.g. "show this tip again?").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumString, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -104,11 +135,15 @@ pub enum PreferenceValue {
 }
 
 impl PreferenceValue {
+    /// Snake_case wire representation of the variant (matches the
+    /// `serde` and `FromStr` form).
     pub fn as_str(&self) -> &'static str {
         self.into()
     }
 }
 
+/// Match semantics for a [`PathRule`]. `Prefix` matches when the request
+/// path starts with the rule's `path`; `Exact` requires equality.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, EnumString, IntoStaticStr,
 )]
@@ -121,11 +156,21 @@ pub enum PathMatchType {
 }
 
 impl PathMatchType {
+    /// Snake_case wire representation of the variant (matches the
+    /// `serde` and `FromStr` form).
     pub fn as_str(&self) -> &'static str {
         self.into()
     }
 }
 
+/// Per-path override that layers on top of a [`Route`]. A matching rule
+/// can re-target backends, swap caching/rate-limit settings, force a
+/// redirect, or short-circuit with `return_status` for the requests
+/// whose path matches `path` under [`PathMatchType`] semantics.
+///
+/// Rules are evaluated in declaration order; the first match wins.
+/// `None` fields leave the underlying route value unchanged - see
+/// [`Route::with_path_rule_overrides`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PathRule {
     pub path: String,
@@ -152,6 +197,8 @@ pub struct PathRule {
 }
 
 impl PathRule {
+    /// Test the rule's `path` against an incoming request path under the
+    /// configured [`PathMatchType`].
     pub fn matches(&self, request_path: &str) -> bool {
         match self.match_type {
             PathMatchType::Prefix => request_path.starts_with(&self.path),
@@ -177,6 +224,8 @@ pub enum HeaderMatchType {
 }
 
 impl HeaderMatchType {
+    /// Snake_case wire representation of the variant (matches the
+    /// `serde` and `FromStr` form).
     pub fn as_str(&self) -> &'static str {
         self.into()
     }
@@ -601,6 +650,19 @@ pub fn resolve_security_preset<'a>(
 
 // --- Data Models ---
 
+/// A virtual host served by the proxy: hostname (+ optional aliases),
+/// associated TLS certificate, the pool of backends behind it, and the
+/// per-route policy knobs (timeouts, headers, WAF, cache, mTLS, ...).
+///
+/// `hostname` (and any entry in `hostname_aliases`) must be unique across
+/// the whole route table - `ConfigStore::create_route` /
+/// `update_route` reject inserts that would create a conflict.
+/// `certificate_id` is a soft reference: if it points to a missing
+/// [`Certificate`] the route will simply fail to terminate TLS at runtime
+/// rather than at insert time.
+///
+/// Backends are linked separately through `route_backends`; see
+/// `ConfigStore::link_route_backend`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
     pub id: String,
@@ -750,6 +812,11 @@ pub struct Route {
 }
 
 impl Route {
+    /// Return a clone of this route with any `Some(_)` field of `rule`
+    /// merged on top (cache, rate-limit, headers, redirect, return
+    /// status). `None` fields on the rule leave the route unchanged.
+    /// Used by the proxy to resolve the effective config for a request
+    /// once a [`PathRule`] has matched.
     pub fn with_path_rule_overrides(&self, rule: &PathRule) -> Route {
         let mut r = self.clone();
         if let Some(ref h) = rule.response_headers {
@@ -780,6 +847,11 @@ impl Route {
     }
 }
 
+/// Single upstream target reachable at `address` (validated as
+/// `host:port` by the store). Multiple backends are grouped via
+/// `route_backends` and selected by the route's [`LoadBalancing`]
+/// strategy. `health_status` is updated by the health-check loop and
+/// `lifecycle_state` by the drain controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Backend {
     pub id: String,
@@ -815,12 +887,19 @@ pub struct Backend {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Many-to-many association row between a [`Route`] and a [`Backend`].
+/// Surfaced primarily by the export/import path; runtime code uses
+/// `ConfigStore::list_backends_for_route` instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteBackend {
     pub route_id: String,
     pub backend_id: String,
 }
 
+/// X.509 certificate + private key used to terminate TLS for one or
+/// more routes. `key_pem` is encrypted at rest by the store when an
+/// [`EncryptionKey`](crate::EncryptionKey) is configured. `is_acme` /
+/// `acme_*` fields drive the ACME renewal loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certificate {
     pub id: String,
@@ -860,6 +939,10 @@ pub struct DnsProvider {
     pub created_at: DateTime<Utc>,
 }
 
+/// Notification destination (email / webhook / Slack). `config` is a
+/// channel-specific JSON blob (encrypted at rest when the store has an
+/// encryption key) and `alert_types` lists the alert categories this
+/// destination subscribes to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationConfig {
     pub id: String,
@@ -869,6 +952,9 @@ pub struct NotificationConfig {
     pub alert_types: Vec<String>,
 }
 
+/// Persistent UI preference for the dashboard ("never show this dialog
+/// again", etc.). `preference_key` is unique; lookup is via
+/// `ConfigStore::get_user_preference_by_key`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserPreference {
     pub id: String,
@@ -878,6 +964,9 @@ pub struct UserPreference {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Dashboard / API administrator account. `password_hash` is an Argon2
+/// hash; export redacts it to `**REDACTED**` and import refuses to load
+/// records still carrying that placeholder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminUser {
     pub id: String,
@@ -888,6 +977,10 @@ pub struct AdminUser {
     pub last_login: Option<DateTime<Utc>>,
 }
 
+/// Process-wide tunables persisted in the `global_settings` key-value
+/// table. Read with `ConfigStore::get_global_settings` (which fills in
+/// defaults from [`GlobalSettings::default`] for any missing keys) and
+/// rewritten in full by `update_global_settings`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalSettings {
     pub management_port: u16,
@@ -1097,6 +1190,10 @@ impl Default for GlobalSettings {
 
 // --- SLA Models ---
 
+/// Per-route SLA target: the proxy classifies a request as "successful"
+/// when its HTTP status is in `[success_status_min, success_status_max]`
+/// AND its latency is `<= max_latency_ms`. `target_pct` is the success
+/// percentage that defines "meets SLA" in summary reports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaConfig {
     pub route_id: String,
@@ -1109,6 +1206,9 @@ pub struct SlaConfig {
 }
 
 impl SlaConfig {
+    /// Build the default SLA target for a route: 99.9 % success at
+    /// `<= 500 ms` for status codes 200-499. Used by
+    /// `ConfigStore::get_sla_config` when no row exists yet.
     pub fn default_for_route(route_id: &str) -> Self {
         let now = Utc::now();
         Self {
@@ -1122,6 +1222,8 @@ impl SlaConfig {
         }
     }
 
+    /// Return true when the given response satisfies both the status
+    /// and the latency thresholds of this SLA config.
     pub fn is_success(&self, status: u16, latency_ms: u64) -> bool {
         let status_ok = (status as i32) >= self.success_status_min
             && (status as i32) <= self.success_status_max;
@@ -1130,6 +1232,11 @@ impl SlaConfig {
     }
 }
 
+/// Aggregated request statistics for one route over a fixed time window
+/// (the "bucket"). Buckets are written by the SLA aggregator and read
+/// back by `compute_sla_summary`. The `cfg_*` fields snapshot the
+/// [`SlaConfig`] active when the bucket was recorded so historical
+/// reports stay consistent if the live config is later edited.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaBucket {
     pub id: Option<i64>,
@@ -1170,6 +1277,11 @@ fn default_cfg_target_pct() -> f64 {
     99.9
 }
 
+/// Roll-up over a window of [`SlaBucket`]s for one route. Returned by
+/// `ConfigStore::compute_sla_summary` for dashboard display.
+/// `meets_target` compares `sla_pct` against the snapshot `target_pct`
+/// from the most recent bucket in the window (falls back to live config
+/// when the window is empty).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaSummary {
     pub route_id: String,
@@ -1187,6 +1299,10 @@ pub struct SlaSummary {
 
 // --- Probe Models ---
 
+/// Active synthetic probe attached to a [`Route`]. Each enabled probe is
+/// scheduled to issue `method path` against the route every `interval_s`
+/// seconds and assert the response status equals `expected_status`
+/// within `timeout_ms`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeConfig {
     pub id: String,
@@ -1201,6 +1317,8 @@ pub struct ProbeConfig {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One historical probe execution result, returned by
+/// `ConfigStore::list_probe_results`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeResultRow {
     pub id: i64,
@@ -1215,6 +1333,9 @@ pub struct ProbeResultRow {
 
 // --- Load Test Models ---
 
+/// User-defined load test scenario. Driven by `lorica-bench`; can be
+/// invoked manually or scheduled via `schedule_cron`. Range checks
+/// against `GlobalSettings::loadtest_max_*` happen at the API layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadTestConfig {
     pub id: String,
@@ -1233,11 +1354,16 @@ pub struct LoadTestConfig {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Default safe limits for load tests.
+/// Default upper bound on concurrent virtual users per load test.
 pub const SAFE_LIMIT_CONCURRENCY: i32 = 100;
+/// Default upper bound on a single load test's duration, in seconds.
 pub const SAFE_LIMIT_DURATION_S: i32 = 60;
+/// Default upper bound on requests per second per load test.
 pub const SAFE_LIMIT_RPS: i32 = 1000;
 
+/// Aggregated outcome of one [`LoadTestConfig`] execution. `aborted`
+/// is set with `abort_reason` when the run was stopped early (e.g.
+/// `error_threshold_pct` exceeded).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadTestResult {
     pub id: String,
@@ -1258,6 +1384,9 @@ pub struct LoadTestResult {
     pub abort_reason: Option<String>,
 }
 
+/// Pairing of two [`LoadTestResult`]s plus their relative deltas, used
+/// by the dashboard to flag regressions between consecutive runs.
+/// `previous` is `None` for the very first run of a config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadTestComparison {
     pub current: LoadTestResult,

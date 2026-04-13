@@ -29,6 +29,11 @@ pub const DEFAULT_BLOCKLIST_URL: &str =
     "https://raw.githubusercontent.com/duggytuxy/Data-Shield_IPv4_Blocklist/refs/heads/main/prod_data-shield_ipv4_blocklist.txt";
 
 /// Thread-safe IP blocklist with O(1) lookup.
+///
+/// Backed by a `HashSet<IpAddr>` so both IPv4 and IPv6 are supported.
+/// CIDR ranges are not expanded - callers must feed individual host
+/// addresses. The `enabled` flag lets the blocklist be toggled at
+/// runtime without dropping the loaded set.
 pub struct IpBlocklist {
     ips: RwLock<HashSet<IpAddr>>,
     enabled: RwLock<bool>,
@@ -78,6 +83,11 @@ impl IpBlocklist {
     }
 
     /// Load IPs from plain text (one IP per line, comments/blanks ignored).
+    ///
+    /// Replaces any previously loaded entries atomically and enables
+    /// the blocklist on success. Lines that fail to parse as `IpAddr`
+    /// (including CIDR notation) are skipped silently. Returns the
+    /// number of unique IPs loaded.
     pub fn load_from_text(&self, text: &str) -> usize {
         let mut set = HashSet::new();
         for line in text.lines() {
@@ -139,7 +149,7 @@ impl IpBlocklist {
             .is_empty()
     }
 
-    /// Clear the blocklist.
+    /// Clear the blocklist and disable it.
     pub fn clear(&self) {
         self.ips
             .write()

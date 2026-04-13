@@ -1,3 +1,6 @@
+//! Cookie-based session middleware: parsing, persistence, GC, and the
+//! `require_auth` axum guard.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -14,6 +17,7 @@ use crate::error::ApiError;
 const SESSION_COOKIE_NAME: &str = "lorica_session";
 const SESSION_TIMEOUT_MINUTES: i64 = 30;
 
+/// Authenticated session injected into request extensions by [`require_auth`].
 #[derive(Debug, Clone)]
 pub struct Session {
     pub user_id: String,

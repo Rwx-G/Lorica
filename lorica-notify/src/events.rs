@@ -28,6 +28,11 @@ pub enum AlertType {
 }
 
 impl AlertType {
+    /// Return the canonical `snake_case` identifier of this alert type.
+    ///
+    /// Matches the form used by `Serialize`/`Deserialize` and by
+    /// [`std::str::FromStr`], so it is safe to use for routing keys and
+    /// channel subscription filters.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::CertExpiring => "cert_expiring",

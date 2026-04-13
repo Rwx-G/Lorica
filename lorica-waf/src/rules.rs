@@ -33,6 +33,9 @@ pub enum RuleCategory {
 }
 
 impl RuleCategory {
+    /// Stable string identifier for the category, suitable for logs,
+    /// API payloads, and config files. Round-trips with the
+    /// [`std::str::FromStr`] impl.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::SqlInjection => "sql_injection",
@@ -71,6 +74,10 @@ impl std::str::FromStr for RuleCategory {
 }
 
 /// A single WAF rule with a precompiled regex pattern.
+///
+/// Built-in rules use a `'static` description and a CRS-style numeric
+/// `id` (e.g. `942100` for SQLi via UNION). The `pattern` is compiled
+/// once at startup and reused for every request.
 pub struct WafRule {
     /// Unique rule ID (CRS-style numbering).
     pub id: u32,
@@ -109,12 +116,22 @@ impl std::fmt::Debug for WafRule {
 }
 
 /// A compiled set of WAF rules ready for evaluation.
+///
+/// Built once at engine startup via [`RuleSet::default_crs`] and held
+/// immutable for the lifetime of the [`crate::engine::WafEngine`];
+/// per-rule enable/disable state lives separately on the engine so
+/// the compiled regexes can be shared without locking.
 pub struct RuleSet {
     rules: Vec<WafRule>,
 }
 
 impl RuleSet {
     /// Build the default OWASP CRS-inspired ruleset.
+    ///
+    /// Compiles every built-in regex pattern. Panics at startup if any
+    /// pattern is malformed - the patterns are constants vetted in
+    /// tests, so this is treated as a programming error rather than a
+    /// runtime condition.
     pub fn default_crs() -> Self {
         let rules = vec![
             // --- SQL Injection (CRS 942xxx) ---

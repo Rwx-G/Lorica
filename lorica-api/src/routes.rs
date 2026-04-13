@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
 
+/// Per-path rule view returned alongside a route (path match plus per-path overrides).
 #[derive(Serialize)]
 pub struct PathRuleResponse {
     pub path: String,
@@ -44,6 +45,7 @@ pub struct PathRuleResponse {
     pub return_status: Option<u16>,
 }
 
+/// JSON body for a single path rule on a route create or update.
 #[derive(Deserialize)]
 pub struct PathRuleRequest {
     pub path: String,
@@ -59,6 +61,7 @@ pub struct PathRuleRequest {
     pub return_status: Option<u16>,
 }
 
+/// Header-based routing rule (matches a header value, picks a backend pool).
 #[derive(Serialize, Deserialize)]
 pub struct HeaderRuleRequest {
     pub header_name: String,
@@ -77,6 +80,7 @@ pub struct HeaderRuleRequest {
     pub disabled: bool,
 }
 
+/// Canary traffic split assigning a percent of traffic to a backend pool.
 #[derive(Serialize, Deserialize)]
 pub struct TrafficSplitRequest {
     #[serde(default)]
@@ -86,6 +90,7 @@ pub struct TrafficSplitRequest {
     pub backend_ids: Vec<String>,
 }
 
+/// Forward-auth subrequest configuration (address, timeout, propagated headers, verdict cache TTL).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ForwardAuthConfigRequest {
     pub address: String,
@@ -101,6 +106,7 @@ fn default_forward_auth_timeout_ms() -> u32 {
     5_000
 }
 
+/// One literal-or-regex find/replace rule applied to response bodies.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ResponseRewriteRuleRequest {
     pub pattern: String,
@@ -111,6 +117,7 @@ pub struct ResponseRewriteRuleRequest {
     pub max_replacements: Option<u32>,
 }
 
+/// Response body rewrite configuration: ordered rules, body size cap, content-type filter.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ResponseRewriteConfigRequest {
     #[serde(default)]
@@ -121,6 +128,7 @@ pub struct ResponseRewriteConfigRequest {
     pub content_type_prefixes: Vec<String>,
 }
 
+/// Per-route mTLS configuration: trusted CA bundle and optional org allowlist.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MtlsConfigRequest {
     pub ca_cert_pem: String,
@@ -134,6 +142,7 @@ fn default_rewrite_max_body_bytes() -> u32 {
     1_048_576
 }
 
+/// Request mirroring configuration (shadow backends, sample percent, body cap, timeout).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MirrorConfigRequest {
     #[serde(default)]
@@ -156,6 +165,7 @@ fn default_mirror_max_body_bytes() -> u32 {
     1_048_576
 }
 
+/// Full JSON view of a route returned by list / get / create / update endpoints.
 #[derive(Serialize)]
 pub struct RouteResponse {
     pub id: String,
@@ -229,6 +239,7 @@ pub struct RouteResponse {
     pub updated_at: String,
 }
 
+/// JSON body for `POST /api/v1/routes`. Most fields are optional and fall back to defaults.
 #[derive(Deserialize)]
 pub struct CreateRouteRequest {
     pub hostname: String,
@@ -295,6 +306,7 @@ pub struct CreateRouteRequest {
     pub mtls: Option<MtlsConfigRequest>,
 }
 
+/// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateRouteRequest {
     pub hostname: Option<String>,
@@ -901,7 +913,7 @@ fn build_header_rule(
     })
 }
 
-/// GET /api/v1/routes
+/// GET /api/v1/routes - list every configured route with its linked backend ids.
 pub async fn list_routes(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -915,7 +927,10 @@ pub async fn list_routes(
     Ok(json_data(serde_json::json!({ "routes": responses })))
 }
 
-/// POST /api/v1/routes
+/// POST /api/v1/routes - create a new route.
+///
+/// Validates type-shape (enum parsing, regex compilability); business
+/// rules (hostname uniqueness) are enforced by the store layer.
 pub async fn create_route(
     Extension(state): Extension<AppState>,
     Json(body): Json<CreateRouteRequest>,
@@ -1085,7 +1100,7 @@ pub async fn create_route(
     Ok(json_data_with_status(StatusCode::CREATED, response))
 }
 
-/// GET /api/v1/routes/:id
+/// GET /api/v1/routes/:id - fetch a single route by id.
 pub async fn get_route(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -1098,7 +1113,7 @@ pub async fn get_route(
     Ok(json_data(route_to_response(&route, backend_ids)))
 }
 
-/// PUT /api/v1/routes/:id
+/// PUT /api/v1/routes/:id - patch route fields and trigger a proxy reload.
 pub async fn update_route(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -1456,7 +1471,7 @@ pub async fn update_route(
     Ok(json_data(route_to_response(&route, backend_ids)))
 }
 
-/// DELETE /api/v1/routes/:id
+/// DELETE /api/v1/routes/:id - delete a route and notify the proxy.
 pub async fn delete_route(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -1475,11 +1490,13 @@ pub async fn delete_route(
 // any store state.
 // ---------------------------------------------------------------------------
 
+/// JSON body for `POST /api/v1/validate/mtls-pem`.
 #[derive(Deserialize)]
 pub struct ValidateMtlsPemRequest {
     pub ca_cert_pem: String,
 }
 
+/// Response describing a validated mTLS CA bundle (count + per-cert subject summaries).
 #[derive(Serialize)]
 pub struct ValidateMtlsPemResponse {
     pub ca_count: usize,
@@ -1531,6 +1548,7 @@ pub async fn validate_mtls_pem(
     }))
 }
 
+/// JSON body for `POST /api/v1/validate/forward-auth`.
 #[derive(Deserialize)]
 pub struct ValidateForwardAuthRequest {
     pub address: String,
@@ -1538,6 +1556,7 @@ pub struct ValidateForwardAuthRequest {
     pub timeout_ms: u32,
 }
 
+/// Response describing a validated forward-auth probe (status, latency, whitelisted headers).
 #[derive(Serialize)]
 pub struct ValidateForwardAuthResponse {
     /// Status returned by the auth service.

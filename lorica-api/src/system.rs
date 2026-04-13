@@ -1,3 +1,5 @@
+//! Host, process, and proxy resource metrics surfaced via `/api/v1/system`.
+
 use axum::extract::Extension;
 use axum::Json;
 use serde::Serialize;
@@ -6,6 +8,7 @@ use sysinfo::{Pid, System};
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
+/// Top-level payload returned by `GET /api/v1/system`.
 #[derive(Serialize)]
 pub struct SystemResponse {
     pub host: HostMetrics,
@@ -13,6 +16,7 @@ pub struct SystemResponse {
     pub proxy: ProxyInfo,
 }
 
+/// Host-level CPU, memory, and disk usage.
 #[derive(Serialize)]
 pub struct HostMetrics {
     /// Total CPU usage percentage (0-100).
@@ -33,6 +37,7 @@ pub struct HostMetrics {
     pub disk_usage_percent: f64,
 }
 
+/// Lorica process resource usage.
 #[derive(Serialize)]
 pub struct ProcessMetrics {
     /// Lorica process memory usage in bytes (RSS).
@@ -41,6 +46,7 @@ pub struct ProcessMetrics {
     pub cpu_usage_percent: f32,
 }
 
+/// Proxy version, uptime, listen ports, and live connection count.
 #[derive(Serialize)]
 pub struct ProxyInfo {
     /// Lorica version string.
@@ -55,7 +61,8 @@ pub struct ProxyInfo {
     pub https_port: u16,
 }
 
-/// Cached system info to avoid expensive re-creation on every request.
+/// Cached `sysinfo::System` instance, kept in `AppState` to avoid the cost of
+/// recreating it on every request.
 pub struct SystemCache {
     sys: System,
 }
@@ -67,6 +74,7 @@ impl Default for SystemCache {
 }
 
 impl SystemCache {
+    /// Initialize the cache and perform a full first refresh.
     pub fn new() -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
@@ -94,7 +102,7 @@ impl SystemCache {
     }
 }
 
-/// GET /api/v1/system
+/// GET /api/v1/system - return host, process, and proxy resource usage.
 pub async fn get_system(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

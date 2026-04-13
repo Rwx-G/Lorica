@@ -1,3 +1,6 @@
+//! CRUD endpoints for stored DNS provider credentials used by ACME DNS-01
+//! challenges (Cloudflare, Route53, OVH).
+
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
@@ -24,7 +27,7 @@ fn provider_to_response(p: &lorica_config::models::DnsProvider) -> DnsProviderRe
     }
 }
 
-/// GET /api/v1/dns-providers
+/// GET /api/v1/dns-providers - list every stored DNS provider (without credentials).
 pub async fn list_dns_providers(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -124,7 +127,7 @@ impl DnsProviderConfig {
     }
 }
 
-/// POST /api/v1/dns-providers
+/// POST /api/v1/dns-providers - register a new DNS provider with provider-specific credentials.
 pub async fn create_dns_provider(
     Extension(state): Extension<AppState>,
     Json(body): Json<CreateDnsProviderRequest>,
@@ -152,7 +155,7 @@ pub async fn create_dns_provider(
     ))
 }
 
-/// PUT /api/v1/dns-providers/:id
+/// PUT /api/v1/dns-providers/:id - replace the credentials and metadata of an existing DNS provider.
 pub async fn update_dns_provider(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -182,7 +185,7 @@ pub async fn update_dns_provider(
     Ok(json_data(provider_to_response(&provider)))
 }
 
-/// DELETE /api/v1/dns-providers/:id
+/// DELETE /api/v1/dns-providers/:id - delete the provider, refusing if any certificate references it.
 pub async fn delete_dns_provider(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,

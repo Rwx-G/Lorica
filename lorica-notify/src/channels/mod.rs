@@ -100,6 +100,8 @@ pub struct NotifyDispatcher {
 }
 
 impl NotifyDispatcher {
+    /// Create an empty dispatcher with default rate limiting and a
+    /// 100-event history ring buffer.
     pub fn new() -> Self {
         Self {
             channels: Vec::new(),
@@ -111,7 +113,7 @@ impl NotifyDispatcher {
         }
     }
 
-    /// Create a dispatcher with custom rate limiting.
+    /// Create a dispatcher with a custom rate-limit policy.
     pub fn with_rate_limit(rate_limit: RateLimitConfig) -> Self {
         Self {
             rate_limit,
@@ -119,17 +121,26 @@ impl NotifyDispatcher {
         }
     }
 
-    /// Return the number of suppressed notifications.
+    /// Return the cumulative number of notifications suppressed by the
+    /// rate limiter since this dispatcher was created.
     pub fn suppressed_count(&self) -> usize {
         *self.suppressed_count.lock()
     }
 
-    /// Return a reference to the event history buffer.
+    /// Return a shared handle to the in-memory event history ring buffer.
+    ///
+    /// The buffer holds the most recent events (oldest first) up to the
+    /// dispatcher's `max_history` capacity. The returned handle aliases
+    /// the dispatcher's own buffer, so external readers see live updates.
     pub fn history(&self) -> Arc<Mutex<VecDeque<AlertEvent>>> {
         Arc::clone(&self.history)
     }
 
-    /// Register an email channel.
+    /// Register an SMTP email channel.
+    ///
+    /// `alert_types` is a list of `snake_case` alert identifiers (or `"*"`
+    /// for all). An empty list also matches every alert type. `enabled`
+    /// gates dispatch without requiring the channel to be removed.
     pub fn add_email_channel(
         &mut self,
         id: String,
@@ -145,7 +156,12 @@ impl NotifyDispatcher {
         });
     }
 
-    /// Register a webhook channel.
+    /// Register a generic HTTP webhook channel.
+    ///
+    /// Events are POSTed as JSON. See [`add_email_channel`] for the
+    /// semantics of `alert_types` and `enabled`.
+    ///
+    /// [`add_email_channel`]: Self::add_email_channel
     pub fn add_webhook_channel(
         &mut self,
         id: String,
@@ -161,7 +177,13 @@ impl NotifyDispatcher {
         });
     }
 
-    /// Register a Slack (or Discord) webhook channel.
+    /// Register a Slack-formatted webhook channel.
+    ///
+    /// Works with Slack Incoming Webhooks and Discord webhooks that accept
+    /// the Slack-compatible payload. See [`add_email_channel`] for the
+    /// semantics of `alert_types` and `enabled`.
+    ///
+    /// [`add_email_channel`]: Self::add_email_channel
     pub fn add_slack_channel(
         &mut self,
         id: String,
@@ -177,15 +199,25 @@ impl NotifyDispatcher {
         });
     }
 
-    /// Clear all registered channels (for reconfiguration).
+    /// Remove every registered channel.
+    ///
+    /// Used when reloading configuration so that channels can be re-added
+    /// from the new state. History, rate-limit counters, and suppressed
+    /// counts are preserved.
     pub fn clear_channels(&mut self) {
         self.channels.clear();
     }
 
-    /// Dispatch an alert event to all matching channels.
+    /// Dispatch an alert event to every matching channel.
     ///
-    /// Stdout is always emitted. Email and webhook channels are only
-    /// used if they are enabled and subscribe to the event's alert type.
+    /// Stdout always emits and the event is always recorded in history.
+    /// Email, webhook, and Slack channels fire only when enabled and when
+    /// their `alert_types` filter matches (empty list or `"*"` matches
+    /// everything). Per-channel send failures are logged and do not
+    /// interrupt delivery to other channels. Channels exceeding their
+    /// rate limit are skipped and counted in [`suppressed_count`].
+    ///
+    /// [`suppressed_count`]: Self::suppressed_count
     pub async fn dispatch(&self, event: &AlertEvent) {
         // Always emit to stdout
         stdout::emit(event);
@@ -277,18 +309,19 @@ impl NotifyDispatcher {
         }
     }
 
-    /// Return the number of registered channels.
+    /// Return the number of currently registered channels (enabled or not).
     pub fn channel_count(&self) -> usize {
         self.channels.len()
     }
 
-    /// Return recent notification history.
+    /// Return up to `limit` of the most recent events, newest first.
     pub fn recent_history(&self, limit: usize) -> Vec<AlertEvent> {
         let hist = self.history.lock();
         hist.iter().rev().take(limit).cloned().collect()
     }
 
-    /// Return the total number of events in history.
+    /// Return the number of events currently held in the history buffer
+    /// (capped at the dispatcher's `max_history`).
     pub fn history_count(&self) -> usize {
         self.history.lock().len()
     }
@@ -324,7 +357,10 @@ impl Default for NotifyDispatcher {
     }
 }
 
-/// Validate an email configuration string (JSON).
+/// Parse and validate an [`EmailConfig`] from a JSON string.
+///
+/// Returns [`NotifyError::Config`] if the JSON is malformed or if any of
+/// `smtp_host`, `from_address`, or `to_address` is empty.
 pub fn validate_email_config(config_json: &str) -> Result<EmailConfig, NotifyError> {
     let config: EmailConfig =
         serde_json::from_str(config_json).map_err(|e| NotifyError::Config(e.to_string()))?;
@@ -340,7 +376,10 @@ pub fn validate_email_config(config_json: &str) -> Result<EmailConfig, NotifyErr
     Ok(config)
 }
 
-/// Validate a webhook configuration string (JSON).
+/// Parse and validate a [`WebhookConfig`] from a JSON string.
+///
+/// Returns [`NotifyError::Config`] if the JSON is malformed or if `url`
+/// is empty.
 pub fn validate_webhook_config(config_json: &str) -> Result<WebhookConfig, NotifyError> {
     let config: WebhookConfig =
         serde_json::from_str(config_json).map_err(|e| NotifyError::Config(e.to_string()))?;

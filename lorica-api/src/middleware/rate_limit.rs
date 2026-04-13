@@ -1,3 +1,5 @@
+//! Per-key fixed-window rate limiter (5 attempts / 60 s) used for the login endpoint.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -26,6 +28,7 @@ impl Default for RateLimiter {
 }
 
 impl RateLimiter {
+    /// Construct an empty limiter.
     pub fn new() -> Self {
         Self {
             buckets: Arc::new(Mutex::new(HashMap::new())),

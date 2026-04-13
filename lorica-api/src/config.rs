@@ -1,3 +1,6 @@
+//! Endpoints to export the running configuration as TOML and import a new
+//! one (with optional dry-run diff preview).
+
 use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::Json;
@@ -6,12 +9,13 @@ use serde::Deserialize;
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
+/// JSON body wrapping a TOML configuration document.
 #[derive(Deserialize)]
 pub struct ImportRequest {
     pub toml_content: String,
 }
 
-/// POST /api/v1/config/export
+/// POST /api/v1/config/export - serialize the current configuration as a TOML download.
 pub async fn export_config(
     Extension(state): Extension<AppState>,
 ) -> Result<
@@ -42,7 +46,7 @@ pub async fn export_config(
 /// Maximum TOML import size: 1 MB.
 const MAX_IMPORT_SIZE: usize = 1_048_576;
 
-/// POST /api/v1/config/import - direct import (replaces all data)
+/// POST /api/v1/config/import - replace the entire configuration from a TOML payload (max 1 MB).
 pub async fn import_config(
     Extension(state): Extension<AppState>,
     Json(body): Json<ImportRequest>,
@@ -69,7 +73,7 @@ pub async fn import_config(
     ))
 }
 
-/// POST /api/v1/config/import/preview - parse TOML and return diff without applying
+/// POST /api/v1/config/import/preview - parse a TOML payload and return its diff without applying it.
 pub async fn import_preview(
     Extension(state): Extension<AppState>,
     Json(body): Json<ImportRequest>,

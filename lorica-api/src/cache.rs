@@ -1,3 +1,5 @@
+//! Response cache statistics, route purge, and IP ban list management.
+
 use std::sync::atomic::Ordering;
 
 use axum::extract::Path;

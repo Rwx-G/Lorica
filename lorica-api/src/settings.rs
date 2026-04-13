@@ -1,3 +1,5 @@
+//! Global settings, notification channels, and per-user UI preferences endpoints.
+
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
@@ -8,7 +10,7 @@ use crate::server::AppState;
 
 // ---- Global Settings ----
 
-/// GET /api/v1/settings
+/// GET /api/v1/settings - return the global settings document.
 pub async fn get_settings(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -17,6 +19,7 @@ pub async fn get_settings(
     Ok(json_data(settings))
 }
 
+/// JSON body for `PUT /api/v1/settings`. Only the supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateSettingsRequest {
     pub management_port: Option<u16>,
@@ -39,7 +42,7 @@ pub struct UpdateSettingsRequest {
     pub connection_allow_cidrs: Option<Vec<String>>,
 }
 
-/// PUT /api/v1/settings
+/// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
 pub async fn update_settings(
     Extension(state): Extension<AppState>,
     Json(body): Json<UpdateSettingsRequest>,
@@ -215,7 +218,7 @@ fn validate_cidr_list(entries: &[String], field: &str) -> Result<(), ApiError> {
 
 // ---- Notification Configs ----
 
-/// GET /api/v1/notifications
+/// GET /api/v1/notifications - list notification channels with secrets masked.
 pub async fn list_notifications(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -227,6 +230,7 @@ pub async fn list_notifications(
     Ok(json_data(serde_json::json!({ "notifications": configs })))
 }
 
+/// JSON body for creating or updating a notification channel.
 #[derive(Deserialize)]
 pub struct CreateNotificationRequest {
     pub channel: String,
@@ -235,7 +239,7 @@ pub struct CreateNotificationRequest {
     pub alert_types: Vec<String>,
 }
 
-/// POST /api/v1/notifications
+/// POST /api/v1/notifications - register a new notification channel.
 pub async fn create_notification(
     Extension(state): Extension<AppState>,
     Json(body): Json<CreateNotificationRequest>,
@@ -262,7 +266,7 @@ pub async fn create_notification(
     Ok(json_data_with_status(StatusCode::CREATED, masked))
 }
 
-/// POST /api/v1/notifications/:id/test - send a real test notification
+/// POST /api/v1/notifications/:id/test - send a real test alert through the configured channel.
 pub async fn test_notification(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -310,7 +314,7 @@ pub async fn test_notification(
     })))
 }
 
-/// GET /api/v1/notifications/history
+/// GET /api/v1/notifications/history - return the recent notification dispatch history.
 pub async fn notification_history(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -365,7 +369,7 @@ fn validate_notification_config(config: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// PUT /api/v1/notifications/:id
+/// PUT /api/v1/notifications/:id - update channel config; `********` placeholders preserve stored secrets.
 pub async fn update_notification(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -434,7 +438,7 @@ pub async fn update_notification(
     Ok(json_data(masked))
 }
 
-/// DELETE /api/v1/notifications/:id
+/// DELETE /api/v1/notifications/:id - remove a notification channel.
 pub async fn delete_notification(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -448,7 +452,7 @@ pub async fn delete_notification(
 
 // ---- User Preferences ----
 
-/// GET /api/v1/preferences
+/// GET /api/v1/preferences - list every per-user UI preference key/value.
 pub async fn list_preferences(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -457,12 +461,13 @@ pub async fn list_preferences(
     Ok(json_data(serde_json::json!({ "preferences": prefs })))
 }
 
+/// JSON body for `PUT /api/v1/preferences/:id`.
 #[derive(Deserialize)]
 pub struct UpdatePreferenceRequest {
     pub value: String,
 }
 
-/// PUT /api/v1/preferences/:id
+/// PUT /api/v1/preferences/:id - update one user preference value.
 pub async fn update_preference(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -488,7 +493,7 @@ pub async fn update_preference(
     Ok(json_data(updated))
 }
 
-/// DELETE /api/v1/preferences/:id
+/// DELETE /api/v1/preferences/:id - remove a user preference.
 pub async fn delete_preference(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,

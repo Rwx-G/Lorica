@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Read and configure SLA windows, raw buckets, and CSV/JSON exports per route.
+
 use axum::extract::Path;
 use axum::response::IntoResponse;
 use axum::Extension;
@@ -22,8 +24,7 @@ use serde::Deserialize;
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
-/// GET /api/v1/sla/routes/:id
-/// Returns SLA summaries for all standard windows (1h, 24h, 7d, 30d).
+/// GET /api/v1/sla/routes/:id - return passive SLA summaries for all standard windows (1h, 24h, 7d, 30d).
 pub async fn get_route_sla(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
@@ -41,8 +42,7 @@ pub async fn get_route_sla(
     Ok(json_data(summaries))
 }
 
-/// GET /api/v1/sla/routes/:id/buckets?from=...&to=...
-/// Returns raw SLA buckets for a route within a time range.
+/// Query parameters for bucket queries: `?from=&to=&source=passive|active`.
 #[derive(Deserialize)]
 pub struct BucketQuery {
     pub from: Option<String>,
@@ -50,6 +50,7 @@ pub struct BucketQuery {
     pub source: Option<String>,
 }
 
+/// GET /api/v1/sla/routes/:id/buckets - return raw SLA buckets within the requested time range.
 pub async fn get_route_sla_buckets(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
@@ -83,8 +84,7 @@ pub async fn get_route_sla_buckets(
     Ok(json_data(buckets))
 }
 
-/// GET /api/v1/sla/routes/:id/config
-/// Returns the SLA configuration for a route.
+/// GET /api/v1/sla/routes/:id/config - return the per-route SLA target / latency / status thresholds.
 pub async fn get_sla_config(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
@@ -102,8 +102,7 @@ pub async fn get_sla_config(
     Ok(json_data(config))
 }
 
-/// PUT /api/v1/sla/routes/:id/config
-/// Update SLA configuration for a route.
+/// JSON body for `PUT /api/v1/sla/routes/:id/config`. Only supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateSlaConfig {
     pub target_pct: Option<f64>,
@@ -112,6 +111,7 @@ pub struct UpdateSlaConfig {
     pub success_status_max: Option<i32>,
 }
 
+/// PUT /api/v1/sla/routes/:id/config - patch SLA targets and refresh the live collector cache.
 pub async fn update_sla_config(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
@@ -163,8 +163,7 @@ pub async fn update_sla_config(
     Ok(json_data(config))
 }
 
-/// GET /api/v1/sla/routes/:id/export?format=json|csv&from=...&to=...
-/// Export SLA data for reporting.
+/// Query parameters for SLA export: `?from=&to=&format=json|csv` (default 30d, JSON).
 #[derive(Deserialize)]
 pub struct ExportQuery {
     pub from: Option<String>,
@@ -189,6 +188,7 @@ fn parse_export_range(query: &ExportQuery) -> (chrono::DateTime<Utc>, chrono::Da
     (from, to)
 }
 
+/// GET /api/v1/sla/routes/:id/export - download passive SLA buckets as JSON or CSV.
 pub async fn export_sla_data(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
@@ -256,8 +256,7 @@ pub async fn export_sla_data(
     }
 }
 
-/// DELETE /api/v1/sla/routes/:id/data
-/// Clear all SLA data for a route.
+/// DELETE /api/v1/sla/routes/:id/data - delete every persisted SLA bucket and clear the in-memory collector.
 pub async fn clear_route_sla(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
@@ -283,8 +282,7 @@ pub async fn clear_route_sla(
     })))
 }
 
-/// GET /api/v1/sla/overview
-/// Returns SLA summaries for all routes (24h window).
+/// GET /api/v1/sla/overview - return 1h and 24h passive SLA summaries for every route.
 pub async fn get_sla_overview(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

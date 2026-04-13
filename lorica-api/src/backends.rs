@@ -1,3 +1,5 @@
+//! CRUD endpoints for upstream backends, including graceful drain on delete.
+
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
@@ -7,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
 
+/// JSON view of a backend enriched with live EWMA score and active connection count.
 #[derive(Serialize)]
 pub struct BackendResponse {
     pub id: String,
@@ -29,6 +32,7 @@ pub struct BackendResponse {
     pub updated_at: String,
 }
 
+/// JSON body for `POST /api/v1/backends`. Optional fields fall back to defaults.
 #[derive(Deserialize)]
 pub struct CreateBackendRequest {
     pub address: String,
@@ -44,6 +48,7 @@ pub struct CreateBackendRequest {
     pub h2_upstream: Option<bool>,
 }
 
+/// JSON body for `PUT /api/v1/backends/:id`. Only the supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateBackendRequest {
     pub address: Option<String>,
@@ -122,7 +127,7 @@ async fn get_ewma_score_async(state: &crate::server::AppState, addr: &str) -> f6
     0.0
 }
 
-/// GET /api/v1/backends
+/// GET /api/v1/backends - list every backend with its live EWMA score and active connection count.
 pub async fn list_backends(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -137,7 +142,7 @@ pub async fn list_backends(
     Ok(json_data(serde_json::json!({ "backends": responses })))
 }
 
-/// POST /api/v1/backends
+/// POST /api/v1/backends - register a new upstream backend.
 pub async fn create_backend(
     Extension(state): Extension<AppState>,
     Json(body): Json<CreateBackendRequest>,
@@ -178,7 +183,7 @@ pub async fn create_backend(
     ))
 }
 
-/// GET /api/v1/backends/:id
+/// GET /api/v1/backends/:id - fetch a single backend by id.
 pub async fn get_backend(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -192,7 +197,7 @@ pub async fn get_backend(
     Ok(json_data(backend_to_response(&backend, score, conns)))
 }
 
-/// PUT /api/v1/backends/:id
+/// PUT /api/v1/backends/:id - patch backend fields and trigger a proxy reload.
 pub async fn update_backend(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -253,7 +258,7 @@ pub async fn update_backend(
     Ok(json_data(backend_to_response(&backend, score, conns)))
 }
 
-/// DELETE /api/v1/backends/:id
+/// DELETE /api/v1/backends/:id - graceful drain delete.
 ///
 /// Initiates graceful drain: sets lifecycle_state to Closing so no new
 /// requests are routed to this backend, then spawns a background task

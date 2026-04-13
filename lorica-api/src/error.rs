@@ -1,28 +1,39 @@
+//! Unified error type for API handlers and the JSON error envelope they emit.
+
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use thiserror::Error;
 
+/// Error type returned by every handler. Maps to an HTTP status and a
+/// `{"error": {"code", "message"}}` JSON envelope via [`IntoResponse`].
 #[derive(Debug, Error)]
 pub enum ApiError {
+    /// 404 Not Found: the requested resource (route, certificate, backend, ...) does not exist.
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// 400 Bad Request: payload failed validation (bad enum, malformed regex, etc.).
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// 401 Unauthorized: missing or invalid session cookie / credentials.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    /// 403 Forbidden: authenticated but not allowed (e.g. CSRF check failed).
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// 409 Conflict: uniqueness violation or state conflict (duplicate hostname, etc.).
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// 429 Too Many Requests: client exceeded the per-IP login rate limiter.
     #[error("rate limited")]
     RateLimited,
 
+    /// 500 Internal Server Error: unexpected failure (DB, IO, serialization).
     #[error("internal error: {0}")]
     Internal(String),
 }

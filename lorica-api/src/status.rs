@@ -1,3 +1,6 @@
+//! Aggregate counts of routes, backends, and certificates for the dashboard
+//! landing page.
+
 use axum::extract::Extension;
 use axum::Json;
 use serde::Serialize;
@@ -5,6 +8,7 @@ use serde::Serialize;
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
+/// Snapshot returned by `GET /api/v1/status` summarizing the proxy fleet.
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub routes_count: usize,
@@ -16,7 +20,7 @@ pub struct StatusResponse {
     pub certificates_expiring_soon: usize,
 }
 
-/// GET /api/v1/status
+/// GET /api/v1/status - return aggregate counts of routes, backends (by health), and certificates.
 pub async fn get_status(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

@@ -17,7 +17,11 @@
 use super::{NotifyError, WebhookConfig};
 use crate::events::AlertEvent;
 
-/// Send an alert event as a JSON POST to the configured webhook URL.
+/// POST an alert event as JSON to the configured webhook URL.
+///
+/// Uses a 10-second total timeout. If `auth_header` is set it is sent
+/// verbatim as the `Authorization` header. Returns [`NotifyError::Webhook`]
+/// on transport failures or when the response status is not 2xx.
 pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), NotifyError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

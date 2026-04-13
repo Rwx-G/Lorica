@@ -73,10 +73,12 @@ impl Default for AcmeChallengeStore {
 }
 
 impl AcmeChallengeStore {
+    /// Build a store using the default database path (`/var/lib/lorica/lorica.db`).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Build a store backed by a SQLite file at `path`.
     pub fn with_db_path(path: std::path::PathBuf) -> Self {
         // Ensure the acme_challenges table exists and WAL mode is enabled
         if let Ok(conn) = rusqlite::Connection::open(&path) {
@@ -92,6 +94,7 @@ impl AcmeChallengeStore {
         }
     }
 
+    /// Persist a challenge `token -> key_authorization` to SQLite and the in-memory cache.
     pub async fn set(&self, token: String, key_authorization: String) {
         self.challenges
             .write()
@@ -119,6 +122,7 @@ impl AcmeChallengeStore {
         }
     }
 
+    /// Look up the key authorization for `token`, falling back to SQLite if not in the local cache.
     pub async fn get(&self, token: &str) -> Option<String> {
         // Try in-memory first (supervisor process)
         if let Some(val) = self.challenges.read().await.get(token).cloned() {
@@ -149,6 +153,7 @@ impl AcmeChallengeStore {
         result
     }
 
+    /// Remove a challenge token from both the cache and SQLite once it is no longer needed.
     pub async fn remove(&self, token: &str) {
         self.challenges.write().await.remove(token);
         if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
@@ -207,6 +212,7 @@ impl Default for AcmeConfig {
 }
 
 impl AcmeConfig {
+    /// Return the ACME directory URL (staging or production).
     pub fn directory_url(&self) -> &str {
         if self.staging {
             "https://acme-staging-v02.api.letsencrypt.org/directory"
@@ -926,6 +932,7 @@ pub struct CloudflareDnsChallenger {
 }
 
 impl CloudflareDnsChallenger {
+    /// Construct a new challenger bound to a Cloudflare zone and API token.
     pub fn new(zone_id: String, api_token: String) -> Self {
         Self {
             zone_id,
@@ -1049,6 +1056,7 @@ pub struct Route53DnsChallenger {
 
 #[cfg(feature = "route53")]
 impl Route53DnsChallenger {
+    /// Construct a new challenger using AWS credentials and a Route53 hosted zone id.
     pub async fn new(hosted_zone_id: String, access_key: String, secret_key: String) -> Self {
         let creds = aws_sdk_route53::config::Credentials::new(
             access_key,
@@ -1163,6 +1171,7 @@ pub struct OvhDnsChallenger {
 }
 
 impl OvhDnsChallenger {
+    /// Construct a new OVH challenger from the four-part credential set.
     pub fn new(
         endpoint: String,
         application_key: String,
