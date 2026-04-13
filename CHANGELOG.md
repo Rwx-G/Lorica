@@ -27,6 +27,12 @@ Author: Rwx-G
 ### Changed
 
 - Circuit breaker now scopes state by `(route_id, backend)` instead of by backend alone. Two routes that share the same upstream IP:port (common when a single Teleport / nginx front-door multiplexes several virtual hosts on one port) no longer punish each other: failures on one route open the breaker only for that route, leaving sibling routes routable to the same physical backend
+- Response body rewriting: compiled rules are now resolved once in `response_filter` and stored on the per-request context, replacing a linear scan of all routes that previously ran on every body chunk. Per-chunk overhead is a pointer clone regardless of route count
+- Basic auth credential cache keys are now the raw NUL-joined `"{credential}\0{hash}"` string instead of a 64-bit `DefaultHasher` digest. Two distinct credentials can no longer collide on a truncated hash and share a cache slot (same design as the forward auth verdict cache)
+- Forward auth `X-Forwarded-Proto` is now derived from the TLS socket state (`ssl_digest`) instead of HTTP version. h2c (HTTP/2 over plaintext) would previously be reported as `https` to the auth service
+- `canary_bucket` now uses FNV-1a with fixed constants instead of `DefaultHasher` (which seeds a random `RandomState` per process). Canary assignments are now stable across restarts and rolling upgrades: the same client IP lands on the same bucket on the new process as on the old one, so a rollout does not silently reshuffle which users see the canary
+- `RouteEntry` is now stored as `Arc<RouteEntry>` in `ProxyConfig` and the matched entry is cached in the per-request context during `request_filter`. `upstream_peer` no longer re-runs `find_route` on the same request; the entry is reused as a pointer clone
+- Canary / header-rule / path-rule overrides remain strictly fail-closed when all of their backends are breaker-open or unhealthy (502 rather than fallback to route defaults). Documented explicitly in `upstream_peer` so operators know a bad canary surfaces as a visible error on the fraction of traffic routed to it, not as silent absorption by the primary
 
 ## [1.2.0] - 2026-04-11
 

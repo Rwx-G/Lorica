@@ -113,15 +113,33 @@ pub async fn reload_proxy_config_with_mtls(
         },
     );
 
-    // Preserve round-robin counters from the old config to avoid resetting
-    // load distribution on every config reload
+    // Preserve round-robin counters from the old config to avoid
+    // resetting load distribution on every config reload. Entries are
+    // now stored as `Arc<RouteEntry>` (shared across hostname +
+    // aliases), so we rebuild the inner struct with the preserved
+    // wrr_state once per route_id and then replace every Arc slot
+    // pointing at that route.
     let old_config = proxy_config.load();
-    for entries in new_config.routes_by_host.values_mut() {
-        for entry in entries.iter_mut() {
+    let mut rebuilt: std::collections::HashMap<String, Arc<crate::proxy_wiring::RouteEntry>> =
+        std::collections::HashMap::new();
+    for entries in new_config.routes_by_host.values() {
+        for entry in entries {
+            if rebuilt.contains_key(&entry.route.id) {
+                continue;
+            }
             if let Some(old_entries) = old_config.routes_by_host.get(&entry.route.hostname) {
                 if let Some(old_entry) = old_entries.iter().find(|e| e.route.id == entry.route.id) {
-                    entry.wrr_state = Arc::clone(&old_entry.wrr_state);
+                    let mut new_inner = (**entry).clone();
+                    new_inner.wrr_state = Arc::clone(&old_entry.wrr_state);
+                    rebuilt.insert(entry.route.id.clone(), Arc::new(new_inner));
                 }
+            }
+        }
+    }
+    for entries in new_config.routes_by_host.values_mut() {
+        for slot in entries.iter_mut() {
+            if let Some(new_arc) = rebuilt.get(&slot.route.id) {
+                *slot = Arc::clone(new_arc);
             }
         }
     }

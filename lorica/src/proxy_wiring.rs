@@ -193,9 +193,9 @@ pub struct MtlsEnforcer {
 pub struct ProxyConfig {
     /// Routes indexed by hostname for fast matching.
     /// Each hostname maps to a list of routes sorted by path_prefix length (longest first).
-    pub routes_by_host: HashMap<String, Vec<RouteEntry>>,
+    pub routes_by_host: HashMap<String, Vec<Arc<RouteEntry>>>,
     /// Wildcard routes (*.example.com) checked when exact lookup fails.
-    pub wildcard_routes: Vec<(String, Vec<RouteEntry>)>,
+    pub wildcard_routes: Vec<(String, Vec<Arc<RouteEntry>>)>,
     /// Merged security header presets (builtin + custom).
     /// Custom presets override builtins when names collide.
     pub security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
@@ -276,7 +276,7 @@ impl ProxyConfig {
                 .push(backend_id);
         }
 
-        let mut routes_by_host: HashMap<String, Vec<RouteEntry>> = HashMap::new();
+        let mut routes_by_host: HashMap<String, Vec<Arc<RouteEntry>>> = HashMap::new();
 
         for route in routes {
             if !route.enabled {
@@ -444,7 +444,7 @@ impl ProxyConfig {
                 allowed_organizations: m.allowed_organizations.clone(),
             });
 
-            let entry = RouteEntry {
+            let entry = Arc::new(RouteEntry {
                 route: Arc::new(route.clone()),
                 backends: route_backends,
                 certificate,
@@ -457,24 +457,24 @@ impl ProxyConfig {
                 mirror_backends,
                 response_rewrite_compiled,
                 mtls_enforcer,
-            };
+            });
 
             routes_by_host
                 .entry(route.hostname.clone())
                 .or_default()
-                .push(entry.clone());
+                .push(Arc::clone(&entry));
 
             // Index hostname aliases so they resolve to the same route entry
             for alias in &route.hostname_aliases {
                 routes_by_host
                     .entry(alias.clone())
                     .or_default()
-                    .push(entry.clone());
+                    .push(Arc::clone(&entry));
             }
         }
 
         // Separate wildcard hostnames (*.example.com) from exact ones
-        let mut wildcard_routes: Vec<(String, Vec<RouteEntry>)> = Vec::new();
+        let mut wildcard_routes: Vec<(String, Vec<Arc<RouteEntry>>)> = Vec::new();
         let wildcard_keys: Vec<String> = routes_by_host
             .keys()
             .filter(|k| k.starts_with("*."))
@@ -559,7 +559,7 @@ impl ProxyConfig {
 
     /// Find a matching route entry for a given host and path.
     /// Exact hostname match takes precedence over wildcard.
-    pub fn find_route<'a>(&'a self, host: &str, path: &str) -> Option<&'a RouteEntry> {
+    pub fn find_route<'a>(&'a self, host: &str, path: &str) -> Option<&'a Arc<RouteEntry>> {
         // 1. Exact hostname match (O(1))
         if let Some(entries) = self.routes_by_host.get(host) {
             if let Some(entry) = entries
@@ -1025,6 +1025,12 @@ pub struct RequestCtx {
     /// Snapshot of the matched route for use in later pipeline stages.
     /// Arc-wrapped to avoid deep-cloning the Route struct on every request.
     pub route_snapshot: Option<Arc<Route>>,
+    /// Full matched `RouteEntry` captured in `request_filter` so
+    /// `upstream_peer` does not need to re-run `config.find_route`.
+    /// Cheap (pointer clone) since the entry is already `Arc`'d in
+    /// `ProxyConfig`. `None` when no route matched (request_filter
+    /// returned `Ok(false)` and upstream_peer will 404).
+    pub matched_route_entry: Option<Arc<RouteEntry>>,
     /// Unique request identifier for tracing (propagated to backend via X-Request-Id).
     pub request_id: String,
     /// Whether access logging is enabled for this route.
@@ -1067,6 +1073,12 @@ pub struct RequestCtx {
     /// than a half-rewritten body). `None` means the feature is off
     /// for this response (Content-Type/Encoding didn't qualify).
     pub response_rewrite_state: Option<ResponseRewriteState>,
+    /// Precompiled rewrite rules for this response, resolved once in
+    /// `response_filter` from the current ProxyConfig and stored here
+    /// so `response_body_filter` does not re-scan the routes map on
+    /// every chunk (which was O(routes) per chunk under load). `Arc`
+    /// so clones stay cheap.
+    pub response_rewrite_rules: Option<Arc<Vec<Option<CompiledRewriteRule>>>>,
 
     /// Pending mirror sub-request awaiting the downstream request body.
     /// Populated in `request_filter` when the route has mirroring
@@ -1131,7 +1143,13 @@ pub struct LoricaProxy {
     /// "username:password" to the timestamp of the last successful Argon2
     /// verification. Entries older than 60 s are ignored, forcing a fresh
     /// Argon2 check. This avoids ~100 ms per request on auth-protected routes.
-    basic_auth_cache: Arc<DashMap<u64, Instant>>,
+    /// HTTP Basic Auth credential cache. Keys are the NUL-joined
+    /// concatenation `"{Authorization-header-value}\0{expected_hash}"`
+    /// stored verbatim - NOT a 64-bit hash digest - so two
+    /// distinct credentials cannot collide and share a cache slot,
+    /// which would let one bypass Argon2. Same design as the forward
+    /// auth verdict cache (see SEC-AUD-01).
+    basic_auth_cache: Arc<DashMap<String, Instant>>,
 }
 
 impl LoricaProxy {
@@ -1954,12 +1972,29 @@ pub(crate) fn spawn_mirrors(
 /// `pub` so integration tests can pick synthetic client IPs that are
 /// guaranteed to fall in a specific bucket band without running the
 /// law-of-large-numbers gauntlet.
+///
+/// Uses FNV-1a (64-bit) with fixed constants rather than
+/// `DefaultHasher`, which in Rust is seeded from a random
+/// `RandomState` at process start: same inputs would land in a
+/// different bucket after every restart, silently shuffling canary
+/// assignments across rolling upgrades. FNV-1a gives cross-restart
+/// stability and is uniform enough for a `% 100` bucketing.
 pub fn canary_bucket(route_id: &str, client_ip: &str) -> u8 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    route_id.hash(&mut h);
-    client_ip.hash(&mut h);
-    (h.finish() % 100) as u8
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for byte in route_id.as_bytes() {
+        h ^= *byte as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    // NUL separator so "r1" + "ab" and "r1a" + "b" don't collide.
+    h ^= 0;
+    h = h.wrapping_mul(FNV_PRIME);
+    for byte in client_ip.as_bytes() {
+        h ^= *byte as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    (h % 100) as u8
 }
 
 /// Select the backends for a traffic split given a deterministic bucket
@@ -2104,6 +2139,7 @@ impl ProxyHttp for LoricaProxy {
             waf_blocked: false,
             waf_detected: false,
             route_snapshot: None,
+            matched_route_entry: None,
             path_rewrite_regex: None,
             request_id: generate_request_id(),
             access_log_enabled: true,
@@ -2123,6 +2159,7 @@ impl ProxyHttp for LoricaProxy {
             mirror_pending: None,
             mirror_body_state: None,
             response_rewrite_state: None,
+            response_rewrite_rules: None,
         }
     }
 
@@ -2303,11 +2340,14 @@ impl ProxyHttp for LoricaProxy {
         let path = req.uri.path();
         let query = req.uri.query();
 
-        // Find matching route (exact hostname first, then wildcard)
+        // Find matching route (exact hostname first, then wildcard).
+        // Cache the matched entry in ctx so upstream_peer does not
+        // re-run find_route on the same request.
         let entry = match config.find_route(host, path) {
             Some(e) => e,
             None => return Ok(false), // No route = let upstream_peer handle 404
         };
+        ctx.matched_route_entry = Some(Arc::clone(entry));
 
         // Store route snapshot, precompiled regex, and access log setting for later pipeline stages
         ctx.route_snapshot = Some(Arc::clone(&entry.route));
@@ -2418,7 +2458,15 @@ impl ProxyHttp for LoricaProxy {
         // after route match but before header/canary/path rules so a
         // denied request never leaks into the backend-selection phase.
         if let Some(ref fa_cfg) = entry.route.forward_auth {
-            let scheme = if session.is_http2() { "https" } else { "http" };
+            // Detect TLS from the downstream socket, not HTTP version:
+            // h2c (HTTP/2 over plaintext) would otherwise be reported
+            // as https to the auth service, which is misleading and
+            // may trigger redirect loops.
+            let is_tls = session
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref())
+                .is_some();
+            let scheme = if is_tls { "https" } else { "http" };
             let outcome = run_forward_auth_keyed(
                 fa_cfg,
                 req,
@@ -2669,13 +2717,16 @@ impl ProxyHttp for LoricaProxy {
                             return false;
                         }
 
-                        // Check credential cache before running Argon2
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut h = DefaultHasher::new();
-                        cred.hash(&mut h);
-                        expected_hash.hash(&mut h);
-                        let cache_key = h.finish();
+                        // Check credential cache before running Argon2.
+                        // Key is the NUL-joined literal "{cred}\0{hash}"
+                        // so two distinct credentials cannot collide on
+                        // a truncated 64-bit digest (which, at a small
+                        // cache size, is not worth the bypass risk).
+                        let mut cache_key =
+                            String::with_capacity(cred.len() + 1 + expected_hash.len());
+                        cache_key.push_str(&cred);
+                        cache_key.push('\0');
+                        cache_key.push_str(expected_hash.as_str());
 
                         const AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
                         if let Some(verified_at) = self.basic_auth_cache.get(&cache_key) {
@@ -3585,16 +3636,25 @@ impl ProxyHttp for LoricaProxy {
         let host = host_raw.split(':').next().unwrap_or(host_raw);
 
         let path = req.uri.path();
-        let config = self.config.load();
 
-        // Find matching route (exact hostname first, then wildcard)
-        let entry = match config.find_route(host, path) {
-            Some(e) => e,
+        // Fast path: request_filter already matched and cached the
+        // entry. Fall back to a fresh find_route only when ctx is
+        // empty (e.g. request_filter returned Ok(false) and we need
+        // to emit a 404 through the normal upstream_peer path).
+        let config_guard;
+        let entry: Arc<RouteEntry> = match ctx.matched_route_entry.as_ref() {
+            Some(cached) => Arc::clone(cached),
             None => {
-                return Error::e_explain(
-                    ErrorType::HTTPStatus(404),
-                    format!("no route configured for host={host} path={path}"),
-                );
+                config_guard = self.config.load();
+                match config_guard.find_route(host, path) {
+                    Some(e) => Arc::clone(e),
+                    None => {
+                        return Error::e_explain(
+                            ErrorType::HTTPStatus(404),
+                            format!("no route configured for host={host} path={path}"),
+                        );
+                    }
+                }
             }
         };
 
@@ -3608,7 +3668,21 @@ impl ProxyHttp for LoricaProxy {
             ctx.access_log_enabled = entry.route.access_log_enabled;
         }
 
-        // Filter healthy backends (use path-rule override if set)
+        // Filter healthy backends (path-rule / header-rule / canary
+        // override wins when set).
+        //
+        // Intentional fail-closed design: when an override group
+        // (canary split, header rule, path rule) has all its backends
+        // Down / Draining / breaker-Open, we return 502 rather than
+        // silently falling back to the route's default backends. A
+        // silent fallback would mask a broken deployment - an
+        // operator rolling out a bad canary would see their primary
+        // absorb the traffic and assume the release is healthy. The
+        // explicit 502 (with the matching Prometheus counter) makes
+        // the failure visible. If a graceful fallback is desired on
+        // a given route, operators should use small weights on the
+        // canary split so the default band still covers the majority
+        // of traffic.
         let backends_source = if let Some(ref overridden) = ctx.matched_backends {
             overridden
         } else {
@@ -4048,6 +4122,15 @@ impl ProxyHttp for LoricaProxy {
                     // likewise re-derived by the server.
                     upstream_response.remove_header("content-length");
                     ctx.response_rewrite_state = Some(ResponseRewriteState::Active(Vec::new()));
+                    // Resolve compiled rules ONCE from the cached
+                    // route entry and hand them to response_body_filter
+                    // via ctx. Prior code re-scanned routes on every
+                    // chunk (O(routes) per chunk under load); now the
+                    // per-chunk path is a pointer clone.
+                    if let Some(entry) = ctx.matched_route_entry.as_ref() {
+                        ctx.response_rewrite_rules =
+                            Some(Arc::new(entry.response_rewrite_compiled.clone()));
+                    }
                 }
             }
         }
@@ -4090,21 +4173,13 @@ impl ProxyHttp for LoricaProxy {
             };
             (cfg.max_body_bytes as usize, route.clone())
         };
-        // We only need the compiled rules, which live on the RouteEntry
-        // not the Route snapshot. Look them up via the current
-        // ProxyConfig. This is a per-chunk lookup but the hashmap
-        // read is cheap and avoids duplicating the compiled rules on
-        // the route snapshot.
-        let cfg_load = self.config.load();
+        // Compiled rules were resolved once in response_filter and
+        // stored in ctx - a pointer clone here, no per-chunk scan.
+        let rules = ctx
+            .response_rewrite_rules
+            .clone()
+            .unwrap_or_else(|| Arc::new(Vec::new()));
         let route_id = compiled.id.as_str();
-        let rules: Vec<Option<CompiledRewriteRule>> = cfg_load
-            .routes_by_host
-            .values()
-            .flatten()
-            .find(|e| e.route.id == route_id)
-            .map(|e| e.response_rewrite_compiled.clone())
-            .unwrap_or_default();
-        drop(cfg_load);
 
         // Accumulate or overflow.
         let state = ctx.response_rewrite_state.take();
@@ -4149,7 +4224,7 @@ impl ProxyHttp for LoricaProxy {
         }
 
         if end_of_stream {
-            let rewritten = apply_response_rewrites(&buffer, &rules);
+            let rewritten = apply_response_rewrites(&buffer, rules.as_slice());
             *body = Some(bytes::Bytes::from(rewritten));
             // Drop state; no more chunks expected.
         } else {
@@ -5847,19 +5922,19 @@ mod tests {
 
     #[test]
     fn test_basic_auth_cache_stores_and_retrieves() {
-        let cache: DashMap<u64, Instant> = DashMap::new();
-        let key: u64 = 12345;
-        cache.insert(key, Instant::now());
+        let cache: DashMap<String, Instant> = DashMap::new();
+        let key = "admin:password\0$argon2id$hash".to_string();
+        cache.insert(key.clone(), Instant::now());
         assert!(cache.get(&key).is_some());
         assert!(cache.get(&key).unwrap().elapsed() < Duration::from_secs(1));
     }
 
     #[test]
     fn test_basic_auth_cache_ttl_expiry() {
-        let cache: DashMap<u64, Instant> = DashMap::new();
-        let key: u64 = 99999;
+        let cache: DashMap<String, Instant> = DashMap::new();
+        let key = "admin:password\0$argon2id$hash".to_string();
         // Insert with a timestamp in the past (simulate expired entry)
-        cache.insert(key, Instant::now() - Duration::from_secs(120));
+        cache.insert(key.clone(), Instant::now() - Duration::from_secs(120));
         let ttl = Duration::from_secs(60);
         let is_valid = cache.get(&key).map(|t| t.elapsed() < ttl).unwrap_or(false);
         assert!(
@@ -5870,22 +5945,24 @@ mod tests {
 
     #[test]
     fn test_basic_auth_cache_key_changes_on_password() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        // Literal-string cache keys: two distinct (credential, hash)
+        // pairs must never compare equal, so one credential cannot
+        // pass through on a cache slot primed by the other. Prior
+        // code used a 64-bit DefaultHasher digest which is vulnerable
+        // to birthday collisions at scale.
+        let mut key1 = String::new();
+        key1.push_str("admin:password1");
+        key1.push('\0');
+        key1.push_str("$argon2id$hash1");
 
-        let mut h1 = DefaultHasher::new();
-        "admin:password1".hash(&mut h1);
-        "$argon2id$hash1".hash(&mut h1);
-        let key1 = h1.finish();
-
-        let mut h2 = DefaultHasher::new();
-        "admin:password2".hash(&mut h2);
-        "$argon2id$hash1".hash(&mut h2);
-        let key2 = h2.finish();
+        let mut key2 = String::new();
+        key2.push_str("admin:password2");
+        key2.push('\0');
+        key2.push_str("$argon2id$hash1");
 
         assert_ne!(
             key1, key2,
-            "Different passwords should produce different cache keys"
+            "Different passwords must produce different cache keys"
         );
     }
 
@@ -6827,6 +6904,42 @@ mod tests {
             let b = canary_bucket("r1", &ip);
             assert_eq!(a, b, "hash must be stable for {ip}");
             assert!(a < 100, "bucket {a} out of range");
+        }
+    }
+
+    #[test]
+    fn test_canary_bucket_matches_reference_fnv1a() {
+        // Pins the hash construction: any change to canary_bucket's
+        // constants or update rule would reshuffle every operator's
+        // canary assignments across a rolling upgrade, which is
+        // exactly the cross-restart instability we're guarding
+        // against. The reference implementation below is a clean-room
+        // FNV-1a (64 bit) with a NUL separator between fields; it
+        // must stay byte-for-byte equivalent to canary_bucket.
+        fn reference(route_id: &str, client_ip: &str) -> u8 {
+            const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+            const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+            let mut h = FNV_OFFSET;
+            for b in route_id.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            h ^= 0;
+            h = h.wrapping_mul(FNV_PRIME);
+            for b in client_ip.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            (h % 100) as u8
+        }
+        for route in ["", "r1", "route-a", "route-b"] {
+            for ip in ["", "10.0.0.1", "10.0.0.2", "2001:db8::1"] {
+                assert_eq!(
+                    canary_bucket(route, ip),
+                    reference(route, ip),
+                    "drift for ({route}, {ip})",
+                );
+            }
         }
     }
 
