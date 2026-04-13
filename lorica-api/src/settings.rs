@@ -380,22 +380,40 @@ pub async fn update_notification(
 
     let mut config = body.config.clone();
     if channel == lorica_config::models::NotificationChannel::Email {
+        // If the submitted config carries the sentinel mask
+        // `"********"` for the password, the UI wants us to keep the
+        // previously stored value. Any failure in that restore path
+        // (config unparseable, no existing row, no password in the
+        // existing row) must be surfaced as an error; silently
+        // falling through would persist the literal mask string and
+        // erase the real SMTP password.
         if let Ok(mut new_val) = serde_json::from_str::<serde_json::Value>(&config) {
             if new_val
                 .get("smtp_password")
                 .is_some_and(|v| v.as_str() == Some("********"))
             {
                 let store = state.store.lock().await;
-                if let Some(existing) = store.get_notification_config(&id)? {
-                    if let Ok(existing_val) =
-                        serde_json::from_str::<serde_json::Value>(&existing.config)
-                    {
-                        if let Some(pwd) = existing_val.get("smtp_password") {
-                            new_val["smtp_password"] = pwd.clone();
-                            config = serde_json::to_string(&new_val).unwrap_or(config);
-                        }
-                    }
-                }
+                let existing = store.get_notification_config(&id)?.ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "cannot restore masked smtp_password: no existing config for this channel"
+                            .into(),
+                    )
+                })?;
+                let existing_val: serde_json::Value = serde_json::from_str(&existing.config)
+                    .map_err(|_| {
+                        ApiError::BadRequest(
+                            "existing email config is corrupt; cannot restore smtp_password".into(),
+                        )
+                    })?;
+                let pwd = existing_val.get("smtp_password").ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "existing email config has no smtp_password to restore".into(),
+                    )
+                })?;
+                new_val["smtp_password"] = pwd.clone();
+                config = serde_json::to_string(&new_val).map_err(|_| {
+                    ApiError::BadRequest("failed to re-serialize notification config".into())
+                })?;
                 drop(store);
             }
         }

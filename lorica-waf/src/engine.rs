@@ -202,6 +202,18 @@ impl WafEngine {
         }
     }
 
+    /// Maximum raw pattern length accepted for a custom WAF rule.
+    /// Caps the admin-only attack surface on `RegexBuilder::build`:
+    /// the `regex` crate has linear-time matching but pathological
+    /// alternations or nested repetitions can still burn seconds and
+    /// megabytes at *compile* time. 4 KiB is enough for any realistic
+    /// operator-written pattern and short-circuits adversarial input.
+    pub const MAX_CUSTOM_PATTERN_LEN: usize = 4 * 1024;
+
+    /// Upper bound on the compiled NFA / DFA size (in bytes) for a
+    /// custom rule. Matches what `RegexBuilder::size_limit` gates.
+    pub const MAX_CUSTOM_REGEX_SIZE: usize = 512 * 1024;
+
     /// Add a custom user-defined WAF rule. Returns Err if the regex is invalid.
     pub fn add_custom_rule(
         &self,
@@ -211,7 +223,16 @@ impl WafEngine {
         pattern: &str,
         severity: u8,
     ) -> Result<(), String> {
-        let regex = regex::Regex::new(pattern).map_err(|e| format!("invalid regex: {e}"))?;
+        if pattern.len() > Self::MAX_CUSTOM_PATTERN_LEN {
+            return Err(format!(
+                "pattern exceeds {} bytes",
+                Self::MAX_CUSTOM_PATTERN_LEN
+            ));
+        }
+        let regex = regex::RegexBuilder::new(pattern)
+            .size_limit(Self::MAX_CUSTOM_REGEX_SIZE)
+            .build()
+            .map_err(|e| format!("invalid regex: {e}"))?;
         let rule = CustomRule {
             id,
             description,

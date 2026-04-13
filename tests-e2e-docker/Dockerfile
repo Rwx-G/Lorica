@@ -57,5 +57,8 @@ RUN chmod +x /entrypoint.sh /entrypoint-workers.sh
 
 EXPOSE 9443 8080 8443
 
-# Runs as root: entrypoint needs socat bind + su to drop to lorica user
+# Drop root for defense-in-depth. The exposed ports (9443/8080/8443)
+# are all above 1024 so binding does not need CAP_NET_BIND_SERVICE,
+# and the entrypoints no longer rely on `su` to switch users.
+USER lorica
 ENTRYPOINT ["/entrypoint.sh"]
