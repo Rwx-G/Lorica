@@ -67,6 +67,17 @@ const SLOW_ENQUEUE_WARN: Duration = Duration::from_millis(10);
 /// Default per-request timeout when the caller does not specify one.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Inflight map: std::sync::Mutex<HashMap> (not DashMap) is deliberate.
+// Volume on supervisor/worker channels is O(reloads + rpc-per-request),
+// well under the frequency where DashMap's lock-striping pays off.
+// `HashMap::{insert, remove}` cannot panic (no user closures, no
+// allocator exceptions on modern glibc), so `expect("inflight map
+// poisoned")` on the lock guards is effectively infallible; were it to
+// fire, it surfaces a corruption bug at the earliest moment instead of
+// silently leaving the map in an inconsistent state. The lone Drop on
+// `Inner` uses `if let Ok(...)` because panicking in Drop is UB-adjacent.
+// If this framework ever hosts a high-frequency path (e.g. per-request
+// RPC fan-out > 100 kHz), this is the first structure to revisit.
 type InflightMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Response>>>>;
 
 /// A pipelined, duplex RPC endpoint.
@@ -234,6 +245,17 @@ impl RpcEndpoint {
 
         // Cover both enqueue and response wait under a single timeout so
         // that a stuck peer surfaces as Timeout, not an indefinite hang.
+        //
+        // Cancel-safety: if the outer `timeout` fires while `send_fut`
+        // is still pending (queue full, peer stuck), dropping `full`
+        // drops `send_fut` before the envelope leaves the process — no
+        // command is enqueued, no spurious response can arrive, and
+        // `forget(seq)` below then removes the inflight oneshot. If the
+        // timeout fires after enqueue but before `resp_rx` resolves, a
+        // late response from the peer will be dropped by `reader_task`
+        // because the inflight entry is gone (logged at debug level as
+        // "response for unknown sequence"), and the oneshot sender is
+        // simply discarded. Either way, no leak, no double-send.
         let full = async move {
             // Enqueue. Emit a warning if the send future is still pending
             // after SLOW_ENQUEUE_WARN; keep awaiting on the same future
@@ -408,6 +430,15 @@ async fn reader_task(
     tracing::debug!("rpc: reader task exiting");
     // Best-effort: close out in-flight requests so they don't hang on
     // timeout. Dropping the oneshot senders signals Closed to their rx.
+    //
+    // Asymmetric with the hot-path `expect("inflight map poisoned")`:
+    // here we use `if let Ok(...)` because we must not panic while a
+    // task is exiting (it would leave dependent tasks and Arc counts in
+    // an awkward state). In the impossible-in-practice case where the
+    // mutex is already poisoned, pending requesters fall back to their
+    // per-request timeout instead of a prompt Closed — acceptable
+    // degradation for a pathological situation we don't actually expect
+    // to hit.
     if let Ok(mut map) = inflight.lock() {
         map.clear();
     }
