@@ -1150,6 +1150,13 @@ pub struct LoricaProxy {
     /// which would let one bypass Argon2. Same design as the forward
     /// auth verdict cache (see SEC-AUD-01).
     basic_auth_cache: Arc<DashMap<String, Instant>>,
+    /// Cross-worker shared-memory region. `Some` in worker mode
+    /// (populated from the memfd the supervisor passes at fork),
+    /// `None` in single-process mode. Holds cross-worker WAF counters
+    /// and future shared-state primitives (see
+    /// `docs/architecture/worker-shared-state.md` § 5). `'static`
+    /// because the mapping lives for the process lifetime.
+    pub shmem: Option<&'static lorica_shmem::SharedRegion>,
 }
 
 impl LoricaProxy {
@@ -1182,6 +1189,7 @@ impl LoricaProxy {
             log_store: None,
             circuit_breaker: Arc::new(CircuitBreaker::new(5, 10)),
             basic_auth_cache: Arc::new(DashMap::new()),
+            shmem: None,
         }
     }
 

@@ -195,6 +195,36 @@ impl<const N: usize> AtomicHashTable<N> {
         None
     }
 
+    /// Release the slot for `tagged_hash` by CAS-ing its key from
+    /// `tagged_hash` back to `0`. Returns `true` if the slot was
+    /// released, `false` if the key was not present or a concurrent
+    /// writer claimed it already. Subsequent `increment` on the same
+    /// key will reclaim a fresh slot with `value = by`.
+    ///
+    /// Used by the WAF auto-ban path to clear a counter after a ban
+    /// has been issued — a repeat offender after ban expiry starts
+    /// counting from zero rather than inheriting the previous run.
+    pub fn reset(&self, tagged_hash: u64) -> bool {
+        debug_assert!(tagged_hash != 0);
+        let mask = N - 1;
+        let start = (tagged_hash as usize) & mask;
+        for probe in 0..MAX_PROBE {
+            let i = (start + probe) & mask;
+            let s = &self.slots[i];
+            let cur = s.key.load(Ordering::Acquire);
+            if cur == 0 {
+                return false;
+            }
+            if cur == tagged_hash {
+                return s
+                    .key
+                    .compare_exchange(tagged_hash, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+            }
+        }
+        false
+    }
+
     /// Number of slots (capacity).
     pub const fn capacity(&self) -> usize {
         N
@@ -372,5 +402,24 @@ mod tests {
     fn slot_is_cache_line_sized() {
         assert_eq!(std::mem::size_of::<Slot>(), 64);
         assert_eq!(std::mem::align_of::<Slot>(), 64);
+    }
+
+    #[test]
+    fn reset_releases_slot_and_next_increment_starts_fresh() {
+        let t: Box<AtomicHashTable<1024>> = AtomicHashTable::new_zeroed();
+        let h = tagged_hash(0xc0ffee);
+        assert_eq!(t.increment(h, 10, 1), 10);
+        assert_eq!(t.read(h), Some(10));
+        assert!(t.reset(h));
+        assert_eq!(t.read(h), None);
+        // Next increment re-claims with a fresh counter.
+        assert_eq!(t.increment(h, 3, 2), 3);
+    }
+
+    #[test]
+    fn reset_returns_false_for_absent_key() {
+        let t: Box<AtomicHashTable<1024>> = AtomicHashTable::new_zeroed();
+        let h = tagged_hash(0xabcd);
+        assert!(!t.reset(h));
     }
 }

@@ -16,6 +16,14 @@
 //!
 //! The supervisor creates listening sockets, then passes their FDs to workers
 //! over a unix socketpair using the SCM_RIGHTS ancillary message.
+//!
+//! Each FD carries a typed tag ([`FdKind`]) so callers can distinguish a
+//! listening TCP socket from e.g. the shared-memory memfd used by
+//! `lorica-shmem`. On the wire, the tags are serialised as a space-
+//! separated list alongside the SCM_RIGHTS payload:
+//!
+//! - `listener:0.0.0.0:8080` — a TCP listener
+//! - `shmem` — the anonymous memfd holding the `SharedRegion`
 
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -28,11 +36,52 @@ use nix::sys::socket::{
 
 use crate::WorkerError;
 
-/// Maximum number of listener FDs that can be passed in a single message.
+/// Maximum number of FDs that can be passed in a single message. Covers
+/// the worst case: one HTTP listener + one HTTPS listener + one shmem
+/// memfd + headroom for future RPC / shared-state descriptors.
 const MAX_FDS: usize = 32;
 
-/// Maximum size of the address payload buffer.
+/// Maximum size of the tag payload buffer.
 const PAYLOAD_BUF_SIZE: usize = 2048;
+
+/// What a passed file descriptor is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FdKind {
+    /// A listening TCP socket. `addr` is the bind address (e.g. "0.0.0.0:8080").
+    Listener { addr: String },
+    /// The anonymous memfd backing the `lorica_shmem::SharedRegion`.
+    Shmem,
+}
+
+impl FdKind {
+    /// Serialise as a wire token (one space-separated item in the payload).
+    fn to_token(&self) -> String {
+        match self {
+            FdKind::Listener { addr } => format!("listener:{addr}"),
+            FdKind::Shmem => "shmem".to_string(),
+        }
+    }
+
+    /// Parse a wire token produced by [`Self::to_token`].
+    fn from_token(tok: &str) -> Result<Self, WorkerError> {
+        if tok == "shmem" {
+            Ok(FdKind::Shmem)
+        } else if let Some(addr) = tok.strip_prefix("listener:") {
+            Ok(FdKind::Listener {
+                addr: addr.to_string(),
+            })
+        } else {
+            Err(WorkerError::InvalidPayload)
+        }
+    }
+}
+
+/// A typed FD entry sent over the command channel at worker fork.
+#[derive(Debug, Clone)]
+pub struct FdEntry {
+    pub fd: RawFd,
+    pub kind: FdKind,
+}
 
 /// Create a Unix socketpair for supervisor-worker communication.
 ///
@@ -51,21 +100,17 @@ pub fn create_socketpair() -> Result<(OwnedFd, OwnedFd), WorkerError> {
     Ok((fd1, fd2))
 }
 
-/// Send listening socket FDs and their bind addresses to a worker.
+/// Send typed FD entries to a worker.
 ///
-/// The addresses are serialized as space-separated strings in the message payload.
-/// The FDs are sent via SCM_RIGHTS ancillary data.
-pub fn send_listener_fds(sock: RawFd, fds: &[RawFd], addrs: &[String]) -> Result<(), WorkerError> {
-    if fds.len() != addrs.len() {
-        return Err(WorkerError::FdAddrMismatch {
-            fds: fds.len(),
-            addrs: addrs.len(),
-        });
-    }
-
-    let payload = addrs.join(" ");
+/// The tags are serialised as a space-separated payload; the FDs travel
+/// in the SCM_RIGHTS ancillary message. The `i`-th tag pairs with the
+/// `i`-th FD. Order is preserved; callers match by `kind`, not by index.
+pub fn send_worker_fds(sock: RawFd, entries: &[FdEntry]) -> Result<(), WorkerError> {
+    let fds: Vec<RawFd> = entries.iter().map(|e| e.fd).collect();
+    let tokens: Vec<String> = entries.iter().map(|e| e.kind.to_token()).collect();
+    let payload = tokens.join(" ");
     let iov = [IoSlice::new(payload.as_bytes())];
-    let cmsg = [ControlMessage::ScmRights(fds)];
+    let cmsg = [ControlMessage::ScmRights(&fds)];
 
     socket::sendmsg::<UnixAddr>(sock, &iov, &cmsg, MsgFlags::empty(), None)
         .map_err(WorkerError::SendFds)?;
@@ -73,10 +118,8 @@ pub fn send_listener_fds(sock: RawFd, fds: &[RawFd], addrs: &[String]) -> Result
     Ok(())
 }
 
-/// Receive listening socket FDs and their bind addresses from the supervisor.
-///
-/// Returns a list of `(raw_fd, bind_address)` pairs.
-pub fn recv_listener_fds(sock: RawFd) -> Result<Vec<(RawFd, String)>, WorkerError> {
+/// Receive typed FD entries from the supervisor.
+pub fn recv_worker_fds(sock: RawFd) -> Result<Vec<FdEntry>, WorkerError> {
     let mut buf = [0u8; PAYLOAD_BUF_SIZE];
     let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
 
@@ -96,16 +139,53 @@ pub fn recv_listener_fds(sock: RawFd) -> Result<Vec<(RawFd, String)>, WorkerErro
     };
 
     let payload = std::str::from_utf8(&buf[..bytes]).map_err(|_| WorkerError::InvalidPayload)?;
-    let addrs: Vec<String> = payload.split_ascii_whitespace().map(String::from).collect();
+    let tokens: Vec<&str> = payload.split_ascii_whitespace().collect();
 
+    if fds.len() != tokens.len() {
+        return Err(WorkerError::FdAddrMismatch {
+            fds: fds.len(),
+            addrs: tokens.len(),
+        });
+    }
+
+    fds.into_iter()
+        .zip(tokens)
+        .map(|(fd, tok)| FdKind::from_token(tok).map(|kind| FdEntry { fd, kind }))
+        .collect()
+}
+
+/// Backwards-compatible wrapper used by tests that only care about
+/// listener FDs. The on-wire tokens are still the typed form so
+/// [`send_listener_fds`] interoperates with [`recv_worker_fds`].
+pub fn send_listener_fds(sock: RawFd, fds: &[RawFd], addrs: &[String]) -> Result<(), WorkerError> {
     if fds.len() != addrs.len() {
         return Err(WorkerError::FdAddrMismatch {
             fds: fds.len(),
             addrs: addrs.len(),
         });
     }
+    let entries: Vec<FdEntry> = fds
+        .iter()
+        .zip(addrs)
+        .map(|(&fd, addr)| FdEntry {
+            fd,
+            kind: FdKind::Listener { addr: addr.clone() },
+        })
+        .collect();
+    send_worker_fds(sock, &entries)
+}
 
-    Ok(fds.into_iter().zip(addrs).collect())
+/// Backwards-compatible wrapper: drops non-listener entries so callers
+/// that only need listeners stay simple.
+pub fn recv_listener_fds(sock: RawFd) -> Result<Vec<(RawFd, String)>, WorkerError> {
+    let entries = recv_worker_fds(sock)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            FdKind::Listener { addr } => Some((e.fd, addr)),
+            FdKind::Shmem => None,
+        })
+        .collect())
 }
 
 /// Clear the CLOEXEC flag on a file descriptor so it survives `execv`.
@@ -260,5 +340,95 @@ mod tests {
 
         // Clean up
         unsafe { close_fd(fd) };
+    }
+
+    #[test]
+    fn test_send_recv_typed_shmem_plus_listener() {
+        use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
+        let (parent_fd, child_fd) = create_socketpair().expect("socketpair failed");
+
+        let memfd = memfd_create(c"lorica-shmem-test", MemFdCreateFlag::MFD_CLOEXEC)
+            .expect("memfd_create");
+        let dummy = socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .expect("dummy");
+
+        let entries = [
+            FdEntry {
+                fd: memfd.as_raw_fd(),
+                kind: FdKind::Shmem,
+            },
+            FdEntry {
+                fd: dummy.as_raw_fd(),
+                kind: FdKind::Listener {
+                    addr: "0.0.0.0:8080".to_string(),
+                },
+            },
+        ];
+        send_worker_fds(parent_fd.as_raw_fd(), &entries).expect("send");
+
+        let received = recv_worker_fds(child_fd.as_raw_fd()).expect("recv");
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].kind, FdKind::Shmem);
+        match &received[1].kind {
+            FdKind::Listener { addr } => assert_eq!(addr, "0.0.0.0:8080"),
+            _ => panic!("expected Listener"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_listener_wrapper_filters_out_shmem() {
+        // Sender mixes shmem + listener; legacy receiver keeps only listeners.
+        use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
+        let (parent_fd, child_fd) = create_socketpair().expect("socketpair failed");
+
+        let memfd = memfd_create(c"lorica-shmem-test2", MemFdCreateFlag::MFD_CLOEXEC).unwrap();
+        let dummy = socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        let entries = [
+            FdEntry {
+                fd: memfd.as_raw_fd(),
+                kind: FdKind::Shmem,
+            },
+            FdEntry {
+                fd: dummy.as_raw_fd(),
+                kind: FdKind::Listener {
+                    addr: "127.0.0.1:9000".to_string(),
+                },
+            },
+        ];
+        send_worker_fds(parent_fd.as_raw_fd(), &entries).unwrap();
+        let pairs = recv_listener_fds(child_fd.as_raw_fd()).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_fd_kind_token_roundtrip() {
+        let cases = [
+            FdKind::Shmem,
+            FdKind::Listener {
+                addr: "0.0.0.0:8080".to_string(),
+            },
+            FdKind::Listener {
+                addr: "[::]:443".to_string(),
+            },
+        ];
+        for k in cases {
+            let t = k.to_token();
+            let back = FdKind::from_token(&t).unwrap();
+            assert_eq!(back, k);
+        }
+        // Unknown tag is an error.
+        assert!(FdKind::from_token("wat:garbage").is_err());
     }
 }

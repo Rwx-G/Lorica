@@ -29,7 +29,7 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execv, fork, ForkResult, Pid};
 use tracing::{info, warn};
 
-use crate::fd_passing;
+use crate::fd_passing::{self, FdEntry, FdKind};
 use crate::WorkerError;
 
 /// Maximum backoff delay between restarts.
@@ -118,6 +118,10 @@ pub struct WorkerManager {
     listen_fds: Vec<RawFd>,
     /// Bind addresses corresponding to each listen_fd.
     listen_addrs: Vec<String>,
+    /// Optional anonymous memfd for the `lorica-shmem` SharedRegion,
+    /// sent to each worker alongside the listener FDs. `None` when
+    /// shared-memory state is disabled (single-process mode or tests).
+    shmem_fd: Option<RawFd>,
 }
 
 impl WorkerManager {
@@ -128,7 +132,15 @@ impl WorkerManager {
             workers: Vec::new(),
             listen_fds: Vec::new(),
             listen_addrs: Vec::new(),
+            shmem_fd: None,
         }
+    }
+
+    /// Attach a memfd that will be sent to every worker as the
+    /// `lorica-shmem` region descriptor. Call before [`Self::start`].
+    /// `None` disables shared-memory propagation (single-process mode).
+    pub fn set_shmem_fd(&mut self, fd: Option<RawFd>) {
+        self.shmem_fd = fd;
     }
 
     /// Create listening sockets and spawn all worker processes.
@@ -187,11 +199,20 @@ impl WorkerManager {
                 // Parent: close worker end, send FDs, record handle
                 drop(worker_fd);
 
-                fd_passing::send_listener_fds(
-                    supervisor_fd.as_raw_fd(),
-                    &self.listen_fds,
-                    &self.listen_addrs,
-                )?;
+                let mut entries: Vec<FdEntry> = Vec::new();
+                if let Some(fd) = self.shmem_fd {
+                    entries.push(FdEntry {
+                        fd,
+                        kind: FdKind::Shmem,
+                    });
+                }
+                for (fd, addr) in self.listen_fds.iter().zip(&self.listen_addrs) {
+                    entries.push(FdEntry {
+                        fd: *fd,
+                        kind: FdKind::Listener { addr: addr.clone() },
+                    });
+                }
+                fd_passing::send_worker_fds(supervisor_fd.as_raw_fd(), &entries)?;
 
                 info!(worker_id = id, pid = child.as_raw(), "worker spawned");
 

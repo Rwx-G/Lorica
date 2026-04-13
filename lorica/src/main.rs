@@ -388,12 +388,39 @@ fn run_supervisor(cli: Cli) {
         info!("database migrations completed, forking workers");
     }
 
+    // Create the shared-memory region BEFORE forking so every worker
+    // inherits a mapping to the same pages. See
+    // docs/architecture/worker-shared-state.md § 5.
+    // The returned &'static reference outlives the fork; the OwnedFd is
+    // passed to every worker via SCM_RIGHTS and is closed in the
+    // supervisor once all workers have received it (workers then keep
+    // the pages alive via their own OwnedFd inside `open_worker`).
+    let (shmem_region, shmem_fd) = match lorica_shmem::SharedRegion::create_supervisor() {
+        Ok(pair) => pair,
+        Err(e) => {
+            error!(error = %e, "failed to create shared-memory region");
+            std::process::exit(1);
+        }
+    };
+    info!(
+        bytes = lorica_shmem::REGION_SIZE,
+        "shared-memory region created; forking workers"
+    );
+
     // Fork workers BEFORE creating any threads/runtime
     let mut manager = WorkerManager::new(config);
+    // Hand the memfd to the manager so every forked worker receives it
+    // alongside the listener FDs.
+    {
+        use std::os::fd::AsRawFd;
+        manager.set_shmem_fd(Some(shmem_fd.as_raw_fd()));
+    }
     if let Err(e) = manager.start() {
         error!(error = %e, "failed to start worker processes");
         std::process::exit(1);
     }
+    // The supervisor keeps the fd alive (via `shmem_fd`) for the
+    // eviction task and any later supervisor-side reads/writes.
 
     info!(
         worker_count = manager.worker_count(),
@@ -516,6 +543,30 @@ fn run_supervisor(cli: Cli) {
                 }
             }
         });
+
+        // Shared-memory region eviction task. The supervisor is the sole
+        // evictor; workers only read and increment. See
+        // docs/architecture/worker-shared-state.md § 5.4. Cadence and
+        // staleness come from `lorica_shmem::DEFAULT_SCAN_INTERVAL` (60s)
+        // and `DEFAULT_STALE_AFTER` (5 min) respectively.
+        {
+            let region = shmem_region;
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(lorica_shmem::DEFAULT_SCAN_INTERVAL);
+                tick.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Delay,
+                );
+                tick.tick().await; // skip the immediate tick
+                let stale_ns = lorica_shmem::DEFAULT_STALE_AFTER.as_nanos() as u64;
+                loop {
+                    tick.tick().await;
+                    let now = lorica_shmem::now_ns();
+                    let stats = lorica_shmem::evict_once(region, now, stale_ns);
+                    lorica_shmem::eviction::log_pass(stats);
+                }
+            });
+        }
 
         // Broadcast channel: API config changes fan out to all per-worker tasks
         let (reload_bc_tx, _) = broadcast::channel::<u64>(16);
@@ -1244,29 +1295,50 @@ fn run_worker(
 
     info!(worker_id = id, cmd_fd = cmd_fd, "worker starting");
 
-    // Receive listening FDs from supervisor via SCM_RIGHTS
-    let fd_pairs = match fd_passing::recv_listener_fds(cmd_fd) {
-        Ok(pairs) => pairs,
+    // Receive typed FDs from supervisor via SCM_RIGHTS. Listener entries
+    // register with the Fds table; a `Shmem` entry (if present) is
+    // adopted via `lorica_shmem::SharedRegion::open_worker`.
+    let entries = match fd_passing::recv_worker_fds(cmd_fd) {
+        Ok(entries) => entries,
         Err(e) => {
-            error!(error = %e, "worker failed to receive listener FDs");
+            error!(error = %e, "worker failed to receive FDs");
             std::process::exit(1);
         }
     };
 
-    info!(
-        worker_id = id,
-        listener_count = fd_pairs.len(),
-        "received listener FDs"
-    );
-
-    // Build the Fds table for lorica-core
     let mut fds = Fds::new();
     let mut listener_addrs: Vec<String> = Vec::new();
-    for (fd, addr) in &fd_pairs {
-        fds.add(addr.clone(), *fd);
-        listener_addrs.push(addr.clone());
-        info!(worker_id = id, addr = %addr, fd = fd, "registered listener FD");
+    let mut shmem_region: Option<&'static lorica_shmem::SharedRegion> = None;
+    let mut listener_count = 0usize;
+    for entry in entries {
+        match entry.kind {
+            fd_passing::FdKind::Listener { addr } => {
+                fds.add(addr.clone(), entry.fd);
+                listener_addrs.push(addr.clone());
+                listener_count += 1;
+                info!(worker_id = id, addr = %addr, fd = entry.fd, "registered listener FD");
+            }
+            fd_passing::FdKind::Shmem => {
+                match unsafe { lorica_shmem::SharedRegion::open_worker(entry.fd) } {
+                    Ok(region) => {
+                        shmem_region = Some(region);
+                        info!(worker_id = id, fd = entry.fd, "adopted shmem region");
+                    }
+                    Err(e) => {
+                        error!(worker_id = id, error = %e, "worker failed to open shmem region");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
     }
+
+    info!(
+        worker_id = id,
+        listener_count,
+        shmem = shmem_region.is_some(),
+        "received worker FDs"
+    );
 
     // Open the configuration database with encryption key
     let data_dir = PathBuf::from(data_dir);
@@ -1614,6 +1686,34 @@ fn run_worker(
                     CommandType::Unspecified => {
                         warn!(worker_id = id, "received unspecified command");
                     }
+                    // Pipelined RPC command variants (Phase 1 framework,
+                    // see docs/architecture/worker-shared-state.md § 4).
+                    // The legacy CommandChannel used here is request/reply
+                    // inline; the pipelined RPC uses RpcEndpoint on a
+                    // separate (future) socketpair. Any RPC-typed Command
+                    // arriving on this channel is a protocol misuse; reply
+                    // with a clear error so the supervisor can log it.
+                    CommandType::RateLimitQuery
+                    | CommandType::RateLimitDelta
+                    | CommandType::VerdictLookup
+                    | CommandType::VerdictPush
+                    | CommandType::BreakerQuery
+                    | CommandType::BreakerReport
+                    | CommandType::ConfigReloadPrepare
+                    | CommandType::ConfigReloadCommit => {
+                        warn!(
+                            worker_id = id,
+                            command_type = ?cmd.typed_command(),
+                            "RPC-typed command delivered on legacy channel; expected the pipelined RpcEndpoint"
+                        );
+                        let resp = Response::error(
+                            cmd.sequence,
+                            "pipelined RPC command on legacy channel",
+                        );
+                        if let Err(e) = channel.send(&resp).await {
+                            warn!(error = %e, "failed to send RPC protocol-error response");
+                        }
+                    }
                 }
             }
         });
@@ -1743,6 +1843,7 @@ fn run_worker(
     lorica_proxy.request_counts = worker_request_counts;
     lorica_proxy.waf_counts = worker_waf_counts;
     lorica_proxy.waf_engine = waf_engine;
+    lorica_proxy.shmem = shmem_region;
     // Periodic basic-auth cache prune (PERF-8). Worker mode has no
     // supervisor TaskTracker available here; a local tracker is fine
     // because worker shutdown is orchestrated by the supervisor via
