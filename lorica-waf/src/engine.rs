@@ -911,7 +911,10 @@ mod tests {
         let e = engine();
         assert!(e.disable_rule(942100));
         let rules = e.list_rules();
-        let sqli_union = rules.iter().find(|r| r.id == 942100).unwrap();
+        let sqli_union = rules
+            .iter()
+            .find(|r| r.id == 942100)
+            .expect("test setup: rule 942100 must exist in CRS ruleset");
         assert!(!sqli_union.enabled);
         assert_eq!(e.enabled_rule_count(), e.rule_count() - 1);
     }
@@ -928,7 +931,10 @@ mod tests {
         e.disable_rule(942100);
         assert!(e.enable_rule(942100));
         let rules = e.list_rules();
-        let sqli_union = rules.iter().find(|r| r.id == 942100).unwrap();
+        let sqli_union = rules
+            .iter()
+            .find(|r| r.id == 942100)
+            .expect("test setup: rule 942100 must exist in CRS ruleset");
         assert!(sqli_union.enabled);
     }
 
@@ -964,9 +970,27 @@ mod tests {
         let e = engine();
         e.set_disabled_rules(&[942100, 941100, 930100]);
         let rules = e.list_rules();
-        assert!(!rules.iter().find(|r| r.id == 942100).unwrap().enabled);
-        assert!(!rules.iter().find(|r| r.id == 941100).unwrap().enabled);
-        assert!(!rules.iter().find(|r| r.id == 930100).unwrap().enabled);
+        assert!(
+            !rules
+                .iter()
+                .find(|r| r.id == 942100)
+                .expect("test setup: rule 942100 must exist in CRS ruleset")
+                .enabled
+        );
+        assert!(
+            !rules
+                .iter()
+                .find(|r| r.id == 941100)
+                .expect("test setup: rule 941100 must exist in CRS ruleset")
+                .enabled
+        );
+        assert!(
+            !rules
+                .iter()
+                .find(|r| r.id == 930100)
+                .expect("test setup: rule 930100 must exist in CRS ruleset")
+                .enabled
+        );
         assert_eq!(e.enabled_rule_count(), e.rule_count() - 3);
 
         // Re-enable all

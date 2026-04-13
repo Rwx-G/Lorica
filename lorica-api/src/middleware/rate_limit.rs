@@ -95,7 +95,9 @@ mod tests {
         // Manually expire the window
         {
             let mut buckets = limiter.buckets.lock().await;
-            let bucket = buckets.get_mut("key1").unwrap();
+            let bucket = buckets
+                .get_mut("key1")
+                .expect("test setup: bucket inserted just above");
             bucket.window_start = Utc::now() - Duration::seconds(WINDOW_SECONDS + 1);
         }
 

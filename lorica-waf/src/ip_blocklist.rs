@@ -45,19 +45,34 @@ impl IpBlocklist {
 
     /// Check if an IP address is blocked.
     pub fn is_blocked(&self, ip: &IpAddr) -> bool {
-        if !*self.enabled.read().unwrap() {
+        if !*self
+            .enabled
+            .read()
+            .expect("RwLock poisoned (no panicking writer holds this guard)")
+        {
             return false;
         }
-        self.ips.read().unwrap().contains(ip)
+        self.ips
+            .read()
+            .expect("RwLock poisoned (no panicking writer holds this guard)")
+            .contains(ip)
     }
 
     /// Check if an IP string is blocked (parses the string first).
     pub fn is_blocked_str(&self, ip_str: &str) -> bool {
-        if !*self.enabled.read().unwrap() {
+        if !*self
+            .enabled
+            .read()
+            .expect("RwLock poisoned (no panicking writer holds this guard)")
+        {
             return false;
         }
         match ip_str.parse::<IpAddr>() {
-            Ok(ip) => self.ips.read().unwrap().contains(&ip),
+            Ok(ip) => self
+                .ips
+                .read()
+                .expect("RwLock poisoned (no panicking writer holds this guard)")
+                .contains(&ip),
             Err(_) => false,
         }
     }
@@ -80,36 +95,60 @@ impl IpBlocklist {
             }
         }
         let count = set.len();
-        *self.ips.write().unwrap() = set;
-        *self.enabled.write().unwrap() = true;
+        *self
+            .ips
+            .write()
+            .expect("RwLock poisoned (no panicking writer holds this guard)") = set;
+        *self
+            .enabled
+            .write()
+            .expect("RwLock poisoned (no panicking writer holds this guard)") = true;
         info!(count = count, "IP blocklist loaded");
         count
     }
 
     /// Enable or disable the blocklist.
     pub fn set_enabled(&self, enabled: bool) {
-        *self.enabled.write().unwrap() = enabled;
+        *self
+            .enabled
+            .write()
+            .expect("RwLock poisoned (no panicking writer holds this guard)") = enabled;
     }
 
     /// Return whether the blocklist is enabled.
     pub fn is_enabled(&self) -> bool {
-        *self.enabled.read().unwrap()
+        *self
+            .enabled
+            .read()
+            .expect("RwLock poisoned (no panicking writer holds this guard)")
     }
 
     /// Return the number of IPs in the blocklist.
     pub fn len(&self) -> usize {
-        self.ips.read().unwrap().len()
+        self.ips
+            .read()
+            .expect("RwLock poisoned (no panicking writer holds this guard)")
+            .len()
     }
 
     /// Return true if the blocklist is empty.
     pub fn is_empty(&self) -> bool {
-        self.ips.read().unwrap().is_empty()
+        self.ips
+            .read()
+            .expect("RwLock poisoned (no panicking writer holds this guard)")
+            .is_empty()
     }
 
     /// Clear the blocklist.
     pub fn clear(&self) {
-        self.ips.write().unwrap().clear();
-        *self.enabled.write().unwrap() = false;
+        self.ips
+            .write()
+            .expect("RwLock poisoned (no panicking writer holds this guard)")
+            .clear();
+        *self
+            .enabled
+            .write()
+            .expect("RwLock poisoned (no panicking writer holds this guard)") = false;
     }
 }
 
@@ -207,7 +246,9 @@ invalid-line
     fn test_is_blocked_with_parsed_ip() {
         let bl = IpBlocklist::new();
         bl.load_from_text("192.168.1.1");
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        let ip: IpAddr = "192.168.1.1"
+            .parse()
+            .expect("test setup: literal IP parses");
         assert!(bl.is_blocked(&ip));
     }
 
@@ -279,7 +320,7 @@ invalid-line
         assert!(bl.is_empty());
         assert!(!bl.is_blocked_str("1.2.3.4"));
         // IpAddr lookup should also return false
-        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let ip: IpAddr = "1.2.3.4".parse().expect("test setup: literal IP parses");
         assert!(!bl.is_blocked(&ip));
     }
 

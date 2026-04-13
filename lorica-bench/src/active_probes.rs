@@ -161,7 +161,10 @@ impl ProbeScheduler {
                 // Flush result as an "active" source bucket
                 let bucket_start = {
                     let now = Utc::now();
-                    now.with_nanosecond(0).unwrap().with_second(0).unwrap()
+                    now.with_nanosecond(0)
+                        .expect("0 is a valid nanosecond value")
+                        .with_second(0)
+                        .expect("0 is a valid second value")
                 };
 
                 let bucket = SlaBucket {
@@ -353,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_store_probe_crud() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
         // Create a route (FK constraint)
         let route = lorica_config::models::Route {
@@ -421,46 +424,69 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: create route");
 
         let probe = make_probe_config("p1", "r1");
-        store.create_probe_config(&probe).unwrap();
+        store
+            .create_probe_config(&probe)
+            .expect("test setup: create probe config");
 
         // List all
-        let probes = store.list_probe_configs().unwrap();
+        let probes = store
+            .list_probe_configs()
+            .expect("test setup: list probe configs");
         assert_eq!(probes.len(), 1);
         assert_eq!(probes[0].id, "p1");
 
         // Get by ID
-        let p = store.get_probe_config("p1").unwrap().unwrap();
+        let p = store
+            .get_probe_config("p1")
+            .expect("test setup: get probe config")
+            .expect("test setup: probe exists after create");
         assert_eq!(p.route_id, "r1");
         assert_eq!(p.method, "GET");
 
         // List for route
-        let probes = store.list_probes_for_route("r1").unwrap();
+        let probes = store
+            .list_probes_for_route("r1")
+            .expect("test setup: list probes for route");
         assert_eq!(probes.len(), 1);
 
         // List enabled
-        let enabled = store.list_enabled_probes().unwrap();
+        let enabled = store
+            .list_enabled_probes()
+            .expect("test setup: list enabled probes");
         assert_eq!(enabled.len(), 1);
 
         // Update
         let mut updated = p;
         updated.method = "HEAD".to_string();
         updated.interval_s = 60;
-        store.update_probe_config(&updated).unwrap();
-        let p = store.get_probe_config("p1").unwrap().unwrap();
+        store
+            .update_probe_config(&updated)
+            .expect("test setup: update probe config");
+        let p = store
+            .get_probe_config("p1")
+            .expect("test setup: get probe config")
+            .expect("test setup: probe exists after update");
         assert_eq!(p.method, "HEAD");
         assert_eq!(p.interval_s, 60);
 
         // Delete
-        store.delete_probe_config("p1").unwrap();
-        assert!(store.get_probe_config("p1").unwrap().is_none());
+        store
+            .delete_probe_config("p1")
+            .expect("test setup: delete probe config");
+        assert!(store
+            .get_probe_config("p1")
+            .expect("test setup: get probe config after delete")
+            .is_none());
     }
 
     #[test]
     fn test_store_probe_cascade_delete() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
         let route = lorica_config::models::Route {
             id: "r1".to_string(),
@@ -527,19 +553,28 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: create route");
 
         let probe = make_probe_config("p1", "r1");
-        store.create_probe_config(&probe).unwrap();
+        store
+            .create_probe_config(&probe)
+            .expect("test setup: create probe config");
 
         // Deleting the route should cascade-delete the probe
-        store.delete_route("r1").unwrap();
-        assert!(store.get_probe_config("p1").unwrap().is_none());
+        store.delete_route("r1").expect("test setup: delete route");
+        assert!(store
+            .get_probe_config("p1")
+            .expect("test setup: get probe config after cascade")
+            .is_none());
     }
 
     #[tokio::test]
     async fn test_probe_scheduler_active_count() {
-        let store = Arc::new(TokioMutex::new(ConfigStore::open_in_memory().unwrap()));
+        let store = Arc::new(TokioMutex::new(
+            ConfigStore::open_in_memory().expect("test setup: open in-memory store"),
+        ));
         let scheduler = ProbeScheduler::new(store, None);
         assert_eq!(scheduler.active_count().await, 0);
     }
@@ -567,6 +602,9 @@ mod tests {
             error: Some("expected status 200, got 503".to_string()),
         };
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("503"));
+        assert!(result
+            .error
+            .expect("test setup: error field is Some for failure result")
+            .contains("503"));
     }
 }

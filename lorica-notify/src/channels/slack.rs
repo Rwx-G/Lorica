@@ -96,7 +96,7 @@ mod tests {
             username: "Lorica".into(),
             icon_emoji: ":shield:".into(),
         };
-        let json = serde_json::to_string(&msg).unwrap();
+        let json = serde_json::to_string(&msg).expect("SlackMessage fixture serializes cleanly");
         assert!(json.contains("BACKEND DOWN"));
         assert!(json.contains("Lorica"));
     }

@@ -510,8 +510,10 @@ mod tests {
         let encoder = TextEncoder::new();
         let families = REGISTRY.gather();
         let mut buf = Vec::new();
-        encoder.encode(&families, &mut buf).unwrap();
-        let text = String::from_utf8(buf).unwrap();
+        encoder
+            .encode(&families, &mut buf)
+            .expect("test setup: encode metrics");
+        let text = String::from_utf8(buf).expect("test setup: metrics output is UTF-8");
         assert!(text.contains("lorica_http_requests_total"));
         assert!(text.contains("test-encode"));
     }
@@ -527,7 +529,9 @@ mod tests {
         let encoder = TextEncoder::new();
         let families = REGISTRY.gather();
         let mut buf = Vec::new();
-        encoder.encode(&families, &mut buf).unwrap();
+        encoder
+            .encode(&families, &mut buf)
+            .expect("test setup: encode metrics");
         assert!(!buf.is_empty());
     }
 }

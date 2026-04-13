@@ -1651,15 +1651,15 @@ mod tests {
     #[test]
     fn build_traffic_split_trims_name() {
         let req = split("  v2  ", 5, &["b"]);
-        let built = build_traffic_split(&req).unwrap();
+        let built = build_traffic_split(&req).expect("test setup");
         assert_eq!(built.name, "v2");
     }
 
     #[test]
     fn validate_traffic_splits_rejects_cumulative_over_100() {
         let splits = vec![
-            build_traffic_split(&split("a", 60, &["x"])).unwrap(),
-            build_traffic_split(&split("b", 50, &["y"])).unwrap(),
+            build_traffic_split(&split("a", 60, &["x"])).expect("test setup"),
+            build_traffic_split(&split("b", 50, &["y"])).expect("test setup"),
         ];
         let err = validate_traffic_splits(&splits).expect_err("should reject");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("<= 100")));
@@ -1668,8 +1668,8 @@ mod tests {
     #[test]
     fn validate_traffic_splits_accepts_cumulative_exactly_100() {
         let splits = vec![
-            build_traffic_split(&split("a", 40, &["x"])).unwrap(),
-            build_traffic_split(&split("b", 60, &["y"])).unwrap(),
+            build_traffic_split(&split("a", 40, &["x"])).expect("test setup"),
+            build_traffic_split(&split("b", 60, &["y"])).expect("test setup"),
         ];
         assert!(validate_traffic_splits(&splits).is_ok());
     }
@@ -1715,7 +1715,7 @@ mod tests {
             2_000,
             vec!["Remote-User"],
         ))
-        .unwrap();
+        .expect("test setup");
         assert_eq!(built.address, "http://authelia.internal/api/verify");
         assert_eq!(built.timeout_ms, 2_000);
         assert_eq!(built.response_headers, vec!["Remote-User".to_string()]);
@@ -1730,23 +1730,20 @@ mod tests {
 
     #[test]
     fn build_forward_auth_rejects_empty_address() {
-        let err = build_forward_auth(&fa_req("", 1000, vec![])).err().unwrap();
+        let err = build_forward_auth(&fa_req("", 1000, vec![])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("must not be empty")));
     }
 
     #[test]
     fn build_forward_auth_rejects_non_absolute_url() {
-        let err = build_forward_auth(&fa_req("/verify", 1000, vec![]))
-            .err()
-            .unwrap();
+        let err = build_forward_auth(&fa_req("/verify", 1000, vec![])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[test]
     fn build_forward_auth_rejects_non_http_scheme() {
         let err = build_forward_auth(&fa_req("ftp://x.example.com/", 1000, vec![]))
-            .err()
-            .unwrap();
+            .expect_err("test setup");
         assert!(
             matches!(err, ApiError::BadRequest(ref m) if m.contains("http") || m.contains("https"))
         );
@@ -1754,25 +1751,20 @@ mod tests {
 
     #[test]
     fn build_forward_auth_rejects_zero_timeout() {
-        let err = build_forward_auth(&fa_req("http://a/", 0, vec![]))
-            .err()
-            .unwrap();
+        let err = build_forward_auth(&fa_req("http://a/", 0, vec![])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("> 0")));
     }
 
     #[test]
     fn build_forward_auth_rejects_over_one_minute_timeout() {
-        let err = build_forward_auth(&fa_req("http://a/", 60_001, vec![]))
-            .err()
-            .unwrap();
+        let err = build_forward_auth(&fa_req("http://a/", 60_001, vec![])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("60000")));
     }
 
     #[test]
     fn build_forward_auth_rejects_blank_response_header_entry() {
         let err = build_forward_auth(&fa_req("http://a/", 1000, vec!["Remote-User", "   "]))
-            .err()
-            .unwrap();
+            .expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("non-empty")));
     }
 
@@ -1783,7 +1775,7 @@ mod tests {
             1000,
             vec![" Remote-User ", "Remote-Groups"],
         ))
-        .unwrap();
+        .expect("test setup");
         assert_eq!(
             built.response_headers,
             vec!["Remote-User".to_string(), "Remote-Groups".to_string()]
@@ -1803,7 +1795,8 @@ mod tests {
 
     #[test]
     fn build_mirror_accepts_valid() {
-        let built = build_mirror_config(&mirror_req(vec!["b1", "b2"], 25, 3000)).unwrap();
+        let built =
+            build_mirror_config(&mirror_req(vec!["b1", "b2"], 25, 3000)).expect("test setup");
         assert_eq!(built.backend_ids, vec!["b1".to_string(), "b2".to_string()]);
         assert_eq!(built.sample_percent, 25);
         assert_eq!(built.timeout_ms, 3000);
@@ -1811,41 +1804,31 @@ mod tests {
 
     #[test]
     fn build_mirror_rejects_empty_backend_list() {
-        let err = build_mirror_config(&mirror_req(vec![], 100, 5000))
-            .err()
-            .unwrap();
+        let err = build_mirror_config(&mirror_req(vec![], 100, 5000)).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("must not be empty")));
     }
 
     #[test]
     fn build_mirror_rejects_sample_over_100() {
-        let err = build_mirror_config(&mirror_req(vec!["b"], 101, 5000))
-            .err()
-            .unwrap();
+        let err = build_mirror_config(&mirror_req(vec!["b"], 101, 5000)).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("0..=100")));
     }
 
     #[test]
     fn build_mirror_rejects_zero_timeout() {
-        let err = build_mirror_config(&mirror_req(vec!["b"], 50, 0))
-            .err()
-            .unwrap();
+        let err = build_mirror_config(&mirror_req(vec!["b"], 50, 0)).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("> 0")));
     }
 
     #[test]
     fn build_mirror_rejects_over_60s_timeout() {
-        let err = build_mirror_config(&mirror_req(vec!["b"], 50, 60_001))
-            .err()
-            .unwrap();
+        let err = build_mirror_config(&mirror_req(vec!["b"], 50, 60_001)).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("60000")));
     }
 
     #[test]
     fn build_mirror_rejects_blank_backend_id() {
-        let err = build_mirror_config(&mirror_req(vec!["   "], 50, 5000))
-            .err()
-            .unwrap();
+        let err = build_mirror_config(&mirror_req(vec!["   "], 50, 5000)).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("non-empty")));
     }
 
@@ -1854,13 +1837,14 @@ mod tests {
         // Duplicate backend IDs would spawn two sub-requests to the same
         // shadow per primary request, which is wasteful and skews any
         // load/error metrics the operator is watching on the shadow.
-        let built = build_mirror_config(&mirror_req(vec!["b1", "b2", "b1"], 50, 5000)).unwrap();
+        let built =
+            build_mirror_config(&mirror_req(vec!["b1", "b2", "b1"], 50, 5000)).expect("test setup");
         assert_eq!(built.backend_ids, vec!["b1".to_string(), "b2".to_string()]);
     }
 
     #[test]
     fn build_mirror_trims_backend_ids() {
-        let built = build_mirror_config(&mirror_req(vec!["  b1  "], 50, 5000)).unwrap();
+        let built = build_mirror_config(&mirror_req(vec!["  b1  "], 50, 5000)).expect("test setup");
         assert_eq!(built.backend_ids, vec!["b1".to_string()]);
     }
 
@@ -1870,7 +1854,7 @@ mod tests {
         // under the 256 concurrent-mirror cap.
         let mut req = mirror_req(vec!["b"], 50, 5000);
         req.max_body_bytes = 256 * 1_048_576;
-        let err = build_mirror_config(&req).err().unwrap();
+        let err = build_mirror_config(&req).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("128 MiB")));
     }
 
@@ -1899,14 +1883,14 @@ mod tests {
             rr_rule("internal", "public", false),
             rr_rule(r"\d+", "***", true),
         ]);
-        let built = build_response_rewrite(&cfg).unwrap();
+        let built = build_response_rewrite(&cfg).expect("test setup");
         assert_eq!(built.rules.len(), 2);
     }
 
     #[test]
     fn build_response_rewrite_rejects_empty_rules() {
         let cfg = rr_cfg(vec![]);
-        let err = build_response_rewrite(&cfg).err().unwrap();
+        let err = build_response_rewrite(&cfg).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("must not be empty")));
     }
 
@@ -1914,7 +1898,7 @@ mod tests {
     fn build_response_rewrite_rejects_zero_max_body_bytes() {
         let mut cfg = rr_cfg(vec![rr_rule("a", "b", false)]);
         cfg.max_body_bytes = 0;
-        let err = build_response_rewrite(&cfg).err().unwrap();
+        let err = build_response_rewrite(&cfg).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("> 0")));
     }
 
@@ -1922,14 +1906,14 @@ mod tests {
     fn build_response_rewrite_rejects_excessive_max_body_bytes() {
         let mut cfg = rr_cfg(vec![rr_rule("a", "b", false)]);
         cfg.max_body_bytes = 200 * 1_048_576;
-        let err = build_response_rewrite(&cfg).err().unwrap();
+        let err = build_response_rewrite(&cfg).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("128 MiB")));
     }
 
     #[test]
     fn build_response_rewrite_rejects_empty_pattern() {
         let cfg = rr_cfg(vec![rr_rule("", "x", false)]);
-        let err = build_response_rewrite(&cfg).err().unwrap();
+        let err = build_response_rewrite(&cfg).expect_err("test setup");
         assert!(
             matches!(err, ApiError::BadRequest(ref m) if m.contains("pattern must not be empty"))
         );
@@ -1940,7 +1924,7 @@ mod tests {
         // Operator shouldn't have to wait until reload + first request
         // to find out their regex is broken. Fail fast.
         let cfg = rr_cfg(vec![rr_rule("(unclosed", "x", true)]);
-        let err = build_response_rewrite(&cfg).err().unwrap();
+        let err = build_response_rewrite(&cfg).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("invalid regex")));
     }
 
@@ -1949,7 +1933,7 @@ mod tests {
         // 0 would be a no-op rule. Probably operator meant unlimited.
         let mut cfg = rr_cfg(vec![rr_rule("a", "b", false)]);
         cfg.rules[0].max_replacements = Some(0);
-        let err = build_response_rewrite(&cfg).err().unwrap();
+        let err = build_response_rewrite(&cfg).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("max_replacements")));
     }
 
@@ -1958,7 +1942,7 @@ mod tests {
         let mut cfg = rr_cfg(vec![rr_rule("a", "b", false)]);
         cfg.content_type_prefixes =
             vec!["  text/  ".into(), "   ".into(), "application/json".into()];
-        let built = build_response_rewrite(&cfg).unwrap();
+        let built = build_response_rewrite(&cfg).expect("test setup");
         assert_eq!(
             built.content_type_prefixes,
             vec!["text/".to_string(), "application/json".to_string()]
@@ -1971,28 +1955,28 @@ mod tests {
         // Explicitly allowed, not an error.
         let mut req = mirror_req(vec!["b"], 50, 5000);
         req.max_body_bytes = 0;
-        let built = build_mirror_config(&req).unwrap();
+        let built = build_mirror_config(&req).expect("test setup");
         assert_eq!(built.max_body_bytes, 0);
     }
 
     #[test]
     fn build_forward_auth_trims_address() {
-        let built = build_forward_auth(&fa_req("  http://a/verify  ", 1000, vec![])).unwrap();
+        let built =
+            build_forward_auth(&fa_req("  http://a/verify  ", 1000, vec![])).expect("test setup");
         assert_eq!(built.address, "http://a/verify");
     }
 
     #[test]
     fn build_forward_auth_accepts_verdict_cache_within_cap() {
-        let built =
-            build_forward_auth(&fa_req_with_cache("https://a/v", 1000, vec![], 30_000)).unwrap();
+        let built = build_forward_auth(&fa_req_with_cache("https://a/v", 1000, vec![], 30_000))
+            .expect("test setup");
         assert_eq!(built.verdict_cache_ttl_ms, 30_000);
     }
 
     #[test]
     fn build_forward_auth_rejects_verdict_cache_over_cap() {
         let err = build_forward_auth(&fa_req_with_cache("https://a/v", 1000, vec![], 60_001))
-            .err()
-            .unwrap();
+            .expect_err("test setup");
         assert!(
             matches!(err, ApiError::BadRequest(ref m) if m.contains("60s") || m.contains("60000")),
             "expected 60s cap message, got: {err:?}"
@@ -2002,7 +1986,7 @@ mod tests {
     #[test]
     fn build_forward_auth_default_verdict_cache_is_zero() {
         // Zero-trust default: caching must be opt-in.
-        let built = build_forward_auth(&fa_req("https://a/v", 1000, vec![])).unwrap();
+        let built = build_forward_auth(&fa_req("https://a/v", 1000, vec![])).expect("test setup");
         assert_eq!(built.verdict_cache_ttl_ms, 0);
     }
 
@@ -2012,8 +1996,8 @@ mod tests {
         // We can't observe the warn log from a unit test without a
         // tracing subscriber, so this test documents the acceptance
         // path; the warn-on-non-loopback path is covered in e2e.
-        let built =
-            build_forward_auth(&fa_req("http://127.0.0.1:9091/verify", 1000, vec![])).unwrap();
+        let built = build_forward_auth(&fa_req("http://127.0.0.1:9091/verify", 1000, vec![]))
+            .expect("test setup");
         assert_eq!(built.address, "http://127.0.0.1:9091/verify");
     }
 
@@ -2023,14 +2007,15 @@ mod tests {
         // Build a self-signed CA with rcgen so parsers have something
         // real to chew on. Generated per-test so we never leak key bytes
         // into the repo.
-        let mut params = rcgen::CertificateParams::new(vec!["Test CA".to_string()]).unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["Test CA".to_string()]).expect("test setup");
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "Test CA");
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
+        let key = rcgen::KeyPair::generate().expect("test setup");
+        let cert = params.self_signed(&key).expect("test setup");
         cert.pem()
     }
 
@@ -2045,7 +2030,7 @@ mod tests {
     #[test]
     fn build_mtls_accepts_well_formed_bundle() {
         let pem = gen_ca_pem();
-        let built = build_mtls_config(&mtls_req(&pem, true, vec!["Acme"])).unwrap();
+        let built = build_mtls_config(&mtls_req(&pem, true, vec!["Acme"])).expect("test setup");
         assert!(built.ca_cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(built.required);
         assert_eq!(built.allowed_organizations, vec!["Acme".to_string()]);
@@ -2053,25 +2038,20 @@ mod tests {
 
     #[test]
     fn build_mtls_rejects_empty_pem() {
-        let err = build_mtls_config(&mtls_req("", false, vec![]))
-            .err()
-            .unwrap();
+        let err = build_mtls_config(&mtls_req("", false, vec![])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[test]
     fn build_mtls_rejects_whitespace_pem() {
-        let err = build_mtls_config(&mtls_req("    \n  ", false, vec![]))
-            .err()
-            .unwrap();
+        let err = build_mtls_config(&mtls_req("    \n  ", false, vec![])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[test]
     fn build_mtls_rejects_garbage_pem() {
         let err = build_mtls_config(&mtls_req("not a pem file at all", false, vec![]))
-            .err()
-            .unwrap();
+            .expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
@@ -2080,9 +2060,7 @@ mod tests {
         // PEM with only a PRIVATE KEY block - no CERTIFICATE = not a
         // CA bundle. Operator probably pasted the wrong file.
         let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ==\n-----END PRIVATE KEY-----\n";
-        let err = build_mtls_config(&mtls_req(pem, false, vec![]))
-            .err()
-            .unwrap();
+        let err = build_mtls_config(&mtls_req(pem, false, vec![])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
@@ -2094,9 +2072,7 @@ mod tests {
         use base64::Engine as _;
         let junk = base64::engine::general_purpose::STANDARD.encode(b"not-x509-der-bytes");
         let pem = format!("-----BEGIN CERTIFICATE-----\n{junk}\n-----END CERTIFICATE-----\n");
-        let err = build_mtls_config(&mtls_req(&pem, false, vec![]))
-            .err()
-            .unwrap();
+        let err = build_mtls_config(&mtls_req(&pem, false, vec![])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
@@ -2111,17 +2087,15 @@ mod tests {
             pem.trim().len() > 1_048_576,
             "test did not actually exceed cap"
         );
-        let err = build_mtls_config(&mtls_req(&pem, false, vec![]))
-            .err()
-            .unwrap();
+        let err = build_mtls_config(&mtls_req(&pem, false, vec![])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[test]
     fn build_mtls_dedup_and_trims_organizations() {
         let pem = gen_ca_pem();
-        let built =
-            build_mtls_config(&mtls_req(&pem, false, vec!["  Acme  ", "Beta", "Acme"])).unwrap();
+        let built = build_mtls_config(&mtls_req(&pem, false, vec!["  Acme  ", "Beta", "Acme"]))
+            .expect("test setup");
         assert_eq!(
             built.allowed_organizations,
             vec!["Acme".to_string(), "Beta".to_string()]
@@ -2131,9 +2105,8 @@ mod tests {
     #[test]
     fn build_mtls_rejects_empty_organization_entry() {
         let pem = gen_ca_pem();
-        let err = build_mtls_config(&mtls_req(&pem, false, vec!["Acme", "   "]))
-            .err()
-            .unwrap();
+        let err =
+            build_mtls_config(&mtls_req(&pem, false, vec!["Acme", "   "])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 }

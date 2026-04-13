@@ -457,7 +457,7 @@ mod tests {
     use super::*;
 
     fn test_store() -> lorica_config::ConfigStore {
-        lorica_config::ConfigStore::open_in_memory().unwrap()
+        lorica_config::ConfigStore::open_in_memory().expect("test setup: open in-memory store")
     }
 
     #[test]

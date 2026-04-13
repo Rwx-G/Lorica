@@ -2706,7 +2706,12 @@ mod tests {
             .find(|a| a.summary.contains("CRITICAL"))
             .expect("should have a CRITICAL alert");
         assert!(crit.summary.contains("crit.example.com"));
-        assert_eq!(crit.details.get("cert_id").unwrap(), "cert-crit");
+        assert_eq!(
+            crit.details
+                .get("cert_id")
+                .expect("test setup: cert_id detail present"),
+            "cert-crit"
+        );
 
         // Find the warning alert
         let warn = alerts
@@ -2714,7 +2719,12 @@ mod tests {
             .find(|a| !a.summary.contains("CRITICAL"))
             .expect("should have a warning alert");
         assert!(warn.summary.contains("warn.example.com"));
-        assert_eq!(warn.details.get("cert_id").unwrap(), "cert-warn");
+        assert_eq!(
+            warn.details
+                .get("cert_id")
+                .expect("test setup: cert_id detail present"),
+            "cert-warn"
+        );
     }
 
     #[test]

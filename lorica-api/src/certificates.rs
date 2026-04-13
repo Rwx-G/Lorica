@@ -108,7 +108,10 @@ fn parse_cert_pem(cert_pem: &str) -> ParsedCertInfo {
         Err(_) => {
             // Try parsing first block from multi-block PEM (cert chain)
             match pem::parse_many(cert_pem) {
-                Ok(blocks) if !blocks.is_empty() => blocks.into_iter().next().unwrap(),
+                Ok(blocks) if !blocks.is_empty() => blocks
+                    .into_iter()
+                    .next()
+                    .expect("guard `!blocks.is_empty()` guarantees at least one block"),
                 _ => return defaults(),
             }
         }
@@ -182,7 +185,7 @@ fn compute_fingerprint_from_der(der: &[u8]) -> String {
         if i > 0 {
             hex.push(':');
         }
-        write!(hex, "{byte:02X}").unwrap();
+        write!(hex, "{byte:02X}").expect("write to String is infallible");
     }
     hex
 }
@@ -195,7 +198,7 @@ fn compute_fingerprint_from_pem(cert_pem: &str) -> String {
         if i > 0 {
             hex.push(':');
         }
-        write!(hex, "{byte:02X}").unwrap();
+        write!(hex, "{byte:02X}").expect("write to String is infallible");
     }
     hex
 }

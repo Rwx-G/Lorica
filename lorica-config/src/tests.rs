@@ -192,13 +192,15 @@ mod tests {
 
     #[test]
     fn test_clone_load_test_config() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let config = make_load_test_config();
-        store.create_load_test_config(&config).unwrap();
+        store
+            .create_load_test_config(&config)
+            .expect("test setup: load test config inserts");
 
         let cloned = store
             .clone_load_test_config(&config.id, "Cloned Test")
-            .unwrap();
+            .expect("test setup: value present");
         assert_ne!(cloned.id, config.id);
         assert_eq!(cloned.name, "Cloned Test");
         assert_eq!(cloned.target_url, config.target_url);
@@ -210,36 +212,51 @@ mod tests {
 
     #[test]
     fn test_route_crud() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
 
         // Create
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
         // Read
-        let fetched = store.get_route(&route.id).unwrap().unwrap();
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.hostname, "example.com");
         assert_eq!(fetched.path_prefix, "/");
 
         // List
-        let routes = store.list_routes().unwrap();
+        let routes = store.list_routes().expect("test setup: routes listed");
         assert_eq!(routes.len(), 1);
 
         // Update
         route.hostname = "updated.com".into();
         route.updated_at = Utc::now();
-        store.update_route(&route).unwrap();
-        let fetched = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .update_route(&route)
+            .expect("test setup: route updates");
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.hostname, "updated.com");
 
         // Delete
-        store.delete_route(&route.id).unwrap();
-        assert!(store.get_route(&route.id).unwrap().is_none());
+        store
+            .delete_route(&route.id)
+            .expect("test setup: route deletes");
+        assert!(store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .is_none());
     }
 
     #[test]
     fn test_route_not_found() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.id = "nonexistent".into();
         assert!(store.update_route(&route).is_err());
@@ -250,48 +267,77 @@ mod tests {
 
     #[test]
     fn test_backend_crud() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut backend = make_backend();
 
-        store.create_backend(&backend).unwrap();
+        store
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
 
-        let fetched = store.get_backend(&backend.id).unwrap().unwrap();
+        let fetched = store
+            .get_backend(&backend.id)
+            .expect("test setup: backend fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.address, "192.168.1.10:8080");
         assert_eq!(fetched.weight, 100);
 
-        let backends = store.list_backends().unwrap();
+        let backends = store.list_backends().expect("test setup: backends listed");
         assert_eq!(backends.len(), 1);
 
         backend.address = "10.0.0.1:9090".into();
         backend.updated_at = Utc::now();
-        store.update_backend(&backend).unwrap();
-        let fetched = store.get_backend(&backend.id).unwrap().unwrap();
+        store
+            .update_backend(&backend)
+            .expect("test setup: backend updates");
+        let fetched = store
+            .get_backend(&backend.id)
+            .expect("test setup: backend fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.address, "10.0.0.1:9090");
 
-        store.delete_backend(&backend.id).unwrap();
-        assert!(store.get_backend(&backend.id).unwrap().is_none());
+        store
+            .delete_backend(&backend.id)
+            .expect("test setup: backend deletes");
+        assert!(store
+            .get_backend(&backend.id)
+            .expect("test setup: backend fetch")
+            .is_none());
     }
 
     // ---- Route-Backend links ----
 
     #[test]
     fn test_route_backend_links() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
         let backend = make_backend();
 
-        store.create_route(&route).unwrap();
-        store.create_backend(&backend).unwrap();
-        store.link_route_backend(&route.id, &backend.id).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        store
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
+        store
+            .link_route_backend(&route.id, &backend.id)
+            .expect("test setup: route/backend link");
 
-        let backends = store.list_backends_for_route(&route.id).unwrap();
+        let backends = store
+            .list_backends_for_route(&route.id)
+            .expect("test setup: backends for route listed");
         assert_eq!(backends, vec![backend.id.clone()]);
 
-        let routes = store.list_routes_for_backend(&backend.id).unwrap();
+        let routes = store
+            .list_routes_for_backend(&backend.id)
+            .expect("test setup: routes for backend listed");
         assert_eq!(routes, vec![route.id.clone()]);
 
-        store.unlink_route_backend(&route.id, &backend.id).unwrap();
-        let backends = store.list_backends_for_route(&route.id).unwrap();
+        store
+            .unlink_route_backend(&route.id, &backend.id)
+            .expect("test setup: route/backend unlink");
+        let backends = store
+            .list_backends_for_route(&route.id)
+            .expect("test setup: backends for route listed");
         assert!(backends.is_empty());
     }
 
@@ -299,86 +345,141 @@ mod tests {
 
     #[test]
     fn test_certificate_crud() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut cert = make_certificate();
 
-        store.create_certificate(&cert).unwrap();
+        store
+            .create_certificate(&cert)
+            .expect("test setup: certificate inserts");
 
-        let fetched = store.get_certificate(&cert.id).unwrap().unwrap();
+        let fetched = store
+            .get_certificate(&cert.id)
+            .expect("test setup: certificate fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.domain, "example.com");
         assert_eq!(fetched.san_domains, vec!["www.example.com"]);
 
-        let certs = store.list_certificates().unwrap();
+        let certs = store
+            .list_certificates()
+            .expect("test setup: certificates listed");
         assert_eq!(certs.len(), 1);
 
         cert.domain = "updated.com".into();
-        store.update_certificate(&cert).unwrap();
-        let fetched = store.get_certificate(&cert.id).unwrap().unwrap();
+        store
+            .update_certificate(&cert)
+            .expect("test setup: certificate updates");
+        let fetched = store
+            .get_certificate(&cert.id)
+            .expect("test setup: certificate fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.domain, "updated.com");
 
-        store.delete_certificate(&cert.id).unwrap();
-        assert!(store.get_certificate(&cert.id).unwrap().is_none());
+        store
+            .delete_certificate(&cert.id)
+            .expect("test setup: certificate deletes");
+        assert!(store
+            .get_certificate(&cert.id)
+            .expect("test setup: certificate fetch")
+            .is_none());
     }
 
     // ---- NotificationConfig CRUD ----
 
     #[test]
     fn test_notification_config_crud() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut nc = make_notification_config();
 
-        store.create_notification_config(&nc).unwrap();
+        store
+            .create_notification_config(&nc)
+            .expect("test setup: notification config inserts");
 
-        let fetched = store.get_notification_config(&nc.id).unwrap().unwrap();
+        let fetched = store
+            .get_notification_config(&nc.id)
+            .expect("test setup: notification config fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.channel, NotificationChannel::Email);
         assert_eq!(fetched.alert_types.len(), 2);
 
-        let configs = store.list_notification_configs().unwrap();
+        let configs = store
+            .list_notification_configs()
+            .expect("test setup: notification configs listed");
         assert_eq!(configs.len(), 1);
 
         nc.enabled = false;
-        store.update_notification_config(&nc).unwrap();
-        let fetched = store.get_notification_config(&nc.id).unwrap().unwrap();
+        store
+            .update_notification_config(&nc)
+            .expect("test setup: notification config updates");
+        let fetched = store
+            .get_notification_config(&nc.id)
+            .expect("test setup: notification config fetch")
+            .expect("test setup: value present");
         assert!(!fetched.enabled);
 
-        store.delete_notification_config(&nc.id).unwrap();
-        assert!(store.get_notification_config(&nc.id).unwrap().is_none());
+        store
+            .delete_notification_config(&nc.id)
+            .expect("test setup: notification config deletes");
+        assert!(store
+            .get_notification_config(&nc.id)
+            .expect("test setup: notification config fetch")
+            .is_none());
     }
 
     // ---- DnsProvider CRUD ----
 
     #[test]
     fn test_dns_provider_crud() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut provider = make_dns_provider();
 
-        store.create_dns_provider(&provider).unwrap();
+        store
+            .create_dns_provider(&provider)
+            .expect("test setup: dns provider inserts");
 
-        let fetched = store.get_dns_provider(&provider.id).unwrap().unwrap();
+        let fetched = store
+            .get_dns_provider(&provider.id)
+            .expect("test setup: dns provider fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.name, "Test OVH Provider");
         assert_eq!(fetched.provider_type, "ovh");
         assert!(fetched.config.contains("api_token"));
 
-        let providers = store.list_dns_providers().unwrap();
+        let providers = store
+            .list_dns_providers()
+            .expect("test setup: dns providers listed");
         assert_eq!(providers.len(), 1);
 
         provider.name = "Updated Provider".into();
-        store.update_dns_provider(&provider).unwrap();
-        let fetched = store.get_dns_provider(&provider.id).unwrap().unwrap();
+        store
+            .update_dns_provider(&provider)
+            .expect("test setup: dns provider updates");
+        let fetched = store
+            .get_dns_provider(&provider.id)
+            .expect("test setup: dns provider fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.name, "Updated Provider");
 
         // Not in use
-        assert!(!store.dns_provider_in_use(&provider.id).unwrap());
+        assert!(!store
+            .dns_provider_in_use(&provider.id)
+            .expect("test setup: dns provider in-use check"));
 
-        store.delete_dns_provider(&provider.id).unwrap();
-        assert!(store.get_dns_provider(&provider.id).unwrap().is_none());
+        store
+            .delete_dns_provider(&provider.id)
+            .expect("test setup: dns provider deletes");
+        assert!(store
+            .get_dns_provider(&provider.id)
+            .expect("test setup: dns provider fetch")
+            .is_none());
     }
 
     #[test]
     fn test_dns_provider_unique_name() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let p1 = make_dns_provider();
-        store.create_dns_provider(&p1).unwrap();
+        store
+            .create_dns_provider(&p1)
+            .expect("test setup: dns provider inserts");
 
         let mut p2 = make_dns_provider();
         p2.name = p1.name.clone(); // same name, different id
@@ -388,90 +489,139 @@ mod tests {
 
     #[test]
     fn test_dns_provider_in_use() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let provider = make_dns_provider();
-        store.create_dns_provider(&provider).unwrap();
+        store
+            .create_dns_provider(&provider)
+            .expect("test setup: dns provider inserts");
 
         let mut cert = make_certificate();
         cert.acme_dns_provider_id = Some(provider.id.clone());
-        store.create_certificate(&cert).unwrap();
+        store
+            .create_certificate(&cert)
+            .expect("test setup: certificate inserts");
 
-        assert!(store.dns_provider_in_use(&provider.id).unwrap());
+        assert!(store
+            .dns_provider_in_use(&provider.id)
+            .expect("test setup: dns provider in-use check"));
 
-        store.delete_certificate(&cert.id).unwrap();
-        assert!(!store.dns_provider_in_use(&provider.id).unwrap());
+        store
+            .delete_certificate(&cert.id)
+            .expect("test setup: certificate deletes");
+        assert!(!store
+            .dns_provider_in_use(&provider.id)
+            .expect("test setup: dns provider in-use check"));
     }
 
     // ---- UserPreference CRUD ----
 
     #[test]
     fn test_user_preference_crud() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut pref = make_user_preference();
 
-        store.create_user_preference(&pref).unwrap();
+        store
+            .create_user_preference(&pref)
+            .expect("test setup: user preference inserts");
 
-        let fetched = store.get_user_preference(&pref.id).unwrap().unwrap();
+        let fetched = store
+            .get_user_preference(&pref.id)
+            .expect("test setup: user preference fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.preference_key, "self_signed_cert");
         assert_eq!(fetched.value, PreferenceValue::Never);
 
         let by_key = store
             .get_user_preference_by_key("self_signed_cert")
-            .unwrap()
-            .unwrap();
+            .expect("test setup: value present")
+            .expect("test setup: value present");
         assert_eq!(by_key.id, pref.id);
 
-        let prefs = store.list_user_preferences().unwrap();
+        let prefs = store
+            .list_user_preferences()
+            .expect("test setup: user preferences listed");
         assert_eq!(prefs.len(), 1);
 
         pref.value = PreferenceValue::Always;
         pref.updated_at = Utc::now();
-        store.update_user_preference(&pref).unwrap();
-        let fetched = store.get_user_preference(&pref.id).unwrap().unwrap();
+        store
+            .update_user_preference(&pref)
+            .expect("test setup: user preference updates");
+        let fetched = store
+            .get_user_preference(&pref.id)
+            .expect("test setup: user preference fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.value, PreferenceValue::Always);
 
-        store.delete_user_preference(&pref.id).unwrap();
-        assert!(store.get_user_preference(&pref.id).unwrap().is_none());
+        store
+            .delete_user_preference(&pref.id)
+            .expect("test setup: user preference deletes");
+        assert!(store
+            .get_user_preference(&pref.id)
+            .expect("test setup: user preference fetch")
+            .is_none());
     }
 
     // ---- AdminUser CRUD ----
 
     #[test]
     fn test_admin_user_crud() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut user = make_admin_user();
 
-        store.create_admin_user(&user).unwrap();
+        store
+            .create_admin_user(&user)
+            .expect("test setup: admin user inserts");
 
-        let fetched = store.get_admin_user(&user.id).unwrap().unwrap();
+        let fetched = store
+            .get_admin_user(&user.id)
+            .expect("test setup: admin user fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.username, "admin");
         assert!(fetched.must_change_password);
 
-        let by_name = store.get_admin_user_by_username("admin").unwrap().unwrap();
+        let by_name = store
+            .get_admin_user_by_username("admin")
+            .expect("test setup: admin user by username")
+            .expect("test setup: value present");
         assert_eq!(by_name.id, user.id);
 
-        let users = store.list_admin_users().unwrap();
+        let users = store
+            .list_admin_users()
+            .expect("test setup: admin users listed");
         assert_eq!(users.len(), 1);
 
         user.must_change_password = false;
         user.last_login = Some(Utc::now());
-        store.update_admin_user(&user).unwrap();
-        let fetched = store.get_admin_user(&user.id).unwrap().unwrap();
+        store
+            .update_admin_user(&user)
+            .expect("test setup: admin user updates");
+        let fetched = store
+            .get_admin_user(&user.id)
+            .expect("test setup: admin user fetch")
+            .expect("test setup: value present");
         assert!(!fetched.must_change_password);
         assert!(fetched.last_login.is_some());
 
-        store.delete_admin_user(&user.id).unwrap();
-        assert!(store.get_admin_user(&user.id).unwrap().is_none());
+        store
+            .delete_admin_user(&user.id)
+            .expect("test setup: admin user deletes");
+        assert!(store
+            .get_admin_user(&user.id)
+            .expect("test setup: admin user fetch")
+            .is_none());
     }
 
     // ---- GlobalSettings ----
 
     #[test]
     fn test_global_settings() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 
         // Defaults from migration
-        let settings = store.get_global_settings().unwrap();
+        let settings = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
         assert_eq!(settings.management_port, 9443);
         assert_eq!(settings.log_level, "info");
         assert_eq!(settings.default_health_check_interval_s, 10);
@@ -486,8 +636,12 @@ mod tests {
 
             ..GlobalSettings::default()
         };
-        store.update_global_settings(&new_settings).unwrap();
-        let fetched = store.get_global_settings().unwrap();
+        store
+            .update_global_settings(&new_settings)
+            .expect("test setup: global settings update");
+        let fetched = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
         assert_eq!(fetched.management_port, 8443);
         assert_eq!(fetched.log_level, "debug");
         assert_eq!(fetched.default_health_check_interval_s, 30);
@@ -495,10 +649,12 @@ mod tests {
 
     #[test]
     fn test_global_settings_custom_security_presets_round_trip() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 
         // Initially empty
-        let settings = store.get_global_settings().unwrap();
+        let settings = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
         assert!(settings.custom_security_presets.is_empty());
 
         // Store custom presets
@@ -511,10 +667,14 @@ mod tests {
         };
         let mut updated = settings;
         updated.custom_security_presets = vec![custom];
-        store.update_global_settings(&updated).unwrap();
+        store
+            .update_global_settings(&updated)
+            .expect("test setup: global settings update");
 
         // Read back
-        let fetched = store.get_global_settings().unwrap();
+        let fetched = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
         assert_eq!(fetched.custom_security_presets.len(), 1);
         assert_eq!(fetched.custom_security_presets[0].name, "api-only");
         assert_eq!(
@@ -525,19 +685,25 @@ mod tests {
 
     #[test]
     fn test_global_settings_trusted_proxies_round_trip() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 
         // Initially empty
-        let settings = store.get_global_settings().unwrap();
+        let settings = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
         assert!(settings.trusted_proxies.is_empty());
 
         // Store trusted proxies
         let mut updated = settings;
         updated.trusted_proxies = vec!["192.168.0.0/16".to_string(), "10.0.0.1".to_string()];
-        store.update_global_settings(&updated).unwrap();
+        store
+            .update_global_settings(&updated)
+            .expect("test setup: global settings update");
 
         // Read back
-        let fetched = store.get_global_settings().unwrap();
+        let fetched = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
         assert_eq!(fetched.trusted_proxies.len(), 2);
         assert_eq!(fetched.trusted_proxies[0], "192.168.0.0/16");
         assert_eq!(fetched.trusted_proxies[1], "10.0.0.1");
@@ -547,21 +713,31 @@ mod tests {
 
     #[test]
     fn test_migration_version() {
-        let store = ConfigStore::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 21);
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        assert_eq!(
+            store
+                .schema_version()
+                .expect("test setup: schema version reads"),
+            21
+        );
     }
 
     #[test]
     fn test_migration_idempotent() {
         // Opening twice should not fail - migrations should be idempotent
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = NamedTempFile::new().expect("test setup: new() succeeds");
         let path = tmp.path();
         {
-            let _store = ConfigStore::open(path, None).unwrap();
+            let _store = ConfigStore::open(path, None).expect("test setup: store opens");
         }
         {
-            let store = ConfigStore::open(path, None).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 21);
+            let store = ConfigStore::open(path, None).expect("test setup: store opens");
+            assert_eq!(
+                store
+                    .schema_version()
+                    .expect("test setup: schema version reads"),
+                21
+            );
         }
     }
 
@@ -569,28 +745,42 @@ mod tests {
 
     #[test]
     fn test_export_import_round_trip() {
-        let store1 = ConfigStore::open_in_memory().unwrap();
+        let store1 = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 
         // Populate with test data
         let cert = make_certificate();
-        store1.create_certificate(&cert).unwrap();
+        store1
+            .create_certificate(&cert)
+            .expect("test setup: certificate inserts");
 
         let mut route = make_route();
         route.certificate_id = Some(cert.id.clone());
-        store1.create_route(&route).unwrap();
+        store1
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
         let backend = make_backend();
-        store1.create_backend(&backend).unwrap();
-        store1.link_route_backend(&route.id, &backend.id).unwrap();
+        store1
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
+        store1
+            .link_route_backend(&route.id, &backend.id)
+            .expect("test setup: route/backend link");
 
         let nc = make_notification_config();
-        store1.create_notification_config(&nc).unwrap();
+        store1
+            .create_notification_config(&nc)
+            .expect("test setup: notification config inserts");
 
         let pref = make_user_preference();
-        store1.create_user_preference(&pref).unwrap();
+        store1
+            .create_user_preference(&pref)
+            .expect("test setup: user preference inserts");
 
         let user = make_admin_user();
-        store1.create_admin_user(&user).unwrap();
+        store1
+            .create_admin_user(&user)
+            .expect("test setup: admin user inserts");
 
         let settings = GlobalSettings {
             management_port: 8443,
@@ -601,50 +791,64 @@ mod tests {
 
             ..GlobalSettings::default()
         };
-        store1.update_global_settings(&settings).unwrap();
+        store1
+            .update_global_settings(&settings)
+            .expect("test setup: global settings update");
 
         // Export
-        let toml_str = export_to_toml(&store1).unwrap();
+        let toml_str = export_to_toml(&store1).expect("test setup: toml export succeeds");
 
         // Verify password hash is redacted in export
         assert!(toml_str.contains("**REDACTED**"));
         assert!(!toml_str.contains(&user.password_hash));
 
         // Import into a fresh store - restore real hash since export redacts it
-        let store2 = ConfigStore::open_in_memory().unwrap();
+        let store2 = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let toml_for_import = toml_str.replace("**REDACTED**", &user.password_hash);
-        let data = parse_toml(&toml_for_import).unwrap();
-        import_to_store(&store2, &data).unwrap();
+        let data = parse_toml(&toml_for_import).expect("test setup: toml parses");
+        import_to_store(&store2, &data).expect("test setup: import succeeds");
 
         // Verify all data matches
-        let routes2 = store2.list_routes().unwrap();
+        let routes2 = store2.list_routes().expect("test setup: routes listed");
         assert_eq!(routes2.len(), 1);
         assert_eq!(routes2[0].hostname, route.hostname);
         assert_eq!(routes2[0].certificate_id, Some(cert.id.clone()));
 
-        let backends2 = store2.list_backends().unwrap();
+        let backends2 = store2.list_backends().expect("test setup: backends listed");
         assert_eq!(backends2.len(), 1);
         assert_eq!(backends2[0].address, backend.address);
 
-        let links = store2.list_backends_for_route(&route.id).unwrap();
+        let links = store2
+            .list_backends_for_route(&route.id)
+            .expect("test setup: backends for route listed");
         assert_eq!(links, vec![backend.id.clone()]);
 
-        let certs2 = store2.list_certificates().unwrap();
+        let certs2 = store2
+            .list_certificates()
+            .expect("test setup: certificates listed");
         assert_eq!(certs2.len(), 1);
         assert_eq!(certs2[0].domain, cert.domain);
 
-        let ncs2 = store2.list_notification_configs().unwrap();
+        let ncs2 = store2
+            .list_notification_configs()
+            .expect("test setup: notification configs listed");
         assert_eq!(ncs2.len(), 1);
 
-        let prefs2 = store2.list_user_preferences().unwrap();
+        let prefs2 = store2
+            .list_user_preferences()
+            .expect("test setup: user preferences listed");
         assert_eq!(prefs2.len(), 1);
         assert_eq!(prefs2[0].preference_key, pref.preference_key);
 
-        let users2 = store2.list_admin_users().unwrap();
+        let users2 = store2
+            .list_admin_users()
+            .expect("test setup: admin users listed");
         assert_eq!(users2.len(), 1);
         assert_eq!(users2[0].username, user.username);
 
-        let settings2 = store2.get_global_settings().unwrap();
+        let settings2 = store2
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
         assert_eq!(settings2.management_port, 8443);
         assert_eq!(settings2.log_level, "debug");
     }
@@ -653,17 +857,22 @@ mod tests {
 
     #[test]
     fn test_wal_mode_enabled() {
-        let tmp = NamedTempFile::new().unwrap();
-        let store = ConfigStore::open(tmp.path(), None).unwrap();
+        let tmp = NamedTempFile::new().expect("test setup: new() succeeds");
+        let store = ConfigStore::open(tmp.path(), None).expect("test setup: store opens");
 
         // Verify WAL mode by writing and reading back
         let route = make_route();
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
         // Data survives re-open (simulates crash recovery)
         drop(store);
-        let store2 = ConfigStore::open(tmp.path(), None).unwrap();
-        let fetched = store2.get_route(&route.id).unwrap().unwrap();
+        let store2 = ConfigStore::open(tmp.path(), None).expect("test setup: store opens");
+        let fetched = store2
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.hostname, "example.com");
     }
 
@@ -720,17 +929,19 @@ backend_id = "also-nonexistent"
 
     #[test]
     fn test_file_export_import() {
-        let store1 = ConfigStore::open_in_memory().unwrap();
+        let store1 = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store1.create_route(&route).unwrap();
+        store1
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let tmp = NamedTempFile::new().unwrap();
-        crate::export::export_to_file(&store1, tmp.path()).unwrap();
+        let tmp = NamedTempFile::new().expect("test setup: new() succeeds");
+        crate::export::export_to_file(&store1, tmp.path()).expect("test setup: value present");
 
-        let store2 = ConfigStore::open_in_memory().unwrap();
-        crate::import::import_from_file(&store2, tmp.path()).unwrap();
+        let store2 = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        crate::import::import_from_file(&store2, tmp.path()).expect("test setup: value present");
 
-        let routes = store2.list_routes().unwrap();
+        let routes = store2.list_routes().expect("test setup: routes listed");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].hostname, route.hostname);
     }
@@ -739,16 +950,31 @@ backend_id = "also-nonexistent"
 
     #[test]
     fn test_clear_all() {
-        let store = ConfigStore::open_in_memory().unwrap();
-        store.create_route(&make_route()).unwrap();
-        store.create_backend(&make_backend()).unwrap();
-        store.create_certificate(&make_certificate()).unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        store
+            .create_route(&make_route())
+            .expect("test setup: route inserts");
+        store
+            .create_backend(&make_backend())
+            .expect("test setup: backend inserts");
+        store
+            .create_certificate(&make_certificate())
+            .expect("test setup: certificate inserts");
 
-        store.clear_all().unwrap();
+        store.clear_all().expect("test setup: value present");
 
-        assert!(store.list_routes().unwrap().is_empty());
-        assert!(store.list_backends().unwrap().is_empty());
-        assert!(store.list_certificates().unwrap().is_empty());
+        assert!(store
+            .list_routes()
+            .expect("test setup: routes listed")
+            .is_empty());
+        assert!(store
+            .list_backends()
+            .expect("test setup: backends listed")
+            .is_empty());
+        assert!(store
+            .list_certificates()
+            .expect("test setup: certificates listed")
+            .is_empty());
     }
 
     // ---- Encryption at rest ----
@@ -757,15 +983,21 @@ backend_id = "also-nonexistent"
     fn test_key_pem_encrypted_at_rest() {
         use crate::crypto::EncryptionKey;
 
-        let key = EncryptionKey::generate().unwrap();
-        let store = ConfigStore::open_in_memory_with_key(key).unwrap();
+        let key = EncryptionKey::generate().expect("test setup: key generates");
+        let store = ConfigStore::open_in_memory_with_key(key)
+            .expect("test setup: in-memory store opens with key");
         let cert = make_certificate();
         let original_key_pem = cert.key_pem.clone();
 
-        store.create_certificate(&cert).unwrap();
+        store
+            .create_certificate(&cert)
+            .expect("test setup: certificate inserts");
 
         // Verify we can read back the decrypted key_pem
-        let fetched = store.get_certificate(&cert.id).unwrap().unwrap();
+        let fetched = store
+            .get_certificate(&cert.id)
+            .expect("test setup: certificate fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.key_pem, original_key_pem);
 
         // Verify it's stored encrypted in the DB (raw query)
@@ -776,7 +1008,7 @@ backend_id = "also-nonexistent"
                 rusqlite::params![cert.id],
                 |row| row.get(0),
             )
-            .unwrap();
+            .expect("test setup: value present");
         // Encrypted data should differ from plaintext
         assert_ne!(raw, original_key_pem.as_bytes());
         // Encrypted data should be larger (nonce + tag overhead)
@@ -787,23 +1019,33 @@ backend_id = "also-nonexistent"
     fn test_key_pem_round_trip_with_encryption() {
         use crate::crypto::EncryptionKey;
 
-        let key = EncryptionKey::generate().unwrap();
-        let store = ConfigStore::open_in_memory_with_key(key).unwrap();
+        let key = EncryptionKey::generate().expect("test setup: key generates");
+        let store = ConfigStore::open_in_memory_with_key(key)
+            .expect("test setup: in-memory store opens with key");
 
         let cert = make_certificate();
-        store.create_certificate(&cert).unwrap();
+        store
+            .create_certificate(&cert)
+            .expect("test setup: certificate inserts");
 
         // List also decrypts
-        let certs = store.list_certificates().unwrap();
+        let certs = store
+            .list_certificates()
+            .expect("test setup: certificates listed");
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].key_pem, cert.key_pem);
 
         // Update also encrypts
         let mut updated = cert.clone();
         updated.key_pem = "-----BEGIN PRIVATE KEY-----\nnew key\n-----END PRIVATE KEY-----".into();
-        store.update_certificate(&updated).unwrap();
+        store
+            .update_certificate(&updated)
+            .expect("test setup: certificate updates");
 
-        let fetched = store.get_certificate(&updated.id).unwrap().unwrap();
+        let fetched = store
+            .get_certificate(&updated.id)
+            .expect("test setup: certificate fetch")
+            .expect("test setup: value present");
         assert_eq!(fetched.key_pem, updated.key_pem);
     }
 
@@ -811,26 +1053,29 @@ backend_id = "also-nonexistent"
 
     #[test]
     fn test_diff_empty_to_empty() {
-        let store = ConfigStore::open_in_memory().unwrap();
-        let toml_str = export_to_toml(&store).unwrap();
-        let import_data = parse_toml(&toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        let import_data = parse_toml(&toml_str).expect("test setup: toml parses");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
         assert!(diff.is_empty());
     }
 
     #[test]
     fn test_diff_detects_added_route() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
 
         // Build import data with one route, current store is empty
         let toml_str = {
-            let temp = ConfigStore::open_in_memory().unwrap();
-            temp.create_route(&route).unwrap();
-            export_to_toml(&temp).unwrap()
+            let temp = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+            temp.create_route(&route)
+                .expect("test setup: route inserts");
+            export_to_toml(&temp).expect("test setup: toml export succeeds")
         };
-        let import_data = parse_toml(&toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let import_data = parse_toml(&toml_str).expect("test setup: toml parses");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
         assert_eq!(diff.routes.added.len(), 1);
         assert!(diff.routes.removed.is_empty());
@@ -839,17 +1084,20 @@ backend_id = "also-nonexistent"
 
     #[test]
     fn test_diff_detects_removed_backend() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let backend = make_backend();
-        store.create_backend(&backend).unwrap();
+        store
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
 
         // Import data with no backends
         let toml_str = {
-            let temp = ConfigStore::open_in_memory().unwrap();
-            export_to_toml(&temp).unwrap()
+            let temp = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+            export_to_toml(&temp).expect("test setup: toml export succeeds")
         };
-        let import_data = parse_toml(&toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let import_data = parse_toml(&toml_str).expect("test setup: toml parses");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
         assert!(diff.backends.added.is_empty());
         assert_eq!(diff.backends.removed.len(), 1);
@@ -857,20 +1105,24 @@ backend_id = "also-nonexistent"
 
     #[test]
     fn test_diff_detects_modified_route() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
         // Modify hostname in import data
         let mut modified = route.clone();
         modified.hostname = "modified.com".into();
         let toml_str = {
-            let temp = ConfigStore::open_in_memory().unwrap();
-            temp.create_route(&modified).unwrap();
-            export_to_toml(&temp).unwrap()
+            let temp = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+            temp.create_route(&modified)
+                .expect("test setup: route inserts");
+            export_to_toml(&temp).expect("test setup: toml export succeeds")
         };
-        let import_data = parse_toml(&toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let import_data = parse_toml(&toml_str).expect("test setup: toml parses");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
         assert!(diff.routes.added.is_empty());
         assert!(diff.routes.removed.is_empty());
@@ -879,7 +1131,7 @@ backend_id = "also-nonexistent"
 
     #[test]
     fn test_diff_detects_settings_change() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 
         let toml_str = r#"
 version = 1
@@ -889,8 +1141,9 @@ management_port = 9443
 log_level = "debug"
 default_health_check_interval_s = 30
 "#;
-        let import_data = parse_toml(toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let import_data = parse_toml(toml_str).expect("test setup: toml parses");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
         assert_eq!(diff.global_settings.changes.len(), 2);
         assert!(!diff.is_empty());
@@ -1011,7 +1264,7 @@ management_port = 9443
 log_level = "info"
 default_health_check_interval_s = 10
 "#;
-        let data = parse_toml(toml_str).unwrap();
+        let data = parse_toml(toml_str).expect("test setup: toml parses");
         assert_eq!(data.version, 1);
         assert!(data.routes.is_empty());
         assert!(data.backends.is_empty());
@@ -1019,13 +1272,29 @@ default_health_check_interval_s = 10
 
     #[test]
     fn test_import_replaces_all_data() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 
         // Pre-populate
-        store.create_route(&make_route()).unwrap();
-        store.create_backend(&make_backend()).unwrap();
-        assert_eq!(store.list_routes().unwrap().len(), 1);
-        assert_eq!(store.list_backends().unwrap().len(), 1);
+        store
+            .create_route(&make_route())
+            .expect("test setup: route inserts");
+        store
+            .create_backend(&make_backend())
+            .expect("test setup: backend inserts");
+        assert_eq!(
+            store
+                .list_routes()
+                .expect("test setup: routes listed")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_backends()
+                .expect("test setup: backends listed")
+                .len(),
+            1
+        );
 
         // Import empty config
         let toml_str = r#"
@@ -1036,36 +1305,52 @@ management_port = 9443
 log_level = "info"
 default_health_check_interval_s = 10
 "#;
-        let data = parse_toml(toml_str).unwrap();
-        import_to_store(&store, &data).unwrap();
+        let data = parse_toml(toml_str).expect("test setup: toml parses");
+        import_to_store(&store, &data).expect("test setup: import succeeds");
 
         // Everything should be cleared
-        assert!(store.list_routes().unwrap().is_empty());
-        assert!(store.list_backends().unwrap().is_empty());
+        assert!(store
+            .list_routes()
+            .expect("test setup: routes listed")
+            .is_empty());
+        assert!(store
+            .list_backends()
+            .expect("test setup: backends listed")
+            .is_empty());
     }
 
     // ---- ConfigDiff edge cases ----
 
     #[test]
     fn test_diff_route_backends_added_and_removed() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
         let backend1 = make_backend();
-        store.create_route(&route).unwrap();
-        store.create_backend(&backend1).unwrap();
-        store.link_route_backend(&route.id, &backend1.id).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        store
+            .create_backend(&backend1)
+            .expect("test setup: backend inserts");
+        store
+            .link_route_backend(&route.id, &backend1.id)
+            .expect("test setup: route/backend link");
 
         // Import data with a different backend link
         let mut backend2 = make_backend();
         backend2.id = "backend-new".into();
-        let temp = ConfigStore::open_in_memory().unwrap();
-        temp.create_route(&route).unwrap();
-        temp.create_backend(&backend2).unwrap();
-        temp.link_route_backend(&route.id, &backend2.id).unwrap();
-        let toml_str = export_to_toml(&temp).unwrap();
+        let temp = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        temp.create_route(&route)
+            .expect("test setup: route inserts");
+        temp.create_backend(&backend2)
+            .expect("test setup: backend inserts");
+        temp.link_route_backend(&route.id, &backend2.id)
+            .expect("test setup: route/backend link");
+        let toml_str = export_to_toml(&temp).expect("test setup: toml export succeeds");
 
-        let import_data = parse_toml(&toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let import_data = parse_toml(&toml_str).expect("test setup: toml parses");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
         assert!(!diff.route_backends.added.is_empty());
         assert!(!diff.route_backends.removed.is_empty());
@@ -1073,65 +1358,77 @@ default_health_check_interval_s = 10
 
     #[test]
     fn test_diff_notification_config_changes() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let nc = make_notification_config();
-        store.create_notification_config(&nc).unwrap();
+        store
+            .create_notification_config(&nc)
+            .expect("test setup: notification config inserts");
 
         // Import with modified notification
         let mut modified = nc.clone();
         modified.enabled = false;
-        let temp = ConfigStore::open_in_memory().unwrap();
-        temp.create_notification_config(&modified).unwrap();
-        let toml_str = export_to_toml(&temp).unwrap();
+        let temp = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        temp.create_notification_config(&modified)
+            .expect("test setup: notification config inserts");
+        let toml_str = export_to_toml(&temp).expect("test setup: toml export succeeds");
 
-        let import_data = parse_toml(&toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let import_data = parse_toml(&toml_str).expect("test setup: toml parses");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
         assert_eq!(diff.notification_configs.modified.len(), 1);
     }
 
     #[test]
     fn test_diff_admin_user_changes() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let user = make_admin_user();
-        store.create_admin_user(&user).unwrap();
+        store
+            .create_admin_user(&user)
+            .expect("test setup: admin user inserts");
 
         // Import with modified username
         let mut modified = user.clone();
         modified.username = "superadmin".into();
-        let temp = ConfigStore::open_in_memory().unwrap();
-        temp.create_admin_user(&modified).unwrap();
-        let toml_str = export_to_toml(&temp).unwrap();
+        let temp = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        temp.create_admin_user(&modified)
+            .expect("test setup: admin user inserts");
+        let toml_str = export_to_toml(&temp).expect("test setup: toml export succeeds");
 
         // Restore real hash since export redacts it
         let toml_str = toml_str.replace("**REDACTED**", &modified.password_hash);
-        let import_data = parse_toml(&toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let import_data = parse_toml(&toml_str).expect("test setup: toml parses");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
         assert_eq!(diff.admin_users.modified.len(), 1);
     }
 
     #[test]
     fn test_diff_user_preference_changes() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let pref = make_user_preference();
-        store.create_user_preference(&pref).unwrap();
+        store
+            .create_user_preference(&pref)
+            .expect("test setup: user preference inserts");
 
         let mut modified = pref.clone();
         modified.value = PreferenceValue::Always;
-        let temp = ConfigStore::open_in_memory().unwrap();
-        temp.create_user_preference(&modified).unwrap();
-        let toml_str = export_to_toml(&temp).unwrap();
+        let temp = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        temp.create_user_preference(&modified)
+            .expect("test setup: user preference inserts");
+        let toml_str = export_to_toml(&temp).expect("test setup: toml export succeeds");
 
-        let import_data = parse_toml(&toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let import_data = parse_toml(&toml_str).expect("test setup: toml parses");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
         assert_eq!(diff.user_preferences.modified.len(), 1);
     }
 
     #[test]
     fn test_diff_all_settings_fields() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 
         let toml_str = r#"
 version = 1
@@ -1143,8 +1440,9 @@ default_health_check_interval_s = 30
 cert_warning_days = 14
 cert_critical_days = 3
 "#;
-        let import_data = parse_toml(toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let import_data = parse_toml(toml_str).expect("test setup: toml parses");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
         // All 5 settings should differ from defaults
         assert_eq!(diff.global_settings.changes.len(), 5);
@@ -1152,18 +1450,23 @@ cert_critical_days = 3
 
     #[test]
     fn test_diff_certificate_changes() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let cert = make_certificate();
-        store.create_certificate(&cert).unwrap();
+        store
+            .create_certificate(&cert)
+            .expect("test setup: certificate inserts");
 
         let mut modified = cert.clone();
         modified.domain = "new-domain.com".into();
-        let temp = ConfigStore::open_in_memory().unwrap();
-        temp.create_certificate(&modified).unwrap();
-        let toml_str = export_to_toml(&temp).unwrap();
+        let temp = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        temp.create_certificate(&modified)
+            .expect("test setup: certificate inserts");
+        let toml_str = export_to_toml(&temp).expect("test setup: toml export succeeds");
 
-        let import_data = crate::import::parse_toml_for_preview(&toml_str).unwrap();
-        let diff = crate::diff::compute_diff(&store, &import_data).unwrap();
+        let import_data =
+            crate::import::parse_toml_for_preview(&toml_str).expect("test setup: value present");
+        let diff =
+            crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
         assert_eq!(diff.certificates.modified.len(), 1);
     }
@@ -1172,40 +1475,54 @@ cert_critical_days = 3
 
     #[test]
     fn test_export_empty_store_produces_valid_toml() {
-        let store = ConfigStore::open_in_memory().unwrap();
-        let toml_str = export_to_toml(&store).unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
         assert!(toml_str.contains("version = 1"));
         assert!(toml_str.contains("[global_settings]"));
         // Should be re-importable
-        let data = parse_toml(&toml_str).unwrap();
+        let data = parse_toml(&toml_str).expect("test setup: toml parses");
         assert_eq!(data.version, 1);
     }
 
     #[test]
     fn test_export_preserves_all_entity_types() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 
         let cert = make_certificate();
-        store.create_certificate(&cert).unwrap();
+        store
+            .create_certificate(&cert)
+            .expect("test setup: certificate inserts");
 
         let mut route = make_route();
         route.certificate_id = Some(cert.id.clone());
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
         let backend = make_backend();
-        store.create_backend(&backend).unwrap();
-        store.link_route_backend(&route.id, &backend.id).unwrap();
+        store
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
+        store
+            .link_route_backend(&route.id, &backend.id)
+            .expect("test setup: route/backend link");
 
         let nc = make_notification_config();
-        store.create_notification_config(&nc).unwrap();
+        store
+            .create_notification_config(&nc)
+            .expect("test setup: notification config inserts");
 
         let pref = make_user_preference();
-        store.create_user_preference(&pref).unwrap();
+        store
+            .create_user_preference(&pref)
+            .expect("test setup: user preference inserts");
 
         let user = make_admin_user();
-        store.create_admin_user(&user).unwrap();
+        store
+            .create_admin_user(&user)
+            .expect("test setup: admin user inserts");
 
-        let toml_str = export_to_toml(&store).unwrap();
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
 
         // All sections should appear
         assert!(toml_str.contains("[[routes]]"));
@@ -1235,7 +1552,7 @@ cert_critical_days = 3
 
     #[test]
     fn test_backend_address_missing_port_rejected() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut backend = make_backend();
         backend.address = "192.168.1.10".into(); // no port
         let result = store.create_backend(&backend);
@@ -1246,7 +1563,7 @@ cert_critical_days = 3
 
     #[test]
     fn test_backend_address_trailing_colon_rejected() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut backend = make_backend();
         backend.address = "192.168.1.10:".into();
         let result = store.create_backend(&backend);
@@ -1257,7 +1574,7 @@ cert_critical_days = 3
 
     #[test]
     fn test_backend_address_invalid_port_rejected() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut backend = make_backend();
         backend.address = "192.168.1.10:notaport".into();
         let result = store.create_backend(&backend);
@@ -1268,7 +1585,7 @@ cert_critical_days = 3
 
     #[test]
     fn test_backend_address_port_out_of_range_rejected() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut backend = make_backend();
         backend.address = "192.168.1.10:99999".into(); // > u16::MAX
         let result = store.create_backend(&backend);
@@ -1277,7 +1594,7 @@ cert_critical_days = 3
 
     #[test]
     fn test_backend_address_valid_formats() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 
         // IPv4 with port
         let mut b1 = make_backend();
@@ -1292,9 +1609,11 @@ cert_critical_days = 3
 
     #[test]
     fn test_backend_update_also_validates_address() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut backend = make_backend();
-        store.create_backend(&backend).unwrap();
+        store
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
 
         backend.address = "no-port-here".into();
         let result = store.update_backend(&backend);
@@ -1305,9 +1624,11 @@ cert_critical_days = 3
 
     #[test]
     fn test_hostname_uniqueness_rejects_duplicate_primary() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route1 = make_route();
-        store.create_route(&route1).unwrap();
+        store
+            .create_route(&route1)
+            .expect("test setup: route inserts");
 
         let mut route2 = make_route();
         route2.hostname = "example.com".into(); // same hostname as route1
@@ -1319,9 +1640,11 @@ cert_critical_days = 3
 
     #[test]
     fn test_hostname_uniqueness_rejects_alias_conflict_with_primary() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route1 = make_route();
-        store.create_route(&route1).unwrap();
+        store
+            .create_route(&route1)
+            .expect("test setup: route inserts");
 
         let mut route2 = make_route();
         route2.hostname = "other.com".into();
@@ -1334,10 +1657,12 @@ cert_critical_days = 3
 
     #[test]
     fn test_hostname_uniqueness_rejects_primary_conflict_with_alias() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route1 = make_route();
         route1.hostname_aliases = vec!["alias.example.com".into()];
-        store.create_route(&route1).unwrap();
+        store
+            .create_route(&route1)
+            .expect("test setup: route inserts");
 
         let mut route2 = make_route();
         route2.hostname = "alias.example.com".into(); // primary conflicts with route1 alias
@@ -1349,9 +1674,11 @@ cert_critical_days = 3
 
     #[test]
     fn test_hostname_uniqueness_allows_update_own_hostname() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
         // Updating route with same hostname should succeed
         route.path_prefix = "/api".into();
@@ -1363,7 +1690,7 @@ cert_critical_days = 3
 
     #[test]
     fn test_route_cache_and_protection_fields_round_trip() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.cache_enabled = true;
         route.cache_ttl_s = 600;
@@ -1383,8 +1710,13 @@ cert_critical_days = 3
         route.retry_attempts = Some(3);
         route.max_request_body_bytes = Some(10485760);
 
-        store.create_route(&route).unwrap();
-        let fetched = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
 
         assert!(fetched.cache_enabled);
         assert_eq!(fetched.cache_ttl_s, 600);
@@ -1407,12 +1739,17 @@ cert_critical_days = 3
 
     #[test]
     fn test_route_optional_fields_none_round_trip() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
         // All optional fields are None/empty by default from make_route()
 
-        store.create_route(&route).unwrap();
-        let fetched = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
 
         assert!(!fetched.cache_enabled);
         assert!(fetched.rate_limit_rps.is_none());
@@ -1428,7 +1765,7 @@ cert_critical_days = 3
 
     #[test]
     fn test_route_advanced_config_fields_round_trip() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.force_https = true;
         route.redirect_hostname = Some("www.example.com".into());
@@ -1447,8 +1784,13 @@ cert_critical_days = 3
         route.proxy_headers_remove = vec!["X-Debug".into()];
         route.response_headers_remove = vec!["Server".into()];
 
-        store.create_route(&route).unwrap();
-        let fetched = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let fetched = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
 
         assert!(fetched.force_https);
         assert_eq!(
@@ -1473,14 +1815,19 @@ cert_critical_days = 3
 
     #[test]
     fn test_backend_name_group_round_trip() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut backend = make_backend();
         backend.name = "web-server-1".into();
         backend.group_name = "web-pool".into();
         backend.health_check_path = Some("/healthz".into());
 
-        store.create_backend(&backend).unwrap();
-        let fetched = store.get_backend(&backend.id).unwrap().unwrap();
+        store
+            .create_backend(&backend)
+            .expect("test setup: backend inserts");
+        let fetched = store
+            .get_backend(&backend.id)
+            .expect("test setup: backend fetch")
+            .expect("test setup: value present");
 
         assert_eq!(fetched.name, "web-server-1");
         assert_eq!(fetched.group_name, "web-pool");
@@ -1491,14 +1838,17 @@ cert_critical_days = 3
     fn test_export_import_with_encryption() {
         use crate::crypto::EncryptionKey;
 
-        let key = EncryptionKey::generate().unwrap();
-        let store1 = ConfigStore::open_in_memory_with_key(key.clone()).unwrap();
+        let key = EncryptionKey::generate().expect("test setup: key generates");
+        let store1 = ConfigStore::open_in_memory_with_key(key.clone())
+            .expect("test setup: in-memory store opens with key");
 
         let cert = make_certificate();
-        store1.create_certificate(&cert).unwrap();
+        store1
+            .create_certificate(&cert)
+            .expect("test setup: certificate inserts");
 
         // Export redacts key_pem
-        let toml_str = export_to_toml(&store1).unwrap();
+        let toml_str = export_to_toml(&store1).expect("test setup: toml export succeeds");
         assert!(toml_str.contains("**REDACTED**"));
         assert!(!toml_str.contains(&cert.key_pem));
     }
@@ -1507,29 +1857,41 @@ cert_critical_days = 3
     fn test_encryption_key_rotation() {
         use crate::crypto::EncryptionKey;
 
-        let key1 = EncryptionKey::generate().unwrap();
-        let key2 = EncryptionKey::generate().unwrap();
+        let key1 = EncryptionKey::generate().expect("test setup: key generates");
+        let key2 = EncryptionKey::generate().expect("test setup: key generates");
 
-        let store = ConfigStore::open_in_memory_with_key(key1).unwrap();
+        let store = ConfigStore::open_in_memory_with_key(key1)
+            .expect("test setup: in-memory store opens with key");
 
         let cert = make_certificate();
-        store.create_certificate(&cert).unwrap();
+        store
+            .create_certificate(&cert)
+            .expect("test setup: certificate inserts");
 
         let nc = make_notification_config();
-        store.create_notification_config(&nc).unwrap();
+        store
+            .create_notification_config(&nc)
+            .expect("test setup: notification config inserts");
 
-        let count = store.rotate_encryption_key(&key2).unwrap();
+        let count = store
+            .rotate_encryption_key(&key2)
+            .expect("test setup: value present");
         assert_eq!(count, 2);
     }
 
     #[test]
     fn test_sticky_session_persistence() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.sticky_session = true;
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(
             loaded.sticky_session,
             "sticky_session should persist as true"
@@ -1538,9 +1900,14 @@ cert_critical_days = 3
         // Toggle off
         let mut updated = loaded;
         updated.sticky_session = false;
-        store.update_route(&updated).unwrap();
+        store
+            .update_route(&updated)
+            .expect("test setup: route updates");
 
-        let reloaded = store.get_route(&route.id).unwrap().unwrap();
+        let reloaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(
             !reloaded.sticky_session,
             "sticky_session should persist as false"
@@ -1549,11 +1916,16 @@ cert_critical_days = 3
 
     #[test]
     fn test_sticky_session_default_false() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(
             !loaded.sticky_session,
             "sticky_session should default to false"
@@ -1562,23 +1934,28 @@ cert_critical_days = 3
 
     #[test]
     fn test_load_balancing_least_conn_roundtrip() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.load_balancing = LoadBalancing::LeastConn;
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert_eq!(loaded.load_balancing, LoadBalancing::LeastConn);
     }
 
     #[test]
     fn test_load_balancing_from_str() {
         assert_eq!(
-            LoadBalancing::from_str("least_conn").unwrap(),
+            LoadBalancing::from_str("least_conn").expect("test setup: deserializes from str"),
             LoadBalancing::LeastConn
         );
         assert_eq!(
-            LoadBalancing::from_str("round_robin").unwrap(),
+            LoadBalancing::from_str("round_robin").expect("test setup: deserializes from str"),
             LoadBalancing::RoundRobin
         );
         assert!(LoadBalancing::from_str("invalid").is_err());
@@ -1592,14 +1969,19 @@ cert_critical_days = 3
 
     #[test]
     fn test_basic_auth_roundtrip() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.basic_auth_username = Some("admin".to_string());
         route.basic_auth_password_hash =
             Some("$argon2id$v=19$m=19456,t=2,p=1$salt$hash".to_string());
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert_eq!(loaded.basic_auth_username.as_deref(), Some("admin"));
         assert_eq!(
             loaded.basic_auth_password_hash.as_deref(),
@@ -1609,24 +1991,34 @@ cert_critical_days = 3
 
     #[test]
     fn test_basic_auth_default_none() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(loaded.basic_auth_username.is_none());
         assert!(loaded.basic_auth_password_hash.is_none());
     }
 
     #[test]
     fn test_maintenance_mode_roundtrip() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.maintenance_mode = true;
         route.error_page_html = Some("<h1>Down for maintenance</h1>".to_string());
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(loaded.maintenance_mode);
         assert_eq!(
             loaded.error_page_html.as_deref(),
@@ -1636,35 +2028,50 @@ cert_critical_days = 3
 
     #[test]
     fn test_maintenance_mode_default_false() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(!loaded.maintenance_mode);
         assert!(loaded.error_page_html.is_none());
     }
 
     #[test]
     fn test_stale_config_roundtrip() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.stale_while_revalidate_s = 30;
         route.stale_if_error_s = 120;
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert_eq!(loaded.stale_while_revalidate_s, 30);
         assert_eq!(loaded.stale_if_error_s, 120);
     }
 
     #[test]
     fn test_stale_config_default_values() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert_eq!(
             loaded.stale_while_revalidate_s, 10,
             "default stale-while-revalidate should be 10s"
@@ -1677,18 +2084,28 @@ cert_critical_days = 3
 
     #[test]
     fn test_basic_auth_clear() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.basic_auth_username = Some("user".to_string());
         route.basic_auth_password_hash = Some("hash".to_string());
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let mut updated = store.get_route(&route.id).unwrap().unwrap();
+        let mut updated = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         updated.basic_auth_username = None;
         updated.basic_auth_password_hash = None;
-        store.update_route(&updated).unwrap();
+        store
+            .update_route(&updated)
+            .expect("test setup: route updates");
 
-        let reloaded = store.get_route(&route.id).unwrap().unwrap();
+        let reloaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(reloaded.basic_auth_username.is_none());
         assert!(reloaded.basic_auth_password_hash.is_none());
     }
@@ -1700,12 +2117,17 @@ cert_critical_days = 3
         // differing indentation. The list_routes path happened to work;
         // get_route returned empty. This test exercises get_route
         // specifically so the two SELECTs can't drift again.
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.cache_vary_headers = vec!["Accept-Encoding".into(), "Accept-Language".into()];
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let via_get = store.get_route(&route.id).unwrap().unwrap();
+        let via_get = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert_eq!(
             via_get.cache_vary_headers,
             vec!["Accept-Encoding".to_string(), "Accept-Language".to_string()]
@@ -1713,7 +2135,7 @@ cert_critical_days = 3
 
         let via_list: Vec<_> = store
             .list_routes()
-            .unwrap()
+            .expect("test setup: value present")
             .into_iter()
             .filter(|r| r.id == route.id)
             .collect();
@@ -1726,7 +2148,7 @@ cert_critical_days = 3
         // Schema V26: header_rules persists as a JSON array. Confirms the
         // migration is applied on a fresh DB and that the SELECT column
         // index (currently row index 56) stays in sync with create/update.
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.header_rules = vec![
             HeaderRule {
@@ -1742,9 +2164,14 @@ cert_critical_days = 3
                 backend_ids: vec![],
             },
         ];
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert_eq!(loaded.header_rules.len(), 2);
         assert_eq!(loaded.header_rules[0].header_name, "X-Tenant");
         assert!(matches!(
@@ -1761,8 +2188,13 @@ cert_critical_days = 3
         // Update clears the rules.
         let mut cleared = loaded.clone();
         cleared.header_rules.clear();
-        store.update_route(&cleared).unwrap();
-        let after_update = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .update_route(&cleared)
+            .expect("test setup: route updates");
+        let after_update = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(after_update.header_rules.is_empty());
     }
 
@@ -1772,7 +2204,7 @@ cert_critical_days = 3
         // index for reads is 57 - this test pins both create/get paths
         // and guards against a regression like the V25 cache_vary_headers
         // one (SELECT drift between get_route and list_routes).
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.traffic_splits = vec![
             TrafficSplit {
@@ -1786,9 +2218,14 @@ cert_critical_days = 3
                 backend_ids: vec!["b-v3".into()],
             },
         ];
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let via_get = store.get_route(&route.id).unwrap().unwrap();
+        let via_get = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert_eq!(via_get.traffic_splits.len(), 2);
         assert_eq!(via_get.traffic_splits[0].name, "v2-canary");
         assert_eq!(via_get.traffic_splits[0].weight_percent, 5);
@@ -1800,7 +2237,7 @@ cert_critical_days = 3
 
         let via_list: Vec<_> = store
             .list_routes()
-            .unwrap()
+            .expect("test setup: value present")
             .into_iter()
             .filter(|r| r.id == route.id)
             .collect();
@@ -1810,8 +2247,13 @@ cert_critical_days = 3
         // Clear via update.
         let mut cleared = via_get.clone();
         cleared.traffic_splits.clear();
-        store.update_route(&cleared).unwrap();
-        let after = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .update_route(&cleared)
+            .expect("test setup: route updates");
+        let after = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(after.traffic_splits.is_empty());
     }
 
@@ -1820,7 +2262,7 @@ cert_critical_days = 3
         // Schema V28: forward_auth stored as nullable JSON at column 58.
         // Confirms create/get/list/update stay in sync and that the NULL
         // path (feature off by default) round-trips too.
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.forward_auth = Some(ForwardAuthConfig {
             address: "http://authelia.internal/api/verify".into(),
@@ -1828,10 +2270,18 @@ cert_critical_days = 3
             response_headers: vec!["Remote-User".into(), "Remote-Groups".into()],
             verdict_cache_ttl_ms: 15_000,
         });
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let via_get = store.get_route(&route.id).unwrap().unwrap();
-        let fa = via_get.forward_auth.as_ref().unwrap();
+        let via_get = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+        let fa = via_get
+            .forward_auth
+            .as_ref()
+            .expect("test setup: option has value");
         assert_eq!(fa.address, "http://authelia.internal/api/verify");
         assert_eq!(fa.timeout_ms, 2_500);
         assert_eq!(
@@ -1845,7 +2295,7 @@ cert_critical_days = 3
 
         let via_list: Vec<_> = store
             .list_routes()
-            .unwrap()
+            .expect("test setup: value present")
             .into_iter()
             .filter(|r| r.id == route.id)
             .collect();
@@ -1855,15 +2305,20 @@ cert_critical_days = 3
         // Clear via update: disable the feature on an existing route.
         let mut cleared = via_get.clone();
         cleared.forward_auth = None;
-        store.update_route(&cleared).unwrap();
-        let after = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .update_route(&cleared)
+            .expect("test setup: route updates");
+        let after = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(after.forward_auth.is_none());
     }
 
     #[test]
     fn test_mirror_roundtrip() {
         // Schema V29: mirror stored as nullable JSON at column 59.
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.mirror = Some(MirrorConfig {
             backend_ids: vec!["shadow-a".into(), "shadow-b".into()],
@@ -1871,10 +2326,18 @@ cert_critical_days = 3
             timeout_ms: 3_000,
             max_body_bytes: 524_288,
         });
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let via_get = store.get_route(&route.id).unwrap().unwrap();
-        let m = via_get.mirror.as_ref().unwrap();
+        let via_get = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+        let m = via_get
+            .mirror
+            .as_ref()
+            .expect("test setup: option has value");
         assert_eq!(
             m.backend_ids,
             vec!["shadow-a".to_string(), "shadow-b".to_string()]
@@ -1885,7 +2348,7 @@ cert_critical_days = 3
 
         let via_list: Vec<_> = store
             .list_routes()
-            .unwrap()
+            .expect("test setup: value present")
             .into_iter()
             .filter(|r| r.id == route.id)
             .collect();
@@ -1895,8 +2358,13 @@ cert_critical_days = 3
         // Clear via update.
         let mut cleared = via_get.clone();
         cleared.mirror = None;
-        store.update_route(&cleared).unwrap();
-        let after = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .update_route(&cleared)
+            .expect("test setup: route updates");
+        let after = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(after.mirror.is_none());
     }
 
@@ -1905,7 +2373,7 @@ cert_critical_days = 3
         // Schema V30: response_rewrite stored as nullable JSON at column
         // 60. Regression guard against SELECT / UPDATE drift across the
         // 60 columns the row now carries.
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.response_rewrite = Some(ResponseRewriteConfig {
             rules: vec![
@@ -1925,10 +2393,18 @@ cert_critical_days = 3
             max_body_bytes: 524_288,
             content_type_prefixes: vec!["text/".into(), "application/json".into()],
         });
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let via_get = store.get_route(&route.id).unwrap().unwrap();
-        let rr = via_get.response_rewrite.as_ref().unwrap();
+        let via_get = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+        let rr = via_get
+            .response_rewrite
+            .as_ref()
+            .expect("test setup: option has value");
         assert_eq!(rr.rules.len(), 2);
         assert_eq!(rr.rules[0].pattern, "internal.local");
         assert!(rr.rules[1].is_regex);
@@ -1938,7 +2414,7 @@ cert_critical_days = 3
 
         let via_list: Vec<_> = store
             .list_routes()
-            .unwrap()
+            .expect("test setup: value present")
             .into_iter()
             .filter(|r| r.id == route.id)
             .collect();
@@ -1947,17 +2423,27 @@ cert_critical_days = 3
 
         let mut cleared = via_get.clone();
         cleared.response_rewrite = None;
-        store.update_route(&cleared).unwrap();
-        let after = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .update_route(&cleared)
+            .expect("test setup: route updates");
+        let after = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(after.response_rewrite.is_none());
     }
 
     #[test]
     fn test_response_rewrite_default_none() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(loaded.response_rewrite.is_none());
     }
 
@@ -1966,7 +2452,7 @@ cert_critical_days = 3
         // Schema V31: mtls stored as nullable JSON at column 61.
         // Regression guard against SELECT / UPDATE drift now that the
         // row carries 61 columns.
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();
         route.mtls = Some(MtlsConfig {
             ca_cert_pem: "-----BEGIN CERTIFICATE-----\nMIIBdummy\n-----END CERTIFICATE-----\n"
@@ -1974,17 +2460,22 @@ cert_critical_days = 3
             required: true,
             allowed_organizations: vec!["Acme Corp".into(), "Beta Inc".into()],
         });
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
 
-        let via_get = store.get_route(&route.id).unwrap().unwrap();
-        let m = via_get.mtls.as_ref().unwrap();
+        let via_get = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+        let m = via_get.mtls.as_ref().expect("test setup: option has value");
         assert!(m.ca_cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(m.required);
         assert_eq!(m.allowed_organizations, vec!["Acme Corp", "Beta Inc"]);
 
         let via_list: Vec<_> = store
             .list_routes()
-            .unwrap()
+            .expect("test setup: value present")
             .into_iter()
             .filter(|r| r.id == route.id)
             .collect();
@@ -1993,54 +2484,84 @@ cert_critical_days = 3
 
         let mut cleared = via_get.clone();
         cleared.mtls = None;
-        store.update_route(&cleared).unwrap();
-        let after = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .update_route(&cleared)
+            .expect("test setup: route updates");
+        let after = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(after.mtls.is_none());
     }
 
     #[test]
     fn test_mtls_default_none() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(loaded.mtls.is_none());
     }
 
     #[test]
     fn test_mirror_default_none() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(loaded.mirror.is_none());
     }
 
     #[test]
     fn test_forward_auth_default_none() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(loaded.forward_auth.is_none());
     }
 
     #[test]
     fn test_traffic_splits_default_empty() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(loaded.traffic_splits.is_empty());
     }
 
     #[test]
     fn test_header_rules_default_empty() {
         // Default Route ctor: no header_rules persisted or loaded.
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let route = make_route();
-        store.create_route(&route).unwrap();
-        let loaded = store.get_route(&route.id).unwrap().unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+        let loaded = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
         assert!(loaded.header_rules.is_empty());
     }
 }

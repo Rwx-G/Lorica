@@ -143,7 +143,10 @@ pub fn compute_percentiles(samples: &mut [u64]) -> (i64, i64, i64) {
 /// Current minute bucket start (truncated to minute boundary).
 fn current_bucket_start() -> DateTime<Utc> {
     let now = Utc::now();
-    now.with_nanosecond(0).unwrap().with_second(0).unwrap()
+    now.with_nanosecond(0)
+        .expect("0 is a valid nanosecond value")
+        .with_second(0)
+        .expect("0 is a valid second value")
 }
 
 /// SLA metrics collector for passive (real traffic) monitoring.
@@ -474,7 +477,7 @@ mod tests {
     #[test]
     fn test_collector_record_and_flush() {
         let collector = SlaCollector::new();
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
         // Record some metrics
         collector.record("route-1", 200, 50);
@@ -538,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_store_sla_bucket_insert_and_query() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
         // Create a route first (FK constraint)
         let route = lorica_config::models::Route {
@@ -606,7 +609,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: create route");
 
         let now = current_bucket_start();
         let bucket = SlaBucket {
@@ -628,13 +633,15 @@ mod tests {
             cfg_status_max: 399,
             cfg_target_pct: 99.9,
         };
-        store.insert_sla_bucket(&bucket).unwrap();
+        store
+            .insert_sla_bucket(&bucket)
+            .expect("test setup: insert sla bucket");
 
         let from = now - chrono::Duration::minutes(1);
         let to = now + chrono::Duration::minutes(1);
         let buckets = store
             .query_sla_buckets("r1", &from, &to, "passive")
-            .unwrap();
+            .expect("test setup: query sla buckets");
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].request_count, 100);
         assert_eq!(buckets[0].success_count, 95);
@@ -643,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_store_sla_summary() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
         let route = lorica_config::models::Route {
             id: "r1".to_string(),
@@ -710,7 +717,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: create route");
 
         let now = current_bucket_start();
         for i in 0..3 {
@@ -733,14 +742,16 @@ mod tests {
                 cfg_status_max: 399,
                 cfg_target_pct: 99.9,
             };
-            store.insert_sla_bucket(&bucket).unwrap();
+            store
+                .insert_sla_bucket(&bucket)
+                .expect("test setup: insert sla bucket");
         }
 
         let from = now - chrono::Duration::hours(1);
         let to = now + chrono::Duration::minutes(1);
         let summary = store
             .compute_sla_summary("r1", &from, &to, "1h", "passive")
-            .unwrap();
+            .expect("test setup: compute sla summary");
         assert_eq!(summary.total_requests, 300);
         assert_eq!(summary.successful_requests, 297);
         assert!((summary.sla_pct - 99.0).abs() < 0.01);
@@ -749,12 +760,12 @@ mod tests {
 
     #[test]
     fn test_store_sla_summary_no_data() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
         let now = Utc::now();
         let from = now - chrono::Duration::hours(1);
         let summary = store
             .compute_sla_summary("nonexistent", &from, &now, "1h", "passive")
-            .unwrap();
+            .expect("test setup: compute sla summary");
         assert_eq!(summary.total_requests, 0);
         assert_eq!(summary.sla_pct, 0.0);
         assert!(!summary.meets_target);
@@ -762,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_store_prune_buckets() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
         let route = lorica_config::models::Route {
             id: "r1".to_string(),
@@ -829,7 +840,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: create route");
 
         let now = current_bucket_start();
         let old = now - chrono::Duration::days(31);
@@ -856,17 +869,21 @@ mod tests {
                 cfg_target_pct: 99.9,
             };
             // Use different source to avoid UNIQUE constraint
-            store.insert_sla_bucket(&bucket).unwrap();
+            store
+                .insert_sla_bucket(&bucket)
+                .expect("test setup: insert sla bucket");
         }
 
         let cutoff = now - chrono::Duration::days(30);
-        let pruned = store.prune_sla_buckets(&cutoff).unwrap();
+        let pruned = store
+            .prune_sla_buckets(&cutoff)
+            .expect("test setup: prune sla buckets");
         assert_eq!(pruned, 1);
     }
 
     #[test]
     fn test_store_sla_config_upsert_and_get() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
         let route = lorica_config::models::Route {
             id: "r1".to_string(),
@@ -933,10 +950,14 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: create route");
 
         // Default config (no row in DB)
-        let config = store.get_sla_config("r1").unwrap();
+        let config = store
+            .get_sla_config("r1")
+            .expect("test setup: get sla config");
         assert_eq!(config.target_pct, 99.9);
         assert_eq!(config.max_latency_ms, 500);
 
@@ -944,16 +965,20 @@ mod tests {
         let mut custom = SlaConfig::default_for_route("r1");
         custom.target_pct = 99.5;
         custom.max_latency_ms = 200;
-        store.upsert_sla_config(&custom).unwrap();
+        store
+            .upsert_sla_config(&custom)
+            .expect("test setup: upsert sla config");
 
-        let config = store.get_sla_config("r1").unwrap();
+        let config = store
+            .get_sla_config("r1")
+            .expect("test setup: get sla config");
         assert_eq!(config.target_pct, 99.5);
         assert_eq!(config.max_latency_ms, 200);
     }
 
     #[test]
     fn test_store_export_sla_data() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
         let route = lorica_config::models::Route {
             id: "r1".to_string(),
@@ -1020,7 +1045,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        store.create_route(&route).unwrap();
+        store
+            .create_route(&route)
+            .expect("test setup: create route");
 
         let now = current_bucket_start();
         let bucket = SlaBucket {
@@ -1042,13 +1069,23 @@ mod tests {
             cfg_status_max: 399,
             cfg_target_pct: 99.9,
         };
-        store.insert_sla_bucket(&bucket).unwrap();
+        store
+            .insert_sla_bucket(&bucket)
+            .expect("test setup: insert sla bucket");
 
         let from = now - chrono::Duration::hours(1);
         let to = now + chrono::Duration::hours(1);
-        let export = store.export_sla_data("r1", &from, &to).unwrap();
+        let export = store
+            .export_sla_data("r1", &from, &to)
+            .expect("test setup: export sla data");
         assert_eq!(export["route_id"], "r1");
         assert!(export["buckets"].is_array());
-        assert_eq!(export["buckets"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            export["buckets"]
+                .as_array()
+                .expect("test setup: buckets field is an array")
+                .len(),
+            1
+        );
     }
 }

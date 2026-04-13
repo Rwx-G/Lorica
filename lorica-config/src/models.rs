@@ -1280,7 +1280,10 @@ mod tests {
             ("random", LoadBalancing::Random),
             ("peak_ewma", LoadBalancing::PeakEwma),
         ] {
-            assert_eq!(s.parse::<LoadBalancing>().unwrap(), variant);
+            assert_eq!(
+                s.parse::<LoadBalancing>().expect("test setup: parses"),
+                variant
+            );
             assert_eq!(variant.as_str(), s);
         }
     }
@@ -1298,7 +1301,7 @@ mod tests {
             ("detection", WafMode::Detection),
             ("blocking", WafMode::Blocking),
         ] {
-            assert_eq!(s.parse::<WafMode>().unwrap(), variant);
+            assert_eq!(s.parse::<WafMode>().expect("test setup: parses"), variant);
             assert_eq!(variant.as_str(), s);
         }
     }
@@ -1318,7 +1321,10 @@ mod tests {
             ("down", HealthStatus::Down),
             ("unknown", HealthStatus::Unknown),
         ] {
-            assert_eq!(s.parse::<HealthStatus>().unwrap(), variant);
+            assert_eq!(
+                s.parse::<HealthStatus>().expect("test setup: parses"),
+                variant
+            );
             assert_eq!(variant.as_str(), s);
         }
     }
@@ -1326,7 +1332,9 @@ mod tests {
     #[test]
     fn test_health_status_unknown() {
         assert_eq!(
-            "unknown".parse::<HealthStatus>().unwrap(),
+            "unknown"
+                .parse::<HealthStatus>()
+                .expect("test setup: parses"),
             HealthStatus::Unknown
         );
         assert!("invalid_status".parse::<HealthStatus>().is_err());
@@ -1341,7 +1349,10 @@ mod tests {
             ("closing", LifecycleState::Closing),
             ("closed", LifecycleState::Closed),
         ] {
-            assert_eq!(s.parse::<LifecycleState>().unwrap(), variant);
+            assert_eq!(
+                s.parse::<LifecycleState>().expect("test setup: parses"),
+                variant
+            );
             assert_eq!(variant.as_str(), s);
         }
     }
@@ -1360,7 +1371,11 @@ mod tests {
             ("webhook", NotificationChannel::Webhook),
             ("slack", NotificationChannel::Slack),
         ] {
-            assert_eq!(s.parse::<NotificationChannel>().unwrap(), variant);
+            assert_eq!(
+                s.parse::<NotificationChannel>()
+                    .expect("test setup: parses"),
+                variant
+            );
             assert_eq!(variant.as_str(), s);
         }
     }
@@ -1379,7 +1394,10 @@ mod tests {
             ("always", PreferenceValue::Always),
             ("once", PreferenceValue::Once),
         ] {
-            assert_eq!(s.parse::<PreferenceValue>().unwrap(), variant);
+            assert_eq!(
+                s.parse::<PreferenceValue>().expect("test setup: parses"),
+                variant
+            );
             assert_eq!(variant.as_str(), s);
         }
     }
@@ -1404,8 +1422,9 @@ mod tests {
     #[test]
     fn test_global_settings_serde_round_trip() {
         let settings = GlobalSettings::default();
-        let json = serde_json::to_string(&settings).unwrap();
-        let deserialized: GlobalSettings = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&settings).expect("test setup: serializes to string");
+        let deserialized: GlobalSettings =
+            serde_json::from_str(&json).expect("test setup: deserializes from str");
         assert_eq!(deserialized.management_port, settings.management_port);
         assert_eq!(deserialized.log_level, settings.log_level);
     }
@@ -1414,7 +1433,8 @@ mod tests {
     fn test_global_settings_cert_day_defaults_on_missing() {
         let json =
             r#"{"management_port":9443,"log_level":"info","default_health_check_interval_s":10}"#;
-        let settings: GlobalSettings = serde_json::from_str(json).unwrap();
+        let settings: GlobalSettings =
+            serde_json::from_str(json).expect("test setup: deserializes from str");
         assert_eq!(settings.cert_warning_days, 30);
         assert_eq!(settings.cert_critical_days, 7);
     }
@@ -1429,7 +1449,8 @@ mod tests {
     fn test_global_settings_custom_presets_deserialized_on_missing() {
         let json =
             r#"{"management_port":9443,"log_level":"info","default_health_check_interval_s":10}"#;
-        let settings: GlobalSettings = serde_json::from_str(json).unwrap();
+        let settings: GlobalSettings =
+            serde_json::from_str(json).expect("test setup: deserializes from str");
         assert!(settings.custom_security_presets.is_empty());
     }
 
@@ -1445,7 +1466,10 @@ mod tests {
     #[test]
     fn test_builtin_strict_preset_has_expected_headers() {
         let presets = builtin_security_presets();
-        let strict = presets.iter().find(|p| p.name == "strict").unwrap();
+        let strict = presets
+            .iter()
+            .find(|p| p.name == "strict")
+            .expect("test setup: find yields element");
         assert!(strict.headers.contains_key("Strict-Transport-Security"));
         assert!(strict.headers.contains_key("X-Frame-Options"));
         assert!(strict.headers.contains_key("Content-Security-Policy"));
@@ -1456,7 +1480,10 @@ mod tests {
     #[test]
     fn test_builtin_moderate_preset_has_expected_headers() {
         let presets = builtin_security_presets();
-        let moderate = presets.iter().find(|p| p.name == "moderate").unwrap();
+        let moderate = presets
+            .iter()
+            .find(|p| p.name == "moderate")
+            .expect("test setup: find yields element");
         assert!(moderate.headers.contains_key("X-Content-Type-Options"));
         assert!(moderate.headers.contains_key("Strict-Transport-Security"));
         assert_eq!(moderate.headers["X-Frame-Options"], "SAMEORIGIN");
@@ -1465,7 +1492,10 @@ mod tests {
     #[test]
     fn test_builtin_none_preset_is_empty() {
         let presets = builtin_security_presets();
-        let none = presets.iter().find(|p| p.name == "none").unwrap();
+        let none = presets
+            .iter()
+            .find(|p| p.name == "none")
+            .expect("test setup: find yields element");
         assert!(none.headers.is_empty());
     }
 
@@ -1474,7 +1504,7 @@ mod tests {
         let presets = builtin_security_presets();
         let found = resolve_security_preset("strict", &presets);
         assert!(found.is_some());
-        assert_eq!(found.unwrap().name, "strict");
+        assert_eq!(found.expect("test setup: value present").name, "strict");
     }
 
     #[test]
@@ -1542,7 +1572,7 @@ mod tests {
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
         }"#;
-        let route: Route = serde_json::from_str(json).unwrap();
+        let route: Route = serde_json::from_str(json).expect("test setup: deserializes from str");
         assert_eq!(route.security_headers, "moderate");
         assert_eq!(route.connect_timeout_s, 5);
         assert_eq!(route.read_timeout_s, 60);
@@ -1567,7 +1597,8 @@ mod tests {
     fn test_global_settings_loadtest_defaults_on_missing() {
         let json =
             r#"{"management_port":9443,"log_level":"info","default_health_check_interval_s":10}"#;
-        let settings: GlobalSettings = serde_json::from_str(json).unwrap();
+        let settings: GlobalSettings =
+            serde_json::from_str(json).expect("test setup: deserializes from str");
         assert_eq!(settings.max_active_probes, 50);
         assert_eq!(settings.loadtest_max_concurrency, 100);
         assert_eq!(settings.loadtest_max_duration_s, 60);
@@ -1580,8 +1611,9 @@ mod tests {
             name: "custom".to_string(),
             headers: HashMap::from([("X-Custom".to_string(), "value".to_string())]),
         };
-        let json = serde_json::to_string(&preset).unwrap();
-        let deserialized: SecurityHeaderPreset = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&preset).expect("test setup: serializes to string");
+        let deserialized: SecurityHeaderPreset =
+            serde_json::from_str(&json).expect("test setup: deserializes from str");
         assert_eq!(deserialized.name, "custom");
         assert_eq!(deserialized.headers["X-Custom"], "value");
     }
@@ -1594,7 +1626,10 @@ mod tests {
             ("prefix", PathMatchType::Prefix),
             ("exact", PathMatchType::Exact),
         ] {
-            assert_eq!(s.parse::<PathMatchType>().unwrap(), variant);
+            assert_eq!(
+                s.parse::<PathMatchType>().expect("test setup: parses"),
+                variant
+            );
             assert_eq!(variant.as_str(), s);
         }
     }

@@ -103,7 +103,10 @@ mod tests {
             ("sla_recovered", AlertType::SlaRecovered),
             ("ip_banned", AlertType::IpBanned),
         ] {
-            assert_eq!(s.parse::<AlertType>().unwrap(), variant);
+            assert_eq!(
+                s.parse::<AlertType>().expect("known AlertType variant"),
+                variant
+            );
             assert_eq!(variant.as_str(), s);
         }
     }
@@ -126,8 +129,17 @@ mod tests {
         let event = AlertEvent::new(AlertType::CertExpiring, "Certificate expiring soon")
             .with_detail("domain", "example.com")
             .with_detail("days_remaining", "7");
-        assert_eq!(event.details.get("domain").unwrap(), "example.com");
-        assert_eq!(event.details.get("days_remaining").unwrap(), "7");
+        assert_eq!(
+            event.details.get("domain").expect("domain was set above"),
+            "example.com"
+        );
+        assert_eq!(
+            event
+                .details
+                .get("days_remaining")
+                .expect("days_remaining was set above"),
+            "7"
+        );
     }
 
     #[test]
@@ -138,24 +150,34 @@ mod tests {
             .with_detail("duration_s", "3600");
         assert_eq!(event.alert_type, AlertType::IpBanned);
         assert_eq!(event.details.len(), 3);
-        assert_eq!(event.details.get("ip").unwrap(), "1.2.3.4");
+        assert_eq!(
+            event.details.get("ip").expect("ip was set above"),
+            "1.2.3.4"
+        );
     }
 
     #[test]
     fn test_alert_event_serde_round_trip() {
         let event = AlertEvent::new(AlertType::IpBanned, "banned").with_detail("ip", "10.0.0.1");
-        let json = serde_json::to_string(&event).unwrap();
-        let deserialized: AlertEvent = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&event).expect("AlertEvent fixture serializes cleanly");
+        let deserialized: AlertEvent =
+            serde_json::from_str(&json).expect("just-serialized JSON round-trips");
         assert_eq!(deserialized.alert_type, AlertType::IpBanned);
         assert_eq!(deserialized.summary, "banned");
-        assert_eq!(deserialized.details.get("ip").unwrap(), "10.0.0.1");
+        assert_eq!(
+            deserialized
+                .details
+                .get("ip")
+                .expect("ip was set on the source event"),
+            "10.0.0.1"
+        );
     }
 
     #[test]
     fn test_alert_event_serializes_to_json() {
         let event = AlertEvent::new(AlertType::WafAlert, "SQL injection detected")
             .with_detail("rule_id", "942100");
-        let json = serde_json::to_string(&event).unwrap();
+        let json = serde_json::to_string(&event).expect("AlertEvent fixture serializes cleanly");
         assert!(json.contains("waf_alert"));
         assert!(json.contains("942100"));
     }

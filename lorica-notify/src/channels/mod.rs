@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn test_validate_email_config_valid() {
         let json = r#"{"smtp_host":"mail.example.com","from_address":"noreply@example.com","to_address":"admin@example.com"}"#;
-        let config = validate_email_config(json).unwrap();
+        let config = validate_email_config(json).expect("valid email JSON should parse");
         assert_eq!(config.smtp_host, "mail.example.com");
         assert_eq!(config.from_address, "noreply@example.com");
     }
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn test_validate_webhook_config_valid() {
         let json = r#"{"url":"https://hooks.example.com/alert"}"#;
-        let config = validate_webhook_config(json).unwrap();
+        let config = validate_webhook_config(json).expect("valid webhook JSON should parse");
         assert_eq!(config.url, "https://hooks.example.com/alert");
         assert!(config.auth_header.is_none());
     }
@@ -386,7 +386,7 @@ mod tests {
     fn test_validate_webhook_config_with_auth() {
         let json =
             r#"{"url":"https://hooks.example.com/alert","auth_header":"Bearer secret-token"}"#;
-        let config = validate_webhook_config(json).unwrap();
+        let config = validate_webhook_config(json).expect("valid webhook JSON should parse");
         assert_eq!(config.auth_header.as_deref(), Some("Bearer secret-token"));
     }
 
@@ -627,7 +627,13 @@ mod tests {
         assert_eq!(d.history_count(), 1);
         let recent = d.recent_history(1);
         assert_eq!(recent[0].alert_type, AlertType::IpBanned);
-        assert_eq!(recent[0].details.get("ip").unwrap(), "1.2.3.4");
+        assert_eq!(
+            recent[0]
+                .details
+                .get("ip")
+                .expect("ip detail was set above"),
+            "1.2.3.4"
+        );
     }
 
     #[tokio::test]

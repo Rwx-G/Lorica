@@ -87,8 +87,9 @@ mod tests {
 
     #[test]
     fn test_compute_all_windows_no_data() {
-        let store = ConfigStore::open_in_memory().unwrap();
-        let summaries = compute_all_windows(&store, "nonexistent", "passive").unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
+        let summaries = compute_all_windows(&store, "nonexistent", "passive")
+            .expect("test setup: compute all windows");
         assert_eq!(summaries.len(), 4);
         for s in &summaries {
             assert_eq!(s.total_requests, 0);
