@@ -513,6 +513,10 @@ ExecStart=/usr/bin/lorica --workers 6
 
 See [docs/tuning.md](docs/tuning.md) for kernel parameters (`sysctl`), file descriptor limits, worker configuration, cache settings, and a production readiness checklist. Run [bench/](bench/) for reproducible throughput measurements.
 
+## Worker Mode
+
+When running with `--workers N >= 1`, see [docs/worker-mode.md](docs/worker-mode.md) for the operational notes (which settings require a supervisor restart, what changes between single-process and worker mode).
+
 ## Package Verification
 
 Release `.deb` and `.rpm` packages are GPG-signed. Import the public key to verify:
