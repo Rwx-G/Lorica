@@ -26,6 +26,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time", "net"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+itoa = "1"
 lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = false }
 lorica-http = { version = "0.1.0", path = "../lorica-http" }
 lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }

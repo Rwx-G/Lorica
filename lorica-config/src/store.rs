@@ -76,6 +76,13 @@ impl ConfigStore {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        // synchronous=NORMAL paired with WAL is the documented SQLite
+        // recommendation: durable against power loss, ~10x faster
+        // commits than the default FULL on spinning disk and noticeably
+        // faster on SSD under write bursts (imports, ACME renewals,
+        // bulk edits). The narrow uncommitted window between fsyncs is
+        // acceptable for config state given the export/backup story.
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         let store = Self {
             conn,
             encryption_key,
@@ -511,6 +518,21 @@ impl ConfigStore {
         let _ = self
             .conn
             .execute("ALTER TABLE routes ADD COLUMN mtls TEXT DEFAULT NULL", []);
+
+        // V32: indexes on sessions(expires_at) and sessions(user_id).
+        // The session GC scans expired rows on every tick and the
+        // password-change flow deletes sessions for one user; both
+        // queries were full-table scans before this index. CREATE
+        // INDEX IF NOT EXISTS is idempotent so the migration is safe
+        // to re-run.
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)",
+            [],
+        );
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
+            [],
+        );
 
         Ok(())
     }

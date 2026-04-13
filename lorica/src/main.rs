@@ -1743,6 +1743,13 @@ fn run_worker(
     lorica_proxy.request_counts = worker_request_counts;
     lorica_proxy.waf_counts = worker_waf_counts;
     lorica_proxy.waf_engine = waf_engine;
+    // Periodic basic-auth cache prune (PERF-8). Worker mode has no
+    // supervisor TaskTracker available here; a local tracker is fine
+    // because worker shutdown is orchestrated by the supervisor via
+    // SIGTERM and the prune task exits with the runtime.
+    let worker_auth_prune_tracker = tokio_util::task::TaskTracker::new();
+    let _basic_auth_prune = lorica_proxy
+        .spawn_basic_auth_cache_prune(&worker_auth_prune_tracker, Duration::from_secs(30));
     // Open a LogStore so the worker can persist WAF events directly (with
     // route_hostname and action stamped). SQLite WAL mode allows concurrent
     // writes from multiple worker processes.
@@ -2032,6 +2039,11 @@ fn run_single_process(cli: Cli) {
         lorica_proxy.acme_challenge_store = Some(acme_challenge_store.clone());
         lorica_proxy.alert_sender = Some(alert_sender.clone());
         lorica_proxy.log_store = log_store.clone();
+        // Periodic prune of expired basic-auth cache entries so a
+        // password-spray with no successful logins cannot grow the
+        // cache unboundedly until next restart (PERF-8).
+        let _basic_auth_prune = lorica_proxy
+            .spawn_basic_auth_cache_prune(&single_task_tracker, Duration::from_secs(30));
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);

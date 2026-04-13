@@ -39,7 +39,9 @@ impl LogStore {
                 source TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON access_logs(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_access_logs_host ON access_logs(host);",
+            CREATE INDEX IF NOT EXISTS idx_access_logs_host ON access_logs(host);
+            CREATE INDEX IF NOT EXISTS idx_access_logs_status ON access_logs(status);
+            CREATE INDEX IF NOT EXISTS idx_access_logs_host_timestamp ON access_logs(host, timestamp);",
         )
         .map_err(|e| format!("failed to initialize access log schema: {e}"))?;
 
@@ -353,24 +355,44 @@ impl LogStore {
 
     /// Delete entries older than the retention limit, keeping at most `max_entries` rows.
     /// Trim the access log table to the most recent `max_entries`. Returns the number deleted.
+    ///
+    /// Uses `MIN(id)` / `MAX(id)` (both `O(log n)` index seeks on the
+    /// PRIMARY KEY rowid) instead of `SELECT COUNT(*)` (which scans
+    /// the whole table and could freeze the writer's `Mutex<Connection>`
+    /// for hundreds of milliseconds at millions of rows).
+    /// `(MAX - MIN + 1)` over-estimates after deletes leave gaps in
+    /// the id sequence, which is fine here: trimming slightly more
+    /// aggressively than strictly needed cannot violate the retention
+    /// contract. The actual DELETE remains exact via the inner ORDER
+    /// BY + LIMIT subquery.
     pub fn enforce_retention(&self, max_entries: u64) -> Result<u64, String> {
         let conn = self.conn.lock();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM access_logs", [], |row| row.get(0))
-            .map_err(|e| format!("failed to count access logs: {e}"))?;
+        let bounds: Option<(i64, i64)> = conn
+            .query_row("SELECT MIN(id), MAX(id) FROM access_logs", [], |row| {
+                let lo: Option<i64> = row.get(0)?;
+                let hi: Option<i64> = row.get(1)?;
+                Ok(lo.zip(hi))
+            })
+            .map_err(|e| format!("failed to compute access log bounds: {e}"))?;
 
-        if count <= max_entries as i64 {
+        let approx_count = match bounds {
+            None => 0u64,
+            Some((lo, hi)) => (hi - lo + 1).max(0) as u64,
+        };
+
+        if approx_count <= max_entries {
             return Ok(0);
         }
 
-        let to_delete = count - max_entries as i64;
-        conn.execute(
-            "DELETE FROM access_logs WHERE id IN (SELECT id FROM access_logs ORDER BY id ASC LIMIT ?1)",
-            params![to_delete],
-        )
-        .map_err(|e| format!("failed to enforce access log retention: {e}"))?;
+        let to_delete = (approx_count - max_entries) as i64;
+        let deleted = conn
+            .execute(
+                "DELETE FROM access_logs WHERE id IN (SELECT id FROM access_logs ORDER BY id ASC LIMIT ?1)",
+                params![to_delete],
+            )
+            .map_err(|e| format!("failed to enforce access log retention: {e}"))?;
 
-        Ok(to_delete as u64)
+        Ok(deleted as u64)
     }
 
     /// Clear all entries.
