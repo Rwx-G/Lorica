@@ -108,6 +108,11 @@ export interface RouteFormState {
   mtls_ca_cert_pem: string;              // empty = feature off
   mtls_required: boolean;
   mtls_allowed_organizations: string;    // CSV
+  // Per-route token-bucket rate limit (cross-worker under `--workers`).
+  // Empty / 0 capacity = feature off.
+  rate_limit_capacity: number | '';
+  rate_limit_refill_per_sec: number | '';
+  rate_limit_scope: 'per_ip' | 'per_route';
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -180,6 +185,9 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   mtls_ca_cert_pem: '',
   mtls_required: false,
   mtls_allowed_organizations: '',
+  rate_limit_capacity: '',
+  rate_limit_refill_per_sec: '',
+  rate_limit_scope: 'per_ip',
 };
 
 // Tab field mappings for dot indicators
@@ -214,6 +222,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   protection: [
     'max_connections', 'slowloris_threshold_ms',
     'auto_ban_threshold', 'auto_ban_duration_s',
+    'rate_limit_capacity', 'rate_limit_refill_per_sec', 'rate_limit_scope',
   ],
   path_rules: ['path_rules'],
   header_rules: ['header_rules'],
@@ -366,6 +375,9 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     mtls_ca_cert_pem: route.mtls?.ca_cert_pem ?? '',
     mtls_required: route.mtls?.required ?? false,
     mtls_allowed_organizations: (route.mtls?.allowed_organizations ?? []).join(', '),
+    rate_limit_capacity: route.rate_limit?.capacity ?? '',
+    rate_limit_refill_per_sec: route.rate_limit?.refill_per_sec ?? '',
+    rate_limit_scope: route.rate_limit?.scope ?? 'per_ip',
   };
 }
 
@@ -552,6 +564,33 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     mirror: mirrorFormToRequest(form, isUpdate),
     response_rewrite: responseRewriteFormToRequest(form, isUpdate),
     mtls: mtlsFormToRequest(form, isUpdate),
+    rate_limit: rateLimitFormToRequest(form, isUpdate),
+  };
+}
+
+function rateLimitFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): { capacity: number; refill_per_sec: number; scope: 'per_ip' | 'per_route' } | undefined {
+  const capacity =
+    typeof form.rate_limit_capacity === 'number'
+      ? form.rate_limit_capacity
+      : 0;
+  if (capacity === 0) {
+    // On update, capacity=0 is the explicit "disable" signal (API
+    // clears `rate_limit` to None). On create, omit entirely.
+    return isUpdate
+      ? { capacity: 0, refill_per_sec: 0, scope: form.rate_limit_scope }
+      : undefined;
+  }
+  const refill =
+    typeof form.rate_limit_refill_per_sec === 'number'
+      ? form.rate_limit_refill_per_sec
+      : 0;
+  return {
+    capacity,
+    refill_per_sec: refill,
+    scope: form.rate_limit_scope,
   };
 }
 

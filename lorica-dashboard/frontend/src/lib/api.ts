@@ -162,8 +162,17 @@ export interface RouteResponse {
   mirror?: MirrorConfigResponse | null;
   response_rewrite?: ResponseRewriteConfigResponse | null;
   mtls?: MtlsConfigResponse | null;
+  rate_limit?: RateLimitConfig | null;
   created_at: string;
   updated_at: string;
+}
+
+export type RateLimitScope = 'per_ip' | 'per_route';
+
+export interface RateLimitConfig {
+  capacity: number;
+  refill_per_sec: number;
+  scope: RateLimitScope;
 }
 
 export interface HeaderRuleResponse {
@@ -321,6 +330,7 @@ export interface CreateRouteRequest {
   mirror?: MirrorConfigRequest;
   response_rewrite?: ResponseRewriteConfigRequest;
   mtls?: MtlsConfigRequest;
+  rate_limit?: RateLimitConfig;
 }
 
 
@@ -385,6 +395,7 @@ export interface UpdateRouteRequest {
   mirror?: MirrorConfigRequest;
   response_rewrite?: ResponseRewriteConfigRequest;
   mtls?: MtlsConfigRequest;
+  rate_limit?: RateLimitConfig;
 }
 
 export interface BackendResponse {
