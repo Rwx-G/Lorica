@@ -774,6 +774,36 @@ pub fn compute_pool_size(backend_count: usize) -> usize {
     }
 }
 
+/// Compact a client IP into a `u64` key for the shmem hashtables.
+///
+/// `lorica_shmem` pre-hashes this with its secret siphash key before
+/// slotting, so the only requirement here is a deterministic, low-cost
+/// serialisation of the IP into 64 bits. IPv4 becomes its 32-bit value;
+/// IPv6 folds the two 64-bit halves via XOR; an unparseable string
+/// falls back to a deterministic FNV-1a rollup so malformed inputs
+/// still route consistently (they should not reach this path in
+/// practice).
+pub fn ip_to_shmem_key(ip: &str) -> u64 {
+    use std::net::IpAddr;
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => u32::from(v4) as u64,
+        Ok(IpAddr::V6(v6)) => {
+            let o = v6.octets();
+            let high = u64::from_be_bytes([o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]]);
+            let low = u64::from_be_bytes([o[8], o[9], o[10], o[11], o[12], o[13], o[14], o[15]]);
+            high ^ low
+        }
+        Err(_) => {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in ip.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        }
+    }
+}
+
 /// Check whether an IP address matches a pattern (exact match or CIDR range).
 fn ip_matches(ip: &str, pattern: &str) -> bool {
     if pattern.contains('/') {
@@ -3098,45 +3128,70 @@ impl ProxyHttp for LoricaProxy {
                 ctx.matched_host = Some(host.to_string());
                 ctx.matched_path = Some(path.to_string());
 
-                // WAF auto-ban: local per-process fallback for single-process mode.
-                // In multi-worker mode the supervisor counts violations globally
-                // across all workers and broadcasts BanIp commands. The local
-                // counter here serves as a fallback that still works in
-                // single-process deployments.
+                // WAF auto-ban counter. Two modes:
+                //
+                // - Multi-worker (`self.shmem.is_some()`): increment the
+                //   cross-worker `waf_auto_ban` atomic counter. The
+                //   supervisor reads the counter on each UDS WAF event,
+                //   decides when the threshold is crossed, broadcasts
+                //   `BanIp` to all workers, and resets the slot. Workers
+                //   never issue bans directly — the supervisor is the
+                //   sole authority so the ban is consistent across the
+                //   pool.
+                //
+                // - Single-process (`self.shmem.is_none()`): fall back to
+                //   the per-process `waf_violations` DashMap + local
+                //   `ban_list` insertion, as before.
                 if let Some(ref ip) = check_ip {
                     let config = self.config.load();
                     let threshold = config.waf_ban_threshold;
                     if threshold > 0 {
-                        let violations = self
-                            .waf_violations
-                            .entry(ip.to_string())
-                            .or_insert_with(|| AtomicU64::new(0))
-                            .fetch_add(1, Ordering::Relaxed)
-                            + 1;
-                        if violations >= threshold as u64 {
-                            let ban_duration = config.waf_ban_duration_s;
-                            self.ban_list
-                                .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
-                            self.waf_violations.remove(ip.as_str());
-                            warn!(
-                                ip = %ip,
-                                violations = %violations,
-                                ban_duration_s = %ban_duration,
-                                "IP auto-banned for repeated WAF violations (local counter)"
+                        if let Some(region) = self.shmem {
+                            // Multi-worker: just bump the shmem counter.
+                            let tagged =
+                                region.tagged(ip_to_shmem_key(ip.as_str()));
+                            let _ = region.waf_auto_ban.increment(
+                                tagged,
+                                1,
+                                lorica_shmem::now_ns(),
                             );
-                            if let Some(ref sender) = self.alert_sender {
-                                sender.send(
-                                    lorica_notify::AlertEvent::new(
-                                        lorica_notify::events::AlertType::IpBanned,
-                                        format!(
-                                            "IP {} auto-banned for repeated WAF violations",
-                                            ip
-                                        ),
-                                    )
-                                    .with_detail("ip", ip.to_string())
-                                    .with_detail("violations", violations.to_string())
-                                    .with_detail("ban_duration_s", ban_duration.to_string()),
+                        } else {
+                            let violations = self
+                                .waf_violations
+                                .entry(ip.to_string())
+                                .or_insert_with(|| AtomicU64::new(0))
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
+                            if violations >= threshold as u64 {
+                                let ban_duration = config.waf_ban_duration_s;
+                                self.ban_list.insert(
+                                    ip.to_string(),
+                                    (Instant::now(), ban_duration as u64),
                                 );
+                                self.waf_violations.remove(ip.as_str());
+                                warn!(
+                                    ip = %ip,
+                                    violations = %violations,
+                                    ban_duration_s = %ban_duration,
+                                    "IP auto-banned for repeated WAF violations (local counter)"
+                                );
+                                if let Some(ref sender) = self.alert_sender {
+                                    sender.send(
+                                        lorica_notify::AlertEvent::new(
+                                            lorica_notify::events::AlertType::IpBanned,
+                                            format!(
+                                                "IP {} auto-banned for repeated WAF violations",
+                                                ip
+                                            ),
+                                        )
+                                        .with_detail("ip", ip.to_string())
+                                        .with_detail("violations", violations.to_string())
+                                        .with_detail(
+                                            "ban_duration_s",
+                                            ban_duration.to_string(),
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }

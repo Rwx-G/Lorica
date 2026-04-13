@@ -812,9 +812,13 @@ fn run_supervisor(cli: Cli) {
         }
         let waf_event_sink = Arc::clone(&waf_event_buffer);
         let waf_alert_sender = alert_sender.clone();
-        // Global WAF violation counter: counts blocked events per IP across all workers
-        let waf_global_violations: Arc<dashmap::DashMap<String, std::sync::atomic::AtomicU64>> =
-            Arc::new(dashmap::DashMap::new());
+        // Cross-worker WAF auto-ban counter lives in the shmem region
+        // (see lorica-shmem::SharedRegion::waf_auto_ban). The supervisor
+        // is the sole ban-issuer: it increments on each UDS event,
+        // compares to the configured threshold, and on crossing
+        // broadcasts BanIp then resets the slot so the next round of
+        // violations starts at zero.
+        let waf_shmem = shmem_region;
         let waf_ban_tx = ban_bc_tx.clone();
         let waf_ban_store = Arc::clone(&store);
         tokio::spawn(async move {
@@ -823,9 +827,9 @@ fn run_supervisor(cli: Cli) {
                     Ok((stream, _)) => {
                         let sink = Arc::clone(&waf_event_sink);
                         let alert_tx = waf_alert_sender.clone();
-                        let violations = Arc::clone(&waf_global_violations);
                         let ban_tx = waf_ban_tx.clone();
                         let ban_store = Arc::clone(&waf_ban_store);
+                        let shmem = waf_shmem;
                         tokio::spawn(async move {
                             let mut reader = tokio::io::BufReader::new(stream);
                             let mut line = String::new();
@@ -850,7 +854,12 @@ fn run_supervisor(cli: Cli) {
                                                 .with_detail("severity", event.severity.to_string()),
                                             );
 
-                                            // Global WAF auto-ban: count blocked events per client IP
+                                            // Global WAF auto-ban: read the cross-worker shmem
+                                            // counter. Workers have already bumped it in their
+                                            // hot path (see proxy_wiring.rs). The supervisor
+                                            // compares against the configured threshold and,
+                                            // on the first crossing, broadcasts BanIp and
+                                            // resets the slot so the next round starts at zero.
                                             if !event.client_ip.is_empty() && event.client_ip != "-" {
                                                 let s = ban_store.lock().await;
                                                 let (threshold, duration_s) = s.get_global_settings()
@@ -859,13 +868,22 @@ fn run_supervisor(cli: Cli) {
                                                 drop(s);
 
                                                 if threshold > 0 {
-                                                    let count = violations
-                                                        .entry(event.client_ip.clone())
-                                                        .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
-                                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                                        + 1;
+                                                    let key = lorica::proxy_wiring::ip_to_shmem_key(
+                                                        &event.client_ip,
+                                                    );
+                                                    let tagged = shmem.tagged(key);
+                                                    let count = shmem
+                                                        .waf_auto_ban
+                                                        .read(tagged)
+                                                        .unwrap_or(0);
                                                     if count >= threshold {
-                                                        violations.remove(&event.client_ip);
+                                                        // Reset slot so concurrent/future
+                                                        // violations after broadcast start
+                                                        // fresh. CAS failure is benign (another
+                                                        // event raced and we already broadcast).
+                                                        let _ = shmem
+                                                            .waf_auto_ban
+                                                            .reset(tagged);
                                                         warn!(
                                                             ip = %event.client_ip,
                                                             violations = %count,
