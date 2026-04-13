@@ -34,9 +34,9 @@ pub use channel::CommandChannel;
 pub use messages::{
     command, envelope, response, BackendConnEntry, BanReportEntry, BreakerDecision, BreakerQuery,
     BreakerReport, BreakerResult, Command, CommandType, ConfigReloadCommit, ConfigReloadPrepare,
-    Envelope, EwmaReportEntry, MetricsReport, RateLimitDelta, RateLimitEntry, RateLimitQuery,
-    RateLimitResult, RequestCountEntry, Response, ResponseStatus, Verdict, VerdictLookup,
-    VerdictPush, VerdictResult, WafCountEntry,
+    Envelope, EwmaReportEntry, MetricsReport, RateLimitDelta, RateLimitDeltaResult, RateLimitEntry,
+    RateLimitQuery, RateLimitResult, RateLimitSnapshot, RequestCountEntry, Response,
+    ResponseStatus, Verdict, VerdictLookup, VerdictPush, VerdictResult, WafCountEntry,
 };
 pub use rpc::{IncomingCommand, IncomingCommands, RpcEndpoint, DEFAULT_REQUEST_TIMEOUT};
 

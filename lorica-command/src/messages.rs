@@ -254,13 +254,13 @@ pub struct Response {
     pub message: ::prost::alloc::string::String,
     /// Typed payload for RPC responses (verdict, breaker decision, rate
     /// limit snapshot). None for legacy status-only responses.
-    #[prost(oneof = "response::Payload", tags = "100, 101, 102")]
+    #[prost(oneof = "response::Payload", tags = "100, 101, 102, 103")]
     pub payload: ::core::option::Option<response::Payload>,
 }
 
 /// Typed payload variants for pipelined RPC responses.
 pub mod response {
-    use super::{BreakerResult, RateLimitResult, VerdictResult};
+    use super::{BreakerResult, RateLimitDeltaResult, RateLimitResult, VerdictResult};
 
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Payload {
@@ -270,6 +270,8 @@ pub mod response {
         BreakerResult(BreakerResult),
         #[prost(message, tag = "102")]
         RateLimitResult(RateLimitResult),
+        #[prost(message, tag = "103")]
+        RateLimitDeltaResult(RateLimitDeltaResult),
     }
 }
 
@@ -615,6 +617,28 @@ pub struct RateLimitResult {
     pub remaining: u32,
 }
 
+/// One authoritative-bucket snapshot entry returned by
+/// [`RateLimitDeltaResult`]. Pairs by `key` with the `RateLimitDelta`
+/// request; absent keys default to the initial capacity client-side.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RateLimitSnapshot {
+    #[prost(string, tag = "1")]
+    pub key: String,
+    /// Tokens remaining in the authoritative bucket after applying the
+    /// worker's pushed delta.
+    #[prost(uint32, tag = "2")]
+    pub remaining: u32,
+}
+
+/// Supervisor -> worker: batched authoritative snapshots in reply to a
+/// `RateLimitDelta` push. Worker matches each entry by `key` and calls
+/// `LocalBucket::refresh(remaining)`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RateLimitDeltaResult {
+    #[prost(message, repeated, tag = "1")]
+    pub snapshots: Vec<RateLimitSnapshot>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -956,6 +980,29 @@ mod tests {
             response::Payload::RateLimitResult(RateLimitResult {
                 allowed: true,
                 remaining: 17,
+            }),
+        );
+        let roundtrip = Response::decode(&resp.encode_to_vec()[..]).unwrap();
+        assert_eq!(roundtrip, resp);
+    }
+
+    #[test]
+    fn test_response_with_rate_limit_delta_result_roundtrip() {
+        use prost::Message;
+
+        let resp = Response::ok_with(
+            10,
+            response::Payload::RateLimitDeltaResult(RateLimitDeltaResult {
+                snapshots: vec![
+                    RateLimitSnapshot {
+                        key: "r1:1.2.3.4".into(),
+                        remaining: 42,
+                    },
+                    RateLimitSnapshot {
+                        key: "r1:5.6.7.8".into(),
+                        remaining: 0,
+                    },
+                ],
             }),
         );
         let roundtrip = Response::decode(&resp.encode_to_vec()[..]).unwrap();
