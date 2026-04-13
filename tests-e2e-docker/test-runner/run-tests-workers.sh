@@ -753,7 +753,7 @@ sleep 3
 TB_200=0
 TB_429=0
 for i in $(seq 1 20); do
-    TB_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+    TB_CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' \
         -H "Host: w-ratelimit-tb.test" "$PROXY/" 2>/dev/null || true)
     if [ "$TB_CODE" = "200" ]; then TB_200=$((TB_200 + 1)); fi
     if [ "$TB_CODE" = "429" ]; then TB_429=$((TB_429 + 1)); fi

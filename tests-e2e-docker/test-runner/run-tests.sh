@@ -3856,7 +3856,10 @@ JSON
     RL_200=0
     RL_429=0
     for i in 1 2 3 4 5; do
-        CODE=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: rl.test' "http://$PROXY/")
+        # $PROXY is already `http://lorica:8080` (full URL). `--max-time 5`
+        # guards against the test-runner hanging forever if the proxy
+        # ever stops responding.
+        CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -H 'Host: rl.test' "$PROXY/" 2>/dev/null || echo "000")
         if [ "$CODE" = "200" ]; then
             RL_200=$((RL_200 + 1))
         elif [ "$CODE" = "429" ]; then
@@ -3870,7 +3873,7 @@ JSON
     fi
 
     # The 429 responses must advertise a Retry-After header.
-    RETRY_AFTER=$(curl -s -D - -o /dev/null -H 'Host: rl.test' "http://$PROXY/" \
+    RETRY_AFTER=$(curl -s --max-time 5 -D - -o /dev/null -H 'Host: rl.test' "$PROXY/" 2>/dev/null \
         | grep -i '^retry-after:' | head -1 | awk '{print $2}' | tr -d '\r')
     if [ -n "$RETRY_AFTER" ] && [ "$RETRY_AFTER" = "60" ]; then
         ok "Retry-After: 60 (one-shot bucket advice)"
@@ -3889,7 +3892,7 @@ JSON
 JSON
 )
     BAD_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+        -b "$SESSION" -H 'Content-Type: application/json' \
         -d "$BAD_RATE" "$API/api/v1/routes")
     if [ "$BAD_CODE" = "400" ]; then
         ok "API rejects capacity > 1_000_000 with 400"

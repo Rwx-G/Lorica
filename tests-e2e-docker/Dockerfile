@@ -32,6 +32,7 @@ COPY lorica-runtime/ lorica-runtime/
 COPY lorica-timeout/ lorica-timeout/
 COPY lorica-tls/ lorica-tls/
 COPY lorica-command/ lorica-command/
+COPY lorica-shmem/ lorica-shmem/
 COPY lorica-waf/ lorica-waf/
 COPY lorica-worker/ lorica-worker/
 COPY lorica-bench/ lorica-bench/
@@ -54,6 +55,14 @@ COPY --from=builder /app/target/release/lorica /usr/local/bin/lorica
 COPY tests-e2e-docker/entrypoint.sh /entrypoint.sh
 COPY tests-e2e-docker/entrypoint-workers.sh /entrypoint-workers.sh
 RUN chmod +x /entrypoint.sh /entrypoint-workers.sh
+
+# Pre-create the `/shared` mount point owned by the non-root lorica
+# user so the entrypoint can write `/shared/admin_password` after the
+# volume is mounted over it. Without this, a freshly-created Docker
+# named volume inherits the parent directory's owner (root), and the
+# subsequent write silently fails because the lorica user cannot
+# write to a root-owned directory.
+RUN mkdir -p /shared && chown lorica:lorica /shared
 
 EXPOSE 9443 8080 8443
 

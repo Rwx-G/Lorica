@@ -2441,9 +2441,12 @@ fn run_single_process(cli: Cli) {
             Arc::new(parking_lot::Mutex::new(None));
         {
             // Build the optional mTLS verifier from the union of per-route
-            // CA bundles.
+            // CA bundles. `store` is a `tokio::sync::Mutex`, and we are
+            // inside the `rt.block_on(async move { ... })` runtime
+            // context — so we must `await` the lock instead of using
+            // the blocking_lock which panics from within a runtime.
             let (mtls_verifier, startup_fp) = {
-                let routes = store.blocking_lock().list_routes().unwrap_or_default();
+                let routes = store.lock().await.list_routes().unwrap_or_default();
                 (
                     lorica::mtls::build_from_routes(&routes),
                     lorica::mtls::compute_ca_fingerprint(&routes),
