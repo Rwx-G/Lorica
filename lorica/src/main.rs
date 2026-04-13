@@ -2052,6 +2052,13 @@ fn run_worker(
     // because worker shutdown is orchestrated by the supervisor via
     // SIGTERM and the prune task exits with the runtime.
     let worker_auth_prune_tracker = tokio_util::task::TaskTracker::new();
+    // All four of the following `spawn_*` helpers call into
+    // `tokio::spawn`, which requires a current runtime. We are
+    // between two `rt.block_on(...)` blocks here, so use `rt.enter()`
+    // to establish a runtime context for the duration of the setup.
+    // The spawned tasks outlive the guard (tokio keeps them attached
+    // to the runtime itself).
+    let _rt_guard = rt.enter();
     let _basic_auth_prune = lorica_proxy
         .spawn_basic_auth_cache_prune(&worker_auth_prune_tracker, Duration::from_secs(30));
     // Per-IP rate-limit buckets need the same lazy-prune treatment:
@@ -2101,6 +2108,7 @@ fn run_worker(
             "worker started with shmem but no RPC FD; rate-limit sync disabled"
         );
     }
+    drop(_rt_guard);
     // Open a LogStore so the worker can persist WAF events directly (with
     // route_hostname and action stamped). SQLite WAL mode allows concurrent
     // writes from multiple worker processes.
