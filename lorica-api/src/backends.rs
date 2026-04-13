@@ -283,11 +283,14 @@ pub async fn delete_backend(
     drop(store);
     state.notify_config_changed();
 
-    // Spawn background drain task
+    // Spawn background drain task under the shared tracker so
+    // shutdown waits (up to the supervisor drain timeout) for any
+    // in-flight drain to complete rather than ripping the DB row out
+    // with connections still bound to it.
     let drain_state = state.clone();
     let drain_addr = backend.address.clone();
     let drain_id = id.clone();
-    tokio::spawn(async move {
+    state.task_tracker.spawn(async move {
         const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
         let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;

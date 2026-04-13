@@ -47,6 +47,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 parking_lot = "0.12"
 ipnet = "2"
 strum = "0.26"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [features]
 default = ["route53"]

@@ -426,8 +426,9 @@ pub async fn reload_blocklist(
 pub fn spawn_blocklist_refresh(
     engine: std::sync::Arc<lorica_waf::WafEngine>,
     interval: std::time::Duration,
+    tracker: &tokio_util::task::TaskTracker,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    tracker.spawn(async move {
         // Initial fetch at startup if blocklist is already enabled (restored from settings)
         if engine.ip_blocklist().is_enabled() {
             match fetch_and_load_blocklist(engine.ip_blocklist()).await {

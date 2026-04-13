@@ -48,6 +48,12 @@ pub struct Session {
 pub struct SessionStore {
     pub(crate) sessions: Arc<Mutex<HashMap<String, Session>>>,
     db: Arc<Mutex<ConfigStore>>,
+    /// Tracker for the fire-and-forget SQLite writes (`delete_session`,
+    /// `update_session_expiry`, `cleanup_expired_sessions`). Defaults
+    /// to a standalone tracker so tests and callers that don't care
+    /// about drain still work; the supervisor wires its shared tracker
+    /// via `with_task_tracker` so shutdown can wait on pending writes.
+    task_tracker: tokio_util::task::TaskTracker,
 }
 
 impl SessionStore {
@@ -85,7 +91,16 @@ impl SessionStore {
         Self {
             sessions: Arc::new(Mutex::new(cache)),
             db,
+            task_tracker: tokio_util::task::TaskTracker::new(),
         }
+    }
+
+    /// Swap in the supervisor's shared task tracker so background
+    /// session-store writes are drained on shutdown instead of being
+    /// dropped mid-write.
+    pub fn with_task_tracker(mut self, tracker: tokio_util::task::TaskTracker) -> Self {
+        self.task_tracker = tracker;
+        self
     }
 
     /// Create a new session and return the session ID.
@@ -134,7 +149,7 @@ impl SessionStore {
                 sessions.remove(session_id);
                 let db = self.db.clone();
                 let sid = session_id.to_string();
-                tokio::spawn(async move {
+                self.task_tracker.spawn(async move {
                     let store = db.lock().await;
                     let _ = store.delete_session(&sid);
                 });
@@ -190,7 +205,7 @@ impl SessionStore {
 
             let db = self.db.clone();
             let sid = session_id.to_string();
-            tokio::spawn(async move {
+            self.task_tracker.spawn(async move {
                 let store = db.lock().await;
                 let _ = store.update_session_expiry(&sid, &new_expiry);
             });
@@ -214,7 +229,7 @@ impl SessionStore {
         let db = self.db.clone();
         let uid = user_id.to_string();
         let keep = keep_session_id.to_string();
-        tokio::spawn(async move {
+        self.task_tracker.spawn(async move {
             let store = db.lock().await;
             let _ = store.delete_sessions_for_user_except(&uid, &keep);
         });
@@ -230,7 +245,7 @@ impl SessionStore {
 
         if purged > 0 {
             let db = self.db.clone();
-            tokio::spawn(async move {
+            self.task_tracker.spawn(async move {
                 let store = db.lock().await;
                 let _ = store.cleanup_expired_sessions();
             });
@@ -241,7 +256,8 @@ impl SessionStore {
 
     /// Spawn a background task that purges expired sessions at a fixed interval.
     pub fn spawn_gc(self, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+        let tracker = self.task_tracker.clone();
+        tracker.spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
@@ -482,5 +498,51 @@ mod tests {
             .body(axum::body::Body::empty())
             .expect("test setup");
         assert!(extract_session_cookie(&req).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Task tracker wiring test
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_session_store_tracker_drains_pending_writes() {
+        // Regression test for QUA-5. Fire-and-forget SQLite writes
+        // issued from the session store must be drained by the
+        // supervisor's shared `TaskTracker` on shutdown, not dropped
+        // mid-step. `get()` on an expired cache entry spawns a
+        // `delete_session` write; after `tracker.close(); wait()`
+        // the write must have executed.
+        let tracker = tokio_util::task::TaskTracker::new();
+        let store = test_store().await.with_task_tracker(tracker.clone());
+
+        // Seed an already-expired session directly in memory (bypass
+        // `create()` which sets a future expiry) so the next `get()`
+        // triggers the spawn path we want to exercise.
+        let sid = "expired-session".to_string();
+        {
+            let mut cache = store.sessions.lock().await;
+            cache.insert(
+                sid.clone(),
+                Session {
+                    user_id: "u1".into(),
+                    username: "u1".into(),
+                    created_at: Utc::now() - Duration::hours(2),
+                    expires_at: Utc::now() - Duration::hours(1),
+                },
+            );
+        }
+        assert!(
+            store.get(&sid).await.is_none(),
+            "expired lookup returns None"
+        );
+
+        // Now drain: shutdown semantics. `close()` prevents further
+        // spawns, `wait()` resolves once every tracked future is done.
+        tracker.close();
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait()).await;
+        assert!(
+            drained.is_ok(),
+            "tracker.wait() must resolve; a leaked tokio::spawn would hang it"
+        );
     }
 }

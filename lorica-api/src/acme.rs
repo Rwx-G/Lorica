@@ -506,7 +506,8 @@ pub fn spawn_renewal_task(
     renewal_threshold_days: i64,
     alert_sender: Option<lorica_notify::AlertSender>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    let tracker = state.task_tracker.clone();
+    tracker.spawn(async move {
         loop {
             tokio::time::sleep(check_interval).await;
 
@@ -689,7 +690,8 @@ pub fn spawn_cert_expiry_check_task(
     check_interval: std::time::Duration,
     alert_sender: lorica_notify::AlertSender,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    let tracker = state.task_tracker.clone();
+    tracker.spawn(async move {
         check_cert_expiry(&state, &alert_sender).await;
         loop {
             tokio::time::sleep(check_interval).await;
@@ -2684,6 +2686,7 @@ mod tests {
             notification_history: None,
             log_store: None,
             aggregated_metrics: None,
+            task_tracker: tokio_util::task::TaskTracker::new(),
         };
 
         let alert_sender = lorica_notify::AlertSender::new(64);

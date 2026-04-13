@@ -70,6 +70,13 @@ pub struct AppState {
     pub log_store: Option<Arc<crate::log_store::LogStore>>,
     /// Aggregated proxy metrics from worker processes. `None` in single-process mode.
     pub aggregated_metrics: Option<Arc<crate::workers::AggregatedMetrics>>,
+    /// Tracker for background tasks that must be drained on graceful
+    /// shutdown (ACME polling, session-store writes, WAF refresh,
+    /// backend drain watchdog, etc.). The supervisor shutdown path
+    /// calls `task_tracker.close(); task_tracker.wait().await` so
+    /// in-flight work completes rather than being dropped mid-step.
+    /// Cheap to clone (internal `Arc`).
+    pub task_tracker: tokio_util::task::TaskTracker,
 }
 
 impl AppState {

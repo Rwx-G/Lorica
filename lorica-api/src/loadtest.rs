@@ -257,10 +257,12 @@ pub async fn start_test(
         })));
     }
 
-    // Run the test in a background task
+    // Run the test in a background task, tracked so graceful
+    // shutdown waits for it to finish (bounded by the supervisor
+    // drain timeout) rather than leaving partial results.
     let engine = Arc::clone(engine);
     let store = Arc::clone(&state.store);
-    tokio::spawn(async move {
+    state.task_tracker.spawn(async move {
         engine.run(&config, &store).await;
     });
 
@@ -295,7 +297,7 @@ pub async fn start_test_confirmed(
 
     let engine = Arc::clone(engine);
     let store = Arc::clone(&state.store);
-    tokio::spawn(async move {
+    state.task_tracker.spawn(async move {
         engine.run(&config, &store).await;
     });
 

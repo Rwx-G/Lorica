@@ -860,10 +860,17 @@ fn run_supervisor(cli: Cli) {
             }
         }
 
+        // Tracker shared by every background task that must drain on
+        // shutdown (blocklist refresh, ACME polling, session GC,
+        // backend drain, loadtest driver). The shutdown path below
+        // calls `close(); wait().await` on its clone.
+        let task_tracker = tokio_util::task::TaskTracker::new();
+
         // Spawn IP blocklist auto-refresh in supervisor
         let _blocklist_refresh = lorica_api::waf::spawn_blocklist_refresh(
             Arc::clone(&waf_engine),
             std::time::Duration::from_secs(6 * 3600),
+            &task_tracker,
         );
 
         // Create notification dispatcher from DB configs
@@ -929,6 +936,11 @@ fn run_supervisor(cli: Cli) {
         let api_aggregated_metrics = Arc::clone(&aggregated_metrics);
         let management_port = cli.management_port;
         let api_db_path = db_path.clone();
+        // `task_tracker` is already defined above (before the WAF
+        // blocklist refresh spawn). Re-use its clones for the API
+        // task's AppState and the shutdown drain path.
+        let api_task_tracker = task_tracker.clone();
+        let shutdown_task_tracker = task_tracker.clone();
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -960,8 +972,11 @@ fn run_supervisor(cli: Cli) {
                     Some(d.history())
                 },
                 log_store: api_log_store,
+                task_tracker: api_task_tracker,
             };
-            let session_store = SessionStore::new(Arc::clone(&state.store)).await;
+            let session_store = SessionStore::new(Arc::clone(&state.store))
+                .await
+                .with_task_tracker(state.task_tracker.clone());
             let rate_limiter = RateLimiter::new();
 
             if let Err(e) =
@@ -1166,6 +1181,17 @@ fn run_supervisor(cli: Cli) {
                 e.into_inner()
             })
             .shutdown_all();
+        // Drain tracked background tasks (ACME polling, session-store
+        // writes, WAF refresh, backend drain watchdog). Bounded to 10 s
+        // so a hung task cannot delay shutdown indefinitely; systemd
+        // TimeoutStopSec will SIGKILL us past that anyway.
+        shutdown_task_tracker.close();
+        if tokio::time::timeout(Duration::from_secs(10), shutdown_task_tracker.wait())
+            .await
+            .is_err()
+        {
+            warn!("some background tasks did not finish within drain timeout; aborting");
+        }
         api_handle.abort();
         health_handle.abort();
         monitor_handle.abort();
@@ -1583,9 +1609,14 @@ fn run_worker(
                 }
             }
             let blocklist_engine = Arc::clone(&waf_fwd_engine);
+            // Worker mode has no supervisor drain; a local tracker
+            // is fine (worker shutdown is orchestrated by the
+            // supervisor via SIGTERM + drain-timeout anyway).
+            let worker_blocklist_tracker = tokio_util::task::TaskTracker::new();
             lorica_api::waf::spawn_blocklist_refresh(
                 blocklist_engine,
                 std::time::Duration::from_secs(6 * 3600),
+                &worker_blocklist_tracker,
             );
 
             // Forward WAF events to supervisor
@@ -1895,10 +1926,17 @@ fn run_single_process(cli: Cli) {
             }
         }
 
+        // Tracker shared by every background task that must drain on
+        // shutdown. The shutdown path below calls `close(); wait().
+        // await` on its clone, giving in-flight work a bounded time
+        // to complete.
+        let single_task_tracker = tokio_util::task::TaskTracker::new();
+
         // Spawn IP blocklist auto-refresh (every 6 hours, matching Data-Shield update frequency)
         let _blocklist_refresh = lorica_api::waf::spawn_blocklist_refresh(
             Arc::clone(&waf_engine),
             std::time::Duration::from_secs(6 * 3600),
+            &single_task_tracker,
         );
 
         // Create non-blocking alert sender and notification dispatcher
@@ -2040,6 +2078,11 @@ fn run_single_process(cli: Cli) {
         let api_active_connections = Arc::clone(&active_connections);
         let api_log_store = log_store.clone();
         let management_port = cli.management_port;
+        // `single_task_tracker` is already defined above (before the
+        // WAF blocklist refresh spawn). Clone it for AppState and the
+        // shutdown drain path.
+        let api_task_tracker = single_task_tracker.clone();
+        let shutdown_task_tracker = single_task_tracker.clone();
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store.clone(),
@@ -2067,6 +2110,7 @@ fn run_single_process(cli: Cli) {
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
                 aggregated_metrics: None, // single-process uses direct Arc references
+                task_tracker: api_task_tracker,
             };
 
             // Spawn ACME certificate auto-renewal (check every 12h, renew at 30 days before expiry)
@@ -2084,7 +2128,9 @@ fn run_single_process(cli: Cli) {
                 alert_sender.clone(),
             );
 
-            let session_store = SessionStore::new(api_store.clone()).await;
+            let session_store = SessionStore::new(api_store.clone())
+                .await
+                .with_task_tracker(state.task_tracker.clone());
             let rate_limiter = RateLimiter::new();
 
             if let Err(e) = lorica_api::server::start_server(
@@ -2196,6 +2242,15 @@ fn run_single_process(cli: Cli) {
 
         info!("Lorica shutting down gracefully");
 
+        // Drain tracked background tasks before tearing down the API
+        // server. Bounded at 10 s so a hung task does not delay exit.
+        shutdown_task_tracker.close();
+        if tokio::time::timeout(Duration::from_secs(10), shutdown_task_tracker.wait())
+            .await
+            .is_err()
+        {
+            warn!("some background tasks did not finish within drain timeout; aborting");
+        }
         api_handle.abort();
         health_handle.abort();
     });
