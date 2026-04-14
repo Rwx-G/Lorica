@@ -983,6 +983,17 @@ pub struct RequestCtx {
     /// bounce back to Open on failure). `None` for requests that went
     /// out on a Closed breaker.
     pub breaker_probe_backend: Option<String>,
+    /// W3C `traceparent` to emit toward the upstream. `Some` once the
+    /// request_filter pipeline has either preserved the client's
+    /// header (with a new parent-span id rolled for Lorica) or
+    /// synthesised a fresh trace from the request_id. `None` only
+    /// during early startup between `new_ctx` and the first line of
+    /// `request_filter`. See `lorica::otel`.
+    pub outgoing_traceparent: Option<crate::otel::TraceParent>,
+    /// Whether the outgoing traceparent was preserved from the
+    /// client (true) or synthesised by Lorica (false). Used by later
+    /// stories (span attributes, metrics) to distinguish trace origin.
+    pub traceparent_from_client: bool,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -1801,6 +1812,8 @@ impl ProxyHttp for LoricaProxy {
             breaker_probe_backend: None,
             response_rewrite_state: None,
             response_rewrite_rules: None,
+            outgoing_traceparent: None,
+            traceparent_from_client: false,
         }
     }
 
@@ -1808,6 +1821,33 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // W3C trace context capture. Runs before everything else so
+        // even ACME challenges carry a traceparent forward (ACME
+        // responders are themselves interesting to trace). If the
+        // client sent a well-formed header we keep the trace_id and
+        // roll a new parent_id (Lorica sits between client and
+        // origin); otherwise we synthesise a fresh trace seeded on
+        // the request_id so backend sidecars can still correlate.
+        // Parsing is ~50 ns and runs regardless of the `otel` feature
+        // so header pass-through is always available.
+        {
+            let incoming = session
+                .req_header()
+                .headers
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::otel::TraceParent::parse);
+            if let Some(parent) = incoming {
+                ctx.outgoing_traceparent = Some(parent.child(&ctx.request_id));
+                ctx.traceparent_from_client = true;
+            } else {
+                ctx.outgoing_traceparent = Some(
+                    crate::otel::traceparent_from_request_id(&ctx.request_id),
+                );
+                ctx.traceparent_from_client = false;
+            }
+        }
+
         // ACME HTTP-01 challenge intercept (must respond before any other check)
         if let Some(ref challenge_store) = self.acme_challenge_store {
             let path = session.req_header().uri.path();
@@ -3740,6 +3780,19 @@ impl ProxyHttp for LoricaProxy {
 
         // Inject X-Request-Id for end-to-end tracing
         let _ = upstream_request.insert_header("X-Request-Id", &ctx.request_id);
+
+        // W3C trace context propagation. Always overwrite whatever the
+        // client sent: the value stored on `ctx.outgoing_traceparent`
+        // either preserves the client's trace_id with Lorica as the
+        // new parent (client traceparent was well-formed) or is a
+        // fresh deterministic trace from the request_id. The backend
+        // thus always sees a valid traceparent and the trace tree
+        // stays continuous across the hop. Tracestate passes through
+        // unchanged when present (vendor-opaque); we do not touch it
+        // here so a backend can still rely on any vendor baggage.
+        if let Some(ref tp) = ctx.outgoing_traceparent {
+            let _ = upstream_request.insert_header("traceparent", tp.to_header_value());
+        }
 
         // Path rewriting: strip prefix then add prefix
         let original_path = upstream_request.uri.path().to_string();
