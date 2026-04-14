@@ -464,6 +464,7 @@ fn test_route_with_path_rule_overrides_applies_some_fields() {
         response_rewrite: None,
         mtls: None,
         rate_limit: None,
+        geoip: None,
         created_at: now,
         updated_at: now,
     };
@@ -606,6 +607,7 @@ fn example_route_for_serde() -> Route {
         response_rewrite: None,
         mtls: None,
         rate_limit: None,
+        geoip: None,
         created_at: now,
         updated_at: now,
     }

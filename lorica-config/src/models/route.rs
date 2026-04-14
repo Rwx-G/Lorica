@@ -595,8 +595,42 @@ pub struct Route {
     /// `lorica_limits::AuthoritativeBucket`). `None` = unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
+    /// Per-route GeoIP country filter. When set and the supervisor
+    /// has loaded a `.mmdb` database, Lorica resolves the client IP
+    /// to an ISO 3166-1 alpha-2 country code and enforces the
+    /// configured mode (Allowlist / Denylist). Unknown country
+    /// (reserved / private ranges, missing from the DB) falls
+    /// through without blocking so legitimate clients behind a
+    /// corporate NAT are not accidentally denied. `None` = filter
+    /// disabled for this route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geoip: Option<GeoIpConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Mode for the per-route GeoIP filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GeoIpMode {
+    /// Only countries in `countries` pass; everything else returns 403.
+    Allowlist,
+    /// Countries in `countries` return 403; everything else passes.
+    Denylist,
+}
+
+/// Per-route GeoIP filter. Evaluated after connection pre-filter and
+/// IP blocklist, before WAF (so cheap geographic rejection happens
+/// before expensive regex matching). See `lorica::proxy_wiring`
+/// request_filter for exact placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeoIpConfig {
+    pub mode: GeoIpMode,
+    /// ISO 3166-1 alpha-2 country codes (uppercase two-letter).
+    /// API validation enforces the shape; empty list with
+    /// `mode: Allowlist` would block everything and is rejected at
+    /// write time.
+    pub countries: Vec<String>,
 }
 
 impl Route {

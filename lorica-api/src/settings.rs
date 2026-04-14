@@ -44,6 +44,8 @@ pub struct UpdateSettingsRequest {
     pub otlp_protocol: Option<String>,
     pub otlp_service_name: Option<String>,
     pub otlp_sampling_ratio: Option<f64>,
+    pub geoip_db_path: Option<String>,
+    pub geoip_auto_update_enabled: Option<bool>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -243,6 +245,31 @@ pub async fn update_settings(
             ));
         }
         settings.otlp_sampling_ratio = ratio;
+    }
+    if let Some(ref path) = body.geoip_db_path {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            settings.geoip_db_path = None;
+        } else {
+            // Require an absolute path so the supervisor does not end
+            // up looking for the DB relative to whatever cwd it was
+            // started from. Bounded at 4 KiB to match typical PATH_MAX
+            // on Linux without trusting libc's limits.
+            if !trimmed.starts_with('/') {
+                return Err(ApiError::BadRequest(
+                    "geoip_db_path must be an absolute path (starting with '/')".into(),
+                ));
+            }
+            if trimmed.len() > 4096 {
+                return Err(ApiError::BadRequest(
+                    "geoip_db_path too long (> 4096 chars)".into(),
+                ));
+            }
+            settings.geoip_db_path = Some(trimmed.to_string());
+        }
+    }
+    if let Some(auto_update) = body.geoip_auto_update_enabled {
+        settings.geoip_auto_update_enabled = auto_update;
     }
 
     store.update_global_settings(&settings)?;

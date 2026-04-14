@@ -561,6 +561,18 @@ impl ConfigStore {
             [],
         );
 
+        // V34: per-route GeoIP country filter (v1.4.0 Epic 2 story 2.2).
+        // JSON blob or NULL (feature off by default). Schema:
+        //   { "mode": "allowlist" | "denylist",
+        //     "countries": ["FR", "DE", ...] }
+        // The supervisor's shared-memory `.mmdb` reader (loaded from
+        // `GlobalSettings.geoip_db_path`) is the lookup source; a NULL
+        // column skips the GeoIP check entirely for that route.
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN geoip TEXT DEFAULT NULL",
+            [],
+        );
+
         Ok(())
     }
 

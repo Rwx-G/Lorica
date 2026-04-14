@@ -85,6 +85,7 @@ impl ConfigStore {
             serialize_optional_field("response_rewrite", route.response_rewrite.as_ref())?;
         let mtls_json = serialize_optional_field("mtls", route.mtls.as_ref())?;
         let rate_limit_json = serialize_optional_field("rate_limit", route.rate_limit.as_ref())?;
+        let geoip_json = serialize_optional_field("geoip", route.geoip.as_ref())?;
 
         self.conn.execute(
             "INSERT INTO routes (id, hostname, path_prefix, certificate_id, load_balancing,
@@ -117,12 +118,13 @@ impl ConfigStore {
              mirror,
              response_rewrite,
              mtls,
-             rate_limit)
+             rate_limit,
+             geoip)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
                      ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45,
-                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60, ?61, ?62, ?63)",
+                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60, ?61, ?62, ?63, ?64)",
             params![
                 route.id,
                 route.hostname,
@@ -187,6 +189,7 @@ impl ConfigStore {
                 response_rewrite_json,
                 mtls_json,
                 rate_limit_json,
+                geoip_json,
             ],
         )?;
         Ok(())
@@ -225,7 +228,9 @@ impl ConfigStore {
                  forward_auth,
                  mirror,
                  response_rewrite,
-                 mtls
+                 mtls,
+                 rate_limit,
+                 geoip
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
@@ -267,7 +272,8 @@ impl ConfigStore {
              mirror,
              response_rewrite,
              mtls,
-             rate_limit
+             rate_limit,
+             geoip
              FROM routes ORDER BY hostname, path_prefix",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_route(row)))?;
@@ -308,6 +314,7 @@ impl ConfigStore {
             serialize_optional_field("response_rewrite", route.response_rewrite.as_ref())?;
         let mtls_json = serialize_optional_field("mtls", route.mtls.as_ref())?;
         let rate_limit_json = serialize_optional_field("rate_limit", route.rate_limit.as_ref())?;
+        let geoip_json = serialize_optional_field("geoip", route.geoip.as_ref())?;
 
         let changed = self.conn.execute(
             "UPDATE routes SET hostname=?2, path_prefix=?3, certificate_id=?4,
@@ -339,7 +346,8 @@ impl ConfigStore {
              mirror=?59,
              response_rewrite=?60,
              mtls=?61,
-             rate_limit=?62 WHERE id=?1",
+             rate_limit=?62,
+             geoip=?63 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -403,6 +411,7 @@ impl ConfigStore {
                 response_rewrite_json,
                 mtls_json,
                 rate_limit_json,
+                geoip_json,
             ],
         )?;
         if changed == 0 {

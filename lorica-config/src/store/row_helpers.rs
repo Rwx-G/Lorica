@@ -172,6 +172,13 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             let raw: Option<String> = row.get::<_, Option<String>>(62).unwrap_or(None);
             raw.and_then(|s| serde_json::from_str(&s).ok())
         },
+        geoip: {
+            // Column index 63 (v1.4.0 story 2.2 migration V34). Stored
+            // as JSON or NULL; a parse failure downgrades silently to
+            // `None` so a hand-edited bad row cannot crash the proxy.
+            let raw: Option<String> = row.get::<_, Option<String>>(63).unwrap_or(None);
+            raw.and_then(|s| serde_json::from_str(&s).ok())
+        },
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

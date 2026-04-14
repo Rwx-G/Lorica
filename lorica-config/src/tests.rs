@@ -76,6 +76,7 @@ mod tests {
             response_rewrite: None,
             mtls: None,
             rate_limit: None,
+            geoip: None,
             created_at: now,
             updated_at: now,
         }

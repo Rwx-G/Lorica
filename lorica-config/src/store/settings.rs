@@ -124,6 +124,12 @@ impl ConfigStore {
                         ConfigError::Validation("invalid otlp_sampling_ratio".into())
                     })?;
                 }
+                "geoip_db_path" => {
+                    settings.geoip_db_path = if value.is_empty() { None } else { Some(value) };
+                }
+                "geoip_auto_update_enabled" => {
+                    settings.geoip_auto_update_enabled = value == "true" || value == "1";
+                }
                 _ => {}
             }
         }
@@ -243,6 +249,14 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_sampling_ratio', ?1)",
             params![settings.otlp_sampling_ratio.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('geoip_db_path', ?1)",
+            params![settings.geoip_db_path.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('geoip_auto_update_enabled', ?1)",
+            params![settings.geoip_auto_update_enabled.to_string()],
         )?;
         Ok(())
     }

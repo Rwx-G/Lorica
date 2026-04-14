@@ -232,6 +232,7 @@ fn cacheable_route(ttl_s: i32, swr_s: i32, sie_s: i32) -> Route {
         response_rewrite: None,
         mtls: None,
         rate_limit: None,
+        geoip: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

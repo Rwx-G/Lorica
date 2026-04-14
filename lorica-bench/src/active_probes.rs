@@ -422,6 +422,7 @@ mod tests {
             response_rewrite: None,
             mtls: None,
             rate_limit: None,
+            geoip: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -552,6 +553,7 @@ mod tests {
             response_rewrite: None,
             mtls: None,
             rate_limit: None,
+            geoip: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

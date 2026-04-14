@@ -187,6 +187,24 @@ pub struct GlobalSettings {
     /// are no partial traces.
     #[serde(default = "default_otlp_sampling_ratio")]
     pub otlp_sampling_ratio: f64,
+    /// Filesystem path to the `.mmdb` GeoIP database. `None` = GeoIP
+    /// disabled at runtime even when per-route `GeoIpConfig` is set
+    /// (the request_filter check becomes a no-op). Default data source
+    /// is DB-IP Lite Country (CC-BY 4.0, no account required). The
+    /// `.mmdb` format is identical to MaxMind's GeoLite2, so operators
+    /// with a MaxMind license can just swap this path with no other
+    /// changes.
+    #[serde(default)]
+    pub geoip_db_path: Option<String>,
+    /// Whether Lorica should periodically download a fresh DB-IP
+    /// Lite Country snapshot and hot-swap the in-memory reader.
+    /// Default `false` — operators opt in via the dashboard after
+    /// they have read the CC-BY 4.0 attribution requirement. When
+    /// `true`, the supervisor runs a weekly refresh task inside its
+    /// tokio runtime; failures fall back to serving the previously
+    /// loaded DB so a transient network blip never blocks requests.
+    #[serde(default)]
+    pub geoip_auto_update_enabled: bool,
 }
 
 fn default_waf_ban_threshold() -> i32 {
@@ -279,6 +297,8 @@ impl Default for GlobalSettings {
             otlp_protocol: default_otlp_protocol(),
             otlp_service_name: default_otlp_service_name(),
             otlp_sampling_ratio: default_otlp_sampling_ratio(),
+            geoip_db_path: None,
+            geoip_auto_update_enabled: false,
         }
     }
 }

@@ -82,6 +82,7 @@ fn make_route(id: &str, hostname: &str, path_prefix: &str) -> Route {
         response_rewrite: None,
         mtls: None,
         rate_limit: None,
+        geoip: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

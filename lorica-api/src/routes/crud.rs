@@ -32,6 +32,56 @@ use super::traffic_splits::{build_traffic_split, validate_traffic_splits, Traffi
 /// arithmetic in the token-bucket refill path.
 const RATE_LIMIT_MAX: u32 = 1_000_000;
 
+/// Validate a per-route `GeoIpConfig` for API acceptance. Country
+/// codes must be ISO 3166-1 alpha-2 (two ASCII letters, normalised to
+/// upper). Duplicates are collapsed. Allowlist mode rejects empty
+/// lists so an operator cannot accidentally block everything by
+/// leaving the country list blank after switching modes.
+fn validate_geoip(
+    cfg: &lorica_config::models::GeoIpConfig,
+) -> Result<lorica_config::models::GeoIpConfig, ApiError> {
+    use lorica_config::models::GeoIpMode;
+
+    let mut normalised: Vec<String> = Vec::with_capacity(cfg.countries.len());
+    for raw in &cfg.countries {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.len() != 2 || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Err(ApiError::BadRequest(format!(
+                "geoip.countries: '{trimmed}' is not a valid ISO 3166-1 alpha-2 code"
+            )));
+        }
+        let upper = trimmed.to_ascii_uppercase();
+        if !normalised.contains(&upper) {
+            normalised.push(upper);
+        }
+    }
+
+    if cfg.mode == GeoIpMode::Allowlist && normalised.is_empty() {
+        return Err(ApiError::BadRequest(
+            "geoip.countries: allowlist mode with empty country list would block every request. \
+             Use denylist mode or add at least one country"
+                .into(),
+        ));
+    }
+
+    // Upper bound on the country list so an operator cannot paste a
+    // huge blob. 300 covers every ISO code twice over.
+    const MAX_COUNTRIES: usize = 300;
+    if normalised.len() > MAX_COUNTRIES {
+        return Err(ApiError::BadRequest(format!(
+            "geoip.countries: at most {MAX_COUNTRIES} entries allowed"
+        )));
+    }
+
+    Ok(lorica_config::models::GeoIpConfig {
+        mode: cfg.mode,
+        countries: normalised,
+    })
+}
+
 /// Validate a `RateLimit` config for API acceptance. Returns the
 /// config unchanged on success, `ApiError::BadRequest` with a clear
 /// message on validation failure.
@@ -207,6 +257,8 @@ pub struct RouteResponse {
     pub mtls: Option<MtlsConfigRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<lorica_config::models::RateLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geoip: Option<lorica_config::models::GeoIpConfig>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -277,6 +329,7 @@ pub struct CreateRouteRequest {
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
     pub mtls: Option<MtlsConfigRequest>,
     pub rate_limit: Option<lorica_config::models::RateLimit>,
+    pub geoip: Option<lorica_config::models::GeoIpConfig>,
 }
 
 /// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are mutated.
@@ -357,6 +410,12 @@ pub struct UpdateRouteRequest {
     /// `capacity = 0` = clear; present with `capacity > 0` =
     /// validate + install/replace.
     pub rate_limit: Option<lorica_config::models::RateLimit>,
+    /// Update semantics: missing = leave alone; present with empty
+    /// `countries` list = clear; present with non-empty = validate
+    /// (ISO 3166-1 alpha-2 codes only) + install / replace. When
+    /// `mode = Allowlist` an empty list is rejected at validation
+    /// time so the operator cannot accidentally block everything.
+    pub geoip: Option<lorica_config::models::GeoIpConfig>,
 }
 
 fn route_to_response(
@@ -505,6 +564,7 @@ fn route_to_response(
             allowed_organizations: m.allowed_organizations.clone(),
         }),
         rate_limit: route.rate_limit.clone(),
+        geoip: route.geoip.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -654,6 +714,13 @@ pub async fn create_route(
         },
         rate_limit: match body.rate_limit.as_ref() {
             Some(rl) => Some(validate_rate_limit(rl)?),
+            None => None,
+        },
+        geoip: match body.geoip.as_ref() {
+            // Empty country list in denylist mode is legal (means "no
+            // countries blocked"), but allowlist with empty list is
+            // rejected by `validate_geoip`.
+            Some(g) => Some(validate_geoip(g)?),
             None => None,
         },
         created_at: now,
@@ -1004,6 +1071,18 @@ pub async fn update_route(
             route.rate_limit = None;
         } else {
             route.rate_limit = Some(validate_rate_limit(rl)?);
+        }
+    }
+    if let Some(ref g) = body.geoip {
+        // Empty country list in allowlist mode is rejected by
+        // `validate_geoip`; empty list in denylist mode is legal and
+        // means "filter disabled for this route". Empty list in
+        // denylist mode also clears the `geoip` column on disk.
+        use lorica_config::models::GeoIpMode;
+        if g.mode == GeoIpMode::Denylist && g.countries.is_empty() {
+            route.geoip = None;
+        } else {
+            route.geoip = Some(validate_geoip(g)?);
         }
     }
     route.updated_at = Utc::now();
