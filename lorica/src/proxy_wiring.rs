@@ -999,12 +999,20 @@ pub struct RequestCtx {
     /// client (true) or synthesised by Lorica (false). Used by later
     /// stories (span attributes, metrics) to distinguish trace origin.
     pub traceparent_from_client: bool,
-    /// OpenTelemetry root span for this request. Always present as a
-    /// handle, but the underlying span is only recording when the
-    /// `otel` feature is compiled in AND the global provider is
-    /// installed AND the sampler admits the trace. See
-    /// `lorica::otel::ActiveSpan`.
-    pub otel_span: crate::otel::ActiveSpan,
+    /// Root `tracing::Span` for this request. Created by the
+    /// `#[instrument(name = "http_request")]` on `request_filter` and
+    /// captured via `Span::current()` at the top of that hook so the
+    /// downstream hooks (`upstream_request_filter`, `response_filter`,
+    /// `logging`, `fail_to_proxy`) can parent their own `#[instrument]`
+    /// spans under it — producing a clean nested tree in Jaeger /
+    /// Tempo when the `otel` feature is on (the
+    /// `tracing_opentelemetry` bridge installed in `init_logging`
+    /// mirrors every tracing span to an OTel span, inheriting the
+    /// parent link). Without the feature, the tracing span still
+    /// exists but only feeds the fmt layer for log correlation. The
+    /// field starts as `tracing::Span::none()` in `new_ctx` and is
+    /// replaced at the top of `request_filter`.
+    pub root_tracing_span: tracing::Span,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -1836,23 +1844,39 @@ impl ProxyHttp for LoricaProxy {
             outgoing_traceparent: None,
             incoming_traceparent: None,
             traceparent_from_client: false,
-            otel_span: crate::otel::ActiveSpan::empty(),
+            root_tracing_span: tracing::Span::none(),
         }
     }
 
     #[tracing::instrument(
-        name = "request_filter",
+        name = "http_request",
         skip_all,
         fields(
+            otel.kind = "server",
+            http.request.method = %session.req_header().method.as_str(),
+            url.path = %session.req_header().uri.path(),
             trace_id = tracing::field::Empty,
             span_id = tracing::field::Empty,
             request_id = %ctx.request_id,
+            lorica.route_id = tracing::field::Empty,
+            http.response.status_code = tracing::field::Empty,
+            client.geo.country_iso_code = tracing::field::Empty,
+            server.address = tracing::field::Empty,
+            network.peer.address = tracing::field::Empty,
+            lorica.latency_ms = tracing::field::Empty,
+            lorica.trace.origin = tracing::field::Empty,
         )
     )]
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool>
     where
         Self::CTX: Send + Sync,
     {
+        // Capture the span created by `#[instrument]` so downstream
+        // hooks can nest under it via `parent = &ctx.root_tracing_span`.
+        // When the `tracing_opentelemetry` bridge is installed
+        // (init_logging + otel::init both wired), the whole hook
+        // tree renders as a single nested OTel trace per request.
+        ctx.root_tracing_span = tracing::Span::current();
         // W3C trace context capture. Runs before everything else so
         // even ACME challenges carry a traceparent forward (ACME
         // responders are themselves interesting to trace). If the
@@ -1895,21 +1919,42 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Create the OpenTelemetry root span for this request, linked
-        // to the client's parent span (when a valid traceparent was
-        // present) so the span tree in Jaeger / Tempo shows the client
-        // above Lorica. No-op handle when the `otel` feature is off,
-        // the global provider was never installed, or the sampler
-        // dropped the trace; method calls on the returned handle are
-        // cheap in all those cases.
-        {
-            let method = session.req_header().method.as_str().to_string();
-            let path = session.req_header().uri.path().to_string();
-            ctx.otel_span = crate::otel::start_root_span(
-                &method,
-                &path,
-                ctx.incoming_traceparent.as_ref(),
-            );
+        // Link the current `http_request` tracing span (created by
+        // the `#[instrument]` on this function, captured above into
+        // `ctx.root_tracing_span`) to the client's W3C parent via
+        // the OpenTelemetry bridge when the `otel` feature is on.
+        // `tracing_opentelemetry::OpenTelemetrySpanExt::set_parent`
+        // seeds the tracing span with a remote span context so the
+        // exported OTel span shows the client as its parent in
+        // Jaeger / Tempo. No-op when the `otel` feature is off (the
+        // `set_parent` method is unavailable so the whole block is
+        // `cfg`-gated) or when the client did not send a valid
+        // traceparent.
+        #[cfg(feature = "otel")]
+        if let Some(ref parent) = ctx.incoming_traceparent {
+            use opentelemetry::trace::{
+                SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId,
+                TraceState,
+            };
+            use opentelemetry::Context;
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            if let (Ok(tid), Ok(sid)) = (
+                TraceId::from_hex(&parent.trace_id),
+                SpanId::from_hex(&parent.parent_id),
+            ) {
+                let sc = SpanContext::new(
+                    tid,
+                    sid,
+                    TraceFlags::new(parent.flags),
+                    true, // remote
+                    TraceState::default(),
+                );
+                let cx = Context::new().with_remote_span_context(sc);
+                // `set_parent` returns the receiver to enable
+                // chaining; we have no follow-up call so the
+                // returned Span is dropped intentionally.
+                let _ = tracing::Span::current().set_parent(cx);
+            }
         }
 
         // ACME HTTP-01 challenge intercept (must respond before any other check)
@@ -2749,13 +2794,15 @@ impl ProxyHttp for LoricaProxy {
         if let Some(ref ip_str) = check_ip {
             if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
                 if let Some(country) = self.geoip_resolver.lookup_country(ip_addr) {
-                    // Always stamp the country on the OTel span — the
-                    // attribute is useful even on requests that are
-                    // not blocked (traffic analytics per country,
-                    // anomaly detection) and the set_str no-op path
-                    // costs ~ns when the span is not recording.
-                    ctx.otel_span
-                        .set_str("client.geo.country_iso_code", country.to_string());
+                    // Always stamp the country on the root tracing
+                    // span — the attribute is useful even on requests
+                    // that are not blocked (traffic analytics per
+                    // country, anomaly detection). The bridge
+                    // mirrors this onto the exported OTel span when
+                    // the `otel` feature is on; without the feature
+                    // it just shows up as a span field in JSON logs.
+                    ctx.root_tracing_span
+                        .record("client.geo.country_iso_code", country.as_str());
 
                     if let Some(ref geoip_cfg) = entry.route.geoip {
                         use lorica_config::models::GeoIpMode;
@@ -3631,6 +3678,7 @@ impl ProxyHttp for LoricaProxy {
     /// response (plain-text status line).
     #[tracing::instrument(
         name = "fail_to_proxy",
+        parent = &ctx.root_tracing_span,
         skip_all,
         fields(
             trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
@@ -3920,6 +3968,7 @@ impl ProxyHttp for LoricaProxy {
 
     #[tracing::instrument(
         name = "upstream_request_filter",
+        parent = &ctx.root_tracing_span,
         skip_all,
         fields(
             trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
@@ -4086,6 +4135,7 @@ impl ProxyHttp for LoricaProxy {
 
     #[tracing::instrument(
         name = "response_filter",
+        parent = &ctx.root_tracing_span,
         skip_all,
         fields(
             trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
@@ -4402,6 +4452,7 @@ impl ProxyHttp for LoricaProxy {
 
     #[tracing::instrument(
         name = "logging",
+        parent = &ctx.root_tracing_span,
         skip_all,
         fields(
             trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
@@ -4473,39 +4524,51 @@ impl ProxyHttp for LoricaProxy {
             );
         }
 
-        // Finalise the OTel root span. Records OTel HTTP semconv
-        // attributes on the final values (status code, backend peer
-        // address, route_id), then ends the span so the batch
-        // exporter can flush it. Methods are no-ops when OTel is
-        // compiled out, the provider is not installed, or the
-        // sampler rejected the trace — so this block is always cheap
-        // to execute. `mem::take` replaces the span with an empty
-        // handle so later accidental method calls stay safe.
+        // Finalise the root `http_request` tracing span by recording
+        // the response-time HTTP semconv attributes. Each `record`
+        // call updates a field that was declared as
+        // `field::Empty` on the `#[instrument]` attribute, so the
+        // bridge picks them up on span close and exports the OTel
+        // span with the full attribute set. The span itself is
+        // closed automatically when `request_filter` returns and the
+        // implicit `#[instrument]` guard drops — no explicit `end()`
+        // call needed (the bridge runs on the layer's `on_close`).
         {
-            let mut span = std::mem::take(&mut ctx.otel_span);
-            if span.is_recording() {
-                span.set_i64("http.response.status_code", status as i64);
-                span.set_i64("lorica.latency_ms", latency_ms as i64);
-                if host != "-" {
-                    span.set_str("server.address", host.to_string());
-                }
-                if backend_addr != "-" {
-                    span.set_str("network.peer.address", backend_addr.to_string());
-                }
-                if let Some(ref rid) = ctx.route_id {
-                    span.set_str("lorica.route_id", rid.clone());
-                }
-                if ctx.traceparent_from_client {
-                    span.set_str("lorica.trace.origin", "client");
-                } else {
-                    span.set_str("lorica.trace.origin", "lorica");
-                }
-                if let Some(ref err) = error_str {
-                    span.set_str("error.message", err.clone());
-                }
-                span.set_status(status);
+            let span = &ctx.root_tracing_span;
+            span.record("http.response.status_code", status as i64);
+            span.record("lorica.latency_ms", latency_ms as i64);
+            if host != "-" {
+                span.record("server.address", host);
             }
-            span.end();
+            if backend_addr != "-" {
+                span.record("network.peer.address", backend_addr);
+            }
+            if let Some(ref rid) = ctx.route_id {
+                span.record("lorica.route_id", rid.as_str());
+            }
+            span.record(
+                "lorica.trace.origin",
+                if ctx.traceparent_from_client {
+                    "client"
+                } else {
+                    "lorica"
+                },
+            );
+            // `otel.status_code` is the well-known field the
+            // tracing-opentelemetry bridge reads to set the OTel
+            // span status: "OK" / "ERROR" / "UNSET". Map 5xx -> ERROR,
+            // everything else -> OK to match OTel semconv.
+            span.record(
+                "otel.status_code",
+                if (500..600).contains(&status) {
+                    "ERROR"
+                } else {
+                    "OK"
+                },
+            );
+            if let Some(ref err) = error_str {
+                span.record("error.message", err.as_str());
+            }
         }
 
         // Decrement per-route connection counter (max_connections enforcement)

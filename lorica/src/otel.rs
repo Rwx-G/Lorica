@@ -225,6 +225,18 @@ pub struct OtelConfig {
     pub sampling_ratio: f64,
 }
 
+/// Hook installed by `init_logging` when the `otel` feature is built
+/// in. Called from `otel::init` once the global tracer provider is
+/// live so the `tracing_opentelemetry` bridge layer's embedded tracer
+/// is swapped from its startup noop to a real `BoxedTracer` that
+/// points at the freshly installed provider. The type-erased closure
+/// hides the subscriber-chain type parameters that would otherwise
+/// leak into every call site (see story 1.4c).
+#[cfg(feature = "otel")]
+pub static OTEL_RELOAD_HOOK: std::sync::OnceLock<
+    Box<dyn Fn(opentelemetry::global::BoxedTracer) + Send + Sync>,
+> = std::sync::OnceLock::new();
+
 #[cfg(feature = "otel")]
 mod imp {
     //! Real implementation; compiled only when `otel` is enabled.
@@ -315,6 +327,21 @@ mod imp {
 
         global::set_tracer_provider(provider.clone());
         *slot = Some(provider);
+
+        // Story 1.4c: if the tracing_subscriber's reload slot was
+        // populated at init_logging time (it is, unconditionally,
+        // when the `otel` feature is on), swap the noop
+        // `BoxedTracer` for a real one bound to the freshly
+        // installed provider. After this call, every `#[instrument]`
+        // span created on the proxy hot path gets mirrored to an
+        // OTel span via the tracing_opentelemetry bridge — without
+        // this swap the bridge would keep sending spans into the
+        // per-process noop tracer and nothing would reach the
+        // collector.
+        if let Some(hook) = super::OTEL_RELOAD_HOOK.get() {
+            let tracer = global::tracer("lorica");
+            hook(tracer);
+        }
         Ok(())
     }
 
@@ -335,185 +362,6 @@ mod imp {
         }
     }
 
-    // Expose a convenience accessor so span creation does not have to
-    // touch the OTel `global::` entry point. Keeps the API surface
-    // concentrated in this module.
-    pub fn tracer() -> opentelemetry::global::BoxedTracer {
-        global::tracer("lorica")
-    }
-}
-
-// ---- Per-request root span ----
-//
-// Typed as `ActiveSpan` everywhere so call sites in proxy_wiring do
-// not need feature-gated code paths. When `otel` is off `ActiveSpan`
-// is a ZST and every method is a no-op; when `otel` is on it wraps a
-// `BoxedSpan` from the global tracer (itself a noop-span when the
-// endpoint is unconfigured or the sampler drops the request, so the
-// creation cost stays bounded — a single virtual call + a bit of
-// attribute allocation).
-
-#[cfg(feature = "otel")]
-pub struct ActiveSpan {
-    inner: Option<opentelemetry::global::BoxedSpan>,
-}
-
-#[cfg(not(feature = "otel"))]
-pub struct ActiveSpan;
-
-impl ActiveSpan {
-    /// An always-empty span. Used in `RequestCtx::default()` before
-    /// `start_root_span` runs in `request_filter`.
-    pub const fn empty() -> Self {
-        #[cfg(feature = "otel")]
-        {
-            Self { inner: None }
-        }
-        #[cfg(not(feature = "otel"))]
-        {
-            Self
-        }
-    }
-
-    /// Is there a live span bound to this handle? Used to skip
-    /// per-attribute work when tracing is disabled at runtime.
-    pub fn is_recording(&self) -> bool {
-        #[cfg(feature = "otel")]
-        {
-            use opentelemetry::trace::Span as _;
-            self.inner
-                .as_ref()
-                .map(|s| s.is_recording())
-                .unwrap_or(false)
-        }
-        #[cfg(not(feature = "otel"))]
-        {
-            false
-        }
-    }
-
-    /// Record a string attribute on the span. No-op when OTel is off
-    /// or when the underlying span was not created. Attribute names
-    /// should follow the OTel semantic-conventions vocabulary
-    /// (`http.request.method`, `url.path`, `server.address`, ...).
-    #[allow(unused_variables)]
-    pub fn set_str(&mut self, key: &'static str, value: impl Into<String>) {
-        #[cfg(feature = "otel")]
-        if let Some(span) = self.inner.as_mut() {
-            use opentelemetry::trace::Span as _;
-            span.set_attribute(opentelemetry::KeyValue::new(key, value.into()));
-        }
-    }
-
-    /// Record an integer attribute. Used for status codes, byte
-    /// counts, etc. Converted to i64 per OTel semconv.
-    #[allow(unused_variables)]
-    pub fn set_i64(&mut self, key: &'static str, value: i64) {
-        #[cfg(feature = "otel")]
-        if let Some(span) = self.inner.as_mut() {
-            use opentelemetry::trace::Span as _;
-            span.set_attribute(opentelemetry::KeyValue::new(key, value));
-        }
-    }
-
-    /// Mark the span status. `5xx` is `Error`, everything else is
-    /// `Ok`. OTel uses the three-state `Status::{Ok, Error, Unset}`
-    /// vocabulary; clients like Tempo / Jaeger render `Error` with a
-    /// red badge so the operator can find failing traces quickly.
-    #[allow(unused_variables)]
-    pub fn set_status(&mut self, status_code: u16) {
-        #[cfg(feature = "otel")]
-        if let Some(span) = self.inner.as_mut() {
-            use opentelemetry::trace::{Span as _, Status};
-            if (500..600).contains(&status_code) {
-                span.set_status(Status::error(format!("HTTP {status_code}")));
-            } else {
-                span.set_status(Status::Ok);
-            }
-        }
-    }
-
-    /// End the span, releasing it to the batch exporter. Called from
-    /// the final logging() hook. Idempotent — dropping an already-ended
-    /// span is a no-op at the OTel layer.
-    pub fn end(self) {
-        #[cfg(feature = "otel")]
-        if let Some(mut span) = self.inner {
-            use opentelemetry::trace::Span as _;
-            span.end();
-        }
-    }
-}
-
-impl Default for ActiveSpan {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-impl std::fmt::Debug for ActiveSpan {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ActiveSpan")
-            .field("is_recording", &self.is_recording())
-            .finish()
-    }
-}
-
-/// Start the per-request root span. When OTel is off or the global
-/// provider was never installed, this returns an empty handle and
-/// all subsequent method calls are no-ops. The caller passes the
-/// W3C traceparent already parsed in `request_filter` so the span
-/// is linked to the client-supplied parent context (when any) with
-/// the correct trace_id.
-#[allow(unused_variables)]
-pub fn start_root_span(method: &str, path: &str, parent: Option<&TraceParent>) -> ActiveSpan {
-    #[cfg(feature = "otel")]
-    {
-        use opentelemetry::trace::{
-            SpanContext, SpanId, SpanKind, TraceContextExt as _, TraceFlags, TraceId, TraceState,
-            Tracer as _,
-        };
-        use opentelemetry::{Context, KeyValue};
-
-        let tracer = imp::tracer();
-        let mut builder = tracer
-            .span_builder(format!("HTTP {method}"))
-            .with_kind(SpanKind::Server)
-            .with_attributes(vec![
-                KeyValue::new("http.request.method", method.to_string()),
-                KeyValue::new("url.path", path.to_string()),
-            ]);
-        // Link to the client's parent span when we parsed a valid
-        // traceparent. Using the raw trace_id / span_id bytes so the
-        // span tree in Jaeger / Tempo shows the upstream client above
-        // Lorica instead of Lorica as a new trace root.
-        let context = if let Some(p) = parent {
-            if let (Ok(tid), Ok(sid)) = (
-                TraceId::from_hex(&p.trace_id),
-                SpanId::from_hex(&p.parent_id),
-            ) {
-                let sc = SpanContext::new(
-                    tid,
-                    sid,
-                    TraceFlags::new(p.flags),
-                    true, // remote
-                    TraceState::default(),
-                );
-                builder = builder.with_trace_id(tid);
-                Context::current().with_remote_span_context(sc)
-            } else {
-                Context::current()
-            }
-        } else {
-            Context::current()
-        };
-        let span = tracer.build_with_context(builder, &context);
-        ActiveSpan { inner: Some(span) }
-    }
-    #[cfg(not(feature = "otel"))]
-    {
-        ActiveSpan
-    }
 }
 
 #[cfg(not(feature = "otel"))]
