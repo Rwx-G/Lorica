@@ -42,7 +42,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 - **WAF engine** - 49 OWASP CRS-inspired rules (SQLi, XSS, path traversal, command injection, SSRF, Log4Shell, XXE, CRLF)
 - **mTLS client verification** - per-route CA bundle + optional organization allowlist. Chain validated at the TLS handshake (rustls `WebPkiClientVerifier`), per-route enforcement returns 496 ("cert required") or 495 ("cert error"). `required` and org-allowlist hot-reload; CA edits take effect on restart
-- **Forward authentication** - per-route sub-request to Authelia / Authentik / Keycloak / oauth2-proxy before proxying; 2xx injects response headers into upstream, 401/403/3xx forwarded verbatim to the client, timeout = fail-closed 503. Optional opt-in verdict cache (TTL-capped at 60s, Cookie-keyed) to shortcut hot paths
+- **Forward authentication** - per-route sub-request to Authelia / Authentik / Keycloak / oauth2-proxy before proxying; 2xx injects response headers into upstream, 401/403/3xx forwarded verbatim to the client, timeout = fail-closed 503. Optional opt-in verdict cache (TTL-capped at 60s, Cookie-keyed) to shortcut hot paths. Under `--workers N` the cache is owned by the supervisor and routed through the pipelined RPC channel, so an Allow verdict cached by one worker is served from every worker, and a session revocation invalidates the cache uniformly (WPAR-2, design § 7)
 - **Connection pre-filter** - global IP allow/deny CIDR policy enforced at TCP accept, before the TLS handshake. Deny always wins; non-empty allow switches to default-deny. Hot-reloaded via arc-swap in single-process and worker modes
 - **IP blocklist** - auto-fetched from Data-Shield IPv4 Blocklist (~80,000 entries, O(1) lookup, updated every 6h)
 - **Rate limiting** - per-route, per-client-IP with configurable RPS and burst tolerance (legacy event-rate estimator `rate_limit_rps` / `rate_limit_burst`)
@@ -89,7 +89,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :package: Reliability
 
 - **Worker process isolation** - fork+exec with socket passing via SCM_RIGHTS
-- **Protobuf command channel** - supervisor-to-worker config reload without traffic interruption
+- **Protobuf command channel** - supervisor-to-worker config reload without traffic interruption. Under `--workers N`, reloads run as two-phase Prepare + Commit on a pipelined RPC channel so the divergence window between workers collapses to the UDS RTT (microseconds) instead of the per-worker DB-rebuild time (WPAR-8, design § 7). The same RPC plane carries cross-worker circuit-breaker admission (`BreakerDecision::AllowProbe` for HalfOpen) so probe slots are allocated atomically across workers and a failure on one trips the breaker for every worker (WPAR-3)
 - **Health checks** - TCP and HTTP probes, backends marked degraded (>2s) or down and removed from rotation
 - **Graceful drain** - per-backend active connection tracking with Closing/Closed lifecycle states
 - **Certificate hot-swap** - atomic swap via arc-swap, zero downtime during rotation
