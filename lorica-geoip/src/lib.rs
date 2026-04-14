@@ -34,6 +34,8 @@
 //! job keeps serving the old DB on transient errors and only swaps
 //! once a fresh copy has passed a sanity check.
 
+pub mod updater;
+
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
