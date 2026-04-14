@@ -15,3 +15,22 @@ renamed from pingora-* to lorica-*, with unused components removed
 Architectural patterns in Lorica are inspired by Sozu (Clever Cloud),
 reimplemented from scratch. No Sozu code has been copied (AGPL-3.0
 prevents code reuse).
+
+GeoIP data
+----------
+
+When the GeoIP country filter (v1.4.0) is enabled and the operator
+does not override `GlobalSettings.geoip_db_path`, Lorica's automatic
+update task downloads the IP-to-Country Lite database published by
+DB-IP.com.
+
+  "IP to Country Lite" by DB-IP.com is licensed under
+  CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/).
+  Source: https://db-ip.com/db/download/ip-to-country-lite
+
+Operators that redistribute a Lorica binary or an image with the
+pre-loaded database MUST preserve the above attribution in their
+own NOTICE / README. The `.mmdb` file format is compatible with
+MaxMind's GeoLite2, so operators with a MaxMind license can opt out
+of the DB-IP source by pointing `geoip_db_path` at their own file
+and disabling `geoip_auto_update_enabled`.

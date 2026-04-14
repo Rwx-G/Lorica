@@ -437,3 +437,84 @@ is deterministic.
   because `lorica_core::Server::run_forever()` exits the process
   without a pre-exit hook. Supervisor + single-process flush
   cleanly. Follow-up noted in CHANGELOG.
+
+### 19. GeoIP country filter
+
+Per-route country allow / deny via DB-IP Lite Country (CC-BY 4.0,
+no account required). The `.mmdb` format is compatible with
+MaxMind's GeoLite2 so operators with a paid license can swap the
+file.
+
+**Preflight: install a database.**
+
+```bash
+# Fetch the current month's DB manually the first time:
+curl -fsSL \
+  "https://download.db-ip.com/free/dbip-country-lite-$(date -u +%Y-%m).mmdb.gz" \
+  | gunzip -c > /var/lib/lorica/geoip.mmdb
+sudo chown lorica:lorica /var/lib/lorica/geoip.mmdb
+sudo chmod 644 /var/lib/lorica/geoip.mmdb
+```
+
+**Configure globally (dashboard Settings tab):**
+
+1. Set `geoip_db_path` = `/var/lib/lorica/geoip.mmdb` (absolute).
+2. Set `geoip_auto_update_enabled` = true to let Lorica refresh
+   the DB weekly. The supervisor downloads a fresh copy and
+   atomic-renames onto the same path; workers pick up the new DB
+   on restart.
+3. Save. Supervisor log: `"GeoIP auto-update task spawned"`.
+   Worker log (in each worker): `"worker: GeoIP database loaded"`.
+
+**Per-route rule (Protection tab > GeoIP country filter section):**
+
+- **Denylist mode** (default): list the countries to block. Every
+  other country passes.
+- **Allowlist mode**: list the countries allowed. Every other
+  country returns 403.
+- Country codes are ISO 3166-1 alpha-2, uppercase, comma-separated
+  (`FR, DE, IT`). Normalisation, dedup, and validation happen
+  server-side.
+
+**End-to-end test with a faked source IP:**
+
+```bash
+# Requires trusted_proxies to include your test client address so
+# X-Forwarded-For is honoured. Then:
+
+# Known US IP (Google DNS), US is in the denylist = expect 403:
+curl -v -H 'X-Forwarded-For: 8.8.8.8' https://your-route.rwx-g.fr/
+
+# Known FR IP, FR is NOT in the denylist = expect 200:
+curl -v -H 'X-Forwarded-For: 193.203.239.1' https://your-route.rwx-g.fr/
+```
+
+**Metrics to watch:**
+
+```
+# Total blocks per route / country / mode:
+lorica_geoip_block_total{route_id, country, mode}
+```
+
+**Traces (when OTel is on):**
+
+Every traced request carries
+`client.geo.country_iso_code = "<code>"` as a span attribute (even
+on requests that are not blocked — useful for traffic analytics
+per country). Requests where the DB is missing or the IP is in a
+reserved range (RFC 1918, link-local, ...) simply omit the
+attribute.
+
+**Known limitations:**
+
+- Multi-worker mode: the supervisor's auto-update task refreshes
+  the on-disk DB, but workers load their own copy at fork time;
+  a fresh download after fork requires a proxy restart for
+  workers to pick it up. A `ReloadGeoIp` broadcast command is a
+  future follow-up.
+- Unknown country (reserved / private IP, DB miss) falls through
+  WITHOUT blocking. For fail-close semantics, layer
+  `ip_allowlist` on top of the GeoIP rule.
+- DB-IP Lite Country attribution lives in `NOTICE` per CC-BY 4.0
+  requirements. Commercial deployments that redistribute the
+  Lorica binary must preserve that attribution.
