@@ -9,6 +9,98 @@ Author: Rwx-G
 
 ## [1.3.0] - 2026-04-14
 
+### Fixed (pre-release audit: 3 High + 7 Medium + 5 Low)
+
+- `SupervisorBreakerRegistry` stale-probe deadlock (audit H-1): if the
+  probe-admitted worker crashed between admit and report, the breaker
+  entry was pinned in `HalfOpen { probe_in_flight: true }` forever and
+  every subsequent query for that `(route, backend)` returned Deny until
+  supervisor restart. `HalfOpen` now carries `probe_started_at:
+  Option<Instant>`; on the next query observing `elapsed >= cooldown`
+  the supervisor synthesises a failed probe, bumps the failure counter,
+  transitions back to Open with a fresh cooldown, and emits a warn log.
+  Regression test `breaker_registry_stale_probe_recovers_after_cooldown`
+- `lorica-worker::fd_passing::recv_worker_fds` kernel-FD leak on error
+  paths (audit H-2): the function collected raw `RawFd`s into a `Vec`
+  and returned `Err(...)` on UTF-8 validation / fds-tokens mismatch /
+  bad `FdKind` token without closing them. Received FDs are now wrapped
+  in `OwnedFd` immediately after `recvmsg` so every error path
+  `close(2)`s via the RAII drop. Added `MSG_TRUNC` / `MSG_CTRUNC`
+  detection so silent kernel truncation returns `InvalidPayload`
+  instead of adopting a half-received FD set. Added a compile-time
+  size assertion on `PAYLOAD_BUF_SIZE`
+- Two-phase config reload non-atomic `connection_filter` publish (audit
+  H-3): `PendingProxyConfig` now carries the full `reload::PreparedReload`
+  rather than only `Arc<ProxyConfig>`, so the Commit handler calls
+  `commit_prepared_reload(proxy_config, filter, prepared)` which
+  publishes the ArcSwap and the filter CIDR reload together. Prior
+  code re-read the filter separately, opening a short window where
+  ProxyConfig v2 ran against filter v1 on reloads that flipped
+  `connection_allow_cidrs` / `connection_deny_cidrs`. The worker-side
+  RPC listener is now wired with `Some(connection_filter)` at the
+  call site (was `None`)
+- `EwmaTracker::record` hot-path allocation (audit M-1): the common
+  case (backend already known) no longer pays for an `addr.to_string()`
+  per request. `get_mut` path + first-sample seeding without the 30 %
+  alpha bias
+- TOCTOU in `SupervisorVerdictCache::lookup` + `FORWARD_AUTH_VERDICT_
+  CACHE` expiry eviction (audit M-2 + M-3): a concurrent fresh insert
+  racing with an expiry observation could be evicted by the stale
+  lookup. Replaced with `dashmap::DashMap::remove_if` that evicts
+  only when the entry's `expires_at` still matches the observation
+- `handle_rate_limit_delta` mutex contention on first-seen keys (audit
+  M-4): N concurrent `RateLimitDelta` RPCs on a first-seen
+  `{route|scope}` previously serialised on the `store` tokio::Mutex for
+  N SQLite reads. Added a supervisor-side `rl_policy_cache` DashMap
+  that caches per-route policy, invalidated on every reload (both the
+  fully-succeeded two-phase commit and the legacy-broadcast fallback)
+- Predictable `generate_request_id` IDs (audit M-5): previous
+  implementation used `DefaultHasher(SystemTime::nanos XOR
+  thread_id)`, which is deterministic given inputs and collides on
+  same-nanosecond concurrent same-thread requests. Replaced with
+  `OsRng.fill_bytes(16)` for 128 bits of unpredictable ID
+- `ConfigReloadAbort` RPC (audit M-7): new wire-additive
+  `CommandType::ConfigReloadAbort` (tag 14) fanned out to workers
+  that succeeded Prepare when a peer fails; worker drops the pending
+  slot on generation match instead of pinning one orphan
+  `Arc<ProxyConfig>` per worker until the next reload
+- `lorica-shmem::now_ns` silent fallback (audit L-1): `clock_gettime`
+  failure now emits a warn log instead of silently returning 0, which
+  would stall eviction without any signal to ops
+- `lorica-command::IncomingCommand::reply` debug-assert on
+  caller-supplied sequence mismatch (audit L-3): release builds still
+  overwrite with the originating command's sequence, but wiring bugs
+  that pass a different non-zero sequence now surface in tests
+- `generate_random_password` deterministic RNG (audit L-5): replaced
+  `thread_rng()` with `ChaCha20Rng::from_rng(OsRng)` so the first-run
+  admin password pedigree matches `hash_password`'s OS-entropy salt
+- `lorica-limits::token_bucket::refill_locked` overflow-defence
+  tightening (audit L-6): added a `debug_assert!` that
+  `refill_per_sec <= 1_000_000` (the API cap) so future regressions
+  surface in tests instead of silently saturating
+
+### Changed
+
+- Supervisor -> worker pipelined-RPC Prometheus counter
+  (`lorica_supervisor_rpc_outcome_total{kind, outcome}`): one counter
+  spanning `metrics_pull` / `config_reload_{prepare,commit,abort}`
+  with `ok` / `timeout` / `error` outcomes. Lets ops tell apart
+  "all workers slow on Prepare" (DB contention) from "one worker
+  stuck on metrics pull" (downstream issue)
+- Fix `RpcEndpoint::Inner::drop` to actually abort reader + writer
+  tokio tasks instead of relying on JoinHandle-drop detach semantics,
+  so a dropped endpoint actually closes its socket halves and the
+  peer sees EOF. Without this, a worker's RPC listener would hang
+  past the 10 s TaskTracker drain on supervisor shutdown. Regression
+  test `reload_listener_drains_on_supervisor_eof` asserts completion
+  within 5 s
+- Bumped `dashmap 5.5.3 -> 6.1.0` across `lorica`, `lorica-api`,
+  `lorica-limits`; 5.x had iterator-invariant unsoundness fixed in
+  6.x (supply-chain audit SC-M-1, SC-M-4)
+- Bumped `tokio-tungstenite 0.20.1 -> 0.29.0` in `lorica-proxy` to
+  drop a duplicated websocket frame parser and pull in fuzzer-driven
+  fixes (supply-chain audit SC-M-2)
+
 ### Added
 
 - `/metrics` pull-on-scrape over pipelined RPC (WPAR worker-parity audit, Phase 6 / WPAR-7): Prometheus scrapes now trigger a fresh fan-out to every worker via the pipelined RPC channel before the handler reads the aggregated state. Each worker responds with a `MetricsReport` payload carrying per-request counters (cache_hits / cache_misses / active_connections / ban_entries / EWMA scores / backend connections / per-route request counts / WAF counts); the supervisor aggregates into `AggregatedMetrics` and the scrape encodes it. Dedup via an `Instant`-based lock collapses concurrent scrapes within a 250 ms window into a single fan-out - scraping /metrics from five concurrent Prometheus servers only hits the workers once. Per-worker 500 ms timeout bounds the fan-out; non-responders fall back silently to the cached state (populated by the existing periodic-pull task), so a stuck worker cannot stall a scrape. A 1 s wall-clock watchdog wraps the refresher call in the handler as a last resort. See design § 7
