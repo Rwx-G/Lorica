@@ -649,14 +649,13 @@ fn run_supervisor(cli: Cli) {
                             "two-phase config reload had failures; falling back to legacy broadcast"
                         );
                         let _ = reload_bc_tx_clone.send(seq);
-                    } else {
-                        // Commit succeeded on every worker: route
-                        // rate-limit policies may have changed, so
-                        // drop the cached supervisor-side copies so
-                        // the next `RateLimitDelta` for a given route
-                        // re-reads them from the store (audit M-4).
-                        rl_policy_for_reload.clear();
                     }
+                    // Whether the two-phase path fully committed or fell
+                    // back to the legacy broadcast, the route policies
+                    // may have changed - drop the supervisor-side
+                    // rate-limit policy cache so the next RateLimitDelta
+                    // re-reads them from the store (audit M-4).
+                    rl_policy_for_reload.clear();
                 } else {
                     // No workers with RPC (e.g. --workers 0 or before
                     // any worker registered). Fall back to legacy
