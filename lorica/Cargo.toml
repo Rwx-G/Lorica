@@ -96,6 +96,10 @@ harness = false
 name = "canary_bucket"
 harness = false
 
+[[bench]]
+name = "otel_overhead"
+harness = false
+
 [features]
 default = ["rustls", "lb", "connection_filter"]
 
