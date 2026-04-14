@@ -990,10 +990,21 @@ pub struct RequestCtx {
     /// during early startup between `new_ctx` and the first line of
     /// `request_filter`. See `lorica::otel`.
     pub outgoing_traceparent: Option<crate::otel::TraceParent>,
+    /// Parsed incoming `traceparent` from the client, retained so the
+    /// OTel span created in `request_filter` can link to the client's
+    /// span as its parent. `None` when the client did not send a
+    /// header or sent a malformed one.
+    pub incoming_traceparent: Option<crate::otel::TraceParent>,
     /// Whether the outgoing traceparent was preserved from the
     /// client (true) or synthesised by Lorica (false). Used by later
     /// stories (span attributes, metrics) to distinguish trace origin.
     pub traceparent_from_client: bool,
+    /// OpenTelemetry root span for this request. Always present as a
+    /// handle, but the underlying span is only recording when the
+    /// `otel` feature is compiled in AND the global provider is
+    /// installed AND the sampler admits the trace. See
+    /// `lorica::otel::ActiveSpan`.
+    pub otel_span: crate::otel::ActiveSpan,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -1813,7 +1824,9 @@ impl ProxyHttp for LoricaProxy {
             response_rewrite_state: None,
             response_rewrite_rules: None,
             outgoing_traceparent: None,
+            incoming_traceparent: None,
             traceparent_from_client: false,
+            otel_span: crate::otel::ActiveSpan::empty(),
         }
     }
 
@@ -1837,7 +1850,7 @@ impl ProxyHttp for LoricaProxy {
                 .get("traceparent")
                 .and_then(|v| v.to_str().ok())
                 .and_then(crate::otel::TraceParent::parse);
-            if let Some(parent) = incoming {
+            if let Some(ref parent) = incoming {
                 ctx.outgoing_traceparent = Some(parent.child(&ctx.request_id));
                 ctx.traceparent_from_client = true;
             } else {
@@ -1846,6 +1859,24 @@ impl ProxyHttp for LoricaProxy {
                 );
                 ctx.traceparent_from_client = false;
             }
+            ctx.incoming_traceparent = incoming;
+        }
+
+        // Create the OpenTelemetry root span for this request, linked
+        // to the client's parent span (when a valid traceparent was
+        // present) so the span tree in Jaeger / Tempo shows the client
+        // above Lorica. No-op handle when the `otel` feature is off,
+        // the global provider was never installed, or the sampler
+        // dropped the trace; method calls on the returned handle are
+        // cheap in all those cases.
+        {
+            let method = session.req_header().method.as_str().to_string();
+            let path = session.req_header().uri.path().to_string();
+            ctx.otel_span = crate::otel::start_root_span(
+                &method,
+                &path,
+                ctx.incoming_traceparent.as_ref(),
+            );
         }
 
         // ACME HTTP-01 challenge intercept (must respond before any other check)
@@ -4290,6 +4321,41 @@ impl ProxyHttp for LoricaProxy {
                 backend = backend_addr,
                 "request completed"
             );
+        }
+
+        // Finalise the OTel root span. Records OTel HTTP semconv
+        // attributes on the final values (status code, backend peer
+        // address, route_id), then ends the span so the batch
+        // exporter can flush it. Methods are no-ops when OTel is
+        // compiled out, the provider is not installed, or the
+        // sampler rejected the trace — so this block is always cheap
+        // to execute. `mem::take` replaces the span with an empty
+        // handle so later accidental method calls stay safe.
+        {
+            let mut span = std::mem::take(&mut ctx.otel_span);
+            if span.is_recording() {
+                span.set_i64("http.response.status_code", status as i64);
+                span.set_i64("lorica.latency_ms", latency_ms as i64);
+                if host != "-" {
+                    span.set_str("server.address", host.to_string());
+                }
+                if backend_addr != "-" {
+                    span.set_str("network.peer.address", backend_addr.to_string());
+                }
+                if let Some(ref rid) = ctx.route_id {
+                    span.set_str("lorica.route_id", rid.clone());
+                }
+                if ctx.traceparent_from_client {
+                    span.set_str("lorica.trace.origin", "client");
+                } else {
+                    span.set_str("lorica.trace.origin", "lorica");
+                }
+                if let Some(ref err) = error_str {
+                    span.set_str("error.message", err.clone());
+                }
+                span.set_status(status);
+            }
+            span.end();
         }
 
         // Decrement per-route connection counter (max_connections enforcement)
