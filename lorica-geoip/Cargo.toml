@@ -1,0 +1,25 @@
+[package]
+name = "lorica-geoip"
+version = "1.4.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "GeoIP country-code lookup for Lorica, wrapping maxminddb"
+repository = "https://github.com/Rwx-G/Lorica"
+
+[dependencies]
+# `maxminddb` reads the .mmdb binary format used by both MaxMind's
+# commercial GeoLite2 and the free DB-IP Lite distributions. The free
+# DB-IP Lite Country DB (CC-BY 4.0, no account required, monthly
+# refresh) is what Lorica targets out of the box. See the `NOTICE` /
+# docs for the required attribution.
+maxminddb = "0.27"
+arc-swap = "1"
+thiserror = "2"
+tracing = "0.1"
+# `chrono` is used for DB freshness timestamps. Matches the workspace
+# usage elsewhere (same version behaviour as lorica-api / lorica-notify).
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
