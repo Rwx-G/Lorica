@@ -125,8 +125,10 @@ pub struct GlobalSettings {
     /// Older entries are purged periodically. 0 = unlimited. Default: 100000.
     #[serde(default = "default_access_log_retention")]
     pub access_log_retention: i64,
-    /// Whether automatic SLA data purge is enabled. Default: false.
-    #[serde(default)]
+    /// Whether automatic SLA data purge is enabled. Default: true
+    /// (bounded disk usage out of the box; operators who need full
+    /// history can opt out via the dashboard Settings tab).
+    #[serde(default = "default_sla_purge_enabled")]
     pub sla_purge_enabled: bool,
     /// Number of days to retain SLA buckets. Buckets older than this are deleted.
     /// Default: 90 days.
@@ -198,6 +200,10 @@ fn default_access_log_retention() -> i64 {
     100_000
 }
 
+fn default_sla_purge_enabled() -> bool {
+    true
+}
+
 fn default_sla_purge_retention_days() -> i32 {
     90
 }
@@ -225,7 +231,7 @@ impl Default for GlobalSettings {
             waf_ban_duration_s: default_waf_ban_duration_s(),
             custom_security_presets: Vec::new(),
             access_log_retention: default_access_log_retention(),
-            sla_purge_enabled: false,
+            sla_purge_enabled: default_sla_purge_enabled(),
             sla_purge_retention_days: default_sla_purge_retention_days(),
             sla_purge_schedule: default_sla_purge_schedule(),
             trusted_proxies: Vec::new(),

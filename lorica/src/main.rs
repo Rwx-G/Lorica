@@ -190,10 +190,34 @@ fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("lorica.log");
-        let file_appender = tracing_appender::rolling::never(dir, filename);
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        let _ = LOG_GUARD.set(guard);
-        build_subscriber!(non_blocking, false);
+        // Daily rotation with 14-day retention so an unattended install
+        // can't fill the disk. The current day's file is the canonical
+        // path the operator configured (e.g. /var/log/lorica.log);
+        // rotated files are suffixed with the date (lorica.log.2026-04-13).
+        // Falls back to non-rotating append if the builder rejects the
+        // path (read-only mount, missing dir) so a misconfigured log path
+        // never blocks startup.
+        let appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(filename)
+            .max_log_files(14)
+            .build(dir);
+        match appender {
+            Ok(file_appender) => {
+                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                let _ = LOG_GUARD.set(guard);
+                build_subscriber!(non_blocking, false);
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: rolling log appender failed for {path}: {e}; falling back to non-rotating append"
+                );
+                let file_appender = tracing_appender::rolling::never(dir, filename);
+                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                let _ = LOG_GUARD.set(guard);
+                build_subscriber!(non_blocking, false);
+            }
+        }
     } else {
         build_subscriber!(std::io::stdout, true);
     }
