@@ -40,6 +40,10 @@ pub struct UpdateSettingsRequest {
     pub waf_whitelist_ips: Option<Vec<String>>,
     pub connection_deny_cidrs: Option<Vec<String>>,
     pub connection_allow_cidrs: Option<Vec<String>>,
+    pub otlp_endpoint: Option<String>,
+    pub otlp_protocol: Option<String>,
+    pub otlp_service_name: Option<String>,
+    pub otlp_sampling_ratio: Option<f64>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -192,6 +196,53 @@ pub async fn update_settings(
     if let Some(ref cidrs) = body.connection_allow_cidrs {
         validate_cidr_list(cidrs, "connection_allow_cidrs")?;
         settings.connection_allow_cidrs = cidrs.clone();
+    }
+    if let Some(ref endpoint) = body.otlp_endpoint {
+        let trimmed = endpoint.trim();
+        if trimmed.is_empty() {
+            settings.otlp_endpoint = None;
+        } else {
+            // Accept http:// or https:// URLs (OTLP/HTTP and OTLP/gRPC both
+            // use HTTP-scheme URLs; gRPC transport is negotiated by the
+            // `otlp_protocol` field, not the URL scheme).
+            if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+                return Err(ApiError::BadRequest(
+                    "otlp_endpoint must start with http:// or https://".into(),
+                ));
+            }
+            if trimmed.len() > 2048 {
+                return Err(ApiError::BadRequest(
+                    "otlp_endpoint too long (> 2048 chars)".into(),
+                ));
+            }
+            settings.otlp_endpoint = Some(trimmed.to_string());
+        }
+    }
+    if let Some(ref protocol) = body.otlp_protocol {
+        let valid = ["grpc", "http-proto", "http-json"];
+        if !valid.contains(&protocol.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "invalid otlp_protocol: {protocol}. Must be one of: {valid:?}"
+            )));
+        }
+        settings.otlp_protocol = protocol.clone();
+    }
+    if let Some(ref name) = body.otlp_service_name {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.len() > 256 {
+            return Err(ApiError::BadRequest(
+                "otlp_service_name must be 1-256 characters".into(),
+            ));
+        }
+        settings.otlp_service_name = trimmed.to_string();
+    }
+    if let Some(ratio) = body.otlp_sampling_ratio {
+        if !(0.0..=1.0).contains(&ratio) || !ratio.is_finite() {
+            return Err(ApiError::BadRequest(
+                "otlp_sampling_ratio must be a finite number in 0.0..=1.0".into(),
+            ));
+        }
+        settings.otlp_sampling_ratio = ratio;
     }
 
     store.update_global_settings(&settings)?;

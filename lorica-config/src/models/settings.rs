@@ -162,6 +162,31 @@ pub struct GlobalSettings {
     /// Examples: `["10.0.0.0/8", "192.168.0.0/16"]`.
     #[serde(default)]
     pub connection_allow_cidrs: Vec<String>,
+    /// OTLP collector endpoint (e.g. `http://localhost:4317` for gRPC,
+    /// `http://localhost:4318` for HTTP). Empty / None = OTel tracing
+    /// disabled at runtime, even when the binary was built with
+    /// `--features otel`. Changes take effect on the next config reload.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+    /// OTLP transport protocol: `grpc`, `http-proto`, or `http-json`.
+    /// Default `http-proto` since every major collector (Tempo, Jaeger v2,
+    /// Datadog agent) accepts it and it is cheaper than gRPC when the
+    /// collector sits behind an L7 load balancer.
+    #[serde(default = "default_otlp_protocol")]
+    pub otlp_protocol: String,
+    /// Service name reported to the tracing backend
+    /// (`service.name` OTel attribute). Defaults to `lorica`. Set to a
+    /// per-deployment value like `lorica-prod-eu-west-1` when multiple
+    /// instances share a collector.
+    #[serde(default = "default_otlp_service_name")]
+    pub otlp_service_name: String,
+    /// Head sampler ratio in 0.0..=1.0. 0.0 disables tracing even when
+    /// the endpoint is set; 1.0 samples every request. Default 0.1
+    /// (matches Tempo / Grafana guidance for steady-state overhead
+    /// under ~2 %). Child spans inherit the root-span decision so there
+    /// are no partial traces.
+    #[serde(default = "default_otlp_sampling_ratio")]
+    pub otlp_sampling_ratio: f64,
 }
 
 fn default_waf_ban_threshold() -> i32 {
@@ -212,6 +237,18 @@ fn default_sla_purge_schedule() -> String {
     "first_of_month".to_string()
 }
 
+fn default_otlp_protocol() -> String {
+    "http-proto".to_string()
+}
+
+fn default_otlp_service_name() -> String {
+    "lorica".to_string()
+}
+
+fn default_otlp_sampling_ratio() -> f64 {
+    0.1
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
@@ -238,6 +275,10 @@ impl Default for GlobalSettings {
             waf_whitelist_ips: Vec::new(),
             connection_deny_cidrs: Vec::new(),
             connection_allow_cidrs: Vec::new(),
+            otlp_endpoint: None,
+            otlp_protocol: default_otlp_protocol(),
+            otlp_service_name: default_otlp_service_name(),
+            otlp_sampling_ratio: default_otlp_sampling_ratio(),
         }
     }
 }

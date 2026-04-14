@@ -65,6 +65,15 @@ thiserror = "2"
 http = { workspace = true }
 ipnet = "2"
 
+# OpenTelemetry (feature-gated, off by default)
+# Enabled via `--features otel`. Policy matches `route53` since v1.3.0
+# supply-chain audit SC-M-3: non-OTel users do not pay the dep-graph cost.
+opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", optional = true, default-features = false, features = ["trace", "http-proto", "grpc-tonic", "reqwest-client", "tls-ring", "tls-webpki-roots"] }
+opentelemetry-semantic-conventions = { version = "0.31", optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true, default-features = false }
+
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
@@ -110,3 +119,14 @@ connection_filter = [
 any_tls = []
 patched_http1 = ["lorica-core/patched_http1"]
 prometheus = ["lorica-core/prometheus"]
+
+# Distributed tracing via OTLP export. Off by default.
+# Enable with `cargo build --release --features otel`. See Cargo.toml
+# section above for the exact crate versions pulled in.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-semantic-conventions",
+    "dep:tracing-opentelemetry",
+]

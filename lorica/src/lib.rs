@@ -38,6 +38,7 @@
 
 pub mod connection_filter;
 pub mod mtls;
+pub mod otel;
 pub mod proxy_wiring;
 pub mod reload;
 

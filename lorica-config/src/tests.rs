@@ -710,6 +710,52 @@ mod tests {
         assert_eq!(fetched.trusted_proxies[1], "10.0.0.1");
     }
 
+    #[test]
+    fn test_global_settings_otlp_round_trip() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+
+        // Defaults: endpoint None (OTel disabled), protocol http-proto,
+        // service name "lorica", sampling 0.1.
+        let settings = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert!(settings.otlp_endpoint.is_none());
+        assert_eq!(settings.otlp_protocol, "http-proto");
+        assert_eq!(settings.otlp_service_name, "lorica");
+        assert!((settings.otlp_sampling_ratio - 0.1).abs() < f64::EPSILON);
+
+        // Round-trip non-default values.
+        let mut updated = settings;
+        updated.otlp_endpoint = Some("http://tempo:4318".to_string());
+        updated.otlp_protocol = "grpc".to_string();
+        updated.otlp_service_name = "lorica-prod".to_string();
+        updated.otlp_sampling_ratio = 0.25;
+        store
+            .update_global_settings(&updated)
+            .expect("test setup: global settings update");
+
+        let fetched = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert_eq!(fetched.otlp_endpoint.as_deref(), Some("http://tempo:4318"));
+        assert_eq!(fetched.otlp_protocol, "grpc");
+        assert_eq!(fetched.otlp_service_name, "lorica-prod");
+        assert!((fetched.otlp_sampling_ratio - 0.25).abs() < f64::EPSILON);
+
+        // Clearing the endpoint (empty string) deserialises back to None
+        // so operators can turn OTel off via the dashboard without
+        // dropping the row.
+        let mut cleared = fetched;
+        cleared.otlp_endpoint = None;
+        store
+            .update_global_settings(&cleared)
+            .expect("test setup: global settings update");
+        let fetched = store
+            .get_global_settings()
+            .expect("test setup: global settings fetch");
+        assert!(fetched.otlp_endpoint.is_none());
+    }
+
     // ---- Migration ----
 
     #[test]

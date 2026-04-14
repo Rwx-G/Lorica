@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Author: Rwx-G
 
+## [Unreleased]
+
+### Added
+
+- OpenTelemetry tracing scaffolding (feature-gated, off by default). New Cargo feature `otel` on the `lorica` crate pulls in `opentelemetry` 0.31, `opentelemetry_sdk` 0.31, `opentelemetry-otlp` 0.31, `opentelemetry-semantic-conventions` 0.31 and `tracing-opentelemetry` 0.32. Policy matches `route53` since the v1.3.0 supply-chain audit (SC-M-3): non-OTel users do not pay the dep-graph cost and the `.deb` / `.rpm` / Dockerfile / CI build scripts stay on default features unchanged. Four new fields on `GlobalSettings`: `otlp_endpoint` (Option<String>, None = disabled at runtime even with the feature built in), `otlp_protocol` ("grpc" / "http-proto" / "http-json", default "http-proto"), `otlp_service_name` (default "lorica") and `otlp_sampling_ratio` (f64 in 0.0..=1.0, default 0.1 matching Tempo / Grafana overhead guidance). API validation in `PUT /api/v1/settings` enforces URL scheme, protocol enum, service-name length (1..=256), and finite sampling ratio. `global_settings` is a key-value table so no SQL migration is required; four new keys are read / written alongside the existing ones. Actual exporter init, span creation, W3C context propagation and log correlation land in the following stories
+
 ## [1.3.0] - 2026-04-14
 
 ### Added

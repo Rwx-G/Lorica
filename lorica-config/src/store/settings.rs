@@ -114,6 +114,16 @@ impl ConfigStore {
                             ))
                         })?;
                 }
+                "otlp_endpoint" => {
+                    settings.otlp_endpoint = if value.is_empty() { None } else { Some(value) };
+                }
+                "otlp_protocol" => settings.otlp_protocol = value,
+                "otlp_service_name" => settings.otlp_service_name = value,
+                "otlp_sampling_ratio" => {
+                    settings.otlp_sampling_ratio = value.parse().map_err(|_| {
+                        ConfigError::Validation("invalid otlp_sampling_ratio".into())
+                    })?;
+                }
                 _ => {}
             }
         }
@@ -217,6 +227,22 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('connection_allow_cidrs', ?1)",
             params![connection_allow_json],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_endpoint', ?1)",
+            params![settings.otlp_endpoint.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_protocol', ?1)",
+            params![settings.otlp_protocol],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_service_name', ?1)",
+            params![settings.otlp_service_name],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_sampling_ratio', ?1)",
+            params![settings.otlp_sampling_ratio.to_string()],
         )?;
         Ok(())
     }
