@@ -335,6 +335,37 @@ pub fn inc_forward_auth_cache(route_id: &str, outcome: &str) {
         .inc();
 }
 
+/// Counter: GeoIP-filter rejections per route. Labels:
+/// - `route_id`: bounded by number of configured routes.
+/// - `country`: ISO 3166-1 alpha-2 (bounded ~240).
+/// - `mode`: "allowlist" | "denylist".
+///
+/// Cardinality bound: routes * countries * 2, well within Prometheus
+/// comfort envelope on any sensible deployment. A route with no
+/// GeoIP config never increments this counter.
+static GEOIP_BLOCK_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "geoip_block_total",
+            "GeoIP-filter blocks (country=ISO3166 alpha-2, mode=allowlist|denylist)"
+        )
+        .namespace("lorica"),
+        &["route_id", "country", "mode"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a GeoIP filter rejection. Called from the proxy request
+/// filter when a country mismatches the per-route
+/// `Allowlist` / `Denylist` rule and Lorica returns 403.
+pub fn inc_geoip_block(route_id: &str, country: &str, mode: &str) {
+    GEOIP_BLOCK_TOTAL
+        .with_label_values(&[route_id, country, mode])
+        .inc();
+}
+
 /// Counter: notification events dropped by the bounded broadcast
 /// channel, labeled by drop reason (`lag` = subscriber fell behind,
 /// `closed` = channel closed). Bounded-cardinality: only two labels.

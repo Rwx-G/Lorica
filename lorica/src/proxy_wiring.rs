@@ -2746,10 +2746,18 @@ impl ProxyHttp for LoricaProxy {
         // client behind a corporate NAT is never accidentally denied
         // — the operator can layer an explicit `ip_allowlist` on top
         // when they want fail-close semantics.
-        if let Some(ref geoip_cfg) = entry.route.geoip {
-            if let Some(ref ip_str) = check_ip {
-                if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
-                    if let Some(country) = self.geoip_resolver.lookup_country(ip_addr) {
+        if let Some(ref ip_str) = check_ip {
+            if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
+                if let Some(country) = self.geoip_resolver.lookup_country(ip_addr) {
+                    // Always stamp the country on the OTel span — the
+                    // attribute is useful even on requests that are
+                    // not blocked (traffic analytics per country,
+                    // anomaly detection) and the set_str no-op path
+                    // costs ~ns when the span is not recording.
+                    ctx.otel_span
+                        .set_str("client.geo.country_iso_code", country.to_string());
+
+                    if let Some(ref geoip_cfg) = entry.route.geoip {
                         use lorica_config::models::GeoIpMode;
                         let blocked = match geoip_cfg.mode {
                             GeoIpMode::Allowlist => !geoip_cfg
@@ -2762,13 +2770,21 @@ impl ProxyHttp for LoricaProxy {
                                 .any(|c| c.eq_ignore_ascii_case(country.as_str())),
                         };
                         if blocked {
-                            let reason = format!(
-                                "GeoIP blocked ({country} via {})",
-                                match geoip_cfg.mode {
-                                    GeoIpMode::Allowlist => "allowlist",
-                                    GeoIpMode::Denylist => "denylist",
-                                }
+                            let mode_str = match geoip_cfg.mode {
+                                GeoIpMode::Allowlist => "allowlist",
+                                GeoIpMode::Denylist => "denylist",
+                            };
+                            // Prometheus counter: bounded cardinality
+                            // (routes * ~240 countries * 2 modes).
+                            let route_label =
+                                ctx.route_id.as_deref().unwrap_or("_unknown");
+                            lorica_api::metrics::inc_geoip_block(
+                                route_label,
+                                country.as_str(),
+                                mode_str,
                             );
+
+                            let reason = format!("GeoIP blocked ({country} via {mode_str})");
                             ctx.block_reason = Some(reason.clone());
                             let host_header = extract_host(session.req_header()).to_string();
                             let body = render_error_body(
@@ -2792,11 +2808,13 @@ impl ProxyHttp for LoricaProxy {
                             return Ok(true);
                         }
                     }
-                    // `country` is None = DB miss / unknown range;
-                    // fall through without blocking. Operators that
-                    // want fail-close behaviour can layer
-                    // ip_allowlist on top.
                 }
+                // `country` is None = DB miss / unknown range;
+                // fall through without blocking. Operators that
+                // want fail-close behaviour can layer
+                // ip_allowlist on top. No OTel attribute when
+                // country is unknown — omitting is semantically
+                // clearer than setting an empty string.
             }
         }
 
