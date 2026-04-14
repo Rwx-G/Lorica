@@ -229,32 +229,119 @@ pub struct OtelConfig {
 mod imp {
     //! Real implementation; compiled only when `otel` is enabled.
 
+    use std::sync::Mutex;
+
+    use once_cell::sync::Lazy;
+    use opentelemetry::global;
+    use opentelemetry::KeyValue;
+    use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
+    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+    use opentelemetry_sdk::Resource;
+
     use super::{OtelConfig, OtlpProtocol};
+
+    /// Handle to the currently installed provider. Held globally so
+    /// `shutdown()` can flush + drop it, and `init()` can tear down a
+    /// previous provider when settings change at runtime. `Mutex`
+    /// because init can race with shutdown during a config reload.
+    static PROVIDER: Lazy<Mutex<Option<SdkTracerProvider>>> = Lazy::new(|| Mutex::new(None));
 
     /// Initialise the global OpenTelemetry tracer provider with an
     /// OTLP exporter. Returns `Ok(())` on success; on failure the
     /// caller should log and continue without tracing rather than
     /// abort startup (tracing is observability, not a critical path).
-    pub fn init(_cfg: &OtelConfig) -> Result<(), String> {
-        // Exporter wiring lands in story 1.4 (span creation depends
-        // on the tracer being installed). For now the feature-gated
-        // build path exists and links against the OTel crates.
+    ///
+    /// Safe to call repeatedly: a subsequent `init()` tears down the
+    /// previous provider before installing the new one, so a config
+    /// reload that changes endpoint / protocol / service name /
+    /// sampling ratio takes effect without a process restart.
+    ///
+    /// Empty endpoint = disabled at runtime (the caller should not
+    /// even call `init()` in that case, but we guard defensively).
+    pub fn init(cfg: &OtelConfig) -> Result<(), String> {
+        if cfg.endpoint.trim().is_empty() {
+            return Ok(());
+        }
+
+        // Tear down any previous provider under the same lock so two
+        // concurrent reloads cannot leak exporters.
+        let mut slot = PROVIDER.lock().map_err(|e| format!("otel mutex poisoned: {e}"))?;
+        if let Some(old) = slot.take() {
+            let _ = old.shutdown();
+        }
+
+        let exporter = match cfg.protocol {
+            OtlpProtocol::HttpProto => SpanExporter::builder()
+                .with_http()
+                .with_endpoint(&cfg.endpoint)
+                .with_protocol(Protocol::HttpBinary)
+                .build()
+                .map_err(|e| format!("OTLP HTTP/protobuf exporter build failed: {e}"))?,
+            OtlpProtocol::HttpJson => SpanExporter::builder()
+                .with_http()
+                .with_endpoint(&cfg.endpoint)
+                .with_protocol(Protocol::HttpJson)
+                .build()
+                .map_err(|e| format!("OTLP HTTP/JSON exporter build failed: {e}"))?,
+            OtlpProtocol::Grpc => SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(&cfg.endpoint)
+                .build()
+                .map_err(|e| format!("OTLP gRPC exporter build failed: {e}"))?,
+        };
+
+        let resource = Resource::builder()
+            .with_attribute(KeyValue::new("service.name", cfg.service_name.clone()))
+            .with_attribute(KeyValue::new(
+                "service.version",
+                env!("CARGO_PKG_VERSION").to_string(),
+            ))
+            .build();
+
+        // TraceIdRatioBased is head-sampled and bit-accurate: the same
+        // trace_id always makes the same decision across Lorica hops,
+        // so re-sampling on the backend sees a consistent view.
+        // Ratio 0.0 -> drop everything (ParentBased short-circuits);
+        // ratio 1.0 -> AlwaysOn equivalent.
+        let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+            cfg.sampling_ratio.clamp(0.0, 1.0),
+        )));
+
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(resource)
+            .with_sampler(sampler)
+            .build();
+
+        global::set_tracer_provider(provider.clone());
+        *slot = Some(provider);
         Ok(())
     }
 
     /// Flush and shut down the global tracer provider. Called from
     /// the supervisor drain hook before the 10 s worker drain so
-    /// in-flight spans reach the collector.
+    /// in-flight spans reach the collector. Idempotent: calling
+    /// `shutdown()` on an already-shut-down provider is a no-op.
     pub fn shutdown() {
-        // Wired in story 1.6.
+        // Poisoned mutex during shutdown is non-fatal; we're tearing
+        // down anyway and the OS will reclaim everything on exit.
+        let Ok(mut slot) = PROVIDER.lock() else {
+            return;
+        };
+        if let Some(provider) = slot.take() {
+            // Provider shutdown flushes the batch exporter. After this
+            // call, the globally installed tracer returns no-op spans.
+            let _ = provider.shutdown();
+        }
     }
 
-    // Silence unused-variant warnings on the enum before stories 1.4+
-    // wire the config. Removed once `init` consumes `_cfg.protocol`.
-    fn _keep_variants_alive() {
-        let _ = OtlpProtocol::Grpc;
-        let _ = OtlpProtocol::HttpProto;
-        let _ = OtlpProtocol::HttpJson;
+    // Expose a convenience accessor so story 1.4b can grab a `Tracer`
+    // without having to know about the `global::` entry point. Keeps
+    // the OTel API surface concentrated in this module. Allowed-dead
+    // until per-request span creation lands (story 1.4b).
+    #[allow(dead_code)]
+    pub fn tracer() -> opentelemetry::global::BoxedTracer {
+        global::tracer("lorica")
     }
 }
 

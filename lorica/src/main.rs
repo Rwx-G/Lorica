@@ -3207,6 +3207,39 @@ fn run_single_process(cli: Cli) {
             std::process::exit(1);
         }
 
+        // OpenTelemetry tracing init (feature-gated, no-op when `otel` feature
+        // is off). Reads `otlp_*` fields from GlobalSettings and installs the
+        // global tracer provider. Runs inside the Tokio runtime because the
+        // OTLP batch exporter spawns a background flush task. Failures are
+        // logged and tracing stays disabled — observability is not a critical
+        // path so a misconfigured endpoint never blocks startup.
+        {
+            let s = store.lock().await;
+            if let Ok(gs) = s.get_global_settings() {
+                if let Some(endpoint) = gs.otlp_endpoint.as_ref().filter(|e| !e.trim().is_empty()) {
+                    let otel_cfg = lorica::otel::OtelConfig {
+                        endpoint: endpoint.clone(),
+                        protocol: lorica::otel::OtlpProtocol::from_settings(&gs.otlp_protocol),
+                        service_name: gs.otlp_service_name.clone(),
+                        sampling_ratio: gs.otlp_sampling_ratio,
+                    };
+                    match lorica::otel::init(&otel_cfg) {
+                        Ok(()) => info!(
+                            endpoint = %otel_cfg.endpoint,
+                            protocol = otel_cfg.protocol.as_str(),
+                            service_name = %otel_cfg.service_name,
+                            sampling_ratio = otel_cfg.sampling_ratio,
+                            "OpenTelemetry tracing enabled"
+                        ),
+                        Err(e) => warn!(
+                            error = %e,
+                            "OpenTelemetry init failed; tracing disabled (startup continues)"
+                        ),
+                    }
+                }
+            }
+        }
+
         // Build the CertResolver for SNI-based certificate selection
         let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
         {
@@ -3618,6 +3651,12 @@ fn run_single_process(cli: Cli) {
         }
         api_handle.abort();
         health_handle.abort();
+
+        // Flush the OTel batch exporter before the runtime drops so
+        // in-flight spans reach the collector on clean shutdown. No-op
+        // when the `otel` feature is off or when the endpoint was
+        // never configured, so it's always safe to call.
+        lorica::otel::shutdown();
     });
 }
 
