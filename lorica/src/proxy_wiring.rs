@@ -1744,6 +1744,9 @@ impl LoricaProxy {
                         )
                         .await;
                     }
+                    lorica_command::CommandType::ConfigReloadAbort => {
+                        handle_config_reload_abort(inc, &pending, worker_id).await;
+                    }
                     lorica_command::CommandType::MetricsRequest => {
                         handle_metrics_request(inc, &metrics_ctx, worker_id).await;
                     }
@@ -1947,6 +1950,50 @@ async fn handle_config_reload_prepare(
                 .await;
         }
     }
+}
+
+/// Worker-side handler for `ConfigReloadAbort`. Drops the pending
+/// slot if its generation matches. A mismatch or an empty slot is a
+/// silent no-op (Ok reply) - Abort is advisory; the worker is free
+/// to already have moved on. Closes audit M-7 orphan.
+async fn handle_config_reload_abort(
+    inc: lorica_command::IncomingCommand,
+    pending: &Arc<parking_lot::Mutex<Option<PendingProxyConfig>>>,
+    worker_id: u32,
+) {
+    let abort = match inc.command().payload.clone() {
+        Some(lorica_command::command::Payload::ConfigReloadAbort(a)) => a,
+        _ => {
+            let _ = inc
+                .reply_error("malformed ConfigReloadAbort payload")
+                .await;
+            return;
+        }
+    };
+    let dropped = {
+        let mut slot = pending.lock();
+        match *slot {
+            Some(ref p) if p.generation == abort.generation => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    };
+    if dropped {
+        tracing::info!(
+            worker_id,
+            generation = abort.generation,
+            "ConfigReloadAbort: pending config dropped"
+        );
+    } else {
+        tracing::debug!(
+            worker_id,
+            generation = abort.generation,
+            "ConfigReloadAbort: no matching pending (already committed or already dropped)"
+        );
+    }
+    let _ = inc.reply(lorica_command::Response::ok(0)).await;
 }
 
 /// Worker-side handler for `ConfigReloadCommit`. Pops the pending

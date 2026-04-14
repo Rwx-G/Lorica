@@ -1759,8 +1759,19 @@ async fn handle_verdict_push(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SupervisorBreakerState {
     Closed,
-    Open { opened_at: Instant },
-    HalfOpen { probe_in_flight: bool },
+    Open {
+        opened_at: Instant,
+    },
+    /// HalfOpen grants a single probe slot. `probe_started_at` is set to
+    /// `Some(Instant)` on admission and back to `None` on report. The
+    /// deadlock-avoidance guarantee (audit H-1) lives here: if the
+    /// probe-admitted worker crashes between admit and report, every
+    /// subsequent query observes `probe_started_at.elapsed() > cooldown`
+    /// and synthesises a failed-probe transition back to Open with a
+    /// fresh cooldown, so the backend is never locked out forever.
+    HalfOpen {
+        probe_started_at: Option<Instant>,
+    },
 }
 
 struct SupervisorBreakerEntry {
@@ -1794,8 +1805,14 @@ impl SupervisorBreakerRegistry {
 
     /// Decide admission for a `(route, backend)`. Closed = Allow; Open
     /// past cooldown = promote to HalfOpen and grant the sole probe
-    /// (`AllowProbe`); HalfOpen with probe already in flight = Deny;
-    /// Open within cooldown = Deny.
+    /// (`AllowProbe`); HalfOpen with probe already in flight = Deny
+    /// (unless the probe is stale past `cooldown`, in which case we
+    /// synthesise a failed-probe transition to Open and grant a fresh
+    /// probe to the caller).
+    ///
+    /// The stale-probe path closes audit H-1: a worker that crashes
+    /// between admit and report no longer pins the breaker in
+    /// HalfOpen forever.
     fn query(&self, route_id: &str, backend: &str) -> lorica_command::BreakerDecision {
         let key = Self::key(route_id, backend);
         let entry = self.entries.entry(key).or_insert_with(|| {
@@ -1810,21 +1827,43 @@ impl SupervisorBreakerRegistry {
             SupervisorBreakerState::Open { opened_at } => {
                 if opened_at.elapsed() >= self.cooldown {
                     guard.state = SupervisorBreakerState::HalfOpen {
-                        probe_in_flight: true,
+                        probe_started_at: Some(Instant::now()),
                     };
                     lorica_command::BreakerDecision::AllowProbe
                 } else {
                     lorica_command::BreakerDecision::Deny
                 }
             }
-            SupervisorBreakerState::HalfOpen { probe_in_flight } => {
-                if probe_in_flight {
-                    lorica_command::BreakerDecision::Deny
-                } else {
-                    guard.state = SupervisorBreakerState::HalfOpen {
-                        probe_in_flight: true,
-                    };
-                    lorica_command::BreakerDecision::AllowProbe
+            SupervisorBreakerState::HalfOpen { probe_started_at } => {
+                match probe_started_at {
+                    None => {
+                        // Slot is free (prior probe reported). Grant.
+                        guard.state = SupervisorBreakerState::HalfOpen {
+                            probe_started_at: Some(Instant::now()),
+                        };
+                        lorica_command::BreakerDecision::AllowProbe
+                    }
+                    Some(started) if started.elapsed() >= self.cooldown => {
+                        // Stale probe: the admitted worker never reported
+                        // back within cooldown. Treat as a failed probe
+                        // so the backend isn't locked out forever (H-1).
+                        // Bounce to Open with a fresh cooldown; account
+                        // the miss as a failure for consistency with the
+                        // HalfOpen -> Open transition path in `report`.
+                        guard.consecutive_failures =
+                            guard.consecutive_failures.saturating_add(1);
+                        guard.state = SupervisorBreakerState::Open {
+                            opened_at: Instant::now(),
+                        };
+                        tracing::warn!(
+                            route_id,
+                            backend,
+                            probe_age_s = started.elapsed().as_secs(),
+                            "breaker probe stale past cooldown; synthesising failed probe (audit H-1)"
+                        );
+                        lorica_command::BreakerDecision::Deny
+                    }
+                    Some(_) => lorica_command::BreakerDecision::Deny,
                 }
             }
         }
@@ -1990,21 +2029,30 @@ async fn coordinate_config_reload(
             "ConfigReloadPrepare failed on some workers; aborting reload"
         );
         // Best-effort drop of the pending slot on workers that did
-        // Prepare successfully: issue a Commit for `generation` so the
-        // slot gets swapped-in on those workers. This keeps the
-        // workers consistent with the partial failure semantics the
-        // operator expects: either every worker picks up the new
-        // config or the reload fails loudly. We *could* instead send
-        // a dedicated Abort RPC, but there's no meaningful difference
-        // to operators between "some workers are running the new
-        // config" and "none are" - both require a retry anyway, and
-        // the simpler wire format is a single command type.
-        //
-        // For now we leave the pending entries in place on the
-        // successful workers; a follow-up reload will overwrite them
-        // with a fresher generation, and the GenerationGate rejects
-        // commits for older generations so stale pending cannot be
-        // committed by accident.
+        // Prepare successfully via the `ConfigReloadAbort` RPC (audit
+        // M-7). Without this, a partial-Prepare failure leaves one
+        // orphan `Arc<ProxyConfig>` per successful-Prepare worker
+        // until the next reload overwrites it. Abort is advisory so
+        // we ignore reply errors - the worst case (RPC timeout) is
+        // exactly what we already guarded against.
+        let abort_futures = prepared.iter().filter_map(|wid| {
+            let ep = endpoints.get(wid).map(|e| e.value().clone())?;
+            let payload = lorica_command::command::Payload::ConfigReloadAbort(
+                lorica_command::ConfigReloadAbort { generation },
+            );
+            let wid = *wid;
+            Some(async move {
+                let _ = ep
+                    .request_rpc(
+                        lorica_command::CommandType::ConfigReloadAbort,
+                        payload,
+                        CONFIG_RELOAD_COMMIT_TIMEOUT,
+                    )
+                    .await;
+                wid
+            })
+        });
+        let _ = futures_util::future::join_all(abort_futures).await;
         return ConfigReloadReport {
             generation,
             prepared,
@@ -2609,7 +2657,8 @@ fn run_worker(
                     | CommandType::BreakerQuery
                     | CommandType::BreakerReport
                     | CommandType::ConfigReloadPrepare
-                    | CommandType::ConfigReloadCommit => {
+                    | CommandType::ConfigReloadCommit
+                    | CommandType::ConfigReloadAbort => {
                         warn!(
                             worker_id = id,
                             command_type = ?cmd.typed_command(),
@@ -3676,6 +3725,51 @@ mod supervisor_tests {
         assert_eq!(
             r.query("r", "b"),
             lorica_command::BreakerDecision::AllowProbe
+        );
+    }
+
+    #[test]
+    fn breaker_registry_stale_probe_recovers_after_cooldown() {
+        // Audit H-1: if the probe-admitted worker crashes between admit
+        // and report, the breaker must not lock the backend out forever.
+        // After `cooldown` elapses past probe_started_at, the next query
+        // synthesises a failed probe and transitions back to Open.
+        let cooldown = Duration::from_millis(40);
+        let r = SupervisorBreakerRegistry::new(1, cooldown);
+        r.report("r", "b", false, false); // state: Open at t0
+
+        // Wait past the initial cooldown so Open promotes to HalfOpen.
+        std::thread::sleep(cooldown + Duration::from_millis(10));
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::AllowProbe,
+            "first admission past cooldown grants probe"
+        );
+        // Worker "crashes" - no report arrives.
+
+        // Concurrent query within cooldown of the probe: denied.
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::Deny,
+            "second query within probe cooldown is denied"
+        );
+
+        // Wait past cooldown from probe_started_at. Next query
+        // synthesises the failed probe: state -> Open with a fresh
+        // opened_at, returns Deny (fresh cooldown starts now).
+        std::thread::sleep(cooldown + Duration::from_millis(10));
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::Deny,
+            "stale-probe detection path: synthesises failed probe and returns Deny"
+        );
+
+        // Wait past the fresh cooldown.
+        std::thread::sleep(cooldown + Duration::from_millis(10));
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::AllowProbe,
+            "backend admits a fresh probe; if this fails the breaker has stuck (audit H-1)"
         );
     }
 

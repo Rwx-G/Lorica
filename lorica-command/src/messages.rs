@@ -50,6 +50,13 @@ pub enum CommandType {
     ConfigReloadPrepare = 12,
     /// Supervisor -> worker: commit the prepared generation via ArcSwap.
     ConfigReloadCommit = 13,
+    /// Supervisor -> worker: abandon the prepared generation. Sent when
+    /// Prepare succeeded on this worker but the coordinator is giving up
+    /// (peer worker failed Prepare, timeout, etc.). The worker drops
+    /// its `pending_proxy_config` entry if its generation matches, so
+    /// the orphan `Arc<ProxyConfig>` is freed instead of pinning memory
+    /// until the next reload (audit M-7).
+    ConfigReloadAbort = 14,
 }
 
 impl CommandType {
@@ -68,6 +75,7 @@ impl CommandType {
             11 => Self::BreakerReport,
             12 => Self::ConfigReloadPrepare,
             13 => Self::ConfigReloadCommit,
+            14 => Self::ConfigReloadAbort,
             _ => Self::Unspecified,
         }
     }
@@ -157,7 +165,7 @@ pub struct Command {
     /// None for legacy variants.
     #[prost(
         oneof = "command::Payload",
-        tags = "100, 101, 102, 103, 104, 105, 106, 107"
+        tags = "100, 101, 102, 103, 104, 105, 106, 107, 108"
     )]
     pub payload: ::core::option::Option<command::Payload>,
 }
@@ -165,8 +173,8 @@ pub struct Command {
 /// Typed payload variants for pipelined RPC commands.
 pub mod command {
     use super::{
-        BreakerQuery, BreakerReport, ConfigReloadCommit, ConfigReloadPrepare, RateLimitDelta,
-        RateLimitQuery, VerdictLookup, VerdictPush,
+        BreakerQuery, BreakerReport, ConfigReloadAbort, ConfigReloadCommit, ConfigReloadPrepare,
+        RateLimitDelta, RateLimitQuery, VerdictLookup, VerdictPush,
     };
 
     #[derive(Clone, PartialEq, ::prost::Oneof)]
@@ -187,6 +195,8 @@ pub mod command {
         ConfigReloadPrepare(ConfigReloadPrepare),
         #[prost(message, tag = "107")]
         ConfigReloadCommit(ConfigReloadCommit),
+        #[prost(message, tag = "108")]
+        ConfigReloadAbort(ConfigReloadAbort),
     }
 }
 
@@ -598,6 +608,18 @@ pub struct ConfigReloadPrepare {
 /// Supervisor -> worker: commit the prepared generation via ArcSwap.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ConfigReloadCommit {
+    #[prost(uint64, tag = "1")]
+    pub generation: u64,
+}
+
+/// Supervisor -> worker: discard the prepared generation if it matches.
+///
+/// Sent when the coordinator gives up on a reload after a peer worker
+/// failed Prepare; the receiving worker drops its pending slot so the
+/// orphan `Arc<ProxyConfig>` isn't pinned until the next reload
+/// (audit M-7).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConfigReloadAbort {
     #[prost(uint64, tag = "1")]
     pub generation: u64,
 }
