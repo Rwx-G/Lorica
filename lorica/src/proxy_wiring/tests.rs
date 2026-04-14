@@ -2319,8 +2319,7 @@ async fn test_verdict_cache_hit_served_without_upstream_call() {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = [0u8; 2048];
                 let _ = stream.read(&mut buf).await;
-                let resp =
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                 let _ = stream.write_all(resp).await;
                 let _ = stream.shutdown().await;
             });
@@ -2337,9 +2336,25 @@ async fn test_verdict_cache_hit_served_without_upstream_call() {
 
     verdict_cache_reset_for_test();
 
-    let r1 = run_forward_auth_keyed(&cfg, &req, None, "http", "cache-hit-route", &VerdictCacheEngine::Local).await;
+    let r1 = run_forward_auth_keyed(
+        &cfg,
+        &req,
+        None,
+        "http",
+        "cache-hit-route",
+        &VerdictCacheEngine::Local,
+    )
+    .await;
     assert!(matches!(r1, ForwardAuthOutcome::Allow { .. }));
-    let r2 = run_forward_auth_keyed(&cfg, &req, None, "http", "cache-hit-route", &VerdictCacheEngine::Local).await;
+    let r2 = run_forward_auth_keyed(
+        &cfg,
+        &req,
+        None,
+        "http",
+        "cache-hit-route",
+        &VerdictCacheEngine::Local,
+    )
+    .await;
     assert!(matches!(r2, ForwardAuthOutcome::Allow { .. }));
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -2387,8 +2402,24 @@ async fn test_verdict_cache_honors_auth_no_store_directive() {
 
     verdict_cache_reset_for_test();
 
-    let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "ns-route", &VerdictCacheEngine::Local).await;
-    let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "ns-route", &VerdictCacheEngine::Local).await;
+    let _ = run_forward_auth_keyed(
+        &cfg,
+        &req,
+        None,
+        "http",
+        "ns-route",
+        &VerdictCacheEngine::Local,
+    )
+    .await;
+    let _ = run_forward_auth_keyed(
+        &cfg,
+        &req,
+        None,
+        "http",
+        "ns-route",
+        &VerdictCacheEngine::Local,
+    )
+    .await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,
@@ -2443,8 +2474,7 @@ async fn test_verdict_cache_off_when_ttl_zero() {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = [0u8; 2048];
                 let _ = stream.read(&mut buf).await;
-                let resp =
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                 let _ = stream.write_all(resp).await;
                 let _ = stream.shutdown().await;
             });
@@ -2461,8 +2491,24 @@ async fn test_verdict_cache_off_when_ttl_zero() {
 
     verdict_cache_reset_for_test();
 
-    let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "off-route", &VerdictCacheEngine::Local).await;
-    let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "off-route", &VerdictCacheEngine::Local).await;
+    let _ = run_forward_auth_keyed(
+        &cfg,
+        &req,
+        None,
+        "http",
+        "off-route",
+        &VerdictCacheEngine::Local,
+    )
+    .await;
+    let _ = run_forward_auth_keyed(
+        &cfg,
+        &req,
+        None,
+        "http",
+        "off-route",
+        &VerdictCacheEngine::Local,
+    )
+    .await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,

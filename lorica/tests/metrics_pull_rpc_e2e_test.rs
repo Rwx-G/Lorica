@@ -29,7 +29,12 @@ use lorica_command::{
     MetricsReport, RequestCountEntry, Response, RpcEndpoint, WafCountEntry,
 };
 
-fn socketpair() -> (RpcEndpoint, lorica_command::IncomingCommands, RpcEndpoint, lorica_command::IncomingCommands) {
+fn socketpair() -> (
+    RpcEndpoint,
+    lorica_command::IncomingCommands,
+    RpcEndpoint,
+    lorica_command::IncomingCommands,
+) {
     let (a, b) = tokio::net::UnixStream::pair().expect("UnixStream::pair");
     let (ep1, inc1) = RpcEndpoint::new(a);
     let (ep2, inc2) = RpcEndpoint::new(b);
@@ -141,14 +146,8 @@ async fn metrics_pull_rpc_timeout_on_stuck_worker_does_not_block_others() {
     let per_timeout = Duration::from_millis(150);
     let start = std::time::Instant::now();
     let futures = vec![
-        sup_a.request(
-            Command::new(CommandType::MetricsRequest, 0),
-            per_timeout,
-        ),
-        sup_b.request(
-            Command::new(CommandType::MetricsRequest, 0),
-            per_timeout,
-        ),
+        sup_a.request(Command::new(CommandType::MetricsRequest, 0), per_timeout),
+        sup_b.request(Command::new(CommandType::MetricsRequest, 0), per_timeout),
     ];
     let results = futures_util::future::join_all(futures).await;
     let elapsed = start.elapsed();
@@ -215,7 +214,10 @@ async fn metrics_pull_rpc_dropped_peer_surfaces_via_per_request_timeout() {
         .request(Command::new(CommandType::MetricsRequest, 0), per_timeout)
         .await;
     let elapsed = start.elapsed();
-    assert!(matches!(res, Err(lorica_command::ChannelError::Timeout) | Err(lorica_command::ChannelError::Closed)));
+    assert!(matches!(
+        res,
+        Err(lorica_command::ChannelError::Timeout) | Err(lorica_command::ChannelError::Closed)
+    ));
     assert!(
         elapsed < Duration::from_millis(800),
         "per-request timeout must bound the stall on a dead peer, got {elapsed:?}"

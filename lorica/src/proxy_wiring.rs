@@ -1088,35 +1088,34 @@ pub struct PendingProxyConfig {
     pub prepared: crate::reload::PreparedReload,
 }
 
-
 // Audit M-8: BreakerAdmission / BreakerEngine / VerdictCacheEngine /
 // RateLimitEngine moved to proxy_wiring/engines.rs to keep this
 // file below the refactor threshold. Re-exported here so
 // `lorica::proxy_wiring::BreakerEngine` (etc.) still resolves.
 pub mod forward_auth;
-pub(crate) use forward_auth::{run_forward_auth_keyed, ForwardAuthOutcome};
 #[cfg(test)]
 pub(crate) use forward_auth::{
     build_forward_auth_headers, run_forward_auth, verdict_cache_key, verdict_cache_reset_for_test,
 };
+pub(crate) use forward_auth::{run_forward_auth_keyed, ForwardAuthOutcome};
 
 pub mod mirror_rewrite;
-pub(crate) use mirror_rewrite::{
-    apply_response_rewrites, build_mirror_forward_headers, compile_rewrite_rule,
-    mirror_sample_hit, request_has_body, should_rewrite_response, spawn_mirrors,
-    CompiledRewriteRule, MirrorBodyState, MirrorPending, ResponseRewriteState,
-};
 #[cfg(test)]
 pub(crate) use mirror_rewrite::build_mirror_url;
+pub(crate) use mirror_rewrite::{
+    apply_response_rewrites, build_mirror_forward_headers, compile_rewrite_rule, mirror_sample_hit,
+    request_has_body, should_rewrite_response, spawn_mirrors, CompiledRewriteRule, MirrorBodyState,
+    MirrorPending, ResponseRewriteState,
+};
 
 pub mod helpers;
 // `pub` (not `pub(crate)`) for `canary_bucket` and `evaluate_mtls`
 // because they're re-exported by integration tests under `tests/`
 // (canary_e2e_test, mtls_e2e_test).
-pub use helpers::{canary_bucket, evaluate_mtls};
 pub(crate) use helpers::{
     cache_vary_for_request, downstream_ssl_digest, extract_host, sanitize_html,
 };
+pub use helpers::{canary_bucket, evaluate_mtls};
 #[cfg(test)]
 pub(crate) use helpers::{
     compute_cache_variance, match_header_rule_backends, pick_traffic_split_backends,
@@ -1127,7 +1126,6 @@ pub use engines::{BreakerAdmission, BreakerEngine, RateLimitEngine, VerdictCache
 
 pub mod error_pages;
 pub(crate) use error_pages::render_error_body;
-
 
 impl LoricaProxy {
     pub fn new(
@@ -1606,9 +1604,7 @@ async fn handle_config_reload_abort(
     let abort = match inc.command().payload.clone() {
         Some(lorica_command::command::Payload::ConfigReloadAbort(a)) => a,
         _ => {
-            let _ = inc
-                .reply_error("malformed ConfigReloadAbort payload")
-                .await;
+            let _ = inc.reply_error("malformed ConfigReloadAbort payload").await;
             return;
         }
     };
@@ -1942,13 +1938,8 @@ impl ProxyHttp for LoricaProxy {
                     ctx.block_reason = Some("IP banned".to_string());
                     // Pre-route stage: no route override consultable.
                     let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        403,
-                        &ctx.request_id,
-                        &host_header,
-                        None,
-                        "IP banned",
-                    );
+                    let body =
+                        render_error_body(403, &ctx.request_id, &host_header, None, "IP banned");
                     let mut header = lorica_http::ResponseHeader::build(403, None)?;
                     header.insert_header("Content-Type", "text/html; charset=utf-8")?;
                     header.insert_header("Content-Length", body.len().to_string())?;
@@ -2001,13 +1992,8 @@ impl ProxyHttp for LoricaProxy {
                     }
                     // Pre-route stage: no route override consultable.
                     let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        403,
-                        &ctx.request_id,
-                        &host_header,
-                        None,
-                        "IP blocked",
-                    );
+                    let body =
+                        render_error_body(403, &ctx.request_id, &host_header, None, "IP blocked");
                     let mut header = lorica_http::ResponseHeader::build(403, None)?;
                     header.insert_header("Content-Type", "text/html; charset=utf-8")?;
                     header.insert_header("Content-Length", body.len().to_string())?;
@@ -3590,8 +3576,7 @@ impl ProxyHttp for LoricaProxy {
         let mut healthy_backends: Vec<&Backend> = Vec::with_capacity(backends_source.len());
         let mut probe_backend: Option<String> = None;
         for b in backends_source.iter() {
-            if b.health_status == HealthStatus::Down
-                || b.lifecycle_state != LifecycleState::Normal
+            if b.health_status == HealthStatus::Down || b.lifecycle_state != LifecycleState::Normal
             {
                 continue;
             }
@@ -4353,7 +4338,6 @@ impl ProxyHttp for LoricaProxy {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests;

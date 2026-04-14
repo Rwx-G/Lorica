@@ -174,8 +174,8 @@ pub fn recv_worker_fds(sock: RawFd) -> Result<Vec<FdEntry>, WorkerError> {
                 }
             }
         }
-        let truncated = msg.flags.contains(MsgFlags::MSG_TRUNC)
-            || msg.flags.contains(MsgFlags::MSG_CTRUNC);
+        let truncated =
+            msg.flags.contains(MsgFlags::MSG_TRUNC) || msg.flags.contains(MsgFlags::MSG_CTRUNC);
         (owned, msg.bytes, truncated)
     };
 

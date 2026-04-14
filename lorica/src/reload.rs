@@ -62,7 +62,8 @@ pub async fn build_proxy_config(
     proxy_config: &Arc<ArcSwap<ProxyConfig>>,
     installed_mtls_fingerprint: Option<&parking_lot::Mutex<Option<String>>>,
 ) -> Result<PreparedReload, Box<dyn std::error::Error + Send + Sync>> {
-    let prepared = build_proxy_config_inner(store, proxy_config, installed_mtls_fingerprint).await?;
+    let prepared =
+        build_proxy_config_inner(store, proxy_config, installed_mtls_fingerprint).await?;
     Ok(prepared)
 }
 

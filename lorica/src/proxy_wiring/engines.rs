@@ -84,18 +84,13 @@ impl BreakerEngine {
                 }
             }
             BreakerEngine::Rpc { endpoint, timeout } => {
-                let payload = lorica_command::command::Payload::BreakerQuery(
-                    lorica_command::BreakerQuery {
+                let payload =
+                    lorica_command::command::Payload::BreakerQuery(lorica_command::BreakerQuery {
                         route_id: route_id.to_string(),
                         backend: backend.to_string(),
-                    },
-                );
+                    });
                 match endpoint
-                    .request_rpc(
-                        lorica_command::CommandType::BreakerQuery,
-                        payload,
-                        *timeout,
-                    )
+                    .request_rpc(lorica_command::CommandType::BreakerQuery, payload, *timeout)
                     .await
                 {
                     Ok(resp) => match resp.payload {

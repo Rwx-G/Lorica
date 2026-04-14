@@ -263,9 +263,7 @@ async fn handle_breaker_query(inc: IncomingCommand, br: &BreakerRegistry) {
     let _ = inc
         .reply(lorica_command::Response::ok_with(
             0,
-            response::Payload::BreakerResult(BreakerResult {
-                decision: d as i32,
-            }),
+            response::Payload::BreakerResult(BreakerResult { decision: d as i32 }),
         ))
         .await;
 }
@@ -286,7 +284,12 @@ async fn handle_breaker_report(inc: IncomingCommand, br: &BreakerRegistry) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn socketpair() -> (RpcEndpoint, lorica_command::IncomingCommands, RpcEndpoint, lorica_command::IncomingCommands) {
+fn socketpair() -> (
+    RpcEndpoint,
+    lorica_command::IncomingCommands,
+    RpcEndpoint,
+    lorica_command::IncomingCommands,
+) {
     let (a, b) = tokio::net::UnixStream::pair().expect("UnixStream::pair");
     let (ep1, inc1) = RpcEndpoint::new(a);
     let (ep2, inc2) = RpcEndpoint::new(b);
@@ -432,7 +435,10 @@ async fn breaker_rpc_opens_after_threshold() {
         .unwrap();
     match resp.payload {
         Some(response::Payload::BreakerResult(r)) => {
-            assert_eq!(BreakerDecision::from_i32(r.decision), BreakerDecision::Allow);
+            assert_eq!(
+                BreakerDecision::from_i32(r.decision),
+                BreakerDecision::Allow
+            );
         }
         _ => panic!("unexpected payload"),
     }

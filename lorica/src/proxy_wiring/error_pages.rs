@@ -195,7 +195,9 @@ pub(crate) fn render_error_page(status: u16, request_id: &str, host_header: &str
         escape_html(host_header)
     };
 
-    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let timestamp = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
 
     // Per-tier modifiers: which tier carries the `broken` CSS
     // class (drops the white triangle notch underneath) and which
@@ -205,7 +207,8 @@ pub(crate) fn render_error_page(status: u16, request_id: &str, host_header: &str
         BrokenTier::Network => ("", " broken", ""),
         BrokenTier::Host => ("", "", " broken"),
     };
-    let (you_badge, you_glyph, you_state, you_state_class) = badge(info.broken_tier == BrokenTier::You);
+    let (you_badge, you_glyph, you_state, you_state_class) =
+        badge(info.broken_tier == BrokenTier::You);
     let (net_badge, net_glyph, net_state, net_state_class) =
         badge(info.broken_tier == BrokenTier::Network);
     let (host_badge, host_glyph, host_state, host_state_class) =

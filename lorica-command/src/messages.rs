@@ -271,7 +271,9 @@ pub struct Response {
 
 /// Typed payload variants for pipelined RPC responses.
 pub mod response {
-    use super::{BreakerResult, MetricsReport, RateLimitDeltaResult, RateLimitResult, VerdictResult};
+    use super::{
+        BreakerResult, MetricsReport, RateLimitDeltaResult, RateLimitResult, VerdictResult,
+    };
 
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Payload {

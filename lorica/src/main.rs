@@ -1758,7 +1758,8 @@ impl SupervisorVerdictCache {
             // still the one we read. `remove_if` closes the TOCTOU noted
             // in audit M-2 - a fresh `insert` racing with this lookup
             // can no longer be evicted by a stale expiry observation.
-            self.entries.remove_if(&key, |_, e| e.expires_at == expires_at);
+            self.entries
+                .remove_if(&key, |_, e| e.expires_at == expires_at);
             return None;
         }
         let ttl_ms = expires_at.saturating_duration_since(now).as_millis() as u64;
@@ -1842,10 +1843,7 @@ async fn handle_verdict_lookup(
         .await;
 }
 
-async fn handle_verdict_push(
-    inc: lorica_command::IncomingCommand,
-    cache: &SupervisorVerdictCache,
-) {
+async fn handle_verdict_push(inc: lorica_command::IncomingCommand, cache: &SupervisorVerdictCache) {
     use lorica_command::command;
 
     let push = match inc.command().payload.clone() {
@@ -1859,13 +1857,21 @@ async fn handle_verdict_push(
     // single-process semantics. A Deny or zero-TTL push is treated as a
     // silent no-op so a worker that miscomputes the cache predicate
     // cannot poison the supervisor's cache.
-    if push.ttl_ms > 0 && lorica_command::Verdict::from_i32(push.verdict) == lorica_command::Verdict::Allow {
+    if push.ttl_ms > 0
+        && lorica_command::Verdict::from_i32(push.verdict) == lorica_command::Verdict::Allow
+    {
         let headers = push
             .response_headers
             .into_iter()
             .map(|h| (h.name, h.value))
             .collect();
-        cache.insert(&push.route_id, &push.cookie, push.verdict, headers, push.ttl_ms);
+        cache.insert(
+            &push.route_id,
+            &push.cookie,
+            push.verdict,
+            headers,
+            push.ttl_ms,
+        );
     }
     let _ = inc.reply(lorica_command::Response::ok(0)).await;
 }
@@ -1973,8 +1979,7 @@ impl SupervisorBreakerRegistry {
                         // Bounce to Open with a fresh cooldown; account
                         // the miss as a failure for consistency with the
                         // HalfOpen -> Open transition path in `report`.
-                        guard.consecutive_failures =
-                            guard.consecutive_failures.saturating_add(1);
+                        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
                         guard.state = SupervisorBreakerState::Open {
                             opened_at: Instant::now(),
                         };
@@ -2134,17 +2139,11 @@ async fn coordinate_config_reload(
     for (wid, result) in prepare_results {
         match result {
             Ok(resp) if resp.typed_status() == lorica_command::ResponseStatus::Ok => {
-                lorica_api::metrics::inc_supervisor_rpc_outcome(
-                    "config_reload_prepare",
-                    "ok",
-                );
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_prepare", "ok");
                 prepared.push(wid);
             }
             Ok(resp) => {
-                lorica_api::metrics::inc_supervisor_rpc_outcome(
-                    "config_reload_prepare",
-                    "error",
-                );
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_prepare", "error");
                 prepare_failed.push((wid, resp.message));
             }
             Err(e) => {
@@ -2153,10 +2152,7 @@ async fn coordinate_config_reload(
                 } else {
                     "error"
                 };
-                lorica_api::metrics::inc_supervisor_rpc_outcome(
-                    "config_reload_prepare",
-                    outcome,
-                );
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_prepare", outcome);
                 prepare_failed.push((wid, format!("rpc error: {e}")));
             }
         }
@@ -2195,10 +2191,7 @@ async fn coordinate_config_reload(
                     Err(lorica_command::ChannelError::Timeout) => "timeout",
                     Err(_) => "error",
                 };
-                lorica_api::metrics::inc_supervisor_rpc_outcome(
-                    "config_reload_abort",
-                    outcome,
-                );
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_abort", outcome);
                 wid
             })
         });
@@ -2234,17 +2227,11 @@ async fn coordinate_config_reload(
     for (wid, result) in commit_results {
         match result {
             Ok(resp) if resp.typed_status() == lorica_command::ResponseStatus::Ok => {
-                lorica_api::metrics::inc_supervisor_rpc_outcome(
-                    "config_reload_commit",
-                    "ok",
-                );
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_commit", "ok");
                 committed.push(wid);
             }
             Ok(resp) => {
-                lorica_api::metrics::inc_supervisor_rpc_outcome(
-                    "config_reload_commit",
-                    "error",
-                );
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_commit", "error");
                 commit_failed.push((wid, resp.message));
             }
             Err(e) => {
@@ -2253,10 +2240,7 @@ async fn coordinate_config_reload(
                 } else {
                     "error"
                 };
-                lorica_api::metrics::inc_supervisor_rpc_outcome(
-                    "config_reload_commit",
-                    outcome,
-                );
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_commit", outcome);
                 commit_failed.push((wid, format!("rpc error: {e}")));
             }
         }
@@ -2326,8 +2310,7 @@ async fn pull_all_metrics_via_rpc(
         .collect();
 
     let futures = targets.into_iter().map(|(wid, ep)| {
-        let cmd =
-            lorica_command::Command::new(lorica_command::CommandType::MetricsRequest, 0);
+        let cmd = lorica_command::Command::new(lorica_command::CommandType::MetricsRequest, 0);
         async move {
             let res = ep.request(cmd, per_worker_timeout).await;
             (wid, res)
@@ -3022,16 +3005,14 @@ fn run_worker(
                 // `Clone` via `Arc<Inner>` so all five share the
                 // same underlying stream and pipelined dispatcher.
                 // See design § 4.3.
-                lorica_proxy.verdict_cache =
-                    lorica::proxy_wiring::VerdictCacheEngine::rpc(
-                        endpoint.clone(),
-                        Duration::from_millis(500),
-                    );
-                lorica_proxy.circuit_breaker_engine =
-                    lorica::proxy_wiring::BreakerEngine::rpc(
-                        endpoint.clone(),
-                        Duration::from_millis(500),
-                    );
+                lorica_proxy.verdict_cache = lorica::proxy_wiring::VerdictCacheEngine::rpc(
+                    endpoint.clone(),
+                    Duration::from_millis(500),
+                );
+                lorica_proxy.circuit_breaker_engine = lorica::proxy_wiring::BreakerEngine::rpc(
+                    endpoint.clone(),
+                    Duration::from_millis(500),
+                );
                 let _rpc_listener = lorica_proxy.spawn_worker_rpc_listener(
                     &worker_auth_prune_tracker,
                     incoming,
@@ -3820,7 +3801,13 @@ mod supervisor_tests {
     #[test]
     fn verdict_cache_miss_on_expired_entry() {
         let c = SupervisorVerdictCache::new();
-        c.insert("r1", "cookie", lorica_command::Verdict::Allow as i32, Vec::new(), 1);
+        c.insert(
+            "r1",
+            "cookie",
+            lorica_command::Verdict::Allow as i32,
+            Vec::new(),
+            1,
+        );
         std::thread::sleep(Duration::from_millis(10));
         assert!(c.lookup("r1", "cookie").is_none());
         // Lazy eviction on lookup: expired entry removed.
@@ -3830,7 +3817,13 @@ mod supervisor_tests {
     #[test]
     fn verdict_cache_partitions_by_route() {
         let c = SupervisorVerdictCache::new();
-        c.insert("route-a", "c", lorica_command::Verdict::Allow as i32, Vec::new(), 30_000);
+        c.insert(
+            "route-a",
+            "c",
+            lorica_command::Verdict::Allow as i32,
+            Vec::new(),
+            30_000,
+        );
         assert!(c.lookup("route-a", "c").is_some());
         assert!(c.lookup("route-b", "c").is_none());
     }

@@ -22,13 +22,13 @@
 
 #![cfg(unix)]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use lorica_command::{
-    command, CommandType, ConfigReloadCommit, ConfigReloadPrepare, GenerationGate,
-    IncomingCommand, ResponseStatus, RpcEndpoint,
+    command, CommandType, ConfigReloadCommit, ConfigReloadPrepare, GenerationGate, IncomingCommand,
+    ResponseStatus, RpcEndpoint,
 };
 
 struct WorkerState {
@@ -122,7 +122,12 @@ async fn handle_commit(inc: IncomingCommand, state: &WorkerState) {
     }
 }
 
-fn socketpair() -> (RpcEndpoint, lorica_command::IncomingCommands, RpcEndpoint, lorica_command::IncomingCommands) {
+fn socketpair() -> (
+    RpcEndpoint,
+    lorica_command::IncomingCommands,
+    RpcEndpoint,
+    lorica_command::IncomingCommands,
+) {
     let (a, b) = tokio::net::UnixStream::pair().expect("UnixStream::pair");
     let (ep1, inc1) = RpcEndpoint::new(a);
     let (ep2, inc2) = RpcEndpoint::new(b);
@@ -272,8 +277,7 @@ async fn reload_listener_drains_on_supervisor_eof() {
     // The listener task should complete within a few seconds; 5 s is a
     // generous ceiling that catches "truly hung" while tolerating
     // tokio scheduler hiccups.
-    let join_result =
-        tokio::time::timeout(Duration::from_secs(5), handle).await;
+    let join_result = tokio::time::timeout(Duration::from_secs(5), handle).await;
     assert!(
         join_result.is_ok(),
         "worker RPC listener must exit within 5s of supervisor EOF; hung shutdown is a blocker"

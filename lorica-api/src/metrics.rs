@@ -447,8 +447,7 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
     // for scheduling overhead. On timeout we keep the cached state so
     // the scrape still returns something useful.
     if let Some(ref refresher) = state.metrics_refresher {
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_millis(1_000), refresher()).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1_000), refresher()).await;
     }
 
     // Refresh active connections (aggregated from workers if available)
