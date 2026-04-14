@@ -48,7 +48,7 @@ pub const UPDATE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Conservative floor for the uncompressed `.mmdb` size. The DB-IP
 /// Lite Country feed ships ~3 MiB uncompressed; anything smaller
 /// than 1 MiB is either truncated or the wrong artefact.
-const MIN_MMDB_SIZE: u64 = 1 * 1024 * 1024;
+const MIN_MMDB_SIZE: u64 = 1024 * 1024;
 
 /// Upper bound on the uncompressed download. A runaway response
 /// (redirect loop into a huge blob, accidentally served something
