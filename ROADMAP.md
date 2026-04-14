@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-04-12 | Current release: v1.3.0 | In progress: v1.4.0
+> Last updated: 2026-04-14 | Current release: v1.3.0 | In progress: v1.4.0
 >
 > See [COMPARISON.md](COMPARISON.md) for the full competitive feature matrix.
 >
@@ -45,6 +45,46 @@ Major feature additions that close the gap with Traefik and Nginx.
 | Stale-while-revalidate | Done | Low | `stale_writer` support exists in cache lock module. Serve stale while background refresh |
 | Cache predictor | Done | Medium | `lorica-cache/src/predictor.rs` exists. Learn which assets are cacheable |
 | Connection pre-filter | Done | Low | Replace `AcceptAllFilter` with configurable filter. IP-level filtering before TLS handshake |
+
+### v1.3.0 - Worker-parity audit (WPAR)
+
+Cross-worker shared-state rewrite so `--workers N` behaves like
+`--workers 0` instead of amplifying per-worker state by `N`. Design
+and rationale in [`docs/architecture/worker-shared-state.md`](docs/architecture/worker-shared-state.md).
+
+| Feature | Status | Effort | Notes |
+|---|---|---|---|
+| Pipelined RPC framework (`lorica-command`) | Done | 2 d | Sequence-multiplexed in-flight map, bounded outbound queue, per-request timeout. `RpcEndpoint::Inner::drop` explicitly aborts reader + writer (audit fix) |
+| `lorica-shmem` crate (memfd + atomic hashtable) | Done | 4 d | Anonymous `memfd_create`, `mmap(MAP_SHARED)`, open-addressing hashtable with SipHash-1-3 + 128-bit randomized key (anti HashDoS). Cross-process atomic counters for WAF flood / auto-ban |
+| WPAR-1 per-route token-bucket rate limit | Done | 3 d | Worker-side `LocalBucket` CAS cache syncs every 100 ms with supervisor's authoritative `AuthoritativeBucket`. Aggregate admission bound: `capacity + 100 ms * N_workers * refill_per_sec`. Per-IP bucket eviction at 5 min idle |
+| WPAR-1 WAF auto-ban via shmem | Done | - | Per-IP violation counter lives in the shmem hashtable; supervisor is the sole ban issuer on threshold crossing |
+| WPAR-2 forward-auth verdict cache RPC | Done | 1 d | `VerdictCacheEngine::{Local, Rpc}`; worker mode routes lookup/push to a supervisor-owned cache with FIFO eviction (16 Ki entries). Allow verdicts carry `response_headers` on the wire so hits skip the auth upstream round trip |
+| WPAR-3 circuit breaker RPC | Done | 1 d | `BreakerEngine::{Local, Rpc}` with tri-state `BreakerAdmission::{Allow, Probe, Deny}`. Supervisor owns the state machine; probe slots allocated atomically across workers. Stale-probe detection (audit H-1) prevents deadlock on crashed probe worker |
+| WPAR-7 `/metrics` pull-on-scrape | Done | 0.5 d | Prometheus scrape triggers a 500 ms fan-out to every worker; concurrent scrapes dedup via a 250 ms `Instant` lock; non-responders fall back to cached state |
+| WPAR-8 two-phase config reload | Done | 1 d | `ConfigReloadPrepare` (2 s timeout, slow: SQLite read + ProxyConfig build) + `ConfigReloadCommit` (500 ms timeout, fast: single ArcSwap). Cross-worker divergence window collapses from ~10-50 ms down to the UDS RTT. `ConfigReloadAbort` RPC drops orphan pending configs on partial failure |
+| WPAR multi-worker integration tests | Done | 1.5 d | Per-phase RPC round-trip Rust tests (verdict, breaker, metrics pull, config reload) + 76 / 76 E2E Docker tests in `--workers 2` mode covering sections 1-19c |
+
+Bonus bug found during audit + fixed in v1.3.0: `RpcEndpoint::Inner::drop`
+was detach-on-drop (tokio `JoinHandle` default), which kept the reader's
+`tx_out` clone alive, which kept the writer task and socket halves
+alive, which blocked peer EOF, which hung worker shutdown on the 10 s
+`TaskTracker` drain. Now `drop` explicitly calls `handle.abort()` on
+both tasks.
+
+### v1.3.0 - deferred to v1.3.1
+
+Tech debt and feature-flag reshapes that were explicitly scoped out
+of the release, with tracking issues to open:
+
+| Item | Source | Notes |
+|---|---|---|
+| Split `proxy_wiring.rs` (8 Ki LOC) | Audit M-8 | Extract `engines.rs` (BreakerEngine / VerdictCacheEngine / RateLimitEngine) + move `#[cfg(test)]` block (~3 k LOC) into `proxy_wiring/tests.rs`. Mechanical; risk > benefit for the release |
+| `route53` feature off-by-default | Audit SC-M-3 | Flip the default-on feature in `lorica-api/Cargo.toml` so non-Route53 deployments don't ship `rustls 0.21 + hyper 0.14` (security-maintenance only) |
+| `brotli 3 -> 7` | Audit SC-L-1 | Minor version bump; held because upstream brotli 7 has API changes we didn't want to absorb mid-release |
+| `no_debug 3.1.0` inline | Audit SC-L-3 | Unmaintained single-file macro; inline (~10 lines) in `lorica-tls` |
+| `daemonize 0.5.0` replacement | RUSTSEC-2025-0069 | Single-maintainer + unmaintained. Inline double-fork in `lorica-core` |
+| `eslint-plugin-svelte` in CI | Audit coverage gap | Semgrep OSS lacks a Svelte language pack. Manual audit in v1.3.0 confirmed 0 exploitable `{@html}` sites, but ongoing regression guard needs a CI linter |
+| `trailofbits/semgrep-rules` in CI | Audit coverage gap | Original `p/bash` / `p/yaml` / `p/sql` rulesets 404'd on the Semgrep registry; replacement rulesets identified but not wired into CI |
 
 ---
 
