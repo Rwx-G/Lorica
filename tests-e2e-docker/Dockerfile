@@ -41,9 +41,17 @@ COPY tinyufo/ tinyufo/
 # Copy pre-built frontend into the dashboard crate
 COPY --from=frontend /app/lorica-dashboard/frontend/dist/ lorica-dashboard/frontend/dist/
 
-# Build with SKIP_FRONTEND_BUILD since we already built it
+# Build with SKIP_FRONTEND_BUILD since we already built it. Cargo
+# features can be toggled at build time via the `LORICA_FEATURES`
+# build arg (e.g. `--build-arg LORICA_FEATURES=otel`); defaults to
+# the crate's default feature set.
+ARG LORICA_FEATURES=""
 ENV SKIP_FRONTEND_BUILD=1
-RUN cargo build --release -p lorica
+RUN if [ -n "$LORICA_FEATURES" ]; then \
+        cargo build --release -p lorica --features "$LORICA_FEATURES"; \
+    else \
+        cargo build --release -p lorica; \
+    fi
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim

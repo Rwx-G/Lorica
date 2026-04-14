@@ -406,14 +406,33 @@ INFO role="supervisor" endpoint="http://jaeger:4318" protocol="http-proto" servi
 
 One line per role: `supervisor`, each `worker`, or `single-process`.
 
+**Automated E2E smoke test (docker-compose `otel` profile):**
+
+```bash
+cd tests-e2e-docker
+# Build Lorica with --features otel, start Jaeger, run the smoke test:
+docker compose --profile otel up --build -d jaeger lorica-otel
+docker compose --profile otel run --rm otel-smoke
+# On success: exits 0 and prints "Tests: N | Passed: N | Failed: 0".
+# On failure: the failed assertion names the missing tag / status.
+
+# Inspect the traces visually:
+open http://localhost:16686
+```
+
+The smoke test sends a request through Lorica carrying a known W3C
+traceparent, then polls the Jaeger HTTP query API for the trace id
+and asserts the span has the expected HTTP semconv tags
+(`http.request.method`, `url.path`, `http.response.status_code`,
+`lorica.route_id`). Default sampling is forced to 1.0 so the bench
+is deterministic.
+
 **Known limitations:**
 
 - Child spans for per-stage timing (waf.eval, forward_auth, mtls,
   cache.lookup, upstream.connect, upstream.response) are not yet
   emitted; only the request-level root span with final-state
   attributes is exported. Follow-up in story 1.4c.
-- Tracing logs do not yet carry `trace_id` / `span_id` fields
-  (story 1.5 log/trace correlation pending).
 - Workers lose up to the last ~5 s of spans on abrupt shutdown
   because `lorica_core::Server::run_forever()` exits the process
   without a pre-exit hook. Supervisor + single-process flush

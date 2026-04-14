@@ -105,11 +105,72 @@ services:
     networks:
       - e2e
 
+  # ---- OpenTelemetry E2E (v1.4.0 Epic 1, story 1.8) --------------------
+  # Optional profile that wires Lorica built with `--features otel`
+  # against a Jaeger all-in-one collector so the `otel-smoke` test can
+  # drive a request through the proxy and assert the resulting span
+  # tree is visible via Jaeger's HTTP query API.
+  #
+  # Run with: docker compose --profile otel up --build
+  #   docker compose --profile otel run --rm otel-smoke
+  #
+  # Jaeger exposes:
+  #   4317 (OTLP/gRPC)    - not used by Lorica in the default config
+  #   4318 (OTLP/HTTP)    - used when protocol=http-proto or http-json
+  #   16686 (Query UI)    - http://localhost:16686 after `up`
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    profiles: ["otel"]
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"
+    networks:
+      - e2e
+
+  lorica-otel:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+      args:
+        LORICA_FEATURES: "otel"
+    profiles: ["otel"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-otel-data:/var/lib/lorica
+      - shared-otel:/shared
+    depends_on:
+      - backend1
+      - jaeger
+    networks:
+      - e2e
+
+  otel-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["otel"]
+    entrypoint: ["bash", "run-otel-smoke.sh"]
+    depends_on:
+      - lorica-otel
+      - jaeger
+    volumes:
+      - shared-otel:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-otel:9443
+      - LORICA_PROXY=http://lorica-otel:8080
+      - JAEGER_QUERY=http://jaeger:16686
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
+  lorica-otel-data:
   shared:
   shared-workers:
+  shared-otel:
 
 networks:
   e2e:
