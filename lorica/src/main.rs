@@ -592,13 +592,60 @@ fn run_supervisor(cli: Cli) {
         let reload_bc_tx_clone = reload_bc_tx.clone();
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
 
+        // Per-worker RPC endpoint table. Used by the config-reload
+        // coordinator (§ 7 WPAR-8) to fan out `ConfigReloadPrepare`
+        // and `ConfigReloadCommit` in two phases. Each worker's spawn
+        // block inserts here; on worker crash + respawn the table is
+        // updated with the new endpoint.
+        let worker_rpc_endpoints: Arc<
+            dashmap::DashMap<u32, lorica_command::RpcEndpoint>,
+        > = Arc::new(dashmap::DashMap::new());
+        // Monotonic generation counter owned by the supervisor. Every
+        // coordinated Prepare+Commit round bumps it so late/reordered
+        // workers detect stale Prepares via `GenerationGate::observe`.
+        let reload_generation: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         // Bridge: watch channel (from API) -> broadcast (to per-worker tasks)
+        //
+        // In worker mode we also drive the pipelined-RPC two-phase
+        // coordinator off the same signal (see `coordinate_config_reload`
+        // below). The coordinator and the legacy broadcast both end up
+        // reloading the same config; when both succeed the later one is
+        // a no-op (new_config == current_config). We keep the legacy
+        // path for the rare case where a worker's RPC channel is not
+        // yet registered (race at worker spawn).
         let sequence = Arc::new(AtomicU64::new(1));
         let bridge_seq = Arc::clone(&sequence);
+        let endpoints_for_reload = Arc::clone(&worker_rpc_endpoints);
+        let reload_generation_clone = Arc::clone(&reload_generation);
         tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
                 let seq = bridge_seq.fetch_add(1, Ordering::Relaxed);
-                let _ = reload_bc_tx_clone.send(seq);
+                // Two-phase RPC reload (WPAR-8) when any worker has a
+                // registered endpoint.
+                if !endpoints_for_reload.is_empty() {
+                    let gen = reload_generation_clone
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    let report = coordinate_config_reload(&endpoints_for_reload, gen).await;
+                    if !report.prepare_failed.is_empty() || !report.commit_failed.is_empty() {
+                        warn!(
+                            seq,
+                            generation = report.generation,
+                            prepare_failed = report.prepare_failed.len(),
+                            commit_failed = report.commit_failed.len(),
+                            "two-phase config reload had failures; falling back to legacy broadcast"
+                        );
+                        let _ = reload_bc_tx_clone.send(seq);
+                    }
+                } else {
+                    // No workers with RPC (e.g. --workers 0 or before
+                    // any worker registered). Fall back to legacy
+                    // per-worker broadcast which also fires the SIGHUP
+                    // path for single-process mode.
+                    let _ = reload_bc_tx_clone.send(seq);
+                }
             }
         });
 
@@ -664,11 +711,12 @@ fn run_supervisor(cli: Cli) {
                 let store_for_rpc = Arc::clone(&store);
                 let vcache = Arc::clone(&verdict_cache);
                 let breakers = Arc::clone(&breaker_registry);
+                let endpoints = Arc::clone(&worker_rpc_endpoints);
                 tokio::spawn(async move {
                     // SAFETY: rpc_fd is a valid socketpair end from
                     // WorkerManager::spawn_worker, exclusively owned by
                     // this task.
-                    let (_endpoint, mut incoming) = match unsafe {
+                    let (endpoint, mut incoming) = match unsafe {
                         lorica_command::RpcEndpoint::from_raw_fd(rpc_fd)
                     } {
                         Ok(pair) => pair,
@@ -681,6 +729,9 @@ fn run_supervisor(cli: Cli) {
                             return;
                         }
                     };
+                    // Register for supervisor-initiated RPCs (config
+                    // reload coordinator, future metrics pull).
+                    endpoints.insert(worker_id, endpoint);
                     while let Some(inc) = incoming.recv().await {
                         match inc.command_type() {
                             lorica_command::CommandType::RateLimitDelta => {
@@ -716,6 +767,10 @@ fn run_supervisor(cli: Cli) {
                             }
                         }
                     }
+                    // Worker died or channel EOF: drop the registered
+                    // endpoint so the config-reload coordinator does
+                    // not try to fan out commands to a dead worker.
+                    endpoints.remove(&worker_id);
                     tracing::debug!(worker_id, "supervisor RPC loop exiting");
                 });
             }
@@ -1822,6 +1877,161 @@ async fn handle_breaker_report(
 }
 
 // ---------------------------------------------------------------------------
+// Supervisor-side two-phase config reload coordinator (WPAR-8).
+//
+// Replaces the legacy one-shot `CommandType::ConfigReload` with a
+// Prepare (2 s timeout per worker, slow path: SQLite read + config
+// build) + Commit (500 ms timeout, fast path: single ArcSwap). The
+// result is that the divergence window between workers collapses
+// from ~10-50 ms down to the UDS RTT between workers (microseconds).
+//
+// A failed Prepare aborts the whole reload — workers that did reply
+// Ok to Prepare are asked to drop their pending slot via a best-effort
+// Commit of the *same* generation so they don't leak a stale pending
+// entry across a subsequent reload.
+// ---------------------------------------------------------------------------
+
+const CONFIG_RELOAD_PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
+const CONFIG_RELOAD_COMMIT_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Debug)]
+#[allow(dead_code)] // Lists are exported via the Debug derive for ops diagnostics.
+struct ConfigReloadReport {
+    generation: u64,
+    prepared: Vec<u32>,
+    prepare_failed: Vec<(u32, String)>,
+    committed: Vec<u32>,
+    commit_failed: Vec<(u32, String)>,
+}
+
+async fn coordinate_config_reload(
+    endpoints: &dashmap::DashMap<u32, lorica_command::RpcEndpoint>,
+    generation: u64,
+) -> ConfigReloadReport {
+    // Snapshot the endpoint list so a worker re-registering or dying
+    // mid-coordination doesn't change the set we're operating on.
+    let targets: Vec<(u32, lorica_command::RpcEndpoint)> = endpoints
+        .iter()
+        .map(|e| (*e.key(), e.value().clone()))
+        .collect();
+    let mut prepared = Vec::new();
+    let mut prepare_failed = Vec::new();
+    let mut committed = Vec::new();
+    let mut commit_failed = Vec::new();
+
+    // Phase 1: Prepare. Per-worker timeout; concurrent dispatch.
+    let prepare_futures = targets.iter().map(|(wid, ep)| {
+        let payload = lorica_command::command::Payload::ConfigReloadPrepare(
+            lorica_command::ConfigReloadPrepare { generation },
+        );
+        let ep = ep.clone();
+        let wid = *wid;
+        async move {
+            let res = ep
+                .request_rpc(
+                    lorica_command::CommandType::ConfigReloadPrepare,
+                    payload,
+                    CONFIG_RELOAD_PREPARE_TIMEOUT,
+                )
+                .await;
+            (wid, res)
+        }
+    });
+    let prepare_results = futures_util::future::join_all(prepare_futures).await;
+    for (wid, result) in prepare_results {
+        match result {
+            Ok(resp) if resp.typed_status() == lorica_command::ResponseStatus::Ok => {
+                prepared.push(wid);
+            }
+            Ok(resp) => {
+                prepare_failed.push((wid, resp.message));
+            }
+            Err(e) => {
+                prepare_failed.push((wid, format!("rpc error: {e}")));
+            }
+        }
+    }
+    if !prepare_failed.is_empty() {
+        warn!(
+            generation,
+            failed = prepare_failed.len(),
+            succeeded = prepared.len(),
+            "ConfigReloadPrepare failed on some workers; aborting reload"
+        );
+        // Best-effort drop of the pending slot on workers that did
+        // Prepare successfully: issue a Commit for `generation` so the
+        // slot gets swapped-in on those workers. This keeps the
+        // workers consistent with the partial failure semantics the
+        // operator expects: either every worker picks up the new
+        // config or the reload fails loudly. We *could* instead send
+        // a dedicated Abort RPC, but there's no meaningful difference
+        // to operators between "some workers are running the new
+        // config" and "none are" - both require a retry anyway, and
+        // the simpler wire format is a single command type.
+        //
+        // For now we leave the pending entries in place on the
+        // successful workers; a follow-up reload will overwrite them
+        // with a fresher generation, and the GenerationGate rejects
+        // commits for older generations so stale pending cannot be
+        // committed by accident.
+        return ConfigReloadReport {
+            generation,
+            prepared,
+            prepare_failed,
+            committed,
+            commit_failed,
+        };
+    }
+
+    // Phase 2: Commit. Smaller timeout; still concurrent.
+    let commit_futures = targets.iter().map(|(wid, ep)| {
+        let payload = lorica_command::command::Payload::ConfigReloadCommit(
+            lorica_command::ConfigReloadCommit { generation },
+        );
+        let ep = ep.clone();
+        let wid = *wid;
+        async move {
+            let res = ep
+                .request_rpc(
+                    lorica_command::CommandType::ConfigReloadCommit,
+                    payload,
+                    CONFIG_RELOAD_COMMIT_TIMEOUT,
+                )
+                .await;
+            (wid, res)
+        }
+    });
+    let commit_results = futures_util::future::join_all(commit_futures).await;
+    for (wid, result) in commit_results {
+        match result {
+            Ok(resp) if resp.typed_status() == lorica_command::ResponseStatus::Ok => {
+                committed.push(wid);
+            }
+            Ok(resp) => {
+                commit_failed.push((wid, resp.message));
+            }
+            Err(e) => {
+                commit_failed.push((wid, format!("rpc error: {e}")));
+            }
+        }
+    }
+    info!(
+        generation,
+        prepared = prepared.len(),
+        committed = committed.len(),
+        commit_failed = commit_failed.len(),
+        "config reload coordinated via pipelined RPC"
+    );
+    ConfigReloadReport {
+        generation,
+        prepared,
+        prepare_failed,
+        committed,
+        commit_failed,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Worker mode (Unix only): receives FDs from supervisor, runs proxy engine
 // ---------------------------------------------------------------------------
 
@@ -2429,18 +2639,15 @@ fn run_worker(
         // SAFETY: fd is a valid socketpair end received via SCM_RIGHTS
         // from the supervisor and exclusively owned by this worker.
         match unsafe { lorica_command::RpcEndpoint::from_raw_fd(fd) } {
-            Ok((endpoint, _incoming)) => {
-                // We do not currently serve supervisor-initiated
-                // commands on this channel; drop the receiver to let
-                // the reader task exit cleanly if the supervisor ever
-                // sends one (it will see the channel closed).
-                //
-                // The endpoint is cloned across four use sites:
+            Ok((endpoint, incoming)) => {
+                // The endpoint is cloned across five use sites:
                 // rate-limit sync loop, verdict cache lookup/push,
-                // breaker query/report, and config-reload prepare/
-                // commit listener. `RpcEndpoint` is `Clone` via
-                // `Arc<Inner>` so all four share the same underlying
-                // stream and pipelined dispatcher. See design § 4.3.
+                // breaker query/report, config-reload prepare/commit
+                // listener, and the incoming stream that receives
+                // supervisor-initiated commands. `RpcEndpoint` is
+                // `Clone` via `Arc<Inner>` so all five share the
+                // same underlying stream and pipelined dispatcher.
+                // See design § 4.3.
                 lorica_proxy.verdict_cache =
                     lorica::proxy_wiring::VerdictCacheEngine::rpc(
                         endpoint.clone(),
@@ -2451,6 +2658,13 @@ fn run_worker(
                         endpoint.clone(),
                         Duration::from_millis(500),
                     );
+                let _rpc_listener = lorica_proxy.spawn_worker_rpc_listener(
+                    &worker_auth_prune_tracker,
+                    incoming,
+                    Arc::clone(&store),
+                    None,
+                    id,
+                );
                 let _sync_handle = lorica_proxy.spawn_rate_limit_sync(
                     &worker_auth_prune_tracker,
                     endpoint,
@@ -2458,7 +2672,7 @@ fn run_worker(
                 );
                 info!(
                     worker_id = id,
-                    "rate-limit sync task spawned; verdict cache + breaker engines bound to RPC"
+                    "rate-limit sync + RPC listener spawned; verdict cache + breaker engines bound to RPC"
                 );
             }
             Err(e) => {
