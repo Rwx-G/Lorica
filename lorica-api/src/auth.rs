@@ -224,10 +224,20 @@ pub fn hash_password(password: &str) -> Result<String, ApiError> {
 }
 
 /// Generate a random password for first-run admin setup.
+///
+/// Uses `OsRng` (getrandom) rather than `thread_rng` so the first-run
+/// password is unpredictable even if the thread_rng seeding path ever
+/// degrades. Matches the other crypto-sensitive RNG in this file
+/// (`hash_password`'s `SaltString::generate(OsRng)`). Audit L-5.
 pub fn generate_random_password() -> String {
-    use rand::Rng;
+    use rand::{Rng, SeedableRng};
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%&*";
-    let mut rng = rand::thread_rng();
+    // ChaCha20 seeded from OsRng: fast, deterministic-per-seed
+    // sequence but seeded from OS entropy. `rand::rngs::OsRng` itself
+    // is not a `Rng` in rand 0.8 (it's a `CryptoRng + RngCore`), and
+    // `gen_range` requires a `Rng`, so we re-seed a CSPRNG from OsRng.
+    let mut rng = rand_chacha::ChaCha20Rng::from_rng(rand::rngs::OsRng)
+        .expect("OsRng must seed ChaCha20 for admin password generation");
     (0..24)
         .map(|_| {
             let idx = rng.gen_range(0..CHARSET.len());

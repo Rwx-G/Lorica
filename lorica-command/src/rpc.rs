@@ -57,11 +57,20 @@ use crate::ChannelError;
 const MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
 
 /// Bounded outbound queue capacity. Under backpressure, `request` awaits
-/// `tx_out.send(...)` which drives the per-request timeout.
+/// `tx_out.send(...)` which drives the per-request timeout. The cap
+/// intentionally does NOT cause a hard error path: the per-request
+/// timeout passed to `request(...)` is the single wall-clock bound on
+/// the entire RPC (enqueue + write + peer processing + reply). A stuck
+/// peer cannot blow the queue because backpressure stalls the caller
+/// there, and the caller's timeout eventually wakes up and removes the
+/// in-flight entry on exit.
 const OUTBOUND_QUEUE_CAP: usize = 256;
 
 /// If enqueuing to the outbound channel takes longer than this, log a
-/// warning so operators can spot a stuck peer.
+/// warning so operators can spot a stuck peer. Advisory only - the
+/// per-request `timeout` passed to `request(...)` remains the
+/// authoritative bound on total RPC latency. Tuning this down turns up
+/// the log volume; tuning it up hides the slowdown from ops.
 const SLOW_ENQUEUE_WARN: Duration = Duration::from_millis(10);
 
 /// Default per-request timeout when the caller does not specify one.
@@ -144,7 +153,21 @@ impl IncomingCommand {
 
     /// Reply with a pre-built `Response`. The response's `sequence` is
     /// overwritten with the originating command's sequence as a safety.
+    ///
+    /// In debug builds we assert that any caller-provided `sequence`
+    /// is either zero (the conventional sentinel used by
+    /// `Response::ok_with(0, ...)`) or already matches the incoming
+    /// command - passing a mismatched non-zero sequence is almost
+    /// always a wiring bug (audit L-3).
     pub async fn reply(self, mut resp: Response) -> Result<(), ChannelError> {
+        debug_assert!(
+            resp.sequence == 0 || resp.sequence == self.cmd.sequence,
+            "IncomingCommand::reply received a response with sequence {} which does not match \
+             the originating command's sequence {}; pass 0 as the sentinel sequence when the \
+             response sequence is not yet known.",
+            resp.sequence,
+            self.cmd.sequence
+        );
         resp.sequence = self.cmd.sequence;
         send_envelope(&self.tx_out, Envelope::response(resp)).await
     }

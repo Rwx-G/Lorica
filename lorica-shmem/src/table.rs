@@ -266,16 +266,25 @@ pub fn now_ns() -> u64 {
     // clock_gettime(CLOCK_MONOTONIC) cannot fail in practice on Linux
     // with a valid clockid. Fall back to 0 if it ever does; eviction
     // walker will simply see every slot as "fresh" during that tick.
-    clock_gettime(ClockId::CLOCK_MONOTONIC)
-        .map(|ts| {
+    // We surface the (extremely unlikely) error as a warn log instead
+    // of silently degrading the eviction semantics - audit L-1.
+    match clock_gettime(ClockId::CLOCK_MONOTONIC) {
+        Ok(ts) => {
             // tv_nsec is i64 but POSIX constrains CLOCK_MONOTONIC to
             // 0..=999_999_999 — never negative in practice — so the
             // `as u64` cast is well-defined.
             (ts.num_seconds() as u64)
                 .saturating_mul(1_000_000_000)
                 .saturating_add(ts.tv_nsec() as u64)
-        })
-        .unwrap_or(0)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "lorica-shmem::now_ns: clock_gettime(CLOCK_MONOTONIC) failed; eviction disabled for this tick"
+            );
+            0
+        }
+    }
 }
 
 #[cfg(test)]

@@ -244,6 +244,19 @@ impl AuthoritativeBucket {
         // Tokens added (fp) = refill_per_sec * elapsed_ns / 1_000
         //                   = refill_per_sec * elapsed_ns * SCALE / 1_000_000_000
         // (since SCALE / 1_000_000_000 == 1 / 1_000)
+        //
+        // Saturation check: with `refill_per_sec` API-capped at
+        // `RATE_LIMIT_MAX = 1_000_000` and `elapsed_ns / 1000` bounded
+        // by `i64::MAX / 1_000_000 ~= 9.2e12` microseconds (~290 years),
+        // `saturating_mul` only fires on a runaway clock (uptime past
+        // 290y or a rewound `now_ns`). In debug we assert we're well
+        // below that to catch future API-cap regressions early -
+        // audit L-6.
+        debug_assert!(
+            self.refill_per_sec <= 1_000_000,
+            "refill_per_sec {} exceeds API cap 1_000_000; API validation should reject this",
+            self.refill_per_sec
+        );
         let add_fp = (self.refill_per_sec as i64).saturating_mul((elapsed_ns / 1_000) as i64);
         let cap_fp = (self.capacity as i64).saturating_mul(SCALE);
         s.tokens_fp = (s.tokens_fp.saturating_add(add_fp)).min(cap_fp);
