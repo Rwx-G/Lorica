@@ -158,6 +158,17 @@ fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
     // Build the writer: file (non-blocking, thread-safe) or stdout.
+    // `tracing_subscriber::fmt()` internally builds a Registry with the
+    // fmt layer attached; the span fields on entered `#[instrument]`
+    // scopes flow onto every event record by default via the fmt layer's
+    // `with_current_span(true)` + `with_span_list(true)` behaviour, which
+    // is how the `trace_id` / `span_id` / `request_id` fields set on the
+    // proxy hooks end up in every log line without per-line plumbing.
+    // The tracing-opentelemetry bridge (so `#[instrument]` spans become
+    // OTel spans exported via the global provider) is intentionally not
+    // installed from here: the reload pattern fights the current
+    // `tracing_subscriber::fmt().init()` shape. That bridge lives behind
+    // a separate follow-up in story 1.4c.
     macro_rules! build_subscriber {
         ($writer:expr, $ansi:expr) => {
             if log_format == "text" {

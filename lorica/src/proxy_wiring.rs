@@ -1830,6 +1830,15 @@ impl ProxyHttp for LoricaProxy {
         }
     }
 
+    #[tracing::instrument(
+        name = "request_filter",
+        skip_all,
+        fields(
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            request_id = %ctx.request_id,
+        )
+    )]
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool>
     where
         Self::CTX: Send + Sync,
@@ -1860,6 +1869,20 @@ impl ProxyHttp for LoricaProxy {
                 ctx.traceparent_from_client = false;
             }
             ctx.incoming_traceparent = incoming;
+
+            // Now that the outgoing traceparent exists, stamp the
+            // `trace_id` and `span_id` fields on the current tracing
+            // span so every subsequent tracing::info! / warn! inside
+            // request_filter (and inside any function it calls that
+            // does not open its own span) carries them in the log
+            // output. For downstream hooks (upstream_request_filter,
+            // response_filter, logging), their own #[instrument]
+            // attribute reads the same fields directly from ctx.
+            if let Some(ref tp) = ctx.outgoing_traceparent {
+                let span = tracing::Span::current();
+                span.record("trace_id", tp.trace_id.as_str());
+                span.record("span_id", tp.parent_id.as_str());
+            }
         }
 
         // Create the OpenTelemetry root span for this request, linked
@@ -3515,6 +3538,15 @@ impl ProxyHttp for LoricaProxy {
     /// If the route has an `error_page_html` configured, render it with the
     /// error status code. Otherwise fall back to the default Pingora error
     /// response (plain-text status line).
+    #[tracing::instrument(
+        name = "fail_to_proxy",
+        skip_all,
+        fields(
+            trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
+            span_id = ctx.outgoing_traceparent.as_ref().map(|t| t.parent_id.as_str()).unwrap_or(""),
+            request_id = %ctx.request_id,
+        )
+    )]
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
@@ -3795,6 +3827,15 @@ impl ProxyHttp for LoricaProxy {
         Ok(peer)
     }
 
+    #[tracing::instrument(
+        name = "upstream_request_filter",
+        skip_all,
+        fields(
+            trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
+            span_id = ctx.outgoing_traceparent.as_ref().map(|t| t.parent_id.as_str()).unwrap_or(""),
+            request_id = %ctx.request_id,
+        )
+    )]
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
@@ -3952,6 +3993,15 @@ impl ProxyHttp for LoricaProxy {
         Ok(())
     }
 
+    #[tracing::instrument(
+        name = "response_filter",
+        skip_all,
+        fields(
+            trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
+            span_id = ctx.outgoing_traceparent.as_ref().map(|t| t.parent_id.as_str()).unwrap_or(""),
+            request_id = %ctx.request_id,
+        )
+    )]
     async fn response_filter(
         &self,
         session: &mut Session,
@@ -4259,6 +4309,15 @@ impl ProxyHttp for LoricaProxy {
         })
     }
 
+    #[tracing::instrument(
+        name = "logging",
+        skip_all,
+        fields(
+            trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
+            span_id = ctx.outgoing_traceparent.as_ref().map(|t| t.parent_id.as_str()).unwrap_or(""),
+            request_id = %ctx.request_id,
+        )
+    )]
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX)
     where
         Self::CTX: Send + Sync,
