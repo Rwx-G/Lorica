@@ -51,7 +51,14 @@ strum = "0.26"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [features]
-default = ["route53"]
+# Route53 is opt-in because its dep graph drags `aws-smithy-http-client`
+# which depends on the security-maintenance-only `rustls 0.21` + `hyper 0.14`
+# stack. Deployments that don't use ACME DNS-01 via Route53 (the great
+# majority of today's users) should not pay the compile cost nor ship that
+# older TLS surface. Enable explicitly with `--features route53` when
+# building from source, or uncomment the default line for downstream
+# packagers that need it. See ROADMAP.md (audit SC-M-3).
+default = []
 route53 = ["aws-config", "aws-sdk-route53"]
 
 [dev-dependencies]
