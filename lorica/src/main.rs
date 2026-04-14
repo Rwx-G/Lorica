@@ -1569,6 +1569,10 @@ async fn handle_rate_limit_delta(
 
 const SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES: usize = 16_384;
 
+/// Triple returned by [`SupervisorVerdictCache::lookup`]: encoded
+/// `Verdict`, response-header pairs, and remaining TTL in ms.
+type VerdictLookupResult = (i32, Vec<(String, String)>, u64);
+
 struct SupervisorVerdictCacheEntry {
     verdict: i32,
     response_headers: Vec<(String, String)>,
@@ -1598,17 +1602,22 @@ impl SupervisorVerdictCache {
         k
     }
 
-    fn lookup(&self, route_id: &str, cookie: &str) -> Option<(i32, Vec<(String, String)>, u64)> {
+    fn lookup(&self, route_id: &str, cookie: &str) -> Option<VerdictLookupResult> {
         let key = Self::key(route_id, cookie);
-        let entry = self.entries.get(&key)?;
-        let now = Instant::now();
-        if now >= entry.expires_at {
-            drop(entry);
+        let result = {
+            let entry = self.entries.get(&key)?;
+            let now = Instant::now();
+            if now >= entry.expires_at {
+                None
+            } else {
+                let ttl_ms = entry.expires_at.saturating_duration_since(now).as_millis() as u64;
+                Some((entry.verdict, entry.response_headers.clone(), ttl_ms))
+            }
+        };
+        if result.is_none() {
             self.entries.remove(&key);
-            return None;
         }
-        let ttl_ms = entry.expires_at.saturating_duration_since(now).as_millis() as u64;
-        Some((entry.verdict, entry.response_headers.clone(), ttl_ms))
+        result
     }
 
     fn insert(

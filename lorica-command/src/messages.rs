@@ -900,6 +900,10 @@ mod tests {
                 cookie: "c".into(),
                 verdict: Verdict::Allow as i32,
                 ttl_ms: 60_000,
+                response_headers: vec![ForwardAuthHeader {
+                    name: "Remote-User".into(),
+                    value: "alice".into(),
+                }],
             }),
         );
         let roundtrip = Command::decode(&push.encode_to_vec()[..]).unwrap();
@@ -962,6 +966,7 @@ mod tests {
                 found: true,
                 verdict: Verdict::Deny as i32,
                 ttl_ms: 30_000,
+                response_headers: Vec::new(),
             }),
         );
         let roundtrip = Response::decode(&resp.encode_to_vec()[..]).unwrap();

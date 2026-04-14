@@ -44,6 +44,8 @@ struct VerdictCache {
     inner: DashMap<String, VerdictEntry>,
 }
 
+type VerdictLookupTriple = (i32, Vec<(String, String)>, u64);
+
 impl VerdictCache {
     fn new() -> Self {
         Self {
@@ -53,7 +55,7 @@ impl VerdictCache {
     fn key(route: &str, cookie: &str) -> String {
         format!("{route}\0{cookie}")
     }
-    fn lookup(&self, route: &str, cookie: &str) -> Option<(i32, Vec<(String, String)>, u64)> {
+    fn lookup(&self, route: &str, cookie: &str) -> Option<VerdictLookupTriple> {
         let k = Self::key(route, cookie);
         let entry = self.inner.get(&k)?;
         if Instant::now() >= entry.expires_at {
