@@ -606,6 +606,16 @@ fn run_supervisor(cli: Cli) {
         let reload_generation: Arc<std::sync::atomic::AtomicU64> =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+        // Per-route rate-limit policy cache (audit M-4). Without this
+        // cache, N concurrent `RateLimitDelta` RPCs on a first-seen
+        // `{route|scope}` key serialise on the single `store`
+        // tokio::Mutex for N SQLite reads. Cache populated on miss,
+        // invalidated on every successful two-phase Commit (see the
+        // reload coordinator below).
+        let rl_policy_cache: Arc<
+            dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>,
+        > = Arc::new(dashmap::DashMap::new());
+
         // Bridge: watch channel (from API) -> broadcast (to per-worker tasks)
         //
         // In worker mode we also drive the pipelined-RPC two-phase
@@ -619,6 +629,7 @@ fn run_supervisor(cli: Cli) {
         let bridge_seq = Arc::clone(&sequence);
         let endpoints_for_reload = Arc::clone(&worker_rpc_endpoints);
         let reload_generation_clone = Arc::clone(&reload_generation);
+        let rl_policy_for_reload = Arc::clone(&rl_policy_cache);
         tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
                 let seq = bridge_seq.fetch_add(1, Ordering::Relaxed);
@@ -638,6 +649,13 @@ fn run_supervisor(cli: Cli) {
                             "two-phase config reload had failures; falling back to legacy broadcast"
                         );
                         let _ = reload_bc_tx_clone.send(seq);
+                    } else {
+                        // Commit succeeded on every worker: route
+                        // rate-limit policies may have changed, so
+                        // drop the cached supervisor-side copies so
+                        // the next `RateLimitDelta` for a given route
+                        // re-reads them from the store (audit M-4).
+                        rl_policy_for_reload.clear();
                     }
                 } else {
                     // No workers with RPC (e.g. --workers 0 or before
@@ -645,6 +663,7 @@ fn run_supervisor(cli: Cli) {
                     // per-worker broadcast which also fires the SIGHUP
                     // path for single-process mode.
                     let _ = reload_bc_tx_clone.send(seq);
+                    rl_policy_for_reload.clear();
                 }
             }
         });
@@ -708,6 +727,7 @@ fn run_supervisor(cli: Cli) {
             {
                 let rpc_fd = rpc_raw_fd;
                 let registry = Arc::clone(&rl_registry);
+                let rl_policy = Arc::clone(&rl_policy_cache);
                 let store_for_rpc = Arc::clone(&store);
                 let vcache = Arc::clone(&verdict_cache);
                 let breakers = Arc::clone(&breaker_registry);
@@ -738,6 +758,7 @@ fn run_supervisor(cli: Cli) {
                                 handle_rate_limit_delta(
                                     inc,
                                     &registry,
+                                    &rl_policy,
                                     &store_for_rpc,
                                     worker_id,
                                 )
@@ -1498,6 +1519,7 @@ fn run_supervisor(cli: Cli) {
 async fn handle_rate_limit_delta(
     inc: lorica_command::IncomingCommand,
     registry: &dashmap::DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>,
+    rl_policy_cache: &dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>,
     store: &Arc<Mutex<lorica_config::ConfigStore>>,
     worker_id: u32,
 ) {
@@ -1535,12 +1557,26 @@ async fn handle_rate_limit_delta(
                 // the worker sent is a no-op (the worker's own
                 // LocalBucket should not have existed in the first
                 // place, but we handle it defensively).
-                let rl_cfg = {
-                    let s = store.lock().await;
-                    s.get_route(route_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|r| r.rate_limit.clone())
+                //
+                // Hit the per-route policy cache first so concurrent
+                // RateLimitDeltas from N workers don't all serialise on
+                // the `store` tokio::Mutex at first-seen time (audit
+                // M-4). The cache is invalidated on every successful
+                // config reload (see `invalidate_rl_policy_cache`).
+                let rl_cfg = if let Some(cached) =
+                    rl_policy_cache.get(route_id).map(|e| e.value().clone())
+                {
+                    cached
+                } else {
+                    let fetched = {
+                        let s = store.lock().await;
+                        s.get_route(route_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|r| r.rate_limit.clone())
+                    };
+                    rl_policy_cache.insert(route_id.to_string(), fetched.clone());
+                    fetched
                 };
                 let Some(rl) = rl_cfg else {
                     tracing::debug!(
@@ -1626,20 +1662,26 @@ impl SupervisorVerdictCache {
 
     fn lookup(&self, route_id: &str, cookie: &str) -> Option<VerdictLookupResult> {
         let key = Self::key(route_id, cookie);
-        let result = {
+        // Fast path: clone out under the read guard, then drop the ref.
+        let (verdict, response_headers, expires_at) = {
             let entry = self.entries.get(&key)?;
-            let now = Instant::now();
-            if now >= entry.expires_at {
-                None
-            } else {
-                let ttl_ms = entry.expires_at.saturating_duration_since(now).as_millis() as u64;
-                Some((entry.verdict, entry.response_headers.clone(), ttl_ms))
-            }
+            (
+                entry.verdict,
+                entry.response_headers.clone(),
+                entry.expires_at,
+            )
         };
-        if result.is_none() {
-            self.entries.remove(&key);
+        let now = Instant::now();
+        if now >= expires_at {
+            // Expired: evict atomically only if the entry at `key` is
+            // still the one we read. `remove_if` closes the TOCTOU noted
+            // in audit M-2 - a fresh `insert` racing with this lookup
+            // can no longer be evicted by a stale expiry observation.
+            self.entries.remove_if(&key, |_, e| e.expires_at == expires_at);
+            return None;
         }
-        result
+        let ttl_ms = expires_at.saturating_duration_since(now).as_millis() as u64;
+        Some((verdict, response_headers, ttl_ms))
     }
 
     fn insert(

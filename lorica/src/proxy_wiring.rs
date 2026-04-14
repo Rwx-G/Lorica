@@ -617,14 +617,21 @@ impl EwmaTracker {
     }
 
     /// Update the EWMA score for a backend with a new latency sample.
+    ///
+    /// Hot path: we try `get_mut` first with a write lock already held
+    /// so the common case (backend already known) avoids the
+    /// `addr.to_string()` allocation that `insert` would incur. Only
+    /// the first-seen backend per process pays for the `String`
+    /// (audit M-1).
     pub fn record(&self, addr: &str, latency_us: f64) {
-        let mut scores = self.scores.write();
-        let current = scores.get(addr).copied().unwrap_or(0.0);
-        // Exponential decay: new_score = alpha * sample + (1-alpha) * old_score
-        // With alpha ~0.3 for responsive adaptation
         let alpha = 0.3;
-        let new_score = alpha * latency_us + (1.0 - alpha) * current;
-        scores.insert(addr.to_string(), new_score);
+        let mut scores = self.scores.write();
+        if let Some(current) = scores.get_mut(addr) {
+            *current = alpha * latency_us + (1.0 - alpha) * *current;
+        } else {
+            // First-seen: seed the decay with the sample itself.
+            scores.insert(addr.to_string(), latency_us);
+        }
     }
 
     /// Select the backend with the lowest EWMA score.
@@ -2078,21 +2085,20 @@ fn extract_sticky_backend(cookie_header: &str) -> Option<&str> {
 }
 
 /// Generate a compact hex request ID (16 bytes = 32 hex chars).
+///
+/// Uses `OsRng` (getrandom) so request IDs are unpredictable and
+/// collision-resistant even under concurrent same-nanosecond requests
+/// on the same thread (audit M-5). The prior `DefaultHasher`
+/// implementation was SipHash-keyed per process and emitted
+/// deterministic output given `(now, thread_id)` inputs, so an
+/// attacker observing a few IDs could predict future ones.
 fn generate_request_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let rand: u64 = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        ts.hash(&mut h);
-        std::thread::current().id().hash(&mut h);
-        h.finish()
-    };
-    format!("{ts:016x}{rand:016x}")
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let hi = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+    let lo = u64::from_le_bytes(bytes[8..].try_into().expect("8 bytes"));
+    format!("{hi:016x}{lo:016x}")
 }
 
 /// Escape HTML special characters to prevent XSS when injecting dynamic values
@@ -2327,24 +2333,23 @@ pub(crate) async fn run_forward_auth_keyed(
         match cache_engine {
             VerdictCacheEngine::Local => {
                 if let Some(ref key) = cache_key {
-                    if let Some(entry) = FORWARD_AUTH_VERDICT_CACHE.get(key) {
-                        if std::time::Instant::now() < entry.expires_at {
-                            lorica_api::metrics::inc_forward_auth_cache(route_id, "hit");
-                            return ForwardAuthOutcome::Allow {
-                                response_headers: entry.response_headers.clone(),
-                            };
-                        }
-                        // Stale entry; drop the read ref so we can remove below.
-                    }
-                    // Lazy eviction: if the entry exists but is expired, remove
-                    // it now so memory doesn't accumulate dead entries when a
-                    // session goes idle.
-                    let expired = FORWARD_AUTH_VERDICT_CACHE
+                    // Clone out under the ref, then drop it before any
+                    // potential mutation so we can't self-deadlock or
+                    // hold the shard lock across the miss path below.
+                    let snapshot = FORWARD_AUTH_VERDICT_CACHE
                         .get(key)
-                        .map(|e| std::time::Instant::now() >= e.expires_at)
-                        .unwrap_or(false);
-                    if expired {
-                        FORWARD_AUTH_VERDICT_CACHE.remove(key);
+                        .map(|e| (e.expires_at, e.response_headers.clone()));
+                    if let Some((expires_at, response_headers)) = snapshot {
+                        if std::time::Instant::now() < expires_at {
+                            lorica_api::metrics::inc_forward_auth_cache(route_id, "hit");
+                            return ForwardAuthOutcome::Allow { response_headers };
+                        }
+                        // Expired: evict atomically only if the entry at
+                        // `key` is still the one we just observed. A
+                        // concurrent fresh `insert` between snapshot and
+                        // remove is preserved - audit M-3 TOCTOU fix.
+                        FORWARD_AUTH_VERDICT_CACHE
+                            .remove_if(key, |_, e| e.expires_at == expires_at);
                     }
                     lorica_api::metrics::inc_forward_auth_cache(route_id, "miss");
                 }
