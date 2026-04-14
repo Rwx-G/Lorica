@@ -31,7 +31,6 @@ use lorica_cache::lock::CacheLock;
 use lorica_cache::predictor::Predictor;
 use lorica_cache::{
     CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable,
-    VarianceBuilder,
 };
 use lorica_config::models::{Backend, Certificate, HealthStatus, LifecycleState, Route, WafMode};
 use lorica_core::protocols::Digest;
@@ -856,13 +855,6 @@ static CACHE_LOCK: Lazy<&'static CacheLock> = Lazy::new(|| {
     Box::leak(lock)
 });
 
-/// Shared HTTP client used for forward-auth sub-requests. Built once and
-/// reused across all routes so connection pooling and TLS sessions amortize
-/// across requests. Redirects are disabled - an auth service replying 302
-/// must be treated as a "deny" verdict we forward to the client, never
-/// transparently followed (that would turn a login-redirect into a
-/// back-to-the-proxy loop).
-
 /// Cacheability predictor. Remembers keys whose origin recently responded as
 /// uncacheable (OriginNotCache, ResponseTooLarge, or a user-defined custom
 /// reason) and short-circuits the cache state machine on the next request,
@@ -1102,16 +1094,20 @@ pub struct PendingProxyConfig {
 // file below the refactor threshold. Re-exported here so
 // `lorica::proxy_wiring::BreakerEngine` (etc.) still resolves.
 pub mod forward_auth;
-pub(crate) use forward_auth::{build_forward_auth_headers, run_forward_auth_keyed, verdict_cache_key, ForwardAuthOutcome};
+pub(crate) use forward_auth::{run_forward_auth_keyed, ForwardAuthOutcome};
 #[cfg(test)]
-pub(crate) use forward_auth::{run_forward_auth, verdict_cache_reset_for_test};
+pub(crate) use forward_auth::{
+    build_forward_auth_headers, run_forward_auth, verdict_cache_key, verdict_cache_reset_for_test,
+};
 
 pub mod mirror_rewrite;
 pub(crate) use mirror_rewrite::{
-    apply_response_rewrites, build_mirror_forward_headers, build_mirror_url,
-    compile_rewrite_rule, mirror_sample_hit, request_has_body, should_rewrite_response,
-    spawn_mirrors, CompiledRewriteRule, MirrorBodyState, MirrorPending, ResponseRewriteState,
+    apply_response_rewrites, build_mirror_forward_headers, compile_rewrite_rule,
+    mirror_sample_hit, request_has_body, should_rewrite_response, spawn_mirrors,
+    CompiledRewriteRule, MirrorBodyState, MirrorPending, ResponseRewriteState,
 };
+#[cfg(test)]
+pub(crate) use mirror_rewrite::build_mirror_url;
 
 pub mod helpers;
 // `pub` (not `pub(crate)`) for `canary_bucket` and `evaluate_mtls`
@@ -1119,11 +1115,12 @@ pub mod helpers;
 // (canary_e2e_test, mtls_e2e_test).
 pub use helpers::{canary_bucket, evaluate_mtls};
 pub(crate) use helpers::{
-    cache_vary_for_request, compute_cache_variance, downstream_ssl_digest, extract_host,
-    sanitize_html,
+    cache_vary_for_request, downstream_ssl_digest, extract_host, sanitize_html,
 };
 #[cfg(test)]
-pub(crate) use helpers::{match_header_rule_backends, pick_traffic_split_backends};
+pub(crate) use helpers::{
+    compute_cache_variance, match_header_rule_backends, pick_traffic_split_backends,
+};
 
 pub mod engines;
 pub use engines::{BreakerAdmission, BreakerEngine, RateLimitEngine, VerdictCacheEngine};

@@ -22,6 +22,10 @@
 //!   - `cache_vary_for_request` + `compute_cache_variance` (cache
 //!     partitioning by request headers).
 
+// `Arc` + `Backend` are only consumed by the `#[cfg(test)]` helpers
+// below (`match_header_rule_backends`, `pick_traffic_split_backends`).
+// Gating their `use`s keeps `-D unused-imports` clean in lib builds.
+#[cfg(test)]
 use std::sync::Arc;
 
 use lorica_cache::key::HashBinary;
@@ -30,7 +34,9 @@ use lorica_config::models::Route;
 use lorica_proxy::Session;
 use once_cell::sync::Lazy;
 
-use super::{Backend, MtlsEnforcer};
+#[cfg(test)]
+use super::Backend;
+use super::MtlsEnforcer;
 
 static RE_SCRIPT: Lazy<regex::Regex> = Lazy::new(|| {
     regex::Regex::new(r"(?is)<script[\s>].*?</script>").expect("sanitize: script regex")
@@ -158,12 +164,6 @@ pub(crate) fn downstream_ssl_digest(session: &Session) -> Option<String> {
     // (empty string is never in a non-empty allowlist).
     Some(ssl.organization.clone().unwrap_or_default())
 }
-
-/// Deterministic per-request sampling decision for request mirroring.
-/// Hashes the `request_id` (a UUID assigned per request) and modulos to
-/// 100. This keeps sampling stable across retries of the same logical
-/// request - useful for debugging ("did this specific request ID get
-/// mirrored?"). Returns `true` when the request should be mirrored.
 
 /// Compute a stable bucket in `0..100` for `(route_id, client_ip)`. Same
 /// inputs always map to the same bucket within a single process, which
