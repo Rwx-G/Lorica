@@ -534,6 +534,8 @@ fn run_supervisor(cli: Cli) {
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let worker_metrics = Arc::new(lorica_api::workers::WorkerMetrics::new());
 
+        try_init_otel_from_settings(&store, "supervisor").await;
+
         // UDS log stream: workers send access logs in real-time to the supervisor
         let log_sock_path = data_dir.join("log.sock");
         let _ = std::fs::remove_file(&log_sock_path); // clean stale socket
@@ -1585,6 +1587,12 @@ fn run_supervisor(cli: Cli) {
         }
         api_handle.abort();
         health_handle.abort();
+
+        // Flush the OTel batch exporter before the runtime drops so
+        // supervisor-side spans (API requests, health checks) reach
+        // the collector on clean shutdown. No-op when the `otel`
+        // feature is off or the endpoint was never configured.
+        lorica::otel::shutdown();
     });
 }
 
@@ -2497,6 +2505,14 @@ fn run_worker(
         }
     });
 
+    // Initialise the OTel exporter in this worker's runtime. Must run
+    // *after* fork and *inside* the worker's runtime so the batch
+    // processor's background task lives on the right reactor. Each
+    // worker thus maintains its own independent exporter; spans emitted
+    // on one worker do not block another worker's flush queue. The
+    // supervisor has its own init (for API / health spans).
+    rt.block_on(try_init_otel_from_settings(&store, "worker"));
+
     // Build CertResolver for TLS termination in worker
     let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
     rt.block_on(async {
@@ -3126,6 +3142,18 @@ fn run_worker(
 
     info!(worker_id = id, "starting proxy engine");
 
+    // NOTE on OTel shutdown in workers: `Server::run_forever()` returns
+    // `!` (process::exit), so there is no reachable post-serve flush
+    // hook here. Workers rely on the BatchSpanProcessor's periodic
+    // export (default ~5 s interval) to drain spans during steady-state
+    // operation; a worker killed abruptly mid-interval may lose at
+    // most the last N seconds of spans. For graceful shutdown, the
+    // supervisor broadcasts drain + SIGTERM, workers exit, and the
+    // supervisor's own `lorica::otel::shutdown()` fires in the parent
+    // process. A future lorica-core change to expose a pre-exit hook
+    // would let workers flush their own exporter. Tracked as a
+    // follow-up.
+
     let mut server = lorica_core::server::Server::new(None).expect("failed to create proxy server");
     server.set_listen_fds(fds);
     server.add_service(proxy_service);
@@ -3207,38 +3235,7 @@ fn run_single_process(cli: Cli) {
             std::process::exit(1);
         }
 
-        // OpenTelemetry tracing init (feature-gated, no-op when `otel` feature
-        // is off). Reads `otlp_*` fields from GlobalSettings and installs the
-        // global tracer provider. Runs inside the Tokio runtime because the
-        // OTLP batch exporter spawns a background flush task. Failures are
-        // logged and tracing stays disabled — observability is not a critical
-        // path so a misconfigured endpoint never blocks startup.
-        {
-            let s = store.lock().await;
-            if let Ok(gs) = s.get_global_settings() {
-                if let Some(endpoint) = gs.otlp_endpoint.as_ref().filter(|e| !e.trim().is_empty()) {
-                    let otel_cfg = lorica::otel::OtelConfig {
-                        endpoint: endpoint.clone(),
-                        protocol: lorica::otel::OtlpProtocol::from_settings(&gs.otlp_protocol),
-                        service_name: gs.otlp_service_name.clone(),
-                        sampling_ratio: gs.otlp_sampling_ratio,
-                    };
-                    match lorica::otel::init(&otel_cfg) {
-                        Ok(()) => info!(
-                            endpoint = %otel_cfg.endpoint,
-                            protocol = otel_cfg.protocol.as_str(),
-                            service_name = %otel_cfg.service_name,
-                            sampling_ratio = otel_cfg.sampling_ratio,
-                            "OpenTelemetry tracing enabled"
-                        ),
-                        Err(e) => warn!(
-                            error = %e,
-                            "OpenTelemetry init failed; tracing disabled (startup continues)"
-                        ),
-                    }
-                }
-            }
-        }
+        try_init_otel_from_settings(&store, "single-process").await;
 
         // Build the CertResolver for SNI-based certificate selection
         let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
@@ -3658,6 +3655,59 @@ fn run_single_process(cli: Cli) {
         // never configured, so it's always safe to call.
         lorica::otel::shutdown();
     });
+}
+
+/// Try to initialise the OpenTelemetry exporter from persisted
+/// `GlobalSettings`. No-op when the `otel` Cargo feature is off, the
+/// settings row cannot be read, or `otlp_endpoint` is unset / blank.
+///
+/// Must be called from inside a Tokio runtime — the OTLP batch
+/// exporter spawns a background flush task. `role` is a free-form
+/// label (`"supervisor"`, `"worker"`, `"single-process"`) included in
+/// the startup log line so multi-process installs can tell which
+/// component finished tracing init.
+///
+/// Errors are logged at `warn!` and swallowed: observability is not
+/// a critical path, so a misconfigured endpoint never blocks startup.
+async fn try_init_otel_from_settings(
+    store: &Arc<Mutex<lorica_config::ConfigStore>>,
+    role: &str,
+) {
+    let s = store.lock().await;
+    let gs = match s.get_global_settings() {
+        Ok(gs) => gs,
+        Err(e) => {
+            warn!(error = %e, "failed to read global settings for OTel init");
+            return;
+        }
+    };
+    drop(s);
+
+    let Some(endpoint) = gs.otlp_endpoint.as_ref().filter(|e| !e.trim().is_empty()) else {
+        return;
+    };
+
+    let otel_cfg = lorica::otel::OtelConfig {
+        endpoint: endpoint.clone(),
+        protocol: lorica::otel::OtlpProtocol::from_settings(&gs.otlp_protocol),
+        service_name: gs.otlp_service_name.clone(),
+        sampling_ratio: gs.otlp_sampling_ratio,
+    };
+    match lorica::otel::init(&otel_cfg) {
+        Ok(()) => info!(
+            role = role,
+            endpoint = %otel_cfg.endpoint,
+            protocol = otel_cfg.protocol.as_str(),
+            service_name = %otel_cfg.service_name,
+            sampling_ratio = otel_cfg.sampling_ratio,
+            "OpenTelemetry tracing enabled"
+        ),
+        Err(e) => warn!(
+            role = role,
+            error = %e,
+            "OpenTelemetry init failed; tracing disabled (startup continues)"
+        ),
+    }
 }
 
 /// Build a NotifyDispatcher from database notification configs.
