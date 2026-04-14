@@ -71,20 +71,27 @@ alive, which blocked peer EOF, which hung worker shutdown on the 10 s
 `TaskTracker` drain. Now `drop` explicitly calls `handle.abort()` on
 both tasks.
 
-### v1.3.0 - deferred to v1.3.1
+### v1.3.0 - audit supply-chain + coverage follow-ups (landed)
 
-Tech debt and feature-flag reshapes that were explicitly scoped out
-of the release, with tracking issues to open:
+The audit round-2 pass identified 7 residual items beyond the
+original 3 High + 8 Medium + 8 Low findings (tech debt + supply-
+chain hygiene + CI coverage). 6 of them landed in the v1.3.0
+release; the last is tracked below in "deferred to v1.3.1".
+
+| Item | Source | Resolution |
+|---|---|---|
+| `route53` feature off-by-default | Audit SC-M-3 | `lorica-api/Cargo.toml` default flipped to `default = []`. Non-Route53 deployments no longer ship `rustls 0.21 + hyper 0.14`. Enable with `--features route53` when building |
+| `brotli 3 -> 8` | Audit SC-L-1 | Bumped `lorica-core/Cargo.toml` to `brotli = "8"`. API source-compatible for our `CompressorWriter` / `DecompressorWriter` usage; no behaviour change |
+| `no_debug 3.1.0` inline | Audit SC-L-3 | Inlined as `lorica-tls::no_debug` module (~130 LOC incl. 5 tests). `pub use crate::no_debug::{...}` keeps every downstream `use lorica_tls::NoDebug` working unchanged |
+| `daemonize 0.5.0` replacement | RUSTSEC-2025-0069 | Dropped the dep. Production Lorica runs under `systemd Type=simple`; legacy `--daemon` flag now emits a warning and falls through to foreground. Re-implementation plan documented in `lorica-core/src/server/daemon.rs` |
+| `eslint-plugin-svelte` in CI | Audit coverage gap | New `eslint.config.js` flat config under `lorica-dashboard/frontend/` enforcing `svelte/no-at-html-tags` + `svelte/no-target-blank` + `no-eval` / `no-implied-eval` family. Wired into the `Lint` CI job as `npm run check` + `npm run lint` |
+| `trailofbits/semgrep-rules` in CI | Audit coverage gap | New `Semgrep (security)` CI job running 7 `p/*` rulesets + 4 trailofbits subfolders (`generic` / `javascript` / `rs` / `yaml`). Non-blocking (continue-on-error: true); SARIF uploaded as PR artifact. Gating after the noise floor stabilises |
+
+### v1.3.0 - deferred to v1.3.1
 
 | Item | Source | Notes |
 |---|---|---|
-| Split `proxy_wiring.rs` (8 Ki LOC) | Audit M-8 | Extract `engines.rs` (BreakerEngine / VerdictCacheEngine / RateLimitEngine) + move `#[cfg(test)]` block (~3 k LOC) into `proxy_wiring/tests.rs`. Mechanical; risk > benefit for the release |
-| `route53` feature off-by-default | Audit SC-M-3 | Flip the default-on feature in `lorica-api/Cargo.toml` so non-Route53 deployments don't ship `rustls 0.21 + hyper 0.14` (security-maintenance only) |
-| `brotli 3 -> 7` | Audit SC-L-1 | Minor version bump; held because upstream brotli 7 has API changes we didn't want to absorb mid-release |
-| `no_debug 3.1.0` inline | Audit SC-L-3 | Unmaintained single-file macro; inline (~10 lines) in `lorica-tls` |
-| `daemonize 0.5.0` replacement | RUSTSEC-2025-0069 | Single-maintainer + unmaintained. Inline double-fork in `lorica-core` |
-| `eslint-plugin-svelte` in CI | Audit coverage gap | Semgrep OSS lacks a Svelte language pack. Manual audit in v1.3.0 confirmed 0 exploitable `{@html}` sites, but ongoing regression guard needs a CI linter |
-| `trailofbits/semgrep-rules` in CI | Audit coverage gap | Original `p/bash` / `p/yaml` / `p/sql` rulesets 404'd on the Semgrep registry; replacement rulesets identified but not wired into CI |
+| Split `proxy_wiring.rs` (8 Ki LOC) | Audit M-8 | Extract `engines.rs` (BreakerEngine / VerdictCacheEngine / RateLimitEngine) + move `#[cfg(test)]` block (~3 k LOC) into `proxy_wiring/tests.rs`. Mechanical; deferred because the risk > benefit for the release (nothing functional, pure refactor) |
 
 ---
 

@@ -100,6 +100,34 @@ Author: Rwx-G
 - Bumped `tokio-tungstenite 0.20.1 -> 0.29.0` in `lorica-proxy` to
   drop a duplicated websocket frame parser and pull in fuzzer-driven
   fixes (supply-chain audit SC-M-2)
+- Bumped `brotli 3 -> 8` in `lorica-core` (supply-chain audit
+  SC-L-1); API source-compatible for Lorica's `CompressorWriter` /
+  `DecompressorWriter` usage
+- `lorica-api` feature `route53` flipped to off by default
+  (supply-chain audit SC-M-3). Non-Route53 deployments no longer
+  ship the `aws-smithy-http-client` dep graph that drags
+  `rustls 0.21` + `hyper 0.14`. Users of ACME DNS-01 via Route53
+  build with `cargo build --release --features route53`. BREAKING
+  for downstream packagers who relied on the default feature
+- Inlined `no_debug` (was `no_debug = "3.1.0"` unmaintained single-
+  file crate, supply-chain audit SC-L-3) as
+  `lorica-tls::no_debug` module. Dropped the dep; public API
+  preserved via `pub use crate::no_debug::{...}`
+- Dropped `daemonize = "0.5"` dep (RUSTSEC-2025-0069,
+  unmaintained). Production Lorica runs under
+  `systemd Type=simple`; legacy `--daemon` flag now emits a warning
+  and falls through to foreground execution. BREAKING only for
+  operators who relied on `--daemon` outside systemd (a non-use-
+  case in practice)
+- CI: new `Semgrep (security)` job running 7 `p/*` rulesets +
+  `trailofbits/semgrep-rules` (generic / javascript / rs / yaml),
+  non-blocking with SARIF upload as PR artifact. Closes the
+  original `p/bash` / `p/yaml` / `p/sql` coverage gap (audit
+  round 1 identified them as 404 on the registry)
+- CI: new `Frontend lint` step running `svelte-check` +
+  `eslint-plugin-svelte` (flat config with `svelte/no-at-html-tags`
+  + `svelte/no-target-blank` + `no-eval` family). Regression
+  guard for the Svelte XSS manual audit pass (audit coverage gap)
 
 ### Added
 

@@ -218,6 +218,7 @@ async fn test_build_dns_challenger_cloudflare() {
     assert!(build_dns_challenger(&config).await.is_ok());
 }
 
+#[cfg(feature = "route53")]
 #[tokio::test]
 async fn test_build_dns_challenger_route53() {
     let config = DnsChallengeConfig {
@@ -229,6 +230,25 @@ async fn test_build_dns_challenger_route53() {
         ovh_consumer_key: None,
     };
     assert!(build_dns_challenger(&config).await.is_ok());
+}
+
+/// When the `route53` feature is off, `build_dns_challenger` must
+/// surface a clear error rather than silently falling through.
+#[cfg(not(feature = "route53"))]
+#[tokio::test]
+async fn test_build_dns_challenger_route53_disabled_without_feature() {
+    let config = DnsChallengeConfig {
+        provider: "route53".into(),
+        zone_id: "Z1234567890".into(),
+        api_token: "AKIAIOSFODNN7EXAMPLE".into(),
+        api_secret: Some("secret".into()),
+        ovh_endpoint: None,
+        ovh_consumer_key: None,
+    };
+    assert!(
+        build_dns_challenger(&config).await.is_err(),
+        "route53 provider must return Err when the feature is disabled"
+    );
 }
 
 #[tokio::test]
