@@ -41,7 +41,7 @@ httparse = { workspace = true }
 tokio-test = "0.4"
 env_logger = "0.11"
 hyper = "0.14"
-tokio-tungstenite = "0.20.1"
+tokio-tungstenite = "0.29"
 lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
 lorica-lb = { version = "0.1.0", path = "../lorica-lb", default-features = false }
 prometheus = "0.14"

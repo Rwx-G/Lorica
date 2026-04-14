@@ -52,7 +52,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-pemfile = "=2.1.2"
 futures-util = "0.3"
 arc-swap = "1"
-dashmap = "5"
+dashmap = "6"
 parking_lot = "0.12"
 argon2 = "0.5"
 base64 = "0.22"
