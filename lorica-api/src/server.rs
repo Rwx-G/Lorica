@@ -20,6 +20,17 @@ use crate::middleware::rate_limit::RateLimiter;
 use crate::system::SystemCache;
 use crate::workers::WorkerMetrics;
 
+/// Type-erased metrics refresher closure (WPAR-7 pull-on-scrape).
+///
+/// Returning a `BoxFuture` keeps `lorica-api` decoupled from the
+/// supervisor-side implementation (which lives in the `lorica`
+/// binary and depends on `lorica-command`). The supervisor wires
+/// this closure at startup with access to the per-worker RPC
+/// endpoints, the AggregatedMetrics handle, and a dedup lock; the
+/// /metrics handler awaits it with a bounded overall timeout.
+pub type MetricsRefresher =
+    Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+
 /// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]
 pub struct AppState {
@@ -70,6 +81,15 @@ pub struct AppState {
     pub log_store: Option<Arc<crate::log_store::LogStore>>,
     /// Aggregated proxy metrics from worker processes. `None` in single-process mode.
     pub aggregated_metrics: Option<Arc<crate::workers::AggregatedMetrics>>,
+    /// Pipelined metrics refresh closure (WPAR-7 pull-on-scrape).
+    /// `Some` in worker mode when the supervisor has wired the
+    /// `MetricsPullCoordinator`; `None` in single-process mode or
+    /// when the supervisor has not yet registered any worker RPC
+    /// endpoint. Called from the `/metrics` handler before reading
+    /// `aggregated_metrics` so Prometheus scrapes see sub-second
+    /// fresh data. Internally dedups: concurrent scrapes within a
+    /// short window collapse into a single supervisor fan-out.
+    pub metrics_refresher: Option<MetricsRefresher>,
     /// Tracker for background tasks that must be drained on graceful
     /// shutdown (ACME polling, session-store writes, WAF refresh,
     /// backend drain watchdog, etc.). The supervisor shutdown path

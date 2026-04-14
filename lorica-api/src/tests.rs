@@ -43,6 +43,7 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         notification_history: None,
         log_store: None,
         aggregated_metrics: None,
+        metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
     };
     let session_store = SessionStore::new(store).await;
@@ -3016,6 +3017,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         notification_history: None,
         log_store: None,
         aggregated_metrics: None,
+        metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
     };
     let session_store = SessionStore::new(store).await;
@@ -3052,6 +3054,7 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         notification_history: None,
         log_store: None,
         aggregated_metrics: None,
+        metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
     };
     let session_store = SessionStore::new(store).await;

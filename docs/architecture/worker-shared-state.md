@@ -1,12 +1,10 @@
 # Worker shared-state architecture
 
 Author: Romain G.
-Status: Implemented. Phases 1, 2, 3, 4, 5, 7 landed in v1.3.0. Phase 6
-(WPAR-7 /metrics pull-on-scrape) deferred - the periodic-pull
-AggregatedMetrics already delivers functional parity; the freshness
-refinement is a follow-up. Phase 8 multi-worker integration tests
-landed as per-phase RPC round-trip tests plus the docker e2e
-worker-mode section.
+Status: Implemented. All phases (1, 2, 3, 4, 5, 6, 7) landed in
+v1.3.0. Phase 8 multi-worker integration tests landed as per-phase
+RPC round-trip tests plus the docker e2e worker-mode sections (19b
+two-phase reload, 19c breaker cross-worker).
 
 This document specifies the cross-process shared-state mechanisms
 introduced to close the worker-parity audit findings WPAR-1 (rate

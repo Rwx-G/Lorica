@@ -1200,6 +1200,27 @@ fn run_supervisor(cli: Cli) {
         let api_log_store = log_store.clone();
         let api_worker_metrics = Arc::clone(&worker_metrics);
         let api_aggregated_metrics = Arc::clone(&aggregated_metrics);
+        // Pipelined metrics refresher (WPAR-7 pull-on-scrape). Captures
+        // the per-worker RPC endpoint map, the AggregatedMetrics
+        // handle, and a dedup lock so concurrent /metrics scrapes
+        // collapse into a single supervisor fan-out. Lives for the
+        // lifetime of the API task.
+        let refresher_endpoints = Arc::clone(&worker_rpc_endpoints);
+        let refresher_aggregated = Arc::clone(&aggregated_metrics);
+        let refresher_dedup: Arc<tokio::sync::Mutex<Option<Instant>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let api_metrics_refresher: lorica_api::server::MetricsRefresher = Arc::new(move || {
+            let endpoints = Arc::clone(&refresher_endpoints);
+            let aggregated = Arc::clone(&refresher_aggregated);
+            let dedup = Arc::clone(&refresher_dedup);
+            Box::pin(pull_all_metrics_via_rpc(
+                endpoints,
+                aggregated,
+                dedup,
+                METRICS_PULL_PER_WORKER_TIMEOUT,
+                METRICS_PULL_DEDUP_TTL,
+            ))
+        });
         let management_port = cli.management_port;
         let api_db_path = db_path.clone();
         // `task_tracker` is already defined above (before the WAF
@@ -1233,6 +1254,7 @@ fn run_supervisor(cli: Cli) {
                 ewma_scores: None,
                 backend_connections: None,
                 aggregated_metrics: Some(api_aggregated_metrics),
+                metrics_refresher: Some(api_metrics_refresher),
                 notification_history: {
                     let d = notify_dispatcher.lock().await;
                     Some(d.history())
@@ -2037,6 +2059,125 @@ async fn coordinate_config_reload(
         prepare_failed,
         committed,
         commit_failed,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor-side metrics pull-on-scrape coordinator (WPAR-7).
+//
+// The /metrics HTTP handler invokes the refresher closure (see
+// `lorica_api::server::MetricsRefresher`) before reading
+// `AggregatedMetrics`. Internally, the refresher dedups concurrent
+// calls and, at most once per `METRICS_PULL_DEDUP_TTL`, fans out a
+// `CommandType::MetricsRequest` RPC to every registered worker with
+// a per-worker timeout of `METRICS_PULL_PER_WORKER_TIMEOUT`. Non-
+// responders fall back silently to the cached AggregatedMetrics
+// (populated by the periodic-pull task that still runs on the
+// legacy channel), so a stuck worker never blocks the scrape.
+// ---------------------------------------------------------------------------
+
+const METRICS_PULL_PER_WORKER_TIMEOUT: Duration = Duration::from_millis(500);
+const METRICS_PULL_DEDUP_TTL: Duration = Duration::from_millis(250);
+
+async fn pull_all_metrics_via_rpc(
+    endpoints: Arc<dashmap::DashMap<u32, lorica_command::RpcEndpoint>>,
+    aggregated: Arc<lorica_api::workers::AggregatedMetrics>,
+    dedup: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    per_worker_timeout: Duration,
+    dedup_ttl: Duration,
+) {
+    // Dedup: if a refresh started within `dedup_ttl`, this call is a
+    // no-op. The caller will read the existing cached state which is
+    // at most `dedup_ttl` old.
+    {
+        let mut guard = dedup.lock().await;
+        if let Some(last) = *guard {
+            if last.elapsed() < dedup_ttl {
+                return;
+            }
+        }
+        *guard = Some(Instant::now());
+    }
+
+    if endpoints.is_empty() {
+        return;
+    }
+
+    // Snapshot endpoints so a concurrent worker insert/remove doesn't
+    // skew the fan-out set.
+    let targets: Vec<(u32, lorica_command::RpcEndpoint)> = endpoints
+        .iter()
+        .map(|e| (*e.key(), e.value().clone()))
+        .collect();
+
+    let futures = targets.into_iter().map(|(wid, ep)| {
+        let cmd =
+            lorica_command::Command::new(lorica_command::CommandType::MetricsRequest, 0);
+        async move {
+            let res = ep.request(cmd, per_worker_timeout).await;
+            (wid, res)
+        }
+    });
+    let results = futures_util::future::join_all(futures).await;
+
+    for (wid, result) in results {
+        match result {
+            Ok(resp) => match resp.payload {
+                Some(lorica_command::response::Payload::MetricsReport(report)) => {
+                    let ewma: std::collections::HashMap<String, f64> = report
+                        .ewma_entries
+                        .iter()
+                        .map(|e| (e.backend_address.clone(), e.score_us))
+                        .collect();
+                    let bans: Vec<(String, u64, u64)> = report
+                        .ban_entries
+                        .iter()
+                        .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
+                        .collect();
+                    let backend_conns: std::collections::HashMap<String, u64> = report
+                        .backend_conn_entries
+                        .iter()
+                        .map(|e| (e.backend_address.clone(), e.connections))
+                        .collect();
+                    let req_counts: Vec<(String, u32, u64)> = report
+                        .request_entries
+                        .iter()
+                        .map(|e| (e.route_id.clone(), e.status_code, e.count))
+                        .collect();
+                    let waf_counts: Vec<(String, String, u64)> = report
+                        .waf_entries
+                        .iter()
+                        .map(|e| (e.category.clone(), e.action.clone(), e.count))
+                        .collect();
+                    aggregated
+                        .update_worker(
+                            wid,
+                            report.cache_hits,
+                            report.cache_misses,
+                            report.active_connections,
+                            bans,
+                            ewma,
+                            backend_conns,
+                            req_counts,
+                            waf_counts,
+                        )
+                        .await;
+                }
+                _ => {
+                    tracing::debug!(
+                        worker_id = wid,
+                        "MetricsRequest RPC: response missing MetricsReport payload; keeping cached state"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::debug!(
+                    worker_id = wid,
+                    error = %e,
+                    "MetricsRequest RPC failed; keeping cached state for this worker"
+                );
+            }
+        }
     }
 }
 
@@ -3124,6 +3265,7 @@ fn run_single_process(cli: Cli) {
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
                 aggregated_metrics: None, // single-process uses direct Arc references
+                metrics_refresher: None,  // pull-on-scrape only meaningful in worker mode
                 task_tracker: api_task_tracker,
             };
 

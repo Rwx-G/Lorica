@@ -253,14 +253,15 @@ pub struct Response {
     #[prost(string, tag = "3")]
     pub message: ::prost::alloc::string::String,
     /// Typed payload for RPC responses (verdict, breaker decision, rate
-    /// limit snapshot). None for legacy status-only responses.
-    #[prost(oneof = "response::Payload", tags = "100, 101, 102, 103")]
+    /// limit snapshot, metrics report). None for legacy status-only
+    /// responses.
+    #[prost(oneof = "response::Payload", tags = "100, 101, 102, 103, 104")]
     pub payload: ::core::option::Option<response::Payload>,
 }
 
 /// Typed payload variants for pipelined RPC responses.
 pub mod response {
-    use super::{BreakerResult, RateLimitDeltaResult, RateLimitResult, VerdictResult};
+    use super::{BreakerResult, MetricsReport, RateLimitDeltaResult, RateLimitResult, VerdictResult};
 
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Payload {
@@ -272,6 +273,12 @@ pub mod response {
         RateLimitResult(RateLimitResult),
         #[prost(message, tag = "103")]
         RateLimitDeltaResult(RateLimitDeltaResult),
+        /// Worker-provided metrics snapshot in reply to a pipelined
+        /// `MetricsRequest`. Used by the /metrics pull-on-scrape path
+        /// (WPAR-7) to dedup and aggregate concurrent Prometheus
+        /// scrapes into a single supervisor fan-out.
+        #[prost(message, tag = "104")]
+        MetricsReport(MetricsReport),
     }
 }
 

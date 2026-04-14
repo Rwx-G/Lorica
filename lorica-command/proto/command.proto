@@ -62,6 +62,13 @@ message Response {
     VerdictResult verdict_result = 100;
     BreakerResult breaker_result = 101;
     RateLimitResult rate_limit_result = 102;
+    RateLimitDeltaResult rate_limit_delta_result = 103;
+    // Worker -> supervisor: point-in-time metrics snapshot in reply to
+    // a pipelined MetricsRequest (WPAR-7). Carries the same data as
+    // the legacy bare-framed MetricsReport, but transported in the
+    // Response envelope so /metrics pull-on-scrape can dedup and
+    // await concurrently across all workers.
+    MetricsReport metrics_report = 104;
   }
 }
 

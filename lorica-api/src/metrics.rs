@@ -394,7 +394,26 @@ pub fn inc_ban_broadcast_lagged(worker_id: &str, count: u64) {
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,
 /// system resources) from AppState before encoding.
+///
+/// In worker mode, first invokes the pipelined `metrics_refresher`
+/// (WPAR-7) so per-worker counters are pulled fresh over the RPC
+/// channel before the scrape encodes them. The refresher dedups
+/// concurrent scrapes internally and has a bounded per-worker
+/// timeout, so an unresponsive worker cannot stall a Prometheus poll.
+/// A conservative wall-clock timeout (~`refresher budget + margin`)
+/// wraps the whole invocation in case the refresher hangs on a
+/// supervisor-side lock - we never want /metrics to be the slowest
+/// thing a Prometheus scrape waits on.
 pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResponse {
+    // WPAR-7 pull-on-scrape: refresh aggregated counters before reading.
+    // Wall-clock budget = per-worker timeout (500 ms) + generous margin
+    // for scheduling overhead. On timeout we keep the cached state so
+    // the scrape still returns something useful.
+    if let Some(ref refresher) = state.metrics_refresher {
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(1_000), refresher()).await;
+    }
+
     // Refresh active connections (aggregated from workers if available)
     let active_conns = if let Some(ref agg) = state.aggregated_metrics {
         agg.total_active_connections().await as i64
