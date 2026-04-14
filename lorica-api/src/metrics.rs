@@ -381,6 +381,43 @@ static BAN_BROADCAST_LAGGED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     counter
 });
 
+/// Counter: pipelined-RPC outcomes on the supervisor-to-worker
+/// channel. Labels: `kind` (`metrics_pull` | `config_reload_abort` |
+/// `config_reload_prepare` | `config_reload_commit`) and `outcome`
+/// (`ok` | `timeout` | `error`). Use this to spot a worker that
+/// consistently times out or errors on one RPC type while healthy
+/// on others (e.g. a long-running config rebuild stalling Prepare
+/// but leaving metrics pull responsive).
+///
+/// Non-zero `timeout` on `config_reload_prepare` usually means DB
+/// contention or a pathological config payload; non-zero `timeout`
+/// on `metrics_pull` means a worker is stuck past the 500 ms per-
+/// worker budget.
+static SUPERVISOR_RPC_OUTCOME_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "supervisor_rpc_outcome_total",
+            "Outcome of supervisor -> worker pipelined RPCs, by kind and result"
+        )
+        .namespace("lorica"),
+        &["kind", "outcome"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record the outcome of a supervisor-initiated RPC. `kind` is the
+/// logical operation (`metrics_pull`, `config_reload_prepare`,
+/// `config_reload_commit`, `config_reload_abort`) and `outcome` is
+/// one of `ok`, `timeout`, `error`. Safe to call from any async
+/// context (counter ops are lock-free).
+pub fn inc_supervisor_rpc_outcome(kind: &str, outcome: &str) {
+    SUPERVISOR_RPC_OUTCOME_TOTAL
+        .with_label_values(&[kind, outcome])
+        .inc();
+}
+
 /// Record one or more BanIp commands lagged on a given worker's
 /// broadcast subscription. `count` is the number of missed messages
 /// reported by `RecvError::Lagged(n)`.

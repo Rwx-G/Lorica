@@ -335,15 +335,22 @@ impl RpcEndpoint {
     }
 }
 
-/// Note: `Inner::Drop` is implicit via the held `JoinHandle`s. When the
-/// last `Arc<Inner>` drops, `_tasks` drops, aborting both the reader and
-/// writer tasks. The bounded `tx_out` also drops, closing the write side
-/// of the mpsc so any partially woken writer task exits cleanly.
+/// When the last `Arc<Inner>` drops we need to actively abort the reader
+/// and writer tasks. A naive `_tasks: [JoinHandle; 2]` does NOT suffice
+/// because tokio's `JoinHandle::drop` is detach, not abort - and the
+/// reader task holds a clone of `tx_out` (for building `IncomingCommand`
+/// replies), which keeps the writer's `rx_out` alive indefinitely. The
+/// socket halves stay owned by those tasks, so the peer never sees EOF
+/// and its own reader blocks forever. This was observable as a hung
+/// worker RPC listener after supervisor shutdown (audit gap).
 ///
-/// We additionally drain `inflight` on drop so any outstanding
-/// `request` callers wake promptly with `ChannelError::Closed`.
+/// We also drain `inflight` on drop so any outstanding `request` callers
+/// wake promptly with `ChannelError::Closed`.
 impl Drop for Inner {
     fn drop(&mut self) {
+        for handle in self._tasks.iter() {
+            handle.abort();
+        }
         if let Ok(mut map) = self.inflight.lock() {
             map.clear();
         }

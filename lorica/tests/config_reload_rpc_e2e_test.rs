@@ -241,6 +241,50 @@ async fn reload_commit_rejects_mismatched_generation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_listener_drains_on_supervisor_eof() {
+    // Audit gap coverage: verify a worker's RPC listener task exits
+    // cleanly when the supervisor drops BOTH its endpoint and its
+    // incoming receiver (process exit, SIGTERM, crash). Without this
+    // guarantee, worker shutdown would hang on the TaskTracker drain
+    // past its 10 s deadline.
+    let (sup_ep, sup_inc, wk_ep, wk_inc) = socketpair();
+    let state = Arc::new(WorkerState::new());
+    let handle = spawn_worker(wk_ep, wk_inc, Arc::clone(&state));
+
+    // Round-trip one Prepare to confirm the listener is alive.
+    let resp = sup_ep
+        .request_rpc(
+            CommandType::ConfigReloadPrepare,
+            command::Payload::ConfigReloadPrepare(ConfigReloadPrepare { generation: 1 }),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("rpc");
+    assert_eq!(resp.typed_status(), ResponseStatus::Ok);
+
+    // Drop both supervisor-side halves. The worker's
+    // `IncomingCommands` receiver must observe EOF (peer closed its
+    // end of the socketpair) and its `while let Some = recv().await`
+    // loop must exit.
+    drop(sup_ep);
+    drop(sup_inc);
+
+    // The listener task should complete within a few seconds; 5 s is a
+    // generous ceiling that catches "truly hung" while tolerating
+    // tokio scheduler hiccups.
+    let join_result =
+        tokio::time::timeout(Duration::from_secs(5), handle).await;
+    assert!(
+        join_result.is_ok(),
+        "worker RPC listener must exit within 5s of supervisor EOF; hung shutdown is a blocker"
+    );
+    assert!(
+        join_result.unwrap().is_ok(),
+        "listener task completed but panicked"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reload_prepare_failure_propagates() {
     let (sup_ep, _sup_inc, wk_ep, wk_inc) = socketpair();
     let state = Arc::new(WorkerState::new());

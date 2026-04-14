@@ -2052,12 +2052,29 @@ async fn coordinate_config_reload(
     for (wid, result) in prepare_results {
         match result {
             Ok(resp) if resp.typed_status() == lorica_command::ResponseStatus::Ok => {
+                lorica_api::metrics::inc_supervisor_rpc_outcome(
+                    "config_reload_prepare",
+                    "ok",
+                );
                 prepared.push(wid);
             }
             Ok(resp) => {
+                lorica_api::metrics::inc_supervisor_rpc_outcome(
+                    "config_reload_prepare",
+                    "error",
+                );
                 prepare_failed.push((wid, resp.message));
             }
             Err(e) => {
+                let outcome = if matches!(e, lorica_command::ChannelError::Timeout) {
+                    "timeout"
+                } else {
+                    "error"
+                };
+                lorica_api::metrics::inc_supervisor_rpc_outcome(
+                    "config_reload_prepare",
+                    outcome,
+                );
                 prepare_failed.push((wid, format!("rpc error: {e}")));
             }
         }
@@ -2083,13 +2100,23 @@ async fn coordinate_config_reload(
             );
             let wid = *wid;
             Some(async move {
-                let _ = ep
+                let res = ep
                     .request_rpc(
                         lorica_command::CommandType::ConfigReloadAbort,
                         payload,
                         CONFIG_RELOAD_COMMIT_TIMEOUT,
                     )
                     .await;
+                let outcome = match res {
+                    Ok(r) if r.typed_status() == lorica_command::ResponseStatus::Ok => "ok",
+                    Ok(_) => "error",
+                    Err(lorica_command::ChannelError::Timeout) => "timeout",
+                    Err(_) => "error",
+                };
+                lorica_api::metrics::inc_supervisor_rpc_outcome(
+                    "config_reload_abort",
+                    outcome,
+                );
                 wid
             })
         });
@@ -2125,12 +2152,29 @@ async fn coordinate_config_reload(
     for (wid, result) in commit_results {
         match result {
             Ok(resp) if resp.typed_status() == lorica_command::ResponseStatus::Ok => {
+                lorica_api::metrics::inc_supervisor_rpc_outcome(
+                    "config_reload_commit",
+                    "ok",
+                );
                 committed.push(wid);
             }
             Ok(resp) => {
+                lorica_api::metrics::inc_supervisor_rpc_outcome(
+                    "config_reload_commit",
+                    "error",
+                );
                 commit_failed.push((wid, resp.message));
             }
             Err(e) => {
+                let outcome = if matches!(e, lorica_command::ChannelError::Timeout) {
+                    "timeout"
+                } else {
+                    "error"
+                };
+                lorica_api::metrics::inc_supervisor_rpc_outcome(
+                    "config_reload_commit",
+                    outcome,
+                );
                 commit_failed.push((wid, format!("rpc error: {e}")));
             }
         }
@@ -2213,6 +2257,7 @@ async fn pull_all_metrics_via_rpc(
         match result {
             Ok(resp) => match resp.payload {
                 Some(lorica_command::response::Payload::MetricsReport(report)) => {
+                    lorica_api::metrics::inc_supervisor_rpc_outcome("metrics_pull", "ok");
                     let ewma: std::collections::HashMap<String, f64> = report
                         .ewma_entries
                         .iter()
@@ -2253,6 +2298,7 @@ async fn pull_all_metrics_via_rpc(
                         .await;
                 }
                 _ => {
+                    lorica_api::metrics::inc_supervisor_rpc_outcome("metrics_pull", "error");
                     tracing::debug!(
                         worker_id = wid,
                         "MetricsRequest RPC: response missing MetricsReport payload; keeping cached state"
@@ -2260,6 +2306,12 @@ async fn pull_all_metrics_via_rpc(
                 }
             },
             Err(e) => {
+                let outcome = if matches!(e, lorica_command::ChannelError::Timeout) {
+                    "timeout"
+                } else {
+                    "error"
+                };
+                lorica_api::metrics::inc_supervisor_rpc_outcome("metrics_pull", outcome);
                 tracing::debug!(
                     worker_id = wid,
                     error = %e,
