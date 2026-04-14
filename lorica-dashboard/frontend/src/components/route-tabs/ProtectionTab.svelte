@@ -85,6 +85,51 @@
       </span>
     </div>
   </div>
+
+  <div class="section-divider">
+    <h4>GeoIP country filter <span class="hint">(per route)</span></h4>
+    <p class="section-hint">
+      Resolves the client IP to an ISO 3166-1 alpha-2 country code via the
+      <code>.mmdb</code> database configured in Settings. Allowlist = only listed
+      countries pass; denylist = listed countries are rejected (403). Unknown
+      country (reserved / private IP, DB miss) falls through without blocking;
+      layer <code>ip_allowlist</code> on top for fail-close semantics. Requires
+      <code>geoip_db_path</code> set globally.
+    </p>
+  </div>
+
+  <div class="form-row">
+    <div class="form-group" class:modified={isModified('geoip_mode')}>
+      <label for="geoip-mode">Mode</label>
+      {#if isImported('geoip_mode')}<span class="imported-badge">imported</span>{/if}
+      <select id="geoip-mode" bind:value={form.geoip_mode}>
+        <option value="denylist">Denylist (block listed countries)</option>
+        <option value="allowlist">Allowlist (block everything except listed)</option>
+      </select>
+      <span class="hint">
+        Empty country list in denylist mode = filter disabled for this route.
+        Allowlist with empty list is rejected by the API (would block
+        everything).
+      </span>
+    </div>
+  </div>
+
+  <div class="form-row">
+    <div class="form-group" class:modified={isModified('geoip_countries')}>
+      <label for="geoip-countries">Countries <span class="hint">(ISO 3166-1 alpha-2, comma-separated)</span></label>
+      {#if isImported('geoip_countries')}<span class="imported-badge">imported</span>{/if}
+      <input
+        id="geoip-countries"
+        type="text"
+        bind:value={form.geoip_countries}
+        placeholder="e.g. FR, DE, IT"
+        autocomplete="off"
+      />
+      <span class="hint">
+        Codes normalised to uppercase, duplicates collapsed. Max 300 entries.
+      </span>
+    </div>
+  </div>
 </div>
 
 <style>

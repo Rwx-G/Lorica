@@ -163,6 +163,7 @@ export interface RouteResponse {
   response_rewrite?: ResponseRewriteConfigResponse | null;
   mtls?: MtlsConfigResponse | null;
   rate_limit?: RateLimitConfig | null;
+  geoip?: GeoIpConfig | null;
   created_at: string;
   updated_at: string;
 }
@@ -173,6 +174,13 @@ export interface RateLimitConfig {
   capacity: number;
   refill_per_sec: number;
   scope: RateLimitScope;
+}
+
+export type GeoIpMode = 'allowlist' | 'denylist';
+
+export interface GeoIpConfig {
+  mode: GeoIpMode;
+  countries: string[];
 }
 
 export interface HeaderRuleResponse {
@@ -331,6 +339,7 @@ export interface CreateRouteRequest {
   response_rewrite?: ResponseRewriteConfigRequest;
   mtls?: MtlsConfigRequest;
   rate_limit?: RateLimitConfig;
+  geoip?: GeoIpConfig;
 }
 
 
@@ -396,6 +405,7 @@ export interface UpdateRouteRequest {
   response_rewrite?: ResponseRewriteConfigRequest;
   mtls?: MtlsConfigRequest;
   rate_limit?: RateLimitConfig;
+  geoip?: GeoIpConfig;
 }
 
 export interface BackendResponse {

@@ -113,6 +113,12 @@ export interface RouteFormState {
   rate_limit_capacity: number | '';
   rate_limit_refill_per_sec: number | '';
   rate_limit_scope: 'per_ip' | 'per_route';
+  // GeoIP country filter (v1.4.0 Epic 2). Empty countries = feature
+  // off in denylist mode; allowlist mode requires at least one
+  // country (API rejects empty allowlist at write time). Countries
+  // are ISO 3166-1 alpha-2 comma-separated (e.g. "FR,DE,IT").
+  geoip_mode: 'allowlist' | 'denylist';
+  geoip_countries: string;
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -188,6 +194,8 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   rate_limit_capacity: '',
   rate_limit_refill_per_sec: '',
   rate_limit_scope: 'per_ip',
+  geoip_mode: 'denylist',
+  geoip_countries: '',
 };
 
 // Tab field mappings for dot indicators
@@ -223,6 +231,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'max_connections', 'slowloris_threshold_ms',
     'auto_ban_threshold', 'auto_ban_duration_s',
     'rate_limit_capacity', 'rate_limit_refill_per_sec', 'rate_limit_scope',
+    'geoip_mode', 'geoip_countries',
   ],
   path_rules: ['path_rules'],
   header_rules: ['header_rules'],
@@ -378,6 +387,8 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     rate_limit_capacity: route.rate_limit?.capacity ?? '',
     rate_limit_refill_per_sec: route.rate_limit?.refill_per_sec ?? '',
     rate_limit_scope: route.rate_limit?.scope ?? 'per_ip',
+    geoip_mode: route.geoip?.mode ?? 'denylist',
+    geoip_countries: (route.geoip?.countries ?? []).join(', '),
   };
 }
 
@@ -565,7 +576,30 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     response_rewrite: responseRewriteFormToRequest(form, isUpdate),
     mtls: mtlsFormToRequest(form, isUpdate),
     rate_limit: rateLimitFormToRequest(form, isUpdate),
+    geoip: geoipFormToRequest(form, isUpdate),
   };
+}
+
+function geoipFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): { mode: 'allowlist' | 'denylist'; countries: string[] } | undefined {
+  // Parse the CSV input: split on comma / whitespace, trim, drop
+  // empty entries. API validation normalises to uppercase + dedups
+  // + rejects non-ISO codes, so we do not try to duplicate that work
+  // in the frontend.
+  const countries = form.geoip_countries
+    .split(/[,\s]+/)
+    .map((c) => c.trim())
+    .filter((c) => c.length > 0);
+
+  // Empty countries + denylist mode on update is the explicit
+  // "clear" signal (API maps this back to geoip=None). On create,
+  // omit entirely so we do not store an empty row.
+  if (countries.length === 0 && form.geoip_mode === 'denylist') {
+    return isUpdate ? { mode: 'denylist', countries: [] } : undefined;
+  }
+  return { mode: form.geoip_mode, countries };
 }
 
 function rateLimitFormToRequest(
