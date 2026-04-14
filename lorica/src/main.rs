@@ -724,6 +724,14 @@ fn run_supervisor(cli: Cli) {
         let breaker_registry: Arc<SupervisorBreakerRegistry> =
             Arc::new(SupervisorBreakerRegistry::new(5, Duration::from_secs(10)));
 
+        // Shared shutdown flag. Set by the SIGTERM handler before
+        // `manager.shutdown_all()` so the worker monitor short-circuits
+        // crash-event respawns and the per-worker heartbeat tasks stop
+        // probing workers that were just SIGTERM'd (avoids a burst of
+        // "heartbeat send failed: Broken pipe" warnings at every
+        // shutdown).
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // Spawn a per-worker task that handles both config reload and heartbeat
         // No shared Mutex - each worker has its own channel and task
         for (worker_id, worker_pid, raw_fd, rpc_raw_fd) in worker_fds {
@@ -742,6 +750,7 @@ fn run_supervisor(cli: Cli) {
             let hb_seq = Arc::clone(&sequence);
             let hb_metrics = Arc::clone(&worker_metrics);
             let agg_metrics = Arc::clone(&aggregated_metrics);
+            let hb_shutting_down = Arc::clone(&shutting_down);
 
             // Pipelined RPC channel task: consumes the per-worker
             // RpcEndpoint stream and handles `RateLimitDelta` by applying
@@ -895,6 +904,13 @@ fn run_supervisor(cli: Cli) {
                         }
                         // Periodic heartbeat
                         _ = heartbeat_timer.tick() => {
+                            // Skip the probe entirely once the supervisor is
+                            // tearing down: workers are SIGTERM'd in the same
+                            // instant, so any send would race the worker's
+                            // exit and log a spurious "Broken pipe" warning.
+                            if hb_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                                continue;
+                            }
                             let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
                             let cmd = Command::new(CommandType::Heartbeat, seq);
                             let start = Instant::now();
@@ -1362,14 +1378,39 @@ fn run_supervisor(cli: Cli) {
         let monitor_hb_metrics = Arc::clone(&worker_metrics);
         let monitor_agg_metrics = Arc::clone(&aggregated_metrics);
         let monitor_task_handles = Arc::clone(&worker_task_handles);
+        // `shutting_down` is declared above, shared with the per-worker
+        // heartbeat tasks. The monitor short-circuits on the same flag
+        // so shutdown-driven worker SIGKILLs don't trigger a respawn:
+        // `monitor_handle.abort()` alone is not enough because the
+        // monitor's loop blocks on `monitor_mgr.lock()` (a
+        // `std::sync::Mutex`, not a tokio one), so abort cannot fire
+        // while the supervisor is holding that mutex inside
+        // `manager.shutdown_all()`. The monitor would then unblock
+        // 30 s later, see the SIGKILL'd workers as crashed, and
+        // respawn them - the exact race that drove systemd to SIGKILL
+        // the whole service group past `TimeoutStopSec`.
+        let monitor_shutting_down = Arc::clone(&shutting_down);
         let monitor_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
+
+                if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
 
                 let mut mgr = monitor_mgr.lock().unwrap_or_else(|e| {
                     warn!("worker monitor mutex poisoned, recovering");
                     e.into_inner()
                 });
+                // Re-check after acquiring the mutex: shutdown may have
+                // grabbed the mutex while we waited (the supervisor
+                // shutdown path holds it for the full ~30 s drain). If
+                // we observe the flag now, the workers we are about to
+                // see as "crashed" were actually SIGKILL'd by us and
+                // must not be respawned.
+                if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
                 let events = mgr.check_workers();
                 for event in events {
                     let (id, log_msg) = match event {
@@ -1505,6 +1546,24 @@ fn run_supervisor(cli: Cli) {
         shutdown_signal().await;
 
         info!("supervisor shutting down");
+        // CRITICAL ordering: stop the worker monitor BEFORE telling
+        // workers to drain. The monitor's job is to detect crashed
+        // workers and respawn them; during shutdown the SIGKILL we
+        // send to stragglers (drain timeout exceeded) shows up as a
+        // crash and triggers a respawn-into-shutdown race - the
+        // freshly forked worker gets SIGTERM ~ms later, can't drain
+        // in time, and systemd ends up SIGKILL'ing the whole service
+        // group past TimeoutStopSec.
+        //
+        // Two-step stop is required because the monitor blocks on a
+        // std::sync::Mutex (the same one shutdown_all needs), so a
+        // bare `monitor_handle.abort()` cannot fire while the
+        // supervisor is inside shutdown_all (sync code, no .await).
+        // The atomic flag is the primary defence: the monitor checks
+        // it both before and after acquiring the mutex and returns
+        // early when set. The abort is the belt-and-braces backstop.
+        shutting_down.store(true, std::sync::atomic::Ordering::Release);
+        monitor_handle.abort();
         // Explicit SIGTERM to all workers before exiting
         manager
             .lock()
@@ -1526,7 +1585,6 @@ fn run_supervisor(cli: Cli) {
         }
         api_handle.abort();
         health_handle.abort();
-        monitor_handle.abort();
     });
 }
 

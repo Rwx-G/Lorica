@@ -9,133 +9,6 @@ Author: Rwx-G
 
 ## [1.3.0] - 2026-04-14
 
-### Fixed (pre-release audit: 3 High + 7 Medium + 5 Low)
-
-- `SupervisorBreakerRegistry` stale-probe deadlock (audit H-1): if the
-  probe-admitted worker crashed between admit and report, the breaker
-  entry was pinned in `HalfOpen { probe_in_flight: true }` forever and
-  every subsequent query for that `(route, backend)` returned Deny until
-  supervisor restart. `HalfOpen` now carries `probe_started_at:
-  Option<Instant>`; on the next query observing `elapsed >= cooldown`
-  the supervisor synthesises a failed probe, bumps the failure counter,
-  transitions back to Open with a fresh cooldown, and emits a warn log.
-  Regression test `breaker_registry_stale_probe_recovers_after_cooldown`
-- `lorica-worker::fd_passing::recv_worker_fds` kernel-FD leak on error
-  paths (audit H-2): the function collected raw `RawFd`s into a `Vec`
-  and returned `Err(...)` on UTF-8 validation / fds-tokens mismatch /
-  bad `FdKind` token without closing them. Received FDs are now wrapped
-  in `OwnedFd` immediately after `recvmsg` so every error path
-  `close(2)`s via the RAII drop. Added `MSG_TRUNC` / `MSG_CTRUNC`
-  detection so silent kernel truncation returns `InvalidPayload`
-  instead of adopting a half-received FD set. Added a compile-time
-  size assertion on `PAYLOAD_BUF_SIZE`
-- Two-phase config reload non-atomic `connection_filter` publish (audit
-  H-3): `PendingProxyConfig` now carries the full `reload::PreparedReload`
-  rather than only `Arc<ProxyConfig>`, so the Commit handler calls
-  `commit_prepared_reload(proxy_config, filter, prepared)` which
-  publishes the ArcSwap and the filter CIDR reload together. Prior
-  code re-read the filter separately, opening a short window where
-  ProxyConfig v2 ran against filter v1 on reloads that flipped
-  `connection_allow_cidrs` / `connection_deny_cidrs`. The worker-side
-  RPC listener is now wired with `Some(connection_filter)` at the
-  call site (was `None`)
-- `EwmaTracker::record` hot-path allocation (audit M-1): the common
-  case (backend already known) no longer pays for an `addr.to_string()`
-  per request. `get_mut` path + first-sample seeding without the 30 %
-  alpha bias
-- TOCTOU in `SupervisorVerdictCache::lookup` + `FORWARD_AUTH_VERDICT_
-  CACHE` expiry eviction (audit M-2 + M-3): a concurrent fresh insert
-  racing with an expiry observation could be evicted by the stale
-  lookup. Replaced with `dashmap::DashMap::remove_if` that evicts
-  only when the entry's `expires_at` still matches the observation
-- `handle_rate_limit_delta` mutex contention on first-seen keys (audit
-  M-4): N concurrent `RateLimitDelta` RPCs on a first-seen
-  `{route|scope}` previously serialised on the `store` tokio::Mutex for
-  N SQLite reads. Added a supervisor-side `rl_policy_cache` DashMap
-  that caches per-route policy, invalidated on every reload (both the
-  fully-succeeded two-phase commit and the legacy-broadcast fallback)
-- Predictable `generate_request_id` IDs (audit M-5): previous
-  implementation used `DefaultHasher(SystemTime::nanos XOR
-  thread_id)`, which is deterministic given inputs and collides on
-  same-nanosecond concurrent same-thread requests. Replaced with
-  `OsRng.fill_bytes(16)` for 128 bits of unpredictable ID
-- `ConfigReloadAbort` RPC (audit M-7): new wire-additive
-  `CommandType::ConfigReloadAbort` (tag 14) fanned out to workers
-  that succeeded Prepare when a peer fails; worker drops the pending
-  slot on generation match instead of pinning one orphan
-  `Arc<ProxyConfig>` per worker until the next reload
-- `lorica-shmem::now_ns` silent fallback (audit L-1): `clock_gettime`
-  failure now emits a warn log instead of silently returning 0, which
-  would stall eviction without any signal to ops
-- `lorica-command::IncomingCommand::reply` debug-assert on
-  caller-supplied sequence mismatch (audit L-3): release builds still
-  overwrite with the originating command's sequence, but wiring bugs
-  that pass a different non-zero sequence now surface in tests
-- `generate_random_password` deterministic RNG (audit L-5): replaced
-  `thread_rng()` with `ChaCha20Rng::from_rng(OsRng)` so the first-run
-  admin password pedigree matches `hash_password`'s OS-entropy salt
-- `lorica-limits::token_bucket::refill_locked` overflow-defence
-  tightening (audit L-6): added a `debug_assert!` that
-  `refill_per_sec <= 1_000_000` (the API cap) so future regressions
-  surface in tests instead of silently saturating
-
-### Changed
-
-- Supervisor -> worker pipelined-RPC Prometheus counter
-  (`lorica_supervisor_rpc_outcome_total{kind, outcome}`): one counter
-  spanning `metrics_pull` / `config_reload_{prepare,commit,abort}`
-  with `ok` / `timeout` / `error` outcomes. Lets ops tell apart
-  "all workers slow on Prepare" (DB contention) from "one worker
-  stuck on metrics pull" (downstream issue)
-- Fix `RpcEndpoint::Inner::drop` to actually abort reader + writer
-  tokio tasks instead of relying on JoinHandle-drop detach semantics,
-  so a dropped endpoint actually closes its socket halves and the
-  peer sees EOF. Without this, a worker's RPC listener would hang
-  past the 10 s TaskTracker drain on supervisor shutdown. Regression
-  test `reload_listener_drains_on_supervisor_eof` asserts completion
-  within 5 s
-- Bumped `dashmap 5.5.3 -> 6.1.0` across `lorica`, `lorica-api`,
-  `lorica-limits`; 5.x had iterator-invariant unsoundness fixed in
-  6.x (supply-chain audit SC-M-1, SC-M-4)
-- Bumped `tokio-tungstenite 0.20.1 -> 0.29.0` in `lorica-proxy` to
-  drop a duplicated websocket frame parser and pull in fuzzer-driven
-  fixes (supply-chain audit SC-M-2)
-- Bumped `brotli 3 -> 8` in `lorica-core` (supply-chain audit
-  SC-L-1); API source-compatible for Lorica's `CompressorWriter` /
-  `DecompressorWriter` usage
-- `lorica-api` feature `route53` flipped to off by default
-  (supply-chain audit SC-M-3). Non-Route53 deployments no longer
-  ship the `aws-smithy-http-client` dep graph that drags
-  `rustls 0.21` + `hyper 0.14`. Users of ACME DNS-01 via Route53
-  build with `cargo build --release --features route53`. BREAKING
-  for downstream packagers who relied on the default feature
-- Inlined `no_debug` (was `no_debug = "3.1.0"` unmaintained single-
-  file crate, supply-chain audit SC-L-3) as
-  `lorica-tls::no_debug` module. Dropped the dep; public API
-  preserved via `pub use crate::no_debug::{...}`
-- Dropped `daemonize = "0.5"` dep (RUSTSEC-2025-0069,
-  unmaintained). Production Lorica runs under
-  `systemd Type=simple`; legacy `--daemon` flag now emits a warning
-  and falls through to foreground execution. BREAKING only for
-  operators who relied on `--daemon` outside systemd (a non-use-
-  case in practice)
-- CI: new `Semgrep (security)` job running 7 `p/*` rulesets +
-  `trailofbits/semgrep-rules` (generic / javascript / rs / yaml),
-  non-blocking with SARIF upload as PR artifact. Closes the
-  original `p/bash` / `p/yaml` / `p/sql` coverage gap (audit
-  round 1 identified them as 404 on the registry)
-- CI: new `Frontend lint` step running `svelte-check` +
-  `eslint-plugin-svelte` (flat config with `svelte/no-at-html-tags`
-  + `svelte/no-target-blank` + `no-eval` family). Regression
-  guard for the Svelte XSS manual audit pass (audit coverage gap)
-- Split `lorica/src/proxy_wiring.rs` from 8 561 LOC down to
-  5 284 LOC (-38 %) as audit M-8 follow-up. Tests block
-  (~3 k LOC) moved to `proxy_wiring/tests.rs`; RPC dispatch
-  enums (BreakerAdmission / BreakerEngine / VerdictCacheEngine /
-  RateLimitEngine) moved to `proxy_wiring/engines.rs` with a
-  `pub use engines::{...}` re-export preserving the existing
-  `lorica::proxy_wiring::*` import path. No functional change
-
 ### Added
 
 - Native daily rotation + 14-file retention on the structured tracing log file (`--log-file` path). Switched `tracing_appender::rolling::never()` to `RollingFileAppender::builder().rotation(DAILY).max_log_files(14)` so an unattended install can no longer fill the disk via the JSON log stream. Today's log keeps the operator-configured filename; rotated files are date-suffixed (`lorica.log.2026-04-13`). Falls back to non-rotating append (with a stderr warning) if the builder rejects the path so a misconfigured log destination never blocks startup. External logrotate is no longer required
@@ -144,9 +17,9 @@ Author: Rwx-G
 - Forward-auth verdict cache over pipelined RPC (WPAR worker-parity audit, Phase 4 / WPAR-2): `VerdictCacheEngine::Rpc` routes lookup/push through the supervisor in worker mode, so an Allow verdict cached by one worker is served from every worker's hot path on subsequent requests and a session revocation invalidates the cache uniformly across the pool. Single-process mode keeps the per-process `FORWARD_AUTH_VERDICT_CACHE` static unchanged. RPC wire is extended with `ForwardAuthHeader` so cached Allow outcomes can serve the injected upstream headers (Remote-User, Remote-Groups, ...) without a second round trip to the auth backend. Transport failure degrades gracefully: a failed lookup RPC falls through to the upstream auth call (fail-open semantics match the single-process lazy-eviction path); a failed push is fire-and-forget so the downstream request still completes. Supervisor-side cache preserves the existing `FORWARD_AUTH_VERDICT_CACHE` semantics (16 384-entry FIFO, per-route partitioning via NUL-separated key, only Allow verdicts cached, Cache-Control: no-store honored). See `docs/architecture/worker-shared-state.md` § 7
 - Circuit-breaker over pipelined RPC (WPAR worker-parity audit, Phase 5 / WPAR-3): `BreakerEngine::Rpc` replaces the per-worker `CircuitBreaker::is_available` / `record_failure` / `record_success` with async `admit()` / `record()` calls that delegate to a supervisor-owned state machine. The supervisor tracks `Closed` / `Open` / `HalfOpen(in-flight probe)` per `(route_id, backend)` so a HalfOpen probe slot is allocated atomically across workers (no two workers can each believe they hold the probe at the same time), and a failure on one worker trips the breaker for every worker. `BreakerDecision` is tri-state: `Allow` (Closed), `AllowProbe` (HalfOpen slot granted), `Deny` (Open). Workers remember a probe-admitted backend on the per-request `ProxyCtx.breaker_probe_backend` so the subsequent outcome report is flagged `was_probe=true`, letting the supervisor close the breaker on probe success or bounce back to Open on probe failure. Transport error fails open so a flaky supervisor channel never DoS's the data plane. Single-process mode keeps the in-process `CircuitBreaker` unchanged under `BreakerEngine::Local`. See design § 7
 - Two-phase config reload over pipelined RPC (WPAR worker-parity audit, Phase 7 / WPAR-8): `ConfigReloadPrepare` + `ConfigReloadCommit` replaces the legacy one-shot `CommandType::ConfigReload` on the legacy UDS channel. The Prepare half (2 s timeout, slow path: SQLite read + `ProxyConfig::from_store` + wrr_state preservation + mTLS fingerprint drift detection) runs concurrently on every worker; the Commit half (500 ms timeout, fast path: single ArcSwap) publishes atomically on all workers at once. The divergence window across workers collapses from ~10-50 ms (synchronous reload per worker on legacy channel) to the UDS RTT (microseconds). Per-worker `GenerationGate` enforces monotonicity: a reordered stale Prepare is rejected (`observe`), a commit for a non-matching generation is rejected while the prepared slot is preserved (`observe_commit`). Supervisor coordinator fans out both phases via `coordinate_config_reload`; on Prepare failure the legacy broadcast fallback fires so a partial RPC regression never stalls a config rollout. A worker with no RPC channel yet registered (early supervisor startup) also falls through to the legacy broadcast. See design § 7
-- Per-route rate limiting (WPAR worker-parity audit, Phase 3): new `rate_limit: { capacity, refill_per_sec, scope }` config field on `Route` exposes a per-route token-bucket limiter applied after ban-list / IP-blocklist / redirect checks but before mTLS / forward-auth / WAF (cheap rejection of abusive clients before expensive evaluation). `scope: per_ip` (default) creates one bucket per (route, client IP) — isolates abusive clients without penalising the rest; `scope: per_route` creates a single shared bucket for the route — caps aggregate traffic to a fragile origin. Rejected requests return `429 Too Many Requests` with a `Retry-After` header computed from the refill rate. Dashboard: three new inputs under the Protection tab (capacity, refill/s, scope dropdown). API validates `capacity` and `refill_per_sec <= 1_000_000` to prevent `u32::MAX` overflow. Schema migration V33. Built on the `lorica_limits::token_bucket` primitives (Mutex-guarded authoritative bucket with fixed-point 1e6-scale tokens, lazy time-based refill, clock-rewind-is-noop). In multi-worker mode (`--workers N >= 1`) the supervisor holds the authoritative bucket registry and workers keep CAS-based `LocalBucket` caches that sync every 100 ms over a dedicated pipelined RPC socketpair (separate from the legacy command channel). Aggregate admission is bounded at `capacity + 100 ms × N_workers × refill_per_sec` worth of tokens — the design's documented initial-tick over-admission (§ 6) — after which workers converge on the authoritative state
+- Per-route rate limiting (WPAR worker-parity audit, Phase 3): new `rate_limit: { capacity, refill_per_sec, scope }` config field on `Route` exposes a per-route token-bucket limiter applied after ban-list / IP-blocklist / redirect checks but before mTLS / forward-auth / WAF (cheap rejection of abusive clients before expensive evaluation). `scope: per_ip` (default) creates one bucket per (route, client IP) - isolates abusive clients without penalising the rest; `scope: per_route` creates a single shared bucket for the route - caps aggregate traffic to a fragile origin. Rejected requests return `429 Too Many Requests` with a `Retry-After` header computed from the refill rate. Dashboard: three new inputs under the Protection tab (capacity, refill/s, scope dropdown). API validates `capacity` and `refill_per_sec <= 1_000_000` to prevent `u32::MAX` overflow. Schema migration V33. Built on the `lorica_limits::token_bucket` primitives (Mutex-guarded authoritative bucket with fixed-point 1e6-scale tokens, lazy time-based refill, clock-rewind-is-noop). In multi-worker mode (`--workers N >= 1`) the supervisor holds the authoritative bucket registry and workers keep CAS-based `LocalBucket` caches that sync every 100 ms over a dedicated pipelined RPC socketpair (separate from the legacy command channel). Aggregate admission is bounded at `capacity + 100 ms × N_workers × refill_per_sec` worth of tokens - the design's documented initial-tick over-admission (§ 6) - after which workers converge on the authoritative state
 - WAF auto-ban counter migrated to shared memory (WPAR worker-parity audit, Phase 3): per-IP violation counting moved from the supervisor-local DashMap (fed by UDS WAF-event forwarding) to the `lorica-shmem` `waf_auto_ban` atomic hashtable. Workers increment the cross-worker counter directly on each WAF block; the supervisor reads the counter, compares against the configured threshold, and on first crossing broadcasts `BanIp` to all workers then CAS-resets the slot so the next round starts at zero. Eliminates the dashmap/shmem/UDS triple-source skew and gives identical accounting across the pool. Single-process mode keeps the existing per-process fallback path unchanged. See `docs/architecture/worker-shared-state.md` § 5-6
-- `lorica-shmem` crate (WPAR worker-parity audit, Phase 2): anonymous memfd-backed shared-memory region for cross-worker atomic counters. `SharedRegion` holds two 128 Ki-slot open-addressing hashtables (`waf_flood`, `waf_auto_ban`) used by WPAR-1 for per-IP flood and auto-ban counts. Each slot is a 64-byte cache line carrying three independent `AtomicU64` fields (key, value, last_update_ns); no seqlock — readers consume `value` with a single atomic load and writers race on commutative `fetch_add`, so there are no torn reads regardless of writer concurrency. Linear probing up to `MAX_PROBE = 16` with a `SATURATED = u64::MAX` sentinel for chain exhaustion (fail-safe: WAF treats saturation as "limit reached"). SipHash-1-3 with a 128-bit supervisor-randomized key (via `getrandom`) prevents an attacker from crafting IPs that collide into the same probe chain. `memfd_create(MFD_CLOEXEC)` + `mmap(MAP_SHARED)`; the supervisor passes the fd to each worker at fork via the existing SCM_RIGHTS machinery. Magic number (ASCII "LORICASHM") and `layout_version` verified on worker open. Synchronous `evict_once(region, now_ns, stale_after)` primitive called by the supervisor's eviction loop; CAS-based slot release leaves `value` / `last_update_ns` for the next claim to reset. 24 unit tests plus 5 fork-based multi-process integration tests (disjoint-key no-crosstalk, same-key commutative-sum, siphash-key shared across children, SIGKILL survivor sanity, probe-chain saturation). See `docs/architecture/worker-shared-state.md` § 5
+- `lorica-shmem` crate (WPAR worker-parity audit, Phase 2): anonymous memfd-backed shared-memory region for cross-worker atomic counters. `SharedRegion` holds two 128 Ki-slot open-addressing hashtables (`waf_flood`, `waf_auto_ban`) used by WPAR-1 for per-IP flood and auto-ban counts. Each slot is a 64-byte cache line carrying three independent `AtomicU64` fields (key, value, last_update_ns); no seqlock - readers consume `value` with a single atomic load and writers race on commutative `fetch_add`, so there are no torn reads regardless of writer concurrency. Linear probing up to `MAX_PROBE = 16` with a `SATURATED = u64::MAX` sentinel for chain exhaustion (fail-safe: WAF treats saturation as "limit reached"). SipHash-1-3 with a 128-bit supervisor-randomized key (via `getrandom`) prevents an attacker from crafting IPs that collide into the same probe chain. `memfd_create(MFD_CLOEXEC)` + `mmap(MAP_SHARED)`; the supervisor passes the fd to each worker at fork via the existing SCM_RIGHTS machinery. Magic number (ASCII "LORICASHM") and `layout_version` verified on worker open. Synchronous `evict_once(region, now_ns, stale_after)` primitive called by the supervisor's eviction loop; CAS-based slot release leaves `value` / `last_update_ns` for the next claim to reset. 24 unit tests plus 5 fork-based multi-process integration tests (disjoint-key no-crosstalk, same-key commutative-sum, siphash-key shared across children, SIGKILL survivor sanity, probe-chain saturation). See `docs/architecture/worker-shared-state.md` § 5
 - `lorica-command` pipelined RPC framework (WPAR worker-parity audit, Phase 1): new `RpcEndpoint` demultiplexes concurrent in-flight requests on a single Unix socket via a background reader task and a per-sequence in-flight map, with a bounded outbound queue (capacity 256) that backpressures through a per-request timeout rather than growing unbounded. In-flight entries are removed on every exit path (Ok, Closed, Timeout) so dead senders cannot linger. Adds an `Envelope` wire frame that carries either a `Command` or a `Response` (required because the two shared leading prost tags), new `CommandType` variants for the upcoming WPAR RPCs (`RateLimitQuery/Delta`, `VerdictLookup/Push`, `BreakerQuery/Report`, `ConfigReloadPrepare/Commit`), typed payload oneofs on `Command` and `Response`, tri-state `BreakerDecision` (`Allow`/`Deny`/`AllowProbe`) per the supervisor-owned HalfOpen-probe model, a `Coalescer<K,V>` dedup primitive with TTL-bounded caching for the upcoming `/metrics` fan-out, and a `GenerationGate` atomic watermark enforcing strictly increasing reload generations. 37 unit tests including concurrency, adjacent-request isolation, peer-drop cleanup, and high-volume pipelining. See `docs/architecture/worker-shared-state.md` § 4
 - Connection pre-filter: IP allow/deny CIDR policy enforced at TCP accept, before TLS handshake. Configurable via new `connection_allow_cidrs` and `connection_deny_cidrs` `GlobalSettings` fields; editable in the dashboard Settings tab. Deny always wins; a non-empty allow list switches the filter to default-deny. Hot-reloaded via arc-swap - listener-state stays consistent without rebuilding endpoints, in both single-process and worker modes
 - Cache predictor: shared 16-shard LRU (32K keys total) remembers cache keys whose origin responded uncacheable (OriginNotCache, ResponseTooLarge, or user-defined custom reason) and short-circuits the cache state machine on the next request. Reduces cache-lock contention and variance-key computation on known-bypass traffic. Transient errors (InternalError, UpstreamError, storage failures, lock timeouts) are not remembered
@@ -159,6 +32,7 @@ Author: Rwx-G
 - Response body rewriting (Nginx `sub_filter` equivalent): per-route `response_rewrite` applies an ordered list of search-and-replace rules to upstream response bodies before they reach the client. Supports literal patterns (default) and regex with capture-group substitution (`$1`, `$2`). Rules compose (each rule runs on the output of the previous one). Only text-ish content is rewritten - configurable `content_type_prefixes` (default `text/`); compressed responses (`Content-Encoding: gzip/br`) pass through unchanged to avoid corrupting the stream. Bodies exceeding `max_body_bytes` (default 1 MiB, cap 128 MiB) stream through verbatim rather than emit a partial rewrite. Cross-chunk patterns are caught because the engine buffers the full body before running rules. `Content-Length` is automatically dropped on rewritten responses (new length differs from origin). API validates regex compilability at write time, non-empty patterns, and bounded limits. Schema migration V30 adds `routes.response_rewrite TEXT` as nullable JSON. Dashboard: dedicated "Rewrite" tab with per-rule reorder/expand UX. HEAD responses, 1xx/204/304 statuses, and cache-enabled routes are skipped (the last is mutually exclusive with rewriting in v1 and is surfaced via a warn log)
 - mTLS client verification: per-route `mtls` requires connecting clients to present an X.509 certificate signed by the configured CA bundle and, optionally, constrains which certificate subject organizations are allowed. The TLS handshake verifier is built at listener startup from the union of all per-route CAs (via rustls `WebPkiClientVerifier` with `allow_unauthenticated`), so different routes on the same listener can have different policies. Per-request enforcement runs before forward_auth: `required = true` with no client cert returns 496 ("SSL certificate required"), a presented cert whose O= isn't in `allowed_organizations` returns 495 ("SSL certificate error"). Rustls `ServerConfig` is immutable after build, so changes to `ca_cert_pem` require a restart; toggling `required` and editing `allowed_organizations` hot-reload. API validates PEM decodability, presence of at least one CERTIFICATE block, X.509 DER integrity, a 1 MiB bundle cap, and dedup/non-empty entries in the organization allowlist. Schema migration V31 adds `routes.mtls TEXT` as nullable JSON. Dashboard exposure in the Security tab
 - Prometheus counters for every v1.3.0 feature with non-trivial activity, exposed on the existing `GET /metrics` endpoint: `lorica_cache_predictor_bypass_total{route_id}`, `lorica_header_rule_match_total{route_id, rule_index}` (with `rule_index = "default"` for fallthrough), `lorica_canary_split_selected_total{route_id, split_name}` (with `"default"` / `"unnamed"` labels), `lorica_mirror_outcome_total{route_id, outcome}` (outcomes: `spawned`, `dropped_saturated`, `dropped_oversize_body`, `errored`), `lorica_forward_auth_cache_total{route_id, outcome}` (outcomes: `hit`, `miss`). Cardinality is bounded by route count - no user-input-derived labels
+- Supervisor -> worker pipelined-RPC Prometheus counter (`lorica_supervisor_rpc_outcome_total{kind, outcome}`): one counter spanning `metrics_pull` / `config_reload_{prepare,commit,abort}` with `ok` / `timeout` / `error` outcomes. Lets ops tell apart "all workers slow on Prepare" (DB contention) from "one worker stuck on metrics pull" (downstream issue)
 - Config-validation endpoints to shorten the save-fail-retry loop when configuring auth and mTLS: `POST /api/v1/validate/mtls-pem` parses a candidate CA PEM and returns the per-cert subjects so operators can confirm their bundle before committing; `POST /api/v1/validate/forward-auth` issues one GET to a candidate auth URL and reports status, elapsed time, and a whitelisted subset of response headers (Location, Remote-User, Remote-Groups, Remote-Email, Content-Type). Surfaced in the dashboard Security tab as inline "Validate PEM" / "Test connection" buttons
 
 ### Changed
@@ -175,6 +49,33 @@ Author: Rwx-G
 - Custom WAF rule compilation now caps both the raw pattern length (4 KiB) and the compiled NFA/DFA size (512 KiB) via `RegexBuilder::size_limit`. An authenticated admin submitting a pathological alternation can no longer stall the management API thread or balloon memory during hot-reload. Runtime matching was already linear via the `regex` crate; this closes the compile-time surface
 - Pinned `rustls-pemfile = "=2.1.2"` in `lorica` and `lorica-tls` to keep the workspace off the 2.2.0 line flagged unmaintained by RustSec (RUSTSEC-2025-0134). The unmaintained API is not used; pinning is precautionary while rustls upstream lands the in-tree replacement
 - E2E Docker harness (`tests-e2e-docker/`) now runs as the non-root `lorica` user end-to-end. The entrypoints no longer need `su` to drop privileges because the exposed ports (9443/8080/8443) are above 1024 and `CAP_NET_BIND_SERVICE` is not required
+- Bumped `dashmap 5.5.3 -> 6.1.0` across `lorica`, `lorica-api`, `lorica-limits`; 5.x had iterator-invariant unsoundness fixed in 6.x (supply-chain audit SC-M-1, SC-M-4)
+- Bumped `tokio-tungstenite 0.20.1 -> 0.29.0` in `lorica-proxy` to drop a duplicated websocket frame parser and pull in fuzzer-driven fixes (supply-chain audit SC-M-2)
+- Bumped `brotli 3 -> 8` in `lorica-core` (supply-chain audit SC-L-1); API source-compatible for Lorica's `CompressorWriter` / `DecompressorWriter` usage
+- `lorica-api` feature `route53` flipped to off by default (supply-chain audit SC-M-3). Non-Route53 deployments no longer ship the `aws-smithy-http-client` dep graph that drags `rustls 0.21` + `hyper 0.14`. Users of ACME DNS-01 via Route53 build with `cargo build --release --features route53`. BREAKING for downstream packagers who relied on the default feature
+- Inlined `no_debug` (was `no_debug = "3.1.0"` unmaintained single-file crate, supply-chain audit SC-L-3) as `lorica-tls::no_debug` module. Dropped the dep; public API preserved via `pub use crate::no_debug::{...}`
+- Dropped `daemonize = "0.5"` dep (RUSTSEC-2025-0069, unmaintained). Production Lorica runs under `systemd Type=simple`; legacy `--daemon` flag now emits a warning and falls through to foreground execution. BREAKING only for operators who relied on `--daemon` outside systemd (a non-use-case in practice)
+- CI: new `Semgrep (security)` job running 7 `p/*` rulesets + `trailofbits/semgrep-rules` (generic / javascript / rs / yaml), non-blocking with SARIF upload as PR artifact. Closes the original `p/bash` / `p/yaml` / `p/sql` coverage gap (audit round 1 identified them as 404 on the registry)
+- CI: new `Frontend lint` step running `svelte-check` + `eslint-plugin-svelte` (flat config with `svelte/no-at-html-tags` + `svelte/no-target-blank` + `no-eval` family). Regression guard for the Svelte XSS manual audit pass (audit coverage gap)
+- Split `lorica/src/proxy_wiring.rs` from 8 561 LOC down to 4 170 LOC (-51 %) as audit M-8 follow-up. Tests block (~3 k LOC) moved to `proxy_wiring/tests.rs`; RPC dispatch enums (BreakerAdmission / BreakerEngine / VerdictCacheEngine / RateLimitEngine) moved to `proxy_wiring/engines.rs`; forward-auth + verdict-cache to `proxy_wiring/forward_auth.rs`; mirror + response-rewrite to `proxy_wiring/mirror_rewrite.rs`; pure helpers (sanitize_html, mTLS, canary, cache vary, header rules) to `proxy_wiring/helpers.rs`. All re-exported via `pub use` so the existing `lorica::proxy_wiring::*` import path is preserved. No functional change
+
+### Fixed
+
+- Worker auto-respawn race during supervisor shutdown: the worker monitor task (which detects crashed workers and respawns them) blocks on a `std::sync::Mutex` shared with the supervisor's shutdown path. `monitor_handle.abort()` cannot fire while the monitor is parked on that mutex (abort only takes effect at the next `.await`), and `manager.shutdown_all()` holds the mutex synchronously for the full ~30 s drain. When `shutdown_all` releases the mutex after SIGKILL'ing stragglers, the monitor unblocks, sees those workers as crashed, and respawns them BEFORE reaching the loop's next `sleep().await` cancellation point. The freshly forked workers get SIGTERM ms later, can't drain in time, and systemd ends up SIGKILL'ing the whole service group past `TimeoutStopSec`. Fix: introduce a `shutting_down` `AtomicBool`. The supervisor sets it before `shutdown_all` (and still calls `monitor_handle.abort()` as a backstop). The monitor checks the flag both before and after acquiring the mutex; on the post-acquire check it returns early without restarting any worker, regardless of how long it waited for the mutex
+- Worker RPC listener hang on supervisor shutdown: `RpcEndpoint::Inner::drop` did not actually abort the reader + writer tokio tasks (dropping a `JoinHandle` is detach, not abort), so a dropped endpoint kept its socket halves alive and the peer never saw EOF. Worker shutdown then hung past the 10 s `TaskTracker` drain. Fix: `Inner::drop` now calls `handle.abort()` on both tasks. Regression test `reload_listener_drains_on_supervisor_eof` asserts completion within 5 s
+- `SupervisorBreakerRegistry` stale-probe deadlock (audit H-1): if the probe-admitted worker crashed between admit and report, the breaker entry was pinned in `HalfOpen { probe_in_flight: true }` forever and every subsequent query for that `(route, backend)` returned Deny until supervisor restart. `HalfOpen` now carries `probe_started_at: Option<Instant>`; on the next query observing `elapsed >= cooldown` the supervisor synthesises a failed probe, bumps the failure counter, transitions back to Open with a fresh cooldown, and emits a warn log. Regression test `breaker_registry_stale_probe_recovers_after_cooldown`
+- `lorica-worker::fd_passing::recv_worker_fds` kernel-FD leak on error paths (audit H-2): the function collected raw `RawFd`s into a `Vec` and returned `Err(...)` on UTF-8 validation / fds-tokens mismatch / bad `FdKind` token without closing them. Received FDs are now wrapped in `OwnedFd` immediately after `recvmsg` so every error path `close(2)`s via the RAII drop. Added `MSG_TRUNC` / `MSG_CTRUNC` detection so silent kernel truncation returns `InvalidPayload` instead of adopting a half-received FD set. Added a compile-time size assertion on `PAYLOAD_BUF_SIZE`
+- Two-phase config reload non-atomic `connection_filter` publish (audit H-3): `PendingProxyConfig` now carries the full `reload::PreparedReload` rather than only `Arc<ProxyConfig>`, so the Commit handler calls `commit_prepared_reload(proxy_config, filter, prepared)` which publishes the ArcSwap and the filter CIDR reload together. Prior code re-read the filter separately, opening a short window where ProxyConfig v2 ran against filter v1 on reloads that flipped `connection_allow_cidrs` / `connection_deny_cidrs`. The worker-side RPC listener is now wired with `Some(connection_filter)` at the call site (was `None`)
+- `EwmaTracker::record` hot-path allocation (audit M-1): the common case (backend already known) no longer pays for an `addr.to_string()` per request. `get_mut` path + first-sample seeding without the 30 % alpha bias
+- TOCTOU in `SupervisorVerdictCache::lookup` + `FORWARD_AUTH_VERDICT_CACHE` expiry eviction (audit M-2 + M-3): a concurrent fresh insert racing with an expiry observation could be evicted by the stale lookup. Replaced with `dashmap::DashMap::remove_if` that evicts only when the entry's `expires_at` still matches the observation
+- `handle_rate_limit_delta` mutex contention on first-seen keys (audit M-4): N concurrent `RateLimitDelta` RPCs on a first-seen `{route|scope}` previously serialised on the `store` `tokio::Mutex` for N SQLite reads. Added a supervisor-side `rl_policy_cache` DashMap that caches per-route policy, invalidated on every reload (both the fully-succeeded two-phase commit and the legacy-broadcast fallback)
+- Predictable `generate_request_id` IDs (audit M-5): previous implementation used `DefaultHasher(SystemTime::nanos XOR thread_id)`, which is deterministic given inputs and collides on same-nanosecond concurrent same-thread requests. Replaced with `OsRng.fill_bytes(16)` for 128 bits of unpredictable ID
+- `ConfigReloadAbort` RPC (audit M-7): new wire-additive `CommandType::ConfigReloadAbort` (tag 14) fanned out to workers that succeeded Prepare when a peer fails; worker drops the pending slot on generation match instead of pinning one orphan `Arc<ProxyConfig>` per worker until the next reload
+- `lorica-shmem::now_ns` silent fallback (audit L-1): `clock_gettime` failure now emits a warn log instead of silently returning 0, which would stall eviction without any signal to ops
+- `lorica-command::IncomingCommand::reply` debug-assert on caller-supplied sequence mismatch (audit L-3): release builds still overwrite with the originating command's sequence, but wiring bugs that pass a different non-zero sequence now surface in tests
+- `generate_random_password` deterministic RNG (audit L-5): replaced `thread_rng()` with `ChaCha20Rng::from_rng(OsRng)` so the first-run admin password pedigree matches `hash_password`'s OS-entropy salt
+- `lorica-limits::token_bucket::refill_locked` overflow-defence tightening (audit L-6): added a `debug_assert!` that `refill_per_sec <= 1_000_000` (the API cap) so future regressions surface in tests instead of silently saturating
+
 
 ## [1.2.0] - 2026-04-11
 
