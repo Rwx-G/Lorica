@@ -540,6 +540,21 @@ pub struct VerdictPush {
     pub verdict: i32,
     #[prost(uint64, tag = "4")]
     pub ttl_ms: u64,
+    /// Forward-auth response headers captured from the upstream auth
+    /// service (Remote-User, Remote-Groups, etc.). Stored alongside the
+    /// verdict so a subsequent lookup can inject them without a fresh
+    /// auth round trip.
+    #[prost(message, repeated, tag = "5")]
+    pub response_headers: Vec<ForwardAuthHeader>,
+}
+
+/// Single header pair propagated from a cached forward-auth verdict.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ForwardAuthHeader {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
 }
 
 /// Worker -> supervisor: ask whether a request should be admitted.
@@ -596,6 +611,9 @@ pub struct VerdictResult {
     /// Remaining TTL in milliseconds (informative).
     #[prost(uint64, tag = "3")]
     pub ttl_ms: u64,
+    /// Headers the worker injects on an Allow hit. Empty on miss / Deny.
+    #[prost(message, repeated, tag = "4")]
+    pub response_headers: Vec<ForwardAuthHeader>,
 }
 
 /// Supervisor -> worker: result of a `BreakerQuery`.

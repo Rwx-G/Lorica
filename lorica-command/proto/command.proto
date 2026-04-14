@@ -84,6 +84,18 @@ message VerdictPush {
   string cookie = 2;
   Verdict verdict = 3;
   uint64 ttl_ms = 4;
+  // Forward-auth response headers captured from the upstream auth
+  // service (e.g. Remote-User, Remote-Groups). The supervisor stores
+  // them alongside the verdict so a worker can serve an Allow-hit
+  // without re-invoking the auth backend.
+  repeated ForwardAuthHeader response_headers = 5;
+}
+
+// Single header pair captured from a forward-auth upstream response
+// and propagated to the downstream request on a cache hit.
+message ForwardAuthHeader {
+  string name = 1;
+  string value = 2;
 }
 
 message BreakerQuery { string route_id = 1; string backend = 2; }
@@ -102,6 +114,10 @@ message VerdictResult {
   bool found = 1;
   Verdict verdict = 2;
   uint64 ttl_ms = 3;
+  // Headers the worker must inject into the upstream request on an
+  // Allow hit. Populated by the supervisor from the last `VerdictPush`
+  // for this (route, cookie). Empty on a miss or on a Deny hit.
+  repeated ForwardAuthHeader response_headers = 4;
 }
 message BreakerResult { BreakerDecision decision = 1; }
 message RateLimitResult { bool allowed = 1; uint32 remaining = 2; }

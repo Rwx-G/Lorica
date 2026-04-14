@@ -618,6 +618,23 @@ fn run_supervisor(cli: Cli) {
             dashmap::DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>,
         > = Arc::new(dashmap::DashMap::new());
 
+        // Cross-worker forward-auth verdict cache. Workers issue
+        // `VerdictLookup` before calling the auth upstream and
+        // `VerdictPush` after a successful Allow. A single shared cache
+        // means every worker sees Allow verdicts populated by any peer
+        // and a session revocation invalidates them uniformly. See
+        // design § 7 WPAR-2.
+        let verdict_cache: Arc<SupervisorVerdictCache> =
+            Arc::new(SupervisorVerdictCache::new());
+
+        // Cross-worker circuit breaker state. Workers ask the
+        // supervisor whether a request to `(route, backend)` should be
+        // admitted and report back the outcome; the supervisor owns
+        // the Closed/Open/HalfOpen state machine so probe admission
+        // never races across workers. See design § 7 WPAR-3.
+        let breaker_registry: Arc<SupervisorBreakerRegistry> =
+            Arc::new(SupervisorBreakerRegistry::new(5, Duration::from_secs(10)));
+
         // Spawn a per-worker task that handles both config reload and heartbeat
         // No shared Mutex - each worker has its own channel and task
         for (worker_id, worker_pid, raw_fd, rpc_raw_fd) in worker_fds {
@@ -645,6 +662,8 @@ fn run_supervisor(cli: Cli) {
                 let rpc_fd = rpc_raw_fd;
                 let registry = Arc::clone(&rl_registry);
                 let store_for_rpc = Arc::clone(&store);
+                let vcache = Arc::clone(&verdict_cache);
+                let breakers = Arc::clone(&breaker_registry);
                 tokio::spawn(async move {
                     // SAFETY: rpc_fd is a valid socketpair end from
                     // WorkerManager::spawn_worker, exclusively owned by
@@ -672,6 +691,18 @@ fn run_supervisor(cli: Cli) {
                                     worker_id,
                                 )
                                 .await;
+                            }
+                            lorica_command::CommandType::VerdictLookup => {
+                                handle_verdict_lookup(inc, &vcache).await;
+                            }
+                            lorica_command::CommandType::VerdictPush => {
+                                handle_verdict_push(inc, &vcache).await;
+                            }
+                            lorica_command::CommandType::BreakerQuery => {
+                                handle_breaker_query(inc, &breakers).await;
+                            }
+                            lorica_command::CommandType::BreakerReport => {
+                                handle_breaker_report(inc, &breakers).await;
                             }
                             other => {
                                 tracing::debug!(
@@ -1472,6 +1503,325 @@ async fn handle_rate_limit_delta(
 }
 
 // ---------------------------------------------------------------------------
+// Supervisor-side forward-auth verdict cache (WPAR-2).
+//
+// Mirrors the per-process FIFO cache that `proxy_wiring.rs` keeps for
+// single-process deployments, but as an instance rather than a static.
+// Worker-mode deployments route lookup/push through the pipelined RPC
+// channel so every worker sees the same Allow verdicts and session
+// revocation invalidates them uniformly.
+// ---------------------------------------------------------------------------
+
+const SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES: usize = 16_384;
+
+struct SupervisorVerdictCacheEntry {
+    verdict: i32,
+    response_headers: Vec<(String, String)>,
+    expires_at: Instant,
+}
+
+struct SupervisorVerdictCache {
+    entries: dashmap::DashMap<String, SupervisorVerdictCacheEntry>,
+    order: parking_lot::Mutex<std::collections::VecDeque<String>>,
+}
+
+impl SupervisorVerdictCache {
+    fn new() -> Self {
+        Self {
+            entries: dashmap::DashMap::with_capacity(SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES),
+            order: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
+                SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES,
+            )),
+        }
+    }
+
+    fn key(route_id: &str, cookie: &str) -> String {
+        let mut k = String::with_capacity(route_id.len() + 1 + cookie.len());
+        k.push_str(route_id);
+        k.push('\0');
+        k.push_str(cookie);
+        k
+    }
+
+    fn lookup(&self, route_id: &str, cookie: &str) -> Option<(i32, Vec<(String, String)>, u64)> {
+        let key = Self::key(route_id, cookie);
+        let entry = self.entries.get(&key)?;
+        let now = Instant::now();
+        if now >= entry.expires_at {
+            drop(entry);
+            self.entries.remove(&key);
+            return None;
+        }
+        let ttl_ms = entry.expires_at.saturating_duration_since(now).as_millis() as u64;
+        Some((entry.verdict, entry.response_headers.clone(), ttl_ms))
+    }
+
+    fn insert(
+        &self,
+        route_id: &str,
+        cookie: &str,
+        verdict: i32,
+        response_headers: Vec<(String, String)>,
+        ttl_ms: u64,
+    ) {
+        let key = Self::key(route_id, cookie);
+        // FIFO bound: pop oldest keys until strictly under the cap.
+        // Matches `verdict_cache_insert` in proxy_wiring.rs so worker
+        // mode and single-process mode agree on memory ceiling.
+        let mut order = self.order.lock();
+        while order.len() >= SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES {
+            if let Some(old) = order.pop_front() {
+                self.entries.remove(&old);
+            } else {
+                break;
+            }
+        }
+        order.push_back(key.clone());
+        drop(order);
+        let expires_at = Instant::now() + Duration::from_millis(ttl_ms);
+        self.entries.insert(
+            key,
+            SupervisorVerdictCacheEntry {
+                verdict,
+                response_headers,
+                expires_at,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+async fn handle_verdict_lookup(
+    inc: lorica_command::IncomingCommand,
+    cache: &SupervisorVerdictCache,
+) {
+    use lorica_command::{command, response, ForwardAuthHeader, VerdictResult};
+
+    let lookup = match inc.command().payload.clone() {
+        Some(command::Payload::VerdictLookup(l)) => l,
+        _ => {
+            let _ = inc.reply_error("malformed VerdictLookup payload").await;
+            return;
+        }
+    };
+    let result = match cache.lookup(&lookup.route_id, &lookup.cookie) {
+        Some((verdict, headers, ttl_ms)) => VerdictResult {
+            found: true,
+            verdict,
+            ttl_ms,
+            response_headers: headers
+                .into_iter()
+                .map(|(n, v)| ForwardAuthHeader { name: n, value: v })
+                .collect(),
+        },
+        None => VerdictResult {
+            found: false,
+            verdict: 0,
+            ttl_ms: 0,
+            response_headers: Vec::new(),
+        },
+    };
+    let _ = inc
+        .reply(lorica_command::Response::ok_with(
+            0,
+            response::Payload::VerdictResult(result),
+        ))
+        .await;
+}
+
+async fn handle_verdict_push(
+    inc: lorica_command::IncomingCommand,
+    cache: &SupervisorVerdictCache,
+) {
+    use lorica_command::command;
+
+    let push = match inc.command().payload.clone() {
+        Some(command::Payload::VerdictPush(p)) => p,
+        _ => {
+            let _ = inc.reply_error("malformed VerdictPush payload").await;
+            return;
+        }
+    };
+    // Only Allow verdicts with a positive TTL are cached, matching the
+    // single-process semantics. A Deny or zero-TTL push is treated as a
+    // silent no-op so a worker that miscomputes the cache predicate
+    // cannot poison the supervisor's cache.
+    if push.ttl_ms > 0 && lorica_command::Verdict::from_i32(push.verdict) == lorica_command::Verdict::Allow {
+        let headers = push
+            .response_headers
+            .into_iter()
+            .map(|h| (h.name, h.value))
+            .collect();
+        cache.insert(&push.route_id, &push.cookie, push.verdict, headers, push.ttl_ms);
+    }
+    let _ = inc.reply(lorica_command::Response::ok(0)).await;
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor-side circuit breaker (WPAR-3).
+//
+// Mirrors the per-process `CircuitBreaker` kept in `proxy_wiring.rs` but
+// elevated to the supervisor so admission decisions and probe slots are
+// consistent across workers. Reuses the same `threshold` / `cooldown`
+// shape so operator-visible behaviour is unchanged.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SupervisorBreakerState {
+    Closed,
+    Open { opened_at: Instant },
+    HalfOpen { probe_in_flight: bool },
+}
+
+struct SupervisorBreakerEntry {
+    state: SupervisorBreakerState,
+    consecutive_failures: u32,
+}
+
+struct SupervisorBreakerRegistry {
+    /// Key: `{route_id}|{backend}`
+    entries: dashmap::DashMap<String, parking_lot::Mutex<SupervisorBreakerEntry>>,
+    failure_threshold: u32,
+    cooldown: Duration,
+}
+
+impl SupervisorBreakerRegistry {
+    fn new(failure_threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            entries: dashmap::DashMap::new(),
+            failure_threshold,
+            cooldown,
+        }
+    }
+
+    fn key(route_id: &str, backend: &str) -> String {
+        let mut k = String::with_capacity(route_id.len() + 1 + backend.len());
+        k.push_str(route_id);
+        k.push('|');
+        k.push_str(backend);
+        k
+    }
+
+    /// Decide admission for a `(route, backend)`. Closed = Allow; Open
+    /// past cooldown = promote to HalfOpen and grant the sole probe
+    /// (`AllowProbe`); HalfOpen with probe already in flight = Deny;
+    /// Open within cooldown = Deny.
+    fn query(&self, route_id: &str, backend: &str) -> lorica_command::BreakerDecision {
+        let key = Self::key(route_id, backend);
+        let entry = self.entries.entry(key).or_insert_with(|| {
+            parking_lot::Mutex::new(SupervisorBreakerEntry {
+                state: SupervisorBreakerState::Closed,
+                consecutive_failures: 0,
+            })
+        });
+        let mut guard = entry.value().lock();
+        match guard.state {
+            SupervisorBreakerState::Closed => lorica_command::BreakerDecision::Allow,
+            SupervisorBreakerState::Open { opened_at } => {
+                if opened_at.elapsed() >= self.cooldown {
+                    guard.state = SupervisorBreakerState::HalfOpen {
+                        probe_in_flight: true,
+                    };
+                    lorica_command::BreakerDecision::AllowProbe
+                } else {
+                    lorica_command::BreakerDecision::Deny
+                }
+            }
+            SupervisorBreakerState::HalfOpen { probe_in_flight } => {
+                if probe_in_flight {
+                    lorica_command::BreakerDecision::Deny
+                } else {
+                    guard.state = SupervisorBreakerState::HalfOpen {
+                        probe_in_flight: true,
+                    };
+                    lorica_command::BreakerDecision::AllowProbe
+                }
+            }
+        }
+    }
+
+    /// Update breaker state after a worker reports the outcome.
+    fn report(&self, route_id: &str, backend: &str, success: bool, was_probe: bool) {
+        let key = Self::key(route_id, backend);
+        let entry = self.entries.entry(key).or_insert_with(|| {
+            parking_lot::Mutex::new(SupervisorBreakerEntry {
+                state: SupervisorBreakerState::Closed,
+                consecutive_failures: 0,
+            })
+        });
+        let mut guard = entry.value().lock();
+        if success {
+            guard.consecutive_failures = 0;
+            if was_probe
+                || matches!(
+                    guard.state,
+                    SupervisorBreakerState::HalfOpen { .. } | SupervisorBreakerState::Open { .. }
+                )
+            {
+                guard.state = SupervisorBreakerState::Closed;
+            }
+        } else {
+            guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+            if guard.consecutive_failures >= self.failure_threshold {
+                guard.state = SupervisorBreakerState::Open {
+                    opened_at: Instant::now(),
+                };
+            } else if was_probe {
+                // Probe failed: bounce back to Open with fresh cooldown.
+                guard.state = SupervisorBreakerState::Open {
+                    opened_at: Instant::now(),
+                };
+            }
+        }
+    }
+}
+
+async fn handle_breaker_query(
+    inc: lorica_command::IncomingCommand,
+    registry: &SupervisorBreakerRegistry,
+) {
+    use lorica_command::{command, response, BreakerResult};
+
+    let q = match inc.command().payload.clone() {
+        Some(command::Payload::BreakerQuery(q)) => q,
+        _ => {
+            let _ = inc.reply_error("malformed BreakerQuery payload").await;
+            return;
+        }
+    };
+    let decision = registry.query(&q.route_id, &q.backend);
+    let _ = inc
+        .reply(lorica_command::Response::ok_with(
+            0,
+            response::Payload::BreakerResult(BreakerResult {
+                decision: decision as i32,
+            }),
+        ))
+        .await;
+}
+
+async fn handle_breaker_report(
+    inc: lorica_command::IncomingCommand,
+    registry: &SupervisorBreakerRegistry,
+) {
+    use lorica_command::command;
+
+    let r = match inc.command().payload.clone() {
+        Some(command::Payload::BreakerReport(r)) => r,
+        _ => {
+            let _ = inc.reply_error("malformed BreakerReport payload").await;
+            return;
+        }
+    };
+    registry.report(&r.route_id, &r.backend, r.success, r.was_probe);
+    let _ = inc.reply(lorica_command::Response::ok(0)).await;
+}
+
+// ---------------------------------------------------------------------------
 // Worker mode (Unix only): receives FDs from supervisor, runs proxy engine
 // ---------------------------------------------------------------------------
 
@@ -2084,12 +2434,32 @@ fn run_worker(
                 // commands on this channel; drop the receiver to let
                 // the reader task exit cleanly if the supervisor ever
                 // sends one (it will see the channel closed).
+                //
+                // The endpoint is cloned across four use sites:
+                // rate-limit sync loop, verdict cache lookup/push,
+                // breaker query/report, and config-reload prepare/
+                // commit listener. `RpcEndpoint` is `Clone` via
+                // `Arc<Inner>` so all four share the same underlying
+                // stream and pipelined dispatcher. See design § 4.3.
+                lorica_proxy.verdict_cache =
+                    lorica::proxy_wiring::VerdictCacheEngine::rpc(
+                        endpoint.clone(),
+                        Duration::from_millis(500),
+                    );
+                lorica_proxy.circuit_breaker_engine =
+                    lorica::proxy_wiring::BreakerEngine::rpc(
+                        endpoint.clone(),
+                        Duration::from_millis(500),
+                    );
                 let _sync_handle = lorica_proxy.spawn_rate_limit_sync(
                     &worker_auth_prune_tracker,
                     endpoint,
                     Duration::from_millis(100),
                 );
-                info!(worker_id = id, "rate-limit sync task spawned");
+                info!(
+                    worker_id = id,
+                    "rate-limit sync task spawned; verdict cache + breaker engines bound to RPC"
+                );
             }
             Err(e) => {
                 error!(
@@ -2819,5 +3189,142 @@ async fn shutdown_signal() {
         _ = sigint.recv() => {
             warn!("Received SIGINT");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for supervisor-side RPC registries (WPAR-2 + WPAR-3).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+
+    #[test]
+    fn verdict_cache_lookup_miss_on_empty() {
+        let c = SupervisorVerdictCache::new();
+        assert!(c.lookup("r1", "cookie-a").is_none());
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn verdict_cache_hit_round_trip() {
+        let c = SupervisorVerdictCache::new();
+        c.insert(
+            "r1",
+            "session=abc",
+            lorica_command::Verdict::Allow as i32,
+            vec![("Remote-User".into(), "alice".into())],
+            30_000,
+        );
+        let (verdict, headers, ttl_ms) = c.lookup("r1", "session=abc").expect("hit");
+        assert_eq!(verdict, lorica_command::Verdict::Allow as i32);
+        assert_eq!(headers, vec![("Remote-User".into(), "alice".into())]);
+        assert!(ttl_ms > 29_000 && ttl_ms <= 30_000);
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn verdict_cache_miss_on_expired_entry() {
+        let c = SupervisorVerdictCache::new();
+        c.insert("r1", "cookie", lorica_command::Verdict::Allow as i32, Vec::new(), 1);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(c.lookup("r1", "cookie").is_none());
+        // Lazy eviction on lookup: expired entry removed.
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn verdict_cache_partitions_by_route() {
+        let c = SupervisorVerdictCache::new();
+        c.insert("route-a", "c", lorica_command::Verdict::Allow as i32, Vec::new(), 30_000);
+        assert!(c.lookup("route-a", "c").is_some());
+        assert!(c.lookup("route-b", "c").is_none());
+    }
+
+    #[test]
+    fn breaker_registry_defaults_to_allow() {
+        let r = SupervisorBreakerRegistry::new(5, Duration::from_secs(10));
+        assert_eq!(
+            r.query("r", "10.0.0.1:80"),
+            lorica_command::BreakerDecision::Allow
+        );
+    }
+
+    #[test]
+    fn breaker_registry_opens_after_threshold() {
+        let r = SupervisorBreakerRegistry::new(3, Duration::from_secs(60));
+        for _ in 0..3 {
+            r.report("r", "b", false, false);
+        }
+        assert_eq!(r.query("r", "b"), lorica_command::BreakerDecision::Deny);
+    }
+
+    #[test]
+    fn breaker_registry_success_resets_failures() {
+        let r = SupervisorBreakerRegistry::new(3, Duration::from_secs(60));
+        r.report("r", "b", false, false);
+        r.report("r", "b", false, false);
+        r.report("r", "b", true, false);
+        r.report("r", "b", false, false);
+        r.report("r", "b", false, false);
+        assert_eq!(r.query("r", "b"), lorica_command::BreakerDecision::Allow);
+    }
+
+    #[test]
+    fn breaker_registry_half_open_probe_single_slot() {
+        let r = SupervisorBreakerRegistry::new(1, Duration::from_millis(0));
+        r.report("r", "b", false, false);
+        // First query after cooldown moves to HalfOpen and grants probe.
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::AllowProbe
+        );
+        // Second concurrent query is denied (slot already held).
+        assert_eq!(r.query("r", "b"), lorica_command::BreakerDecision::Deny);
+    }
+
+    #[test]
+    fn breaker_registry_probe_success_closes() {
+        let r = SupervisorBreakerRegistry::new(1, Duration::from_millis(0));
+        r.report("r", "b", false, false);
+        let d = r.query("r", "b");
+        assert_eq!(d, lorica_command::BreakerDecision::AllowProbe);
+        r.report("r", "b", true, true);
+        assert_eq!(r.query("r", "b"), lorica_command::BreakerDecision::Allow);
+    }
+
+    #[test]
+    fn breaker_registry_probe_failure_reopens() {
+        let r = SupervisorBreakerRegistry::new(5, Duration::from_millis(0));
+        // Hit the threshold to open.
+        for _ in 0..5 {
+            r.report("r", "b", false, false);
+        }
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::AllowProbe
+        );
+        // Probe fails: breaker re-opens.
+        r.report("r", "b", false, true);
+        // Still Open immediately (cooldown=0 means next query admits a fresh probe).
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::AllowProbe
+        );
+    }
+
+    #[test]
+    fn breaker_registry_isolates_routes_sharing_backend() {
+        let r = SupervisorBreakerRegistry::new(1, Duration::from_secs(60));
+        r.report("route-a", "b", false, false);
+        assert_eq!(
+            r.query("route-a", "b"),
+            lorica_command::BreakerDecision::Deny
+        );
+        assert_eq!(
+            r.query("route-b", "b"),
+            lorica_command::BreakerDecision::Allow
+        );
     }
 }

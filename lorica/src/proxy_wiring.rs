@@ -1121,6 +1121,13 @@ pub struct RequestCtx {
     /// `mirror_pending` so the buffer can be taken without disturbing
     /// the pending metadata.
     pub mirror_body_state: Option<MirrorBodyState>,
+    /// Address of the backend admitted via a HalfOpen probe slot on
+    /// this request, when any. Drives `was_probe=true` on the
+    /// subsequent `BreakerEngine::record(...)` call for that exact
+    /// backend so the supervisor can close the breaker on success (or
+    /// bounce back to Open on failure). `None` for requests that went
+    /// out on a Closed breaker.
+    pub breaker_probe_backend: Option<String>,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -1167,8 +1174,13 @@ pub struct LoricaProxy {
     pub alert_sender: Option<lorica_notify::AlertSender>,
     /// Persistent access log store (SQLite).
     pub log_store: Option<Arc<lorica_api::log_store::LogStore>>,
-    /// Per-backend circuit breaker (opens after consecutive failures).
-    pub circuit_breaker: Arc<CircuitBreaker>,
+    /// Per-backend circuit breaker engine. Single-process deployments
+    /// hold the state machine in-process (`BreakerEngine::Local`);
+    /// worker-mode deployments delegate admission and outcome
+    /// reporting to the supervisor via the pipelined RPC channel so
+    /// probe-slot allocation and state transitions stay consistent
+    /// across workers (design § 7 WPAR-3).
+    pub circuit_breaker_engine: BreakerEngine,
     /// Basic auth credential verification cache. Maps a hash of
     /// "username:password" to the timestamp of the last successful Argon2
     /// verification. Entries older than 60 s are ignored, forcing a fresh
@@ -1194,6 +1206,193 @@ pub struct LoricaProxy {
     /// with the supervisor via the pipelined RPC channel (see design
     /// § 6). The [`RateLimitEngine`] enum hides the dispatch.
     pub rate_limit_buckets: RateLimitEngine,
+    /// Forward-auth verdict cache engine. Single-process mode uses the
+    /// process-local static cache; worker mode delegates to the
+    /// supervisor via the pipelined RPC channel so Allow verdicts
+    /// propagate across workers and a session revocation invalidates
+    /// the cache for every worker at once. See design § 7 WPAR-2.
+    pub verdict_cache: VerdictCacheEngine,
+}
+
+/// Circuit-breaker admission result. The worker uses this to know
+/// whether to proceed (`Allow` / `Probe`) and, on completion, whether
+/// the subsequent outcome report must be flagged as `was_probe=true`
+/// so the supervisor can transition HalfOpen -> Closed / Open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BreakerAdmission {
+    /// Admission granted by a Closed breaker. Report outcome without
+    /// `was_probe` flag.
+    Allow,
+    /// HalfOpen probe admitted: the caller holds the sole probe slot
+    /// for this (route, backend) until it reports. Must set
+    /// `was_probe=true` when reporting.
+    Probe,
+    /// Breaker is Open; backend must not be contacted.
+    Deny,
+}
+
+/// Circuit-breaker engine dispatch. Single-process mode uses the
+/// in-process `CircuitBreaker`; worker mode delegates admission and
+/// outcome reporting to the supervisor via the pipelined RPC channel so
+/// probe slots and state transitions are consistent across workers.
+/// See design § 7 WPAR-3.
+#[derive(Clone)]
+pub enum BreakerEngine {
+    Local(Arc<CircuitBreaker>),
+    Rpc {
+        endpoint: lorica_command::RpcEndpoint,
+        timeout: Duration,
+    },
+}
+
+impl BreakerEngine {
+    pub fn local(failure_threshold: u32, cooldown_s: u64) -> Self {
+        Self::Local(Arc::new(CircuitBreaker::new(failure_threshold, cooldown_s)))
+    }
+
+    pub fn rpc(endpoint: lorica_command::RpcEndpoint, timeout: Duration) -> Self {
+        Self::Rpc { endpoint, timeout }
+    }
+
+    /// Query admission for `(route, backend)`. Fails open on transport
+    /// error so a flaky supervisor UDS channel never DoS's the data
+    /// plane - matches the design doc § 9 failure-matrix entry for
+    /// "channel goes silent".
+    pub async fn admit(&self, route_id: &str, backend: &str) -> BreakerAdmission {
+        match self {
+            BreakerEngine::Local(b) => {
+                if b.is_available(route_id, backend) {
+                    // The local breaker collapses Closed and HalfOpen
+                    // into a single boolean; it tracks its own probe
+                    // slot internally. So we always report `Allow` and
+                    // never flag `was_probe`; record_{success,failure}
+                    // on the inner CircuitBreaker handle the state
+                    // transition uniformly.
+                    BreakerAdmission::Allow
+                } else {
+                    BreakerAdmission::Deny
+                }
+            }
+            BreakerEngine::Rpc { endpoint, timeout } => {
+                let payload = lorica_command::command::Payload::BreakerQuery(
+                    lorica_command::BreakerQuery {
+                        route_id: route_id.to_string(),
+                        backend: backend.to_string(),
+                    },
+                );
+                match endpoint
+                    .request_rpc(
+                        lorica_command::CommandType::BreakerQuery,
+                        payload,
+                        *timeout,
+                    )
+                    .await
+                {
+                    Ok(resp) => match resp.payload {
+                        Some(lorica_command::response::Payload::BreakerResult(r)) => {
+                            match lorica_command::BreakerDecision::from_i32(r.decision) {
+                                lorica_command::BreakerDecision::Allow => BreakerAdmission::Allow,
+                                lorica_command::BreakerDecision::Deny => BreakerAdmission::Deny,
+                                lorica_command::BreakerDecision::AllowProbe => {
+                                    BreakerAdmission::Probe
+                                }
+                                lorica_command::BreakerDecision::Unspecified => {
+                                    BreakerAdmission::Allow
+                                }
+                            }
+                        }
+                        _ => BreakerAdmission::Allow,
+                    },
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            route_id,
+                            backend,
+                            "breaker RPC admission failed; failing open"
+                        );
+                        BreakerAdmission::Allow
+                    }
+                }
+            }
+        }
+    }
+
+    /// Report request outcome. `was_probe` must be `true` if the
+    /// prior `admit()` returned `BreakerAdmission::Probe`; the Local
+    /// variant ignores the flag (its state machine handles probe
+    /// transitions internally).
+    pub async fn record(&self, route_id: &str, backend: &str, success: bool, was_probe: bool) {
+        match self {
+            BreakerEngine::Local(b) => {
+                if success {
+                    b.record_success(route_id, backend);
+                } else {
+                    b.record_failure(route_id, backend);
+                }
+            }
+            BreakerEngine::Rpc { endpoint, timeout } => {
+                let payload = lorica_command::command::Payload::BreakerReport(
+                    lorica_command::BreakerReport {
+                        route_id: route_id.to_string(),
+                        backend: backend.to_string(),
+                        success,
+                        was_probe,
+                    },
+                );
+                if let Err(e) = endpoint
+                    .request_rpc(
+                        lorica_command::CommandType::BreakerReport,
+                        payload,
+                        *timeout,
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        error = %e,
+                        route_id,
+                        backend,
+                        success,
+                        was_probe,
+                        "breaker RPC outcome report failed; state may drift until next report"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Forward-auth verdict cache dispatch. Single-process deployments use
+/// the per-process `FORWARD_AUTH_VERDICT_CACHE` static (same behaviour
+/// as pre-WPAR); worker-mode deployments delegate to the supervisor via
+/// the pipelined RPC channel so every worker sees a consistent cache
+/// and session revocation propagates uniformly.
+///
+/// `Clone` is cheap: the `Rpc` variant holds a cloneable `RpcEndpoint`
+/// (internal `Arc<Inner>`), and `Local` is a unit variant.
+#[derive(Clone)]
+pub enum VerdictCacheEngine {
+    /// Single-process: read/write the process-global static cache.
+    /// There is at most one `LoricaProxy` per process, so no partitioning
+    /// by proxy instance is needed.
+    Local,
+    /// Worker mode: issue `VerdictLookup` / `VerdictPush` RPC calls to
+    /// the supervisor. A lookup miss or RPC failure degrades gracefully
+    /// to an upstream auth call - the worker never denies on transport
+    /// errors.
+    Rpc {
+        endpoint: lorica_command::RpcEndpoint,
+        timeout: Duration,
+    },
+}
+
+impl VerdictCacheEngine {
+    pub fn local() -> Self {
+        Self::Local
+    }
+
+    pub fn rpc(endpoint: lorica_command::RpcEndpoint, timeout: Duration) -> Self {
+        Self::Rpc { endpoint, timeout }
+    }
 }
 
 /// Per-route rate-limit engine: either the local authoritative state
@@ -1290,10 +1489,11 @@ impl LoricaProxy {
             acme_challenge_store: None,
             alert_sender: None,
             log_store: None,
-            circuit_breaker: Arc::new(CircuitBreaker::new(5, 10)),
+            circuit_breaker_engine: BreakerEngine::local(5, 10),
             basic_auth_cache: Arc::new(DashMap::new()),
             shmem: None,
             rate_limit_buckets: RateLimitEngine::authoritative(),
+            verdict_cache: VerdictCacheEngine::local(),
         }
     }
 
@@ -1676,20 +1876,22 @@ pub(crate) async fn run_forward_auth(
     client_ip: Option<&str>,
     scheme: &str,
 ) -> ForwardAuthOutcome {
-    run_forward_auth_keyed(cfg, req, client_ip, scheme, "").await
+    run_forward_auth_keyed(cfg, req, client_ip, scheme, "", &VerdictCacheEngine::Local).await
 }
 
 /// Internal variant that takes a `route_id` so the verdict cache can
-/// partition entries per route. The public helper keeps the old
-/// signature for cases where caching is definitely off (unit tests,
-/// ad-hoc validation) and simply passes an empty route id which
-/// `verdict_cache_key` treats as "no cache".
+/// partition entries per route, plus a [`VerdictCacheEngine`] so workers
+/// can delegate the cache to the supervisor via the pipelined RPC. The
+/// public helper keeps the old signature for cases where caching is
+/// definitely off (unit tests, ad-hoc validation) and simply passes an
+/// empty route id which `verdict_cache_key` treats as "no cache".
 pub(crate) async fn run_forward_auth_keyed(
     cfg: &lorica_config::models::ForwardAuthConfig,
     req: &lorica_http::RequestHeader,
     client_ip: Option<&str>,
     scheme: &str,
     route_id: &str,
+    cache_engine: &VerdictCacheEngine,
 ) -> ForwardAuthOutcome {
     // Verdict cache lookup. Only applies when:
     //   - cache is enabled for this route (ttl > 0),
@@ -1702,28 +1904,94 @@ pub(crate) async fn run_forward_auth_keyed(
     } else {
         None
     };
+    let cookie_value = if cache_enabled {
+        req.headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
 
-    if let Some(ref key) = cache_key {
-        if let Some(entry) = FORWARD_AUTH_VERDICT_CACHE.get(key) {
-            if std::time::Instant::now() < entry.expires_at {
-                lorica_api::metrics::inc_forward_auth_cache(route_id, "hit");
-                return ForwardAuthOutcome::Allow {
-                    response_headers: entry.response_headers.clone(),
-                };
+    if cache_enabled {
+        match cache_engine {
+            VerdictCacheEngine::Local => {
+                if let Some(ref key) = cache_key {
+                    if let Some(entry) = FORWARD_AUTH_VERDICT_CACHE.get(key) {
+                        if std::time::Instant::now() < entry.expires_at {
+                            lorica_api::metrics::inc_forward_auth_cache(route_id, "hit");
+                            return ForwardAuthOutcome::Allow {
+                                response_headers: entry.response_headers.clone(),
+                            };
+                        }
+                        // Stale entry; drop the read ref so we can remove below.
+                    }
+                    // Lazy eviction: if the entry exists but is expired, remove
+                    // it now so memory doesn't accumulate dead entries when a
+                    // session goes idle.
+                    let expired = FORWARD_AUTH_VERDICT_CACHE
+                        .get(key)
+                        .map(|e| std::time::Instant::now() >= e.expires_at)
+                        .unwrap_or(false);
+                    if expired {
+                        FORWARD_AUTH_VERDICT_CACHE.remove(key);
+                    }
+                    lorica_api::metrics::inc_forward_auth_cache(route_id, "miss");
+                }
             }
-            // Stale entry; drop the read ref so we can remove below.
+            VerdictCacheEngine::Rpc { endpoint, timeout } => {
+                if let Some(ref cookie) = cookie_value {
+                    let payload = lorica_command::command::Payload::VerdictLookup(
+                        lorica_command::VerdictLookup {
+                            route_id: route_id.to_string(),
+                            cookie: cookie.clone(),
+                        },
+                    );
+                    match endpoint
+                        .request_rpc(
+                            lorica_command::CommandType::VerdictLookup,
+                            payload,
+                            *timeout,
+                        )
+                        .await
+                    {
+                        Ok(resp) => {
+                            if let Some(lorica_command::response::Payload::VerdictResult(v)) =
+                                resp.payload
+                            {
+                                if v.found
+                                    && lorica_command::Verdict::from_i32(v.verdict)
+                                        == lorica_command::Verdict::Allow
+                                {
+                                    lorica_api::metrics::inc_forward_auth_cache(route_id, "hit");
+                                    return ForwardAuthOutcome::Allow {
+                                        response_headers: v
+                                            .response_headers
+                                            .into_iter()
+                                            .map(|h| (h.name, h.value))
+                                            .collect(),
+                                    };
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // RPC failure degrades gracefully: we
+                            // fall through to the upstream auth call
+                            // rather than denying, matching the
+                            // "transport fail open" semantics the
+                            // local cache uses when evicting a stale
+                            // entry.
+                            tracing::debug!(
+                                error = %e,
+                                route_id,
+                                "verdict cache RPC lookup failed; falling back to upstream auth call"
+                            );
+                        }
+                    }
+                    lorica_api::metrics::inc_forward_auth_cache(route_id, "miss");
+                }
+            }
         }
-        // Lazy eviction: if the entry exists but is expired, remove
-        // it now so memory doesn't accumulate dead entries when a
-        // session goes idle.
-        let expired = FORWARD_AUTH_VERDICT_CACHE
-            .get(key)
-            .map(|e| std::time::Instant::now() >= e.expires_at)
-            .unwrap_or(false);
-        if expired {
-            FORWARD_AUTH_VERDICT_CACHE.remove(key);
-        }
-        lorica_api::metrics::inc_forward_auth_cache(route_id, "miss");
     }
 
     let headers_out = build_forward_auth_headers(req, client_ip, scheme);
@@ -1775,16 +2043,61 @@ pub(crate) async fn run_forward_auth_keyed(
             }
         }
         if cache_enabled && cacheable {
-            if let Some(key) = cache_key {
-                let expires_at = std::time::Instant::now()
-                    + Duration::from_millis(cfg.verdict_cache_ttl_ms as u64);
-                verdict_cache_insert(
-                    key,
-                    CachedVerdict {
-                        response_headers: inject.clone(),
-                        expires_at,
-                    },
-                );
+            match cache_engine {
+                VerdictCacheEngine::Local => {
+                    if let Some(key) = cache_key {
+                        let expires_at = std::time::Instant::now()
+                            + Duration::from_millis(cfg.verdict_cache_ttl_ms as u64);
+                        verdict_cache_insert(
+                            key,
+                            CachedVerdict {
+                                response_headers: inject.clone(),
+                                expires_at,
+                            },
+                        );
+                    }
+                }
+                VerdictCacheEngine::Rpc { endpoint, timeout } => {
+                    if let Some(cookie) = cookie_value.clone() {
+                        let headers = inject
+                            .iter()
+                            .map(|(n, v)| lorica_command::ForwardAuthHeader {
+                                name: n.clone(),
+                                value: v.clone(),
+                            })
+                            .collect();
+                        let payload = lorica_command::command::Payload::VerdictPush(
+                            lorica_command::VerdictPush {
+                                route_id: route_id.to_string(),
+                                cookie,
+                                verdict: lorica_command::Verdict::Allow as i32,
+                                ttl_ms: cfg.verdict_cache_ttl_ms as u64,
+                                response_headers: headers,
+                            },
+                        );
+                        // Fire-and-forget: a failed push just means the
+                        // supervisor misses one entry; we still return
+                        // Allow to the caller. No await on metrics
+                        // either - keep the hot path lean.
+                        let endpoint = endpoint.clone();
+                        let timeout = *timeout;
+                        tokio::spawn(async move {
+                            if let Err(e) = endpoint
+                                .request_rpc(
+                                    lorica_command::CommandType::VerdictPush,
+                                    payload,
+                                    timeout,
+                                )
+                                .await
+                            {
+                                tracing::debug!(
+                                    error = %e,
+                                    "verdict cache RPC push failed; supervisor cache may miss this entry"
+                                );
+                            }
+                        });
+                    }
+                }
             }
         }
         return ForwardAuthOutcome::Allow {
@@ -2423,6 +2736,7 @@ impl ProxyHttp for LoricaProxy {
             forward_auth_inject: Vec::new(),
             mirror_pending: None,
             mirror_body_state: None,
+            breaker_probe_backend: None,
             response_rewrite_state: None,
             response_rewrite_rules: None,
         }
@@ -2777,6 +3091,7 @@ impl ProxyHttp for LoricaProxy {
                 ctx.client_ip.as_deref(),
                 scheme,
                 &entry.route.id,
+                &self.verdict_cache,
             )
             .await;
             match outcome {
@@ -4015,16 +4330,48 @@ impl ProxyHttp for LoricaProxy {
         } else {
             &entry.backends
         };
-        let healthy_backends: Vec<&Backend> = backends_source
-            .iter()
-            .filter(|b| {
-                b.health_status != HealthStatus::Down
-                    && b.lifecycle_state == LifecycleState::Normal
-                    && self
-                        .circuit_breaker
-                        .is_available(&entry.route.id, &b.address)
-            })
-            .collect();
+        // Breaker admission is async (may hit the supervisor RPC in
+        // worker mode), so we walk the backends manually instead of a
+        // sync `filter()`. We also track which backend - if any - was
+        // admitted via a HalfOpen probe; the outcome report in
+        // `logging()` uses this to flag `was_probe` correctly.
+        let mut healthy_backends: Vec<&Backend> = Vec::with_capacity(backends_source.len());
+        let mut probe_backend: Option<String> = None;
+        for b in backends_source.iter() {
+            if b.health_status == HealthStatus::Down
+                || b.lifecycle_state != LifecycleState::Normal
+            {
+                continue;
+            }
+            match self
+                .circuit_breaker_engine
+                .admit(&entry.route.id, &b.address)
+                .await
+            {
+                BreakerAdmission::Allow => healthy_backends.push(b),
+                BreakerAdmission::Probe => {
+                    // Only one probe per request; later Probes for the
+                    // same route-backend would deny anyway. Record the
+                    // first one and stop asking for more probes on
+                    // subsequent backends - `is_available` already
+                    // drained the slot, but a probe we don't use would
+                    // leave the breaker stuck in HalfOpen. For a
+                    // multi-backend route we still want to prefer the
+                    // probe-admitted backend (it's the only one that
+                    // can close the breaker on success), so we push
+                    // it to the head of the list.
+                    healthy_backends.insert(0, b);
+                    if probe_backend.is_none() {
+                        probe_backend = Some(b.address.clone());
+                    }
+                }
+                BreakerAdmission::Deny => {}
+            }
+        }
+        // Remember for logging(): the outcome report must flag
+        // `was_probe=true` for this specific backend so the supervisor
+        // can finalize the HalfOpen state machine.
+        ctx.breaker_probe_backend = probe_backend;
 
         if healthy_backends.is_empty() {
             return Error::e_explain(
@@ -4667,13 +5014,21 @@ impl ProxyHttp for LoricaProxy {
 
             // Update circuit breaker: 5xx or connection error = failure, else success.
             // Keyed by (route_id, backend) so a failing route does not punish
-            // sibling routes that share the same upstream IP:port.
+            // sibling routes that share the same upstream IP:port. In
+            // worker mode the supervisor owns the state machine and
+            // `record(...)` issues an RPC; `was_probe` is derived from
+            // `ctx.breaker_probe_backend` so a HalfOpen probe can
+            // transition the breaker back to Closed on success.
             if let Some(ref route_id) = ctx.route_id {
-                if e.is_some() || status >= 500 {
-                    self.circuit_breaker.record_failure(route_id, addr);
-                } else {
-                    self.circuit_breaker.record_success(route_id, addr);
-                }
+                let success = e.is_none() && status < 500;
+                let was_probe = ctx
+                    .breaker_probe_backend
+                    .as_deref()
+                    .map(|probe_addr| probe_addr == addr.as_str())
+                    .unwrap_or(false);
+                self.circuit_breaker_engine
+                    .record(route_id, addr, success, was_probe)
+                    .await;
             }
         }
 
@@ -7088,9 +7443,9 @@ mod tests {
 
         verdict_cache_reset_for_test();
 
-        let r1 = run_forward_auth_keyed(&cfg, &req, None, "http", "cache-hit-route").await;
+        let r1 = run_forward_auth_keyed(&cfg, &req, None, "http", "cache-hit-route", &VerdictCacheEngine::Local).await;
         assert!(matches!(r1, ForwardAuthOutcome::Allow { .. }));
-        let r2 = run_forward_auth_keyed(&cfg, &req, None, "http", "cache-hit-route").await;
+        let r2 = run_forward_auth_keyed(&cfg, &req, None, "http", "cache-hit-route", &VerdictCacheEngine::Local).await;
         assert!(matches!(r2, ForwardAuthOutcome::Allow { .. }));
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -7138,8 +7493,8 @@ mod tests {
 
         verdict_cache_reset_for_test();
 
-        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "ns-route").await;
-        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "ns-route").await;
+        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "ns-route", &VerdictCacheEngine::Local).await;
+        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "ns-route", &VerdictCacheEngine::Local).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -7212,8 +7567,8 @@ mod tests {
 
         verdict_cache_reset_for_test();
 
-        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "off-route").await;
-        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "off-route").await;
+        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "off-route", &VerdictCacheEngine::Local).await;
+        let _ = run_forward_auth_keyed(&cfg, &req, None, "http", "off-route", &VerdictCacheEngine::Local).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
