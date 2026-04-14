@@ -41,8 +41,22 @@ use crate::WorkerError;
 /// memfd + headroom for future RPC / shared-state descriptors.
 const MAX_FDS: usize = 32;
 
-/// Maximum size of the tag payload buffer.
-const PAYLOAD_BUF_SIZE: usize = 2048;
+/// Upper bound on one wire token's encoded size. The longest token today
+/// is `listener:[2001:db8:ffff:ffff:ffff:ffff:ffff:ffff]:65535` which is
+/// under 60 bytes; we give it 128 B of headroom for future schemes.
+const MAX_TOKEN_LEN: usize = 128;
+
+/// Maximum size of the tag payload buffer. Must be large enough to hold
+/// `MAX_FDS` space-separated tokens (each up to `MAX_TOKEN_LEN`). The
+/// compile-time assertion below enforces that invariant so future
+/// `FdKind` variants with longer tokens trip the build instead of
+/// producing silent `MSG_TRUNC` on the wire (audit L-2).
+const PAYLOAD_BUF_SIZE: usize = 4096;
+
+const _: () = assert!(
+    MAX_FDS * MAX_TOKEN_LEN <= PAYLOAD_BUF_SIZE,
+    "PAYLOAD_BUF_SIZE must fit MAX_FDS tokens of MAX_TOKEN_LEN bytes each"
+);
 
 /// What a passed file descriptor is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,39 +142,76 @@ pub fn send_worker_fds(sock: RawFd, entries: &[FdEntry]) -> Result<(), WorkerErr
 }
 
 /// Receive typed FD entries from the supervisor.
+///
+/// Wraps every received `RawFd` into an [`OwnedFd`] immediately after
+/// `recvmsg` so any subsequent error path (UTF-8 validation, fds/tokens
+/// mismatch, bad `FdKind` token) correctly `close(2)`s the FDs via
+/// `OwnedFd::drop`. On success, ownership is transferred back to the
+/// caller via `IntoRawFd` so callers remain free to `mem::forget` or
+/// re-own as they see fit. This closes audit finding H-2 (kernel FD
+/// leak on error paths) and M-6 (silent `MSG_TRUNC` truncation).
 pub fn recv_worker_fds(sock: RawFd) -> Result<Vec<FdEntry>, WorkerError> {
     let mut buf = [0u8; PAYLOAD_BUF_SIZE];
     let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
 
-    let (fds, bytes) = {
+    // Collect OwnedFds up front. If the function returns Err anywhere
+    // below, `drop` closes each FD. If it returns Ok we `into_raw_fd`
+    // to hand ownership to the caller.
+    let (owned_fds, bytes, truncated) = {
         let mut iov = [IoSliceMut::new(&mut buf)];
         let msg =
             socket::recvmsg::<UnixAddr>(sock, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty())
                 .map_err(WorkerError::RecvFds)?;
 
-        let mut fds = Vec::new();
+        let mut owned = Vec::<OwnedFd>::new();
         for cmsg in msg.cmsgs().map_err(WorkerError::RecvFds)? {
             if let ControlMessageOwned::ScmRights(received) = cmsg {
-                fds.extend_from_slice(&received);
+                for raw in received {
+                    // SAFETY: `ScmRights` yields fresh kernel FDs that the
+                    // kernel passed with exclusive ownership; wrapping them
+                    // in `OwnedFd` is the canonical close-on-drop idiom.
+                    owned.push(unsafe { OwnedFd::from_raw_fd(raw) });
+                }
             }
         }
-        (fds, msg.bytes)
+        let truncated = msg.flags.contains(MsgFlags::MSG_TRUNC)
+            || msg.flags.contains(MsgFlags::MSG_CTRUNC);
+        (owned, msg.bytes, truncated)
     };
+
+    if truncated {
+        // Payload or cmsg buffer was too small: the kernel silently
+        // dropped bytes / FDs. Returning Err here also drops `owned_fds`
+        // via `OwnedFd::drop` so no FD leak (audit H-2 / M-6).
+        return Err(WorkerError::InvalidPayload);
+    }
 
     let payload = std::str::from_utf8(&buf[..bytes]).map_err(|_| WorkerError::InvalidPayload)?;
     let tokens: Vec<&str> = payload.split_ascii_whitespace().collect();
 
-    if fds.len() != tokens.len() {
+    if owned_fds.len() != tokens.len() {
         return Err(WorkerError::FdAddrMismatch {
-            fds: fds.len(),
+            fds: owned_fds.len(),
             addrs: tokens.len(),
         });
     }
 
-    fds.into_iter()
-        .zip(tokens)
-        .map(|(fd, tok)| FdKind::from_token(tok).map(|kind| FdEntry { fd, kind }))
-        .collect()
+    // Validate every token before transferring ownership. Any parse
+    // failure here still drops `owned_fds` via the RAII path.
+    let mut kinds = Vec::with_capacity(tokens.len());
+    for tok in &tokens {
+        kinds.push(FdKind::from_token(tok)?);
+    }
+
+    // All validations passed - hand the raw FDs to the caller.
+    Ok(owned_fds
+        .into_iter()
+        .zip(kinds)
+        .map(|(owned, kind)| FdEntry {
+            fd: owned.into_raw_fd(),
+            kind,
+        })
+        .collect())
 }
 
 /// Backwards-compatible wrapper used by tests that only care about
