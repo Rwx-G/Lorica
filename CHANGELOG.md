@@ -128,6 +128,13 @@ Author: Rwx-G
   `eslint-plugin-svelte` (flat config with `svelte/no-at-html-tags`
   + `svelte/no-target-blank` + `no-eval` family). Regression
   guard for the Svelte XSS manual audit pass (audit coverage gap)
+- Split `lorica/src/proxy_wiring.rs` from 8 561 LOC down to
+  5 284 LOC (-38 %) as audit M-8 follow-up. Tests block
+  (~3 k LOC) moved to `proxy_wiring/tests.rs`; RPC dispatch
+  enums (BreakerAdmission / BreakerEngine / VerdictCacheEngine /
+  RateLimitEngine) moved to `proxy_wiring/engines.rs` with a
+  `pub use engines::{...}` re-export preserving the existing
+  `lorica::proxy_wiring::*` import path. No functional change
 
 ### Added
 

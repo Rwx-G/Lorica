@@ -87,11 +87,11 @@ release; the last is tracked below in "deferred to v1.3.1".
 | `eslint-plugin-svelte` in CI | Audit coverage gap | New `eslint.config.js` flat config under `lorica-dashboard/frontend/` enforcing `svelte/no-at-html-tags` + `svelte/no-target-blank` + `no-eval` / `no-implied-eval` family. Wired into the `Lint` CI job as `npm run check` + `npm run lint` |
 | `trailofbits/semgrep-rules` in CI | Audit coverage gap | New `Semgrep (security)` CI job running 7 `p/*` rulesets + 4 trailofbits subfolders (`generic` / `javascript` / `rs` / `yaml`). Non-blocking (continue-on-error: true); SARIF uploaded as PR artifact. Gating after the noise floor stabilises |
 
-### v1.3.0 - deferred to v1.3.1
+### v1.3.0 - M-8 refactor landed
 
-| Item | Source | Notes |
+| Item | Source | Resolution |
 |---|---|---|
-| Split `proxy_wiring.rs` (8 Ki LOC) | Audit M-8 | Extract `engines.rs` (BreakerEngine / VerdictCacheEngine / RateLimitEngine) + move `#[cfg(test)]` block (~3 k LOC) into `proxy_wiring/tests.rs`. Mechanical; deferred because the risk > benefit for the release (nothing functional, pure refactor) |
+| Split `proxy_wiring.rs` (8 Ki LOC) | Audit M-8 | Done. Tests block (~3 k LOC) moved to `lorica/src/proxy_wiring/tests.rs`; BreakerAdmission / BreakerEngine / VerdictCacheEngine / RateLimitEngine moved to `lorica/src/proxy_wiring/engines.rs` (246 LOC). `proxy_wiring.rs` now 5 284 LOC (-38 % vs pre-split). `pub use engines::{...}` re-export keeps the `lorica::proxy_wiring::*` import path working unchanged |
 
 ---
 
