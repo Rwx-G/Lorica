@@ -48,3 +48,6 @@ static_analysis_semgrep_1/
 
 # Pre-release audit artifacts (raw scan outputs; consolidated snapshot lives in docs/audits/)
 audit-v*/
+
+# Local-only error page demo HTML (preview file, not shipped)
+error-page-demo.html
