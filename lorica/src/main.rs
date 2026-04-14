@@ -2861,7 +2861,11 @@ fn run_worker(
                     &worker_auth_prune_tracker,
                     incoming,
                     Arc::clone(&store),
-                    None,
+                    // Pass the connection filter so `ConfigReloadCommit`
+                    // publishes ProxyConfig AND filter CIDRs atomically
+                    // (audit H-3). Previously `None` left the filter
+                    // out of the two-phase semantics.
+                    Some(Arc::clone(&connection_filter)),
                     id,
                 );
                 let _sync_handle = lorica_proxy.spawn_rate_limit_sync(

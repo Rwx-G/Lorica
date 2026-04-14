@@ -1223,11 +1223,14 @@ pub struct LoricaProxy {
 }
 
 /// Prepared-but-not-yet-committed proxy config. Held by workers
-/// between `ConfigReloadPrepare` and `ConfigReloadCommit`. See § 7
+/// between `ConfigReloadPrepare` and `ConfigReloadCommit`. Carries the
+/// full [`crate::reload::PreparedReload`] rather than only the
+/// `ProxyConfig` so the Commit side can publish both the ArcSwap and
+/// the connection-filter update atomically (audit H-3). See § 7
 /// WPAR-8.
 pub struct PendingProxyConfig {
     pub generation: u64,
-    pub config: Arc<ProxyConfig>,
+    pub prepared: crate::reload::PreparedReload,
 }
 
 /// Circuit-breaker admission result. The worker uses this to know
@@ -1919,22 +1922,12 @@ async fn handle_config_reload_prepare(
         Ok(prepared) => {
             *pending.lock() = Some(PendingProxyConfig {
                 generation: prepare.generation,
-                config: Arc::new(prepared.config),
+                prepared,
             });
-            // Connection-filter CIDRs are also part of the prepared
-            // snapshot. They ride alongside the config in the pending
-            // slot so Commit can publish both atomically. We encode
-            // them on the pending entry by wrapping into ProxyConfig-
-            // adjacent state. Simplest: stash them on a companion
-            // slot. For now we keep them on the PendingProxyConfig
-            // by re-reading at commit time - settings rarely change
-            // mid-flight - and rely on commit_prepared_reload to do
-            // the work. TODO: thread the PreparedReload struct
-            // through for true atomicity on the connection filter.
             tracing::info!(
                 worker_id,
                 generation = prepare.generation,
-                "ConfigReloadPrepare: pending config built and stashed"
+                "ConfigReloadPrepare: pending config built and stashed (with connection-filter CIDRs)"
             );
             let _ = inc.reply(lorica_command::Response::ok(0)).await;
         }
@@ -2004,7 +1997,7 @@ async fn handle_config_reload_commit(
     inc: lorica_command::IncomingCommand,
     proxy_config: &Arc<ArcSwap<ProxyConfig>>,
     pending: &Arc<parking_lot::Mutex<Option<PendingProxyConfig>>>,
-    _connection_filter: Option<&Arc<crate::connection_filter::GlobalConnectionFilter>>,
+    connection_filter: Option<&Arc<crate::connection_filter::GlobalConnectionFilter>>,
     gate: &Arc<lorica_command::GenerationGate>,
     worker_id: u32,
 ) {
@@ -2027,10 +2020,15 @@ async fn handle_config_reload_commit(
         let _ = inc.reply_error(format!("stale commit: {e}")).await;
         return;
     }
-    let cfg = {
+    // Pop the prepared snapshot atomically. It carries the ProxyConfig
+    // AND the connection-filter CIDRs AND any mTLS fingerprint drift,
+    // so the single `commit_prepared_reload` call below publishes them
+    // together - no partial-state window between ArcSwap and filter
+    // reload (audit H-3).
+    let prepared = {
         let mut slot = pending.lock();
         match slot.take() {
-            Some(p) if p.generation == commit.generation => Some(p.config),
+            Some(p) if p.generation == commit.generation => Some(p.prepared),
             Some(p) => {
                 let pending_gen = p.generation;
                 // Put it back: a late commit for an older generation
@@ -2047,9 +2045,9 @@ async fn handle_config_reload_commit(
             None => None,
         }
     };
-    match cfg {
-        Some(cfg) => {
-            proxy_config.store(cfg);
+    match prepared {
+        Some(prepared) => {
+            crate::reload::commit_prepared_reload(proxy_config, connection_filter, prepared);
             tracing::info!(
                 worker_id,
                 generation = commit.generation,
