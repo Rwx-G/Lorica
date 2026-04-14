@@ -31,6 +31,12 @@ jobs:
           npm ci
           npm run build
 
+      - name: Frontend lint (svelte-check + ESLint svelte plugin)
+        run: |
+          cd lorica-dashboard/frontend
+          npm run check
+          npm run lint
+
       - name: Clippy (product crates)
         run: cargo clippy -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -- -D warnings
 
