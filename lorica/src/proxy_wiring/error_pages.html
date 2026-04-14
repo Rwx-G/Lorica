@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>__STATUS__ __TITLE__ &middot; __HOST_LABEL__</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                   "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+      font-size: 16px;
+      line-height: 1.5;
+      color: #404040;
+      background: #fff;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    h1, h2, p { margin: 0; }
+
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 32px;
+    }
+
+    .header-band {
+      padding: 64px 0 56px;
+      background: #fff;
+    }
+    .title-row {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 20px;
+      margin-bottom: 18px;
+    }
+    .title {
+      font-size: 60px;
+      font-weight: 300;
+      color: #404040;
+      letter-spacing: -0.02em;
+      line-height: 1;
+    }
+    .pill {
+      background: #e9e9e9;
+      color: #404040;
+      font-size: 14px;
+      padding: 7px 16px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    .lead {
+      font-size: 14px;
+      color: #404040;
+      margin-bottom: 8px;
+    }
+    .lead a {
+      color: #2c7cb0;
+      text-decoration: none;
+    }
+    .lead a:hover { text-decoration: underline; }
+    .timestamp {
+      font-size: 14px;
+      color: #404040;
+    }
+
+    .diag-band {
+      background: linear-gradient(180deg, #ededed 0%, #f3f3f3 18%, #f3f3f3 82%, #ededed 100%);
+      padding: 56px 0 64px;
+      position: relative;
+      box-shadow: inset 0 6px 8px -6px rgba(0, 0, 0, 0.12),
+                  inset 0 -6px 8px -6px rgba(0, 0, 0, 0.12);
+    }
+    .diag {
+      display: flex;
+      justify-content: space-around;
+      align-items: flex-start;
+      gap: 24px;
+    }
+    .tier {
+      flex: 1;
+      text-align: center;
+      max-width: 260px;
+      position: relative;
+    }
+    .tier-icon {
+      width: 110px;
+      height: 110px;
+      margin: 0 auto 16px;
+      position: relative;
+    }
+    .tier-icon svg.base {
+      width: 100%;
+      height: 100%;
+      display: block;
+      color: #909090;
+    }
+    .tier-status-badge {
+      position: absolute;
+      bottom: -2px;
+      right: -2px;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-weight: bold;
+      font-size: 18px;
+      line-height: 1;
+      box-shadow: 0 0 0 3px #f3f3f3;
+    }
+    .tier-status-badge.ok { background: #6fa42a; }
+    .tier-status-badge.err { background: #d44848; }
+    .tier-label {
+      color: #404040;
+      font-size: 16px;
+      margin-bottom: 4px;
+    }
+    .tier-name {
+      color: #909090;
+      font-size: 16px;
+      margin-bottom: 4px;
+    }
+    .tier-state {
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .tier-state.ok { color: #6fa42a; }
+    .tier-state.err { color: #d44848; }
+
+    .tier.broken::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      bottom: calc(-1 * var(--diag-band-bottom-padding, 64px));
+      transform: translateX(-50%);
+      width: 0;
+      height: 0;
+      border-left: 22px solid transparent;
+      border-right: 22px solid transparent;
+      border-bottom: 22px solid #fff;
+      filter: drop-shadow(0 -5px 4px rgba(0, 0, 0, 0.10));
+    }
+
+    .content-band {
+      background: #fff;
+      padding: 56px 0;
+    }
+    .content {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 80px;
+    }
+    .content h2 {
+      font-size: 32px;
+      font-weight: 300;
+      color: #404040;
+      margin-bottom: 18px;
+      line-height: 1.2;
+    }
+    .content p {
+      font-size: 14px;
+      color: #404040;
+      line-height: 1.6;
+    }
+
+    .footer {
+      border-top: 1px solid #e9e9e9;
+      padding: 28px 0;
+      text-align: center;
+      font-size: 13px;
+      color: #909090;
+    }
+    .footer code {
+      font-family: "SF Mono", "Consolas", "Liberation Mono", "Menlo", monospace;
+      color: #404040;
+      font-size: 13px;
+    }
+
+    @media (max-width: 800px) {
+      .title { font-size: 44px; }
+      .diag {
+        flex-direction: column;
+        align-items: center;
+        gap: 36px;
+      }
+      .tier { max-width: none; width: 100%; }
+      .tier.broken::after { display: none; }
+      .content {
+        grid-template-columns: 1fr;
+        gap: 36px;
+      }
+    }
+    @media (max-width: 480px) {
+      .title { font-size: 34px; }
+      .header-band { padding: 36px 0; }
+      .diag-band { padding: 36px 0; }
+      .content-band { padding: 36px 0; }
+    }
+  </style>
+</head>
+<body>
+  <section class="header-band">
+    <div class="container">
+      <div class="title-row">
+        <h1 class="title">__TITLE__</h1>
+        <span class="pill">Error code __STATUS__</span>
+      </div>
+      <p class="lead">
+        Visit
+        <a href="https://en.wikipedia.org/wiki/List_of_HTTP_status_codes#__WIKI_ANCHOR__"
+           rel="noopener noreferrer">Wikipedia</a>
+        for more information about this error.
+      </p>
+      <p class="timestamp">__TIMESTAMP__</p>
+    </div>
+  </section>
+
+  <section class="diag-band">
+    <div class="container">
+      <div class="diag">
+        <div class="tier__YOU_BROKEN__">
+          <div class="tier-icon">
+            <svg class="base" viewBox="0 0 110 110" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round">
+              <rect x="8" y="14" width="94" height="80" rx="6"/>
+              <line x1="8" y1="34" x2="102" y2="34"/>
+              <circle cx="18" cy="24" r="2.5" fill="currentColor" stroke="none"/>
+              <circle cx="28" cy="24" r="2.5" fill="currentColor" stroke="none"/>
+              <circle cx="38" cy="24" r="2.5" fill="currentColor" stroke="none"/>
+              <rect x="50" y="20" width="44" height="8" rx="3" stroke-width="2"/>
+            </svg>
+            <span class="tier-status-badge __YOU_BADGE__" title="__YOU_STATE__">__YOU_GLYPH__</span>
+          </div>
+          <div class="tier-label">You</div>
+          <div class="tier-name">Browser</div>
+          <div class="tier-state __YOU_STATE_CLASS__">__YOU_STATE__</div>
+        </div>
+
+        <div class="tier__NETWORK_BROKEN__">
+          <div class="tier-icon">
+            <svg class="base" viewBox="0 0 110 110" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round">
+              <path d="M30 78
+                       C18 78 12 70 14 60
+                       C8 50 18 40 28 42
+                       C30 28 50 24 56 36
+                       C64 26 84 32 84 46
+                       C96 46 100 60 92 68
+                       C98 76 90 84 80 80 Z"/>
+            </svg>
+            <span class="tier-status-badge __NET_BADGE__" title="__NET_STATE__">__NET_GLYPH__</span>
+          </div>
+          <div class="tier-label">&nbsp;</div>
+          <div class="tier-name">Network</div>
+          <div class="tier-state __NET_STATE_CLASS__">__NET_STATE__</div>
+        </div>
+
+        <div class="tier__HOST_BROKEN__">
+          <div class="tier-icon">
+            <svg class="base" viewBox="0 0 110 110" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round">
+              <rect x="14" y="14" width="82" height="32" rx="4"/>
+              <rect x="22" y="22" width="66" height="16" rx="2" stroke-width="2"/>
+              <rect x="14" y="54" width="82" height="18" rx="3"/>
+              <rect x="14" y="78" width="82" height="18" rx="3"/>
+              <circle cx="22" cy="63" r="2" fill="currentColor" stroke="none"/>
+              <circle cx="22" cy="87" r="2" fill="currentColor" stroke="none"/>
+              <line x1="32" y1="63" x2="80" y2="63" stroke-width="1.5"/>
+              <line x1="32" y1="87" x2="80" y2="87" stroke-width="1.5"/>
+            </svg>
+            <span class="tier-status-badge __HOST_BADGE__" title="__HOST_STATE__">__HOST_GLYPH__</span>
+          </div>
+          <div class="tier-label">__HOST_LABEL__</div>
+          <div class="tier-name">Host</div>
+          <div class="tier-state __HOST_STATE_CLASS__">__HOST_STATE__</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="content-band">
+    <div class="container">
+      <div class="content">
+        <div>
+          <h2>What happened?</h2>
+          <p>__WHAT_HAPPENED__</p>
+        </div>
+        <div>
+          <h2>What can I do?</h2>
+          <p>__WHAT_CAN_I_DO__</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="container">
+      Request ID:
+      <code>__REQUEST_ID__</code>
+    </div>
+  </footer>
+</body>
+</html>
