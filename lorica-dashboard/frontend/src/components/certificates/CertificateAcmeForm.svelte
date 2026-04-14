@@ -219,7 +219,7 @@
       {:else}
         <p>Add the following {manualTxtRecords.length} TXT records at your DNS provider, then click confirm.</p>
 
-        {#each manualTxtRecords as rec, i}
+        {#each manualTxtRecords as rec, i (i)}
           <div class="form-group" style="border-left: 3px solid var(--border-color); padding-left: 12px; margin-bottom: 16px;">
             <div class="form-section-label"><strong>{rec.domain}</strong></div>
             <div style="margin-top: 4px;">
@@ -292,7 +292,7 @@
             <label for="acme-dns-provider-id">DNS Provider</label>
             <select id="acme-dns-provider-id" bind:value={acmeDnsProviderId}>
               <option value="">-- Enter credentials manually --</option>
-              {#each dnsProviders as dp}
+              {#each dnsProviders as dp (dp.id)}
                 <option value={dp.id}>{dp.name} ({dp.provider_type})</option>
               {/each}
             </select>

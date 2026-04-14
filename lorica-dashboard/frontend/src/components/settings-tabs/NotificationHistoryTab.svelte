@@ -37,7 +37,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each notifHistory as ev}
+              {#each notifHistory as ev, i (i)}
                 <tr>
                   <td class="mono">{new Date(ev.timestamp).toLocaleString()}</td>
                   <td><span class="badge badge-{ev.alert_type === 'sla_breached' || ev.alert_type === 'backend_down' ? 'red' : ev.alert_type === 'sla_recovered' ? 'green' : ev.alert_type === 'cert_expiring' ? 'orange' : 'blue'}">{ev.alert_type}</span></td>

@@ -99,7 +99,7 @@
     <label for="lb">Load Balancing</label>
     {#if isImported('load_balancing')}<span class="imported-badge">imported</span>{/if}
     <select id="lb" bind:value={form.load_balancing}>
-      {#each loadBalancingOptions as opt}
+      {#each loadBalancingOptions as opt (opt.value)}
         <option value={opt.value}>{opt.label}</option>
       {/each}
     </select>

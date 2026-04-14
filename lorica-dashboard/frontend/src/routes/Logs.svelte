@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { SvelteURLSearchParams } from 'svelte/reactivity';
   import { api, type LogEntry, type LogsQuery } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
 
@@ -34,7 +35,7 @@
   }
 
   function exportLogs() {
-    const params = new URLSearchParams();
+    const params = new SvelteURLSearchParams();
     if (exportFrom) params.set('time_from', new Date(exportFrom).toISOString());
     if (exportTo) params.set('time_to', new Date(exportTo).toISOString());
     params.set('format', exportFormat);
@@ -278,12 +279,12 @@
       onkeydown={(e) => { if (e.key === 'Enter') loadLogs(); }}
     />
     <select class="filter-select" bind:value={filterStatusCategory} onchange={loadLogs}>
-      {#each statusCategories as cat}
+      {#each statusCategories as cat (cat.value)}
         <option value={cat.value}>{cat.label}</option>
       {/each}
     </select>
     <select class="filter-select" bind:value={filterTimeRange} onchange={loadLogs}>
-      {#each timeRanges as tr}
+      {#each timeRanges as tr (tr.value)}
         <option value={tr.value}>{tr.label}</option>
       {/each}
     </select>

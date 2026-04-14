@@ -97,7 +97,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each preferences as pref}
+              {#each preferences as pref (pref.preference_key)}
                 <tr>
                   <td><code>{pref.preference_key}</code></td>
                   <td>

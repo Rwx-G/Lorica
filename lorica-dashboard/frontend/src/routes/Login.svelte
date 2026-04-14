@@ -65,8 +65,10 @@
           />
           <button type="button" class="toggle-pw" onclick={() => (showPassword = !showPassword)} aria-label={showPassword ? 'Hide password' : 'Show password'}>
             {#if showPassword}
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               {@html eyeOffIcon}
             {:else}
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               {@html eyeIcon}
             {/if}
           </button>

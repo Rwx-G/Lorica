@@ -47,7 +47,7 @@
       <label for="strip-path">Strip path prefix</label>
       {#if isImported('strip_path_prefix')}<span class="imported-badge">imported</span>{/if}
       <input id="strip-path" type="text" bind:value={form.strip_path_prefix} placeholder="/api/v1" />
-      <span class="hint">Nginx: location /api/ {'{'} proxy_pass http://backend/; {'}'} | Traefik: StripPrefix middleware</span>
+      <span class="hint">Nginx: location /api/ {'{'} proxy_pass http://backend/; } | Traefik: StripPrefix middleware</span>
     </div>
     <div class="form-group" class:modified={isModified('add_path_prefix')}>
       <label for="add-path">Add path prefix</label>

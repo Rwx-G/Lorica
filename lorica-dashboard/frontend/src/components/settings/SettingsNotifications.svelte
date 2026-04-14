@@ -202,7 +202,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each notifications as nc}
+              {#each notifications as nc (nc.id)}
                 <tr>
                   <td class="settings-capitalize">{nc.channel}</td>
                   <td>{nc.alert_types.join(', ') || '-'}</td>
@@ -230,7 +230,6 @@
 
 <!-- Notification form modal -->
 {#if showNotifForm}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div class="settings-overlay" onclick={(e) => { if (e.target === e.currentTarget) showNotifForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showNotifForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
     <div class="settings-dialog" role="document">
       <h3>{notifEditing ? 'Edit' : 'Add'} Notification Channel</h3>

@@ -91,17 +91,21 @@
           </td>
           <td class="actions">
             <button class="btn-icon" title="View details" aria-label="View details" onclick={() => onView(cert)}>
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               {@html eyeIcon}
             </button>
             <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => onEdit(cert)}>
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               {@html editIcon}
             </button>
             {#if cert.is_acme}
               <button class="btn-icon" title="Renew" aria-label="Renew certificate" onclick={() => onRenew(cert)} disabled={renewingId === cert.id}>
+                <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                 {@html renewIcon}
               </button>
             {/if}
             <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => onDelete(cert)}>
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               {@html trashIcon}
             </button>
           </td>

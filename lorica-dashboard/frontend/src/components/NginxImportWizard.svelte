@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { SvelteSet } from 'svelte/reactivity';
   import { api, type BackendResponse } from '../lib/api';
   import {
     parseNginxConfig,
@@ -41,7 +42,7 @@
 
   // Derived: backend addresses that need TLS skip verify
   let tlsSkipVerifyAddressesPreview = $derived.by(() => {
-    const addrs = new Set<string>();
+    const addrs = new SvelteSet<string>();
     for (const route of importRoutes) {
       if (route._backendTlsSkipVerify) {
         for (const addr of route.backend_addresses) addrs.add(addr);
@@ -91,7 +92,7 @@
     diagnostics: NginxParseResult['diagnostics'],
     previous?: Map<string, string>,
   ): IncludeEntry[] {
-    const seen = new Set<string>();
+    const seen = new SvelteSet<string>();
     return diagnostics
       .filter((d) => d.directive === 'include' && d.level === 'error')
       .filter((d) => {
@@ -112,7 +113,7 @@
 
   // Recompute backend checks for all routes (including path rule backends).
   function recomputeBackendChecks() {
-    const allAddresses = new Set<string>();
+    const allAddresses = new SvelteSet<string>();
     for (const route of importRoutes) {
       for (const addr of route.backend_addresses) allAddresses.add(addr);
       for (const rule of route.path_rules ?? []) {
@@ -140,7 +141,7 @@
     unresolvedIncludes = extractUnresolvedIncludes(parseResult.diagnostics);
 
     // Extract TLS certificate paths (deduplicate by hostname; aliases used as SAN)
-    const seenCertHosts = new Set<string>();
+    const seenCertHosts = new SvelteSet<string>();
     certEntries = [];
     for (const route of importRoutes) {
       if (route._sslCertPath && route._sslKeyPath && !seenCertHosts.has(route.hostname)) {
@@ -210,17 +211,19 @@
       <div class="wizard-header">
         <h2>Import from Nginx</h2>
         <button class="wizard-close" onclick={handleClose} aria-label="Close">
+          <!-- eslint-disable-next-line svelte/no-at-html-tags -->
           {@html CLOSE_ICON}
         </button>
       </div>
 
       <!-- Stepper -->
       <div class="stepper">
-        {#each WIZARD_STEP_LABELS as label, i}
+        {#each WIZARD_STEP_LABELS as label, i (i)}
           {@const stepNum = i + 1}
           <div class="stepper-item" class:active={step === stepNum} class:completed={step > stepNum}>
             <div class="stepper-circle">
               {#if step > stepNum}
+                <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                 {@html CHECK_ICON}
               {:else}
                 {stepNum}

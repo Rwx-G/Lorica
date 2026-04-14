@@ -50,7 +50,7 @@
 
   {#if importRoutes.length > 1}
     <div class="preview-tabs">
-      {#each importRoutes as route, i}
+      {#each importRoutes as route, i (i)}
         <button
           class="preview-tab"
           class:active={previewTab === i}
@@ -65,7 +65,7 @@
   {#if importRoutes[previewTab]}
     {@const route = importRoutes[previewTab]}
     <div class="preview-card">
-      {#each getRouteFields(route) as { field, imported }}
+      {#each getRouteFields(route) as { field, imported } (field)}
         {@const value = formatFieldValue(route, field)}
         {#if imported || value !== '-'}
           <div class="preview-row" class:imported class:dimmed={!imported}>
@@ -86,7 +86,7 @@
     {#if route.path_rules && route.path_rules.length > 0}
       <div class="preview-path-rules">
         <h5>Path Rules ({route.path_rules.length})</h5>
-        {#each route.path_rules as rule}
+        {#each route.path_rules as rule, i (i)}
           <div class="path-rule-preview">
             <code>{rule.match_type === 'exact' ? '= ' : ''}{rule.path}</code>
             {#if rule.backend_addresses}<span class="rule-override">backends: {rule.backend_addresses.join(', ')}</span>{/if}

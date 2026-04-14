@@ -25,12 +25,14 @@
 <div class="step-content">
   <h3>Import results</h3>
   <div class="results-list">
-    {#each applyResults as result}
+    {#each applyResults as result, i (i)}
       <div class="result-row" class:success={result.success} class:failure={!result.success}>
         <span class="result-icon">
           {#if result.success}
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             {@html CHECK_ICON}
           {:else}
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             {@html X_ICON}
           {/if}
         </span>

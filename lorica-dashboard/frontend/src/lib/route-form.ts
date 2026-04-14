@@ -785,7 +785,7 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
       }
       if (rule.is_regex) {
         try {
-          // eslint-disable-next-line no-new
+           
           new RegExp(rule.pattern);
         } catch (e) {
           return r(`Response rewrite rule ${i + 1}: invalid regex (${(e as Error).message})`, 'response_rewrite');
@@ -894,7 +894,7 @@ export function validateRouteForm(form: RouteFormState): string {
       }
       if (r.is_regex) {
         try {
-          // eslint-disable-next-line no-new
+           
           new RegExp(r.pattern);
         } catch (e) {
           return `Response rewrite rule ${i + 1}: invalid regex (${(e as Error).message})`;

@@ -149,7 +149,6 @@
 </script>
 
 {#if open}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="drawer-overlay"
     onkeydown={handleKeydown}
@@ -158,7 +157,6 @@
     tabindex="-1"
   >
     <!-- Backdrop: separate DOM branch so clicks don't interfere with drawer buttons (Svelte 5 event delegation) -->
-    <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
     <div class="drawer-backdrop" role="presentation" onclick={handleClose} onkeydown={(e) => { if (e.key === 'Escape') handleClose(); }}></div>
     <div class="drawer" role="document">
       <!-- Header -->
@@ -171,6 +169,7 @@
         </div>
         <div class="drawer-header-right">
           <button class="btn-close" onclick={handleClose} title="Close" aria-label="Close drawer">
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             {@html closeIcon}
           </button>
         </div>

@@ -205,6 +205,7 @@
     <h1>Certificates</h1>
     <div class="header-actions">
       <button class="btn btn-secondary" onclick={() => showThresholdConfig = true} title="Configure expiration thresholds">
+        <!-- eslint-disable-next-line svelte/no-at-html-tags -->
         {@html gearIcon}
       </button>
       <button class="btn btn-secondary" onclick={openSelfSigned}>Self-signed</button>

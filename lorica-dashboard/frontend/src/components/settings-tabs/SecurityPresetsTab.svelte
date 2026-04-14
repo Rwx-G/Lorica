@@ -122,7 +122,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each builtinPresets as bp}
+            {#each builtinPresets as bp (bp.name)}
               <tr>
                 <td><code>{bp.name}</code></td>
                 <td class="preset-desc">{bp.description}</td>
@@ -130,7 +130,7 @@
                 <td><span class="text-muted">builtin</span></td>
               </tr>
             {/each}
-            {#each customPresets as cp, idx}
+            {#each customPresets as cp, idx (idx)}
               <tr>
                 <td><code>{cp.name}</code></td>
                 <td class="preset-desc">{Object.keys(cp.headers).length} header{Object.keys(cp.headers).length !== 1 ? 's' : ''}</td>
@@ -153,7 +153,6 @@
 
 <!-- Preset form modal -->
 {#if showPresetForm}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div class="settings-overlay" onclick={(e) => { if (e.target === e.currentTarget) showPresetForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showPresetForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
     <div class="settings-dialog" role="document">
       <h3>{presetEditing !== null ? 'Edit' : 'Add'} Security Header Preset</h3>

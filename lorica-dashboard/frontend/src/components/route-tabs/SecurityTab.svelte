@@ -128,7 +128,7 @@
       <option value="strict">Strict</option>
       <option value="moderate">Moderate</option>
       <option value="none">None</option>
-      {#each customPresets as preset}
+      {#each customPresets as preset (preset.name)}
         <option value={preset.name}>{preset.name} (custom)</option>
       {/each}
     </select>
@@ -360,7 +360,7 @@
       id="mtls-ca"
       rows="6"
       bind:value={form.mtls_ca_cert_pem}
-      placeholder={'-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----'}
+      placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
     ></textarea>
     <span class="hint">
       One or more <code>-----BEGIN CERTIFICATE-----</code> blocks. Empty = feature

@@ -168,27 +168,27 @@
               { label: 'User Preferences', diff: importDiff.user_preferences },
               { label: 'Admin Users', diff: importDiff.admin_users },
             ]}
-            {#each sections as sec}
+            {#each sections as sec (sec.label)}
               {#if sec.diff.added.length > 0 || sec.diff.modified.length > 0 || sec.diff.removed.length > 0}
                 <div class="diff-section">
                   <h4>{sec.label}</h4>
                   {#if sec.diff.added.length > 0}
                     <ul class="diff-list diff-added">
-                      {#each sec.diff.added as item}
+                      {#each sec.diff.added as item, i (i)}
                         <li>+ {item}</li>
                       {/each}
                     </ul>
                   {/if}
                   {#if sec.diff.modified.length > 0}
                     <ul class="diff-list diff-modified">
-                      {#each sec.diff.modified as item}
+                      {#each sec.diff.modified as item, i (i)}
                         <li>~ {item}</li>
                       {/each}
                     </ul>
                   {/if}
                   {#if sec.diff.removed.length > 0}
                     <ul class="diff-list diff-removed">
-                      {#each sec.diff.removed as item}
+                      {#each sec.diff.removed as item, i (i)}
                         <li>- {item}</li>
                       {/each}
                     </ul>
@@ -200,7 +200,7 @@
               <div class="diff-section">
                 <h4>Global Settings</h4>
                 <ul class="diff-list diff-modified">
-                  {#each importDiff.global_settings.changes as ch}
+                  {#each importDiff.global_settings.changes as ch (ch.key)}
                     <li>~ {ch.key}: {ch.old_value} -&gt; {ch.new_value}</li>
                   {/each}
                 </ul>

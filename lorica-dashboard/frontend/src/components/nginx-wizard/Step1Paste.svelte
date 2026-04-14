@@ -13,7 +13,7 @@
   <textarea
     class="config-textarea"
     bind:value={configText}
-    placeholder="server {'\n'}    listen 80;{'\n'}    server_name example.com;{'\n'}    location / {'{'}  {'\n'}        proxy_pass http://127.0.0.1:8080;{'\n'}    {'}'}{'\n'}{'}'}"
+    placeholder={'server \n    listen 80;\n    server_name example.com;\n    location / {  \n        proxy_pass http://127.0.0.1:8080;\n    }\n}'}
     rows="22"
     spellcheck="false"
   ></textarea>

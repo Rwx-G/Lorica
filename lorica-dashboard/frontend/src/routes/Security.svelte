@@ -267,7 +267,7 @@
       <div class="stat-value">{stats.total_events}</div>
       <div class="stat-label">Total Events</div>
     </div>
-    {#each stats.by_category as cat}
+    {#each stats.by_category as cat (cat.category)}
       <div class="stat-card">
         <div class="stat-value">{cat.count}</div>
         <div class="stat-label">{categoryLabel(cat.category)}</div>
@@ -347,7 +347,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each events as event}
+            {#each events as event, i (i)}
               <tr>
                 <td class="mono">{formatTime(event.timestamp)}</td>
                 <td class="mono">{event.client_ip || '-'}</td>
@@ -382,7 +382,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each rules as rule}
+            {#each rules as rule (rule.id)}
               <tr class:disabled-rule={!rule.enabled}>
                 <td class="mono">{rule.id}</td>
                 <td><span class="category-badge">{categoryLabel(rule.category)}</span></td>
@@ -425,7 +425,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each customRules as rule}
+            {#each customRules as rule (rule.id)}
               <tr>
                 <td class="mono">{rule.id}</td>
                 <td><span class="category-badge">{categoryLabel(rule.category)}</span></td>
@@ -434,6 +434,7 @@
                 <td class="mono matched-value" title={rule.pattern}>{rule.pattern}</td>
                 <td>
                   <button class="btn-icon btn-icon-danger" onclick={() => (deletingCustomRule = rule)} title="Delete" aria-label="Delete">
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                     {@html trashIcon}
                   </button>
                 </td>
@@ -568,7 +569,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each bans as ban}
+              {#each bans as ban (ban.ip)}
                 <tr>
                   <td class="mono">{ban.ip}</td>
                   <td>{formatDuration(ban.banned_seconds_ago)} ago</td>

@@ -139,7 +139,7 @@
             <option value="first_of_month">First day of the month</option>
             <option value="daily">Daily (rolling)</option>
             <optgroup label="Specific day of month">
-              {#each Array.from({ length: 28 }, (_, i) => i + 1) as day}
+              {#each Array.from({ length: 28 }, (_, i) => i + 1) as day (day)}
                 <option value={String(day)}>Day {day}</option>
               {/each}
             </optgroup>

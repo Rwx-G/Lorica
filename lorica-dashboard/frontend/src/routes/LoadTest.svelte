@@ -368,7 +368,7 @@
           </tr>
         </thead>
         <tbody>
-          {#each configs as c}
+          {#each configs as c (c.id)}
             <tr class:selected={selectedConfigId === c.id}>
               <td>
                 <button class="link-btn" onclick={() => loadResults(c.id)}>{c.name}</button>
@@ -383,12 +383,15 @@
                   Run
                 </button>
                 <button class="btn-icon" onclick={() => openEditForm(c)} title="Edit" aria-label="Edit">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html editIcon}
                 </button>
                 <button class="btn-icon" onclick={() => handleClone(c.id, c.name)} title="Clone" aria-label="Clone">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html cloneIcon}
                 </button>
                 <button class="btn-icon btn-icon-danger" onclick={() => (deletingConfig = c)} title="Delete" aria-label="Delete">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html trashIcon}
                 </button>
               </td>
@@ -459,7 +462,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each results as r}
+              {#each results as r (r.started_at)}
                 <tr>
                   <td class="mono small">{new Date(r.started_at).toLocaleString()}</td>
                   <td>{r.total_requests.toLocaleString()}</td>
@@ -522,7 +525,7 @@
           <label for="loadtest-route">Route <span class="required">*</span></label>
           <select id="loadtest-route" bind:value={formRouteId}>
             <option value="">Select a route...</option>
-            {#each routes as route}
+            {#each routes as route (route.id)}
               <option value={route.id}>{route.hostname}{route.path_prefix !== '/' ? route.path_prefix : ''}</option>
             {/each}
           </select>

@@ -87,7 +87,6 @@
 </script>
 
 <!-- Edit Form Modal -->
-<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) onClose(); }} onkeydown={handleEditKeydown} role="dialog" aria-modal="true" tabindex="-1">
   <div class="modal" role="document">
     <h2>Edit Certificate</h2>
@@ -128,7 +127,7 @@
           <label for="edit-dns-provider">DNS Provider</label>
           <select id="edit-dns-provider" bind:value={editDnsProviderId}>
             <option value="">-- Select provider --</option>
-            {#each dnsProviders as p}
+            {#each dnsProviders as p (p.id)}
               <option value={p.id}>{p.name} ({p.provider_type})</option>
             {/each}
           </select>

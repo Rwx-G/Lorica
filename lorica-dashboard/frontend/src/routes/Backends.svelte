@@ -272,7 +272,7 @@
           </tr>
         </thead>
         <tbody>
-          {#each filteredBackends as b}
+          {#each filteredBackends as b (b.id)}
             <tr>
               <td>{b.name || '-'}</td>
               <td>{b.group_name || '-'}</td>
@@ -301,9 +301,11 @@
               <td class="mono">{b.ewma_score_us > 0 ? `${(b.ewma_score_us / 1000).toFixed(1)}ms` : '-'}</td>
               <td class="actions">
                 <button class="btn-icon" onclick={() => openEditForm(b)} title="Edit" aria-label="Edit">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html editIcon}
                 </button>
                 <button class="btn-icon btn-icon-danger" onclick={() => (deletingBackend = b)} title="Delete" aria-label="Delete">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html trashIcon}
                 </button>
               </td>

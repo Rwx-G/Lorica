@@ -105,7 +105,7 @@
     <div class="section">
       <h4>Unresolved includes</h4>
       <p class="step-hint">Paste the content of each included file to resolve them, then click "Re-parse".</p>
-      {#each unresolvedIncludes as inc, i}
+      {#each unresolvedIncludes as inc, i (i)}
         <div class="include-entry">
           <label class="include-label" for="nginx-import-include-{i}">
             <span class="badge badge-error">include</span>
@@ -132,7 +132,7 @@
   {#if certEntries.length > 0}
     <div class="section">
       <h4>TLS certificates</h4>
-      {#each certEntries as cert, i}
+      {#each certEntries as cert, i (i)}
         <div class="cert-import-entry">
           <label class="include-label" for="nginx-import-cert-mode-acme-{i}">
             <span class="badge badge-tls">TLS</span>
@@ -183,7 +183,7 @@
     <div class="section">
       <h4>Resolved configuration</h4>
       <div class="resolved-config">
-        {#each resolvedConfigLines as line, i}
+        {#each resolvedConfigLines as line, i (i)}
           <div class="resolved-line" class:resolved-replaced={line.kind === 'replaced'}>
             <span class="resolved-lineno">{i + 1}</span>
             <span class="resolved-text">{line.text}</span>
@@ -201,21 +201,21 @@
     <div class="section">
       <h4>Diagnostics</h4>
       <div class="diagnostics-list">
-        {#each errors as d}
+        {#each errors as d, i (i)}
           <div class="diagnostic diagnostic-error">
             <span class="diag-level">ERROR</span>
             <span class="diag-line">L{d.line}</span>
             <span class="diag-msg">{d.message}</span>
           </div>
         {/each}
-        {#each warnings as d}
+        {#each warnings as d, i (i)}
           <div class="diagnostic diagnostic-warning">
             <span class="diag-level">WARN</span>
             <span class="diag-line">L{d.line}</span>
             <span class="diag-msg">{d.message}</span>
           </div>
         {/each}
-        {#each infos as d}
+        {#each infos as d, i (i)}
           <div class="diagnostic diagnostic-info">
             <span class="diag-level">INFO</span>
             <span class="diag-line">L{d.line}</span>
@@ -244,7 +244,7 @@
     <div class="section">
       <h4>Backends</h4>
       <div class="backend-checks">
-        {#each backendChecks as check, i}
+        {#each backendChecks as check, i (i)}
           <div class="backend-check-row">
             <code class="backend-addr">{check.address}</code>
             {#if check.exists}

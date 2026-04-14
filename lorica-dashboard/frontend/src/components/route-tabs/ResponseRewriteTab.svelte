@@ -128,12 +128,16 @@
             <span class="summary">{ruleSummary(rule)}</span>
           </div>
           <div class="rule-header-right">
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             <button class="btn-icon" title="Move up" aria-label="Move up" disabled={index === 0} onclick={() => moveUp(index)}>{@html upIcon}</button>
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             <button class="btn-icon" title="Move down" aria-label="Move down" disabled={index === form.response_rewrite_rules.length - 1} onclick={() => moveDown(index)}>{@html downIcon}</button>
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             <button class="btn-icon btn-expand" title={expandedIndex === index ? 'Collapse' : 'Expand'} aria-label={expandedIndex === index ? 'Collapse' : 'Expand'} onclick={() => toggleExpand(index)}>{@html expandedIndex === index ? collapseIcon : expandIcon}</button>
             {#if pendingRemoveIndex === index}
               <button class="btn-icon btn-delete btn-delete-confirm" title="Click again within 3 s to remove" aria-label="Confirm remove" onclick={() => requestRemove(index)}>Confirm?</button>
             {:else}
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               <button class="btn-icon btn-delete" title="Remove" aria-label="Remove" onclick={() => requestRemove(index)}>{@html deleteIcon}</button>
             {/if}
           </div>

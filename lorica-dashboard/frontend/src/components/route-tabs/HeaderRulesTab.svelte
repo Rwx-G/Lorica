@@ -152,12 +152,15 @@
           </div>
           <div class="rule-header-right">
             <button class="btn-icon" title="Move up" aria-label="Move up" disabled={index === 0} onclick={() => moveUp(index)}>
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               {@html upIcon}
             </button>
             <button class="btn-icon" title="Move down" aria-label="Move down" disabled={index === form.header_rules.length - 1} onclick={() => moveDown(index)}>
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               {@html downIcon}
             </button>
             <button class="btn-icon btn-expand" title={expandedIndex === index ? 'Collapse' : 'Expand'} aria-label={expandedIndex === index ? 'Collapse' : 'Expand'} onclick={() => toggleExpand(index)}>
+              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               {@html expandedIndex === index ? collapseIcon : expandIcon}
             </button>
             {#if pendingRemoveIndex === index}
@@ -174,6 +177,7 @@
                 aria-label="Remove"
                 onclick={() => requestRemove(index)}
               >
+                <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                 {@html deleteIcon}
               </button>
             {/if}

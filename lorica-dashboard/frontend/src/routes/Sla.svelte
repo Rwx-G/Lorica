@@ -160,7 +160,7 @@
   {:else}
     <!-- Overview cards -->
     <div class="overview-grid">
-      {#each overview.filter(s => s.window === '24h') as s}
+      {#each overview.filter(s => s.window === '24h') as s (s.route_id)}
         {@const hostname = getRouteHostname(s.route_id)}
         <button
           class="sla-card"
@@ -209,7 +209,7 @@
                 <table>
                   <thead><tr><th>Window</th><th>SLA %</th><th>Requests</th><th>p50</th><th>p95</th><th>p99</th></tr></thead>
                   <tbody>
-                    {#each passiveSla as s}
+                    {#each passiveSla as s (s.window)}
                       <tr>
                         <td>{s.window}</td>
                         <td style="color: {slaColor(s.sla_pct, s.target_pct)}; font-weight: 600;">
@@ -234,7 +234,7 @@
                 <table>
                   <thead><tr><th>Window</th><th>SLA %</th><th>Probes</th><th>p50</th><th>p95</th><th>p99</th></tr></thead>
                   <tbody>
-                    {#each activeSla as s}
+                    {#each activeSla as s (s.window)}
                       <tr>
                         <td>{s.window}</td>
                         <td style="color: {slaColor(s.sla_pct, s.target_pct)}; font-weight: 600;">
@@ -279,7 +279,7 @@
                   </tr>
                 </thead>
                 <tbody>
-                  {#each [...buckets].reverse().slice(0, 30) as b}
+                  {#each [...buckets].reverse().slice(0, 30) as b (b.bucket_start)}
                     <tr>
                       <td class="mono">{new Date(b.bucket_start).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })}</td>
                       <td>{b.request_count}</td>
