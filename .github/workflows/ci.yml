@@ -45,6 +45,76 @@ jobs:
           cargo install cargo-audit --locked
           cargo audit 2>&1
 
+  semgrep:
+    name: Semgrep (security)
+    runs-on: ubuntu-latest
+    # Runs in parallel with `lint` to keep total CI wall time down.
+    # Non-blocking on findings so Semgrep registry flakes don't
+    # fail the pipeline; `continue-on-error` + SARIF upload lets
+    # reviewers still see the report on the PR.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python for Semgrep
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: pip install --quiet semgrep
+
+      - name: Semgrep (p/rust + OWASP + security-audit)
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: |
+          semgrep scan --metrics=off \
+            --config p/rust \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --config p/docker-compose \
+            --config p/github-actions \
+            --config p/command-injection \
+            --config p/r2c-security-audit \
+            --severity WARNING --severity ERROR \
+            --exclude target/ --exclude node_modules/ \
+            --exclude lorica-dashboard/frontend/dist/ \
+            --exclude audit-v1.3.0/ --exclude '**/*.bindgen.rs' \
+            --sarif-output=semgrep-results.sarif \
+            . || true
+
+      - name: Semgrep (trailofbits/semgrep-rules)
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: |
+          # Clone Trail of Bits rules (no Semgrep-registry dependency).
+          # These catch Rust, generic shell, JS, and YAML hygiene issues
+          # that the official p/* rulesets do not cover.
+          git clone --depth 1 https://github.com/trailofbits/semgrep-rules.git /tmp/tob-rules
+          semgrep scan --metrics=off \
+            --config /tmp/tob-rules/generic \
+            --config /tmp/tob-rules/javascript \
+            --config /tmp/tob-rules/rs \
+            --config /tmp/tob-rules/yaml \
+            --severity WARNING --severity ERROR \
+            --exclude target/ --exclude node_modules/ \
+            --exclude lorica-dashboard/frontend/dist/ \
+            --exclude audit-v1.3.0/ --exclude '**/*.bindgen.rs' \
+            --sarif-output=semgrep-trailofbits.sarif \
+            . || true
+
+      - name: Upload Semgrep SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-reports
+          path: |
+            semgrep-results.sarif
+            semgrep-trailofbits.sarif
+          retention-days: 30
+
   test:
     name: Test
     needs: lint
