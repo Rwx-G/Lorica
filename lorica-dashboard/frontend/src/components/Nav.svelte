@@ -42,7 +42,7 @@
   </div>
 
   <ul class="nav-list">
-    {#each navItems as item}
+    {#each navItems as item, i (i)}
       {#if 'section' in item}
         <li class="nav-section">{item.section}</li>
       {:else}
@@ -52,6 +52,7 @@
             class:active={path === item.path}
             onclick={() => navigate(item.path)}
           >
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             <span class="nav-icon">{@html getIcon(item.icon)}</span>
             <span>{item.label}</span>
           </button>
@@ -62,6 +63,7 @@
 
   <div class="sidebar-footer">
     <button class="nav-item logout-btn" onclick={handleLogout}>
+      <!-- eslint-disable-next-line svelte/no-at-html-tags -->
       <span class="nav-icon">{@html getIcon('logout')}</span>
       <span>Sign out</span>
     </button>

@@ -161,7 +161,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each dnsProviders as dp}
+              {#each dnsProviders as dp (dp.id)}
                 <tr>
                   <td>{dp.name}</td>
                   <td class="settings-capitalize">{dp.provider_type}</td>
@@ -188,7 +188,6 @@
 
 <!-- DNS Provider form modal -->
 {#if showDnsProviderForm}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div class="settings-overlay" onclick={(e) => { if (e.target === e.currentTarget) showDnsProviderForm = false; }} onkeydown={(e) => { if (e.key === 'Escape') showDnsProviderForm = false; }} role="dialog" aria-modal="true" tabindex="-1">
     <div class="settings-dialog" role="document">
       <h3>{dnsProviderEditing ? 'Edit' : 'Add'} DNS Provider</h3>

@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-04-11 | Lorica v1.2.0 (unreleased)
+> Last updated: 2026-04-12 | Lorica v1.3.0
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin/Module (not built-in)
 >
@@ -28,15 +28,15 @@
 | Direct status responses | Y | P | Y | Y | Y | Y | Y | Y |
 | Connection pooling | Y | Y | Y | Y | Y | Y | Y | Y |
 | Sticky sessions (cookie) | Y | P | Y | Paid | Y | Paid | Y | Y |
-| **Forward auth** | **N** | N | N | Y | Y | Y | Y | P |
-| **Header-based routing** | **N** | P | N | P | Y | N | Y | Y |
+| Forward auth | Y | N | N | Y | Y | Y | Y | P |
+| Header-based routing | Y | P | N | P | Y | N | Y | Y |
+| Canary / traffic split (weighted) | Y | N | N | N | P | N | N | Y |
+| Response body rewriting | Y | N | N | Y | N | N | N | N |
 | **TCP/L4 proxying** | **N** | Y | Y | Y | Y | Y | Plug | Y |
 | **UDP proxying** | **N** | N | N | Y | Y | P | Plug | Y |
 
 ### Gaps for Lorica
 
-- **Forward auth** - Table-stakes feature. Nginx (auth_request), Traefik (forwardAuth), Caddy (forward_auth), BunkerWeb all support it. Required for SSO/MFA via Authelia, Authentik, Keycloak.
-- **Header-based routing** - Traefik, Caddy, HAProxy all support it natively. Enables A/B testing, multi-tenant routing.
 - **TCP/L4 proxying** - Supported by most competitors. Enables database, MQTT, SSH proxying.
 - **HTTP/3 (QUIC)** - Traefik and HAProxy have production support. Pingora has an upstream PR pending. Long-term gap.
 
@@ -53,12 +53,15 @@
 | Random | Y | Y | Y | Y | N | N | Y | Y |
 | IP Hash | N | N | N | Y | N | N | Y | Y |
 | Health-aware filtering | Y | Y | Y | Paid | Y | Paid | Y | Y |
-| **Traffic mirroring** | **N** | N | N | N | Y | N | N | N |
+| Traffic mirroring | Y | N | N | N | Y | N | N | N |
+
+### Lorica Strengths
+
+- **Traffic mirroring** - Only Traefik and Lorica ship this natively. Lorica's implementation adds request-body mirroring up to a configurable cap, deterministic per-request-id sampling, and a 256-slot concurrency semaphore so a slow shadow can't starve the primary.
 
 ### Gaps for Lorica
 
-- **Least Connections** - Standard algorithm, available in Pingora. Should be added.
-- **Traffic mirroring** - Traefik-exclusive differentiator. Useful for shadow testing.
+- ~~Least Connections~~ - Implemented in v1.2.0.
 
 ---
 
@@ -81,7 +84,8 @@
 | **Bot detection (captcha)** | **N** | N | N | N | N | Y | N | N |
 | **Country blocking (GeoIP)** | **N** | N | N | Plug | N | Y | N | N |
 | Request body scanning | Y | N | N | Plug | Plug | Y | N | N |
-| mTLS client verification | N | Y | N | Y | Y | Y | Y | Y |
+| mTLS client verification | Y | Y | N | Y | Y | Y | Y | Y |
+| Connection pre-filter (pre-TLS CIDR) | Y | P | P | P | N | N | N | Y |
 
 ### Lorica Strengths
 
@@ -89,11 +93,12 @@
 - **Auto-ban** - Only BunkerWeb has equivalent (Bad Behavior plugin).
 - **IP blocklist auto-fetch** - Only BunkerWeb has equivalent (Blacklist plugin + BunkerNet).
 - **Slowloris detection** - Rare built-in feature.
+- **Connection pre-filter at TCP accept** - CIDR allow/deny evaluated before the TLS handshake, hot-reloaded without rebuilding listeners.
 
 ### Gaps for Lorica
 
 - ~~Basic auth per route~~ - Implemented in v1.2.0.
-- **mTLS client verification** - Already in backlog. Important for zero-trust and B2B.
+- ~~mTLS client verification~~ - Implemented in v1.3.0.
 - **Bot detection** - BunkerWeb's major differentiator (JS challenge, captcha, hCaptcha, Turnstile).
 - **Country blocking** - BunkerWeb has it. Useful for compliance and attack surface reduction.
 
@@ -109,11 +114,16 @@
 | Cache-Control respect | Y | P | N | Y | - | - | Plug | Y |
 | Cache purge API | Y | N | N | Plug | - | - | Plug | N |
 | X-Cache-Status header | Y | N | N | P | - | - | Plug | N |
+| Vary header partitioning | Y | P | N | Y | - | - | P | Y |
+| Stale-while-revalidate (background refresh) | Y | P | N | Y | - | - | Plug | N |
+| Cache predictor (learn-uncacheable) | Y | Y | N | N | - | - | N | N |
 
 ### Lorica Strengths
 
 - **Built-in HTTP cache** - Traefik requires Enterprise, BunkerWeb requires PRO, Caddy requires plugin. Only Nginx and HAProxy match this natively.
 - **Cache purge API** - Not available in Nginx OSS or HAProxy natively.
+- **Stale-while-revalidate with true background refresh** - most competitors serve stale on error only; Lorica spawns a background sub-request that refreshes the entry while the current request already has the stale body.
+- **Cache predictor** - shared 16-shard LRU remembers deterministically-uncacheable responses so future requests for the same key skip the cache state machine entirely. Only Pingora's framework ships the equivalent.
 
 ---
 
@@ -130,18 +140,19 @@
 | SNI hot-swap | Y | P | Y | N | Y | N | Y | N |
 | CRL support | Y | P | N | Y | N | N | N | Y |
 | OCSP stapling | Y | N | N | Y | N | Y | Y | Y |
-| **mTLS client certs** | **N** | Y | N | Y | Y | Y | Y | Y |
+| mTLS client certs | Y | Y | N | Y | Y | Y | Y | Y |
 
 ### Lorica Strengths
 
 - **ACME DNS-01 with 3 providers** (Cloudflare, Route53, OVH) + manual mode - competitive with Traefik and Caddy.
 - **SNI hot-swap** via arc-swap - zero-downtime cert rotation.
 - **CRL support** - Rare feature, only Nginx and HAProxy match.
+- **Per-route mTLS policy** - chain verification at the TLS listener plus per-route enforcement knobs (`required`, org allowlist) that hot-reload without restart. Most competitors only expose a single listener-wide client-cert setting.
 
 ### Gaps for Lorica
 
-- **mTLS client verification** - Already in backlog. Most competitors support it.
-- **OCSP stapling** - Standard TLS feature, supported by Nginx, BunkerWeb, Caddy, HAProxy.
+- ~~mTLS client verification~~ - Implemented in v1.3.0.
+- ~~OCSP stapling~~ - Implemented in v1.2.0.
 
 ---
 
@@ -156,7 +167,7 @@
 | Built-in load testing | Y | N | N | N | N | N | N | N |
 | SLA breach alerts | Y | N | N | N | N | N | N | N |
 | **OpenTelemetry tracing** | **N** | P | Y | N | Y | N | P | Y |
-| **Structured JSON logs** | **N** | P | Y | Y | Y | Y | Y | Y |
+| Structured JSON logs | Y | P | Y | Y | Y | Y | Y | Y |
 
 ### Lorica Strengths
 
@@ -169,7 +180,7 @@
 ### Gaps for Lorica
 
 - **OpenTelemetry tracing** - Traefik (native OTLP), HAProxy (OpenTracing filter), Sozu support it. Important for distributed tracing.
-- **Structured JSON logs to file/syslog** - Already in backlog. Standard for ELK/Loki/Datadog integration.
+- ~~Structured JSON logs to file/syslog~~ - Implemented in v1.2.0.
 
 ---
 
@@ -241,7 +252,8 @@
 
 ### Gaps for Lorica
 
-- **Docker image** - Most competitors provide official Docker images. Important for containerized deployments.
+- ~~Docker image~~ - Implemented in v1.2.0.
+- **Helm chart** - Nginx, Traefik, BunkerWeb, HAProxy publish official charts; useful for Kubernetes adoption.
 
 ---
 
@@ -261,6 +273,10 @@ These features are either unique to Lorica or extremely rare among competitors:
 | Encrypted secrets at rest (AES-256-GCM) | Lorica only |
 | Built-in WAF + auto-ban + IP blocklist | Lorica, BunkerWeb |
 | Peak EWMA load balancing | Lorica, Pingora |
+| Cache predictor (learn-uncacheable) | Lorica, Pingora |
+| Per-route mTLS with hot-reload policy (required + org allowlist) | Lorica only |
+| Forward-auth verdict cache (opt-in, TTL-capped, cookie-keyed) | Lorica only |
+| Connection pre-filter at TCP accept (hot-reloaded CIDR) | Lorica, HAProxy |
 
 ---
 
@@ -270,20 +286,20 @@ These features are either unique to Lorica or extremely rare among competitors:
 
 | Feature | Backlog? | Competitors With It |
 |---|---|---|
-| Forward auth (external auth) | Yes (#1) | Nginx, Traefik, BunkerWeb, Caddy |
+| ~~Forward auth (external auth)~~ | ~~Yes (#1)~~ | Implemented in v1.3.0 |
 | ~~Basic auth per route~~ | ~~Yes (#4)~~ | Implemented in v1.2.0 |
 | ~~Custom error pages + maintenance mode~~ | ~~Yes (#3)~~ | Implemented in v1.2.0 |
-| mTLS client verification | Yes (#10) | Nginx, Traefik, BunkerWeb, Caddy, HAProxy |
+| ~~mTLS client verification~~ | ~~Yes (#10)~~ | Implemented in v1.3.0 |
 | ~~Retry with backoff~~ | ~~Yes (#7)~~ | Implemented in v1.2.0 (retry_on_methods) |
 
 ### Differentiators (competitive advantage opportunities)
 
 | Feature | Backlog? | Competitors With It |
 |---|---|---|
-| Canary / traffic split | Yes (#5) | Traefik (mirroring), HAProxy |
-| Header-based routing | Yes (#6) | Traefik, Caddy, HAProxy |
-| Structured JSON logs (file/syslog) | Yes (#8) | All |
-| Request mirroring | Yes (#9) | Traefik |
+| ~~Canary / traffic split~~ | ~~Yes (#5)~~ | Implemented in v1.3.0 |
+| ~~Header-based routing~~ | ~~Yes (#6)~~ | Implemented in v1.3.0 |
+| ~~Structured JSON logs (file/syslog)~~ | ~~Yes (#8)~~ | Implemented in v1.2.0 |
+| ~~Request mirroring~~ | ~~Yes (#9)~~ | Implemented in v1.3.0 |
 | TCP/L4 proxying | Yes (#12) | All except Pingora framework |
 
 ### Not Yet in Backlog (consider adding)
@@ -296,7 +312,11 @@ These features are either unique to Lorica or extremely rare among competitors:
 | ~~Docker image~~ | ~~Medium~~ | Implemented in v1.2.0 |
 | Bot detection (JS challenge/captcha) | Low | Only BunkerWeb has it. Niche but impressive |
 | Country blocking (GeoIP) | Low | Only BunkerWeb has it. Useful for compliance |
-| Response body rewriting | Low | Already in backlog (#11). Nginx sub_filter equivalent |
+| ~~Response body rewriting~~ | ~~Low~~ | Implemented in v1.3.0 |
+| ~~Cache Vary partitioning~~ | ~~-~~ | Implemented in v1.3.0 |
+| ~~Cache predictor~~ | ~~-~~ | Implemented in v1.3.0 |
+| ~~Stale-while-revalidate (background refresh)~~ | ~~-~~ | Implemented in v1.3.0 |
+| ~~Connection pre-filter (pre-TLS CIDR)~~ | ~~-~~ | Implemented in v1.3.0 |
 
 ---
 
@@ -304,28 +324,31 @@ These features are either unique to Lorica or extremely rare among competitors:
 
 Lorica is a fork of Cloudflare Pingora. The forked crates already contain significant capabilities that the product does not yet expose. These represent **low-hanging fruit** - the code exists in the workspace, it just needs wiring into the product layer.
 
-### ProxyHttp Trait Hooks (12/41 used)
+### ProxyHttp Trait Hooks
 
-The `ProxyHttp` trait in `lorica-proxy/src/proxy_trait.rs` defines 41 methods. Lorica implements 12. The unused hooks unlock major features with minimal effort since the framework already handles the plumbing.
+The `ProxyHttp` trait in `lorica-proxy/src/proxy_trait.rs` defines 41 methods. v1.3.0 pushed the used count from 12 to 20+. The remaining unused hooks still unlock features with minimal effort.
 
-#### Quick Wins (wire a hook + add config)
+#### Tapped in v1.2.0 / v1.3.0
 
-| Hook | Feature It Unlocks | Effort | Backlog |
-|---|---|---|---|
-| `response_body_filter()` | **Response body rewriting** - modify/replace content per chunk (Nginx `sub_filter` equivalent) | Low | #11 |
-| `fail_to_proxy()` | **Custom error pages** - return branded HTML for 502/503/504 instead of defaults | Low | #3 |
-| `should_serve_stale()` | **Stale-while-error** - serve stale cached content when upstream fails | Low | - |
-| `upstream_response_filter()` | **Header injection/removal** on upstream responses before caching | Low | - |
-| `suppress_error_log()` | **Noise reduction** - suppress known-benign errors (e.g. client disconnects) | Low | - |
-| `request_summary()` | **Structured JSON access logs** - custom log format per request | Low | #8 |
+| Hook | Shipped As | Version |
+|---|---|---|
+| `fail_to_proxy()` | Custom error pages + maintenance mode | v1.2.0 |
+| `should_serve_stale()` | Stale-while-error + stale-while-revalidate background refresh | v1.2.0 / v1.3.0 |
+| `request_summary()` | Structured JSON access logs | v1.2.0 |
+| `is_purge()` + `purge_response_filter()` | Cache purge via HTTP PURGE method | v1.2.0 |
+| `range_header_filter()` | HTTP Range requests | v1.2.0 |
+| `response_body_filter()` | Response body rewriting | v1.3.0 |
+| `allow_spawning_subrequest()` + subrequest pipe | Forward auth + SWR background refresh | v1.3.0 |
+| `cache_vary_filter()` | Cache Vary partitioning | v1.3.0 |
 
-#### Medium Effort (hook + new subsystem)
+#### Still Untapped (remaining opportunities)
 
-| Hook | Feature It Unlocks | Effort | Backlog |
-|---|---|---|---|
-| `allow_spawning_subrequest()` + subrequest pipe | **Forward auth** - send sub-request to auth service before proxying. Infrastructure exists in `lorica-proxy/src/subrequest/` | Medium | #1 |
-| `is_purge()` + `purge_response_filter()` | **Cache purge via HTTP** - PURGE method support (currently API-only) | Low | - |
-| `range_header_filter()` | **HTTP Range requests** - partial content delivery (RFC 7232). Default exists in `proxy_cache::range_filter` | Low | - |
+| Hook | Feature It Unlocks | Effort |
+|---|---|---|
+| `upstream_response_filter()` | **Header injection/removal** on upstream responses before caching | Low |
+| `suppress_error_log()` | **Noise reduction** - suppress known-benign errors (e.g. client disconnects) | Low |
+| `fail_to_connect()` | **Smarter retry decisions** - mark errors as retryable or not | Low |
+| `error_while_proxy()` | **Error context enrichment** for better diagnostics | Low |
 
 ### Load Balancing (lorica-lb)
 
@@ -336,29 +359,29 @@ The `ProxyHttp` trait in `lorica-proxy/src/proxy_trait.rs` defines 41 methods. L
 
 ### Cache (lorica-cache)
 
-The cache crate has significant unused capabilities:
+Most cache capabilities are now wired. Remaining:
 
-| Capability | Location | What It Does | Effort |
-|---|---|---|---|
-| **Cache Lock** | `lorica-cache/src/lock.rs` | Prevents thundering herd on cache miss - only one request fetches from upstream, others wait. Currently `None` in proxy_wiring.rs:1627 | Low |
-| **Cache Predictor** | `lorica-cache/src/predictor.rs` | Predictive caching - learn which assets are cacheable before full response. Currently `None` in proxy_wiring.rs:1626 | Medium |
-| **Vary/Variance** | `lorica-cache/src/variance.rs` | Cache different variants based on `Vary` header (e.g. Accept-Encoding, Accept-Language). `cache_vary_filter()` hook available | Medium |
-| **Streaming Miss** | `storage.rs` `lookup_streaming_write()` | Serve partial content while still fetching from upstream - reduces TTFB for cache misses | Medium |
-| **Stale-while-revalidate** | `lock.rs` `stale_writer` | Serve stale content while background revalidation happens | Low |
+| Capability | Location | What It Does | Effort | Status |
+|---|---|---|---|---|
+| ~~Cache Lock~~ | `lorica-cache/src/lock.rs` | Thundering-herd protection | Low | v1.2.0 |
+| ~~Cache Predictor~~ | `lorica-cache/src/predictor.rs` | Learn-uncacheable short-circuit | Medium | v1.3.0 |
+| ~~Vary/Variance~~ | `lorica-cache/src/variance.rs` | `Vary`-header cache partitioning | Medium | v1.3.0 |
+| ~~Stale-while-revalidate~~ | `lock.rs` `stale_writer` | Serve stale + background refresh | Low | v1.2.0 / v1.3.0 |
+| **Streaming Miss** | `storage.rs` `lookup_streaming_write()` | Serve partial content while still fetching from upstream - reduces TTFB for cache misses | Medium | Untapped |
 
 ### TLS / mTLS (lorica-core)
 
-| Capability | Location | What It Does | Effort |
-|---|---|---|---|
-| **mTLS client verification** | `lorica-core/src/listeners/tls/rustls/mod.rs` `set_client_cert_verifier()` | Require client TLS certificates for specific routes. Full `ClientCertVerifier` trait support exists | Medium |
+| Capability | Location | What It Does | Effort | Status |
+|---|---|---|---|---|
+| ~~mTLS client verification~~ | `lorica-core/src/listeners/tls/rustls/mod.rs` `set_client_cert_verifier()` | Per-route client-cert chain validation + org allowlist | Medium | v1.3.0 |
 
 ### Protocol Support (lorica-core)
 
 | Capability | Location | What It Does | Effort |
 |---|---|---|---|
-| **gRPC-Web module** | `lorica-core/src/modules/http/grpc_web.rs` | gRPC-Web to gRPC translation (browser-compatible gRPC). Module defined but never instantiated | Low |
-| **Connection filter** | `lorica-core/src/listeners/connection_filter.rs` | Per-connection admission control (currently `AcceptAllFilter`). Could enable IP-level filtering before TLS handshake | Low |
-| **Custom protocol connectors** | `lorica-core/src/connectors/http/custom/mod.rs` | Non-standard HTTP protocol handling via trait | High |
+| ~~gRPC-Web module~~ | `lorica-core/src/modules/http/grpc_web.rs` | gRPC-Web to gRPC translation (browser-compatible gRPC) | Low | v1.2.0 |
+| ~~Connection filter~~ | `lorica-core/src/listeners/connection_filter.rs` | Per-connection admission control. CIDR allow/deny pre-TLS | Low | v1.3.0 |
+| **Custom protocol connectors** | `lorica-core/src/connectors/http/custom/mod.rs` | Non-standard HTTP protocol handling via trait | High | Untapped |
 
 ### Error Handling (5 hooks, 0 custom)
 
@@ -371,25 +394,33 @@ All error hooks use defaults. Implementing them enables:
 | `error_while_proxy()` | Error context enrichment for better diagnostics | Low |
 | `should_serve_stale()` | Graceful degradation - serve cached content on upstream failure | Low |
 
-### Priority Matrix: Pingora Quick Wins
+### Priority Matrix: Pingora Quick Wins (consolidated ledger)
 
-Features that are **already coded in the fork** and just need product wiring:
+Baseline audit of Pingora-coded-but-unused capabilities, updated as each one ships.
 
-| Feature | Effort | Impact | Unlocked By |
+| Feature | Effort | Impact | Status |
 |---|---|---|---|
-| Cache lock (thundering herd protection) | Very Low | High | Set `Some(CacheLock::new(...))` in proxy_wiring.rs |
-| Stale-while-error | Low | High | Implement `should_serve_stale()` hook |
-| Custom error pages | Low | High | Implement `fail_to_proxy()` hook |
-| Structured JSON logs | Low | High | Implement `request_summary()` hook |
-| HTTP Range requests | Low | Medium | Enable `range_header_filter()` |
-| Cache purge via PURGE method | Low | Medium | Implement `is_purge()` hook |
-| gRPC-Web module | Low | Medium | Instantiate existing module |
-| Connection pre-filter | Low | Medium | Replace `AcceptAllFilter` |
-| Forward auth (subrequests) | Medium | High | Enable subrequest pipe + `early_request_filter()` |
-| Response body rewriting | Medium | High | Implement `response_body_filter()` |
-| mTLS client verification | Medium | High | Configure `ClientCertVerifier` |
-| Cache Vary support | Medium | Medium | Implement `cache_vary_filter()` |
-| Least Connections LB | Low | Medium | Implement in lorica-lb selection |
+| ~~Cache lock (thundering herd protection)~~ | Very Low | High | v1.2.0 |
+| ~~Stale-while-error~~ | Low | High | v1.2.0 |
+| ~~Custom error pages~~ | Low | High | v1.2.0 |
+| ~~Structured JSON logs~~ | Low | High | v1.2.0 |
+| ~~HTTP Range requests~~ | Low | Medium | v1.2.0 |
+| ~~Cache purge via PURGE method~~ | Low | Medium | v1.2.0 |
+| ~~gRPC-Web module~~ | Low | Medium | v1.2.0 |
+| ~~Least Connections LB~~ | Low | Medium | v1.2.0 |
+| ~~Connection pre-filter~~ | Low | Medium | v1.3.0 |
+| ~~Forward auth (subrequests)~~ | Medium | High | v1.3.0 |
+| ~~Response body rewriting~~ | Medium | High | v1.3.0 |
+| ~~mTLS client verification~~ | Medium | High | v1.3.0 |
+| ~~Cache Vary support~~ | Medium | Medium | v1.3.0 |
+| ~~Cache predictor~~ | Medium | Medium | v1.3.0 |
+| ~~Stale-while-revalidate (background refresh)~~ | Low | High | v1.3.0 |
+| ~~Request mirroring~~ | Medium | Medium | v1.3.0 |
+| ~~Canary / traffic split~~ | Medium | High | v1.3.0 |
+| ~~Header-based routing~~ | Low-Medium | High | v1.3.0 |
+| Streaming cache miss | Medium | Medium | Untapped |
+| Upstream response header filter | Low | Low | Untapped |
+| Custom protocol connectors | High | Low | Untapped |
 
 ---
 

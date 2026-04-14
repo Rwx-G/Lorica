@@ -19,7 +19,13 @@ struct SlackMessage {
     icon_emoji: String,
 }
 
-/// Send an alert event to a Slack (or Discord) incoming webhook.
+/// Post an alert event to a Slack-compatible incoming webhook.
+///
+/// Formats the event as a single Slack message (with an emoji chosen from
+/// the alert type) and POSTs the Slack payload as JSON. Also accepts
+/// Discord webhooks in Slack-compatibility mode. Uses a 10-second total
+/// timeout and returns [`NotifyError::Webhook`] on transport failures or
+/// non-2xx responses.
 pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), NotifyError> {
     let emoji = match event.alert_type {
         crate::events::AlertType::CertExpiring => ":lock:",
@@ -96,7 +102,7 @@ mod tests {
             username: "Lorica".into(),
             icon_emoji: ":shield:".into(),
         };
-        let json = serde_json::to_string(&msg).unwrap();
+        let json = serde_json::to_string(&msg).expect("SlackMessage fixture serializes cleanly");
         assert!(json.contains("BACKEND DOWN"));
         assert!(json.contains("Lorica"));
     }

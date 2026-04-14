@@ -22,13 +22,24 @@
 // Note: unsafe code needed for from_raw_fd (Unix socket FD passing between processes)
 
 pub mod channel;
+pub mod coalesce;
+pub mod generation;
 pub mod messages;
+pub mod rpc;
+
+pub use coalesce::Coalescer;
+pub use generation::{GenerationGate, StaleGeneration};
 
 pub use channel::CommandChannel;
 pub use messages::{
-    BackendConnEntry, BanReportEntry, Command, CommandType, EwmaReportEntry, MetricsReport,
-    RequestCountEntry, Response, ResponseStatus, WafCountEntry,
+    command, envelope, response, BackendConnEntry, BanReportEntry, BreakerDecision, BreakerQuery,
+    BreakerReport, BreakerResult, Command, CommandType, ConfigReloadAbort, ConfigReloadCommit,
+    ConfigReloadPrepare, Envelope, EwmaReportEntry, ForwardAuthHeader, MetricsReport,
+    RateLimitDelta, RateLimitDeltaResult, RateLimitEntry, RateLimitQuery, RateLimitResult,
+    RateLimitSnapshot, RequestCountEntry, Response, ResponseStatus, Verdict, VerdictLookup,
+    VerdictPush, VerdictResult, WafCountEntry,
 };
+pub use rpc::{IncomingCommand, IncomingCommands, RpcEndpoint, DEFAULT_REQUEST_TIMEOUT};
 
 /// Errors from the command channel.
 #[derive(Debug, thiserror::Error)]
@@ -44,4 +55,7 @@ pub enum ChannelError {
 
     #[error("channel operation timed out")]
     Timeout,
+
+    #[error("channel closed by peer or shutdown")]
+    Closed,
 }

@@ -6,11 +6,11 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.2.0-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.3.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-582-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-429-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-985-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-568-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -25,6 +25,9 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 - HTTP/HTTPS reverse proxy with host-based and path-prefix routing
 - **Path rules** - ordered sub-path overrides within a route for backends, cache, headers, rate limits, or direct HTTP status responses
+- **Header-based routing** - per-route rules that pick a backend group by request header value (Exact / Prefix / Regex). A/B testing (`X-Version: beta`), multi-tenant isolation (`X-Tenant: acme`), no upstream URL changes
+- **Canary traffic split** - send `X%` of requests to an alternate backend group with sticky-per-IP deterministic bucketing. Multiple splits per route; weights capped at 100 cumulative
+- **Response body rewriting** - ordered search-and-replace rules (literal or regex with capture groups) applied to upstream response bodies. Configurable content-type filter, max body cap, streams verbatim over the cap
 - TLS termination via rustls (no OpenSSL dependency)
 - SNI-based certificate selection with wildcard domain support (`*.example.com`)
 - Path rewriting (strip/add prefix, regex with capture groups), hostname aliases, HTTP-to-HTTPS redirect
@@ -38,9 +41,13 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :lock: Security
 
 - **WAF engine** - 49 OWASP CRS-inspired rules (SQLi, XSS, path traversal, command injection, SSRF, Log4Shell, XXE, CRLF)
+- **mTLS client verification** - per-route CA bundle + optional organization allowlist. Chain validated at the TLS handshake (rustls `WebPkiClientVerifier`), per-route enforcement returns 496 ("cert required") or 495 ("cert error"). `required` and org-allowlist hot-reload; CA edits take effect on restart
+- **Forward authentication** - per-route sub-request to Authelia / Authentik / Keycloak / oauth2-proxy before proxying; 2xx injects response headers into upstream, 401/403/3xx forwarded verbatim to the client, timeout = fail-closed 503. Optional opt-in verdict cache (TTL-capped at 60s, Cookie-keyed) to shortcut hot paths. Under `--workers N` the cache is owned by the supervisor and routed through the pipelined RPC channel, so an Allow verdict cached by one worker is served from every worker, and a session revocation invalidates the cache uniformly (WPAR-2, design § 7)
+- **Connection pre-filter** - global IP allow/deny CIDR policy enforced at TCP accept, before the TLS handshake. Deny always wins; non-empty allow switches to default-deny. Hot-reloaded via arc-swap in single-process and worker modes
 - **IP blocklist** - auto-fetched from Data-Shield IPv4 Blocklist (~80,000 entries, O(1) lookup, updated every 6h)
-- **Rate limiting** - per-route, per-client-IP with configurable RPS and burst tolerance
-- **Auto-ban** - IPs that repeatedly exceed rate limits are banned automatically (configurable threshold and duration)
+- **Rate limiting** - per-route, per-client-IP with configurable RPS and burst tolerance (legacy event-rate estimator `rate_limit_rps` / `rate_limit_burst`)
+- **Per-route token-bucket limiter** - exact-semantic admission control via `rate_limit: { capacity, refill_per_sec, scope }`. Runs ahead of mTLS / forward-auth / WAF so abusive clients are rejected cheaply with `429 Too Many Requests` + `Retry-After`. `scope: per_ip` isolates individual clients; `scope: per_route` caps aggregate traffic to a fragile origin. Cross-worker under `--workers N`: each worker's CAS-based `LocalBucket` cache syncs every 100 ms with the supervisor's authoritative state over a dedicated pipelined RPC channel. Aggregate bound: `capacity + 100 ms × N_workers × refill_per_sec` (documented in `docs/architecture/worker-shared-state.md` § 6)
+- **Auto-ban** - IPs that repeatedly exceed rate limits (or trip the WAF) are banned automatically (configurable threshold and duration). Under `--workers N`, the WAF auto-ban counter lives in an anonymous `memfd` shared by all workers (no UDS round-trip per block), and the supervisor is the sole ban issuer, broadcasting `BanIp` on threshold crossing
 - **Trusted proxies** - CIDR list for X-Forwarded-For validation, prevents IP spoofing via header injection
 - **DDoS protection** - per-route max connections, global flood rate tracking
 - **Slowloris detection** - rejects slow-header attacks with configurable threshold
@@ -52,7 +59,8 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 
 - **Passive SLA** - per-route uptime, latency percentiles (p50/p95/p99), rolling windows (1h/24h/7d/30d)
 - **Active SLA** - synthetic HTTP probes at configurable intervals, detects outages during low-traffic periods
-- **Prometheus metrics** - `/metrics` endpoint with request counts, latency histograms, backend health, WAF events, cert expiry
+- **Prometheus metrics** - `/metrics` endpoint with request counts, latency histograms, backend health, WAF events, cert expiry. Per-feature counters for cache-predictor bypass, header-rule matches, canary split selection, mirror outcomes (spawned / dropped / errored), forward-auth verdict cache hit rate - all bounded by route count. Under `--workers N` every scrape triggers a pull-on-scrape fan-out over the pipelined RPC channel so per-worker counters are sub-second fresh; concurrent scrapes dedup into a single fan-out and stuck workers fall back to cached state within a 500 ms per-worker timeout (WPAR-7)
+- **Request mirroring (shadow testing)** - duplicate every request to one or more secondary backends (deterministic per `X-Request-Id` sampling, 256-slot concurrency cap, body mirroring up to a configurable cap). Fire-and-forget: mirror failure can never impact the primary
 - **Real-time access logs** - WebSocket streaming to the dashboard with filtering
 - **Load testing** - built-in load test engine with SSE streaming, cron scheduling, CPU circuit breaker, and result comparison
 - **SLA breach alerts** - automatic notifications when SLA drops below target
@@ -71,7 +79,9 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :zap: Performance
 
 - **Pingora engine** - forked from Cloudflare's production proxy framework
-- **HTTP cache** - in-memory response caching with LRU eviction (128 MiB cap), TinyUFO algorithm, cache lock (thundering herd protection), stale-while-revalidate/stale-if-error, HTTP PURGE method support
+- **HTTP cache** - in-memory response caching with LRU eviction (128 MiB cap), TinyUFO algorithm, cache lock (thundering herd protection), stale-while-revalidate **with background refresh** (serves stale immediately, fetches fresh in parallel) and stale-if-error, HTTP PURGE method support
+- **Cache Vary** - per-route `cache_vary_headers` partitions the cache by request-header values (e.g. `Accept-Encoding`) merged with the origin's `Vary` response; `Vary: *` anchors on URI to bound cardinality
+- **Cache predictor** - 16-shard LRU (32K keys) remembers deterministically-uncacheable responses and short-circuits the cache state machine on subsequent hits, avoiding cache-lock contention on known-bypass traffic
 - **Peak EWMA load balancing** - latency-aware backend selection alongside Round Robin, Consistent Hash, Random, Least Connections
 - **DashMap** - lock-free concurrent reads for ban list and route connections in the hot path
 - **Sub-0.5ms WAF evaluation** - precompiled regex patterns with zero overhead when disabled
@@ -79,7 +89,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 ### :package: Reliability
 
 - **Worker process isolation** - fork+exec with socket passing via SCM_RIGHTS
-- **Protobuf command channel** - supervisor-to-worker config reload without traffic interruption
+- **Protobuf command channel** - supervisor-to-worker config reload without traffic interruption. Under `--workers N`, reloads run as two-phase Prepare + Commit on a pipelined RPC channel so the divergence window between workers collapses to the UDS RTT (microseconds) instead of the per-worker DB-rebuild time (WPAR-8, design § 7). The same RPC plane carries cross-worker circuit-breaker admission (`BreakerDecision::AllowProbe` for HalfOpen) so probe slots are allocated atomically across workers and a failure on one trips the breaker for every worker (WPAR-3)
 - **Health checks** - TCP and HTTP probes, backends marked degraded (>2s) or down and removed from rotation
 - **Graceful drain** - per-backend active connection tracking with Closing/Closed lifecycle states
 - **Certificate hot-swap** - atomic swap via arc-swap, zero downtime during rotation
@@ -168,7 +178,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 <p align="center">
   <img src="docs/screenshots/routesDrawer.png" alt="Route Configuration Drawer" width="100%">
-  <br><em>Route editor with 25+ settings across 7 tabs (General, Timeouts, Security, Headers, CORS, Caching, Protection)</em>
+  <br><em>Route editor with 50+ settings across 11 tabs (General, Timeouts, Security, Headers, CORS, Caching, Protection, Path Rules, Header Rules, Canary, Rewrite)</em>
 </p>
 
 <p align="center">
@@ -211,11 +221,12 @@ Lorica is a Rust workspace with 25 crates: 15 forked from Cloudflare Pingora and
 | `lorica-waf` | WAF engine, OWASP rules, IP blocklist |
 | `lorica-notify` | Alert dispatch (stdout, SMTP, webhook) |
 | `lorica-bench` | SLA monitoring, load testing engine |
-| `lorica-worker` | fork+exec worker isolation, socket passing |
-| `lorica-command` | Protobuf supervisor-worker command channel |
+| `lorica-worker` | fork+exec worker isolation, typed FD passing (Listener / Shmem / Rpc) |
+| `lorica-command` | Protobuf supervisor-worker command channel + pipelined RpcEndpoint (Envelope framing, in-flight demux, bounded backpressure), `Coalescer`, `GenerationGate` |
+| `lorica-shmem` | Anonymous `memfd` region shared across all workers; `AtomicHashTable` for per-IP WAF flood / auto-ban counters; SipHash-1-3 anti-HashDoS; 5-min eviction walker |
 | `lorica-lb` | Load balancing (Round Robin, Peak EWMA, Hash, Random, Least Conn) |
 | `lorica-cache` | HTTP response cache, LRU eviction |
-| `lorica-limits` | Rate estimator for rate limiting |
+| `lorica-limits` | Rate estimator + per-route `LocalBucket` / `AuthoritativeBucket` token-bucket primitives (lock-free CAS, 100 ms cross-worker sync) |
 
 Data plane (proxy) and control plane (API/dashboard) are fully separated. API mutations trigger config reload via arc-swap - the proxy picks up changes without restarting.
 
@@ -301,6 +312,8 @@ All endpoints are served on the management port (default `9443`) over HTTPS. Pro
 | `GET` | `/api/v1/routes/:id` | Get route |
 | `PUT` | `/api/v1/routes/:id` | Update route |
 | `DELETE` | `/api/v1/routes/:id` | Delete route |
+| `POST` | `/api/v1/validate/mtls-pem` | Parse a candidate client-CA PEM and return per-cert subjects |
+| `POST` | `/api/v1/validate/forward-auth` | Probe a candidate forward-auth URL (one GET, status + elapsed) |
 
 ### Backends
 
@@ -435,18 +448,45 @@ cargo build --release
 ### Running tests
 
 ```bash
-# All Rust unit tests (892 tests across 25 crates)
-cargo test
+# All Rust unit tests (1553 tests across 19 crates)
+cargo test --workspace
 
-# Product crate tests only (463 tests)
-cargo test -p lorica-config -p lorica-waf -p lorica-api -p lorica-notify -p lorica-bench -p lorica-command
+# Product crate tests only (739 tests)
+cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
+           -p lorica-notify -p lorica-bench -p lorica-worker \
+           -p lorica-command -p lorica-limits -p lorica-shmem
 
-# Frontend tests (119 Vitest tests)
+# Pingora-forked crate tests (568 tests)
+cargo test -p lorica-core -p lorica-proxy -p lorica-http \
+           -p lorica-error -p lorica-tls -p lorica-cache \
+           -p lorica-pool -p lorica-runtime -p lorica-timeout \
+           --features ring -p lorica-lb
+
+# End-to-end tests driving a real Pingora Server (68 tests, 10 binaries)
+cargo test -p lorica --test mtls_e2e_test \
+                     --test response_rewrite_e2e_test \
+                     --test mirror_e2e_test \
+                     --test forward_auth_e2e_test \
+                     --test swr_e2e_test \
+                     --test connection_filter_test \
+                     --test canary_e2e_test \
+                     --test header_routing_e2e_test \
+                     --test proxy_config_test \
+                     --test proxy_routing_test
+
+# Frontend tests (178 Vitest tests across 6 files)
 cd lorica-dashboard/frontend && npx vitest run
-
-# E2E tests (350+ assertions across 65+ sections, Docker required)
-cd tests-e2e-docker && ./run.sh --build
 ```
+
+#### Test coverage by layer
+
+| Layer | Count | Notes |
+|---|---|---|
+| Product unit (config, api, lib, waf, notify, bench, worker, command, limits) | 739 | Lorica-specific code |
+| Product e2e (real Pingora `Server` + mock backends) | 68 | 10 binaries: mTLS, response rewriting, mirroring, forward auth, SWR, connection filter, canary, header routing, config, routing |
+| Pingora-forked crates (core, proxy, http, error, tls, cache, pool, runtime, timeout, lb) | 568 | Inherited upstream coverage kept passing on every change |
+| Frontend (vitest / svelte-check) | 178 | Form validation, type safety, component wiring |
+| **Total shipping tests** | **1553** | |
 
 ## systemd Service
 
@@ -475,6 +515,10 @@ ExecStart=/usr/bin/lorica --workers 6
 
 See [docs/tuning.md](docs/tuning.md) for kernel parameters (`sysctl`), file descriptor limits, worker configuration, cache settings, and a production readiness checklist. Run [bench/](bench/) for reproducible throughput measurements.
 
+## Worker Mode
+
+When running with `--workers N >= 1`, see [docs/worker-mode.md](docs/worker-mode.md) for the operational notes (which settings require a supervisor restart, what changes between single-process and worker mode).
+
 ## Package Verification
 
 Release `.deb` and `.rpm` packages are GPG-signed. Import the public key to verify:
@@ -486,7 +530,7 @@ gpg --verify lorica.deb.asc lorica.deb
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for planned features across upcoming releases (v1.2.0 - v2.0.0).
+See [ROADMAP.md](ROADMAP.md) for planned features across upcoming releases (v1.3.0 - v2.0.0).
 
 See [COMPARISON.md](COMPARISON.md) for a detailed feature comparison with Nginx, Traefik, HAProxy, Caddy, BunkerWeb, Sozu, and Pingora.
 

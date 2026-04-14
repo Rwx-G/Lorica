@@ -1,3 +1,7 @@
+//! SQLite-backed persistent store for access logs, WAF events, and
+//! notification history. Used as the source of truth when present, with
+//! [`crate::logs::LogBuffer`] as a transient fallback in tests.
+
 use std::path::Path;
 
 use parking_lot::Mutex;
@@ -6,6 +10,7 @@ use rusqlite::{params, Connection};
 
 use crate::logs::{LogEntry, LogsQuery};
 
+/// Persistent log database wrapper. Cheaply cloneable through `Arc<LogStore>`.
 pub struct LogStore {
     conn: Mutex<Connection>,
 }
@@ -34,22 +39,48 @@ impl LogStore {
                 source TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON access_logs(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_access_logs_host ON access_logs(host);",
+            CREATE INDEX IF NOT EXISTS idx_access_logs_host ON access_logs(host);
+            CREATE INDEX IF NOT EXISTS idx_access_logs_status ON access_logs(status);
+            CREATE INDEX IF NOT EXISTS idx_access_logs_host_timestamp ON access_logs(host, timestamp);",
         )
         .map_err(|e| format!("failed to initialize access log schema: {e}"))?;
 
         // Migrate: add columns if missing (existing databases).
         // Each ALTER is separate because execute_batch stops at first error.
-        let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN is_xff INTEGER NOT NULL DEFAULT 0", []);
-        let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN xff_proxy_ip TEXT NOT NULL DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN source TEXT NOT NULL DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE access_logs ADD COLUMN request_id TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute(
+            "ALTER TABLE access_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE access_logs ADD COLUMN is_xff INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE access_logs ADD COLUMN xff_proxy_ip TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE access_logs ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE access_logs ADD COLUMN request_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
 
         // Migrate: add columns to waf_events if missing
-        let _ = conn.execute("ALTER TABLE waf_events ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE waf_events ADD COLUMN route_hostname TEXT NOT NULL DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE waf_events ADD COLUMN action TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute(
+            "ALTER TABLE waf_events ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE waf_events ADD COLUMN route_hostname TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE waf_events ADD COLUMN action TEXT NOT NULL DEFAULT ''",
+            [],
+        );
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS waf_events (
@@ -93,6 +124,7 @@ impl LogStore {
     }
 
     /// Insert a log entry.
+    /// Append one access log entry to the database.
     pub fn insert(&self, entry: &LogEntry) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
@@ -119,6 +151,7 @@ impl LogStore {
     }
 
     /// Query entries with filtering. Returns newest first.
+    /// Query log entries with pagination and filters; returns `(rows, total_match_count)`.
     pub fn query(&self, params: &LogsQuery) -> Result<(Vec<LogEntry>, usize), String> {
         let conn = self.conn.lock();
 
@@ -231,6 +264,7 @@ impl LogStore {
     }
 
     /// Query entries for export (up to `max` rows, no pagination). Returns oldest first.
+    /// Stream up to `max` matching entries for export (CSV / JSON).
     pub fn query_export(&self, params: &LogsQuery, max: usize) -> Result<Vec<LogEntry>, String> {
         let conn = self.conn.lock();
 
@@ -320,27 +354,49 @@ impl LogStore {
     }
 
     /// Delete entries older than the retention limit, keeping at most `max_entries` rows.
+    /// Trim the access log table to the most recent `max_entries`. Returns the number deleted.
+    ///
+    /// Uses `MIN(id)` / `MAX(id)` (both `O(log n)` index seeks on the
+    /// PRIMARY KEY rowid) instead of `SELECT COUNT(*)` (which scans
+    /// the whole table and could freeze the writer's `Mutex<Connection>`
+    /// for hundreds of milliseconds at millions of rows).
+    /// `(MAX - MIN + 1)` over-estimates after deletes leave gaps in
+    /// the id sequence, which is fine here: trimming slightly more
+    /// aggressively than strictly needed cannot violate the retention
+    /// contract. The actual DELETE remains exact via the inner ORDER
+    /// BY + LIMIT subquery.
     pub fn enforce_retention(&self, max_entries: u64) -> Result<u64, String> {
         let conn = self.conn.lock();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM access_logs", [], |row| row.get(0))
-            .map_err(|e| format!("failed to count access logs: {e}"))?;
+        let bounds: Option<(i64, i64)> = conn
+            .query_row("SELECT MIN(id), MAX(id) FROM access_logs", [], |row| {
+                let lo: Option<i64> = row.get(0)?;
+                let hi: Option<i64> = row.get(1)?;
+                Ok(lo.zip(hi))
+            })
+            .map_err(|e| format!("failed to compute access log bounds: {e}"))?;
 
-        if count <= max_entries as i64 {
+        let approx_count = match bounds {
+            None => 0u64,
+            Some((lo, hi)) => (hi - lo + 1).max(0) as u64,
+        };
+
+        if approx_count <= max_entries {
             return Ok(0);
         }
 
-        let to_delete = count - max_entries as i64;
-        conn.execute(
-            "DELETE FROM access_logs WHERE id IN (SELECT id FROM access_logs ORDER BY id ASC LIMIT ?1)",
-            params![to_delete],
-        )
-        .map_err(|e| format!("failed to enforce access log retention: {e}"))?;
+        let to_delete = (approx_count - max_entries) as i64;
+        let deleted = conn
+            .execute(
+                "DELETE FROM access_logs WHERE id IN (SELECT id FROM access_logs ORDER BY id ASC LIMIT ?1)",
+                params![to_delete],
+            )
+            .map_err(|e| format!("failed to enforce access log retention: {e}"))?;
 
-        Ok(to_delete as u64)
+        Ok(deleted as u64)
     }
 
     /// Clear all entries.
+    /// Remove every access log row.
     pub fn clear(&self) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM access_logs", [])
@@ -349,6 +405,7 @@ impl LogStore {
     }
 
     /// Get total entry count.
+    /// Return the total number of access log rows in the database.
     pub fn count(&self) -> Result<u64, String> {
         let conn = self.conn.lock();
         let count: i64 = conn
@@ -360,6 +417,7 @@ impl LogStore {
     // ---- WAF Events ----
 
     /// Insert a WAF event.
+    /// Persist a single WAF event for later querying via the events endpoint.
     pub fn insert_waf_event(&self, event: &lorica_waf::WafEvent) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
@@ -385,6 +443,7 @@ impl LogStore {
     /// Query WAF events, newest first. When `category` is provided, only
     /// events matching that category are returned (filtered at the SQL level
     /// so that `limit` applies to the filtered set, not the full table).
+    /// Return up to `limit` recent WAF events, optionally filtered by category.
     pub fn list_waf_events(
         &self,
         limit: usize,
@@ -439,6 +498,7 @@ impl LogStore {
     }
 
     /// Clear all WAF events.
+    /// Remove every persisted WAF event row.
     pub fn clear_waf_events(&self) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM waf_events", [])
@@ -447,6 +507,7 @@ impl LogStore {
     }
 
     /// Purge old WAF events, keeping at most `max_entries`.
+    /// Trim the WAF events table to the most recent `max_entries`. Returns the number deleted.
     pub fn enforce_waf_retention(&self, max_entries: u64) -> Result<u64, String> {
         let conn = self.conn.lock();
         let count: i64 = conn
@@ -467,12 +528,14 @@ impl LogStore {
     // ---- Notification History ----
 
     /// Insert a notification event.
+    /// Persist a notification dispatch outcome for the history endpoint.
     pub fn insert_notification_event(
         &self,
         event: &lorica_notify::AlertEvent,
     ) -> Result<(), String> {
         let conn = self.conn.lock();
-        let details_json = serde_json::to_string(&event.details).unwrap_or_default();
+        let details_json = serde_json::to_string(&event.details)
+            .map_err(|e| format!("failed to serialize alert event details: {e}"))?;
         conn.execute(
             "INSERT INTO notification_history (alert_type, summary, details, timestamp)
              VALUES (?1, ?2, ?3, ?4)",
@@ -488,6 +551,7 @@ impl LogStore {
     }
 
     /// List recent notification events, newest first.
+    /// Return up to `limit` recent notification history rows.
     pub fn list_notification_history(
         &self,
         limit: usize,
@@ -515,8 +579,19 @@ impl LogStore {
             let alert_type = alert_type_str
                 .parse()
                 .unwrap_or(lorica_notify::events::AlertType::ConfigChanged);
+            // Stored details JSON should always be parseable (written
+            // via serde_json::to_string in insert_notification_event).
+            // A parse failure at read time means storage corruption;
+            // surface it as an empty map + warn so the alert history
+            // stays viewable rather than blowing up the whole query.
             let details: std::collections::HashMap<String, String> =
-                serde_json::from_str(&details_json).unwrap_or_default();
+                serde_json::from_str(&details_json).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "notification history row has corrupt details JSON; returning empty map"
+                    );
+                    std::collections::HashMap::new()
+                });
             events.push(lorica_notify::AlertEvent {
                 alert_type,
                 summary,
@@ -528,6 +603,7 @@ impl LogStore {
     }
 
     /// Prune old notification events, keeping at most `max_entries`.
+    /// Trim the notification history table to the most recent `max_entries`.
     pub fn enforce_notification_retention(&self, max_entries: u64) -> Result<u64, String> {
         let conn = self.conn.lock();
         let count: i64 = conn

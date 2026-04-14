@@ -91,14 +91,10 @@ impl<A> Service<A> {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
-    /// # use std::sync::Arc;
-    /// # use lorica_core::listeners::{ConnectionFilter, AcceptAllFilter};
-    /// # struct MyService;
-    /// # impl MyService {
-    /// #   fn new() -> Self { MyService }
-    /// # }
-    /// let mut service = MyService::new();
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use lorica_core::listeners::AcceptAllFilter;
+    /// // `service` is a `Service<A>` for your app type A.
     /// let filter = Arc::new(AcceptAllFilter);
     /// service.set_connection_filter(filter);
     /// ```

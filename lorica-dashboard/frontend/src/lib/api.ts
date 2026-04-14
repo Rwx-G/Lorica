@@ -155,8 +155,119 @@ export interface RouteResponse {
   retry_on_methods: string[];
   maintenance_mode: boolean;
   error_page_html: string | null;
+  cache_vary_headers: string[];
+  header_rules: HeaderRuleResponse[];
+  traffic_splits: TrafficSplitResponse[];
+  forward_auth?: ForwardAuthConfigResponse | null;
+  mirror?: MirrorConfigResponse | null;
+  response_rewrite?: ResponseRewriteConfigResponse | null;
+  mtls?: MtlsConfigResponse | null;
+  rate_limit?: RateLimitConfig | null;
   created_at: string;
   updated_at: string;
+}
+
+export type RateLimitScope = 'per_ip' | 'per_route';
+
+export interface RateLimitConfig {
+  capacity: number;
+  refill_per_sec: number;
+  scope: RateLimitScope;
+}
+
+export interface HeaderRuleResponse {
+  header_name: string;
+  match_type?: string;
+  value: string;
+  backend_ids: string[];
+  // True when the proxy skipped this rule at load time because its
+  // regex failed to compile (e.g. regex-crate version drift after an
+  // upgrade, or out-of-band DB edit). The UI should surface a warning
+  // badge so the operator republishes the rule.
+  disabled?: boolean;
+}
+
+export interface HeaderRuleRequest {
+  header_name: string;
+  match_type?: string;
+  value: string;
+  backend_ids: string[];
+}
+
+export interface TrafficSplitResponse {
+  name: string;
+  weight_percent: number;
+  backend_ids: string[];
+}
+
+export interface TrafficSplitRequest {
+  name: string;
+  weight_percent: number;
+  backend_ids: string[];
+}
+
+export interface ForwardAuthConfigResponse {
+  address: string;
+  timeout_ms: number;
+  response_headers: string[];
+}
+
+export interface ForwardAuthConfigRequest {
+  address: string;
+  timeout_ms: number;
+  response_headers: string[];
+}
+
+export interface MirrorConfigResponse {
+  backend_ids: string[];
+  sample_percent: number;
+  timeout_ms: number;
+  max_body_bytes: number;
+}
+
+export interface ResponseRewriteRuleResponse {
+  pattern: string;
+  replacement: string;
+  is_regex: boolean;
+  max_replacements?: number | null;
+}
+
+export interface ResponseRewriteConfigResponse {
+  rules: ResponseRewriteRuleResponse[];
+  max_body_bytes: number;
+  content_type_prefixes: string[];
+}
+
+export interface ResponseRewriteRuleRequest {
+  pattern: string;
+  replacement: string;
+  is_regex: boolean;
+  max_replacements?: number | null;
+}
+
+export interface ResponseRewriteConfigRequest {
+  rules: ResponseRewriteRuleRequest[];
+  max_body_bytes: number;
+  content_type_prefixes: string[];
+}
+
+export interface MirrorConfigRequest {
+  backend_ids: string[];
+  sample_percent: number;
+  timeout_ms: number;
+  max_body_bytes: number;
+}
+
+export interface MtlsConfigResponse {
+  ca_cert_pem: string;
+  required: boolean;
+  allowed_organizations: string[];
+}
+
+export interface MtlsConfigRequest {
+  ca_cert_pem: string;
+  required: boolean;
+  allowed_organizations: string[];
 }
 
 export interface CreateRouteRequest {
@@ -212,6 +323,14 @@ export interface CreateRouteRequest {
   retry_on_methods?: string[];
   maintenance_mode?: boolean;
   error_page_html?: string;
+  cache_vary_headers?: string[];
+  header_rules?: HeaderRuleRequest[];
+  traffic_splits?: TrafficSplitRequest[];
+  forward_auth?: ForwardAuthConfigRequest;
+  mirror?: MirrorConfigRequest;
+  response_rewrite?: ResponseRewriteConfigRequest;
+  mtls?: MtlsConfigRequest;
+  rate_limit?: RateLimitConfig;
 }
 
 
@@ -269,6 +388,14 @@ export interface UpdateRouteRequest {
   retry_on_methods?: string[];
   maintenance_mode?: boolean;
   error_page_html?: string;
+  cache_vary_headers?: string[];
+  header_rules?: HeaderRuleRequest[];
+  traffic_splits?: TrafficSplitRequest[];
+  forward_auth?: ForwardAuthConfigRequest;
+  mirror?: MirrorConfigRequest;
+  response_rewrite?: ResponseRewriteConfigRequest;
+  mtls?: MtlsConfigRequest;
+  rate_limit?: RateLimitConfig;
 }
 
 export interface BackendResponse {
@@ -418,6 +545,8 @@ export interface GlobalSettingsResponse {
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies: string[];
   waf_whitelist_ips: string[];
+  connection_deny_cidrs: string[];
+  connection_allow_cidrs: string[];
 }
 
 export interface UpdateSettingsRequest {
@@ -437,6 +566,8 @@ export interface UpdateSettingsRequest {
   custom_security_presets?: SecurityHeaderPreset[];
   trusted_proxies?: string[];
   waf_whitelist_ips?: string[];
+  connection_deny_cidrs?: string[];
+  connection_allow_cidrs?: string[];
 }
 
 export interface NotificationConfigResponse {
@@ -541,6 +672,20 @@ export const api = {
 
   updateRoute: (id: string, body: UpdateRouteRequest) =>
     request<RouteResponse>('PUT', `/routes/${id}`, body),
+
+  validateMtlsPem: (ca_cert_pem: string) =>
+    request<{ ca_count: number; subjects: string[] }>(
+      'POST',
+      '/validate/mtls-pem',
+      { ca_cert_pem },
+    ),
+
+  validateForwardAuth: (address: string, timeout_ms: number) =>
+    request<{ status: number; elapsed_ms: number; headers: Record<string, string> }>(
+      'POST',
+      '/validate/forward-auth',
+      { address, timeout_ms },
+    ),
 
   deleteRoute: (id: string) =>
     request<{ message: string }>('DELETE', `/routes/${id}`),

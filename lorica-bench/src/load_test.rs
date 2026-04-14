@@ -656,8 +656,18 @@ mod tests {
         };
 
         let comparison = compare_results(current, Some(previous));
-        assert!(comparison.latency_delta_pct.unwrap() > 0.0); // latency increased
-        assert!(comparison.throughput_delta_pct.unwrap() < 0.0); // throughput decreased
+        assert!(
+            comparison
+                .latency_delta_pct
+                .expect("test setup: previous result has non-zero latency so delta is Some")
+                > 0.0
+        ); // latency increased
+        assert!(
+            comparison
+                .throughput_delta_pct
+                .expect("test setup: previous result has non-zero throughput so delta is Some")
+                < 0.0
+        ); // throughput decreased
     }
 
     #[test]
@@ -689,28 +699,42 @@ mod tests {
 
     #[test]
     fn test_store_load_test_crud() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
         let config = make_test_config();
-        store.create_load_test_config(&config).unwrap();
+        store
+            .create_load_test_config(&config)
+            .expect("test setup: create load test config");
 
-        let configs = store.list_load_test_configs().unwrap();
+        let configs = store
+            .list_load_test_configs()
+            .expect("test setup: list load test configs");
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].name, "Test Load");
 
-        let c = store.get_load_test_config("lt1").unwrap().unwrap();
+        let c = store
+            .get_load_test_config("lt1")
+            .expect("test setup: get load test config")
+            .expect("test setup: load test config exists after create");
         assert_eq!(c.concurrency, 2);
 
-        store.delete_load_test_config("lt1").unwrap();
-        assert!(store.get_load_test_config("lt1").unwrap().is_none());
+        store
+            .delete_load_test_config("lt1")
+            .expect("test setup: delete load test config");
+        assert!(store
+            .get_load_test_config("lt1")
+            .expect("test setup: get load test config after delete")
+            .is_none());
     }
 
     #[test]
     fn test_store_load_test_results() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
 
         let config = make_test_config();
-        store.create_load_test_config(&config).unwrap();
+        store
+            .create_load_test_config(&config)
+            .expect("test setup: create load test config");
 
         let now = Utc::now();
         let result = LoadTestResult {
@@ -731,13 +755,20 @@ mod tests {
             aborted: false,
             abort_reason: None,
         };
-        store.insert_load_test_result(&result).unwrap();
+        store
+            .insert_load_test_result(&result)
+            .expect("test setup: insert load test result");
 
-        let results = store.list_load_test_results("lt1").unwrap();
+        let results = store
+            .list_load_test_results("lt1")
+            .expect("test setup: list load test results");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].total_requests, 100);
 
-        let latest = store.get_latest_load_test_result("lt1").unwrap().unwrap();
+        let latest = store
+            .get_latest_load_test_result("lt1")
+            .expect("test setup: get latest load test result")
+            .expect("test setup: latest result exists after insert");
         assert_eq!(latest.id, "r1");
     }
 
@@ -843,16 +874,23 @@ mod tests {
 
     #[test]
     fn test_load_test_config_store_update() {
-        let store = ConfigStore::open_in_memory().unwrap();
+        let store = ConfigStore::open_in_memory().expect("test setup: open in-memory store");
         let mut config = make_test_config();
-        store.create_load_test_config(&config).unwrap();
+        store
+            .create_load_test_config(&config)
+            .expect("test setup: create load test config");
 
         config.name = "Updated Name".to_string();
         config.concurrency = 50;
         config.schedule_cron = Some("0 3 * * *".to_string());
-        store.update_load_test_config(&config).unwrap();
+        store
+            .update_load_test_config(&config)
+            .expect("test setup: update load test config");
 
-        let fetched = store.get_load_test_config("lt1").unwrap().unwrap();
+        let fetched = store
+            .get_load_test_config("lt1")
+            .expect("test setup: get load test config")
+            .expect("test setup: config exists after update");
         assert_eq!(fetched.name, "Updated Name");
         assert_eq!(fetched.concurrency, 50);
         assert_eq!(fetched.schedule_cron.as_deref(), Some("0 3 * * *"));

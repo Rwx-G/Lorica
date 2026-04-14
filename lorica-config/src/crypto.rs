@@ -140,42 +140,58 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_round_trip() {
-        let key = EncryptionKey::generate().unwrap();
+        let key = EncryptionKey::generate().expect("test setup: key generates");
         let plaintext = b"-----BEGIN PRIVATE KEY-----\ntest data\n-----END PRIVATE KEY-----";
-        let encrypted = key.encrypt(plaintext).unwrap();
+        let encrypted = key
+            .encrypt(plaintext)
+            .expect("test setup: encrypt succeeds");
 
         assert_ne!(encrypted, plaintext);
         assert!(encrypted.len() > plaintext.len());
 
-        let decrypted = key.decrypt(&encrypted).unwrap();
+        let decrypted = key
+            .decrypt(&encrypted)
+            .expect("test setup: decrypt succeeds");
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn test_different_nonces() {
-        let key = EncryptionKey::generate().unwrap();
+        let key = EncryptionKey::generate().expect("test setup: key generates");
         let plaintext = b"same data";
-        let enc1 = key.encrypt(plaintext).unwrap();
-        let enc2 = key.encrypt(plaintext).unwrap();
+        let enc1 = key
+            .encrypt(plaintext)
+            .expect("test setup: encrypt succeeds");
+        let enc2 = key
+            .encrypt(plaintext)
+            .expect("test setup: encrypt succeeds");
         // Different nonces produce different ciphertext
         assert_ne!(enc1, enc2);
         // But both decrypt to the same plaintext
-        assert_eq!(key.decrypt(&enc1).unwrap(), plaintext);
-        assert_eq!(key.decrypt(&enc2).unwrap(), plaintext);
+        assert_eq!(
+            key.decrypt(&enc1).expect("test setup: decrypt succeeds"),
+            plaintext
+        );
+        assert_eq!(
+            key.decrypt(&enc2).expect("test setup: decrypt succeeds"),
+            plaintext
+        );
     }
 
     #[test]
     fn test_wrong_key_fails() {
-        let key1 = EncryptionKey::generate().unwrap();
-        let key2 = EncryptionKey::generate().unwrap();
-        let encrypted = key1.encrypt(b"secret").unwrap();
+        let key1 = EncryptionKey::generate().expect("test setup: key generates");
+        let key2 = EncryptionKey::generate().expect("test setup: key generates");
+        let encrypted = key1
+            .encrypt(b"secret")
+            .expect("test setup: encrypt succeeds");
         assert!(key2.decrypt(&encrypted).is_err());
     }
 
     #[test]
     fn test_corrupted_data_fails() {
-        let key = EncryptionKey::generate().unwrap();
-        let mut encrypted = key.encrypt(b"data").unwrap();
+        let key = EncryptionKey::generate().expect("test setup: key generates");
+        let mut encrypted = key.encrypt(b"data").expect("test setup: encrypt succeeds");
         // Flip a byte in the ciphertext
         let last = encrypted.len() - 1;
         encrypted[last] ^= 0xFF;
@@ -184,23 +200,25 @@ mod tests {
 
     #[test]
     fn test_too_short_data_fails() {
-        let key = EncryptionKey::generate().unwrap();
+        let key = EncryptionKey::generate().expect("test setup: key generates");
         assert!(key.decrypt(&[0u8; 10]).is_err());
     }
 
     #[test]
     fn test_key_load_or_create() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = tempfile::NamedTempFile::new().expect("test setup: new() succeeds");
         let path = tmp.path().with_extension("key");
 
         // First call creates the key
-        let key1 = EncryptionKey::load_or_create(&path).unwrap();
+        let key1 = EncryptionKey::load_or_create(&path).expect("test setup: key load_or_create");
         // Second call loads the same key
-        let key2 = EncryptionKey::load_or_create(&path).unwrap();
+        let key2 = EncryptionKey::load_or_create(&path).expect("test setup: key load_or_create");
 
         // Verify they produce compatible encryption
-        let encrypted = key1.encrypt(b"test").unwrap();
-        let decrypted = key2.decrypt(&encrypted).unwrap();
+        let encrypted = key1.encrypt(b"test").expect("test setup: encrypt succeeds");
+        let decrypted = key2
+            .decrypt(&encrypted)
+            .expect("test setup: decrypt succeeds");
         assert_eq!(decrypted, b"test");
 
         std::fs::remove_file(&path).ok();

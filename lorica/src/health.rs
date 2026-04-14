@@ -196,7 +196,7 @@ pub async fn health_check_loop(
         }
 
         if changed {
-            if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
+            if let Err(e) = reload_proxy_config(&store, &proxy_config, None).await {
                 warn!(error = %e, "failed to reload proxy config after health check");
             }
             // Notify workers to reload their proxy config with updated health statuses

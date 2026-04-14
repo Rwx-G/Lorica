@@ -22,6 +22,9 @@
 pub mod estimator;
 pub mod inflight;
 pub mod rate;
+pub mod token_bucket;
+
+pub use token_bucket::{AuthoritativeBucket, LocalBucket};
 
 use ahash::RandomState;
 use std::hash::Hash;

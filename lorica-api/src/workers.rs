@@ -55,6 +55,7 @@ impl Default for WorkerMetrics {
 }
 
 impl WorkerMetrics {
+    /// Build an empty metrics registry.
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
@@ -139,6 +140,7 @@ impl Default for AggregatedMetrics {
 }
 
 impl AggregatedMetrics {
+    /// Build an empty aggregator with no worker snapshots.
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
@@ -277,7 +279,7 @@ impl AggregatedMetrics {
     }
 }
 
-/// GET /api/v1/workers
+/// GET /api/v1/workers - return per-worker heartbeat status (empty in single-process mode).
 pub async fn get_workers(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

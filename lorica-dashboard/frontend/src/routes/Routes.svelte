@@ -223,9 +223,11 @@
               </td>
               <td class="actions">
                 <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => openEditForm(route)}>
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html editIcon}
                 </button>
                 <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => { deletingRoute = route; }}>
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html trashIcon}
                 </button>
               </td>

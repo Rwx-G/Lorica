@@ -11,10 +11,10 @@ mkdir -p /shared
 
 socat TCP-LISTEN:9443,fork,reuseaddr TCP:127.0.0.1:19443 &
 
-# Start Lorica, capture output to a temp file to extract the password
+# Start Lorica (already running as the non-root lorica user via the
+# Dockerfile USER directive).
 LOGFILE=/tmp/lorica_boot.log
-su -s /bin/sh lorica -c \
-  "lorica --data-dir /var/lib/lorica --management-port 19443" \
+lorica --data-dir /var/lib/lorica --management-port 19443 \
   > "$LOGFILE" 2>&1 &
 LORICA_PID=$!
 

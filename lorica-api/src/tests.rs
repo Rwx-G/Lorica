@@ -15,7 +15,7 @@ use crate::system::SystemCache;
 use crate::workers::WorkerMetrics;
 
 async fn test_state() -> (AppState, SessionStore, RateLimiter) {
-    let store = lorica_config::ConfigStore::open_in_memory().unwrap();
+    let store = lorica_config::ConfigStore::open_in_memory().expect("test setup");
     let store = Arc::new(Mutex::new(store));
     let state = AppState {
         store: Arc::clone(&store),
@@ -43,6 +43,8 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         notification_history: None,
         log_store: None,
         aggregated_metrics: None,
+        metrics_refresher: None,
+        task_tracker: tokio_util::task::TaskTracker::new(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -79,8 +81,9 @@ async fn setup_admin_and_login(
 ) -> String {
     let password = {
         let store = state.store.lock().await;
-        let pw = ensure_admin_user(&store).unwrap().unwrap();
-        pw
+        ensure_admin_user(&store)
+            .expect("test setup")
+            .expect("test setup")
     };
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -93,13 +96,15 @@ async fn setup_admin_and_login(
         .method("POST")
         .uri("/api/v1/auth/login")
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let session_id = extract_session_cookie(&response).unwrap();
+    let session_id = extract_session_cookie(&response).expect("test setup");
     format!("lorica_session={session_id}")
 }
 
@@ -111,7 +116,9 @@ async fn test_login_success() {
 
     let password = {
         let store = state.store.lock().await;
-        ensure_admin_user(&store).unwrap().unwrap()
+        ensure_admin_user(&store)
+            .expect("test setup")
+            .expect("test setup")
     };
 
     let router = app(state, session_store, rate_limiter);
@@ -125,18 +132,22 @@ async fn test_login_success() {
         .method("POST")
         .uri("/api/v1/auth/login")
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().contains_key(http::header::SET_COOKIE));
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["data"]["must_change_password"].as_bool().unwrap());
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert!(json["data"]["must_change_password"]
+        .as_bool()
+        .expect("test setup"));
 }
 
 #[tokio::test]
@@ -145,7 +156,7 @@ async fn test_login_invalid_credentials() {
 
     {
         let store = state.store.lock().await;
-        ensure_admin_user(&store).unwrap();
+        ensure_admin_user(&store).expect("test setup");
     }
 
     let router = app(state, session_store, rate_limiter);
@@ -159,16 +170,18 @@ async fn test_login_invalid_credentials() {
         .method("POST")
         .uri("/api/v1/auth/login")
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["error"]["code"], "unauthorized");
 }
 
@@ -181,9 +194,9 @@ async fn test_unauthenticated_request_returns_401() {
         .method("GET")
         .uri("/api/v1/routes")
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -195,9 +208,12 @@ async fn test_change_password() {
     let known_password = "test_password_123";
     {
         let store = state.store.lock().await;
-        let mut user = store.get_admin_user_by_username("admin").unwrap().unwrap();
-        user.password_hash = hash_password(known_password).unwrap();
-        store.update_admin_user(&user).unwrap();
+        let mut user = store
+            .get_admin_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup");
+        user.password_hash = hash_password(known_password).expect("test setup");
+        store.update_admin_user(&user).expect("test setup");
     }
 
     // Login again with known password
@@ -210,12 +226,14 @@ async fn test_change_password() {
         .method("POST")
         .uri("/api/v1/auth/login")
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_string(&login_body).unwrap()))
-        .unwrap();
-    let response = router2.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&login_body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router2.oneshot(req).await.expect("test setup");
     let cookie2 = format!(
         "lorica_session={}",
-        extract_session_cookie(&response).unwrap()
+        extract_session_cookie(&response).expect("test setup")
     );
 
     // Change password
@@ -230,10 +248,12 @@ async fn test_change_password() {
         .uri("/api/v1/auth/password")
         .header("Content-Type", "application/json")
         .header("Cookie", cookie2)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router3.oneshot(req).await.unwrap();
+    let response = router3.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -243,7 +263,7 @@ async fn test_rate_limiting() {
 
     {
         let store = state.store.lock().await;
-        ensure_admin_user(&store).unwrap();
+        ensure_admin_user(&store).expect("test setup");
     }
 
     let body = serde_json::json!({
@@ -258,10 +278,12 @@ async fn test_rate_limiting() {
             .method("POST")
             .uri("/api/v1/auth/login")
             .header("Content-Type", "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test setup"),
+            ))
+            .expect("test setup");
 
-        let response = router.oneshot(req).await.unwrap();
+        let response = router.oneshot(req).await.expect("test setup");
         if i < 5 {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         } else {
@@ -290,17 +312,19 @@ async fn test_routes_crud() {
         .uri("/api/v1/routes")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let route_id = json["data"]["id"].as_str().unwrap().to_string();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let route_id = json["data"]["id"].as_str().expect("test setup").to_string();
     assert_eq!(json["data"]["hostname"], "example.com");
 
     // List routes
@@ -310,26 +334,29 @@ async fn test_routes_crud() {
         .uri("/api/v1/routes")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["data"]["routes"].as_array().unwrap().len(), 1);
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(
+        json["data"]["routes"].as_array().expect("test setup").len(),
+        1
+    );
 
     // Get route by ID
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("GET")
-        .uri(&format!("/api/v1/routes/{route_id}"))
+        .uri(format!("/api/v1/routes/{route_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     // Update route
@@ -341,43 +368,45 @@ async fn test_routes_crud() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(&format!("/api/v1/routes/{route_id}"))
+        .uri(format!("/api/v1/routes/{route_id}"))
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["hostname"], "updated.com");
-    assert!(!json["data"]["enabled"].as_bool().unwrap());
+    assert!(!json["data"]["enabled"].as_bool().expect("test setup"));
 
     // Delete route
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/routes/{route_id}"))
+        .uri(format!("/api/v1/routes/{route_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     // Verify deleted
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("GET")
-        .uri(&format!("/api/v1/routes/{route_id}"))
+        .uri(format!("/api/v1/routes/{route_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -403,17 +432,19 @@ async fn test_backends_crud() {
         .uri("/api/v1/backends")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let backend_id = json["data"]["id"].as_str().unwrap().to_string();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let backend_id = json["data"]["id"].as_str().expect("test setup").to_string();
     assert_eq!(json["data"]["address"], "192.168.1.10:8080");
 
     // List backends
@@ -423,9 +454,9 @@ async fn test_backends_crud() {
         .uri("/api/v1/backends")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     // Update backend
@@ -437,18 +468,20 @@ async fn test_backends_crud() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(&format!("/api/v1/backends/{backend_id}"))
+        .uri(format!("/api/v1/backends/{backend_id}"))
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["address"], "10.0.0.1:9090");
     assert_eq!(json["data"]["weight"], 50);
 
@@ -456,12 +489,12 @@ async fn test_backends_crud() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/backends/{backend_id}"))
+        .uri(format!("/api/v1/backends/{backend_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -485,17 +518,19 @@ async fn test_certificates_crud() {
         .uri("/api/v1/certificates")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let cert_id = json["data"]["id"].as_str().unwrap().to_string();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let cert_id = json["data"]["id"].as_str().expect("test setup").to_string();
     assert_eq!(json["data"]["domain"], "example.com");
 
     // List certificates
@@ -505,42 +540,42 @@ async fn test_certificates_crud() {
         .uri("/api/v1/certificates")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     // Get certificate detail
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("GET")
-        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .uri(format!("/api/v1/certificates/{cert_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert!(json["data"]["cert_pem"].is_string());
     assert!(json["data"]["associated_routes"]
         .as_array()
-        .unwrap()
+        .expect("test setup")
         .is_empty());
 
     // Delete certificate
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .uri(format!("/api/v1/certificates/{cert_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -562,15 +597,17 @@ async fn test_certificate_delete_blocked_by_route() {
         .uri("/api/v1/certificates")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let cert_id = json["data"]["id"].as_str().unwrap().to_string();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let cert_id = json["data"]["id"].as_str().expect("test setup").to_string();
 
     // Create route referencing certificate
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -584,22 +621,24 @@ async fn test_certificate_delete_blocked_by_route() {
         .uri("/api/v1/routes")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
 
     // Try to delete certificate - should fail with conflict
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .uri(format!("/api/v1/certificates/{cert_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
@@ -616,15 +655,15 @@ async fn test_status_endpoint() {
         .uri("/api/v1/status")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["routes_count"], 0);
     assert_eq!(json["data"]["backends_count"], 0);
     assert_eq!(json["data"]["certificates_count"], 0);
@@ -648,10 +687,12 @@ async fn test_config_export_import() {
         .uri("/api/v1/backends")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
 
     // Export
@@ -661,18 +702,18 @@ async fn test_config_export_import() {
         .uri("/api/v1/config/export")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     let toml_content = String::from_utf8(
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap()
+            .expect("test setup")
             .to_vec(),
     )
-    .unwrap();
+    .expect("test setup");
     assert!(toml_content.contains("version = 1"));
 
     // Strip admin_users section (contains redacted password hash from export)
@@ -693,10 +734,12 @@ async fn test_config_export_import() {
         .uri("/api/v1/config/import")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -704,18 +747,18 @@ async fn test_config_export_import() {
 
 #[tokio::test]
 async fn test_ensure_admin_user_creates_on_first_run() {
-    let store = lorica_config::ConfigStore::open_in_memory().unwrap();
-    let password = ensure_admin_user(&store).unwrap();
+    let store = lorica_config::ConfigStore::open_in_memory().expect("test setup");
+    let password = ensure_admin_user(&store).expect("test setup");
     assert!(password.is_some());
-    assert!(password.unwrap().len() >= 24);
+    assert!(password.expect("test setup").len() >= 24);
 }
 
 #[tokio::test]
 async fn test_ensure_admin_user_noop_if_exists() {
-    let store = lorica_config::ConfigStore::open_in_memory().unwrap();
-    let first = ensure_admin_user(&store).unwrap();
+    let store = lorica_config::ConfigStore::open_in_memory().expect("test setup");
+    let first = ensure_admin_user(&store).expect("test setup");
     assert!(first.is_some());
-    let second = ensure_admin_user(&store).unwrap();
+    let second = ensure_admin_user(&store).expect("test setup");
     assert!(second.is_none());
 }
 
@@ -732,15 +775,15 @@ async fn test_json_error_format() {
         .uri("/api/v1/routes/nonexistent-id")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     // Verify error envelope structure
     assert!(json["error"].is_object());
     assert!(json["error"]["code"].is_string());
@@ -761,9 +804,9 @@ async fn test_logout() {
         .uri("/api/v1/auth/logout")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     // Verify session is invalidated
@@ -773,9 +816,9 @@ async fn test_logout() {
         .uri("/api/v1/routes")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -799,17 +842,22 @@ async fn test_certificate_update() {
         .uri("/api/v1/certificates")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let cert_id = json["data"]["id"].as_str().unwrap().to_string();
-    let original_fingerprint = json["data"]["fingerprint"].as_str().unwrap().to_string();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let cert_id = json["data"]["id"].as_str().expect("test setup").to_string();
+    let original_fingerprint = json["data"]["fingerprint"]
+        .as_str()
+        .expect("test setup")
+        .to_string();
 
     // Update certificate with new PEM
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -820,21 +868,23 @@ async fn test_certificate_update() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .uri(format!("/api/v1/certificates/{cert_id}"))
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["domain"], "updated.com");
     assert_ne!(
-        json["data"]["fingerprint"].as_str().unwrap(),
+        json["data"]["fingerprint"].as_str().expect("test setup"),
         original_fingerprint
     );
 }
@@ -856,20 +906,28 @@ async fn test_generate_self_signed_certificate() {
         .uri("/api/v1/certificates/self-signed")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["domain"], "localhost");
     // rcgen self-signed certs use "rcgen self signed cert" as issuer CN
-    assert!(!json["data"]["issuer"].as_str().unwrap().is_empty());
-    assert!(!json["data"]["fingerprint"].as_str().unwrap().is_empty());
+    assert!(!json["data"]["issuer"]
+        .as_str()
+        .expect("test setup")
+        .is_empty());
+    assert!(!json["data"]["fingerprint"]
+        .as_str()
+        .expect("test setup")
+        .is_empty());
 
     // Verify it's in the list
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -878,36 +936,42 @@ async fn test_generate_self_signed_certificate() {
         .uri("/api/v1/certificates")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["data"]["certificates"].as_array().unwrap().len(), 1);
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(
+        json["data"]["certificates"]
+            .as_array()
+            .expect("test setup")
+            .len(),
+        1
+    );
 
     // Verify detail contains valid PEM
     let cert_id = json["data"]["certificates"][0]["id"]
         .as_str()
-        .unwrap()
+        .expect("test setup")
         .to_string();
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("GET")
-        .uri(&format!("/api/v1/certificates/{cert_id}"))
+        .uri(format!("/api/v1/certificates/{cert_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let cert_pem = json["data"]["cert_pem"].as_str().unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let cert_pem = json["data"]["cert_pem"].as_str().expect("test setup");
     assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
     assert!(cert_pem.contains("-----END CERTIFICATE-----"));
 }
@@ -925,17 +989,20 @@ async fn test_logs_endpoint_empty() {
         .uri("/api/v1/logs")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total"], 0);
-    assert!(json["data"]["entries"].as_array().unwrap().is_empty());
+    assert!(json["data"]["entries"]
+        .as_array()
+        .expect("test setup")
+        .is_empty());
 }
 
 #[tokio::test]
@@ -973,17 +1040,23 @@ async fn test_logs_endpoint_with_entries() {
         .uri("/api/v1/logs")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total"], 3);
-    assert_eq!(json["data"]["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        json["data"]["entries"]
+            .as_array()
+            .expect("test setup")
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -1006,9 +1079,9 @@ async fn test_logs_endpoint_filtering() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
         })
         .await;
     state
@@ -1025,9 +1098,9 @@ async fn test_logs_endpoint_filtering() {
             error: Some("internal error".into()),
             client_ip: String::new(),
             is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
         })
         .await;
 
@@ -1038,13 +1111,13 @@ async fn test_logs_endpoint_filtering() {
         .uri("/api/v1/logs?route=other.com")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total"], 1);
 
     // Filter by search
@@ -1054,13 +1127,13 @@ async fn test_logs_endpoint_filtering() {
         .uri("/api/v1/logs?search=internal")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total"], 1);
     assert_eq!(json["data"]["entries"][0]["status"], 500);
 }
@@ -1085,9 +1158,9 @@ async fn test_clear_logs_endpoint() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
         })
         .await;
 
@@ -1098,9 +1171,9 @@ async fn test_clear_logs_endpoint() {
         .uri("/api/v1/logs")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     // Verify empty
@@ -1110,13 +1183,13 @@ async fn test_clear_logs_endpoint() {
         .uri("/api/v1/logs")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total"], 0);
 }
 
@@ -1155,13 +1228,13 @@ async fn test_logs_endpoint_status_range() {
         .uri("/api/v1/logs?status_min=400")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total"], 2);
 }
 
@@ -1185,9 +1258,9 @@ async fn test_logs_endpoint_time_range() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
         })
         .await;
     state
@@ -1204,9 +1277,9 @@ async fn test_logs_endpoint_time_range() {
             error: None,
             client_ip: String::new(),
             is_xff: false,
-                xff_proxy_ip: String::new(),
-                source: String::new(),
-                request_id: String::new(),
+            xff_proxy_ip: String::new(),
+            source: String::new(),
+            request_id: String::new(),
         })
         .await;
 
@@ -1217,13 +1290,13 @@ async fn test_logs_endpoint_time_range() {
         .uri("/api/v1/logs?time_from=2026-01-01T12:00:00Z")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total"], 1);
     assert_eq!(json["data"]["entries"][0]["path"], "/new");
 }
@@ -1263,15 +1336,21 @@ async fn test_logs_endpoint_limit_and_after_id() {
         .uri("/api/v1/logs?limit=3")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total"], 10);
-    assert_eq!(json["data"]["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        json["data"]["entries"]
+            .as_array()
+            .expect("test setup")
+            .len(),
+        3
+    );
 
     // after_id: only entries after ID 5
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1280,13 +1359,13 @@ async fn test_logs_endpoint_limit_and_after_id() {
         .uri("/api/v1/logs?after_id=5")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total"], 5);
 }
 
@@ -1303,19 +1382,29 @@ async fn test_system_endpoint() {
         .uri("/api/v1/system")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
 
     // Verify structure
-    assert!(json["data"]["host"]["cpu_count"].as_u64().unwrap() > 0);
-    assert!(json["data"]["host"]["memory_total_bytes"].as_u64().unwrap() > 0);
+    assert!(
+        json["data"]["host"]["cpu_count"]
+            .as_u64()
+            .expect("test setup")
+            > 0
+    );
+    assert!(
+        json["data"]["host"]["memory_total_bytes"]
+            .as_u64()
+            .expect("test setup")
+            > 0
+    );
     assert!(json["data"]["proxy"]["version"].is_string());
     assert!(json["data"]["proxy"]["uptime_seconds"].as_u64().is_some());
     assert!(json["data"]["process"]["memory_bytes"].as_u64().is_some());
@@ -1334,15 +1423,15 @@ async fn test_get_settings_defaults() {
         .uri("/api/v1/settings")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["management_port"], 9443);
     assert_eq!(json["data"]["log_level"], "info");
     assert_eq!(json["data"]["default_health_check_interval_s"], 10);
@@ -1364,16 +1453,18 @@ async fn test_update_settings() {
         .uri("/api/v1/settings")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["log_level"], "debug");
     assert_eq!(json["data"]["default_health_check_interval_s"], 30);
     assert_eq!(json["data"]["management_port"], 9443);
@@ -1392,10 +1483,12 @@ async fn test_update_settings_invalid_log_level() {
         .uri("/api/v1/settings")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -1419,19 +1512,21 @@ async fn test_notification_crud() {
         .uri("/api/v1/notifications")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let notif_id = json["data"]["id"].as_str().unwrap().to_string();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let notif_id = json["data"]["id"].as_str().expect("test setup").to_string();
     assert_eq!(json["data"]["channel"], "email");
-    assert_eq!(json["data"]["enabled"], true);
+    assert_eq!(json["data"]["enabled"], serde_json::json!(true));
 
     // List
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1440,15 +1535,21 @@ async fn test_notification_crud() {
         .uri("/api/v1/notifications")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["data"]["notifications"].as_array().unwrap().len(), 1);
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(
+        json["data"]["notifications"]
+            .as_array()
+            .expect("test setup")
+            .len(),
+        1
+    );
 
     // Update
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1461,31 +1562,33 @@ async fn test_notification_crud() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(&format!("/api/v1/notifications/{notif_id}"))
+        .uri(format!("/api/v1/notifications/{notif_id}"))
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["channel"], "webhook");
-    assert_eq!(json["data"]["enabled"], false);
+    assert_eq!(json["data"]["enabled"], serde_json::json!(false));
 
     // Delete
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/notifications/{notif_id}"))
+        .uri(format!("/api/v1/notifications/{notif_id}"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     // Verify empty
@@ -1495,14 +1598,17 @@ async fn test_notification_crud() {
         .uri("/api/v1/notifications")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["data"]["notifications"].as_array().unwrap().is_empty());
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert!(json["data"]["notifications"]
+        .as_array()
+        .expect("test setup")
+        .is_empty());
 }
 
 // ---- Preference Endpoint Tests ----
@@ -1523,7 +1629,7 @@ async fn test_preference_list_update_delete() {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             })
-            .unwrap();
+            .expect("test setup");
     }
 
     // List
@@ -1533,15 +1639,21 @@ async fn test_preference_list_update_delete() {
         .uri("/api/v1/preferences")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["data"]["preferences"].as_array().unwrap().len(), 1);
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(
+        json["data"]["preferences"]
+            .as_array()
+            .expect("test setup")
+            .len(),
+        1
+    );
 
     // Update
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1552,15 +1664,17 @@ async fn test_preference_list_update_delete() {
         .uri("/api/v1/preferences/pref-1")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["value"], "always");
 
     // Delete
@@ -1570,9 +1684,9 @@ async fn test_preference_list_update_delete() {
         .uri("/api/v1/preferences/pref-1")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -1590,16 +1704,16 @@ async fn test_import_preview_empty_diff() {
         .uri("/api/v1/config/export")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     let toml_content = String::from_utf8(
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap()
+            .expect("test setup")
             .to_vec(),
     )
-    .unwrap();
+    .expect("test setup");
 
     // Strip admin_users section (contains redacted password hash from export)
     let toml_content: String = toml_content
@@ -1617,23 +1731,25 @@ async fn test_import_preview_empty_diff() {
         .uri("/api/v1/config/import/preview")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert!(json["data"]["routes"]["added"]
         .as_array()
-        .unwrap()
+        .expect("test setup")
         .is_empty());
     assert!(json["data"]["routes"]["removed"]
         .as_array()
-        .unwrap()
+        .expect("test setup")
         .is_empty());
 }
 
@@ -1651,10 +1767,12 @@ async fn test_import_preview_with_changes() {
         .uri("/api/v1/backends")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
 
     // Preview import with empty config - should show the backend as "removed"
@@ -1667,20 +1785,22 @@ async fn test_import_preview_with_changes() {
         .uri("/api/v1/config/import/preview")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(
         json["data"]["backends"]["removed"]
             .as_array()
-            .unwrap()
+            .expect("test setup")
             .len(),
         1
     );
@@ -1690,7 +1810,7 @@ async fn test_import_preview_with_changes() {
 
 #[tokio::test]
 async fn test_session_purge_expired() {
-    let db = lorica_config::ConfigStore::open_in_memory().unwrap();
+    let db = lorica_config::ConfigStore::open_in_memory().expect("test setup");
     let store = SessionStore::new(Arc::new(Mutex::new(db))).await;
 
     // Create a session
@@ -1738,15 +1858,17 @@ async fn test_create_route_empty_hostname_returns_400() {
         .uri("/api/v1/routes")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["error"]["code"], "bad_request");
 }
 
@@ -1766,10 +1888,12 @@ async fn test_create_route_invalid_load_balancing_returns_400() {
         .uri("/api/v1/routes")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -1786,10 +1910,12 @@ async fn test_update_route_nonexistent_returns_404() {
         .uri("/api/v1/routes/nonexistent-id")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1804,9 +1930,9 @@ async fn test_delete_route_nonexistent_returns_error() {
         .uri("/api/v1/routes/nonexistent-id")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     // ConfigStore::delete_route returns NotFound for unknown IDs
     assert!(
         response.status() == StatusCode::NOT_FOUND
@@ -1827,10 +1953,12 @@ async fn test_create_backend_empty_address_returns_400() {
         .uri("/api/v1/backends")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -1845,9 +1973,9 @@ async fn test_get_backend_nonexistent_returns_404() {
         .uri("/api/v1/backends/nonexistent")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1864,10 +1992,12 @@ async fn test_update_backend_nonexistent_returns_404() {
         .uri("/api/v1/backends/nonexistent")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1888,10 +2018,12 @@ async fn test_create_certificate_empty_domain_returns_400() {
         .uri("/api/v1/certificates")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -1912,10 +2044,12 @@ async fn test_create_certificate_empty_pem_returns_400() {
         .uri("/api/v1/certificates")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -1930,9 +2064,9 @@ async fn test_get_certificate_nonexistent_returns_404() {
         .uri("/api/v1/certificates/nonexistent")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1949,10 +2083,12 @@ async fn test_update_certificate_nonexistent_returns_404() {
         .uri("/api/v1/certificates/nonexistent")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1969,10 +2105,12 @@ async fn test_self_signed_empty_domain_returns_400() {
         .uri("/api/v1/certificates/self-signed")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -1984,10 +2122,13 @@ async fn test_change_password_too_short_returns_400() {
     // Create admin and set known password
     {
         let store = state.store.lock().await;
-        ensure_admin_user(&store).unwrap();
-        let mut user = store.get_admin_user_by_username("admin").unwrap().unwrap();
-        user.password_hash = hash_password(known_password).unwrap();
-        store.update_admin_user(&user).unwrap();
+        ensure_admin_user(&store).expect("test setup");
+        let mut user = store
+            .get_admin_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup");
+        user.password_hash = hash_password(known_password).expect("test setup");
+        store.update_admin_user(&user).expect("test setup");
     }
 
     // Login
@@ -2000,12 +2141,14 @@ async fn test_change_password_too_short_returns_400() {
         .method("POST")
         .uri("/api/v1/auth/login")
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_string(&login_body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&login_body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
     let cookie = format!(
         "lorica_session={}",
-        extract_session_cookie(&response).unwrap()
+        extract_session_cookie(&response).expect("test setup")
     );
 
     // Try change password with too-short new password
@@ -2020,10 +2163,12 @@ async fn test_change_password_too_short_returns_400() {
         .uri("/api/v1/auth/password")
         .header("Content-Type", "application/json")
         .header("Cookie", cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2034,10 +2179,13 @@ async fn test_change_password_wrong_current_returns_401() {
 
     {
         let store = state.store.lock().await;
-        ensure_admin_user(&store).unwrap();
-        let mut user = store.get_admin_user_by_username("admin").unwrap().unwrap();
-        user.password_hash = hash_password(known_password).unwrap();
-        store.update_admin_user(&user).unwrap();
+        ensure_admin_user(&store).expect("test setup");
+        let mut user = store
+            .get_admin_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup");
+        user.password_hash = hash_password(known_password).expect("test setup");
+        store.update_admin_user(&user).expect("test setup");
     }
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -2049,12 +2197,14 @@ async fn test_change_password_wrong_current_returns_401() {
         .method("POST")
         .uri("/api/v1/auth/login")
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_string(&login_body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&login_body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
     let cookie = format!(
         "lorica_session={}",
-        extract_session_cookie(&response).unwrap()
+        extract_session_cookie(&response).expect("test setup")
     );
 
     let router = app(state, session_store, rate_limiter);
@@ -2068,10 +2218,12 @@ async fn test_change_password_wrong_current_returns_401() {
         .uri("/api/v1/auth/password")
         .header("Content-Type", "application/json")
         .header("Cookie", cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -2080,7 +2232,7 @@ async fn test_login_nonexistent_user_returns_401() {
     let (state, session_store, rate_limiter) = test_state().await;
     {
         let store = state.store.lock().await;
-        ensure_admin_user(&store).unwrap();
+        ensure_admin_user(&store).expect("test setup");
     }
 
     let router = app(state, session_store, rate_limiter);
@@ -2093,10 +2245,12 @@ async fn test_login_nonexistent_user_returns_401() {
         .method("POST")
         .uri("/api/v1/auth/login")
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -2117,10 +2271,12 @@ async fn test_import_malformed_toml_returns_400() {
         .uri("/api/v1/config/import")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2141,18 +2297,20 @@ async fn test_import_too_large_returns_400() {
         .uri("/api/v1/config/import")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert!(json["error"]["message"]
         .as_str()
-        .unwrap()
+        .expect("test setup")
         .contains("too large"));
 }
 
@@ -2171,10 +2329,12 @@ async fn test_import_preview_malformed_toml_returns_400() {
         .uri("/api/v1/config/import/preview")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2212,10 +2372,12 @@ updated_at = "2026-01-01T00:00:00Z"
         .uri("/api/v1/config/import")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2234,10 +2396,12 @@ async fn test_settings_invalid_log_level_returns_400() {
         .uri("/api/v1/settings")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2254,10 +2418,12 @@ async fn test_settings_invalid_health_check_interval_returns_400() {
         .uri("/api/v1/settings")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2274,10 +2440,12 @@ async fn test_settings_invalid_cert_warning_days_returns_400() {
         .uri("/api/v1/settings")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2294,10 +2462,12 @@ async fn test_settings_invalid_cert_critical_days_returns_400() {
         .uri("/api/v1/settings")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2320,10 +2490,12 @@ async fn test_create_notification_invalid_channel_returns_400() {
         .uri("/api/v1/notifications")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2344,10 +2516,12 @@ async fn test_create_notification_empty_config_returns_400() {
         .uri("/api/v1/notifications")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2368,10 +2542,12 @@ async fn test_create_notification_invalid_json_config_returns_400() {
         .uri("/api/v1/notifications")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2386,9 +2562,9 @@ async fn test_test_notification_nonexistent_returns_404() {
         .uri("/api/v1/notifications/nonexistent/test")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -2410,27 +2586,29 @@ async fn test_test_notification_email_missing_smtp_host_returns_400() {
         .uri("/api/v1/notifications")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
     let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-    let notif_id = json["data"]["id"].as_str().unwrap().to_string();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    let notif_id = json["data"]["id"].as_str().expect("test setup").to_string();
 
     // Test it - should fail
     let router = app(state, session_store, rate_limiter);
     let req = Request::builder()
         .method("POST")
-        .uri(&format!("/api/v1/notifications/{notif_id}/test"))
+        .uri(format!("/api/v1/notifications/{notif_id}/test"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2451,26 +2629,28 @@ async fn test_test_notification_webhook_missing_url_returns_400() {
         .uri("/api/v1/notifications")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
     let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-    let notif_id = json["data"]["id"].as_str().unwrap().to_string();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    let notif_id = json["data"]["id"].as_str().expect("test setup").to_string();
 
     let router = app(state, session_store, rate_limiter);
     let req = Request::builder()
         .method("POST")
-        .uri(&format!("/api/v1/notifications/{notif_id}/test"))
+        .uri(format!("/api/v1/notifications/{notif_id}/test"))
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2489,10 +2669,12 @@ async fn test_update_preference_nonexistent_returns_404() {
         .uri("/api/v1/preferences/nonexistent")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -2511,7 +2693,7 @@ async fn test_update_preference_invalid_value_returns_400() {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        store.create_user_preference(&pref).unwrap();
+        store.create_user_preference(&pref).expect("test setup");
     }
 
     let router = app(state, session_store, rate_limiter);
@@ -2522,10 +2704,12 @@ async fn test_update_preference_invalid_value_returns_400() {
         .uri("/api/v1/preferences/pref-1")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -2550,9 +2734,9 @@ async fn test_expired_session_returns_401() {
         .uri("/api/v1/routes")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -2569,17 +2753,27 @@ async fn test_system_endpoint_returns_all_fields() {
         .uri("/api/v1/system")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["data"]["host"]["cpu_count"].as_u64().unwrap() > 0);
-    assert!(json["data"]["host"]["memory_total_bytes"].as_u64().unwrap() > 0);
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert!(
+        json["data"]["host"]["cpu_count"]
+            .as_u64()
+            .expect("test setup")
+            > 0
+    );
+    assert!(
+        json["data"]["host"]["memory_total_bytes"]
+            .as_u64()
+            .expect("test setup")
+            > 0
+    );
     assert!(json["data"]["process"].is_object());
     assert!(json["data"]["proxy"]["version"].is_string());
     assert!(json["data"]["proxy"]["uptime_seconds"].is_number());
@@ -2600,14 +2794,16 @@ async fn test_create_route_with_backend_ids() {
         .uri("/api/v1/backends")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
     let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-    let backend_id = json["data"]["id"].as_str().unwrap().to_string();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    let backend_id = json["data"]["id"].as_str().expect("test setup").to_string();
 
     // Create route with backend_ids
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -2620,15 +2816,23 @@ async fn test_create_route_with_backend_ids() {
         .uri("/api/v1/routes")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::CREATED);
     let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-    assert_eq!(json["data"]["backends"].as_array().unwrap().len(), 1);
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    assert_eq!(
+        json["data"]["backends"]
+            .as_array()
+            .expect("test setup")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -2646,14 +2850,16 @@ async fn test_update_route_backend_associations() {
             .uri("/api/v1/backends")
             .header("Content-Type", "application/json")
             .header("Cookie", &cookie)
-            .body(Body::from(serde_json::to_string(&body).unwrap()))
-            .unwrap();
-        let response = router.oneshot(req).await.unwrap();
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test setup"),
+            ))
+            .expect("test setup");
+        let response = router.oneshot(req).await.expect("test setup");
         let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-        backend_ids.push(json["data"]["id"].as_str().unwrap().to_string());
+            .expect("test setup");
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+        backend_ids.push(json["data"]["id"].as_str().expect("test setup").to_string());
     }
 
     // Create route with first backend
@@ -2667,14 +2873,16 @@ async fn test_update_route_backend_associations() {
         .uri("/api/v1/routes")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
     let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-    let route_id = json["data"]["id"].as_str().unwrap().to_string();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    let route_id = json["data"]["id"].as_str().expect("test setup").to_string();
 
     // Update route to use second backend only
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -2683,20 +2891,22 @@ async fn test_update_route_backend_associations() {
     });
     let req = Request::builder()
         .method("PUT")
-        .uri(&format!("/api/v1/routes/{route_id}"))
+        .uri(format!("/api/v1/routes/{route_id}"))
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
-    let backends = json["data"]["backends"].as_array().unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    let backends = json["data"]["backends"].as_array().expect("test setup");
     assert_eq!(backends.len(), 1);
-    assert_eq!(backends[0].as_str().unwrap(), backend_ids[1]);
+    assert_eq!(backends[0].as_str().expect("test setup"), backend_ids[1]);
 }
 
 // ---- Status with data test ----
@@ -2714,9 +2924,11 @@ async fn test_status_counts_with_data() {
         .uri("/api/v1/routes")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-    router.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    router.oneshot(req).await.expect("test setup");
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({ "address": "10.0.0.1:8080" });
@@ -2725,9 +2937,11 @@ async fn test_status_counts_with_data() {
         .uri("/api/v1/backends")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-    router.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    router.oneshot(req).await.expect("test setup");
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({
@@ -2740,9 +2954,11 @@ async fn test_status_counts_with_data() {
         .uri("/api/v1/certificates")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-    router.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    router.oneshot(req).await.expect("test setup");
 
     // Check status
     let router = app(state, session_store, rate_limiter);
@@ -2751,14 +2967,14 @@ async fn test_status_counts_with_data() {
         .uri("/api/v1/status")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["routes_count"], 1);
     assert_eq!(json["data"]["backends_count"], 1);
     // New backends are created with health_status=unknown (not healthy)
@@ -2770,7 +2986,7 @@ async fn test_status_counts_with_data() {
 // ---- WAF & Workers helpers ----
 
 async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
-    let store = lorica_config::ConfigStore::open_in_memory().unwrap();
+    let store = lorica_config::ConfigStore::open_in_memory().expect("test setup");
     let store = Arc::new(Mutex::new(store));
     let engine = Arc::new(lorica_waf::WafEngine::new());
     let event_buffer = engine.event_buffer();
@@ -2801,6 +3017,8 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         notification_history: None,
         log_store: None,
         aggregated_metrics: None,
+        metrics_refresher: None,
+        task_tracker: tokio_util::task::TaskTracker::new(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -2808,7 +3026,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
 }
 
 async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
-    let store = lorica_config::ConfigStore::open_in_memory().unwrap();
+    let store = lorica_config::ConfigStore::open_in_memory().expect("test setup");
     let store = Arc::new(Mutex::new(store));
     let state = AppState {
         store: Arc::clone(&store),
@@ -2836,6 +3054,8 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         notification_history: None,
         log_store: None,
         aggregated_metrics: None,
+        metrics_refresher: None,
+        task_tracker: tokio_util::task::TaskTracker::new(),
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -2855,17 +3075,17 @@ async fn test_waf_events_empty() {
         .uri("/api/v1/waf/events")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["events"], serde_json::json!([]));
     assert_eq!(json["data"]["total"], 0);
-    assert!(json["data"]["rule_count"].as_u64().unwrap() > 0);
+    assert!(json["data"]["rule_count"].as_u64().expect("test setup") > 0);
 }
 
 #[tokio::test]
@@ -2879,16 +3099,16 @@ async fn test_waf_stats_empty() {
         .uri("/api/v1/waf/stats")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total_events"], 0);
-    assert!(json["data"]["rule_count"].as_u64().unwrap() > 0);
+    assert!(json["data"]["rule_count"].as_u64().expect("test setup") > 0);
     assert_eq!(json["data"]["by_category"], serde_json::json!([]));
 }
 
@@ -2903,15 +3123,15 @@ async fn test_waf_clear_events() {
         .uri("/api/v1/waf/events")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["data"]["cleared"], true);
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["cleared"], serde_json::json!(true));
 }
 
 #[tokio::test]
@@ -2925,16 +3145,16 @@ async fn test_waf_rules_list() {
         .uri("/api/v1/waf/rules")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let total = json["data"]["total"].as_u64().unwrap();
-    let enabled = json["data"]["enabled"].as_u64().unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let total = json["data"]["total"].as_u64().expect("test setup");
+    let enabled = json["data"]["enabled"].as_u64().expect("test setup");
     assert!(total > 0, "expected at least one WAF rule");
     assert_eq!(total, enabled, "all rules should be enabled by default");
     assert!(json["data"]["rules"].is_array());
@@ -2952,17 +3172,19 @@ async fn test_waf_rules_disable() {
         .uri("/api/v1/waf/rules/942100")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["rule_id"], 942100);
-    assert_eq!(json["data"]["enabled"], false);
+    assert_eq!(json["data"]["enabled"], serde_json::json!(false));
 }
 
 #[tokio::test]
@@ -2978,9 +3200,11 @@ async fn test_waf_rules_enable() {
         .uri("/api/v1/waf/rules/942100")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-    let response = router.oneshot(req).await.unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
 
     // Then re-enable it
@@ -2991,17 +3215,19 @@ async fn test_waf_rules_enable() {
         .uri("/api/v1/waf/rules/942100")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["rule_id"], 942100);
-    assert_eq!(json["data"]["enabled"], true);
+    assert_eq!(json["data"]["enabled"], serde_json::json!(true));
 }
 
 #[tokio::test]
@@ -3016,10 +3242,12 @@ async fn test_waf_rules_not_found() {
         .uri("/api/v1/waf/rules/999999")
         .header("Content-Type", "application/json")
         .header("Cookie", &cookie)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -3034,14 +3262,14 @@ async fn test_waf_events_without_engine() {
         .uri("/api/v1/waf/events")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["events"], serde_json::json!([]));
     assert_eq!(json["data"]["total"], 0);
     assert_eq!(json["data"]["rule_count"], 0);
@@ -3060,14 +3288,14 @@ async fn test_workers_empty() {
         .uri("/api/v1/workers")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["workers"], serde_json::json!([]));
     assert_eq!(json["data"]["total"], 0);
 }
@@ -3078,7 +3306,7 @@ async fn test_workers_with_metrics() {
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     // Record a heartbeat for worker 1
-    let metrics = state.worker_metrics.as_ref().unwrap();
+    let metrics = state.worker_metrics.as_ref().expect("test setup");
     metrics.record_heartbeat(1, 12345, 5).await;
 
     let router = app(state, session_store, rate_limiter);
@@ -3087,18 +3315,18 @@ async fn test_workers_with_metrics() {
         .uri("/api/v1/workers")
         .header("Cookie", &cookie)
         .body(Body::empty())
-        .unwrap();
+        .expect("test setup");
 
-    let response = router.oneshot(req).await.unwrap();
+    let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
     assert_eq!(json["data"]["total"], 1);
-    let workers = json["data"]["workers"].as_array().unwrap();
+    let workers = json["data"]["workers"].as_array().expect("test setup");
     assert_eq!(workers.len(), 1);
     assert_eq!(workers[0]["worker_id"], 1);
     assert_eq!(workers[0]["pid"], 12345);
-    assert_eq!(workers[0]["healthy"], true);
+    assert_eq!(workers[0]["healthy"], serde_json::json!(true));
 }

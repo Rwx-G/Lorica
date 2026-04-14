@@ -1,3 +1,8 @@
+//! Access log query, export, clear, and live WebSocket streaming endpoints.
+//!
+//! Reads from the persistent SQLite-backed [`crate::log_store::LogStore`] when
+//! present and falls back to the in-process [`LogBuffer`] otherwise.
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, Query};
 use axum::response::IntoResponse;
@@ -57,6 +62,7 @@ struct LogBufferInner {
 }
 
 impl LogBuffer {
+    /// Build a ring buffer holding up to `capacity` entries plus a 2048-slot broadcast channel.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "LogBuffer capacity must be > 0");
         let (tx, _) = broadcast::channel(2048);
@@ -95,7 +101,7 @@ impl LogBuffer {
         let _ = self.tx.send(entry_clone);
     }
 
-    /// Subscribe to real-time log entries.
+    /// Subscribe to the live broadcast stream of newly pushed entries.
     pub fn subscribe(&self) -> broadcast::Receiver<LogEntry> {
         self.tx.subscribe()
     }
@@ -117,7 +123,7 @@ impl LogBuffer {
         }
     }
 
-    /// Clear all entries.
+    /// Drop every buffered entry and reset the write position.
     pub async fn clear(&self) {
         let mut inner = self.entries.write().await;
         inner.buf.clear();
@@ -157,7 +163,7 @@ struct LogsResponse {
     total: usize,
 }
 
-/// GET /api/v1/logs
+/// GET /api/v1/logs - return access log entries matching the supplied filters.
 pub async fn get_logs(
     Extension(state): Extension<AppState>,
     Query(params): Query<LogsQuery>,
@@ -296,16 +302,12 @@ fn csv_escape(s: &str) -> String {
 /// Maximum number of entries for a single export request.
 const EXPORT_MAX_ENTRIES: usize = 100_000;
 
-/// GET /api/v1/logs/export
+/// GET /api/v1/logs/export - download matching access logs as CSV (default) or JSON.
 pub async fn export_logs(
     Extension(state): Extension<AppState>,
     Query(params): Query<LogExportQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let format = params
-        .format
-        .as_deref()
-        .unwrap_or("csv")
-        .to_lowercase();
+    let format = params.format.as_deref().unwrap_or("csv").to_lowercase();
 
     if format != "csv" && format != "json" {
         return Err(ApiError::BadRequest(
@@ -361,8 +363,7 @@ pub async fn export_logs(
                         || e.path.to_lowercase().contains(&s)
                         || e.host.to_lowercase().contains(&s)
                         || e.backend.to_lowercase().contains(&s)
-                        || e
-                            .error
+                        || e.error
                             .as_ref()
                             .is_some_and(|err| err.to_lowercase().contains(&s));
                     if !matches {
@@ -393,7 +394,9 @@ pub async fn export_logs(
         ))
     } else {
         let mut csv = String::with_capacity(entries.len() * 120);
-        csv.push_str("timestamp,method,path,host,status,latency_ms,backend,client_ip,error,request_id\n");
+        csv.push_str(
+            "timestamp,method,path,host,status,latency_ms,backend,client_ip,error,request_id\n",
+        );
         for e in &entries {
             csv.push_str(&csv_escape(&e.timestamp));
             csv.push(',');
@@ -430,7 +433,7 @@ pub async fn export_logs(
     }
 }
 
-/// DELETE /api/v1/logs
+/// DELETE /api/v1/logs - empty both the in-memory ring buffer and the persistent store.
 pub async fn clear_logs(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

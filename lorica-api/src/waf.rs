@@ -31,6 +31,7 @@ pub struct WafEventsQuery {
     pub category: Option<String>,
 }
 
+/// JSON envelope returned by the WAF events endpoint, including the engine's loaded rule count.
 #[derive(Debug, Serialize)]
 struct WafEventsResponse {
     events: Vec<WafEvent>,
@@ -160,6 +161,7 @@ pub async fn get_waf_rules(
     })))
 }
 
+/// JSON body for toggling a WAF rule on or off.
 #[derive(Debug, Deserialize)]
 pub struct RuleToggleRequest {
     pub enabled: bool,
@@ -218,6 +220,7 @@ pub async fn clear_waf_events(
 
 // ---- Custom WAF rules ----
 
+/// JSON body for creating a user-defined WAF rule (regex pattern + category + severity).
 #[derive(Debug, Deserialize)]
 pub struct CreateCustomRuleRequest {
     pub id: u32,
@@ -333,6 +336,7 @@ pub async fn get_blocklist_status(
     })))
 }
 
+/// JSON body for toggling the IP blocklist on or off.
 #[derive(Debug, Deserialize)]
 pub struct BlocklistToggleRequest {
     pub enabled: bool,
@@ -426,8 +430,9 @@ pub async fn reload_blocklist(
 pub fn spawn_blocklist_refresh(
     engine: std::sync::Arc<lorica_waf::WafEngine>,
     interval: std::time::Duration,
+    tracker: &tokio_util::task::TaskTracker,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    tracker.spawn(async move {
         // Initial fetch at startup if blocklist is already enabled (restored from settings)
         if engine.ip_blocklist().is_enabled() {
             match fetch_and_load_blocklist(engine.ip_blocklist()).await {

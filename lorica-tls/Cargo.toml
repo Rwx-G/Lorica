@@ -21,9 +21,12 @@ arc-swap = "1"
 ring = "0.17.12"
 rustls = "0.23.12"
 rustls-native-certs = "0.7.1"
-rustls-pemfile = "2.1.2"
+rustls-pemfile = "=2.1.2"
 rustls-pki-types = "1.7.0"
 tokio-rustls = "0.26.0"
-no_debug = "3.1.0"
+# no_debug = "3.1.0" inlined into src/no_debug.rs in v1.3.0
+# (audit SC-L-3). The upstream single-file wrapper was flagged
+# unmaintained since 2022; inlining removes the supply-chain
+# takeover surface without functional change.
 x509-parser = "0.16"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }

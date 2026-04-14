@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import {
     api,
     type CertificateResponse,
@@ -20,15 +21,16 @@
 
   const DOMAIN_PATTERN = /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
 
-  // Edit form state
-  let editDomain = $state(editingCert.domain);
+  // Edit form state - initialized from props once at mount; bind:value mutates locally.
+  // untrack() silences the "locally captured" warning since reading editingCert here is intentional.
+  let editDomain = $state(untrack(() => editingCert.domain));
   let editCertPem = $state('');
   let editKeyPem = $state('');
   let editError = $state('');
   let editSubmitting = $state(false);
-  let editDnsProviderId = $state(editingCert.acme_dns_provider_id ?? '');
-  let editAcmeMethod = $state(editingCert.acme_method ?? '');
-  let editAutoRenew = $state(editingCert.acme_auto_renew);
+  let editDnsProviderId = $state(untrack(() => editingCert.acme_dns_provider_id ?? ''));
+  let editAcmeMethod = $state(untrack(() => editingCert.acme_method ?? ''));
+  let editAutoRenew = $state(untrack(() => editingCert.acme_auto_renew));
 
   function handleEditKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') onClose();
@@ -85,7 +87,6 @@
 </script>
 
 <!-- Edit Form Modal -->
-<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) onClose(); }} onkeydown={handleEditKeydown} role="dialog" aria-modal="true" tabindex="-1">
   <div class="modal" role="document">
     <h2>Edit Certificate</h2>
@@ -126,7 +127,7 @@
           <label for="edit-dns-provider">DNS Provider</label>
           <select id="edit-dns-provider" bind:value={editDnsProviderId}>
             <option value="">-- Select provider --</option>
-            {#each dnsProviders as p}
+            {#each dnsProviders as p (p.id)}
               <option value={p.id}>{p.name} ({p.provider_type})</option>
             {/each}
           </select>

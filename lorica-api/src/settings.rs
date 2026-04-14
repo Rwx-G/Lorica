@@ -1,3 +1,5 @@
+//! Global settings, notification channels, and per-user UI preferences endpoints.
+
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
@@ -8,7 +10,7 @@ use crate::server::AppState;
 
 // ---- Global Settings ----
 
-/// GET /api/v1/settings
+/// GET /api/v1/settings - return the global settings document.
 pub async fn get_settings(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -17,6 +19,7 @@ pub async fn get_settings(
     Ok(json_data(settings))
 }
 
+/// JSON body for `PUT /api/v1/settings`. Only the supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateSettingsRequest {
     pub management_port: Option<u16>,
@@ -35,9 +38,11 @@ pub struct UpdateSettingsRequest {
     pub custom_security_presets: Option<Vec<lorica_config::models::SecurityHeaderPreset>>,
     pub trusted_proxies: Option<Vec<String>>,
     pub waf_whitelist_ips: Option<Vec<String>>,
+    pub connection_deny_cidrs: Option<Vec<String>>,
+    pub connection_allow_cidrs: Option<Vec<String>>,
 }
 
-/// PUT /api/v1/settings
+/// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
 pub async fn update_settings(
     Extension(state): Extension<AppState>,
     Json(body): Json<UpdateSettingsRequest>,
@@ -180,6 +185,14 @@ pub async fn update_settings(
         }
         settings.waf_whitelist_ips = ips.clone();
     }
+    if let Some(ref cidrs) = body.connection_deny_cidrs {
+        validate_cidr_list(cidrs, "connection_deny_cidrs")?;
+        settings.connection_deny_cidrs = cidrs.clone();
+    }
+    if let Some(ref cidrs) = body.connection_allow_cidrs {
+        validate_cidr_list(cidrs, "connection_allow_cidrs")?;
+        settings.connection_allow_cidrs = cidrs.clone();
+    }
 
     store.update_global_settings(&settings)?;
     drop(store);
@@ -187,9 +200,25 @@ pub async fn update_settings(
     Ok(json_data(settings))
 }
 
+fn validate_cidr_list(entries: &[String], field: &str) -> Result<(), ApiError> {
+    for entry in entries {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.parse::<std::net::IpAddr>().is_err() && trimmed.parse::<ipnet::IpNet>().is_err()
+        {
+            return Err(ApiError::BadRequest(format!(
+                "invalid {field} CIDR or IP: {trimmed}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---- Notification Configs ----
 
-/// GET /api/v1/notifications
+/// GET /api/v1/notifications - list notification channels with secrets masked.
 pub async fn list_notifications(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -201,6 +230,7 @@ pub async fn list_notifications(
     Ok(json_data(serde_json::json!({ "notifications": configs })))
 }
 
+/// JSON body for creating or updating a notification channel.
 #[derive(Deserialize)]
 pub struct CreateNotificationRequest {
     pub channel: String,
@@ -209,7 +239,7 @@ pub struct CreateNotificationRequest {
     pub alert_types: Vec<String>,
 }
 
-/// POST /api/v1/notifications
+/// POST /api/v1/notifications - register a new notification channel.
 pub async fn create_notification(
     Extension(state): Extension<AppState>,
     Json(body): Json<CreateNotificationRequest>,
@@ -217,7 +247,7 @@ pub async fn create_notification(
     let channel: lorica_config::models::NotificationChannel = body
         .channel
         .parse()
-        .map_err(|e: String| ApiError::BadRequest(e))?;
+        .map_err(|e: strum::ParseError| ApiError::BadRequest(e.to_string()))?;
 
     validate_notification_config(&body.config)?;
 
@@ -236,7 +266,7 @@ pub async fn create_notification(
     Ok(json_data_with_status(StatusCode::CREATED, masked))
 }
 
-/// POST /api/v1/notifications/:id/test - send a real test notification
+/// POST /api/v1/notifications/:id/test - send a real test alert through the configured channel.
 pub async fn test_notification(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -284,7 +314,7 @@ pub async fn test_notification(
     })))
 }
 
-/// GET /api/v1/notifications/history
+/// GET /api/v1/notifications/history - return the recent notification dispatch history.
 pub async fn notification_history(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -339,7 +369,7 @@ fn validate_notification_config(config: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// PUT /api/v1/notifications/:id
+/// PUT /api/v1/notifications/:id - update channel config; `********` placeholders preserve stored secrets.
 pub async fn update_notification(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -348,28 +378,46 @@ pub async fn update_notification(
     let channel: lorica_config::models::NotificationChannel = body
         .channel
         .parse()
-        .map_err(|e: String| ApiError::BadRequest(e))?;
+        .map_err(|e: strum::ParseError| ApiError::BadRequest(e.to_string()))?;
 
     validate_notification_config(&body.config)?;
 
     let mut config = body.config.clone();
     if channel == lorica_config::models::NotificationChannel::Email {
+        // If the submitted config carries the sentinel mask
+        // `"********"` for the password, the UI wants us to keep the
+        // previously stored value. Any failure in that restore path
+        // (config unparseable, no existing row, no password in the
+        // existing row) must be surfaced as an error; silently
+        // falling through would persist the literal mask string and
+        // erase the real SMTP password.
         if let Ok(mut new_val) = serde_json::from_str::<serde_json::Value>(&config) {
             if new_val
                 .get("smtp_password")
                 .is_some_and(|v| v.as_str() == Some("********"))
             {
                 let store = state.store.lock().await;
-                if let Some(existing) = store.get_notification_config(&id)? {
-                    if let Ok(existing_val) =
-                        serde_json::from_str::<serde_json::Value>(&existing.config)
-                    {
-                        if let Some(pwd) = existing_val.get("smtp_password") {
-                            new_val["smtp_password"] = pwd.clone();
-                            config = serde_json::to_string(&new_val).unwrap_or(config);
-                        }
-                    }
-                }
+                let existing = store.get_notification_config(&id)?.ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "cannot restore masked smtp_password: no existing config for this channel"
+                            .into(),
+                    )
+                })?;
+                let existing_val: serde_json::Value = serde_json::from_str(&existing.config)
+                    .map_err(|_| {
+                        ApiError::BadRequest(
+                            "existing email config is corrupt; cannot restore smtp_password".into(),
+                        )
+                    })?;
+                let pwd = existing_val.get("smtp_password").ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "existing email config has no smtp_password to restore".into(),
+                    )
+                })?;
+                new_val["smtp_password"] = pwd.clone();
+                config = serde_json::to_string(&new_val).map_err(|_| {
+                    ApiError::BadRequest("failed to re-serialize notification config".into())
+                })?;
                 drop(store);
             }
         }
@@ -390,7 +438,7 @@ pub async fn update_notification(
     Ok(json_data(masked))
 }
 
-/// DELETE /api/v1/notifications/:id
+/// DELETE /api/v1/notifications/:id - remove a notification channel.
 pub async fn delete_notification(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -404,7 +452,7 @@ pub async fn delete_notification(
 
 // ---- User Preferences ----
 
-/// GET /api/v1/preferences
+/// GET /api/v1/preferences - list every per-user UI preference key/value.
 pub async fn list_preferences(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -413,12 +461,13 @@ pub async fn list_preferences(
     Ok(json_data(serde_json::json!({ "preferences": prefs })))
 }
 
+/// JSON body for `PUT /api/v1/preferences/:id`.
 #[derive(Deserialize)]
 pub struct UpdatePreferenceRequest {
     pub value: String,
 }
 
-/// PUT /api/v1/preferences/:id
+/// PUT /api/v1/preferences/:id - update one user preference value.
 pub async fn update_preference(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
@@ -427,7 +476,7 @@ pub async fn update_preference(
     let value: lorica_config::models::PreferenceValue = body
         .value
         .parse()
-        .map_err(|e: String| ApiError::BadRequest(e))?;
+        .map_err(|e: strum::ParseError| ApiError::BadRequest(e.to_string()))?;
 
     let store = state.store.lock().await;
     let existing = store
@@ -444,7 +493,7 @@ pub async fn update_preference(
     Ok(json_data(updated))
 }
 
-/// DELETE /api/v1/preferences/:id
+/// DELETE /api/v1/preferences/:id - remove a user preference.
 pub async fn delete_preference(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,

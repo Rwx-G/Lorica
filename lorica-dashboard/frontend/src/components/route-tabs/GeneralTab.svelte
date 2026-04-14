@@ -99,7 +99,7 @@
     <label for="lb">Load Balancing</label>
     {#if isImported('load_balancing')}<span class="imported-badge">imported</span>{/if}
     <select id="lb" bind:value={form.load_balancing}>
-      {#each loadBalancingOptions as opt}
+      {#each loadBalancingOptions as opt (opt.value)}
         <option value={opt.value}>{opt.label}</option>
       {/each}
     </select>
@@ -218,7 +218,7 @@
   <div class="form-group" class:modified={isModified('error_page_html')}>
     <label for="error-page-html">Custom error page HTML</label>
     <textarea id="error-page-html" rows="6" bind:value={form.error_page_html}
-      placeholder="<html><body><h1>{{status}}</h1><p>{{message}}</p></body></html>"></textarea>
+      placeholder={'<html><body><h1>{{status}}</h1><p>{{message}}</p></body></html>'}></textarea>
     <span class="hint">Used for maintenance 503 and upstream errors (502/504). Placeholders: {"{{status}}"}, {"{{message}}"}</span>
   </div>
   {/if}

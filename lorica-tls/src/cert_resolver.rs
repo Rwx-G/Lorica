@@ -237,6 +237,7 @@ mod tests {
     // Self-signed test certificate for "test.example.com" generated at build time
     // is not practical, so we test the resolver logic with mock entries.
 
+    #[allow(dead_code)] // Placeholder helper kept for future integration tests.
     fn make_resolver_with_entries(entries: Vec<(&str, i64)>) -> CertResolver {
         let resolver = CertResolver::new();
 

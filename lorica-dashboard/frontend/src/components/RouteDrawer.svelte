@@ -10,7 +10,7 @@
     formStateToCreateRequest,
     formStateToUpdateRequest,
     getModifiedFields,
-    validateRouteForm,
+    validateRouteFormWithTab,
   } from '../lib/route-form';
   import { showToast } from '../lib/toast';
   import GeneralTab from './route-tabs/GeneralTab.svelte';
@@ -21,6 +21,9 @@
   import CachingTab from './route-tabs/CachingTab.svelte';
   import ProtectionTab from './route-tabs/ProtectionTab.svelte';
   import PathRulesTab from './route-tabs/PathRulesTab.svelte';
+  import HeaderRulesTab from './route-tabs/HeaderRulesTab.svelte';
+  import CanaryTab from './route-tabs/CanaryTab.svelte';
+  import ResponseRewriteTab from './route-tabs/ResponseRewriteTab.svelte';
 
   interface Props {
     open: boolean;
@@ -50,6 +53,9 @@
     { id: 'caching', label: 'Caching' },
     { id: 'protection', label: 'Protection' },
     { id: 'path_rules', label: 'Path Rules' },
+    { id: 'header_rules', label: 'Header Rules' },
+    { id: 'traffic_splits', label: 'Canary' },
+    { id: 'response_rewrite', label: 'Rewrite' },
   ];
 
   // Reset form when drawer opens - untrack body so form/editing changes
@@ -102,9 +108,15 @@
   }
 
   async function handleSubmit() {
-    const err = validateRouteForm(form);
-    if (err) {
-      formError = err;
+    const { message, tab } = validateRouteFormWithTab(form);
+    if (message) {
+      formError = message;
+      // Auto-switch to the tab that owns the offending field so the
+      // user doesn't have to hunt for it. Falls back to staying put
+      // when the validator couldn't attribute the error.
+      if (tab && tab !== activeTab) {
+        activeTab = tab;
+      }
       return;
     }
     formSubmitting = true;
@@ -137,7 +149,6 @@
 </script>
 
 {#if open}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="drawer-overlay"
     onkeydown={handleKeydown}
@@ -146,7 +157,6 @@
     tabindex="-1"
   >
     <!-- Backdrop: separate DOM branch so clicks don't interfere with drawer buttons (Svelte 5 event delegation) -->
-    <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
     <div class="drawer-backdrop" role="presentation" onclick={handleClose} onkeydown={(e) => { if (e.key === 'Escape') handleClose(); }}></div>
     <div class="drawer" role="document">
       <!-- Header -->
@@ -159,6 +169,7 @@
         </div>
         <div class="drawer-header-right">
           <button class="btn-close" onclick={handleClose} title="Close" aria-label="Close drawer">
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             {@html closeIcon}
           </button>
         </div>
@@ -191,7 +202,7 @@
         {:else if activeTab === 'timeouts'}
           <TimeoutsTab bind:form={form} {importedFields} />
         {:else if activeTab === 'security'}
-          <SecurityTab bind:form={form} {importedFields} {customPresets} />
+          <SecurityTab bind:form={form} {importedFields} {customPresets} {backends} initialMtlsCaCertPem={editing?.mtls?.ca_cert_pem ?? ''} />
         {:else if activeTab === 'headers'}
           <HeadersTab bind:form={form} {importedFields} />
         {:else if activeTab === 'cors'}
@@ -202,6 +213,12 @@
           <ProtectionTab bind:form={form} {importedFields} />
         {:else if activeTab === 'path_rules'}
           <PathRulesTab bind:form={form} {backends} {importedFields} />
+        {:else if activeTab === 'header_rules'}
+          <HeaderRulesTab bind:form={form} {backends} {importedFields} />
+        {:else if activeTab === 'traffic_splits'}
+          <CanaryTab bind:form={form} {backends} {importedFields} />
+        {:else if activeTab === 'response_rewrite'}
+          <ResponseRewriteTab bind:form={form} {importedFields} />
         {/if}
       </div>
 
@@ -320,6 +337,10 @@
     flex-shrink: 0;
   }
 
+  /* Horizontally scrollable tab bar with a right-edge fade to hint
+     at off-screen tabs. The CSS mask keeps ~1.5rem of tab area
+     faded, nudging the user to scroll right when they don't see
+     the rule / canary / rewrite tabs that were added in v1.3.0. */
   .tab-bar {
     display: flex;
     gap: 0;
@@ -327,6 +348,19 @@
     border-bottom: 1px solid var(--color-border);
     overflow-x: auto;
     flex-shrink: 0;
+    scrollbar-width: thin;
+    mask-image: linear-gradient(
+      to right,
+      black 0,
+      black calc(100% - 2rem),
+      transparent 100%
+    );
+    -webkit-mask-image: linear-gradient(
+      to right,
+      black 0,
+      black calc(100% - 2rem),
+      transparent 100%
+    );
   }
 
   .tab-btn {

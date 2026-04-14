@@ -23,9 +23,29 @@ use std::any::Any;
 pub mod pipe;
 
 struct LockCtx {
-    write_permit: WritePermit,
+    // Optional so Drop can move the permit out via `.take()` without
+    // needing unsafe. A live `LockCtx` always has `Some(...)`; we only
+    // transition to `None` during the Drop path.
+    write_permit: Option<WritePermit>,
     cache_lock: &'static CacheKeyLockImpl,
     key: CacheKey,
+}
+
+impl Drop for LockCtx {
+    fn drop(&mut self) {
+        // Safety net for SWR (and any other subrequest-based writer)
+        // paths where the subrequest future is dropped before the
+        // writer had a chance to call `release_write_lock()` or hand
+        // the permit off via `take_write_lock()`. Without this, the
+        // inner `WritePermit::Drop` would log "dropped without
+        // unlock" because the cache_lock table row is still
+        // populated. Explicitly release with TransientError so a new
+        // writer can be elected for the same key on the next request.
+        if let Some(permit) = self.write_permit.take() {
+            self.cache_lock
+                .release(&self.key, permit, LockStatus::TransientError);
+        }
+    }
 }
 
 // Thin wrapper to allow iterating over InputBody Vec.
@@ -74,7 +94,7 @@ impl CtxBuilder {
         self.lock = Some(LockCtx {
             cache_lock,
             key,
-            write_permit,
+            write_permit: Some(write_permit),
         });
         self
     }
@@ -125,19 +145,26 @@ impl Ctx {
     /// Release the write lock from the subrequest (to clean up a write permit
     /// that will not be used in the cache key lock).
     pub fn release_write_lock(&mut self) {
-        if let Some(lock) = self.lock.take() {
+        if let Some(mut lock) = self.lock.take() {
             // If we are releasing the write lock in the subrequest,
             // it means that the cache did not take it for whatever reason.
-            // TransientError will cause the election of a new writer
-            lock.cache_lock
-                .release(&lock.key, lock.write_permit, LockStatus::TransientError);
+            // TransientError will cause the election of a new writer.
+            // Take the permit out of the Option so LockCtx::Drop's
+            // safety-net doesn't re-release it.
+            if let Some(permit) = lock.write_permit.take() {
+                lock.cache_lock
+                    .release(&lock.key, permit, LockStatus::TransientError);
+            }
         }
     }
 
     /// Take the write lock from the subrequest, for use in a cache key lock.
     pub fn take_write_lock(&mut self) -> Option<WritePermit> {
-        // also clear out lock ctx
-        self.lock.take().map(|lock| lock.write_permit)
+        // also clear out lock ctx; move the permit out of Option so
+        // LockCtx::Drop sees None and skips the safety-net release.
+        self.lock
+            .take()
+            .and_then(|mut lock| lock.write_permit.take())
     }
 
     /// Get the `BodyMode` when this subrequest was created.

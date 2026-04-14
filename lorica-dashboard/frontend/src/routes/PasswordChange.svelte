@@ -61,6 +61,7 @@
             autocomplete="current-password"
           />
           <button type="button" class="toggle-pw" onclick={() => (showCurrent = !showCurrent)} aria-label={showCurrent ? 'Hide password' : 'Show password'}>
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             {#if showCurrent}{@html eyeOffIcon}{:else}{@html eyeIcon}{/if}
           </button>
         </div>
@@ -78,6 +79,7 @@
             minlength="12"
           />
           <button type="button" class="toggle-pw" onclick={() => (showNew = !showNew)} aria-label={showNew ? 'Hide password' : 'Show password'}>
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             {#if showNew}{@html eyeOffIcon}{:else}{@html eyeIcon}{/if}
           </button>
         </div>
@@ -94,6 +96,7 @@
             autocomplete="new-password"
           />
           <button type="button" class="toggle-pw" onclick={() => (showConfirm = !showConfirm)} aria-label={showConfirm ? 'Hide password' : 'Show password'}>
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             {#if showConfirm}{@html eyeOffIcon}{:else}{@html eyeIcon}{/if}
           </button>
         </div>

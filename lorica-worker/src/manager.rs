@@ -29,7 +29,7 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execv, fork, ForkResult, Pid};
 use tracing::{info, warn};
 
-use crate::fd_passing;
+use crate::fd_passing::{self, FdEntry, FdKind};
 use crate::WorkerError;
 
 /// Maximum backoff delay between restarts.
@@ -83,9 +83,16 @@ pub enum WorkerEvent {
 pub struct WorkerHandle {
     id: u32,
     pid: Pid,
-    /// Supervisor end of the command channel socketpair.
-    /// `None` after the FD has been taken via [`take_cmd_fd`].
+    /// Supervisor end of the legacy command channel socketpair (bare
+    /// `Command`/`Response` framing used for Heartbeat/ConfigReload/
+    /// Shutdown/MetricsRequest/BanIp). `None` after the FD has been
+    /// taken via [`take_cmd_fd`].
     cmd_fd: Option<OwnedFd>,
+    /// Supervisor end of the pipelined RPC channel (Envelope framing,
+    /// driven by `lorica_command::RpcEndpoint`). Used for per-route
+    /// token-bucket sync, verdict cache, breaker state, etc. `None`
+    /// after the FD has been taken via [`take_rpc_fd`].
+    rpc_fd: Option<OwnedFd>,
     /// When this worker was last spawned (for backoff calculation).
     spawned_at: Instant,
     /// Consecutive restart count (resets after stable run).
@@ -103,10 +110,16 @@ impl WorkerHandle {
         self.pid
     }
 
-    /// Take ownership of the command channel FD.
+    /// Take ownership of the legacy command channel FD.
     /// Returns `None` if already taken.
     pub fn take_cmd_fd(&mut self) -> Option<OwnedFd> {
         self.cmd_fd.take()
+    }
+
+    /// Take ownership of the pipelined RPC channel FD.
+    /// Returns `None` if already taken.
+    pub fn take_rpc_fd(&mut self) -> Option<OwnedFd> {
+        self.rpc_fd.take()
     }
 }
 
@@ -118,6 +131,10 @@ pub struct WorkerManager {
     listen_fds: Vec<RawFd>,
     /// Bind addresses corresponding to each listen_fd.
     listen_addrs: Vec<String>,
+    /// Optional anonymous memfd for the `lorica-shmem` SharedRegion,
+    /// sent to each worker alongside the listener FDs. `None` when
+    /// shared-memory state is disabled (single-process mode or tests).
+    shmem_fd: Option<RawFd>,
 }
 
 impl WorkerManager {
@@ -128,7 +145,15 @@ impl WorkerManager {
             workers: Vec::new(),
             listen_fds: Vec::new(),
             listen_addrs: Vec::new(),
+            shmem_fd: None,
         }
+    }
+
+    /// Attach a memfd that will be sent to every worker as the
+    /// `lorica-shmem` region descriptor. Call before [`Self::start`].
+    /// `None` disables shared-memory propagation (single-process mode).
+    pub fn set_shmem_fd(&mut self, fd: Option<RawFd>) {
+        self.shmem_fd = fd;
     }
 
     /// Create listening sockets and spawn all worker processes.
@@ -180,25 +205,46 @@ impl WorkerManager {
 
     /// Fork+exec a single worker process and send it the listening FDs.
     fn spawn_worker(&mut self, id: u32, restart_count: u32) -> Result<(), WorkerError> {
-        let (supervisor_fd, worker_fd) = fd_passing::create_socketpair()?;
+        // Two socketpairs per worker: the legacy `cmd` channel and the
+        // new pipelined `rpc` channel. Each side retains one end.
+        let (supervisor_cmd, worker_cmd) = fd_passing::create_socketpair()?;
+        let (supervisor_rpc, worker_rpc) = fd_passing::create_socketpair()?;
 
         match unsafe { fork() }.map_err(WorkerError::Fork)? {
             ForkResult::Parent { child } => {
-                // Parent: close worker end, send FDs, record handle
-                drop(worker_fd);
+                // Parent: close worker ends, send FDs (both listener + the
+                // worker's RPC end) via SCM_RIGHTS, record handle.
+                drop(worker_cmd);
 
-                fd_passing::send_listener_fds(
-                    supervisor_fd.as_raw_fd(),
-                    &self.listen_fds,
-                    &self.listen_addrs,
-                )?;
+                let mut entries: Vec<FdEntry> = Vec::new();
+                if let Some(fd) = self.shmem_fd {
+                    entries.push(FdEntry {
+                        fd,
+                        kind: FdKind::Shmem,
+                    });
+                }
+                entries.push(FdEntry {
+                    fd: worker_rpc.as_raw_fd(),
+                    kind: FdKind::Rpc,
+                });
+                for (fd, addr) in self.listen_fds.iter().zip(&self.listen_addrs) {
+                    entries.push(FdEntry {
+                        fd: *fd,
+                        kind: FdKind::Listener { addr: addr.clone() },
+                    });
+                }
+                fd_passing::send_worker_fds(supervisor_cmd.as_raw_fd(), &entries)?;
+                // Supervisor no longer needs its copy of the worker's RPC
+                // FD — it was duplicated into the worker's table via SCM_RIGHTS.
+                drop(worker_rpc);
 
                 info!(worker_id = id, pid = child.as_raw(), "worker spawned");
 
                 self.workers.push(WorkerHandle {
                     id,
                     pid: child,
-                    cmd_fd: Some(supervisor_fd),
+                    cmd_fd: Some(supervisor_cmd),
+                    rpc_fd: Some(supervisor_rpc),
                     spawned_at: Instant::now(),
                     restart_count,
                 });
@@ -206,11 +252,16 @@ impl WorkerManager {
                 Ok(())
             }
             ForkResult::Child => {
-                // Child: close supervisor end, prepare for exec
-                drop(supervisor_fd);
+                // Child: close supervisor ends, prepare for exec. The worker's
+                // RPC FD is received via SCM_RIGHTS (inside `recv_worker_fds`),
+                // so the direct `worker_rpc` handle here is redundant — drop it
+                // so the child's fd table stays clean.
+                drop(supervisor_cmd);
+                drop(supervisor_rpc);
+                drop(worker_rpc);
 
                 // Clear CLOEXEC on the worker socketpair FD so it survives exec
-                let cmd_fd_raw = worker_fd.into_raw_fd();
+                let cmd_fd_raw = worker_cmd.into_raw_fd();
                 fd_passing::clear_cloexec(cmd_fd_raw)?;
 
                 // Build exec arguments
@@ -535,14 +586,18 @@ mod tests {
 
     #[test]
     fn test_backoff_calculation() {
-        // Verify that the backoff formula produces correct delays
+        // Verify the actual backoff formula `(1u64 << n.min(5)).min(30)`
+        // used in `restart_worker`. We exercise it via a closure so the
+        // test stays exactly the formula being shipped (and clippy does
+        // not see the `n.min(5)` reduce to a literal at each call site).
+        let backoff = |n: u32| -> u64 { (1u64 << n.min(5)).min(30) };
         // 2^0=1, 2^1=2, 2^2=4, 2^3=8, 2^4=16, 2^5=32->capped to 30
-        assert_eq!((1u64 << 0u32.min(5)).min(30), 1);
-        assert_eq!((1u64 << 1u32.min(5)).min(30), 2);
-        assert_eq!((1u64 << 2u32.min(5)).min(30), 4);
-        assert_eq!((1u64 << 3u32.min(5)).min(30), 8);
-        assert_eq!((1u64 << 4u32.min(5)).min(30), 16);
-        assert_eq!((1u64 << 5u32.min(5)).min(30), 30);
-        assert_eq!((1u64 << 6u32.min(5)).min(30), 30);
+        assert_eq!(backoff(0), 1);
+        assert_eq!(backoff(1), 2);
+        assert_eq!(backoff(2), 4);
+        assert_eq!(backoff(3), 8);
+        assert_eq!(backoff(4), 16);
+        assert_eq!(backoff(5), 30);
+        assert_eq!(backoff(6), 30);
     }
 }

@@ -21,7 +21,12 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use super::{EmailConfig, NotifyError};
 use crate::events::AlertEvent;
 
-/// Send an alert event via SMTP email.
+/// Send an alert event as a plain-text SMTP email.
+///
+/// Uses STARTTLS on `smtp_port` (default 587) and authenticates when both
+/// `smtp_username` and `smtp_password` are provided. Returns
+/// [`NotifyError::Email`] on address parse failures, transport setup
+/// errors, or SMTP send failures.
 pub async fn send(config: &EmailConfig, event: &AlertEvent) -> Result<(), NotifyError> {
     let subject = format!(
         "[Lorica Alert] {} - {}",

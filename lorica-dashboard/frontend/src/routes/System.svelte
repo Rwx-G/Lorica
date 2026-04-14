@@ -124,7 +124,7 @@
           </tr>
         </thead>
         <tbody>
-          {#each workers as w}
+          {#each workers as w (w.worker_id)}
           <tr>
             <td>#{w.worker_id}</td>
             <td>{w.pid}</td>

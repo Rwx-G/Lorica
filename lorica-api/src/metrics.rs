@@ -196,11 +196,260 @@ pub fn set_system_metrics(cpu_percent: f64, memory_used_bytes: i64) {
     SYSTEM_MEMORY_USED_BYTES.set(memory_used_bytes);
 }
 
+// ---- v1.3.0 feature counters ---------------------------------------------
+//
+// All four counters share a small design rule: label cardinality must
+// stay bounded so a Prometheus scrape doesn't explode under hostile
+// or accidental traffic. Route ids are stable, operator-controlled
+// strings. No user-input-derived label is added.
+
+/// Cache predictor bypass counter. Increments each time the predictor
+/// short-circuits the cache state machine because a prior origin
+/// response marked the key as uncacheable.
+/// Labels: `route_id` (bounded by the number of configured routes).
+static CACHE_PREDICTOR_BYPASS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "cache_predictor_bypass_total",
+            "Times the cache predictor short-circuited a request as uncacheable"
+        )
+        .namespace("lorica"),
+        &["route_id"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a cache-predictor bypass for a route.
+pub fn inc_cache_predictor_bypass(route_id: &str) {
+    CACHE_PREDICTOR_BYPASS_TOTAL
+        .with_label_values(&[route_id])
+        .inc();
+}
+
+/// Header-routing rule match counter. Increments each time a header
+/// rule selected a backend override. A separate label "fallthrough"
+/// is recorded when no rule matched, so operators can compare
+/// matched vs. default traffic without a second metric.
+/// Labels: `route_id`, `rule_index` (or `"default"` for fallthrough).
+static HEADER_RULE_MATCH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "header_rule_match_total",
+            "Header-based routing rule matches (rule_index=\"default\" when no rule matched)"
+        )
+        .namespace("lorica"),
+        &["route_id", "rule_index"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a header-routing rule match. Pass `"default"` as rule_index
+/// when no rule matched.
+pub fn inc_header_rule_match(route_id: &str, rule_index: &str) {
+    HEADER_RULE_MATCH_TOTAL
+        .with_label_values(&[route_id, rule_index])
+        .inc();
+}
+
+/// Canary traffic-split selection counter. `split_name` is the name
+/// the operator gave the split (or `""` for unnamed; `"default"` for
+/// the "didn't hit any split" bucket).
+/// Labels: `route_id`, `split_name`.
+static CANARY_SPLIT_SELECTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "canary_split_selected_total",
+            "Canary traffic split selections (split_name=\"default\" when no split matched)"
+        )
+        .namespace("lorica"),
+        &["route_id", "split_name"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a canary-split selection. Pass `"default"` as split_name
+/// when no split matched.
+pub fn inc_canary_split_selected(route_id: &str, split_name: &str) {
+    CANARY_SPLIT_SELECTED_TOTAL
+        .with_label_values(&[route_id, split_name])
+        .inc();
+}
+
+/// Request-mirroring outcome counter. Three outcomes:
+/// - `"spawned"`: mirror sub-request was launched
+/// - `"dropped_saturated"`: dropped because the 256-slot semaphore
+///   was exhausted (shadow fleet overloaded)
+/// - `"dropped_oversize_body"`: dropped because request body
+///   exceeded `max_body_bytes`
+///
+/// Labels: `route_id`, `outcome`.
+static MIRROR_OUTCOME_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "mirror_outcome_total",
+            "Request-mirroring sub-request outcomes per route"
+        )
+        .namespace("lorica"),
+        &["route_id", "outcome"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a mirror outcome.
+pub fn inc_mirror_outcome(route_id: &str, outcome: &str) {
+    MIRROR_OUTCOME_TOTAL
+        .with_label_values(&[route_id, outcome])
+        .inc();
+}
+
+/// Forward-auth verdict-cache hit/miss counter. `"hit"` means we
+/// served a cached Allow verdict without calling the auth service;
+/// `"miss"` means we made the sub-request. Labels: `route_id`,
+/// `outcome` ("hit" | "miss").
+static FORWARD_AUTH_CACHE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "forward_auth_cache_total",
+            "Forward-auth verdict cache lookups (outcome=hit|miss)"
+        )
+        .namespace("lorica"),
+        &["route_id", "outcome"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a forward-auth verdict cache lookup outcome.
+pub fn inc_forward_auth_cache(route_id: &str, outcome: &str) {
+    FORWARD_AUTH_CACHE_TOTAL
+        .with_label_values(&[route_id, outcome])
+        .inc();
+}
+
+/// Counter: notification events dropped by the bounded broadcast
+/// channel, labeled by drop reason (`lag` = subscriber fell behind,
+/// `closed` = channel closed). Bounded-cardinality: only two labels.
+static NOTIFIER_EVENTS_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "notifier_events_dropped_total",
+            "Alert events dropped by the notifier broadcast channel (reason=lag|closed)"
+        )
+        .namespace("lorica"),
+        &["reason"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one or more dropped notification events.
+pub fn inc_notifier_events_dropped(reason: &str, count: u64) {
+    NOTIFIER_EVENTS_DROPPED_TOTAL
+        .with_label_values(&[reason])
+        .inc_by(count);
+}
+
+/// Counter: BanIp commands dropped by the supervisor -> worker
+/// broadcast channel when a worker subscriber falls behind the
+/// bounded queue. Non-zero values signal that the ban channel
+/// capacity is too small for the ban burst rate or that a worker
+/// is stuck long enough to lag the channel. The auto-ban logic
+/// self-heals on subsequent WAF events + the next `ConfigReload`
+/// picks up the persisted state, so this is observability, not a
+/// correctness crisis.
+static BAN_BROADCAST_LAGGED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "ban_broadcast_lagged_total",
+            "BanIp commands missed by a worker subscriber due to broadcast channel lag"
+        )
+        .namespace("lorica"),
+        &["worker_id"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Counter: pipelined-RPC outcomes on the supervisor-to-worker
+/// channel. Labels: `kind` (`metrics_pull` | `config_reload_abort` |
+/// `config_reload_prepare` | `config_reload_commit`) and `outcome`
+/// (`ok` | `timeout` | `error`). Use this to spot a worker that
+/// consistently times out or errors on one RPC type while healthy
+/// on others (e.g. a long-running config rebuild stalling Prepare
+/// but leaving metrics pull responsive).
+///
+/// Non-zero `timeout` on `config_reload_prepare` usually means DB
+/// contention or a pathological config payload; non-zero `timeout`
+/// on `metrics_pull` means a worker is stuck past the 500 ms per-
+/// worker budget.
+static SUPERVISOR_RPC_OUTCOME_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "supervisor_rpc_outcome_total",
+            "Outcome of supervisor -> worker pipelined RPCs, by kind and result"
+        )
+        .namespace("lorica"),
+        &["kind", "outcome"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record the outcome of a supervisor-initiated RPC. `kind` is the
+/// logical operation (`metrics_pull`, `config_reload_prepare`,
+/// `config_reload_commit`, `config_reload_abort`) and `outcome` is
+/// one of `ok`, `timeout`, `error`. Safe to call from any async
+/// context (counter ops are lock-free).
+pub fn inc_supervisor_rpc_outcome(kind: &str, outcome: &str) {
+    SUPERVISOR_RPC_OUTCOME_TOTAL
+        .with_label_values(&[kind, outcome])
+        .inc();
+}
+
+/// Record one or more BanIp commands lagged on a given worker's
+/// broadcast subscription. `count` is the number of missed messages
+/// reported by `RecvError::Lagged(n)`.
+pub fn inc_ban_broadcast_lagged(worker_id: &str, count: u64) {
+    BAN_BROADCAST_LAGGED_TOTAL
+        .with_label_values(&[worker_id])
+        .inc_by(count);
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,
 /// system resources) from AppState before encoding.
+///
+/// In worker mode, first invokes the pipelined `metrics_refresher`
+/// (WPAR-7) so per-worker counters are pulled fresh over the RPC
+/// channel before the scrape encodes them. The refresher dedups
+/// concurrent scrapes internally and has a bounded per-worker
+/// timeout, so an unresponsive worker cannot stall a Prometheus poll.
+/// A conservative wall-clock timeout (~`refresher budget + margin`)
+/// wraps the whole invocation in case the refresher hangs on a
+/// supervisor-side lock - we never want /metrics to be the slowest
+/// thing a Prometheus scrape waits on.
 pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResponse {
+    // WPAR-7 pull-on-scrape: refresh aggregated counters before reading.
+    // Wall-clock budget = per-worker timeout (500 ms) + generous margin
+    // for scheduling overhead. On timeout we keep the cached state so
+    // the scrape still returns something useful.
+    if let Some(ref refresher) = state.metrics_refresher {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1_000), refresher()).await;
+    }
+
     // Refresh active connections (aggregated from workers if available)
     let active_conns = if let Some(ref agg) = state.aggregated_metrics {
         agg.total_active_connections().await as i64
@@ -347,8 +596,10 @@ mod tests {
         let encoder = TextEncoder::new();
         let families = REGISTRY.gather();
         let mut buf = Vec::new();
-        encoder.encode(&families, &mut buf).unwrap();
-        let text = String::from_utf8(buf).unwrap();
+        encoder
+            .encode(&families, &mut buf)
+            .expect("test setup: encode metrics");
+        let text = String::from_utf8(buf).expect("test setup: metrics output is UTF-8");
         assert!(text.contains("lorica_http_requests_total"));
         assert!(text.contains("test-encode"));
     }
@@ -364,7 +615,9 @@ mod tests {
         let encoder = TextEncoder::new();
         let families = REGISTRY.gather();
         let mut buf = Vec::new();
-        encoder.encode(&families, &mut buf).unwrap();
+        encoder
+            .encode(&families, &mut buf)
+            .expect("test setup: encode metrics");
         assert!(!buf.is_empty());
     }
 }

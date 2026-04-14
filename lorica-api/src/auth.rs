@@ -1,3 +1,9 @@
+//! Login, logout, password change, and admin user bootstrap.
+//!
+//! Passwords are hashed with Argon2id using OWASP-recommended parameters.
+//! Sessions are tracked by [`SessionStore`] and exposed via an HTTP-only
+//! `lorica_session` cookie.
+
 use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, Extension};
@@ -23,30 +29,37 @@ fn argon2_hasher() -> argon2::Argon2<'static> {
     )
 }
 
+/// JSON body for `POST /api/v1/auth/login`.
 #[derive(Deserialize)]
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
 }
 
+/// Successful login payload returned in the `data` envelope.
 #[derive(Serialize)]
 pub struct LoginResponse {
     pub must_change_password: bool,
     pub session_expires_at: String,
 }
 
+/// JSON body for `PUT /api/v1/auth/password`.
 #[derive(Deserialize)]
 pub struct ChangePasswordRequest {
     pub current_password: String,
     pub new_password: String,
 }
 
+/// Acknowledgement returned after a successful password change.
 #[derive(Serialize)]
 pub struct PasswordChangedResponse {
     pub message: String,
 }
 
-/// POST /api/v1/auth/login
+/// POST /api/v1/auth/login - verify credentials and issue a session cookie.
+///
+/// Rate limited per source IP. On success returns a `Set-Cookie` header
+/// with the new `lorica_session` token and updates `last_login`.
 pub async fn login(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     Extension(state): Extension<AppState>,
@@ -104,7 +117,7 @@ pub async fn login(
     ))
 }
 
-/// POST /api/v1/auth/logout
+/// POST /api/v1/auth/logout - invalidate the current session and clear the cookie.
 pub async fn logout(
     Extension(session_store): Extension<SessionStore>,
     headers: http::HeaderMap,
@@ -139,7 +152,10 @@ fn extract_current_session_id(headers: &http::HeaderMap) -> Option<String> {
     None
 }
 
-/// PUT /api/v1/auth/password
+/// PUT /api/v1/auth/password - rotate the current user's password.
+///
+/// Verifies the current password, enforces 8-128 character bounds on the new
+/// one, and invalidates every other session belonging to this user.
 pub async fn change_password(
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
@@ -208,10 +224,20 @@ pub fn hash_password(password: &str) -> Result<String, ApiError> {
 }
 
 /// Generate a random password for first-run admin setup.
+///
+/// Uses `OsRng` (getrandom) rather than `thread_rng` so the first-run
+/// password is unpredictable even if the thread_rng seeding path ever
+/// degrades. Matches the other crypto-sensitive RNG in this file
+/// (`hash_password`'s `SaltString::generate(OsRng)`). Audit L-5.
 pub fn generate_random_password() -> String {
-    use rand::Rng;
+    use rand::{Rng, SeedableRng};
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%&*";
-    let mut rng = rand::thread_rng();
+    // ChaCha20 seeded from OsRng: fast, deterministic-per-seed
+    // sequence but seeded from OS entropy. `rand::rngs::OsRng` itself
+    // is not a `Rng` in rand 0.8 (it's a `CryptoRng + RngCore`), and
+    // `gen_range` requires a `Rng`, so we re-seed a CSPRNG from OsRng.
+    let mut rng = rand_chacha::ChaCha20Rng::from_rng(rand::rngs::OsRng)
+        .expect("OsRng must seed ChaCha20 for admin password generation");
     (0..24)
         .map(|_| {
             let idx = rng.gen_range(0..CHARSET.len());

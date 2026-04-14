@@ -272,12 +272,12 @@
           </tr>
         </thead>
         <tbody>
-          {#each filteredBackends as b}
+          {#each filteredBackends as b (b.id)}
             <tr>
               <td>{b.name || '-'}</td>
               <td>{b.group_name || '-'}</td>
               <td class="mono">{b.address}</td>
-              <td><StatusBadge status={b.health_status} /></td>
+              <td><StatusBadge status={b.health_status as 'healthy' | 'degraded' | 'down' | 'unknown'} /></td>
               <td>{b.weight}</td>
               <td>
                 {#if b.health_check_enabled}
@@ -301,9 +301,11 @@
               <td class="mono">{b.ewma_score_us > 0 ? `${(b.ewma_score_us / 1000).toFixed(1)}ms` : '-'}</td>
               <td class="actions">
                 <button class="btn-icon" onclick={() => openEditForm(b)} title="Edit" aria-label="Edit">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html editIcon}
                 </button>
                 <button class="btn-icon btn-icon-danger" onclick={() => (deletingBackend = b)} title="Delete" aria-label="Delete">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html trashIcon}
                 </button>
               </td>
@@ -335,18 +337,18 @@
 
         <div class="form-row">
           <div class="form-group">
-            <label>Name</label>
-            <input type="text" bind:value={formName} placeholder="e.g. web-server-01, wazuh-node" />
+            <label for="backend-name">Name</label>
+            <input id="backend-name" type="text" bind:value={formName} placeholder="e.g. web-server-01, wazuh-node" />
           </div>
           <div class="form-group">
-            <label>Group</label>
-            <input type="text" bind:value={formGroupName} placeholder="e.g. kubernetes, production, dmz" />
+            <label for="backend-group">Group</label>
+            <input id="backend-group" type="text" bind:value={formGroupName} placeholder="e.g. kubernetes, production, dmz" />
           </div>
         </div>
 
         <div class="form-group">
-          <label>Address <span class="required">*</span></label>
-          <input type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" pattern="^[a-zA-Z0-9._-]+:\d{1,5}$" onblur={handleAddressBlur} />
+          <label for="backend-address">Address <span class="required">*</span></label>
+          <input id="backend-address" type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" pattern={'^[a-zA-Z0-9._-]+:\\d{1,5}$'} onblur={handleAddressBlur} />
           {#if addressError}
             <span class="field-error">{addressError}</span>
           {/if}
@@ -354,18 +356,18 @@
 
         <div class="form-row">
           <div class="form-group">
-            <label>Weight</label>
-            <input type="number" bind:value={formWeight} min="1" max="1000" />
+            <label for="backend-weight">Weight</label>
+            <input id="backend-weight" type="number" bind:value={formWeight} min="1" max="1000" />
           </div>
           <div class="form-group">
-            <label>Health Check Interval (s)</label>
-            <input type="number" bind:value={formHealthCheckInterval} min="5" max="3600" />
+            <label for="backend-healthcheck-interval">Health Check Interval (s)</label>
+            <input id="backend-healthcheck-interval" type="number" bind:value={formHealthCheckInterval} min="5" max="3600" />
           </div>
         </div>
 
         <div class="form-group">
-          <label>Health Check Path (empty = TCP only)</label>
-          <input type="text" bind:value={formHealthCheckPath} placeholder="/healthz" />
+          <label for="backend-healthcheck-path">Health Check Path (empty = TCP only)</label>
+          <input id="backend-healthcheck-path" type="text" bind:value={formHealthCheckPath} placeholder="/healthz" />
         </div>
 
         <div class="checkbox-row">

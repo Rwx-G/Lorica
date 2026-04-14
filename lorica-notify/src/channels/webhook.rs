@@ -17,7 +17,11 @@
 use super::{NotifyError, WebhookConfig};
 use crate::events::AlertEvent;
 
-/// Send an alert event as a JSON POST to the configured webhook URL.
+/// POST an alert event as JSON to the configured webhook URL.
+///
+/// Uses a 10-second total timeout. If `auth_header` is set it is sent
+/// verbatim as the `Authorization` header. Returns [`NotifyError::Webhook`]
+/// on transport failures or when the response status is not 2xx.
 pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), NotifyError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -69,7 +73,7 @@ mod tests {
     fn test_event_serializes_for_webhook() {
         let event = AlertEvent::new(AlertType::ConfigChanged, "config updated")
             .with_detail("changed_by", "admin");
-        let json = serde_json::to_value(&event).unwrap();
+        let json = serde_json::to_value(&event).expect("AlertEvent fixture serializes cleanly");
         assert_eq!(json["alert_type"], "config_changed");
         assert_eq!(json["details"]["changed_by"], "admin");
     }
@@ -102,8 +106,10 @@ mod tests {
             url: "https://hooks.example.com/alert".into(),
             auth_header: Some("Bearer secret".into()),
         };
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: WebhookConfig = serde_json::from_str(&json).unwrap();
+        let json =
+            serde_json::to_string(&config).expect("WebhookConfig fixture serializes cleanly");
+        let parsed: WebhookConfig =
+            serde_json::from_str(&json).expect("just-serialized JSON round-trips");
         assert_eq!(parsed.url, config.url);
         assert_eq!(parsed.auth_header, config.auth_header);
     }

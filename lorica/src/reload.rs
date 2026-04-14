@@ -20,14 +20,111 @@ use lorica_tls::cert_resolver::{CertData, CertResolver};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::connection_filter::{ConnectionFilterPolicy, GlobalConnectionFilter};
 use crate::proxy_wiring::ProxyConfig;
 
 /// Load all routes, backends, certificates and route-backend links from the store
 /// and build a new ProxyConfig, then atomically swap it in.
+///
+/// When `connection_filter` is provided, its CIDR policy is refreshed in the
+/// same transaction as the ProxyConfig swap, so listener-level filtering
+/// stays coherent with route/backend state after a settings change.
 pub async fn reload_proxy_config(
     store: &Arc<Mutex<ConfigStore>>,
     proxy_config: &Arc<ArcSwap<ProxyConfig>>,
+    connection_filter: Option<&Arc<GlobalConnectionFilter>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    reload_proxy_config_with_mtls(store, proxy_config, connection_filter, None).await
+}
+
+/// Result of the Prepare half of the two-phase config reload. Holds
+/// both the rebuilt [`ProxyConfig`] and the connection-filter policy
+/// so the Commit half can publish them together in the same ArcSwap-
+/// adjacent window. See design § 7 WPAR-8.
+pub struct PreparedReload {
+    pub config: ProxyConfig,
+    pub connection_allow_cidrs: Vec<String>,
+    pub connection_deny_cidrs: Vec<String>,
+    pub mtls_fingerprint_drift: Option<(Option<String>, Option<String>)>,
+}
+
+/// Prepare half of a two-phase config reload (WPAR-8).
+///
+/// Performs the slow work - SQLite reads, ProxyConfig construction,
+/// wrr_state preservation, mTLS fingerprint drift detection - but
+/// does **not** ArcSwap the current config or reload the connection
+/// filter. The caller stashes the result and commits it later via
+/// [`commit_prepared_reload`] so multi-worker deployments can
+/// coordinate the swap within microseconds instead of the ~10-50 ms
+/// window the slow rebuild takes.
+pub async fn build_proxy_config(
+    store: &Arc<Mutex<ConfigStore>>,
+    proxy_config: &Arc<ArcSwap<ProxyConfig>>,
+    installed_mtls_fingerprint: Option<&parking_lot::Mutex<Option<String>>>,
+) -> Result<PreparedReload, Box<dyn std::error::Error + Send + Sync>> {
+    let prepared =
+        build_proxy_config_inner(store, proxy_config, installed_mtls_fingerprint).await?;
+    Ok(prepared)
+}
+
+/// Commit half of a two-phase config reload (WPAR-8).
+///
+/// Atomically publishes the [`PreparedReload`] built by
+/// [`build_proxy_config`]. This is the fast path; under normal
+/// operation it's a single ArcSwap plus a lockfree connection filter
+/// reload, so the divergence window between workers collapses to
+/// RTT skew on the UDS channel.
+pub fn commit_prepared_reload(
+    proxy_config: &Arc<ArcSwap<ProxyConfig>>,
+    connection_filter: Option<&Arc<GlobalConnectionFilter>>,
+    prepared: PreparedReload,
+) {
+    if let Some((installed_fp, current_fp)) = &prepared.mtls_fingerprint_drift {
+        warn!(
+            installed = ?installed_fp,
+            current = ?current_fp,
+            "mtls CA bundle changed since startup; restart Lorica to apply (rustls ServerConfig is immutable). Toggling mtls.required or editing allowed_organizations takes effect live."
+        );
+    }
+    proxy_config.store(Arc::new(prepared.config));
+    if let Some(filter) = connection_filter {
+        let policy = ConnectionFilterPolicy::from_cidrs(
+            &prepared.connection_allow_cidrs,
+            &prepared.connection_deny_cidrs,
+        );
+        let allow_count = policy.allow.len();
+        let deny_count = policy.deny.len();
+        filter.reload(policy);
+        info!(
+            allow_cidrs = allow_count,
+            deny_cidrs = deny_count,
+            "connection filter reloaded"
+        );
+    }
+}
+
+/// Variant of [`reload_proxy_config`] that also compares the current
+/// CA fingerprint against the one installed on the listener at startup
+/// and logs a warning when they differ. Kept as a separate entry
+/// point so existing callers (tests, internal call sites that never
+/// see a fingerprint) don't need to track a new argument.
+pub async fn reload_proxy_config_with_mtls(
+    store: &Arc<Mutex<ConfigStore>>,
+    proxy_config: &Arc<ArcSwap<ProxyConfig>>,
+    connection_filter: Option<&Arc<GlobalConnectionFilter>>,
+    installed_mtls_fingerprint: Option<&parking_lot::Mutex<Option<String>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let prepared =
+        build_proxy_config_inner(store, proxy_config, installed_mtls_fingerprint).await?;
+    commit_prepared_reload(proxy_config, connection_filter, prepared);
+    Ok(())
+}
+
+async fn build_proxy_config_inner(
+    store: &Arc<Mutex<ConfigStore>>,
+    proxy_config: &Arc<ArcSwap<ProxyConfig>>,
+    installed_mtls_fingerprint: Option<&parking_lot::Mutex<Option<String>>>,
+) -> Result<PreparedReload, Box<dyn std::error::Error + Send + Sync>> {
     let store = store.lock().await;
 
     let routes = store.list_routes()?;
@@ -63,6 +160,14 @@ pub async fn reload_proxy_config(
         .as_ref()
         .map(|s| s.waf_whitelist_ips.clone())
         .unwrap_or_default();
+    let connection_allow_cidrs = settings
+        .as_ref()
+        .map(|s| s.connection_allow_cidrs.clone())
+        .unwrap_or_default();
+    let connection_deny_cidrs = settings
+        .as_ref()
+        .map(|s| s.connection_deny_cidrs.clone())
+        .unwrap_or_default();
 
     let links: Vec<(String, String)> = route_backends
         .into_iter()
@@ -85,15 +190,33 @@ pub async fn reload_proxy_config(
         },
     );
 
-    // Preserve round-robin counters from the old config to avoid resetting
-    // load distribution on every config reload
+    // Preserve round-robin counters from the old config to avoid
+    // resetting load distribution on every config reload. Entries are
+    // now stored as `Arc<RouteEntry>` (shared across hostname +
+    // aliases), so we rebuild the inner struct with the preserved
+    // wrr_state once per route_id and then replace every Arc slot
+    // pointing at that route.
     let old_config = proxy_config.load();
-    for entries in new_config.routes_by_host.values_mut() {
-        for entry in entries.iter_mut() {
+    let mut rebuilt: std::collections::HashMap<String, Arc<crate::proxy_wiring::RouteEntry>> =
+        std::collections::HashMap::new();
+    for entries in new_config.routes_by_host.values() {
+        for entry in entries {
+            if rebuilt.contains_key(&entry.route.id) {
+                continue;
+            }
             if let Some(old_entries) = old_config.routes_by_host.get(&entry.route.hostname) {
                 if let Some(old_entry) = old_entries.iter().find(|e| e.route.id == entry.route.id) {
-                    entry.wrr_state = Arc::clone(&old_entry.wrr_state);
+                    let mut new_inner = (**entry).clone();
+                    new_inner.wrr_state = Arc::clone(&old_entry.wrr_state);
+                    rebuilt.insert(entry.route.id.clone(), Arc::new(new_inner));
                 }
+            }
+        }
+    }
+    for entries in new_config.routes_by_host.values_mut() {
+        for slot in entries.iter_mut() {
+            if let Some(new_arc) = rebuilt.get(&slot.route.id) {
+                *slot = Arc::clone(new_arc);
             }
         }
     }
@@ -101,8 +224,37 @@ pub async fn reload_proxy_config(
     let route_count: usize = new_config.routes_by_host.values().map(|v| v.len()).sum();
     info!(routes = route_count, "proxy configuration reloaded");
 
-    proxy_config.store(Arc::new(new_config));
-    Ok(())
+    // mTLS CA bundle drift detection: rustls `ServerConfig` is
+    // immutable after the listener is built, so any edit to a
+    // route's `mtls.ca_cert_pem` at runtime won't take effect until
+    // the process is restarted. We detect drift in Prepare so the
+    // log lands once per reload (rather than twice if both Prepare
+    // and Commit emit it); the actual warn! is deferred to
+    // `commit_prepared_reload` so it only fires if the commit
+    // succeeds.
+    let mtls_fingerprint_drift = if let Some(slot) = installed_mtls_fingerprint {
+        let current_routes: Vec<lorica_config::models::Route> = new_config
+            .routes_by_host
+            .values()
+            .flat_map(|v| v.iter().map(|e| (*e.route).clone()))
+            .collect();
+        let current_fp = crate::mtls::compute_ca_fingerprint(&current_routes);
+        let installed_fp = slot.lock().clone();
+        if installed_fp != current_fp {
+            Some((installed_fp, current_fp))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(PreparedReload {
+        config: new_config,
+        connection_allow_cidrs,
+        connection_deny_cidrs,
+        mtls_fingerprint_drift,
+    })
 }
 
 /// Reload the TLS certificate resolver from the database.

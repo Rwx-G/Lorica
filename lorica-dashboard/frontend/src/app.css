@@ -661,6 +661,11 @@ tbody tr:hover td {
   padding: var(--space-4);
 }
 
+.settings-section-body .btn-primary,
+.settings-section-body .btn-secondary {
+  min-width: 140px;
+}
+
 .settings-hint {
   color: var(--color-text-muted);
   font-size: 0.8125rem;
@@ -897,4 +902,18 @@ tbody tr:hover td {
 .settings-actions-cell {
   display: flex;
   gap: 0.5rem;
+}
+
+/* Screen-reader-only utility: keeps labels accessible without
+   visually rendering them. Standard WCAG clip pattern. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }

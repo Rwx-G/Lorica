@@ -42,7 +42,7 @@ use std::net::SocketAddr;
 /// ```rust,no_run
 /// use async_trait::async_trait;
 /// use lorica_core::listeners::ConnectionFilter;
-/// use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+/// use std::net::{IpAddr, SocketAddr};
 ///
 /// #[derive(Debug)]
 /// struct BlocklistFilter {
@@ -51,8 +51,11 @@ use std::net::SocketAddr;
 ///
 /// #[async_trait]
 /// impl ConnectionFilter for BlocklistFilter {
-///     async fn should_accept(&self, addr: &SocketAddr) -> bool {
-///         !self.blocked_ips.contains(&addr.ip())
+///     async fn should_accept(&self, addr: Option<&SocketAddr>) -> bool {
+///         match addr {
+///             Some(a) => !self.blocked_ips.contains(&a.ip()),
+///             None => true,
+///         }
 ///     }
 /// }
 /// ```
@@ -80,14 +83,14 @@ pub trait ConnectionFilter: Debug + Send + Sync {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
-    /// async fn should_accept(&self, addr: &SocketAddr) -> bool {
-    ///     // Accept only connections from private IP ranges
-    ///     match addr.ip() {
-    ///         IpAddr::V4(ip) => ip.is_private(),
-    ///         IpAddr::V6(_) => true,
+    /// ```rust,ignore
+    /// async fn should_accept(&self, addr: Option<&SocketAddr>) -> bool {
+    ///     match addr.map(|a| a.ip()) {
+    ///         Some(std::net::IpAddr::V4(ip)) => ip.is_private(),
+    ///         _ => true,
     ///     }
     /// }
+    /// ```
     ///
     async fn should_accept(&self, _addr: Option<&SocketAddr>) -> bool {
         true

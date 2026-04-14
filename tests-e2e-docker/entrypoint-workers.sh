@@ -1,10 +1,9 @@
 #!/bin/sh
 # E2E test entrypoint for multi-worker mode.
 # Runs Lorica with --workers 2 to test process isolation.
-# Workers require root for fork+exec, so we run as root here.
+# Container runs as the non-root lorica user (see Dockerfile USER).
 
 mkdir -p /shared
-chown lorica:lorica /var/lib/lorica
 
 socat TCP-LISTEN:9443,fork,reuseaddr TCP:127.0.0.1:19443 &
 

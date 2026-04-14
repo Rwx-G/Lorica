@@ -1,4 +1,4 @@
-import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest } from './api';
+import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest, MirrorConfigRequest, ResponseRewriteConfigRequest, MtlsConfigRequest } from './api';
 
 export interface PathRuleFormState {
   path: string;
@@ -12,6 +12,30 @@ export interface PathRuleFormState {
   rate_limit_burst: string;
   redirect_to: string;
   return_status: string;
+}
+
+export interface HeaderRuleFormState {
+  header_name: string;
+  match_type: string;   // 'exact' | 'prefix' | 'regex'
+  value: string;
+  backend_ids: string[];
+  // Read-only runtime signal from the server: true when the proxy
+  // skipped the rule because its regex failed to compile. The form
+  // never sends this back; we only use it to render a warning badge.
+  disabled?: boolean;
+}
+
+export interface TrafficSplitFormState {
+  name: string;
+  weight_percent: number;
+  backend_ids: string[];
+}
+
+export interface ResponseRewriteRuleFormState {
+  pattern: string;
+  replacement: string;
+  is_regex: boolean;
+  max_replacements: string; // "" = unlimited; otherwise parseable int
 }
 
 export interface RouteFormState {
@@ -68,6 +92,27 @@ export interface RouteFormState {
   retry_on_methods: string;
   maintenance_mode: boolean;
   error_page_html: string;
+  cache_vary_headers: string;
+  header_rules: HeaderRuleFormState[];
+  traffic_splits: TrafficSplitFormState[];
+  forward_auth_address: string;        // empty = feature off
+  forward_auth_timeout_ms: number;     // 5000 default
+  forward_auth_response_headers: string; // CSV
+  mirror_backend_ids: string[];         // empty = feature off
+  mirror_sample_percent: number;        // 0..100
+  mirror_timeout_ms: number;            // 5000 default
+  mirror_max_body_bytes: number;        // 1048576 default; 0 = headers-only
+  response_rewrite_rules: ResponseRewriteRuleFormState[]; // empty = feature off
+  response_rewrite_max_body_bytes: number;
+  response_rewrite_content_type_prefixes: string; // CSV
+  mtls_ca_cert_pem: string;              // empty = feature off
+  mtls_required: boolean;
+  mtls_allowed_organizations: string;    // CSV
+  // Per-route token-bucket rate limit (cross-worker under `--workers`).
+  // Empty / 0 capacity = feature off.
+  rate_limit_capacity: number | '';
+  rate_limit_refill_per_sec: number | '';
+  rate_limit_scope: 'per_ip' | 'per_route';
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -124,6 +169,25 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   retry_on_methods: '',
   maintenance_mode: false,
   error_page_html: '',
+  cache_vary_headers: '',
+  header_rules: [],
+  traffic_splits: [],
+  forward_auth_address: '',
+  forward_auth_timeout_ms: 5000,
+  forward_auth_response_headers: '',
+  mirror_backend_ids: [],
+  mirror_sample_percent: 100,
+  mirror_timeout_ms: 5000,
+  mirror_max_body_bytes: 1048576,
+  response_rewrite_rules: [],
+  response_rewrite_max_body_bytes: 1048576,
+  response_rewrite_content_type_prefixes: '',
+  mtls_ca_cert_pem: '',
+  mtls_required: false,
+  mtls_allowed_organizations: '',
+  rate_limit_capacity: '',
+  rate_limit_refill_per_sec: '',
+  rate_limit_scope: 'per_ip',
 };
 
 // Tab field mappings for dot indicators
@@ -141,6 +205,8 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'security_headers', 'max_body_mb', 'rate_limit_rps',
     'rate_limit_burst', 'ip_allowlist', 'ip_denylist',
     'basic_auth_username', 'basic_auth_password',
+    'forward_auth_address', 'forward_auth_timeout_ms', 'forward_auth_response_headers',
+    'mtls_ca_cert_pem', 'mtls_required', 'mtls_allowed_organizations',
   ],
   headers: [
     'proxy_headers', 'proxy_headers_remove',
@@ -151,12 +217,18 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   ],
   caching: [
     'cache_enabled', 'cache_ttl_s', 'cache_max_mb', 'stale_while_revalidate_s', 'stale_if_error_s',
+    'cache_vary_headers',
   ],
   protection: [
     'max_connections', 'slowloris_threshold_ms',
     'auto_ban_threshold', 'auto_ban_duration_s',
+    'rate_limit_capacity', 'rate_limit_refill_per_sec', 'rate_limit_scope',
   ],
   path_rules: ['path_rules'],
+  header_rules: ['header_rules'],
+  traffic_splits: ['traffic_splits'],
+  mirror: ['mirror_backend_ids', 'mirror_sample_percent', 'mirror_timeout_ms', 'mirror_max_body_bytes'],
+  response_rewrite: ['response_rewrite_rules', 'response_rewrite_max_body_bytes', 'response_rewrite_content_type_prefixes'],
 };
 
 function recordToText(rec: Record<string, string>): string {
@@ -174,6 +246,27 @@ function textToRecord(text: string): Record<string, string> {
     }
   }
   return result;
+}
+
+/**
+ * Parse a token list that accepts BOTH comma AND newline separators.
+ *
+ * Lorica's form inputs are inconsistent in which separator they
+ * advertise (CSV for header names, one-per-line for IPs / CIDRs).
+ * Accepting both here means a user who pastes from docs / a spread-
+ * sheet / a previous route's export doesn't get surprised. Tokens
+ * are trimmed and empty ones are dropped; this matches the behaviour
+ * operators expect from similar fields in kubectl / nginx.conf.
+ *
+ * Kept alongside the legacy `csvToArray` / `linesToArray` because
+ * some callers rely on the strict single-separator semantics (e.g.
+ * preserving user-typed empty entries for validation surfacing).
+ */
+function tokenListToArray(text: string): string[] {
+  return text
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 function csvToArray(text: string): string[] {
@@ -251,7 +344,146 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     retry_on_methods: (route.retry_on_methods ?? []).join(', '),
     maintenance_mode: route.maintenance_mode ?? false,
     error_page_html: route.error_page_html ?? '',
+    cache_vary_headers: (route.cache_vary_headers ?? []).join(', '),
+    header_rules: (route.header_rules ?? []).map((r) => ({
+      header_name: r.header_name,
+      match_type: r.match_type ?? 'exact',
+      value: r.value,
+      backend_ids: [...(r.backend_ids ?? [])],
+      disabled: r.disabled ?? false,
+    })),
+    traffic_splits: (route.traffic_splits ?? []).map((s) => ({
+      name: s.name ?? '',
+      weight_percent: s.weight_percent,
+      backend_ids: [...(s.backend_ids ?? [])],
+    })),
+    forward_auth_address: route.forward_auth?.address ?? '',
+    forward_auth_timeout_ms: route.forward_auth?.timeout_ms ?? 5000,
+    forward_auth_response_headers: (route.forward_auth?.response_headers ?? []).join(', '),
+    mirror_backend_ids: [...(route.mirror?.backend_ids ?? [])],
+    mirror_sample_percent: route.mirror?.sample_percent ?? 100,
+    mirror_timeout_ms: route.mirror?.timeout_ms ?? 5000,
+    mirror_max_body_bytes: route.mirror?.max_body_bytes ?? 1048576,
+    response_rewrite_rules: (route.response_rewrite?.rules ?? []).map((r) => ({
+      pattern: r.pattern,
+      replacement: r.replacement,
+      is_regex: r.is_regex,
+      max_replacements: r.max_replacements != null ? String(r.max_replacements) : '',
+    })),
+    response_rewrite_max_body_bytes: route.response_rewrite?.max_body_bytes ?? 1048576,
+    response_rewrite_content_type_prefixes: (route.response_rewrite?.content_type_prefixes ?? []).join(', '),
+    mtls_ca_cert_pem: route.mtls?.ca_cert_pem ?? '',
+    mtls_required: route.mtls?.required ?? false,
+    mtls_allowed_organizations: (route.mtls?.allowed_organizations ?? []).join(', '),
+    rate_limit_capacity: route.rate_limit?.capacity ?? '',
+    rate_limit_refill_per_sec: route.rate_limit?.refill_per_sec ?? '',
+    rate_limit_scope: route.rate_limit?.scope ?? 'per_ip',
   };
+}
+
+function headerRuleFormToRequest(rules: HeaderRuleFormState[]): HeaderRuleRequest[] | undefined {
+  if (rules.length === 0) return undefined;
+  return rules
+    // Drop empty rules silently so an operator who clicks "+ Add" and then
+    // navigates away doesn't send a malformed rule to the API.
+    .filter((r) => r.header_name.trim().length > 0)
+    .map((r) => ({
+      header_name: r.header_name.trim(),
+      match_type: r.match_type,
+      value: r.value,
+      backend_ids: [...r.backend_ids],
+    }));
+}
+
+function responseRewriteFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): ResponseRewriteConfigRequest | undefined {
+  // An operator clicking "+ Add rule" then not filling anything in
+  // produces an all-blank rule; drop those silently so they don't
+  // trip API-layer validation.
+  const rules = form.response_rewrite_rules
+    .filter((r) => r.pattern.trim().length > 0)
+    .map((r) => {
+      const maxStr = r.max_replacements.trim();
+      const max = maxStr === '' ? null : Number(maxStr);
+      return {
+        pattern: r.pattern,
+        replacement: r.replacement,
+        is_regex: r.is_regex,
+        max_replacements: max,
+      };
+    });
+  if (rules.length === 0) {
+    // On update, empty rules = "disable the feature". On create,
+    // omit so the row is inserted with NULL.
+    return isUpdate
+      ? { rules: [], max_body_bytes: 0, content_type_prefixes: [] }
+      : undefined;
+  }
+  return {
+    rules,
+    max_body_bytes: form.response_rewrite_max_body_bytes,
+    content_type_prefixes: form.response_rewrite_content_type_prefixes
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  };
+}
+
+function mirrorFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): MirrorConfigRequest | undefined {
+  if (form.mirror_backend_ids.length === 0) {
+    // On update, empty backends is the dashboard's "disable" signal.
+    // On create, omit entirely so the row is inserted with NULL.
+    return isUpdate
+      ? { backend_ids: [], sample_percent: 0, timeout_ms: 0, max_body_bytes: 0 }
+      : undefined;
+  }
+  return {
+    backend_ids: [...form.mirror_backend_ids],
+    sample_percent: form.mirror_sample_percent,
+    timeout_ms: form.mirror_timeout_ms,
+    max_body_bytes: form.mirror_max_body_bytes,
+  };
+}
+
+function forwardAuthFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): ForwardAuthConfigRequest | undefined {
+  const addr = form.forward_auth_address.trim();
+  if (addr === '') {
+    // On update, an empty address signals "clear the feature" - send
+    // an explicit empty-address object so the API disables it. On create,
+    // leave it undefined so the row is inserted with forward_auth = NULL.
+    return isUpdate
+      ? { address: '', timeout_ms: 0, response_headers: [] }
+      : undefined;
+  }
+  return {
+    address: addr,
+    timeout_ms: form.forward_auth_timeout_ms,
+    response_headers: tokenListToArray(form.forward_auth_response_headers),
+  };
+}
+
+function trafficSplitFormToRequest(
+  splits: TrafficSplitFormState[],
+): TrafficSplitRequest[] | undefined {
+  if (splits.length === 0) return undefined;
+  // Drop splits with no backends AND zero weight (the "+ Add new" default
+  // before the operator fills anything in). A non-zero weight with empty
+  // backends is left intact so the API surfaces the validation error.
+  return splits
+    .filter((s) => !(s.backend_ids.length === 0 && s.weight_percent === 0))
+    .map((s) => ({
+      name: s.name.trim(),
+      weight_percent: s.weight_percent,
+      backend_ids: [...s.backend_ids],
+    }));
 }
 
 function pathRuleFormToRequest(rules: PathRuleFormState[]): PathRuleRequest[] | undefined {
@@ -281,7 +513,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     force_https: form.force_https,
     redirect_hostname: form.redirect_hostname || (isUpdate ? '' : undefined),
     redirect_to: form.redirect_to || (isUpdate ? '' : undefined),
-    hostname_aliases: csvToArray(form.hostname_aliases).length > 0 ? csvToArray(form.hostname_aliases) : empty([]),
+    hostname_aliases: tokenListToArray(form.hostname_aliases).length > 0 ? tokenListToArray(form.hostname_aliases) : empty([]),
     websocket_enabled: form.websocket_enabled,
     access_log_enabled: form.access_log_enabled,
     connect_timeout_s: form.connect_timeout_s,
@@ -323,6 +555,61 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     retry_on_methods: csvToArray(form.retry_on_methods).length > 0 ? csvToArray(form.retry_on_methods) : empty([]),
     maintenance_mode: form.maintenance_mode,
     error_page_html: form.error_page_html || undefined,
+    cache_vary_headers: tokenListToArray(form.cache_vary_headers).length > 0
+      ? tokenListToArray(form.cache_vary_headers)
+      : empty([]),
+    header_rules: headerRuleFormToRequest(form.header_rules) ?? (isUpdate ? [] : undefined),
+    traffic_splits: trafficSplitFormToRequest(form.traffic_splits) ?? (isUpdate ? [] : undefined),
+    forward_auth: forwardAuthFormToRequest(form, isUpdate),
+    mirror: mirrorFormToRequest(form, isUpdate),
+    response_rewrite: responseRewriteFormToRequest(form, isUpdate),
+    mtls: mtlsFormToRequest(form, isUpdate),
+    rate_limit: rateLimitFormToRequest(form, isUpdate),
+  };
+}
+
+function rateLimitFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): { capacity: number; refill_per_sec: number; scope: 'per_ip' | 'per_route' } | undefined {
+  const capacity =
+    typeof form.rate_limit_capacity === 'number'
+      ? form.rate_limit_capacity
+      : 0;
+  if (capacity === 0) {
+    // On update, capacity=0 is the explicit "disable" signal (API
+    // clears `rate_limit` to None). On create, omit entirely.
+    return isUpdate
+      ? { capacity: 0, refill_per_sec: 0, scope: form.rate_limit_scope }
+      : undefined;
+  }
+  const refill =
+    typeof form.rate_limit_refill_per_sec === 'number'
+      ? form.rate_limit_refill_per_sec
+      : 0;
+  return {
+    capacity,
+    refill_per_sec: refill,
+    scope: form.rate_limit_scope,
+  };
+}
+
+function mtlsFormToRequest(
+  form: RouteFormState,
+  isUpdate: boolean,
+): MtlsConfigRequest | undefined {
+  const pem = form.mtls_ca_cert_pem.trim();
+  if (pem === '') {
+    // On update, empty PEM = clear the feature (API treats an
+    // empty ca_cert_pem as "disable"). On create, omit entirely.
+    return isUpdate
+      ? { ca_cert_pem: '', required: false, allowed_organizations: [] }
+      : undefined;
+  }
+  return {
+    ca_cert_pem: pem,
+    required: form.mtls_required,
+    allowed_organizations: tokenListToArray(form.mtls_allowed_organizations),
   };
 }
 
@@ -360,6 +647,18 @@ export function getModifiedFields(form: RouteFormState): Set<string> {
       if (form.path_rules.length > 0) modified.add(key);
       continue;
     }
+    if (key === 'header_rules') {
+      if (form.header_rules.length > 0) modified.add(key);
+      continue;
+    }
+    if (key === 'traffic_splits') {
+      if (form.traffic_splits.length > 0) modified.add(key);
+      continue;
+    }
+    if (key === 'response_rewrite_rules') {
+      if (form.response_rewrite_rules.length > 0) modified.add(key);
+      continue;
+    }
     const defaultVal = ROUTE_DEFAULTS[key];
     const currentVal = form[key];
     if (Array.isArray(defaultVal) && Array.isArray(currentVal)) {
@@ -392,6 +691,137 @@ export function validateHostname(value: string): string {
   return '';
 }
 
+/**
+ * Result shape for `validateRouteFormWithTab`. `tab` names the drawer
+ * tab that owns the offending field so the caller can auto-switch
+ * the view and put the user in front of the problem; `null` means
+ * the error spans multiple tabs or couldn't be attributed (fall back
+ * to just displaying the message).
+ */
+export interface ValidationResult {
+  message: string;
+  tab: string | null;
+}
+
+/**
+ * Same checks as `validateRouteForm` but returns an object that
+ * includes the owning tab id. RouteDrawer uses this to auto-switch
+ * to the correct tab when a submit fails so users don't have to hunt
+ * for the offending field (F-02 UX review finding).
+ *
+ * Kept alongside the legacy string-returning `validateRouteForm`
+ * because 75 existing unit tests depend on the string contract.
+ */
+export function validateRouteFormWithTab(form: RouteFormState): ValidationResult {
+  const r = (message: string, tab: string | null = null): ValidationResult => ({ message, tab });
+
+  const hostErr = validateHostname(form.hostname);
+  if (hostErr) return r(hostErr, 'general');
+  if (form.path_prefix && !form.path_prefix.startsWith('/')) return r('Path prefix must start with /', 'general');
+  if (form.connect_timeout_s < 1 || form.connect_timeout_s > 3600) return r('Connect timeout must be between 1 and 3600', 'timeouts');
+  if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return r('Read timeout must be between 1 and 3600', 'timeouts');
+  if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return r('Send timeout must be between 1 and 3600', 'timeouts');
+  if (form.max_body_mb && Number(form.max_body_mb) <= 0) return r('Max body size must be greater than 0', 'security');
+  if (form.rate_limit_rps && Number(form.rate_limit_rps) <= 0) return r('Rate limit RPS must be greater than 0', 'security');
+  if (form.rate_limit_burst && Number(form.rate_limit_burst) <= 0) return r('Rate limit burst must be greater than 0', 'security');
+  if (form.rate_limit_rps && form.rate_limit_burst && Number(form.rate_limit_burst) < Number(form.rate_limit_rps)) {
+    return r('Rate limit burst must be >= RPS', 'security');
+  }
+  if (form.cors_max_age_s && Number(form.cors_max_age_s) <= 0) return r('CORS max age must be greater than 0', 'cors');
+  const allowErr = validateIpList(form.ip_allowlist);
+  if (allowErr) return r(`IP allowlist: ${allowErr}`, 'security');
+  const denyErr = validateIpList(form.ip_denylist);
+  if (denyErr) return r(`IP denylist: ${denyErr}`, 'security');
+  // Traffic splits
+  let totalWeight = 0;
+  for (const s of form.traffic_splits) {
+    if (!Number.isInteger(s.weight_percent) || s.weight_percent < 0 || s.weight_percent > 100) {
+      return r(`Traffic split weight must be 0..100 (got ${s.weight_percent})`, 'traffic_splits');
+    }
+    if (s.weight_percent > 0 && s.backend_ids.length === 0) {
+      return r('Traffic split with non-zero weight must select at least one backend', 'traffic_splits');
+    }
+    totalWeight += s.weight_percent;
+  }
+  if (totalWeight > 100) {
+    return r(`Traffic splits: cumulative weight must be <= 100 (got ${totalWeight})`, 'traffic_splits');
+  }
+  // Forward auth
+  if (form.forward_auth_address.trim() !== '') {
+    const addr = form.forward_auth_address.trim();
+    if (!/^https?:\/\/[^\s/]+/.test(addr)) {
+      return r('Forward auth URL must start with http:// or https:// and include a host', 'security');
+    }
+    const t = Number(form.forward_auth_timeout_ms);
+    if (!Number.isInteger(t) || t < 1 || t > 60000) {
+      return r('Forward auth timeout must be 1..60000 ms', 'security');
+    }
+  }
+  // Mirror
+  if (form.mirror_backend_ids.length > 0) {
+    const pct = Number(form.mirror_sample_percent);
+    if (!Number.isInteger(pct) || pct < 0 || pct > 100) {
+      return r('Mirror sample percent must be 0..100', 'security');
+    }
+    const mt = Number(form.mirror_timeout_ms);
+    if (!Number.isInteger(mt) || mt < 1 || mt > 60000) {
+      return r('Mirror timeout must be 1..60000 ms', 'security');
+    }
+    const mb = Number(form.mirror_max_body_bytes);
+    if (!Number.isInteger(mb) || mb < 0 || mb > 128 * 1048576) {
+      return r('Mirror max body bytes must be 0..134217728 (128 MiB; 0 = headers only)', 'security');
+    }
+  }
+  // Response rewrite
+  if (form.response_rewrite_rules.length > 0) {
+    const mb = Number(form.response_rewrite_max_body_bytes);
+    if (!Number.isInteger(mb) || mb < 1 || mb > 128 * 1048576) {
+      return r('Response rewrite max body bytes must be 1..134217728 (128 MiB)', 'response_rewrite');
+    }
+    for (let i = 0; i < form.response_rewrite_rules.length; i++) {
+      const rule = form.response_rewrite_rules[i];
+      if (!rule.pattern.trim()) {
+        return r(`Response rewrite rule ${i + 1}: pattern must not be empty`, 'response_rewrite');
+      }
+      if (rule.is_regex) {
+        try {
+           
+          new RegExp(rule.pattern);
+        } catch (e) {
+          return r(`Response rewrite rule ${i + 1}: invalid regex (${(e as Error).message})`, 'response_rewrite');
+        }
+      }
+      const maxStr = rule.max_replacements.trim();
+      if (maxStr !== '') {
+        const n = Number(maxStr);
+        if (!Number.isInteger(n) || n < 1) {
+          return r(`Response rewrite rule ${i + 1}: max_replacements must be a positive integer (or empty for unlimited)`, 'response_rewrite');
+        }
+      }
+    }
+  }
+  // mTLS
+  const mtlsPem = form.mtls_ca_cert_pem.trim();
+  if (mtlsPem !== '') {
+    if (!/-----BEGIN CERTIFICATE-----/.test(mtlsPem)) {
+      return r('mTLS CA PEM must contain at least one "-----BEGIN CERTIFICATE-----" block', 'security');
+    }
+    if (mtlsPem.length > 1048576) {
+      return r('mTLS CA PEM must be 1 MiB or smaller; trim the bundle to issuing CAs only', 'security');
+    }
+    const raw = form.mtls_allowed_organizations;
+    if (raw.trim() !== '') {
+      const parts = raw.split(/[,\n]/);
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i].trim() === '') {
+          return r(`mTLS allowed organization #${i + 1} must not be empty`, 'security');
+        }
+      }
+    }
+  }
+  return r('', null);
+}
+
 export function validateRouteForm(form: RouteFormState): string {
   const hostErr = validateHostname(form.hostname);
   if (hostErr) return hostErr;
@@ -410,5 +840,97 @@ export function validateRouteForm(form: RouteFormState): string {
   if (allowErr) return `IP allowlist: ${allowErr}`;
   const denyErr = validateIpList(form.ip_denylist);
   if (denyErr) return `IP denylist: ${denyErr}`;
+  // Traffic splits: weights in range + cumulative <= 100. Catching this
+  // client-side gives an immediate red outline instead of a 400 round-trip.
+  let totalWeight = 0;
+  for (const s of form.traffic_splits) {
+    if (!Number.isInteger(s.weight_percent) || s.weight_percent < 0 || s.weight_percent > 100) {
+      return `Traffic split weight must be 0..100 (got ${s.weight_percent})`;
+    }
+    if (s.weight_percent > 0 && s.backend_ids.length === 0) {
+      return 'Traffic split with non-zero weight must select at least one backend';
+    }
+    totalWeight += s.weight_percent;
+  }
+  if (totalWeight > 100) {
+    return `Traffic splits: cumulative weight must be <= 100 (got ${totalWeight})`;
+  }
+  // Forward auth URL + timeout sanity. Empty address = feature off (OK).
+  if (form.forward_auth_address.trim() !== '') {
+    const addr = form.forward_auth_address.trim();
+    if (!/^https?:\/\/[^\s/]+/.test(addr)) {
+      return 'Forward auth URL must start with http:// or https:// and include a host';
+    }
+    const t = Number(form.forward_auth_timeout_ms);
+    if (!Number.isInteger(t) || t < 1 || t > 60000) {
+      return 'Forward auth timeout must be 1..60000 ms';
+    }
+  }
+  // Mirror sanity. Empty backend list = feature off (OK).
+  if (form.mirror_backend_ids.length > 0) {
+    const pct = Number(form.mirror_sample_percent);
+    if (!Number.isInteger(pct) || pct < 0 || pct > 100) {
+      return 'Mirror sample percent must be 0..100';
+    }
+    const mt = Number(form.mirror_timeout_ms);
+    if (!Number.isInteger(mt) || mt < 1 || mt > 60000) {
+      return 'Mirror timeout must be 1..60000 ms';
+    }
+    const mb = Number(form.mirror_max_body_bytes);
+    if (!Number.isInteger(mb) || mb < 0 || mb > 128 * 1048576) {
+      return 'Mirror max body bytes must be 0..134217728 (128 MiB; 0 = headers only)';
+    }
+  }
+  // Response rewrite sanity. Empty rules = feature off.
+  if (form.response_rewrite_rules.length > 0) {
+    const mb = Number(form.response_rewrite_max_body_bytes);
+    if (!Number.isInteger(mb) || mb < 1 || mb > 128 * 1048576) {
+      return 'Response rewrite max body bytes must be 1..134217728 (128 MiB)';
+    }
+    for (let i = 0; i < form.response_rewrite_rules.length; i++) {
+      const r = form.response_rewrite_rules[i];
+      if (!r.pattern.trim()) {
+        return `Response rewrite rule ${i + 1}: pattern must not be empty`;
+      }
+      if (r.is_regex) {
+        try {
+           
+          new RegExp(r.pattern);
+        } catch (e) {
+          return `Response rewrite rule ${i + 1}: invalid regex (${(e as Error).message})`;
+        }
+      }
+      const maxStr = r.max_replacements.trim();
+      if (maxStr !== '') {
+        const n = Number(maxStr);
+        if (!Number.isInteger(n) || n < 1) {
+          return `Response rewrite rule ${i + 1}: max_replacements must be a positive integer (or empty for unlimited)`;
+        }
+      }
+    }
+  }
+  // mTLS sanity. Empty ca_cert_pem = feature off.
+  const mtlsPem = form.mtls_ca_cert_pem.trim();
+  if (mtlsPem !== '') {
+    if (!/-----BEGIN CERTIFICATE-----/.test(mtlsPem)) {
+      return 'mTLS CA PEM must contain at least one "-----BEGIN CERTIFICATE-----" block';
+    }
+    if (mtlsPem.length > 1048576) {
+      return 'mTLS CA PEM must be 1 MiB or smaller; trim the bundle to issuing CAs only';
+    }
+    // Match API behavior: any trimmed-empty entry is a hard reject,
+    // including the single-element " " case and the leading/trailing
+    // comma cases. An empty field (no commas, no text) is fine - it
+    // means "no allowlist".
+    const raw = form.mtls_allowed_organizations;
+    if (raw.trim() !== '') {
+      const parts = raw.split(',');
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i].trim() === '') {
+          return `mTLS allowed organization #${i + 1} must not be empty`;
+        }
+      }
+    }
+  }
   return '';
 }

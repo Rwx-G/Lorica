@@ -7,11 +7,15 @@
   import Dashboard from './routes/Dashboard.svelte';
   import Toast from './components/Toast.svelte';
 
-  let state: AuthState = $state({ status: 'unauthenticated' });
+  // Named `authState` (not `state`) to avoid colliding with the
+  // Svelte 5 `$state` rune - svelte-check treats `$state` as an
+  // auto-subscription to a variable called `state` in Svelte 4 compat
+  // mode and trips over the reserved rune name otherwise.
+  let authState: AuthState = $state({ status: 'unauthenticated' });
   let checking = $state(true);
 
   auth.subscribe((v) => {
-    state = v;
+    authState = v;
   });
 
   function applyTheme(t: 'dark' | 'light') {
@@ -51,9 +55,9 @@
 
 {#if checking}
   <div class="boot-check"><p class="loading">Loading...</p></div>
-{:else if state.status === 'unauthenticated'}
+{:else if authState.status === 'unauthenticated'}
   <Login />
-{:else if state.status === 'must_change_password'}
+{:else if authState.status === 'must_change_password'}
   <PasswordChange />
 {:else}
   <Dashboard />

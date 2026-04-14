@@ -3814,9 +3814,99 @@ if [ -n "$SESSION" ]; then
     fi
 
 # =============================================================================
-# 67. CLEANUP
+# 67. RATE LIMIT PER ROUTE (Phase 3 / WPAR-1)
 # =============================================================================
-    log "=== 67. Cleanup ==="
+    log "=== 67. Rate Limit Per Route ==="
+
+    # Create a dedicated backend + route so this section does not interact
+    # with any route carrying pre-v1.3 rate_limit_rps / rate_limit_burst.
+    RL_BACKEND_PAYLOAD=$(cat <<JSON
+{"address":"$BACKEND1","weight":1,"health_check_enabled":false,"name":"rl-backend"}
+JSON
+)
+    RL_BACKEND_ID=$(api_post "/api/v1/backends" "$RL_BACKEND_PAYLOAD" | jq -r '.data.id')
+    if [ -n "$RL_BACKEND_ID" ] && [ "$RL_BACKEND_ID" != "null" ]; then
+        ok "Rate-limit backend created: $RL_BACKEND_ID"
+    else
+        fail "Rate-limit backend create failed"
+    fi
+
+    # One-shot bucket: capacity 3, no refill. Expect the first 3 requests
+    # to return 200 and the 4th/5th to return 429 with Retry-After = 60
+    # (per the formula in proxy_wiring.rs for refill_per_sec == 0).
+    RL_ROUTE_PAYLOAD=$(cat <<JSON
+{
+  "hostname":"rl.test",
+  "path_prefix":"/",
+  "backend_ids":["$RL_BACKEND_ID"],
+  "rate_limit": {"capacity": 3, "refill_per_sec": 0, "scope": "per_ip"}
+}
+JSON
+)
+    RL_ROUTE_ID=$(api_post "/api/v1/routes" "$RL_ROUTE_PAYLOAD" | jq -r '.data.id')
+    if [ -n "$RL_ROUTE_ID" ] && [ "$RL_ROUTE_ID" != "null" ]; then
+        ok "Rate-limit route created: $RL_ROUTE_ID"
+    else
+        fail "Rate-limit route create failed"
+    fi
+
+    # Wait for config reload to land on the proxy.
+    sleep 2
+
+    RL_200=0
+    RL_429=0
+    for i in 1 2 3 4 5; do
+        # $PROXY is already `http://lorica:8080` (full URL). `--max-time 5`
+        # guards against the test-runner hanging forever if the proxy
+        # ever stops responding.
+        CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -H 'Host: rl.test' "$PROXY/" 2>/dev/null || echo "000")
+        if [ "$CODE" = "200" ]; then
+            RL_200=$((RL_200 + 1))
+        elif [ "$CODE" = "429" ]; then
+            RL_429=$((RL_429 + 1))
+        fi
+    done
+    if [ "$RL_200" = "3" ] && [ "$RL_429" = "2" ]; then
+        ok "rate_limit: 3x200 + 2x429 as expected"
+    else
+        fail "rate_limit: got ${RL_200}x200 + ${RL_429}x429 (expected 3+2)"
+    fi
+
+    # The 429 responses must advertise a Retry-After header.
+    RETRY_AFTER=$(curl -s --max-time 5 -D - -o /dev/null -H 'Host: rl.test' "$PROXY/" 2>/dev/null \
+        | grep -i '^retry-after:' | head -1 | awk '{print $2}' | tr -d '\r')
+    if [ -n "$RETRY_AFTER" ] && [ "$RETRY_AFTER" = "60" ]; then
+        ok "Retry-After: 60 (one-shot bucket advice)"
+    else
+        fail "Retry-After header missing or unexpected (got '$RETRY_AFTER', wanted '60')"
+    fi
+
+    # Validator: capacity > 1_000_000 must be rejected with 400.
+    BAD_RATE=$(cat <<JSON
+{
+  "hostname":"bad.test",
+  "path_prefix":"/",
+  "backend_ids":["$RL_BACKEND_ID"],
+  "rate_limit": {"capacity": 9999999, "refill_per_sec": 0, "scope": "per_ip"}
+}
+JSON
+)
+    BAD_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+        -b "$SESSION" -H 'Content-Type: application/json' \
+        -d "$BAD_RATE" "$API/api/v1/routes")
+    if [ "$BAD_CODE" = "400" ]; then
+        ok "API rejects capacity > 1_000_000 with 400"
+    else
+        fail "API did not reject capacity > 1_000_000 (got $BAD_CODE)"
+    fi
+
+    api_del "/api/v1/routes/$RL_ROUTE_ID" >/dev/null && ok "Rate-limit route deleted" || fail "Rate-limit route delete failed"
+    api_del "/api/v1/backends/$RL_BACKEND_ID" >/dev/null && ok "Rate-limit backend deleted" || fail "Rate-limit backend delete failed"
+
+# =============================================================================
+# 68. CLEANUP
+# =============================================================================
+    log "=== 68. Cleanup ==="
 
     api_del "/api/v1/routes/$R1_ID" >/dev/null && ok "Route 1 deleted" || fail "Route 1 delete failed"
     api_del "/api/v1/routes/$R2_ID" >/dev/null && ok "Route 2 deleted" || fail "Route 2 delete failed"

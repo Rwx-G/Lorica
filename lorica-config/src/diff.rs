@@ -34,6 +34,8 @@ pub struct SettingsDiff {
     pub changes: Vec<SettingChange>,
 }
 
+/// One entry of a [`SettingsDiff`]: the key whose value would change,
+/// rendered both before and after as strings for display purposes.
 #[derive(Debug, Serialize)]
 pub struct SettingChange {
     pub key: String,

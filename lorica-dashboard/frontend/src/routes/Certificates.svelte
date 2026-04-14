@@ -5,14 +5,17 @@
     type CertificateResponse,
     type CertificateDetailResponse,
     type RouteResponse,
-    type CreateCertificateRequest,
-    type GenerateSelfSignedRequest,
     type DnsProviderResponse,
   } from '../lib/api';
-  import CertExpiryBadge from '../components/CertExpiryBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import CertificateAcmeForm from '../components/certificates/CertificateAcmeForm.svelte';
   import CertificateEditForm from '../components/certificates/CertificateEditForm.svelte';
+  import CertificateList from '../components/certificates/CertificateList.svelte';
+  import CertificateUploadForm from '../components/certificates/CertificateUploadForm.svelte';
+  import CertificateDetail from '../components/certificates/CertificateDetail.svelte';
+  import CertificateSelfSignedForm from '../components/certificates/CertificateSelfSignedForm.svelte';
+  import CertificateSelfSignedPrefPrompt from '../components/certificates/CertificateSelfSignedPrefPrompt.svelte';
+  import CertificateThresholdsForm from '../components/certificates/CertificateThresholdsForm.svelte';
   import { showToast } from '../lib/toast';
 
   let certificates: CertificateResponse[] = $state([]);
@@ -25,16 +28,9 @@
   let warningDays = $state(30);
   let criticalDays = $state(7);
   let showThresholdConfig = $state(false);
-  let thresholdWarning = $state(30);
-  let thresholdCritical = $state(7);
 
   // Upload form state
   let showUploadForm = $state(false);
-  let formDomain = $state('');
-  let formCertPem = $state('');
-  let formKeyPem = $state('');
-  let formError = $state('');
-  let formSubmitting = $state(false);
 
   // Edit form state
   let editingCert: CertificateResponse | null = $state(null);
@@ -54,9 +50,6 @@
 
   // Self-signed generation state
   let showSelfSigned = $state(false);
-  let selfSignedDomain = $state('');
-  let selfSignedError = $state('');
-  let selfSignedSubmitting = $state(false);
   const SS_PREF_KEY = 'lorica_self_signed_pref';
   let selfSignedPref: 'never' | 'always' | 'once' | null = $state(
     (() => {
@@ -65,6 +58,7 @@
     })()
   );
   let showSelfSignedPrefPrompt = $state(false);
+  let showSelfSignedConfirm = $state(false);
 
   // ACME provisioning state
   let showAcmeForm = $state(false);
@@ -76,7 +70,7 @@
   async function loadData() {
     loading = true;
     error = '';
-    const [certsRes, routesRes, settingsRes, prefRes, dnsRes] = await Promise.all([
+    const [certsRes, routesRes, settingsRes, , dnsRes] = await Promise.all([
       api.listCertificates(),
       api.listRoutes(),
       api.getSettings(),
@@ -98,103 +92,20 @@
     if (dnsRes.data) {
       dnsProviders = dnsRes.data.dns_providers;
     }
-    // Self-signed pref loaded from localStorage at init
     loading = false;
   }
 
   onMount(loadData);
 
-  function formatDate(iso: string): string {
-    return new Date(iso).toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-    });
-  }
-
   function getRoutesForCert(certId: string): RouteResponse[] {
     return routes.filter((r) => r.certificate_id === certId);
   }
 
-  // Upload form
-  function openUploadForm() {
-    formDomain = '';
-    formCertPem = '';
-    formKeyPem = '';
-    formError = '';
-    showUploadForm = true;
-  }
-
-  function closeUploadForm() {
-    showUploadForm = false;
-  }
-
-  function handleUploadKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') closeUploadForm();
-  }
-
-  async function handleFileInput(
-    e: Event,
-    target: 'cert' | 'key',
-  ) {
-    const input = e.target as HTMLInputElement;
-    const file = input.files?.[0];
-    if (!file) return;
-    const text = await file.text();
-    if (target === 'cert') formCertPem = text;
-    else formKeyPem = text;
-  }
-
-  const DOMAIN_PATTERN = /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
-
-  function validateUploadForm(): string {
-    if (!formDomain.trim()) return 'Domain is required';
-    if (!DOMAIN_PATTERN.test(formDomain.trim())) return 'Invalid domain pattern';
-    if (!formCertPem.trim()) return 'Certificate PEM is required';
-    if (!formCertPem.trim().startsWith('-----BEGIN CERTIFICATE-----')) return 'Certificate PEM must start with -----BEGIN CERTIFICATE-----';
-    if (!formKeyPem.trim()) return 'Private key PEM is required';
-    if (!formKeyPem.trim().startsWith('-----BEGIN')) return 'Key PEM must start with -----BEGIN (RSA/EC/PRIVATE KEY)';
-    return '';
-  }
-
-  async function handleUploadSubmit() {
-    const err = validateUploadForm();
-    if (err) {
-      formError = err;
-      return;
-    }
-    formSubmitting = true;
-    formError = '';
-
-    const body: CreateCertificateRequest = {
-      domain: formDomain,
-      cert_pem: formCertPem,
-      key_pem: formKeyPem,
-    };
-    const res = await api.createCertificate(body);
-    if (res.error) {
-      formError = res.error.message;
-      formSubmitting = false;
-      return;
-    }
-
-    formSubmitting = false;
-    closeUploadForm();
-    await loadData();
-  }
-
-  // Edit form
   function openEditForm(cert: CertificateResponse) {
     editingCert = cert;
     showEditForm = true;
   }
 
-  function closeEditForm() {
-    showEditForm = false;
-    editingCert = null;
-  }
-
-  // Detail view
   async function openDetail(cert: CertificateResponse) {
     detailLoading = true;
     showDetail = true;
@@ -209,21 +120,6 @@
     detailLoading = false;
   }
 
-  function closeDetail() {
-    showDetail = false;
-    detailCert = null;
-  }
-
-  function handleDetailKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') closeDetail();
-  }
-
-  function getRouteHostname(routeId: string): string {
-    const r = routes.find((r) => r.id === routeId);
-    return r ? `${r.hostname}${r.path_prefix}` : routeId.slice(0, 8);
-  }
-
-  // Delete
   function openDelete(cert: CertificateResponse) {
     deletingCert = cert;
     deleteRoutes = getRoutesForCert(cert.id);
@@ -265,8 +161,6 @@
   }
 
   // Self-signed generation
-  let showSelfSignedConfirm = $state(false);
-
   function openSelfSigned() {
     if (selfSignedPref === 'never') return;
     if (selfSignedPref === null) {
@@ -277,15 +171,11 @@
       showSelfSignedConfirm = true;
       return;
     }
-    selfSignedDomain = '';
-    selfSignedError = '';
     showSelfSigned = true;
   }
 
   function confirmSelfSigned() {
     showSelfSignedConfirm = false;
-    selfSignedDomain = '';
-    selfSignedError = '';
     showSelfSigned = true;
   }
 
@@ -294,68 +184,19 @@
     showSelfSignedPrefPrompt = false;
     localStorage.setItem(SS_PREF_KEY, choice);
     if (choice === 'never') return;
-    selfSignedDomain = '';
-    selfSignedError = '';
     showSelfSigned = true;
   }
 
-  function closeSelfSigned() {
-    showSelfSigned = false;
-  }
-
-  function handleSelfSignedKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') closeSelfSigned();
-  }
-
-  async function handleSelfSignedSubmit() {
-    if (!selfSignedDomain.trim()) {
-      selfSignedError = 'Domain is required';
-      return;
-    }
-    selfSignedSubmitting = true;
-    selfSignedError = '';
-
-    const body: GenerateSelfSignedRequest = {
-      domain: selfSignedDomain,
-    };
-    const res = await api.generateSelfSigned(body);
-    if (res.error) {
-      selfSignedError = res.error.message;
-      selfSignedSubmitting = false;
-      return;
-    }
-
-    selfSignedSubmitting = false;
-    closeSelfSigned();
+  async function onSelfSignedReloaded() {
     if (selfSignedPref === 'once') {
       selfSignedPref = null;
     }
     await loadData();
   }
 
-  // Threshold config
-  function openThresholdConfig() {
-    thresholdWarning = warningDays;
-    thresholdCritical = criticalDays;
-    showThresholdConfig = true;
-  }
-
-  function closeThresholdConfig() {
-    showThresholdConfig = false;
-  }
-
-  function handleThresholdKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') closeThresholdConfig();
-  }
-
-  async function saveThresholds() {
-    if (thresholdCritical >= thresholdWarning) {
-      return;
-    }
-    warningDays = thresholdWarning;
-    criticalDays = thresholdCritical;
-    await api.updateSettings({ cert_warning_days: warningDays, cert_critical_days: criticalDays });
-    closeThresholdConfig();
+  function onThresholdsSaved(warning: number, critical: number) {
+    warningDays = warning;
+    criticalDays = critical;
   }
 </script>
 
@@ -363,12 +204,13 @@
   <div class="page-header">
     <h1>Certificates</h1>
     <div class="header-actions">
-      <button class="btn btn-secondary" onclick={openThresholdConfig} title="Configure expiration thresholds">
+      <button class="btn btn-secondary" onclick={() => showThresholdConfig = true} title="Configure expiration thresholds">
+        <!-- eslint-disable-next-line svelte/no-at-html-tags -->
         {@html gearIcon}
       </button>
       <button class="btn btn-secondary" onclick={openSelfSigned}>Self-signed</button>
       <button class="btn btn-acme" onclick={openAcmeForm}>Let's Encrypt</button>
-      <button class="btn btn-primary" onclick={openUploadForm}>+ Upload Certificate</button>
+      <button class="btn btn-primary" onclick={() => showUploadForm = true}>+ Upload Certificate</button>
     </div>
   </div>
 
@@ -382,213 +224,47 @@
     <div class="empty-state">
       <p>No certificates configured yet.</p>
       <p class="text-muted">You can upload a PEM certificate, generate a self-signed certificate for testing, or provision a free Let's Encrypt certificate.</p>
-      <button class="btn btn-primary" onclick={openUploadForm}>Upload your first certificate</button>
+      <button class="btn btn-primary" onclick={() => showUploadForm = true}>Upload your first certificate</button>
     </div>
   {:else}
-    <div class="table-wrapper">
-      <table>
-        <thead>
-          <tr>
-            <th>Domain</th>
-            <th>Issuer</th>
-            <th>Expires</th>
-            <th>Days Left</th>
-            <th>Status</th>
-            <th>Routes</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each certificates as cert (cert.id)}
-            <tr>
-              <td class="domain">
-                <button class="link-btn" onclick={() => openDetail(cert)}>{cert.domain}</button>
-                {#if cert.san_domains.length > 0}
-                  <span class="san-count" title={cert.san_domains.join(', ')}>+{cert.san_domains.length} SAN</span>
-                {/if}
-                {#if cert.is_acme}
-                  <span class="cert-source-badge acme" title={cert.acme_method || 'http01'}>ACME{#if cert.acme_method && cert.acme_method !== 'http01'} ({cert.acme_method.replace('dns01-', '')}){/if}{#if cert.acme_auto_renew} &#x21bb;{/if}</span>
-                {:else}
-                  <span class="cert-source-badge manual">Manual</span>
-                {/if}
-              </td>
-              <td class="issuer">{cert.issuer}</td>
-              <td>{formatDate(cert.not_after)}</td>
-              <td>
-                {#if true}
-                  {@const daysLeft = Math.floor((new Date(cert.not_after).getTime() - Date.now()) / (1000 * 60 * 60 * 24))}
-                  <span class="days-left" style="color: {daysLeft < 7 ? 'var(--color-red)' : daysLeft <= 30 ? 'var(--color-orange, #fb923c)' : 'var(--color-green)'}; font-weight: 700; font-size: 1rem;">
-                    {daysLeft}d
-                  </span>
-                {/if}
-              </td>
-              <td><CertExpiryBadge notAfter={cert.not_after} {warningDays} {criticalDays} /></td>
-              <td>
-                {#if getRoutesForCert(cert.id).length === 0}
-                  <span class="text-muted">None</span>
-                {:else}
-                  <span class="route-count">{getRoutesForCert(cert.id).length} route{getRoutesForCert(cert.id).length > 1 ? 's' : ''}</span>
-                {/if}
-              </td>
-              <td class="actions">
-                <button class="btn-icon" title="View details" aria-label="View details" onclick={() => openDetail(cert)}>
-                  {@html eyeIcon}
-                </button>
-                <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => openEditForm(cert)}>
-                  {@html editIcon}
-                </button>
-                {#if cert.is_acme}
-                  <button class="btn-icon" title="Renew" aria-label="Renew certificate" onclick={() => handleRenew(cert)} disabled={renewingId === cert.id}>
-                    {@html renewIcon}
-                  </button>
-                {/if}
-                <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => openDelete(cert)}>
-                  {@html trashIcon}
-                </button>
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
+    <CertificateList
+      {certificates}
+      {routes}
+      {warningDays}
+      {criticalDays}
+      {renewingId}
+      onView={openDetail}
+      onEdit={openEditForm}
+      onRenew={handleRenew}
+      onDelete={openDelete}
+    />
   {/if}
 </div>
 
-<!-- Upload Form Modal -->
 {#if showUploadForm}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) closeUploadForm(); }} onkeydown={handleUploadKeydown} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal" role="document">
-      <h2>Upload Certificate</h2>
-
-      {#if formError}
-        <div class="form-error">{formError}</div>
-      {/if}
-
-      <div class="form-group">
-        <label for="upload-domain">Domain <span class="required">*</span></label>
-        <input id="upload-domain" type="text" bind:value={formDomain} placeholder="example.com" />
-      </div>
-
-      <div class="form-group">
-        <label for="upload-cert">Certificate PEM <span class="required">*</span></label>
-        <div class="file-input-row">
-          <input type="file" accept=".pem,.crt,.cer" onchange={(e) => handleFileInput(e, 'cert')} />
-        </div>
-        <textarea id="upload-cert" bind:value={formCertPem} placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----" rows="4"></textarea>
-      </div>
-
-      <div class="form-group">
-        <label for="upload-key">Private Key PEM <span class="required">*</span></label>
-        <div class="file-input-row">
-          <input type="file" accept=".pem,.key" onchange={(e) => handleFileInput(e, 'key')} />
-        </div>
-        <textarea id="upload-key" bind:value={formKeyPem} placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----" rows="4"></textarea>
-      </div>
-
-      <div class="form-actions">
-        <button class="btn btn-cancel" onclick={closeUploadForm}>Cancel</button>
-        <button class="btn btn-primary" disabled={formSubmitting} onclick={handleUploadSubmit}>
-          {formSubmitting ? 'Uploading...' : 'Upload'}
-        </button>
-      </div>
-    </div>
-  </div>
+  <CertificateUploadForm onClose={() => showUploadForm = false} onReload={loadData} />
 {/if}
 
-<!-- Edit Form Modal -->
 {#if showEditForm && editingCert}
-  <CertificateEditForm {editingCert} {dnsProviders} onClose={closeEditForm} onReload={loadData} />
+  <CertificateEditForm
+    {editingCert}
+    {dnsProviders}
+    onClose={() => { showEditForm = false; editingCert = null; }}
+    onReload={loadData}
+  />
 {/if}
 
-<!-- Detail View Modal -->
 {#if showDetail}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) closeDetail(); }} onkeydown={handleDetailKeydown} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal modal-wide" role="document">
-      {#if detailLoading}
-        <p class="loading">Loading certificate details...</p>
-      {:else if detailCert}
-        <h2>Certificate: {detailCert.domain}</h2>
-
-        <div class="detail-grid">
-          <div class="detail-row">
-            <span class="detail-label">Domain</span>
-            <span class="detail-value">{detailCert.domain}</span>
-          </div>
-          {#if detailCert.san_domains.length > 0}
-            <div class="detail-row">
-              <span class="detail-label">SAN Domains</span>
-              <span class="detail-value">{detailCert.san_domains.join(', ')}</span>
-            </div>
-          {/if}
-          <div class="detail-row">
-            <span class="detail-label">Issuer</span>
-            <span class="detail-value">{detailCert.issuer}</span>
-          </div>
-          <div class="detail-row">
-            <span class="detail-label">Valid From</span>
-            <span class="detail-value">{formatDate(detailCert.not_before)}</span>
-          </div>
-          <div class="detail-row">
-            <span class="detail-label">Valid Until</span>
-            <span class="detail-value">
-              {formatDate(detailCert.not_after)}
-              <CertExpiryBadge notAfter={detailCert.not_after} {warningDays} {criticalDays} />
-            </span>
-          </div>
-          <div class="detail-row">
-            <span class="detail-label">Fingerprint (SHA-256)</span>
-            <span class="detail-value mono">{detailCert.fingerprint}</span>
-          </div>
-          <div class="detail-row">
-            <span class="detail-label">ACME</span>
-            <span class="detail-value">{detailCert.is_acme ? 'Yes' : 'No'}{detailCert.acme_auto_renew ? ' (auto-renew)' : ''}</span>
-          </div>
-          {#if detailCert.acme_method}
-            <div class="detail-row">
-              <span class="detail-label">ACME Method</span>
-              <span class="detail-value">
-                {detailCert.acme_method}
-                {#if detailCert.acme_method.startsWith('dns01-') && detailCert.acme_method !== 'dns01-manual'}
-                  <span style="display:inline-block;padding:0.0625rem 0.375rem;border-radius:9999px;font-size:0.625rem;font-weight:600;text-transform:uppercase;margin-left:0.375rem;background:rgba(34,197,94,0.15);color:var(--color-green);">credentials stored</span>
-                {/if}
-              </span>
-            </div>
-          {/if}
-          <div class="detail-row">
-            <span class="detail-label">Created</span>
-            <span class="detail-value">{formatDate(detailCert.created_at)}</span>
-          </div>
-        </div>
-
-        <div class="detail-section">
-          <h3>Associated Routes</h3>
-          {#if detailCert.associated_routes.length === 0}
-            <p class="text-muted">No routes are using this certificate.</p>
-          {:else}
-            <ul class="route-list">
-              {#each detailCert.associated_routes as routeId}
-                <li>{getRouteHostname(routeId)}</li>
-              {/each}
-            </ul>
-          {/if}
-        </div>
-
-        <div class="detail-section">
-          <h3>Certificate Chain (PEM)</h3>
-          <pre class="pem-block">{detailCert.cert_pem}</pre>
-        </div>
-
-        <div class="form-actions">
-          <button class="btn btn-cancel" onclick={closeDetail}>Close</button>
-        </div>
-      {/if}
-    </div>
-  </div>
+  <CertificateDetail
+    {detailCert}
+    {detailLoading}
+    {routes}
+    {warningDays}
+    {criticalDays}
+    onClose={() => { showDetail = false; detailCert = null; }}
+  />
 {/if}
 
-<!-- Delete Confirmation -->
 {#if deletingCert}
   <ConfirmDialog
     title="Delete Certificate"
@@ -598,20 +274,11 @@
   />
 {/if}
 
-<!-- Self-signed Preference Prompt -->
 {#if showSelfSignedPrefPrompt}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) showSelfSignedPrefPrompt = false; }} onkeydown={(e) => { if (e.key === 'Escape') showSelfSignedPrefPrompt = false; }} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal" role="document">
-      <h2>Self-signed Certificate Generation</h2>
-      <p class="pref-text">Self-signed certificates are useful for development and testing but should not be used in production. How would you like to handle this?</p>
-      <div class="pref-actions">
-        <button class="btn btn-cancel" onclick={() => handleSelfSignedPref('never')}>Never generate</button>
-        <button class="btn btn-secondary" onclick={() => handleSelfSignedPref('once')}>Just this once</button>
-        <button class="btn btn-primary" onclick={() => handleSelfSignedPref('always')}>Always allow</button>
-      </div>
-    </div>
-  </div>
+  <CertificateSelfSignedPrefPrompt
+    onChoice={handleSelfSignedPref}
+    onDismiss={() => showSelfSignedPrefPrompt = false}
+  />
 {/if}
 
 {#if showSelfSignedConfirm}
@@ -625,73 +292,27 @@
   />
 {/if}
 
-<!-- Self-signed Generation Modal -->
 {#if showSelfSigned}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) closeSelfSigned(); }} onkeydown={handleSelfSignedKeydown} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal" role="document">
-      <h2>Generate Self-signed Certificate</h2>
-
-      {#if selfSignedError}
-        <div class="form-error">{selfSignedError}</div>
-      {/if}
-
-      <div class="form-group">
-        <label for="selfsign-domain">Domain <span class="required">*</span></label>
-        <input id="selfsign-domain" type="text" bind:value={selfSignedDomain} placeholder="localhost" />
-      </div>
-
-      <div class="form-actions">
-        <button class="btn btn-cancel" onclick={closeSelfSigned}>Cancel</button>
-        <button class="btn btn-primary" disabled={selfSignedSubmitting} onclick={handleSelfSignedSubmit}>
-          {selfSignedSubmitting ? 'Generating...' : 'Generate'}
-        </button>
-      </div>
-    </div>
-  </div>
+  <CertificateSelfSignedForm
+    onClose={() => showSelfSigned = false}
+    onReload={onSelfSignedReloaded}
+  />
 {/if}
 
-<!-- Threshold Configuration Modal -->
 {#if showThresholdConfig}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) closeThresholdConfig(); }} onkeydown={handleThresholdKeydown} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="modal" role="document">
-      <h2>Expiration Thresholds</h2>
-
-      <div class="form-group">
-        <label for="thresh-warn">Warning threshold (days)</label>
-        <input id="thresh-warn" type="number" min="1" bind:value={thresholdWarning} />
-        <span class="field-hint">Certificates expiring within this many days show orange.</span>
-      </div>
-
-      <div class="form-group">
-        <label for="thresh-crit">Critical threshold (days)</label>
-        <input id="thresh-crit" type="number" min="1" bind:value={thresholdCritical} />
-        <span class="field-hint">Certificates expiring within this many days show red.</span>
-      </div>
-
-      {#if thresholdCritical >= thresholdWarning}
-        <div class="form-error">Critical threshold must be less than warning threshold.</div>
-      {/if}
-
-      <div class="form-actions">
-        <button class="btn btn-cancel" onclick={closeThresholdConfig}>Cancel</button>
-        <button class="btn btn-primary" disabled={thresholdCritical >= thresholdWarning} onclick={saveThresholds}>Save</button>
-      </div>
-    </div>
-  </div>
+  <CertificateThresholdsForm
+    {warningDays}
+    {criticalDays}
+    onClose={() => showThresholdConfig = false}
+    onSaved={onThresholdsSaved}
+  />
 {/if}
 
-<!-- ACME Provisioning Modal -->
 {#if showAcmeForm}
   <CertificateAcmeForm {dnsProviders} onClose={() => showAcmeForm = false} onReload={loadData} />
 {/if}
 
 <script lang="ts" module>
-  const eyeIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
-  const editIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
-  const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
-  const renewIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
   const gearIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
 </script>
 
@@ -717,152 +338,8 @@
     align-items: center;
   }
 
-
-  .domain {
-    font-weight: 600;
-    color: var(--color-text-heading);
-  }
-
-  .link-btn {
-    background: none;
-    border: none;
-    color: var(--color-primary);
-    font-weight: 600;
-    font-size: 0.875rem;
-    padding: 0;
-    text-decoration: none;
-  }
-
-  .link-btn:hover {
-    text-decoration: underline;
-  }
-
-  .cert-source-badge {
-    display: inline-block;
-    padding: 0.0625rem 0.375rem;
-    border-radius: 9999px;
-    font-size: 0.625rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    margin-left: 0.375rem;
-    vertical-align: middle;
-  }
-
-  .cert-source-badge.acme {
-    background: rgba(34, 197, 94, 0.15);
-    color: var(--color-green);
-  }
-
-  .cert-source-badge.manual {
-    background: rgba(148, 163, 184, 0.15);
-    color: var(--color-text-muted);
-  }
-
-  .san-count {
-    margin-left: 0.5rem;
-    font-size: 0.7rem;
-    font-weight: 400;
-    color: var(--color-text-muted);
-    background: rgba(148, 163, 184, 0.1);
-    padding: 0.1rem 0.4rem;
-    border-radius: 9999px;
-  }
-
-  .issuer {
-    color: var(--color-text-muted);
-  }
-
   .text-muted {
     color: var(--color-text-muted);
-  }
-
-  .mono {
-    font-family: var(--mono);
-    font-size: 0.75rem;
-    word-break: break-all;
-  }
-
-  .route-count {
-    color: var(--color-text);
-  }
-
-  /* Modal / Form */
-  .modal-wide {
-    max-width: 680px;
-  }
-
-  .form-error {
-    background: var(--color-red-subtle);
-    border: 1px solid var(--color-red);
-    border-radius: var(--radius-md);
-    color: var(--color-red);
-    padding: var(--space-2) var(--space-3);
-    font-size: var(--text-base);
-    margin-bottom: var(--space-4);
-  }
-
-  .form-group {
-    margin-bottom: 1rem;
-  }
-
-  .form-group label {
-    display: block;
-    font-size: 0.8125rem;
-    font-weight: 500;
-    color: var(--color-text-muted);
-    margin-bottom: 0.375rem;
-  }
-
-  .required {
-    color: var(--color-red);
-  }
-
-  .form-group input[type="text"],
-  .form-group input[type="number"],
-  .form-group textarea {
-    width: 100%;
-    padding: 0.5rem 0.75rem;
-    border: 1px solid var(--color-border);
-    border-radius: 0.375rem;
-    background: var(--color-bg-input);
-    color: var(--color-text);
-    font-size: 0.875rem;
-    font-family: var(--sans);
-  }
-
-  .form-group textarea {
-    font-family: var(--mono);
-    font-size: 0.8125rem;
-    resize: vertical;
-  }
-
-  .form-group input:focus,
-  .form-group textarea:focus {
-    outline: none;
-    border-color: var(--color-primary);
-  }
-
-  .file-input-row {
-    margin-bottom: 0.375rem;
-  }
-
-  .file-input-row input[type="file"] {
-    font-size: 0.8125rem;
-    color: var(--color-text-muted);
-  }
-
-  .field-hint {
-    display: block;
-    font-size: 0.75rem;
-    color: var(--color-text-muted);
-    margin-top: 0.25rem;
-  }
-
-  .form-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.75rem;
-    margin-top: 1.5rem;
   }
 
   .btn {
@@ -882,11 +359,6 @@
     background: var(--color-primary-hover);
   }
 
-  .btn-primary:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
   .btn-secondary {
     background: var(--color-bg-input);
     color: var(--color-text);
@@ -894,99 +366,6 @@
 
   .btn-secondary:hover {
     background: var(--color-bg-hover);
-  }
-
-  .btn-cancel {
-    background: var(--color-bg-input);
-    color: var(--color-text);
-  }
-
-  .btn-cancel:hover {
-    background: var(--color-bg-hover);
-  }
-
-  /* Detail view */
-  .detail-grid {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    margin-bottom: 1.25rem;
-  }
-
-  .detail-row {
-    display: flex;
-    gap: 1rem;
-    align-items: baseline;
-    font-size: 0.875rem;
-  }
-
-  .detail-label {
-    flex: 0 0 160px;
-    color: var(--color-text-muted);
-    font-size: 0.8125rem;
-    font-weight: 500;
-  }
-
-  .detail-value {
-    color: var(--color-text);
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-
-  .detail-section {
-    margin-bottom: 1.25rem;
-  }
-
-  .detail-section h3 {
-    margin-bottom: 0.5rem;
-  }
-
-  .route-list {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-  }
-
-  .route-list li {
-    padding: 0.375rem 0;
-    font-size: 0.875rem;
-    color: var(--color-text);
-    border-bottom: 1px solid var(--color-border);
-  }
-
-  .route-list li:last-child {
-    border-bottom: none;
-  }
-
-  .pem-block {
-    background: var(--color-bg-input);
-    border: 1px solid var(--color-border);
-    border-radius: 0.375rem;
-    padding: 0.75rem;
-    font-family: var(--mono);
-    font-size: 0.75rem;
-    overflow-x: auto;
-    white-space: pre-wrap;
-    word-break: break-all;
-    max-height: 200px;
-    overflow-y: auto;
-    color: var(--color-text-muted);
-    margin: 0;
-  }
-
-  /* Self-signed preference prompt */
-  .pref-text {
-    color: var(--color-text-muted);
-    font-size: 0.875rem;
-    line-height: 1.5;
-    margin: 0 0 1.25rem;
-  }
-
-  .pref-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.75rem;
   }
 
   .btn-acme {
@@ -1002,67 +381,5 @@
   }
   .btn-acme:hover {
     opacity: 0.85;
-  }
-
-  .success-banner {
-    background: var(--color-green-subtle);
-    border: 1px solid var(--color-green);
-    border-radius: var(--radius-md);
-    color: var(--color-green);
-    padding: var(--space-3) var(--space-4);
-    margin-bottom: var(--space-4);
-    font-size: var(--text-base);
-  }
-
-  .radio-group {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .radio-item {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-base);
-    cursor: pointer;
-  }
-
-  .radio-item input[type="radio"] {
-    accent-color: var(--color-primary);
-  }
-
-  .copyable-field {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-
-  .copyable-value {
-    flex: 1;
-    background: var(--color-bg-input);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-md);
-    padding: 0.5rem 0.75rem;
-    font-family: var(--mono);
-    font-size: 0.8125rem;
-    word-break: break-all;
-    color: var(--color-text);
-  }
-
-  .btn-small {
-    padding: 0.25rem 0.625rem;
-    font-size: 0.75rem;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--color-border);
-    background: var(--color-bg-input);
-    color: var(--color-text);
-    cursor: pointer;
-    white-space: nowrap;
-    transition: background-color var(--transition-fast);
-  }
-
-  .btn-small:hover {
-    background: var(--color-bg-hover);
   }
 </style>

@@ -185,7 +185,7 @@
           </tr>
         </thead>
         <tbody>
-          {#each probes as p}
+          {#each probes as p (p.id)}
             <tr>
               <td class="route-label">{getRouteLabel(p.route_id)}</td>
               <td><span class="method-badge">{p.method}</span></td>
@@ -202,12 +202,15 @@
               </td>
               <td class="actions">
                 <button class="btn-icon" onclick={() => showHistory(p)} title="History" aria-label="History">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html historyIcon}
                 </button>
                 <button class="btn-icon" onclick={() => openEditForm(p)} title="Edit" aria-label="Edit">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html editIcon}
                 </button>
                 <button class="btn-icon btn-icon-danger" onclick={() => (deletingProbe = p)} title="Delete" aria-label="Delete">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html trashIcon}
                 </button>
               </td>
@@ -239,9 +242,9 @@
 
         {#if !editingProbe}
           <div class="form-group">
-            <label>Route <span class="required">*</span></label>
-            <select bind:value={formRouteId}>
-              {#each routes as r}
+            <label for="probe-route">Route <span class="required">*</span></label>
+            <select id="probe-route" bind:value={formRouteId}>
+              {#each routes as r (r.id)}
                 <option value={r.id}>{r.hostname}{r.path_prefix}</option>
               {/each}
             </select>
@@ -250,32 +253,32 @@
 
         <div class="form-row">
           <div class="form-group">
-            <label>Method</label>
-            <select bind:value={formMethod}>
-              {#each methods as m}
+            <label for="probe-method">Method</label>
+            <select id="probe-method" bind:value={formMethod}>
+              {#each methods as m (m)}
                 <option value={m}>{m}</option>
               {/each}
             </select>
           </div>
           <div class="form-group">
-            <label>Expected Status</label>
-            <input type="number" bind:value={formExpectedStatus} min="100" max="599" />
+            <label for="probe-expected-status">Expected Status</label>
+            <input id="probe-expected-status" type="number" bind:value={formExpectedStatus} min="100" max="599" />
           </div>
         </div>
 
         <div class="form-group">
-          <label>Path</label>
-          <input type="text" bind:value={formPath} placeholder="/" />
+          <label for="probe-path">Path</label>
+          <input id="probe-path" type="text" bind:value={formPath} placeholder="/" />
         </div>
 
         <div class="form-row">
           <div class="form-group">
-            <label>Interval (s)</label>
-            <input type="number" bind:value={formInterval} min="5" max="3600" />
+            <label for="probe-interval">Interval (s)</label>
+            <input id="probe-interval" type="number" bind:value={formInterval} min="5" max="3600" />
           </div>
           <div class="form-group">
-            <label>Timeout (ms)</label>
-            <input type="number" bind:value={formTimeout} min="1000" max="60000" />
+            <label for="probe-timeout">Timeout (ms)</label>
+            <input id="probe-timeout" type="number" bind:value={formTimeout} min="1000" max="60000" />
           </div>
         </div>
 
@@ -299,7 +302,6 @@
   {/if}
 
   {#if historyProbe}
-    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div class="overlay" onclick={(e) => { if (e.target === e.currentTarget) historyProbe = null; }} onkeydown={(e) => { if (e.key === 'Escape') historyProbe = null; }} role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal modal-wide" role="document">
         <h3>Probe History - {historyProbe.method} {historyProbe.path}</h3>
@@ -320,7 +322,7 @@
                 </tr>
               </thead>
               <tbody>
-                {#each historyResults as r}
+                {#each historyResults as r, i (i)}
                   <tr>
                     <td>{new Date(r.executed_at).toLocaleString()}</td>
                     <td>{r.status_code}</td>

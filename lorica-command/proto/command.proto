@@ -1,34 +1,146 @@
 // Command channel protocol between Lorica supervisor and worker processes.
 // This file documents the wire format. The actual Rust types are defined
 // using prost derive macros (no protoc compilation needed).
+//
+// Variants 1-5 are the legacy supervisor -> worker control messages.
+// Variants 6+ belong to the pipelined RPC framework; see
+// docs/architecture/worker-shared-state.md § 4 for the framing, the
+// per-direction monotonic sequence numbers, and the typed payloads.
 
 syntax = "proto3";
 package lorica.command;
 
-// Commands sent from supervisor to worker
+// Commands exchanged between supervisor and worker.
 message Command {
   CommandType command_type = 1;
   uint64 sequence = 2;          // Monotonic sequence for request-response matching
   uint64 timestamp_ms = 3;      // Unix timestamp in milliseconds
+
+  // Legacy BanIp fields (only set when command_type == BAN_IP).
+  string ban_ip = 4;
+  uint64 ban_duration_s = 5;
+
+  // Typed RPC payload (only set when command_type >= RATE_LIMIT_QUERY).
+  // Legacy receivers ignore the unknown oneof; new receivers dispatch
+  // on the variant rather than command_type.
+  oneof payload {
+    RateLimitQuery rate_limit_query = 100;
+    RateLimitDelta rate_limit_delta = 101;
+    VerdictLookup verdict_lookup = 102;
+    VerdictPush verdict_push = 103;
+    BreakerQuery breaker_query = 104;
+    BreakerReport breaker_report = 105;
+    ConfigReloadPrepare config_reload_prepare = 106;
+    ConfigReloadCommit config_reload_commit = 107;
+    ConfigReloadAbort config_reload_abort = 108;
+  }
 }
 
 enum CommandType {
   COMMAND_TYPE_UNSPECIFIED = 0;
-  CONFIG_RELOAD = 1;            // Worker should reload config from database
-  HEARTBEAT = 2;                // Keepalive ping
-  SHUTDOWN = 3;                 // Graceful shutdown requested
+  CONFIG_RELOAD = 1;             // Worker should reload config from database
+  HEARTBEAT = 2;                 // Keepalive ping
+  SHUTDOWN = 3;                  // Graceful shutdown requested
+  METRICS_REQUEST = 4;           // Supervisor requests a MetricsReport
+  BAN_IP = 5;                    // Broadcast a ban to all workers
+  RATE_LIMIT_QUERY = 6;          // Worker -> supervisor token bucket query
+  RATE_LIMIT_DELTA = 7;          // Worker -> supervisor consumption push
+  VERDICT_LOOKUP = 8;            // Worker -> supervisor auth cache lookup
+  VERDICT_PUSH = 9;              // Worker -> supervisor auth cache write
+  BREAKER_QUERY = 10;            // Worker -> supervisor breaker admission
+  BREAKER_REPORT = 11;           // Worker -> supervisor request outcome
+  CONFIG_RELOAD_PREPARE = 12;    // Supervisor -> worker prepare new generation
+  CONFIG_RELOAD_COMMIT = 13;     // Supervisor -> worker commit prepared gen
+  CONFIG_RELOAD_ABORT = 14;      // Supervisor -> worker drop prepared gen
 }
 
-// Responses sent from worker to supervisor
+// Responses matched to commands by `sequence`.
 message Response {
   ResponseStatus status = 1;
-  uint64 sequence = 2;          // Matches the command sequence
-  string message = 3;           // Human-readable detail (empty on success)
+  uint64 sequence = 2;
+  string message = 3;
+
+  oneof payload {
+    VerdictResult verdict_result = 100;
+    BreakerResult breaker_result = 101;
+    RateLimitResult rate_limit_result = 102;
+    RateLimitDeltaResult rate_limit_delta_result = 103;
+    // Worker -> supervisor: point-in-time metrics snapshot in reply to
+    // a pipelined MetricsRequest (WPAR-7). Carries the same data as
+    // the legacy bare-framed MetricsReport, but transported in the
+    // Response envelope so /metrics pull-on-scrape can dedup and
+    // await concurrently across all workers.
+    MetricsReport metrics_report = 104;
+  }
 }
 
 enum ResponseStatus {
   RESPONSE_STATUS_UNSPECIFIED = 0;
   OK = 1;
   ERROR = 2;
-  PROCESSING = 3;               // Long operation in progress (e.g., connection draining)
+  PROCESSING = 3;
+}
+
+// -------- RPC payloads --------
+
+message RateLimitQuery { string key = 1; uint32 cost = 2; }
+message RateLimitEntry { string key = 1; uint32 consumed = 2; }
+message RateLimitDelta { repeated RateLimitEntry entries = 1; }
+
+message VerdictLookup { string route_id = 1; string cookie = 2; }
+message VerdictPush {
+  string route_id = 1;
+  string cookie = 2;
+  Verdict verdict = 3;
+  uint64 ttl_ms = 4;
+  // Forward-auth response headers captured from the upstream auth
+  // service (e.g. Remote-User, Remote-Groups). The supervisor stores
+  // them alongside the verdict so a worker can serve an Allow-hit
+  // without re-invoking the auth backend.
+  repeated ForwardAuthHeader response_headers = 5;
+}
+
+// Single header pair captured from a forward-auth upstream response
+// and propagated to the downstream request on a cache hit.
+message ForwardAuthHeader {
+  string name = 1;
+  string value = 2;
+}
+
+message BreakerQuery { string route_id = 1; string backend = 2; }
+message BreakerReport {
+  string route_id = 1;
+  string backend = 2;
+  bool success = 3;
+  bool was_probe = 4;
+}
+
+message ConfigReloadPrepare { uint64 generation = 1; }
+message ConfigReloadCommit  { uint64 generation = 1; }
+message ConfigReloadAbort   { uint64 generation = 1; }
+
+// Response payloads.
+message VerdictResult {
+  bool found = 1;
+  Verdict verdict = 2;
+  uint64 ttl_ms = 3;
+  // Headers the worker must inject into the upstream request on an
+  // Allow hit. Populated by the supervisor from the last `VerdictPush`
+  // for this (route, cookie). Empty on a miss or on a Deny hit.
+  repeated ForwardAuthHeader response_headers = 4;
+}
+message BreakerResult { BreakerDecision decision = 1; }
+message RateLimitResult { bool allowed = 1; uint32 remaining = 2; }
+
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+  ALLOW = 1;
+  DENY = 2;
+}
+
+enum BreakerDecision {
+  BREAKER_DECISION_UNSPECIFIED = 0;
+  ALLOW = 1;
+  DENY = 2;
+  ALLOW_PROBE = 3;              // Admit a single HalfOpen probe
 }

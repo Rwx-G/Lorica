@@ -190,10 +190,34 @@ fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("lorica.log");
-        let file_appender = tracing_appender::rolling::never(dir, filename);
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        let _ = LOG_GUARD.set(guard);
-        build_subscriber!(non_blocking, false);
+        // Daily rotation with 14-day retention so an unattended install
+        // can't fill the disk. The current day's file is the canonical
+        // path the operator configured (e.g. /var/log/lorica.log);
+        // rotated files are suffixed with the date (lorica.log.2026-04-13).
+        // Falls back to non-rotating append if the builder rejects the
+        // path (read-only mount, missing dir) so a misconfigured log path
+        // never blocks startup.
+        let appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(filename)
+            .max_log_files(14)
+            .build(dir);
+        match appender {
+            Ok(file_appender) => {
+                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                let _ = LOG_GUARD.set(guard);
+                build_subscriber!(non_blocking, false);
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: rolling log appender failed for {path}: {e}; falling back to non-rotating append"
+                );
+                let file_appender = tracing_appender::rolling::never(dir, filename);
+                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                let _ = LOG_GUARD.set(guard);
+                build_subscriber!(non_blocking, false);
+            }
+        }
     } else {
         build_subscriber!(std::io::stdout, true);
     }
@@ -388,12 +412,39 @@ fn run_supervisor(cli: Cli) {
         info!("database migrations completed, forking workers");
     }
 
+    // Create the shared-memory region BEFORE forking so every worker
+    // inherits a mapping to the same pages. See
+    // docs/architecture/worker-shared-state.md § 5.
+    // The returned &'static reference outlives the fork; the OwnedFd is
+    // passed to every worker via SCM_RIGHTS and is closed in the
+    // supervisor once all workers have received it (workers then keep
+    // the pages alive via their own OwnedFd inside `open_worker`).
+    let (shmem_region, shmem_fd) = match lorica_shmem::SharedRegion::create_supervisor() {
+        Ok(pair) => pair,
+        Err(e) => {
+            error!(error = %e, "failed to create shared-memory region");
+            std::process::exit(1);
+        }
+    };
+    info!(
+        bytes = lorica_shmem::REGION_SIZE,
+        "shared-memory region created; forking workers"
+    );
+
     // Fork workers BEFORE creating any threads/runtime
     let mut manager = WorkerManager::new(config);
+    // Hand the memfd to the manager so every forked worker receives it
+    // alongside the listener FDs.
+    {
+        use std::os::fd::AsRawFd;
+        manager.set_shmem_fd(Some(shmem_fd.as_raw_fd()));
+    }
     if let Err(e) = manager.start() {
         error!(error = %e, "failed to start worker processes");
         std::process::exit(1);
     }
+    // The supervisor keeps the fd alive (via `shmem_fd`) for the
+    // eviction task and any later supervisor-side reads/writes.
 
     info!(
         worker_count = manager.worker_count(),
@@ -402,13 +453,22 @@ fn run_supervisor(cli: Cli) {
 
     // Extract raw FDs from worker handles before entering the tokio runtime.
     // CommandChannel::from_raw_fd requires a tokio runtime, so we take the raw FDs
-    // here and create channels inside block_on.
-    let worker_fds: Vec<(u32, i32, RawFd)> = manager
+    // here and create channels inside block_on. Each worker has two channels:
+    // the legacy `cmd` socketpair (for Heartbeat/ConfigReload/BanIp/Shutdown)
+    // and the pipelined `rpc` socketpair (for WPAR-1 token-bucket sync and
+    // future WPAR RPCs).
+    let worker_fds: Vec<(u32, i32, RawFd, RawFd)> = manager
         .workers_mut()
         .iter_mut()
         .filter_map(|w| {
-            let fd = w.take_cmd_fd()?;
-            Some((w.id(), w.pid().as_raw(), fd.into_raw_fd()))
+            let cmd = w.take_cmd_fd()?;
+            let rpc = w.take_rpc_fd()?;
+            Some((
+                w.id(),
+                w.pid().as_raw(),
+                cmd.into_raw_fd(),
+                rpc.into_raw_fd(),
+            ))
         })
         .collect();
 
@@ -517,21 +577,117 @@ fn run_supervisor(cli: Cli) {
             }
         });
 
+        // Shared-memory region eviction task. The supervisor is the sole
+        // evictor; workers only read and increment. See
+        // docs/architecture/worker-shared-state.md § 5.4. Cadence and
+        // staleness come from `lorica_shmem::DEFAULT_SCAN_INTERVAL` (60s)
+        // and `DEFAULT_STALE_AFTER` (5 min) respectively.
+        {
+            let region = shmem_region;
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(lorica_shmem::DEFAULT_SCAN_INTERVAL);
+                tick.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Delay,
+                );
+                tick.tick().await; // skip the immediate tick
+                let stale_ns = lorica_shmem::DEFAULT_STALE_AFTER.as_nanos() as u64;
+                loop {
+                    tick.tick().await;
+                    let now = lorica_shmem::now_ns();
+                    let stats = lorica_shmem::evict_once(region, now, stale_ns);
+                    lorica_shmem::eviction::log_pass(stats);
+                }
+            });
+        }
+
         // Broadcast channel: API config changes fan out to all per-worker tasks
         let (reload_bc_tx, _) = broadcast::channel::<u64>(16);
-        // Broadcast channel: supervisor sends BanIp commands to all per-worker tasks
-        let (ban_bc_tx, _) = broadcast::channel::<(String, u64)>(64);
+        // Broadcast channel: supervisor sends BanIp commands to all
+        // per-worker tasks. Capacity 1024: large enough to absorb a
+        // sweep-like burst from `/api/v1/bans/bulk` or a WAF flood
+        // without tripping `RecvError::Lagged` under normal load. If
+        // a worker still lags, the drop count is exported via the
+        // `lorica_ban_broadcast_lagged_total{worker_id}` Prometheus
+        // counter and the ban is still persisted to SQLite, so the
+        // next `ConfigReload` picks it up.
+        let (ban_bc_tx, _) = broadcast::channel::<(String, u64)>(1024);
         // Clone for the API's watch-based reload signal
         let reload_bc_tx_clone = reload_bc_tx.clone();
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
 
+        // Per-worker RPC endpoint table. Used by the config-reload
+        // coordinator (§ 7 WPAR-8) to fan out `ConfigReloadPrepare`
+        // and `ConfigReloadCommit` in two phases. Each worker's spawn
+        // block inserts here; on worker crash + respawn the table is
+        // updated with the new endpoint.
+        let worker_rpc_endpoints: Arc<
+            dashmap::DashMap<u32, lorica_command::RpcEndpoint>,
+        > = Arc::new(dashmap::DashMap::new());
+        // Monotonic generation counter owned by the supervisor. Every
+        // coordinated Prepare+Commit round bumps it so late/reordered
+        // workers detect stale Prepares via `GenerationGate::observe`.
+        let reload_generation: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Per-route rate-limit policy cache (audit M-4). Without this
+        // cache, N concurrent `RateLimitDelta` RPCs on a first-seen
+        // `{route|scope}` key serialise on the single `store`
+        // tokio::Mutex for N SQLite reads. Cache populated on miss,
+        // invalidated on every successful two-phase Commit (see the
+        // reload coordinator below).
+        let rl_policy_cache: Arc<
+            dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>,
+        > = Arc::new(dashmap::DashMap::new());
+
         // Bridge: watch channel (from API) -> broadcast (to per-worker tasks)
+        //
+        // In worker mode we also drive the pipelined-RPC two-phase
+        // coordinator off the same signal (see `coordinate_config_reload`
+        // below). The coordinator and the legacy broadcast both end up
+        // reloading the same config; when both succeed the later one is
+        // a no-op (new_config == current_config). We keep the legacy
+        // path for the rare case where a worker's RPC channel is not
+        // yet registered (race at worker spawn).
         let sequence = Arc::new(AtomicU64::new(1));
         let bridge_seq = Arc::clone(&sequence);
+        let endpoints_for_reload = Arc::clone(&worker_rpc_endpoints);
+        let reload_generation_clone = Arc::clone(&reload_generation);
+        let rl_policy_for_reload = Arc::clone(&rl_policy_cache);
         tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
                 let seq = bridge_seq.fetch_add(1, Ordering::Relaxed);
-                let _ = reload_bc_tx_clone.send(seq);
+                // Two-phase RPC reload (WPAR-8) when any worker has a
+                // registered endpoint.
+                if !endpoints_for_reload.is_empty() {
+                    let gen = reload_generation_clone
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    let report = coordinate_config_reload(&endpoints_for_reload, gen).await;
+                    if !report.prepare_failed.is_empty() || !report.commit_failed.is_empty() {
+                        warn!(
+                            seq,
+                            generation = report.generation,
+                            prepare_failed = report.prepare_failed.len(),
+                            commit_failed = report.commit_failed.len(),
+                            "two-phase config reload had failures; falling back to legacy broadcast"
+                        );
+                        let _ = reload_bc_tx_clone.send(seq);
+                    }
+                    // Whether the two-phase path fully committed or fell
+                    // back to the legacy broadcast, the route policies
+                    // may have changed - drop the supervisor-side
+                    // rate-limit policy cache so the next RateLimitDelta
+                    // re-reads them from the store (audit M-4).
+                    rl_policy_for_reload.clear();
+                } else {
+                    // No workers with RPC (e.g. --workers 0 or before
+                    // any worker registered). Fall back to legacy
+                    // per-worker broadcast which also fires the SIGHUP
+                    // path for single-process mode.
+                    let _ = reload_bc_tx_clone.send(seq);
+                    rl_policy_for_reload.clear();
+                }
             }
         });
 
@@ -542,9 +698,43 @@ fn run_supervisor(cli: Cli) {
         let worker_task_handles: Arc<parking_lot::Mutex<std::collections::HashMap<u32, tokio::task::JoinHandle<()>>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+        // Cross-worker authoritative token-bucket registry. Every
+        // `RateLimitDelta` RPC from a worker drains its consumption into
+        // the `AuthoritativeBucket` keyed here, then replies with the
+        // current token count for each key so the worker can refresh its
+        // local cache. See docs/architecture/worker-shared-state.md § 6.
+        let rl_registry: Arc<
+            dashmap::DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>,
+        > = Arc::new(dashmap::DashMap::new());
+
+        // Cross-worker forward-auth verdict cache. Workers issue
+        // `VerdictLookup` before calling the auth upstream and
+        // `VerdictPush` after a successful Allow. A single shared cache
+        // means every worker sees Allow verdicts populated by any peer
+        // and a session revocation invalidates them uniformly. See
+        // design § 7 WPAR-2.
+        let verdict_cache: Arc<SupervisorVerdictCache> =
+            Arc::new(SupervisorVerdictCache::new());
+
+        // Cross-worker circuit breaker state. Workers ask the
+        // supervisor whether a request to `(route, backend)` should be
+        // admitted and report back the outcome; the supervisor owns
+        // the Closed/Open/HalfOpen state machine so probe admission
+        // never races across workers. See design § 7 WPAR-3.
+        let breaker_registry: Arc<SupervisorBreakerRegistry> =
+            Arc::new(SupervisorBreakerRegistry::new(5, Duration::from_secs(10)));
+
+        // Shared shutdown flag. Set by the SIGTERM handler before
+        // `manager.shutdown_all()` so the worker monitor short-circuits
+        // crash-event respawns and the per-worker heartbeat tasks stop
+        // probing workers that were just SIGTERM'd (avoids a burst of
+        // "heartbeat send failed: Broken pipe" warnings at every
+        // shutdown).
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // Spawn a per-worker task that handles both config reload and heartbeat
         // No shared Mutex - each worker has its own channel and task
-        for (worker_id, worker_pid, raw_fd) in worker_fds {
+        for (worker_id, worker_pid, raw_fd, rpc_raw_fd) in worker_fds {
             // SAFETY: raw_fd is a valid file descriptor from the socketpair
             // created by WorkerManager::spawn_workers(), passed to this task
             // immediately after fork. The fd is exclusively owned by this task.
@@ -560,6 +750,83 @@ fn run_supervisor(cli: Cli) {
             let hb_seq = Arc::clone(&sequence);
             let hb_metrics = Arc::clone(&worker_metrics);
             let agg_metrics = Arc::clone(&aggregated_metrics);
+            let hb_shutting_down = Arc::clone(&shutting_down);
+
+            // Pipelined RPC channel task: consumes the per-worker
+            // RpcEndpoint stream and handles `RateLimitDelta` by applying
+            // each entry to the authoritative bucket registry. Spawned
+            // alongside the legacy channel task; dies with the worker.
+            {
+                let rpc_fd = rpc_raw_fd;
+                let registry = Arc::clone(&rl_registry);
+                let rl_policy = Arc::clone(&rl_policy_cache);
+                let store_for_rpc = Arc::clone(&store);
+                let vcache = Arc::clone(&verdict_cache);
+                let breakers = Arc::clone(&breaker_registry);
+                let endpoints = Arc::clone(&worker_rpc_endpoints);
+                tokio::spawn(async move {
+                    // SAFETY: rpc_fd is a valid socketpair end from
+                    // WorkerManager::spawn_worker, exclusively owned by
+                    // this task.
+                    let (endpoint, mut incoming) = match unsafe {
+                        lorica_command::RpcEndpoint::from_raw_fd(rpc_fd)
+                    } {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            error!(
+                                worker_id,
+                                error = %e,
+                                "failed to create supervisor RpcEndpoint"
+                            );
+                            return;
+                        }
+                    };
+                    // Register for supervisor-initiated RPCs (config
+                    // reload coordinator, future metrics pull).
+                    endpoints.insert(worker_id, endpoint);
+                    while let Some(inc) = incoming.recv().await {
+                        match inc.command_type() {
+                            lorica_command::CommandType::RateLimitDelta => {
+                                handle_rate_limit_delta(
+                                    inc,
+                                    &registry,
+                                    &rl_policy,
+                                    &store_for_rpc,
+                                    worker_id,
+                                )
+                                .await;
+                            }
+                            lorica_command::CommandType::VerdictLookup => {
+                                handle_verdict_lookup(inc, &vcache).await;
+                            }
+                            lorica_command::CommandType::VerdictPush => {
+                                handle_verdict_push(inc, &vcache).await;
+                            }
+                            lorica_command::CommandType::BreakerQuery => {
+                                handle_breaker_query(inc, &breakers).await;
+                            }
+                            lorica_command::CommandType::BreakerReport => {
+                                handle_breaker_report(inc, &breakers).await;
+                            }
+                            other => {
+                                tracing::debug!(
+                                    worker_id,
+                                    command_type = ?other,
+                                    "supervisor RPC: ignoring command (no handler)"
+                                );
+                                let _ = inc
+                                    .reply_error("no handler registered for this command")
+                                    .await;
+                            }
+                        }
+                    }
+                    // Worker died or channel EOF: drop the registered
+                    // endpoint so the config-reload coordinator does
+                    // not try to fan out commands to a dead worker.
+                    endpoints.remove(&worker_id);
+                    tracing::debug!(worker_id, "supervisor RPC loop exiting");
+                });
+            }
 
             let handle = tokio::spawn(async move {
                 let heartbeat_interval = Duration::from_secs(5);
@@ -570,24 +837,46 @@ fn run_supervisor(cli: Cli) {
                 loop {
                     tokio::select! {
                         // BanIp command from supervisor's global WAF counter
-                        Ok((ip, duration_s)) = ban_rx.recv() => {
-                            let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
-                            let cmd = Command::ban_ip(seq, &ip, duration_s);
-                            if let Err(e) = channel.send(&cmd).await {
-                                warn!(worker_id, error = %e, "BanIp send failed");
-                                continue;
-                            }
-                            match channel.recv::<Response>().await {
-                                Ok(resp) => match resp.typed_status() {
-                                    lorica_command::ResponseStatus::Ok => {
-                                        info!(worker_id, ip = %ip, "worker applied BanIp");
+                        ban_result = ban_rx.recv() => {
+                            match ban_result {
+                                Ok((ip, duration_s)) => {
+                                    let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                                    let cmd = Command::ban_ip(seq, &ip, duration_s);
+                                    if let Err(e) = channel.send(&cmd).await {
+                                        warn!(worker_id, error = %e, "BanIp send failed");
+                                        continue;
                                     }
-                                    lorica_command::ResponseStatus::Error => {
-                                        error!(worker_id, message = %resp.message, "worker BanIp failed");
+                                    match channel.recv::<Response>().await {
+                                        Ok(resp) => match resp.typed_status() {
+                                            lorica_command::ResponseStatus::Ok => {
+                                                info!(worker_id, ip = %ip, "worker applied BanIp");
+                                            }
+                                            lorica_command::ResponseStatus::Error => {
+                                                error!(worker_id, message = %resp.message, "worker BanIp failed");
+                                            }
+                                            _ => {}
+                                        },
+                                        Err(e) => warn!(worker_id, error = %e, "BanIp response failed"),
                                     }
-                                    _ => {}
-                                },
-                                Err(e) => warn!(worker_id, error = %e, "BanIp response failed"),
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    // Subscriber fell behind the bounded channel.
+                                    // The missed bans are still in SQLite (auto-
+                                    // ban logic persists before broadcasting),
+                                    // and the next ConfigReload rehydrates them.
+                                    warn!(
+                                        worker_id,
+                                        dropped = n,
+                                        "BanIp broadcast lagged; missed bans will be applied via next ConfigReload"
+                                    );
+                                    lorica_api::metrics::inc_ban_broadcast_lagged(
+                                        &worker_id.to_string(),
+                                        n,
+                                    );
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
                             }
                         }
                         // Config reload triggered by API
@@ -615,6 +904,13 @@ fn run_supervisor(cli: Cli) {
                         }
                         // Periodic heartbeat
                         _ = heartbeat_timer.tick() => {
+                            // Skip the probe entirely once the supervisor is
+                            // tearing down: workers are SIGTERM'd in the same
+                            // instant, so any send would race the worker's
+                            // exit and log a spurious "Broken pipe" warning.
+                            if hb_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                                continue;
+                            }
                             let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
                             let cmd = Command::new(CommandType::Heartbeat, seq);
                             let start = Instant::now();
@@ -691,7 +987,7 @@ fn run_supervisor(cli: Cli) {
         // resolve backend topologies for health check decisions. It also triggers
         // reload_proxy_config so the health loop sees updated backends.
         let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
-        if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
+        if let Err(e) = reload_proxy_config(&store, &proxy_config, None).await {
             warn!(error = %e, "supervisor: failed to load initial proxy config for health checks");
         }
 
@@ -732,9 +1028,13 @@ fn run_supervisor(cli: Cli) {
         }
         let waf_event_sink = Arc::clone(&waf_event_buffer);
         let waf_alert_sender = alert_sender.clone();
-        // Global WAF violation counter: counts blocked events per IP across all workers
-        let waf_global_violations: Arc<dashmap::DashMap<String, std::sync::atomic::AtomicU64>> =
-            Arc::new(dashmap::DashMap::new());
+        // Cross-worker WAF auto-ban counter lives in the shmem region
+        // (see lorica-shmem::SharedRegion::waf_auto_ban). The supervisor
+        // is the sole ban-issuer: it increments on each UDS event,
+        // compares to the configured threshold, and on crossing
+        // broadcasts BanIp then resets the slot so the next round of
+        // violations starts at zero.
+        let waf_shmem = shmem_region;
         let waf_ban_tx = ban_bc_tx.clone();
         let waf_ban_store = Arc::clone(&store);
         tokio::spawn(async move {
@@ -743,9 +1043,9 @@ fn run_supervisor(cli: Cli) {
                     Ok((stream, _)) => {
                         let sink = Arc::clone(&waf_event_sink);
                         let alert_tx = waf_alert_sender.clone();
-                        let violations = Arc::clone(&waf_global_violations);
                         let ban_tx = waf_ban_tx.clone();
                         let ban_store = Arc::clone(&waf_ban_store);
+                        let shmem = waf_shmem;
                         tokio::spawn(async move {
                             let mut reader = tokio::io::BufReader::new(stream);
                             let mut line = String::new();
@@ -770,7 +1070,24 @@ fn run_supervisor(cli: Cli) {
                                                 .with_detail("severity", event.severity.to_string()),
                                             );
 
-                                            // Global WAF auto-ban: count blocked events per client IP
+                                            // Global WAF auto-ban: read the cross-worker shmem
+                                            // counter. Workers have already bumped it in their
+                                            // hot path (see proxy_wiring.rs). The supervisor
+                                            // compares against the configured threshold and,
+                                            // on the first crossing, broadcasts BanIp and
+                                            // resets the slot so the next round starts at zero.
+                                            //
+                                            // Concurrent UDS events for the same IP can race:
+                                            // task A reads shmem >= threshold, decides to ban,
+                                            // resets; task B reads (post-A's read, pre-A's
+                                            // reset) ALSO sees >= threshold and broadcasts a
+                                            // duplicate BanIp. The race is bounded by the
+                                            // burst size of WAF events for one IP within a few
+                                            // microseconds, and the duplicate broadcast is
+                                            // idempotent (DashMap insert + same duration). The
+                                            // ban_list arrives at every worker exactly the
+                                            // same way; the only effect is one extra notify
+                                            // alert dispatch. Acceptable.
                                             if !event.client_ip.is_empty() && event.client_ip != "-" {
                                                 let s = ban_store.lock().await;
                                                 let (threshold, duration_s) = s.get_global_settings()
@@ -779,13 +1096,22 @@ fn run_supervisor(cli: Cli) {
                                                 drop(s);
 
                                                 if threshold > 0 {
-                                                    let count = violations
-                                                        .entry(event.client_ip.clone())
-                                                        .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
-                                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                                        + 1;
+                                                    let key = lorica::proxy_wiring::ip_to_shmem_key(
+                                                        &event.client_ip,
+                                                    );
+                                                    let tagged = shmem.tagged(key);
+                                                    let count = shmem
+                                                        .waf_auto_ban
+                                                        .read(tagged)
+                                                        .unwrap_or(0);
                                                     if count >= threshold {
-                                                        violations.remove(&event.client_ip);
+                                                        // Reset slot so concurrent/future
+                                                        // violations after broadcast start
+                                                        // fresh. CAS failure is benign (another
+                                                        // event raced and we already broadcast).
+                                                        let _ = shmem
+                                                            .waf_auto_ban
+                                                            .reset(tagged);
                                                         warn!(
                                                             ip = %event.client_ip,
                                                             violations = %count,
@@ -860,10 +1186,17 @@ fn run_supervisor(cli: Cli) {
             }
         }
 
+        // Tracker shared by every background task that must drain on
+        // shutdown (blocklist refresh, ACME polling, session GC,
+        // backend drain, loadtest driver). The shutdown path below
+        // calls `close(); wait().await` on its clone.
+        let task_tracker = tokio_util::task::TaskTracker::new();
+
         // Spawn IP blocklist auto-refresh in supervisor
         let _blocklist_refresh = lorica_api::waf::spawn_blocklist_refresh(
             Arc::clone(&waf_engine),
             std::time::Duration::from_secs(6 * 3600),
+            &task_tracker,
         );
 
         // Create notification dispatcher from DB configs
@@ -905,7 +1238,7 @@ fn run_supervisor(cli: Cli) {
         let mut reload_rx = reload_bc_tx.subscribe();
         tokio::spawn(async move {
             while reload_rx.recv().await.is_ok() {
-                if let Err(e) = reload_proxy_config(&reload_store, &reload_config).await {
+                if let Err(e) = reload_proxy_config(&reload_store, &reload_config, None).await {
                     tracing::error!(error = %e, "supervisor: failed to reload proxy config");
                 }
                 reload_probe_scheduler.reload().await;
@@ -927,8 +1260,34 @@ fn run_supervisor(cli: Cli) {
         let api_log_store = log_store.clone();
         let api_worker_metrics = Arc::clone(&worker_metrics);
         let api_aggregated_metrics = Arc::clone(&aggregated_metrics);
+        // Pipelined metrics refresher (WPAR-7 pull-on-scrape). Captures
+        // the per-worker RPC endpoint map, the AggregatedMetrics
+        // handle, and a dedup lock so concurrent /metrics scrapes
+        // collapse into a single supervisor fan-out. Lives for the
+        // lifetime of the API task.
+        let refresher_endpoints = Arc::clone(&worker_rpc_endpoints);
+        let refresher_aggregated = Arc::clone(&aggregated_metrics);
+        let refresher_dedup: Arc<tokio::sync::Mutex<Option<Instant>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let api_metrics_refresher: lorica_api::server::MetricsRefresher = Arc::new(move || {
+            let endpoints = Arc::clone(&refresher_endpoints);
+            let aggregated = Arc::clone(&refresher_aggregated);
+            let dedup = Arc::clone(&refresher_dedup);
+            Box::pin(pull_all_metrics_via_rpc(
+                endpoints,
+                aggregated,
+                dedup,
+                METRICS_PULL_PER_WORKER_TIMEOUT,
+                METRICS_PULL_DEDUP_TTL,
+            ))
+        });
         let management_port = cli.management_port;
         let api_db_path = db_path.clone();
+        // `task_tracker` is already defined above (before the WAF
+        // blocklist refresh spawn). Re-use its clones for the API
+        // task's AppState and the shutdown drain path.
+        let api_task_tracker = task_tracker.clone();
+        let shutdown_task_tracker = task_tracker.clone();
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -955,13 +1314,17 @@ fn run_supervisor(cli: Cli) {
                 ewma_scores: None,
                 backend_connections: None,
                 aggregated_metrics: Some(api_aggregated_metrics),
+                metrics_refresher: Some(api_metrics_refresher),
                 notification_history: {
                     let d = notify_dispatcher.lock().await;
                     Some(d.history())
                 },
                 log_store: api_log_store,
+                task_tracker: api_task_tracker,
             };
-            let session_store = SessionStore::new(Arc::clone(&state.store)).await;
+            let session_store = SessionStore::new(Arc::clone(&state.store))
+                .await
+                .with_task_tracker(state.task_tracker.clone());
             let rate_limiter = RateLimiter::new();
 
             if let Err(e) =
@@ -1015,14 +1378,39 @@ fn run_supervisor(cli: Cli) {
         let monitor_hb_metrics = Arc::clone(&worker_metrics);
         let monitor_agg_metrics = Arc::clone(&aggregated_metrics);
         let monitor_task_handles = Arc::clone(&worker_task_handles);
+        // `shutting_down` is declared above, shared with the per-worker
+        // heartbeat tasks. The monitor short-circuits on the same flag
+        // so shutdown-driven worker SIGKILLs don't trigger a respawn:
+        // `monitor_handle.abort()` alone is not enough because the
+        // monitor's loop blocks on `monitor_mgr.lock()` (a
+        // `std::sync::Mutex`, not a tokio one), so abort cannot fire
+        // while the supervisor is holding that mutex inside
+        // `manager.shutdown_all()`. The monitor would then unblock
+        // 30 s later, see the SIGKILL'd workers as crashed, and
+        // respawn them - the exact race that drove systemd to SIGKILL
+        // the whole service group past `TimeoutStopSec`.
+        let monitor_shutting_down = Arc::clone(&shutting_down);
         let monitor_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
+
+                if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
 
                 let mut mgr = monitor_mgr.lock().unwrap_or_else(|e| {
                     warn!("worker monitor mutex poisoned, recovering");
                     e.into_inner()
                 });
+                // Re-check after acquiring the mutex: shutdown may have
+                // grabbed the mutex while we waited (the supervisor
+                // shutdown path holds it for the full ~30 s drain). If
+                // we observe the flag now, the workers we are about to
+                // see as "crashed" were actually SIGKILL'd by us and
+                // must not be respawned.
+                if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
                 let events = mgr.check_workers();
                 for event in events {
                     let (id, log_msg) = match event {
@@ -1158,6 +1546,24 @@ fn run_supervisor(cli: Cli) {
         shutdown_signal().await;
 
         info!("supervisor shutting down");
+        // CRITICAL ordering: stop the worker monitor BEFORE telling
+        // workers to drain. The monitor's job is to detect crashed
+        // workers and respawn them; during shutdown the SIGKILL we
+        // send to stragglers (drain timeout exceeded) shows up as a
+        // crash and triggers a respawn-into-shutdown race - the
+        // freshly forked worker gets SIGTERM ~ms later, can't drain
+        // in time, and systemd ends up SIGKILL'ing the whole service
+        // group past TimeoutStopSec.
+        //
+        // Two-step stop is required because the monitor blocks on a
+        // std::sync::Mutex (the same one shutdown_all needs), so a
+        // bare `monitor_handle.abort()` cannot fire while the
+        // supervisor is inside shutdown_all (sync code, no .await).
+        // The atomic flag is the primary defence: the monitor checks
+        // it both before and after acquiring the mutex and returns
+        // early when set. The abort is the belt-and-braces backstop.
+        shutting_down.store(true, std::sync::atomic::Ordering::Release);
+        monitor_handle.abort();
         // Explicit SIGTERM to all workers before exiting
         manager
             .lock()
@@ -1166,10 +1572,819 @@ fn run_supervisor(cli: Cli) {
                 e.into_inner()
             })
             .shutdown_all();
+        // Drain tracked background tasks (ACME polling, session-store
+        // writes, WAF refresh, backend drain watchdog). Bounded to 10 s
+        // so a hung task cannot delay shutdown indefinitely; systemd
+        // TimeoutStopSec will SIGKILL us past that anyway.
+        shutdown_task_tracker.close();
+        if tokio::time::timeout(Duration::from_secs(10), shutdown_task_tracker.wait())
+            .await
+            .is_err()
+        {
+            warn!("some background tasks did not finish within drain timeout; aborting");
+        }
         api_handle.abort();
         health_handle.abort();
-        monitor_handle.abort();
     });
+}
+
+/// Supervisor-side handler for `CommandType::RateLimitDelta`. Walks the
+/// batched entries, applies each consumption to the authoritative
+/// bucket for `{route_id}|{scope_key}`, and replies with a
+/// `RateLimitDeltaResult` carrying the current token count per key
+/// so the worker can refresh its local cache.
+///
+/// The `{route_id}|{scope_key}` key format is assembled by the worker
+/// in `proxy_wiring.rs`; the supervisor only splits it to look up the
+/// route config once per first-seen key (for capacity + refill rate).
+async fn handle_rate_limit_delta(
+    inc: lorica_command::IncomingCommand,
+    registry: &dashmap::DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>,
+    rl_policy_cache: &dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>,
+    store: &Arc<Mutex<lorica_config::ConfigStore>>,
+    worker_id: u32,
+) {
+    use lorica_command::{command, response, RateLimitDeltaResult, RateLimitSnapshot};
+
+    let delta = match inc.command().payload.clone() {
+        Some(command::Payload::RateLimitDelta(d)) => d,
+        _ => {
+            let _ = inc.reply_error("malformed RateLimitDelta payload").await;
+            return;
+        }
+    };
+    if delta.entries.is_empty() {
+        let _ = inc
+            .reply(lorica_command::Response::ok_with(
+                0,
+                response::Payload::RateLimitDeltaResult(RateLimitDeltaResult {
+                    snapshots: Vec::new(),
+                }),
+            ))
+            .await;
+        return;
+    }
+    let now_ns = lorica_shmem::now_ns();
+    let mut snapshots = Vec::with_capacity(delta.entries.len());
+    for entry in &delta.entries {
+        // Key shape: "{route_id}|{scope_key}". Peel off the route id to
+        // fetch capacity/refill for a first-seen key.
+        let route_id = entry.key.split('|').next().unwrap_or("");
+        let bucket = match registry.get(&entry.key) {
+            Some(b) => Arc::clone(b.value()),
+            None => {
+                // Lookup route config to seed the authoritative bucket.
+                // A missing or unlimited route means any contribution
+                // the worker sent is a no-op (the worker's own
+                // LocalBucket should not have existed in the first
+                // place, but we handle it defensively).
+                //
+                // Hit the per-route policy cache first so concurrent
+                // RateLimitDeltas from N workers don't all serialise on
+                // the `store` tokio::Mutex at first-seen time (audit
+                // M-4). The cache is invalidated on every successful
+                // config reload (see `invalidate_rl_policy_cache`).
+                let rl_cfg = if let Some(cached) =
+                    rl_policy_cache.get(route_id).map(|e| e.value().clone())
+                {
+                    cached
+                } else {
+                    let fetched = {
+                        let s = store.lock().await;
+                        s.get_route(route_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|r| r.rate_limit.clone())
+                    };
+                    rl_policy_cache.insert(route_id.to_string(), fetched.clone());
+                    fetched
+                };
+                let Some(rl) = rl_cfg else {
+                    tracing::debug!(
+                        worker_id,
+                        key = %entry.key,
+                        "RateLimitDelta for route with no rate_limit; ignoring"
+                    );
+                    snapshots.push(RateLimitSnapshot {
+                        key: entry.key.clone(),
+                        remaining: 0,
+                    });
+                    continue;
+                };
+                let new = Arc::new(lorica_limits::token_bucket::AuthoritativeBucket::new(
+                    rl.capacity,
+                    rl.refill_per_sec,
+                    now_ns,
+                ));
+                let entry_ref = registry
+                    .entry(entry.key.clone())
+                    .or_insert_with(|| new.clone());
+                Arc::clone(entry_ref.value())
+            }
+        };
+        let remaining = bucket.apply_delta(entry.consumed, now_ns);
+        snapshots.push(RateLimitSnapshot {
+            key: entry.key.clone(),
+            remaining,
+        });
+    }
+    let _ = inc
+        .reply(lorica_command::Response::ok_with(
+            0,
+            response::Payload::RateLimitDeltaResult(RateLimitDeltaResult { snapshots }),
+        ))
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor-side forward-auth verdict cache (WPAR-2).
+//
+// Mirrors the per-process FIFO cache that `proxy_wiring.rs` keeps for
+// single-process deployments, but as an instance rather than a static.
+// Worker-mode deployments route lookup/push through the pipelined RPC
+// channel so every worker sees the same Allow verdicts and session
+// revocation invalidates them uniformly.
+// ---------------------------------------------------------------------------
+
+const SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES: usize = 16_384;
+
+/// Triple returned by [`SupervisorVerdictCache::lookup`]: encoded
+/// `Verdict`, response-header pairs, and remaining TTL in ms.
+type VerdictLookupResult = (i32, Vec<(String, String)>, u64);
+
+struct SupervisorVerdictCacheEntry {
+    verdict: i32,
+    response_headers: Vec<(String, String)>,
+    expires_at: Instant,
+}
+
+struct SupervisorVerdictCache {
+    entries: dashmap::DashMap<String, SupervisorVerdictCacheEntry>,
+    order: parking_lot::Mutex<std::collections::VecDeque<String>>,
+}
+
+impl SupervisorVerdictCache {
+    fn new() -> Self {
+        Self {
+            entries: dashmap::DashMap::with_capacity(SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES),
+            order: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
+                SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES,
+            )),
+        }
+    }
+
+    fn key(route_id: &str, cookie: &str) -> String {
+        let mut k = String::with_capacity(route_id.len() + 1 + cookie.len());
+        k.push_str(route_id);
+        k.push('\0');
+        k.push_str(cookie);
+        k
+    }
+
+    fn lookup(&self, route_id: &str, cookie: &str) -> Option<VerdictLookupResult> {
+        let key = Self::key(route_id, cookie);
+        // Fast path: clone out under the read guard, then drop the ref.
+        let (verdict, response_headers, expires_at) = {
+            let entry = self.entries.get(&key)?;
+            (
+                entry.verdict,
+                entry.response_headers.clone(),
+                entry.expires_at,
+            )
+        };
+        let now = Instant::now();
+        if now >= expires_at {
+            // Expired: evict atomically only if the entry at `key` is
+            // still the one we read. `remove_if` closes the TOCTOU noted
+            // in audit M-2 - a fresh `insert` racing with this lookup
+            // can no longer be evicted by a stale expiry observation.
+            self.entries
+                .remove_if(&key, |_, e| e.expires_at == expires_at);
+            return None;
+        }
+        let ttl_ms = expires_at.saturating_duration_since(now).as_millis() as u64;
+        Some((verdict, response_headers, ttl_ms))
+    }
+
+    fn insert(
+        &self,
+        route_id: &str,
+        cookie: &str,
+        verdict: i32,
+        response_headers: Vec<(String, String)>,
+        ttl_ms: u64,
+    ) {
+        let key = Self::key(route_id, cookie);
+        // FIFO bound: pop oldest keys until strictly under the cap.
+        // Matches `verdict_cache_insert` in proxy_wiring.rs so worker
+        // mode and single-process mode agree on memory ceiling.
+        let mut order = self.order.lock();
+        while order.len() >= SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES {
+            if let Some(old) = order.pop_front() {
+                self.entries.remove(&old);
+            } else {
+                break;
+            }
+        }
+        order.push_back(key.clone());
+        drop(order);
+        let expires_at = Instant::now() + Duration::from_millis(ttl_ms);
+        self.entries.insert(
+            key,
+            SupervisorVerdictCacheEntry {
+                verdict,
+                response_headers,
+                expires_at,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+async fn handle_verdict_lookup(
+    inc: lorica_command::IncomingCommand,
+    cache: &SupervisorVerdictCache,
+) {
+    use lorica_command::{command, response, ForwardAuthHeader, VerdictResult};
+
+    let lookup = match inc.command().payload.clone() {
+        Some(command::Payload::VerdictLookup(l)) => l,
+        _ => {
+            let _ = inc.reply_error("malformed VerdictLookup payload").await;
+            return;
+        }
+    };
+    let result = match cache.lookup(&lookup.route_id, &lookup.cookie) {
+        Some((verdict, headers, ttl_ms)) => VerdictResult {
+            found: true,
+            verdict,
+            ttl_ms,
+            response_headers: headers
+                .into_iter()
+                .map(|(n, v)| ForwardAuthHeader { name: n, value: v })
+                .collect(),
+        },
+        None => VerdictResult {
+            found: false,
+            verdict: 0,
+            ttl_ms: 0,
+            response_headers: Vec::new(),
+        },
+    };
+    let _ = inc
+        .reply(lorica_command::Response::ok_with(
+            0,
+            response::Payload::VerdictResult(result),
+        ))
+        .await;
+}
+
+async fn handle_verdict_push(inc: lorica_command::IncomingCommand, cache: &SupervisorVerdictCache) {
+    use lorica_command::command;
+
+    let push = match inc.command().payload.clone() {
+        Some(command::Payload::VerdictPush(p)) => p,
+        _ => {
+            let _ = inc.reply_error("malformed VerdictPush payload").await;
+            return;
+        }
+    };
+    // Only Allow verdicts with a positive TTL are cached, matching the
+    // single-process semantics. A Deny or zero-TTL push is treated as a
+    // silent no-op so a worker that miscomputes the cache predicate
+    // cannot poison the supervisor's cache.
+    if push.ttl_ms > 0
+        && lorica_command::Verdict::from_i32(push.verdict) == lorica_command::Verdict::Allow
+    {
+        let headers = push
+            .response_headers
+            .into_iter()
+            .map(|h| (h.name, h.value))
+            .collect();
+        cache.insert(
+            &push.route_id,
+            &push.cookie,
+            push.verdict,
+            headers,
+            push.ttl_ms,
+        );
+    }
+    let _ = inc.reply(lorica_command::Response::ok(0)).await;
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor-side circuit breaker (WPAR-3).
+//
+// Mirrors the per-process `CircuitBreaker` kept in `proxy_wiring.rs` but
+// elevated to the supervisor so admission decisions and probe slots are
+// consistent across workers. Reuses the same `threshold` / `cooldown`
+// shape so operator-visible behaviour is unchanged.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SupervisorBreakerState {
+    Closed,
+    Open {
+        opened_at: Instant,
+    },
+    /// HalfOpen grants a single probe slot. `probe_started_at` is set to
+    /// `Some(Instant)` on admission and back to `None` on report. The
+    /// deadlock-avoidance guarantee (audit H-1) lives here: if the
+    /// probe-admitted worker crashes between admit and report, every
+    /// subsequent query observes `probe_started_at.elapsed() > cooldown`
+    /// and synthesises a failed-probe transition back to Open with a
+    /// fresh cooldown, so the backend is never locked out forever.
+    HalfOpen {
+        probe_started_at: Option<Instant>,
+    },
+}
+
+struct SupervisorBreakerEntry {
+    state: SupervisorBreakerState,
+    consecutive_failures: u32,
+}
+
+struct SupervisorBreakerRegistry {
+    /// Key: `{route_id}|{backend}`
+    entries: dashmap::DashMap<String, parking_lot::Mutex<SupervisorBreakerEntry>>,
+    failure_threshold: u32,
+    cooldown: Duration,
+}
+
+impl SupervisorBreakerRegistry {
+    fn new(failure_threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            entries: dashmap::DashMap::new(),
+            failure_threshold,
+            cooldown,
+        }
+    }
+
+    fn key(route_id: &str, backend: &str) -> String {
+        let mut k = String::with_capacity(route_id.len() + 1 + backend.len());
+        k.push_str(route_id);
+        k.push('|');
+        k.push_str(backend);
+        k
+    }
+
+    /// Decide admission for a `(route, backend)`. Closed = Allow; Open
+    /// past cooldown = promote to HalfOpen and grant the sole probe
+    /// (`AllowProbe`); HalfOpen with probe already in flight = Deny
+    /// (unless the probe is stale past `cooldown`, in which case we
+    /// synthesise a failed-probe transition to Open and grant a fresh
+    /// probe to the caller).
+    ///
+    /// The stale-probe path closes audit H-1: a worker that crashes
+    /// between admit and report no longer pins the breaker in
+    /// HalfOpen forever.
+    fn query(&self, route_id: &str, backend: &str) -> lorica_command::BreakerDecision {
+        let key = Self::key(route_id, backend);
+        let entry = self.entries.entry(key).or_insert_with(|| {
+            parking_lot::Mutex::new(SupervisorBreakerEntry {
+                state: SupervisorBreakerState::Closed,
+                consecutive_failures: 0,
+            })
+        });
+        let mut guard = entry.value().lock();
+        match guard.state {
+            SupervisorBreakerState::Closed => lorica_command::BreakerDecision::Allow,
+            SupervisorBreakerState::Open { opened_at } => {
+                if opened_at.elapsed() >= self.cooldown {
+                    guard.state = SupervisorBreakerState::HalfOpen {
+                        probe_started_at: Some(Instant::now()),
+                    };
+                    lorica_command::BreakerDecision::AllowProbe
+                } else {
+                    lorica_command::BreakerDecision::Deny
+                }
+            }
+            SupervisorBreakerState::HalfOpen { probe_started_at } => {
+                match probe_started_at {
+                    None => {
+                        // Slot is free (prior probe reported). Grant.
+                        guard.state = SupervisorBreakerState::HalfOpen {
+                            probe_started_at: Some(Instant::now()),
+                        };
+                        lorica_command::BreakerDecision::AllowProbe
+                    }
+                    Some(started) if started.elapsed() >= self.cooldown => {
+                        // Stale probe: the admitted worker never reported
+                        // back within cooldown. Treat as a failed probe
+                        // so the backend isn't locked out forever (H-1).
+                        // Bounce to Open with a fresh cooldown; account
+                        // the miss as a failure for consistency with the
+                        // HalfOpen -> Open transition path in `report`.
+                        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+                        guard.state = SupervisorBreakerState::Open {
+                            opened_at: Instant::now(),
+                        };
+                        tracing::warn!(
+                            route_id,
+                            backend,
+                            probe_age_s = started.elapsed().as_secs(),
+                            "breaker probe stale past cooldown; synthesising failed probe (audit H-1)"
+                        );
+                        lorica_command::BreakerDecision::Deny
+                    }
+                    Some(_) => lorica_command::BreakerDecision::Deny,
+                }
+            }
+        }
+    }
+
+    /// Update breaker state after a worker reports the outcome.
+    fn report(&self, route_id: &str, backend: &str, success: bool, was_probe: bool) {
+        let key = Self::key(route_id, backend);
+        let entry = self.entries.entry(key).or_insert_with(|| {
+            parking_lot::Mutex::new(SupervisorBreakerEntry {
+                state: SupervisorBreakerState::Closed,
+                consecutive_failures: 0,
+            })
+        });
+        let mut guard = entry.value().lock();
+        if success {
+            guard.consecutive_failures = 0;
+            if was_probe
+                || matches!(
+                    guard.state,
+                    SupervisorBreakerState::HalfOpen { .. } | SupervisorBreakerState::Open { .. }
+                )
+            {
+                guard.state = SupervisorBreakerState::Closed;
+            }
+        } else {
+            guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+            if guard.consecutive_failures >= self.failure_threshold {
+                guard.state = SupervisorBreakerState::Open {
+                    opened_at: Instant::now(),
+                };
+            } else if was_probe {
+                // Probe failed: bounce back to Open with fresh cooldown.
+                guard.state = SupervisorBreakerState::Open {
+                    opened_at: Instant::now(),
+                };
+            }
+        }
+    }
+}
+
+async fn handle_breaker_query(
+    inc: lorica_command::IncomingCommand,
+    registry: &SupervisorBreakerRegistry,
+) {
+    use lorica_command::{command, response, BreakerResult};
+
+    let q = match inc.command().payload.clone() {
+        Some(command::Payload::BreakerQuery(q)) => q,
+        _ => {
+            let _ = inc.reply_error("malformed BreakerQuery payload").await;
+            return;
+        }
+    };
+    let decision = registry.query(&q.route_id, &q.backend);
+    let _ = inc
+        .reply(lorica_command::Response::ok_with(
+            0,
+            response::Payload::BreakerResult(BreakerResult {
+                decision: decision as i32,
+            }),
+        ))
+        .await;
+}
+
+async fn handle_breaker_report(
+    inc: lorica_command::IncomingCommand,
+    registry: &SupervisorBreakerRegistry,
+) {
+    use lorica_command::command;
+
+    let r = match inc.command().payload.clone() {
+        Some(command::Payload::BreakerReport(r)) => r,
+        _ => {
+            let _ = inc.reply_error("malformed BreakerReport payload").await;
+            return;
+        }
+    };
+    registry.report(&r.route_id, &r.backend, r.success, r.was_probe);
+    let _ = inc.reply(lorica_command::Response::ok(0)).await;
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor-side two-phase config reload coordinator (WPAR-8).
+//
+// Replaces the legacy one-shot `CommandType::ConfigReload` with a
+// Prepare (2 s timeout per worker, slow path: SQLite read + config
+// build) + Commit (500 ms timeout, fast path: single ArcSwap). The
+// result is that the divergence window between workers collapses
+// from ~10-50 ms down to the UDS RTT between workers (microseconds).
+//
+// A failed Prepare aborts the whole reload — workers that did reply
+// Ok to Prepare are asked to drop their pending slot via a best-effort
+// Commit of the *same* generation so they don't leak a stale pending
+// entry across a subsequent reload.
+// ---------------------------------------------------------------------------
+
+const CONFIG_RELOAD_PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
+const CONFIG_RELOAD_COMMIT_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Debug)]
+#[allow(dead_code)] // Lists are exported via the Debug derive for ops diagnostics.
+struct ConfigReloadReport {
+    generation: u64,
+    prepared: Vec<u32>,
+    prepare_failed: Vec<(u32, String)>,
+    committed: Vec<u32>,
+    commit_failed: Vec<(u32, String)>,
+}
+
+async fn coordinate_config_reload(
+    endpoints: &dashmap::DashMap<u32, lorica_command::RpcEndpoint>,
+    generation: u64,
+) -> ConfigReloadReport {
+    // Snapshot the endpoint list so a worker re-registering or dying
+    // mid-coordination doesn't change the set we're operating on.
+    let targets: Vec<(u32, lorica_command::RpcEndpoint)> = endpoints
+        .iter()
+        .map(|e| (*e.key(), e.value().clone()))
+        .collect();
+    let mut prepared = Vec::new();
+    let mut prepare_failed = Vec::new();
+    let mut committed = Vec::new();
+    let mut commit_failed = Vec::new();
+
+    // Phase 1: Prepare. Per-worker timeout; concurrent dispatch.
+    let prepare_futures = targets.iter().map(|(wid, ep)| {
+        let payload = lorica_command::command::Payload::ConfigReloadPrepare(
+            lorica_command::ConfigReloadPrepare { generation },
+        );
+        let ep = ep.clone();
+        let wid = *wid;
+        async move {
+            let res = ep
+                .request_rpc(
+                    lorica_command::CommandType::ConfigReloadPrepare,
+                    payload,
+                    CONFIG_RELOAD_PREPARE_TIMEOUT,
+                )
+                .await;
+            (wid, res)
+        }
+    });
+    let prepare_results = futures_util::future::join_all(prepare_futures).await;
+    for (wid, result) in prepare_results {
+        match result {
+            Ok(resp) if resp.typed_status() == lorica_command::ResponseStatus::Ok => {
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_prepare", "ok");
+                prepared.push(wid);
+            }
+            Ok(resp) => {
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_prepare", "error");
+                prepare_failed.push((wid, resp.message));
+            }
+            Err(e) => {
+                let outcome = if matches!(e, lorica_command::ChannelError::Timeout) {
+                    "timeout"
+                } else {
+                    "error"
+                };
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_prepare", outcome);
+                prepare_failed.push((wid, format!("rpc error: {e}")));
+            }
+        }
+    }
+    if !prepare_failed.is_empty() {
+        warn!(
+            generation,
+            failed = prepare_failed.len(),
+            succeeded = prepared.len(),
+            "ConfigReloadPrepare failed on some workers; aborting reload"
+        );
+        // Best-effort drop of the pending slot on workers that did
+        // Prepare successfully via the `ConfigReloadAbort` RPC (audit
+        // M-7). Without this, a partial-Prepare failure leaves one
+        // orphan `Arc<ProxyConfig>` per successful-Prepare worker
+        // until the next reload overwrites it. Abort is advisory so
+        // we ignore reply errors - the worst case (RPC timeout) is
+        // exactly what we already guarded against.
+        let abort_futures = prepared.iter().filter_map(|wid| {
+            let ep = endpoints.get(wid).map(|e| e.value().clone())?;
+            let payload = lorica_command::command::Payload::ConfigReloadAbort(
+                lorica_command::ConfigReloadAbort { generation },
+            );
+            let wid = *wid;
+            Some(async move {
+                let res = ep
+                    .request_rpc(
+                        lorica_command::CommandType::ConfigReloadAbort,
+                        payload,
+                        CONFIG_RELOAD_COMMIT_TIMEOUT,
+                    )
+                    .await;
+                let outcome = match res {
+                    Ok(r) if r.typed_status() == lorica_command::ResponseStatus::Ok => "ok",
+                    Ok(_) => "error",
+                    Err(lorica_command::ChannelError::Timeout) => "timeout",
+                    Err(_) => "error",
+                };
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_abort", outcome);
+                wid
+            })
+        });
+        let _ = futures_util::future::join_all(abort_futures).await;
+        return ConfigReloadReport {
+            generation,
+            prepared,
+            prepare_failed,
+            committed,
+            commit_failed,
+        };
+    }
+
+    // Phase 2: Commit. Smaller timeout; still concurrent.
+    let commit_futures = targets.iter().map(|(wid, ep)| {
+        let payload = lorica_command::command::Payload::ConfigReloadCommit(
+            lorica_command::ConfigReloadCommit { generation },
+        );
+        let ep = ep.clone();
+        let wid = *wid;
+        async move {
+            let res = ep
+                .request_rpc(
+                    lorica_command::CommandType::ConfigReloadCommit,
+                    payload,
+                    CONFIG_RELOAD_COMMIT_TIMEOUT,
+                )
+                .await;
+            (wid, res)
+        }
+    });
+    let commit_results = futures_util::future::join_all(commit_futures).await;
+    for (wid, result) in commit_results {
+        match result {
+            Ok(resp) if resp.typed_status() == lorica_command::ResponseStatus::Ok => {
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_commit", "ok");
+                committed.push(wid);
+            }
+            Ok(resp) => {
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_commit", "error");
+                commit_failed.push((wid, resp.message));
+            }
+            Err(e) => {
+                let outcome = if matches!(e, lorica_command::ChannelError::Timeout) {
+                    "timeout"
+                } else {
+                    "error"
+                };
+                lorica_api::metrics::inc_supervisor_rpc_outcome("config_reload_commit", outcome);
+                commit_failed.push((wid, format!("rpc error: {e}")));
+            }
+        }
+    }
+    info!(
+        generation,
+        prepared = prepared.len(),
+        committed = committed.len(),
+        commit_failed = commit_failed.len(),
+        "config reload coordinated via pipelined RPC"
+    );
+    ConfigReloadReport {
+        generation,
+        prepared,
+        prepare_failed,
+        committed,
+        commit_failed,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor-side metrics pull-on-scrape coordinator (WPAR-7).
+//
+// The /metrics HTTP handler invokes the refresher closure (see
+// `lorica_api::server::MetricsRefresher`) before reading
+// `AggregatedMetrics`. Internally, the refresher dedups concurrent
+// calls and, at most once per `METRICS_PULL_DEDUP_TTL`, fans out a
+// `CommandType::MetricsRequest` RPC to every registered worker with
+// a per-worker timeout of `METRICS_PULL_PER_WORKER_TIMEOUT`. Non-
+// responders fall back silently to the cached AggregatedMetrics
+// (populated by the periodic-pull task that still runs on the
+// legacy channel), so a stuck worker never blocks the scrape.
+// ---------------------------------------------------------------------------
+
+const METRICS_PULL_PER_WORKER_TIMEOUT: Duration = Duration::from_millis(500);
+const METRICS_PULL_DEDUP_TTL: Duration = Duration::from_millis(250);
+
+async fn pull_all_metrics_via_rpc(
+    endpoints: Arc<dashmap::DashMap<u32, lorica_command::RpcEndpoint>>,
+    aggregated: Arc<lorica_api::workers::AggregatedMetrics>,
+    dedup: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    per_worker_timeout: Duration,
+    dedup_ttl: Duration,
+) {
+    // Dedup: if a refresh started within `dedup_ttl`, this call is a
+    // no-op. The caller will read the existing cached state which is
+    // at most `dedup_ttl` old.
+    {
+        let mut guard = dedup.lock().await;
+        if let Some(last) = *guard {
+            if last.elapsed() < dedup_ttl {
+                return;
+            }
+        }
+        *guard = Some(Instant::now());
+    }
+
+    if endpoints.is_empty() {
+        return;
+    }
+
+    // Snapshot endpoints so a concurrent worker insert/remove doesn't
+    // skew the fan-out set.
+    let targets: Vec<(u32, lorica_command::RpcEndpoint)> = endpoints
+        .iter()
+        .map(|e| (*e.key(), e.value().clone()))
+        .collect();
+
+    let futures = targets.into_iter().map(|(wid, ep)| {
+        let cmd = lorica_command::Command::new(lorica_command::CommandType::MetricsRequest, 0);
+        async move {
+            let res = ep.request(cmd, per_worker_timeout).await;
+            (wid, res)
+        }
+    });
+    let results = futures_util::future::join_all(futures).await;
+
+    for (wid, result) in results {
+        match result {
+            Ok(resp) => match resp.payload {
+                Some(lorica_command::response::Payload::MetricsReport(report)) => {
+                    lorica_api::metrics::inc_supervisor_rpc_outcome("metrics_pull", "ok");
+                    let ewma: std::collections::HashMap<String, f64> = report
+                        .ewma_entries
+                        .iter()
+                        .map(|e| (e.backend_address.clone(), e.score_us))
+                        .collect();
+                    let bans: Vec<(String, u64, u64)> = report
+                        .ban_entries
+                        .iter()
+                        .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
+                        .collect();
+                    let backend_conns: std::collections::HashMap<String, u64> = report
+                        .backend_conn_entries
+                        .iter()
+                        .map(|e| (e.backend_address.clone(), e.connections))
+                        .collect();
+                    let req_counts: Vec<(String, u32, u64)> = report
+                        .request_entries
+                        .iter()
+                        .map(|e| (e.route_id.clone(), e.status_code, e.count))
+                        .collect();
+                    let waf_counts: Vec<(String, String, u64)> = report
+                        .waf_entries
+                        .iter()
+                        .map(|e| (e.category.clone(), e.action.clone(), e.count))
+                        .collect();
+                    aggregated
+                        .update_worker(
+                            wid,
+                            report.cache_hits,
+                            report.cache_misses,
+                            report.active_connections,
+                            bans,
+                            ewma,
+                            backend_conns,
+                            req_counts,
+                            waf_counts,
+                        )
+                        .await;
+                }
+                _ => {
+                    lorica_api::metrics::inc_supervisor_rpc_outcome("metrics_pull", "error");
+                    tracing::debug!(
+                        worker_id = wid,
+                        "MetricsRequest RPC: response missing MetricsReport payload; keeping cached state"
+                    );
+                }
+            },
+            Err(e) => {
+                let outcome = if matches!(e, lorica_command::ChannelError::Timeout) {
+                    "timeout"
+                } else {
+                    "error"
+                };
+                lorica_api::metrics::inc_supervisor_rpc_outcome("metrics_pull", outcome);
+                tracing::debug!(
+                    worker_id = wid,
+                    error = %e,
+                    "MetricsRequest RPC failed; keeping cached state for this worker"
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,29 +2404,56 @@ fn run_worker(
 
     info!(worker_id = id, cmd_fd = cmd_fd, "worker starting");
 
-    // Receive listening FDs from supervisor via SCM_RIGHTS
-    let fd_pairs = match fd_passing::recv_listener_fds(cmd_fd) {
-        Ok(pairs) => pairs,
+    // Receive typed FDs from supervisor via SCM_RIGHTS. Listener entries
+    // register with the Fds table; a `Shmem` entry (if present) is
+    // adopted via `lorica_shmem::SharedRegion::open_worker`.
+    let entries = match fd_passing::recv_worker_fds(cmd_fd) {
+        Ok(entries) => entries,
         Err(e) => {
-            error!(error = %e, "worker failed to receive listener FDs");
+            error!(error = %e, "worker failed to receive FDs");
             std::process::exit(1);
         }
     };
 
-    info!(
-        worker_id = id,
-        listener_count = fd_pairs.len(),
-        "received listener FDs"
-    );
-
-    // Build the Fds table for lorica-core
     let mut fds = Fds::new();
     let mut listener_addrs: Vec<String> = Vec::new();
-    for (fd, addr) in &fd_pairs {
-        fds.add(addr.clone(), *fd);
-        listener_addrs.push(addr.clone());
-        info!(worker_id = id, addr = %addr, fd = fd, "registered listener FD");
+    let mut shmem_region: Option<&'static lorica_shmem::SharedRegion> = None;
+    let mut rpc_fd: Option<i32> = None;
+    let mut listener_count = 0usize;
+    for entry in entries {
+        match entry.kind {
+            fd_passing::FdKind::Listener { addr } => {
+                fds.add(addr.clone(), entry.fd);
+                listener_addrs.push(addr.clone());
+                listener_count += 1;
+                info!(worker_id = id, addr = %addr, fd = entry.fd, "registered listener FD");
+            }
+            fd_passing::FdKind::Shmem => {
+                match unsafe { lorica_shmem::SharedRegion::open_worker(entry.fd) } {
+                    Ok(region) => {
+                        shmem_region = Some(region);
+                        info!(worker_id = id, fd = entry.fd, "adopted shmem region");
+                    }
+                    Err(e) => {
+                        error!(worker_id = id, error = %e, "worker failed to open shmem region");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            fd_passing::FdKind::Rpc => {
+                rpc_fd = Some(entry.fd);
+                info!(worker_id = id, fd = entry.fd, "adopted RPC channel FD");
+            }
+        }
     }
+
+    info!(
+        worker_id = id,
+        listener_count,
+        shmem = shmem_region.is_some(),
+        rpc = rpc_fd.is_some(),
+        "received worker FDs"
+    );
 
     // Open the configuration database with encryption key
     let data_dir = PathBuf::from(data_dir);
@@ -1240,11 +2482,16 @@ fn run_worker(
     let log_buffer = Arc::new(LogBuffer::new(10_000));
     let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+    // Listener-level connection filter with hot-reloadable CIDR policy.
+    // The supervisor broadcasts settings changes via the command channel; the
+    // filter is refreshed inline with ProxyConfig so listener state never
+    // drifts from the rest of the configuration.
+    let connection_filter = Arc::new(lorica::connection_filter::GlobalConnectionFilter::empty());
 
     // Load initial proxy configuration
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
-        if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
+        if let Err(e) = reload_proxy_config(&store, &proxy_config, Some(&connection_filter)).await {
             error!(error = %e, "worker failed to load proxy configuration");
             std::process::exit(1);
         }
@@ -1340,6 +2587,7 @@ fn run_worker(
     let cmd_backend_conns = Arc::clone(&worker_backend_conns);
     let cmd_request_counts = Arc::clone(&worker_request_counts);
     let cmd_waf_counts = Arc::clone(&worker_waf_counts);
+    let cmd_connection_filter = Arc::clone(&connection_filter);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create command channel runtime");
         rt.block_on(async move {
@@ -1371,7 +2619,6 @@ fn run_worker(
                 match cmd.typed_command() {
                     CommandType::ConfigReload => {
                         info!(worker_id = id, seq = cmd.sequence, "applying config reload");
-                        lorica::reload::reload_cert_resolver(&cmd_store, &cmd_cert_resolver).await;
                         // Sync WAF state from persisted settings/DB
                         {
                             let s = cmd_store.lock().await;
@@ -1403,8 +2650,26 @@ fn run_worker(
                                 }
                             }
                         }
-                        match reload_proxy_config(&cmd_store, &cmd_config).await {
+                        match reload_proxy_config(
+                            &cmd_store,
+                            &cmd_config,
+                            Some(&cmd_connection_filter),
+                        )
+                        .await
+                        {
                             Ok(()) => {
+                                // Rebuild the cert resolver AFTER the
+                                // proxy config is committed so any new
+                                // routes referencing a cert are
+                                // resolvable on the first subsequent
+                                // handshake, and so any TLS-settings
+                                // change lands on the same snapshot
+                                // the proxy just adopted.
+                                lorica::reload::reload_cert_resolver(
+                                    &cmd_store,
+                                    &cmd_cert_resolver,
+                                )
+                                .await;
                                 let resp = Response::ok(cmd.sequence);
                                 if let Err(e) = channel.send(&resp).await {
                                     warn!(error = %e, "failed to send response");
@@ -1536,6 +2801,35 @@ fn run_worker(
                     CommandType::Unspecified => {
                         warn!(worker_id = id, "received unspecified command");
                     }
+                    // Pipelined RPC command variants (Phase 1 framework,
+                    // see docs/architecture/worker-shared-state.md § 4).
+                    // The legacy CommandChannel used here is request/reply
+                    // inline; the pipelined RPC uses RpcEndpoint on a
+                    // separate (future) socketpair. Any RPC-typed Command
+                    // arriving on this channel is a protocol misuse; reply
+                    // with a clear error so the supervisor can log it.
+                    CommandType::RateLimitQuery
+                    | CommandType::RateLimitDelta
+                    | CommandType::VerdictLookup
+                    | CommandType::VerdictPush
+                    | CommandType::BreakerQuery
+                    | CommandType::BreakerReport
+                    | CommandType::ConfigReloadPrepare
+                    | CommandType::ConfigReloadCommit
+                    | CommandType::ConfigReloadAbort => {
+                        warn!(
+                            worker_id = id,
+                            command_type = ?cmd.typed_command(),
+                            "RPC-typed command delivered on legacy channel; expected the pipelined RpcEndpoint"
+                        );
+                        let resp = Response::error(
+                            cmd.sequence,
+                            "pipelined RPC command on legacy channel",
+                        );
+                        if let Err(e) = channel.send(&resp).await {
+                            warn!(error = %e, "failed to send RPC protocol-error response");
+                        }
+                    }
                 }
             }
         });
@@ -1562,15 +2856,23 @@ fn run_worker(
 
             // IP blocklist: initial load + periodic refresh (every 6h)
             if waf_fwd_engine.ip_blocklist().is_enabled() {
-                match lorica_api::waf::fetch_and_load_blocklist(waf_fwd_engine.ip_blocklist()).await {
+                match lorica_api::waf::fetch_and_load_blocklist(waf_fwd_engine.ip_blocklist()).await
+                {
                     Ok(count) => tracing::info!(count, "worker: IP blocklist loaded at startup"),
-                    Err(e) => tracing::warn!(error = %e, "worker: IP blocklist initial load failed"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "worker: IP blocklist initial load failed")
+                    }
                 }
             }
             let blocklist_engine = Arc::clone(&waf_fwd_engine);
+            // Worker mode has no supervisor drain; a local tracker
+            // is fine (worker shutdown is orchestrated by the
+            // supervisor via SIGTERM + drain-timeout anyway).
+            let worker_blocklist_tracker = tokio_util::task::TaskTracker::new();
             lorica_api::waf::spawn_blocklist_refresh(
                 blocklist_engine,
                 std::time::Duration::from_secs(6 * 3600),
+                &worker_blocklist_tracker,
             );
 
             // Forward WAF events to supervisor
@@ -1657,6 +2959,99 @@ fn run_worker(
     lorica_proxy.request_counts = worker_request_counts;
     lorica_proxy.waf_counts = worker_waf_counts;
     lorica_proxy.waf_engine = waf_engine;
+    lorica_proxy.shmem = shmem_region;
+    // Worker mode: rate-limit engine runs as a local cache synced with
+    // the supervisor via the pipelined RPC channel every 100 ms. See
+    // `spawn_rate_limit_sync` below and design doc § 6.
+    lorica_proxy.rate_limit_buckets = lorica::proxy_wiring::RateLimitEngine::local();
+    // Periodic basic-auth cache prune (PERF-8). Worker mode has no
+    // supervisor TaskTracker available here; a local tracker is fine
+    // because worker shutdown is orchestrated by the supervisor via
+    // SIGTERM and the prune task exits with the runtime.
+    let worker_auth_prune_tracker = tokio_util::task::TaskTracker::new();
+    // All four of the following `spawn_*` helpers call into
+    // `tokio::spawn`, which requires a current runtime. We are
+    // between two `rt.block_on(...)` blocks here, so use `rt.enter()`
+    // to establish a runtime context for the duration of the setup.
+    // The spawned tasks outlive the guard (tokio keeps them attached
+    // to the runtime itself).
+    let _rt_guard = rt.enter();
+    let _basic_auth_prune = lorica_proxy
+        .spawn_basic_auth_cache_prune(&worker_auth_prune_tracker, Duration::from_secs(30));
+    // Per-IP rate-limit buckets need the same lazy-prune treatment:
+    // a scan or high-cardinality traffic pattern would otherwise
+    // accumulate one bucket per distinct IP forever. 5 min idle TTL
+    // matches the shmem WAF eviction cadence.
+    let _rate_limit_prune = lorica_proxy.spawn_rate_limit_prune(
+        &worker_auth_prune_tracker,
+        Duration::from_secs(60),
+        Duration::from_secs(5 * 60),
+    );
+    // Spawn the cross-worker sync task when the supervisor provided
+    // an RPC socketpair (production worker mode). The task drains
+    // `LocalBucket::take_delta` every 100 ms, pushes the batch via
+    // `RateLimitDelta`, and refreshes each bucket with the
+    // authoritative snapshot from the reply.
+    if let Some(fd) = rpc_fd {
+        // SAFETY: fd is a valid socketpair end received via SCM_RIGHTS
+        // from the supervisor and exclusively owned by this worker.
+        match unsafe { lorica_command::RpcEndpoint::from_raw_fd(fd) } {
+            Ok((endpoint, incoming)) => {
+                // The endpoint is cloned across five use sites:
+                // rate-limit sync loop, verdict cache lookup/push,
+                // breaker query/report, config-reload prepare/commit
+                // listener, and the incoming stream that receives
+                // supervisor-initiated commands. `RpcEndpoint` is
+                // `Clone` via `Arc<Inner>` so all five share the
+                // same underlying stream and pipelined dispatcher.
+                // See design § 4.3.
+                lorica_proxy.verdict_cache = lorica::proxy_wiring::VerdictCacheEngine::rpc(
+                    endpoint.clone(),
+                    Duration::from_millis(500),
+                );
+                lorica_proxy.circuit_breaker_engine = lorica::proxy_wiring::BreakerEngine::rpc(
+                    endpoint.clone(),
+                    Duration::from_millis(500),
+                );
+                let _rpc_listener = lorica_proxy.spawn_worker_rpc_listener(
+                    &worker_auth_prune_tracker,
+                    incoming,
+                    Arc::clone(&store),
+                    // Pass the connection filter so `ConfigReloadCommit`
+                    // publishes ProxyConfig AND filter CIDRs atomically
+                    // (audit H-3). Previously `None` left the filter
+                    // out of the two-phase semantics.
+                    Some(Arc::clone(&connection_filter)),
+                    id,
+                );
+                let _sync_handle = lorica_proxy.spawn_rate_limit_sync(
+                    &worker_auth_prune_tracker,
+                    endpoint,
+                    Duration::from_millis(100),
+                );
+                info!(
+                    worker_id = id,
+                    "rate-limit sync + RPC listener spawned; verdict cache + breaker engines bound to RPC"
+                );
+            }
+            Err(e) => {
+                error!(
+                    worker_id = id,
+                    error = %e,
+                    "failed to create worker RpcEndpoint; rate-limit sync disabled"
+                );
+            }
+        }
+    } else if shmem_region.is_some() {
+        // Worker mode without RPC FD: should not happen in current
+        // `WorkerManager::spawn_worker` which always sends one. Log
+        // loudly so the misconfiguration surfaces.
+        warn!(
+            worker_id = id,
+            "worker started with shmem but no RPC FD; rate-limit sync disabled"
+        );
+    }
+    drop(_rt_guard);
     // Open a LogStore so the worker can persist WAF events directly (with
     // route_hostname and action stamped). SQLite WAL mode allows concurrent
     // writes from multiple worker processes.
@@ -1668,12 +3063,16 @@ fn run_worker(
         }
     };
     // ACME challenge store backed by SQLite - workers can read challenges set by supervisor
-    lorica_proxy.acme_challenge_store = Some(
-        lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone()),
-    );
+    lorica_proxy.acme_challenge_store = Some(lorica_api::acme::AcmeChallengeStore::with_db_path(
+        db_path.clone(),
+    ));
 
     let pool_size = {
-        let backend_count = store.blocking_lock().list_backends().map(|b| b.len()).unwrap_or(0);
+        let backend_count = store
+            .blocking_lock()
+            .list_backends()
+            .map(|b| b.len())
+            .unwrap_or(0);
         lorica::proxy_wiring::compute_pool_size(backend_count)
     };
     info!(pool_size, "upstream keepalive pool size");
@@ -1683,6 +3082,29 @@ fn run_worker(
         ..Default::default()
     });
     let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
+    // Install the TCP-level pre-filter. Held by Arc inside the listener, so
+    // subsequent reloads take effect without rebuilding endpoints.
+    proxy_service.set_connection_filter(
+        connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>
+    );
+
+    // Build the optional mTLS client-cert verifier from the union of
+    // per-route CA bundles. This is done once here; rustls
+    // ServerConfig is immutable so reloading a CA requires a restart.
+    // We also snapshot the CA fingerprint so `reload_proxy_config`
+    // can warn if an operator edits `mtls.ca_cert_pem` at runtime.
+    let (mtls_verifier, mtls_installed_fingerprint) = {
+        let routes = store.blocking_lock().list_routes().unwrap_or_default();
+        let fp = lorica::mtls::compute_ca_fingerprint(&routes);
+        (lorica::mtls::build_from_routes(&routes), fp)
+    };
+    if let Some(ref fp) = mtls_installed_fingerprint {
+        info!(worker_id = id, fingerprint = %fp, "mTLS enabled at listener: per-route enforcement applies");
+    }
+    // Note: the worker process doesn't drive reload_proxy_config
+    // directly (supervisor does via command channel), so no
+    // fingerprint slot is wired here - the supervisor side carries
+    // the drift-detection responsibility for the entire worker pool.
 
     // Register listeners - TCP for HTTP, TLS for HTTPS
     let https_suffix = format!(":{https_port}");
@@ -1691,6 +3113,9 @@ fn run_worker(
             let mut tls_settings =
                 lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
             tls_settings.enable_h2();
+            if let Some(ref v) = mtls_verifier {
+                tls_settings.set_client_cert_verifier(v.clone());
+            }
             proxy_service.add_tls_with_settings(addr, None, tls_settings);
             info!(worker_id = id, addr = %addr, "registered TLS listener");
         } else {
@@ -1774,8 +3199,10 @@ fn run_single_process(cli: Cli) {
         let log_buffer = Arc::new(LogBuffer::new(10_000));
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let proxy_config = Arc::new(ArcSwap::from_pointee(ProxyConfig::default()));
+        let connection_filter =
+            Arc::new(lorica::connection_filter::GlobalConnectionFilter::empty());
 
-        if let Err(e) = reload_proxy_config(&store, &proxy_config).await {
+        if let Err(e) = reload_proxy_config(&store, &proxy_config, Some(&connection_filter)).await {
             error!(error = %e, "failed to load initial proxy configuration");
             std::process::exit(1);
         }
@@ -1819,7 +3246,8 @@ fn run_single_process(cli: Cli) {
             if let Ok(settings) = s.get_global_settings() {
                 if settings.ip_blocklist_enabled {
                     waf_engine.ip_blocklist().set_enabled(true);
-                    match lorica_api::waf::fetch_and_load_blocklist(waf_engine.ip_blocklist()).await {
+                    match lorica_api::waf::fetch_and_load_blocklist(waf_engine.ip_blocklist()).await
+                    {
                         Ok(count) => info!(count, "IP blocklist loaded at startup"),
                         Err(e) => warn!(error = %e, "IP blocklist initial load failed"),
                     }
@@ -1847,10 +3275,17 @@ fn run_single_process(cli: Cli) {
             }
         }
 
+        // Tracker shared by every background task that must drain on
+        // shutdown. The shutdown path below calls `close(); wait().
+        // await` on its clone, giving in-flight work a bounded time
+        // to complete.
+        let single_task_tracker = tokio_util::task::TaskTracker::new();
+
         // Spawn IP blocklist auto-refresh (every 6 hours, matching Data-Shield update frequency)
         let _blocklist_refresh = lorica_api::waf::spawn_blocklist_refresh(
             Arc::clone(&waf_engine),
             std::time::Duration::from_secs(6 * 3600),
+            &single_task_tracker,
         );
 
         // Create non-blocking alert sender and notification dispatcher
@@ -1892,7 +3327,8 @@ fn run_single_process(cli: Cli) {
         lorica_bench::scheduler::start_scheduler(lt_scheduler_store, lt_scheduler_engine);
 
         // Create shared ACME challenge store backed by SQLite for cross-process access
-        let acme_challenge_store = lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone());
+        let acme_challenge_store =
+            lorica_api::acme::AcmeChallengeStore::with_db_path(db_path.clone());
 
         // Start the HTTP proxy service
         let mut lorica_proxy = LoricaProxy::new(
@@ -1905,6 +3341,18 @@ fn run_single_process(cli: Cli) {
         lorica_proxy.acme_challenge_store = Some(acme_challenge_store.clone());
         lorica_proxy.alert_sender = Some(alert_sender.clone());
         lorica_proxy.log_store = log_store.clone();
+        // Periodic prune of expired basic-auth cache entries so a
+        // password-spray with no successful logins cannot grow the
+        // cache unboundedly until next restart (PERF-8).
+        let _basic_auth_prune = lorica_proxy
+            .spawn_basic_auth_cache_prune(&single_task_tracker, Duration::from_secs(30));
+        // Same lazy-prune for per-IP rate-limit buckets; see worker
+        // path comment for rationale.
+        let _rate_limit_prune = lorica_proxy.spawn_rate_limit_prune(
+            &single_task_tracker,
+            Duration::from_secs(60),
+            Duration::from_secs(5 * 60),
+        );
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
@@ -1923,6 +3371,9 @@ fn run_single_process(cli: Cli) {
             ..Default::default()
         });
         let mut proxy_service = lorica_proxy::http_proxy_service(&server_conf, lorica_proxy);
+        proxy_service.set_connection_filter(
+            connection_filter.clone() as Arc<dyn lorica_core::listeners::ConnectionFilter>
+        );
         let mut tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
         tcp_opts.so_reuseport = Some(true);
         proxy_service.add_tcp_with_settings(&format!("0.0.0.0:{}", cli.http_port), tcp_opts);
@@ -1933,10 +3384,35 @@ fn run_single_process(cli: Cli) {
         // Connections to unknown domains fail TLS handshake; when the first cert is uploaded
         // and the resolver is reloaded, TLS starts working without restart.
         let https_port = cli.https_port;
+        // Snapshot the CA fingerprint once at startup and pass the slot
+        // to the reload loop further down so it can warn the operator
+        // if an `mtls.ca_cert_pem` edit happens at runtime (rustls
+        // ServerConfig is immutable; an edit needs a restart).
+        let mtls_installed_fingerprint: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
         {
+            // Build the optional mTLS verifier from the union of per-route
+            // CA bundles. `store` is a `tokio::sync::Mutex`, and we are
+            // inside the `rt.block_on(async move { ... })` runtime
+            // context — so we must `await` the lock instead of using
+            // the blocking_lock which panics from within a runtime.
+            let (mtls_verifier, startup_fp) = {
+                let routes = store.lock().await.list_routes().unwrap_or_default();
+                (
+                    lorica::mtls::build_from_routes(&routes),
+                    lorica::mtls::compute_ca_fingerprint(&routes),
+                )
+            };
+            *mtls_installed_fingerprint.lock() = startup_fp.clone();
+            if let Some(ref fp) = startup_fp {
+                info!(fingerprint = %fp, "mTLS enabled at listener: per-route enforcement applies");
+            }
             let mut tls_settings =
                 lorica_core::listeners::tls::TlsSettings::with_resolver(cert_resolver.clone());
             tls_settings.enable_h2();
+            if let Some(ref v) = mtls_verifier {
+                tls_settings.set_client_cert_verifier(v.clone());
+            }
             let mut tls_tcp_opts = lorica_core::listeners::TcpSocketOptions::default();
             tls_tcp_opts.so_reuseport = Some(true);
             proxy_service.add_tls_with_settings(
@@ -1966,6 +3442,11 @@ fn run_single_process(cli: Cli) {
         let api_active_connections = Arc::clone(&active_connections);
         let api_log_store = log_store.clone();
         let management_port = cli.management_port;
+        // `single_task_tracker` is already defined above (before the
+        // WAF blocklist refresh spawn). Clone it for AppState and the
+        // shutdown drain path.
+        let api_task_tracker = single_task_tracker.clone();
+        let shutdown_task_tracker = single_task_tracker.clone();
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store.clone(),
@@ -1993,6 +3474,8 @@ fn run_single_process(cli: Cli) {
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
                 aggregated_metrics: None, // single-process uses direct Arc references
+                metrics_refresher: None,  // pull-on-scrape only meaningful in worker mode
+                task_tracker: api_task_tracker,
             };
 
             // Spawn ACME certificate auto-renewal (check every 12h, renew at 30 days before expiry)
@@ -2010,7 +3493,9 @@ fn run_single_process(cli: Cli) {
                 alert_sender.clone(),
             );
 
-            let session_store = SessionStore::new(api_store.clone()).await;
+            let session_store = SessionStore::new(api_store.clone())
+                .await
+                .with_task_tracker(state.task_tracker.clone());
             let rate_limiter = RateLimiter::new();
 
             if let Err(e) = lorica_api::server::start_server(
@@ -2064,9 +3549,18 @@ fn run_single_process(cli: Cli) {
         let reload_config = Arc::clone(&proxy_config);
         let reload_cert_resolver = Arc::clone(&cert_resolver);
         let reload_probe_scheduler = Arc::clone(&probe_scheduler);
+        let reload_connection_filter = Arc::clone(&connection_filter);
+        let reload_mtls_fp = Arc::clone(&mtls_installed_fingerprint);
         let _reload_handle = tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
-                if let Err(e) = reload_proxy_config(&reload_store, &reload_config).await {
+                if let Err(e) = lorica::reload::reload_proxy_config_with_mtls(
+                    &reload_store,
+                    &reload_config,
+                    Some(&reload_connection_filter),
+                    Some(&*reload_mtls_fp),
+                )
+                .await
+                {
                     tracing::error!(error = %e, "failed to reload proxy configuration");
                 }
                 lorica::reload::reload_cert_resolver(&reload_store, &reload_cert_resolver).await;
@@ -2113,6 +3607,15 @@ fn run_single_process(cli: Cli) {
 
         info!("Lorica shutting down gracefully");
 
+        // Drain tracked background tasks before tearing down the API
+        // server. Bounded at 10 s so a hung task does not delay exit.
+        shutdown_task_tracker.close();
+        if tokio::time::timeout(Duration::from_secs(10), shutdown_task_tracker.wait())
+            .await
+            .is_err()
+        {
+            warn!("some background tasks did not finish within drain timeout; aborting");
+        }
         api_handle.abort();
         health_handle.abort();
     });
@@ -2188,8 +3691,12 @@ fn spawn_persisted_alert_dispatcher(
                         dropped = n,
                         "alert dispatcher lagged, some notifications were dropped"
                     );
+                    lorica_api::metrics::inc_notifier_events_dropped("lag", n);
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    lorica_api::metrics::inc_notifier_events_dropped("closed", 1);
+                    break;
+                }
             }
         }
     })
@@ -2256,5 +3763,199 @@ async fn shutdown_signal() {
         _ = sigint.recv() => {
             warn!("Received SIGINT");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for supervisor-side RPC registries (WPAR-2 + WPAR-3).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+
+    #[test]
+    fn verdict_cache_lookup_miss_on_empty() {
+        let c = SupervisorVerdictCache::new();
+        assert!(c.lookup("r1", "cookie-a").is_none());
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn verdict_cache_hit_round_trip() {
+        let c = SupervisorVerdictCache::new();
+        c.insert(
+            "r1",
+            "session=abc",
+            lorica_command::Verdict::Allow as i32,
+            vec![("Remote-User".into(), "alice".into())],
+            30_000,
+        );
+        let (verdict, headers, ttl_ms) = c.lookup("r1", "session=abc").expect("hit");
+        assert_eq!(verdict, lorica_command::Verdict::Allow as i32);
+        assert_eq!(headers, vec![("Remote-User".into(), "alice".into())]);
+        assert!(ttl_ms > 29_000 && ttl_ms <= 30_000);
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn verdict_cache_miss_on_expired_entry() {
+        let c = SupervisorVerdictCache::new();
+        c.insert(
+            "r1",
+            "cookie",
+            lorica_command::Verdict::Allow as i32,
+            Vec::new(),
+            1,
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(c.lookup("r1", "cookie").is_none());
+        // Lazy eviction on lookup: expired entry removed.
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn verdict_cache_partitions_by_route() {
+        let c = SupervisorVerdictCache::new();
+        c.insert(
+            "route-a",
+            "c",
+            lorica_command::Verdict::Allow as i32,
+            Vec::new(),
+            30_000,
+        );
+        assert!(c.lookup("route-a", "c").is_some());
+        assert!(c.lookup("route-b", "c").is_none());
+    }
+
+    #[test]
+    fn breaker_registry_defaults_to_allow() {
+        let r = SupervisorBreakerRegistry::new(5, Duration::from_secs(10));
+        assert_eq!(
+            r.query("r", "10.0.0.1:80"),
+            lorica_command::BreakerDecision::Allow
+        );
+    }
+
+    #[test]
+    fn breaker_registry_opens_after_threshold() {
+        let r = SupervisorBreakerRegistry::new(3, Duration::from_secs(60));
+        for _ in 0..3 {
+            r.report("r", "b", false, false);
+        }
+        assert_eq!(r.query("r", "b"), lorica_command::BreakerDecision::Deny);
+    }
+
+    #[test]
+    fn breaker_registry_success_resets_failures() {
+        let r = SupervisorBreakerRegistry::new(3, Duration::from_secs(60));
+        r.report("r", "b", false, false);
+        r.report("r", "b", false, false);
+        r.report("r", "b", true, false);
+        r.report("r", "b", false, false);
+        r.report("r", "b", false, false);
+        assert_eq!(r.query("r", "b"), lorica_command::BreakerDecision::Allow);
+    }
+
+    #[test]
+    fn breaker_registry_half_open_probe_single_slot() {
+        let r = SupervisorBreakerRegistry::new(1, Duration::from_millis(0));
+        r.report("r", "b", false, false);
+        // First query after cooldown moves to HalfOpen and grants probe.
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::AllowProbe
+        );
+        // Second concurrent query is denied (slot already held).
+        assert_eq!(r.query("r", "b"), lorica_command::BreakerDecision::Deny);
+    }
+
+    #[test]
+    fn breaker_registry_probe_success_closes() {
+        let r = SupervisorBreakerRegistry::new(1, Duration::from_millis(0));
+        r.report("r", "b", false, false);
+        let d = r.query("r", "b");
+        assert_eq!(d, lorica_command::BreakerDecision::AllowProbe);
+        r.report("r", "b", true, true);
+        assert_eq!(r.query("r", "b"), lorica_command::BreakerDecision::Allow);
+    }
+
+    #[test]
+    fn breaker_registry_probe_failure_reopens() {
+        let r = SupervisorBreakerRegistry::new(5, Duration::from_millis(0));
+        // Hit the threshold to open.
+        for _ in 0..5 {
+            r.report("r", "b", false, false);
+        }
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::AllowProbe
+        );
+        // Probe fails: breaker re-opens.
+        r.report("r", "b", false, true);
+        // Still Open immediately (cooldown=0 means next query admits a fresh probe).
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::AllowProbe
+        );
+    }
+
+    #[test]
+    fn breaker_registry_stale_probe_recovers_after_cooldown() {
+        // Audit H-1: if the probe-admitted worker crashes between admit
+        // and report, the breaker must not lock the backend out forever.
+        // After `cooldown` elapses past probe_started_at, the next query
+        // synthesises a failed probe and transitions back to Open.
+        let cooldown = Duration::from_millis(40);
+        let r = SupervisorBreakerRegistry::new(1, cooldown);
+        r.report("r", "b", false, false); // state: Open at t0
+
+        // Wait past the initial cooldown so Open promotes to HalfOpen.
+        std::thread::sleep(cooldown + Duration::from_millis(10));
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::AllowProbe,
+            "first admission past cooldown grants probe"
+        );
+        // Worker "crashes" - no report arrives.
+
+        // Concurrent query within cooldown of the probe: denied.
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::Deny,
+            "second query within probe cooldown is denied"
+        );
+
+        // Wait past cooldown from probe_started_at. Next query
+        // synthesises the failed probe: state -> Open with a fresh
+        // opened_at, returns Deny (fresh cooldown starts now).
+        std::thread::sleep(cooldown + Duration::from_millis(10));
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::Deny,
+            "stale-probe detection path: synthesises failed probe and returns Deny"
+        );
+
+        // Wait past the fresh cooldown.
+        std::thread::sleep(cooldown + Duration::from_millis(10));
+        assert_eq!(
+            r.query("r", "b"),
+            lorica_command::BreakerDecision::AllowProbe,
+            "backend admits a fresh probe; if this fails the breaker has stuck (audit H-1)"
+        );
+    }
+
+    #[test]
+    fn breaker_registry_isolates_routes_sharing_backend() {
+        let r = SupervisorBreakerRegistry::new(1, Duration::from_secs(60));
+        r.report("route-a", "b", false, false);
+        assert_eq!(
+            r.query("route-a", "b"),
+            lorica_command::BreakerDecision::Deny
+        );
+        assert_eq!(
+            r.query("route-b", "b"),
+            lorica_command::BreakerDecision::Allow
+        );
     }
 }

@@ -16,11 +16,22 @@
 
 //! WAF engine for Lorica with OWASP CRS-inspired rules.
 //!
-//! Provides SQL injection, XSS, and path traversal detection using
+//! Provides SQL injection, XSS, path traversal, command injection, SSRF,
+//! XXE, SSTI, prototype pollution, and protocol-violation detection using
 //! precompiled regex patterns. Supports detection-only and blocking modes.
+//!
+//! The crate exposes three main building blocks:
+//! - [`engine::WafEngine`] - holds the active ruleset, custom rules,
+//!   IP blocklist, and a bounded ring buffer of recent events.
+//! - [`rules::RuleSet`] / [`rules::WafRule`] - the default CRS-inspired
+//!   ruleset and the per-rule shape consumed by the engine.
+//! - [`ip_blocklist::IpBlocklist`] - a separate O(1) IP blocklist that
+//!   pulls from an external feed and short-circuits requests before
+//!   the regex pipeline runs.
 
 pub mod engine;
 pub mod ip_blocklist;
+pub mod prefilter;
 pub mod rules;
 
 pub use engine::{RuleSummary, WafEngine, WafEvent, WafMode, WafVerdict};

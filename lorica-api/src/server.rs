@@ -10,8 +10,8 @@ use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use http::Method;
-use tower_http::cors::{Any, CorsLayer};
 use tokio::sync::{watch, Mutex};
+use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::logs::LogBuffer;
@@ -19,6 +19,17 @@ use crate::middleware::auth::{require_auth, SessionStore};
 use crate::middleware::rate_limit::RateLimiter;
 use crate::system::SystemCache;
 use crate::workers::WorkerMetrics;
+
+/// Type-erased metrics refresher closure (WPAR-7 pull-on-scrape).
+///
+/// Returning a `BoxFuture` keeps `lorica-api` decoupled from the
+/// supervisor-side implementation (which lives in the `lorica`
+/// binary and depends on `lorica-command`). The supervisor wires
+/// this closure at startup with access to the per-worker RPC
+/// endpoints, the AggregatedMetrics handle, and a dedup lock; the
+/// /metrics handler awaits it with a bounded overall timeout.
+pub type MetricsRefresher =
+    Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]
@@ -70,6 +81,22 @@ pub struct AppState {
     pub log_store: Option<Arc<crate::log_store::LogStore>>,
     /// Aggregated proxy metrics from worker processes. `None` in single-process mode.
     pub aggregated_metrics: Option<Arc<crate::workers::AggregatedMetrics>>,
+    /// Pipelined metrics refresh closure (WPAR-7 pull-on-scrape).
+    /// `Some` in worker mode when the supervisor has wired the
+    /// `MetricsPullCoordinator`; `None` in single-process mode or
+    /// when the supervisor has not yet registered any worker RPC
+    /// endpoint. Called from the `/metrics` handler before reading
+    /// `aggregated_metrics` so Prometheus scrapes see sub-second
+    /// fresh data. Internally dedups: concurrent scrapes within a
+    /// short window collapse into a single supervisor fan-out.
+    pub metrics_refresher: Option<MetricsRefresher>,
+    /// Tracker for background tasks that must be drained on graceful
+    /// shutdown (ACME polling, session-store writes, WAF refresh,
+    /// backend drain watchdog, etc.). The supervisor shutdown path
+    /// calls `task_tracker.close(); task_tracker.wait().await` so
+    /// in-flight work completes rather than being dropped mid-step.
+    /// Cheap to clone (internal `Arc`).
+    pub task_tracker: tokio_util::task::TaskTracker,
 }
 
 impl AppState {
@@ -109,6 +136,14 @@ pub fn build_router(
         .route("/api/v1/routes/:id", get(crate::routes::get_route))
         .route("/api/v1/routes/:id", put(crate::routes::update_route))
         .route("/api/v1/routes/:id", delete(crate::routes::delete_route))
+        .route(
+            "/api/v1/validate/mtls-pem",
+            post(crate::routes::validate_mtls_pem),
+        )
+        .route(
+            "/api/v1/validate/forward-auth",
+            post(crate::routes::validate_forward_auth),
+        )
         .route(
             "/api/v1/cache/routes/:id",
             delete(crate::cache::purge_route_cache),
@@ -336,10 +371,7 @@ pub fn build_router(
             post(crate::loadtest::start_test_confirmed),
         )
         .route("/api/v1/loadtest/status", get(crate::loadtest::get_status))
-        .route(
-            "/api/v1/loadtest/ws",
-            get(crate::loadtest::loadtest_ws),
-        )
+        .route("/api/v1/loadtest/ws", get(crate::loadtest::loadtest_ws))
         .route("/api/v1/loadtest/abort", post(crate::loadtest::abort_test))
         .route(
             "/api/v1/loadtest/results/:config_id",

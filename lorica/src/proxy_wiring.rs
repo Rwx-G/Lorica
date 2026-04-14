@@ -26,7 +26,9 @@ use lorica_bench::SlaCollector;
 use lorica_cache::cache_control::CacheControl;
 use lorica_cache::eviction::simple_lru;
 use lorica_cache::filters::resp_cacheable;
+use lorica_cache::key::HashBinary;
 use lorica_cache::lock::CacheLock;
+use lorica_cache::predictor::Predictor;
 use lorica_cache::{
     CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason, RespCacheable,
 };
@@ -141,6 +143,46 @@ pub struct RouteEntry {
     /// Resolved backends per path rule (parallel to route.path_rules).
     /// None = inherit route backends, Some = override with these backends.
     pub path_rule_backends: Vec<Option<Vec<Backend>>>,
+    /// Precompiled regex per header rule (parallel to route.header_rules).
+    /// `None` when the rule's match_type is Exact/Prefix, or when the regex
+    /// failed to compile (in which case the rule is logged-and-disabled at
+    /// load time rather than failing the whole reload).
+    pub header_rule_regexes: Vec<Option<Arc<regex::Regex>>>,
+    /// Resolved backends per header rule (parallel to route.header_rules).
+    /// None = rule matches but keeps default backends; Some = override.
+    /// Empty backend_ids on a rule also yields None here.
+    pub header_rule_backends: Vec<Option<Vec<Backend>>>,
+    /// Resolved backends per traffic split (parallel to
+    /// route.traffic_splits). Splits whose `backend_ids` are all dangling
+    /// become `None` and are silently skipped at match time, so a typo in
+    /// the dashboard never dead-ends live traffic.
+    pub traffic_split_backends: Vec<Option<Vec<Backend>>>,
+    /// Pre-resolved mirror backends (flattened from
+    /// `route.mirror.backend_ids`). Empty when the feature is off or
+    /// when all configured IDs dangle - either way, `spawn_mirrors` is
+    /// a no-op.
+    pub mirror_backends: Vec<Backend>,
+    /// Pre-compiled response-rewrite rules (parallel to
+    /// `route.response_rewrite.rules`). An entry is `None` when the
+    /// source rule's regex failed to compile - that rule is silently
+    /// skipped at runtime. Empty vec when the feature is off.
+    pub response_rewrite_compiled: Vec<Option<CompiledRewriteRule>>,
+    /// Pre-compiled mTLS enforcement state (required flag + a
+    /// pre-lowercased org allowlist). `None` when mTLS is disabled
+    /// for this route. Chain validation itself is done by the
+    /// listener-level rustls verifier; per-request decisions (does
+    /// this route require a cert, did it present one, does the
+    /// organization match) happen in `request_filter`.
+    pub mtls_enforcer: Option<MtlsEnforcer>,
+}
+
+/// Runtime-side view of a route's mTLS policy: the bits we check at
+/// request time. The CA bundle itself is installed on the listener at
+/// startup and is not needed here.
+#[derive(Debug, Clone)]
+pub struct MtlsEnforcer {
+    pub required: bool,
+    pub allowed_organizations: Vec<String>,
 }
 
 /// In-memory configuration snapshot used by the proxy.
@@ -150,9 +192,9 @@ pub struct RouteEntry {
 pub struct ProxyConfig {
     /// Routes indexed by hostname for fast matching.
     /// Each hostname maps to a list of routes sorted by path_prefix length (longest first).
-    pub routes_by_host: HashMap<String, Vec<RouteEntry>>,
+    pub routes_by_host: HashMap<String, Vec<Arc<RouteEntry>>>,
     /// Wildcard routes (*.example.com) checked when exact lookup fails.
-    pub wildcard_routes: Vec<(String, Vec<RouteEntry>)>,
+    pub wildcard_routes: Vec<(String, Vec<Arc<RouteEntry>>)>,
     /// Merged security header presets (builtin + custom).
     /// Custom presets override builtins when names collide.
     pub security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
@@ -174,7 +216,7 @@ pub struct ProxyConfig {
 }
 
 /// Global settings extracted from the config store for ProxyConfig construction.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ProxyConfigGlobals {
     pub custom_security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
     pub max_global_connections: u32,
@@ -233,7 +275,7 @@ impl ProxyConfig {
                 .push(backend_id);
         }
 
-        let mut routes_by_host: HashMap<String, Vec<RouteEntry>> = HashMap::new();
+        let mut routes_by_host: HashMap<String, Vec<Arc<RouteEntry>>> = HashMap::new();
 
         for route in routes {
             if !route.enabled {
@@ -285,31 +327,153 @@ impl ProxyConfig {
                 }
             });
 
-            let entry = RouteEntry {
+            // Precompile regex rules and pre-resolve backends so the hot
+            // path in `request_filter` can iterate without allocating or
+            // recompiling. A bad regex logs a warning and disables the
+            // single rule - a broken header rule must not poison the rest
+            // of the route's config.
+            let header_rule_regexes: Vec<Option<Arc<regex::Regex>>> = route
+                .header_rules
+                .iter()
+                .map(|rule| match rule.match_type {
+                    lorica_config::models::HeaderMatchType::Regex => {
+                        match regex::Regex::new(&rule.value) {
+                            Ok(re) => Some(Arc::new(re)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    route_id = %route.id,
+                                    header = %rule.header_name,
+                                    pattern = %rule.value,
+                                    error = %e,
+                                    "invalid header_rule regex, disabling this rule"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            let header_rule_backends: Vec<Option<Vec<Backend>>> = route
+                .header_rules
+                .iter()
+                .map(|rule| {
+                    if rule.backend_ids.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            rule.backend_ids
+                                .iter()
+                                .filter_map(|id| backend_map.get(id).cloned())
+                                .collect::<Vec<_>>(),
+                        )
+                        .filter(|v: &Vec<_>| !v.is_empty())
+                    }
+                })
+                .collect();
+
+            let response_rewrite_compiled: Vec<Option<CompiledRewriteRule>> = route
+                .response_rewrite
+                .as_ref()
+                .map(|cfg| {
+                    cfg.rules
+                        .iter()
+                        .enumerate()
+                        .map(|(i, rule)| compile_rewrite_rule(rule, &route.id, i))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mirror_backends: Vec<Backend> = route
+                .mirror
+                .as_ref()
+                .map(|cfg| {
+                    cfg.backend_ids
+                        .iter()
+                        .filter_map(|id| backend_map.get(id).cloned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if route.mirror.is_some()
+                && mirror_backends.is_empty()
+                && route
+                    .mirror
+                    .as_ref()
+                    .map(|m| !m.backend_ids.is_empty())
+                    .unwrap_or(false)
+            {
+                tracing::warn!(
+                    route_id = %route.id,
+                    "mirror.backend_ids all dangling, mirroring is inert for this route"
+                );
+            }
+
+            let traffic_split_backends: Vec<Option<Vec<Backend>>> = route
+                .traffic_splits
+                .iter()
+                .map(|split| {
+                    if split.backend_ids.is_empty() || split.weight_percent == 0 {
+                        None
+                    } else {
+                        let resolved: Vec<_> = split
+                            .backend_ids
+                            .iter()
+                            .filter_map(|id| backend_map.get(id).cloned())
+                            .collect();
+                        if resolved.is_empty() {
+                            // All backend IDs dangled - log once at load
+                            // time so operators see the typo, but let the
+                            // route keep functioning on its defaults.
+                            tracing::warn!(
+                                route_id = %route.id,
+                                split_name = %split.name,
+                                "traffic_split backend_ids all dangling, skipping this split"
+                            );
+                            None
+                        } else {
+                            Some(resolved)
+                        }
+                    }
+                })
+                .collect();
+
+            let mtls_enforcer = route.mtls.as_ref().map(|m| MtlsEnforcer {
+                required: m.required,
+                allowed_organizations: m.allowed_organizations.clone(),
+            });
+
+            let entry = Arc::new(RouteEntry {
                 route: Arc::new(route.clone()),
                 backends: route_backends,
                 certificate,
                 wrr_state: Arc::new(SmoothWrrState::new(std::process::id() as usize)),
                 path_rewrite_regex: path_rewrite_regex.map(Arc::new),
                 path_rule_backends,
-            };
+                header_rule_regexes,
+                header_rule_backends,
+                traffic_split_backends,
+                mirror_backends,
+                response_rewrite_compiled,
+                mtls_enforcer,
+            });
 
             routes_by_host
                 .entry(route.hostname.clone())
                 .or_default()
-                .push(entry.clone());
+                .push(Arc::clone(&entry));
 
             // Index hostname aliases so they resolve to the same route entry
             for alias in &route.hostname_aliases {
                 routes_by_host
                     .entry(alias.clone())
                     .or_default()
-                    .push(entry.clone());
+                    .push(Arc::clone(&entry));
             }
         }
 
         // Separate wildcard hostnames (*.example.com) from exact ones
-        let mut wildcard_routes: Vec<(String, Vec<RouteEntry>)> = Vec::new();
+        let mut wildcard_routes: Vec<(String, Vec<Arc<RouteEntry>>)> = Vec::new();
         let wildcard_keys: Vec<String> = routes_by_host
             .keys()
             .filter(|k| k.starts_with("*."))
@@ -394,7 +558,7 @@ impl ProxyConfig {
 
     /// Find a matching route entry for a given host and path.
     /// Exact hostname match takes precedence over wildcard.
-    pub fn find_route<'a>(&'a self, host: &str, path: &str) -> Option<&'a RouteEntry> {
+    pub fn find_route<'a>(&'a self, host: &str, path: &str) -> Option<&'a Arc<RouteEntry>> {
         // 1. Exact hostname match (O(1))
         if let Some(entries) = self.routes_by_host.get(host) {
             if let Some(entry) = entries
@@ -452,14 +616,21 @@ impl EwmaTracker {
     }
 
     /// Update the EWMA score for a backend with a new latency sample.
+    ///
+    /// Hot path: we try `get_mut` first with a write lock already held
+    /// so the common case (backend already known) avoids the
+    /// `addr.to_string()` allocation that `insert` would incur. Only
+    /// the first-seen backend per process pays for the `String`
+    /// (audit M-1).
     pub fn record(&self, addr: &str, latency_us: f64) {
-        let mut scores = self.scores.write();
-        let current = scores.get(addr).copied().unwrap_or(0.0);
-        // Exponential decay: new_score = alpha * sample + (1-alpha) * old_score
-        // With alpha ~0.3 for responsive adaptation
         let alpha = 0.3;
-        let new_score = alpha * latency_us + (1.0 - alpha) * current;
-        scores.insert(addr.to_string(), new_score);
+        let mut scores = self.scores.write();
+        if let Some(current) = scores.get_mut(addr) {
+            *current = alpha * latency_us + (1.0 - alpha) * *current;
+        } else {
+            // First-seen: seed the decay with the sample itself.
+            scores.insert(addr.to_string(), latency_us);
+        }
     }
 
     /// Select the backend with the lowest EWMA score.
@@ -493,17 +664,25 @@ impl EwmaTracker {
     }
 }
 
-/// Per-backend circuit breaker.
+/// Per-(route, backend) circuit breaker.
 ///
-/// Tracks consecutive failures per backend. When the failure count reaches the
-/// threshold, the circuit opens and all traffic is redirected to other backends
-/// for a cooldown period. After the cooldown, one probe request is allowed
-/// through (half-open). If it succeeds the circuit closes; if it fails the
-/// circuit re-opens.
+/// Tracks consecutive failures per (route, backend) pair rather than per
+/// backend alone. This matters when several routes share the same upstream
+/// IP:port but exercise different paths on it - for example two virtual
+/// hosts both pointing at `10.0.0.1:3080` where one path always succeeds
+/// and the other structurally fails. Keying on the route prevents failures
+/// on one route from tripping the breaker for siblings that are actually
+/// healthy against the same physical backend.
+///
+/// When the failure count reaches the threshold, the circuit opens for that
+/// (route, backend) pair and traffic on that route is redirected to other
+/// backends for a cooldown period. After the cooldown, one probe request is
+/// allowed through (half-open). If it succeeds the circuit closes; if it
+/// fails the circuit re-opens.
 #[derive(Debug)]
 pub struct CircuitBreaker {
-    /// Per-backend state: (consecutive_failures, state, last_state_change)
-    states: dashmap::DashMap<String, CircuitBreakerState>,
+    /// Per-(route_id, backend) state: (consecutive_failures, state, last_state_change)
+    states: dashmap::DashMap<(String, String), CircuitBreakerState>,
     /// Number of consecutive errors before opening the circuit.
     threshold: u32,
     /// How long the circuit stays open before moving to half-open (seconds).
@@ -533,10 +712,11 @@ impl CircuitBreaker {
         }
     }
 
-    /// Check if a backend is available (not in Open state).
+    /// Check if a backend is available for the given route (not in Open state).
     /// Open circuits that have exceeded the cooldown move to HalfOpen.
-    pub fn is_available(&self, addr: &str) -> bool {
-        let mut entry = match self.states.get_mut(addr) {
+    pub fn is_available(&self, route_id: &str, addr: &str) -> bool {
+        let key = (route_id.to_string(), addr.to_string());
+        let mut entry = match self.states.get_mut(&key) {
             Some(e) => e,
             None => return true, // no state = closed = available
         };
@@ -555,8 +735,9 @@ impl CircuitBreaker {
     }
 
     /// Record a successful response. Resets the failure count and closes the circuit.
-    pub fn record_success(&self, addr: &str) {
-        if let Some(mut entry) = self.states.get_mut(addr) {
+    pub fn record_success(&self, route_id: &str, addr: &str) {
+        let key = (route_id.to_string(), addr.to_string());
+        if let Some(mut entry) = self.states.get_mut(&key) {
             if entry.failures > 0 || entry.state != CircuitStatus::Closed {
                 entry.failures = 0;
                 entry.state = CircuitStatus::Closed;
@@ -566,8 +747,9 @@ impl CircuitBreaker {
     }
 
     /// Record a failure. Increments the counter and opens the circuit if threshold is reached.
-    pub fn record_failure(&self, addr: &str) {
-        let mut entry = self.states.entry(addr.to_string()).or_insert(CircuitBreakerState {
+    pub fn record_failure(&self, route_id: &str, addr: &str) {
+        let key = (route_id.to_string(), addr.to_string());
+        let mut entry = self.states.entry(key).or_insert(CircuitBreakerState {
             failures: 0,
             state: CircuitStatus::Closed,
             changed_at: Instant::now(),
@@ -577,10 +759,11 @@ impl CircuitBreaker {
             entry.state = CircuitStatus::Open;
             entry.changed_at = Instant::now();
             tracing::warn!(
+                route_id = %route_id,
                 backend = %addr,
                 failures = entry.failures,
                 cooldown_s = self.cooldown_s,
-                "circuit breaker opened - backend removed from rotation"
+                "circuit breaker opened - backend removed from rotation for this route"
             );
         }
     }
@@ -594,6 +777,36 @@ pub fn compute_pool_size(backend_count: usize) -> usize {
         128
     } else {
         (backend_count * 8).min(1024)
+    }
+}
+
+/// Compact a client IP into a `u64` key for the shmem hashtables.
+///
+/// `lorica_shmem` pre-hashes this with its secret siphash key before
+/// slotting, so the only requirement here is a deterministic, low-cost
+/// serialisation of the IP into 64 bits. IPv4 becomes its 32-bit value;
+/// IPv6 folds the two 64-bit halves via XOR; an unparseable string
+/// falls back to a deterministic FNV-1a rollup so malformed inputs
+/// still route consistently (they should not reach this path in
+/// practice).
+pub fn ip_to_shmem_key(ip: &str) -> u64 {
+    use std::net::IpAddr;
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => u32::from(v4) as u64,
+        Ok(IpAddr::V6(v6)) => {
+            let o = v6.octets();
+            let high = u64::from_be_bytes([o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]]);
+            let low = u64::from_be_bytes([o[8], o[9], o[10], o[11], o[12], o[13], o[14], o[15]]);
+            high ^ low
+        }
+        Err(_) => {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in ip.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        }
     }
 }
 
@@ -642,6 +855,27 @@ static CACHE_LOCK: Lazy<&'static CacheLock> = Lazy::new(|| {
     Box::leak(lock)
 });
 
+/// Cacheability predictor. Remembers keys whose origin recently responded as
+/// uncacheable (OriginNotCache, ResponseTooLarge, or a user-defined custom
+/// reason) and short-circuits the cache state machine on the next request,
+/// avoiding cache-lock contention and variance-key computation for assets
+/// that have proved they would bypass the cache anyway.
+///
+/// `16 * 2048 = 32_768` keys are remembered across 16 LRU shards. A shard is
+/// selected by hash so concurrent writers only contend within their shard.
+/// Internal errors (InternalError, StorageError, UpstreamError, lock
+/// timeouts) are not remembered - those are transient and should not poison
+/// future cacheability decisions.
+const CACHE_PREDICTOR_SHARDS: usize = 16;
+const CACHE_PREDICTOR_SHARD_CAPACITY: usize = 2048;
+
+static CACHE_PREDICTOR: Lazy<&'static Predictor<CACHE_PREDICTOR_SHARDS>> = Lazy::new(|| {
+    Box::leak(Box::new(Predictor::<CACHE_PREDICTOR_SHARDS>::new(
+        CACHE_PREDICTOR_SHARD_CAPACITY,
+        None,
+    )))
+});
+
 /// Default cache TTL for cacheable status codes when the origin does not send
 /// explicit `Cache-Control` headers. The route-specific `cache_ttl_s` is used
 /// as the default fresh duration for 200 and 301 responses.
@@ -676,6 +910,12 @@ pub struct RequestCtx {
     /// Snapshot of the matched route for use in later pipeline stages.
     /// Arc-wrapped to avoid deep-cloning the Route struct on every request.
     pub route_snapshot: Option<Arc<Route>>,
+    /// Full matched `RouteEntry` captured in `request_filter` so
+    /// `upstream_peer` does not need to re-run `config.find_route`.
+    /// Cheap (pointer clone) since the entry is already `Arc`'d in
+    /// `ProxyConfig`. `None` when no route matched (request_filter
+    /// returned `Ok(false)` and upstream_peer will 404).
+    pub matched_route_entry: Option<Arc<RouteEntry>>,
     /// Unique request identifier for tracing (propagated to backend via X-Request-Id).
     pub request_id: String,
     /// Whether access logging is enabled for this route.
@@ -708,6 +948,41 @@ pub struct RequestCtx {
     pub waf_body_buffer: Option<Vec<u8>>,
     /// Backend ID for sticky session cookie injection (set in upstream_peer).
     pub sticky_backend_id: Option<String>,
+    /// Headers harvested from a successful forward-auth response, to be
+    /// injected into the upstream request (e.g. Remote-User).
+    pub forward_auth_inject: Vec<(String, String)>,
+    /// Response-body rewrite state. `Some(Active(buf))` while we're
+    /// buffering the upstream response to rewrite it at end-of-stream;
+    /// `Some(Overflowed)` if the body exceeded `max_body_bytes` (we
+    /// then flush the buffer and stream the rest verbatim - better
+    /// than a half-rewritten body). `None` means the feature is off
+    /// for this response (Content-Type/Encoding didn't qualify).
+    pub response_rewrite_state: Option<ResponseRewriteState>,
+    /// Precompiled rewrite rules for this response, resolved once in
+    /// `response_filter` from the current ProxyConfig and stored here
+    /// so `response_body_filter` does not re-scan the routes map on
+    /// every chunk (which was O(routes) per chunk under load). `Arc`
+    /// so clones stay cheap.
+    pub response_rewrite_rules: Option<Arc<Vec<Option<CompiledRewriteRule>>>>,
+
+    /// Pending mirror sub-request awaiting the downstream request body.
+    /// Populated in `request_filter` when the route has mirroring
+    /// enabled and the request carries a body; fired in
+    /// `request_body_filter` on `end_of_stream`. `None` for requests
+    /// that don't mirror, or that have already fired (no-body methods
+    /// fire immediately from `request_filter`).
+    pub mirror_pending: Option<MirrorPending>,
+    /// Accumulating body state for a pending mirror. Separate from
+    /// `mirror_pending` so the buffer can be taken without disturbing
+    /// the pending metadata.
+    pub mirror_body_state: Option<MirrorBodyState>,
+    /// Address of the backend admitted via a HalfOpen probe slot on
+    /// this request, when any. Drives `was_probe=true` on the
+    /// subsequent `BreakerEngine::record(...)` call for that exact
+    /// backend so the supervisor can close the breaker on success (or
+    /// bounce back to Open on failure). `None` for requests that went
+    /// out on a Closed breaker.
+    pub breaker_probe_backend: Option<String>,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -754,14 +1029,103 @@ pub struct LoricaProxy {
     pub alert_sender: Option<lorica_notify::AlertSender>,
     /// Persistent access log store (SQLite).
     pub log_store: Option<Arc<lorica_api::log_store::LogStore>>,
-    /// Per-backend circuit breaker (opens after consecutive failures).
-    pub circuit_breaker: Arc<CircuitBreaker>,
+    /// Per-backend circuit breaker engine. Single-process deployments
+    /// hold the state machine in-process (`BreakerEngine::Local`);
+    /// worker-mode deployments delegate admission and outcome
+    /// reporting to the supervisor via the pipelined RPC channel so
+    /// probe-slot allocation and state transitions stay consistent
+    /// across workers (design § 7 WPAR-3).
+    pub circuit_breaker_engine: BreakerEngine,
     /// Basic auth credential verification cache. Maps a hash of
     /// "username:password" to the timestamp of the last successful Argon2
     /// verification. Entries older than 60 s are ignored, forcing a fresh
     /// Argon2 check. This avoids ~100 ms per request on auth-protected routes.
-    basic_auth_cache: Arc<DashMap<u64, Instant>>,
+    /// HTTP Basic Auth credential cache. Keys are the NUL-joined
+    /// concatenation `"{Authorization-header-value}\0{expected_hash}"`
+    /// stored verbatim - NOT a 64-bit hash digest - so two
+    /// distinct credentials cannot collide and share a cache slot,
+    /// which would let one bypass Argon2. Same design as the forward
+    /// auth verdict cache (see SEC-AUD-01).
+    basic_auth_cache: Arc<DashMap<String, Instant>>,
+    /// Cross-worker shared-memory region. `Some` in worker mode
+    /// (populated from the memfd the supervisor passes at fork),
+    /// `None` in single-process mode. Holds cross-worker WAF counters
+    /// and future shared-state primitives (see
+    /// `docs/architecture/worker-shared-state.md` § 5). `'static`
+    /// because the mapping lives for the process lifetime.
+    pub shmem: Option<&'static lorica_shmem::SharedRegion>,
+    /// Per-route token-bucket rate limiters keyed by
+    /// `"{route_id}|{scope_key}"`. In single-process mode each entry
+    /// is an [`lorica_limits::token_bucket::AuthoritativeBucket`]; in
+    /// worker mode each entry is a [`LocalBucket`] synced every 100 ms
+    /// with the supervisor via the pipelined RPC channel (see design
+    /// § 6). The [`RateLimitEngine`] enum hides the dispatch.
+    pub rate_limit_buckets: RateLimitEngine,
+    /// Forward-auth verdict cache engine. Single-process mode uses the
+    /// process-local static cache; worker mode delegates to the
+    /// supervisor via the pipelined RPC channel so Allow verdicts
+    /// propagate across workers and a session revocation invalidates
+    /// the cache for every worker at once. See design § 7 WPAR-2.
+    pub verdict_cache: VerdictCacheEngine,
+    /// Two-phase config reload pending state (WPAR-8). When the
+    /// supervisor issues `ConfigReloadPrepare`, the worker reads the
+    /// DB, builds a fresh `ProxyConfig`, and stashes it here keyed by
+    /// generation. The subsequent `ConfigReloadCommit` pops this slot
+    /// and does the ArcSwap atomically across all workers at once,
+    /// collapsing the divergence window from ~10-50 ms down to the
+    /// UDS RTT between workers (microseconds). See design § 7 WPAR-8.
+    pub pending_proxy_config: Arc<parking_lot::Mutex<Option<PendingProxyConfig>>>,
 }
+
+/// Prepared-but-not-yet-committed proxy config. Held by workers
+/// between `ConfigReloadPrepare` and `ConfigReloadCommit`. Carries the
+/// full [`crate::reload::PreparedReload`] rather than only the
+/// `ProxyConfig` so the Commit side can publish both the ArcSwap and
+/// the connection-filter update atomically (audit H-3). See § 7
+/// WPAR-8.
+pub struct PendingProxyConfig {
+    pub generation: u64,
+    pub prepared: crate::reload::PreparedReload,
+}
+
+// Audit M-8: BreakerAdmission / BreakerEngine / VerdictCacheEngine /
+// RateLimitEngine moved to proxy_wiring/engines.rs to keep this
+// file below the refactor threshold. Re-exported here so
+// `lorica::proxy_wiring::BreakerEngine` (etc.) still resolves.
+pub mod forward_auth;
+#[cfg(test)]
+pub(crate) use forward_auth::{
+    build_forward_auth_headers, run_forward_auth, verdict_cache_key, verdict_cache_reset_for_test,
+};
+pub(crate) use forward_auth::{run_forward_auth_keyed, ForwardAuthOutcome};
+
+pub mod mirror_rewrite;
+#[cfg(test)]
+pub(crate) use mirror_rewrite::build_mirror_url;
+pub(crate) use mirror_rewrite::{
+    apply_response_rewrites, build_mirror_forward_headers, compile_rewrite_rule, mirror_sample_hit,
+    request_has_body, should_rewrite_response, spawn_mirrors, CompiledRewriteRule, MirrorBodyState,
+    MirrorPending, ResponseRewriteState,
+};
+
+pub mod helpers;
+// `pub` (not `pub(crate)`) for `canary_bucket` and `evaluate_mtls`
+// because they're re-exported by integration tests under `tests/`
+// (canary_e2e_test, mtls_e2e_test).
+pub(crate) use helpers::{
+    cache_vary_for_request, downstream_ssl_digest, extract_host, sanitize_html,
+};
+pub use helpers::{canary_bucket, evaluate_mtls};
+#[cfg(test)]
+pub(crate) use helpers::{
+    compute_cache_variance, match_header_rule_backends, pick_traffic_split_backends,
+};
+
+pub mod engines;
+pub use engines::{BreakerAdmission, BreakerEngine, RateLimitEngine, VerdictCacheEngine};
+
+pub mod error_pages;
+pub(crate) use error_pages::render_error_body;
 
 impl LoricaProxy {
     pub fn new(
@@ -791,14 +1155,559 @@ impl LoricaProxy {
             acme_challenge_store: None,
             alert_sender: None,
             log_store: None,
-            circuit_breaker: Arc::new(CircuitBreaker::new(5, 10)),
+            circuit_breaker_engine: BreakerEngine::local(5, 10),
             basic_auth_cache: Arc::new(DashMap::new()),
+            shmem: None,
+            rate_limit_buckets: RateLimitEngine::authoritative(),
+            verdict_cache: VerdictCacheEngine::local(),
+            pending_proxy_config: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// Spawn a background task that prunes expired entries from the
+    /// basic-auth credential cache every `interval`. Without this,
+    /// expired entries linger until the next successful verification
+    /// inserts a new entry (which is when `retain` runs); under a
+    /// sustained password-spray with no successful logins the cache
+    /// would grow until process restart. The task is registered with
+    /// the supplied `TaskTracker` so it drains on graceful shutdown.
+    pub fn spawn_basic_auth_cache_prune(
+        &self,
+        tracker: &tokio_util::task::TaskTracker,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        const AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
+        let cache = Arc::clone(&self.basic_auth_cache);
+        tracker.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate tick
+            loop {
+                ticker.tick().await;
+                cache.retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
+            }
+        })
+    }
+
+    /// Spawn a background prune task for `rate_limit_buckets`.
+    ///
+    /// For `scope = per_ip` every distinct client IP gets its own
+    /// `AuthoritativeBucket` (~100 B each). Without eviction, a scan
+    /// or high-cardinality traffic pattern leaks memory at the rate
+    /// of "one bucket per unique IP" until process restart. This
+    /// task walks the map on `interval` and drops any bucket whose
+    /// `last_activity_ns` is older than `idle_ttl`. A future request
+    /// from the same key reconstructs a fresh bucket, which starts
+    /// at full capacity — acceptable (and arguably desirable) since
+    /// the client has been idle past the TTL anyway.
+    pub fn spawn_rate_limit_prune(
+        &self,
+        tracker: &tokio_util::task::TaskTracker,
+        interval: Duration,
+        idle_ttl: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let engine = self.rate_limit_buckets.clone();
+        let idle_ttl_ns = idle_ttl.as_nanos() as u64;
+        tracker.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate tick
+            loop {
+                ticker.tick().await;
+                let now = lorica_shmem::now_ns();
+                match &engine {
+                    RateLimitEngine::Authoritative(map) => {
+                        map.retain(|_, b| now.saturating_sub(b.last_activity_ns()) < idle_ttl_ns);
+                    }
+                    RateLimitEngine::Local(_) => {
+                        // Worker mode: the supervisor sync task drops
+                        // entries via take_delta returning 0 — the local
+                        // cache is kept small by the sync loop walking
+                        // it. Eviction is supervisor-side (future
+                        // follow-up: forward idle-key hints from
+                        // supervisor). No-op here.
+                    }
+                }
+            }
+        })
+    }
+
+    /// Spawn a background task that syncs the worker-side `LocalBucket`
+    /// cache with the supervisor's authoritative bucket registry every
+    /// `interval`. Called on workers only (single-process mode uses
+    /// `RateLimitEngine::Authoritative`, no sync needed).
+    ///
+    /// Each tick the task walks every entry of the local map, pulls out
+    /// the accumulated `take_delta`, batches the non-zero entries into a
+    /// `RateLimitDelta` RPC payload, sends it to the supervisor, and on
+    /// the reply refreshes each bucket's token count with the
+    /// authoritative snapshot. See design § 6.
+    pub fn spawn_rate_limit_sync(
+        &self,
+        tracker: &tokio_util::task::TaskTracker,
+        rpc: lorica_command::RpcEndpoint,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let engine = self.rate_limit_buckets.clone();
+        tracker.spawn(async move {
+            let buckets = match engine {
+                RateLimitEngine::Local(map) => map,
+                RateLimitEngine::Authoritative(_) => {
+                    tracing::debug!(
+                        "rate-limit sync task launched on Authoritative engine; exiting"
+                    );
+                    return;
+                }
+            };
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate tick
+            loop {
+                ticker.tick().await;
+                // Phase 1: drain local deltas into a batched payload.
+                let mut entries: Vec<lorica_command::RateLimitEntry> = Vec::new();
+                for item in buckets.iter() {
+                    let consumed = item.value().take_delta();
+                    if consumed > 0 {
+                        entries.push(lorica_command::RateLimitEntry {
+                            key: item.key().clone(),
+                            consumed,
+                        });
+                    }
+                }
+                if entries.is_empty() {
+                    continue;
+                }
+                // Phase 2: push to the supervisor.
+                let payload = lorica_command::command::Payload::RateLimitDelta(
+                    lorica_command::RateLimitDelta {
+                        entries: entries.clone(),
+                    },
+                );
+                let resp = rpc
+                    .request_rpc(
+                        lorica_command::CommandType::RateLimitDelta,
+                        payload,
+                        Duration::from_millis(500),
+                    )
+                    .await;
+                match resp {
+                    Ok(resp) => match resp.payload {
+                        Some(lorica_command::response::Payload::RateLimitDeltaResult(r)) => {
+                            // Phase 3: refresh local buckets with the
+                            // authoritative snapshot.
+                            for snap in r.snapshots {
+                                if let Some(b) = buckets.get(&snap.key) {
+                                    b.value().refresh(snap.remaining);
+                                }
+                            }
+                        }
+                        _ => {
+                            tracing::debug!(
+                                "rate-limit sync: unexpected reply payload; buckets left stale"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            entries = entries.len(),
+                            "rate-limit sync: RPC failed; buckets left stale until next tick"
+                        );
+                    }
+                }
+            }
+        })
     }
 
     /// Return a reference to the WAF engine for API access.
     pub fn waf_engine(&self) -> &Arc<WafEngine> {
         &self.waf_engine
+    }
+
+    /// Spawn the worker-side pipelined RPC listener that handles
+    /// supervisor-initiated commands on the shared RPC channel
+    /// (`ConfigReloadPrepare`, `ConfigReloadCommit`, `MetricsRequest`).
+    ///
+    /// Drops silently on supervisor EOF; dies with the runtime when
+    /// the worker shuts down.
+    ///
+    /// The Prepare half reads the DB, rebuilds a fresh `ProxyConfig`,
+    /// and stashes it in `self.pending_proxy_config` keyed by the
+    /// generation number. The Commit half pops the stash and does
+    /// the single-instruction `ArcSwap`, collapsing the divergence
+    /// window across workers to the UDS RTT (microseconds). See
+    /// design § 7 WPAR-8.
+    ///
+    /// Generation monotonicity is enforced by
+    /// [`lorica_command::GenerationGate`] so a reordered Prepare is
+    /// rejected rather than silently overwriting a fresher pending
+    /// config.
+    ///
+    /// `MetricsRequest` (WPAR-7) builds an instant snapshot of the
+    /// worker's per-request counters, ban list, EWMA scores, backend
+    /// connections, request counts, and WAF counts and replies with
+    /// a `Response` carrying a `MetricsReport` payload so /metrics
+    /// pull-on-scrape can aggregate concurrently across workers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_worker_rpc_listener(
+        &self,
+        tracker: &tokio_util::task::TaskTracker,
+        mut incoming: lorica_command::IncomingCommands,
+        store: Arc<tokio::sync::Mutex<lorica_config::ConfigStore>>,
+        connection_filter: Option<Arc<crate::connection_filter::GlobalConnectionFilter>>,
+        worker_id: u32,
+    ) -> tokio::task::JoinHandle<()> {
+        let proxy_config = Arc::clone(&self.config);
+        let pending = Arc::clone(&self.pending_proxy_config);
+        let gate = Arc::new(lorica_command::GenerationGate::new());
+        let metrics_ctx = WorkerMetricsCtx {
+            ban_list: Arc::clone(&self.ban_list),
+            ewma_scores: self.ewma_tracker.scores_ref(),
+            backend_connections: Arc::clone(&self.backend_connections),
+            request_counts: Arc::clone(&self.request_counts),
+            waf_counts: Arc::clone(&self.waf_counts),
+            cache_hits: Arc::clone(&self.cache_hits),
+            cache_misses: Arc::clone(&self.cache_misses),
+            active_connections: Arc::clone(&self.active_connections),
+        };
+        tracker.spawn(async move {
+            tracing::info!(worker_id, "worker RPC listener started");
+            while let Some(inc) = incoming.recv().await {
+                match inc.command_type() {
+                    lorica_command::CommandType::ConfigReloadPrepare => {
+                        handle_config_reload_prepare(
+                            inc,
+                            &store,
+                            &proxy_config,
+                            &pending,
+                            &gate,
+                            worker_id,
+                        )
+                        .await;
+                    }
+                    lorica_command::CommandType::ConfigReloadCommit => {
+                        handle_config_reload_commit(
+                            inc,
+                            &proxy_config,
+                            &pending,
+                            connection_filter.as_ref(),
+                            &gate,
+                            worker_id,
+                        )
+                        .await;
+                    }
+                    lorica_command::CommandType::ConfigReloadAbort => {
+                        handle_config_reload_abort(inc, &pending, worker_id).await;
+                    }
+                    lorica_command::CommandType::MetricsRequest => {
+                        handle_metrics_request(inc, &metrics_ctx, worker_id).await;
+                    }
+                    other => {
+                        tracing::debug!(
+                            worker_id,
+                            command_type = ?other,
+                            "worker RPC: supervisor-initiated command has no handler"
+                        );
+                        let _ = inc
+                            .reply_error("no worker-side handler for this command")
+                            .await;
+                    }
+                }
+            }
+            tracing::info!(worker_id, "worker RPC listener exiting (supervisor EOF)");
+        })
+    }
+}
+
+/// Handles needed for the worker-side `MetricsRequest` RPC. Mirrors
+/// the fields the legacy command-channel handler reads to build a
+/// `MetricsReport`, clonable via `Arc` so the listener task can own
+/// its own handle without holding the whole `LoricaProxy`.
+#[derive(Clone)]
+struct WorkerMetricsCtx {
+    ban_list: Arc<DashMap<String, (Instant, u64)>>,
+    ewma_scores: Arc<parking_lot::RwLock<std::collections::HashMap<String, f64>>>,
+    backend_connections: Arc<BackendConnections>,
+    request_counts: Arc<DashMap<(String, u16), AtomicU64>>,
+    waf_counts: Arc<DashMap<(String, String), AtomicU64>>,
+    cache_hits: Arc<AtomicU64>,
+    cache_misses: Arc<AtomicU64>,
+    active_connections: Arc<AtomicU64>,
+}
+
+/// Worker-side handler for `CommandType::MetricsRequest` on the
+/// pipelined RPC channel (WPAR-7). Builds an instant snapshot of
+/// per-request counters (cache, bans, EWMA, backend conns, request
+/// counts, WAF counts) into a `MetricsReport` and replies with it as
+/// a `Response::MetricsReport` payload so the supervisor's pull-on-
+/// scrape coordinator can aggregate across workers within a single
+/// 500 ms budget.
+async fn handle_metrics_request(
+    inc: lorica_command::IncomingCommand,
+    ctx: &WorkerMetricsCtx,
+    worker_id: u32,
+) {
+    use lorica_command::{
+        BackendConnEntry, BanReportEntry, EwmaReportEntry, MetricsReport, RequestCountEntry,
+        WafCountEntry,
+    };
+
+    let ban_entries: Vec<BanReportEntry> = ctx
+        .ban_list
+        .iter()
+        .filter_map(|entry| {
+            let (ip, (banned_at, duration_s)) = (entry.key(), entry.value());
+            let elapsed = banned_at.elapsed().as_secs();
+            if elapsed >= *duration_s {
+                return None;
+            }
+            Some(BanReportEntry {
+                ip: ip.clone(),
+                remaining_seconds: duration_s - elapsed,
+                ban_duration_seconds: *duration_s,
+            })
+        })
+        .collect();
+
+    let ewma_entries: Vec<EwmaReportEntry> = ctx
+        .ewma_scores
+        .read()
+        .iter()
+        .map(|(addr, score)| EwmaReportEntry {
+            backend_address: addr.clone(),
+            score_us: *score,
+        })
+        .collect();
+
+    let backend_conn_entries: Vec<BackendConnEntry> = ctx
+        .backend_connections
+        .snapshot()
+        .into_iter()
+        .map(|(addr, conns)| BackendConnEntry {
+            backend_address: addr,
+            connections: conns,
+        })
+        .collect();
+
+    let request_entries: Vec<RequestCountEntry> = ctx
+        .request_counts
+        .iter()
+        .map(|entry| {
+            let ((route_id, status_code), counter) = (entry.key(), entry.value());
+            RequestCountEntry {
+                route_id: route_id.clone(),
+                status_code: *status_code as u32,
+                count: counter.load(Ordering::Relaxed),
+            }
+        })
+        .collect();
+
+    let waf_entries: Vec<WafCountEntry> = ctx
+        .waf_counts
+        .iter()
+        .map(|entry| {
+            let ((category, action), counter) = (entry.key(), entry.value());
+            WafCountEntry {
+                category: category.clone(),
+                action: action.clone(),
+                count: counter.load(Ordering::Relaxed),
+            }
+        })
+        .collect();
+
+    let mut report = MetricsReport::new(
+        worker_id,
+        0, // total_requests not tracked yet (matches legacy)
+        ctx.active_connections.load(Ordering::Relaxed),
+    );
+    report.cache_hits = ctx.cache_hits.load(Ordering::Relaxed);
+    report.cache_misses = ctx.cache_misses.load(Ordering::Relaxed);
+    report.ban_entries = ban_entries;
+    report.ewma_entries = ewma_entries;
+    report.backend_conn_entries = backend_conn_entries;
+    report.request_entries = request_entries;
+    report.waf_entries = waf_entries;
+
+    let _ = inc
+        .reply(lorica_command::Response::ok_with(
+            0,
+            lorica_command::response::Payload::MetricsReport(report),
+        ))
+        .await;
+}
+
+/// Worker-side handler for `ConfigReloadPrepare`. Reads the DB and
+/// builds a fresh `ProxyConfig`, then stashes it in the pending slot.
+/// Generation must strictly exceed the gate watermark; replies Ok on
+/// success, Error on build failure or generation regression.
+async fn handle_config_reload_prepare(
+    inc: lorica_command::IncomingCommand,
+    store: &Arc<tokio::sync::Mutex<lorica_config::ConfigStore>>,
+    proxy_config: &Arc<ArcSwap<ProxyConfig>>,
+    pending: &Arc<parking_lot::Mutex<Option<PendingProxyConfig>>>,
+    gate: &Arc<lorica_command::GenerationGate>,
+    worker_id: u32,
+) {
+    let prepare = match inc.command().payload.clone() {
+        Some(lorica_command::command::Payload::ConfigReloadPrepare(p)) => p,
+        _ => {
+            let _ = inc
+                .reply_error("malformed ConfigReloadPrepare payload")
+                .await;
+            return;
+        }
+    };
+    if let Err(e) = gate.observe(prepare.generation) {
+        tracing::warn!(
+            worker_id,
+            generation = prepare.generation,
+            error = %e,
+            "ConfigReloadPrepare rejected: stale generation"
+        );
+        let _ = inc.reply_error(format!("stale generation: {e}")).await;
+        return;
+    }
+    match crate::reload::build_proxy_config(store, proxy_config, None).await {
+        Ok(prepared) => {
+            *pending.lock() = Some(PendingProxyConfig {
+                generation: prepare.generation,
+                prepared,
+            });
+            tracing::info!(
+                worker_id,
+                generation = prepare.generation,
+                "ConfigReloadPrepare: pending config built and stashed (with connection-filter CIDRs)"
+            );
+            let _ = inc.reply(lorica_command::Response::ok(0)).await;
+        }
+        Err(e) => {
+            tracing::error!(
+                worker_id,
+                generation = prepare.generation,
+                error = %e,
+                "ConfigReloadPrepare failed to build new ProxyConfig"
+            );
+            let _ = inc
+                .reply_error(format!("Prepare failed to build config: {e}"))
+                .await;
+        }
+    }
+}
+
+/// Worker-side handler for `ConfigReloadAbort`. Drops the pending
+/// slot if its generation matches. A mismatch or an empty slot is a
+/// silent no-op (Ok reply) - Abort is advisory; the worker is free
+/// to already have moved on. Closes audit M-7 orphan.
+async fn handle_config_reload_abort(
+    inc: lorica_command::IncomingCommand,
+    pending: &Arc<parking_lot::Mutex<Option<PendingProxyConfig>>>,
+    worker_id: u32,
+) {
+    let abort = match inc.command().payload.clone() {
+        Some(lorica_command::command::Payload::ConfigReloadAbort(a)) => a,
+        _ => {
+            let _ = inc.reply_error("malformed ConfigReloadAbort payload").await;
+            return;
+        }
+    };
+    let dropped = {
+        let mut slot = pending.lock();
+        match *slot {
+            Some(ref p) if p.generation == abort.generation => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    };
+    if dropped {
+        tracing::info!(
+            worker_id,
+            generation = abort.generation,
+            "ConfigReloadAbort: pending config dropped"
+        );
+    } else {
+        tracing::debug!(
+            worker_id,
+            generation = abort.generation,
+            "ConfigReloadAbort: no matching pending (already committed or already dropped)"
+        );
+    }
+    let _ = inc.reply(lorica_command::Response::ok(0)).await;
+}
+
+/// Worker-side handler for `ConfigReloadCommit`. Pops the pending
+/// slot, verifies the generation, and atomically ArcSwaps. A commit
+/// with no pending entry or a mismatched generation replies Error so
+/// the supervisor's coordinator can decide whether to retry.
+async fn handle_config_reload_commit(
+    inc: lorica_command::IncomingCommand,
+    proxy_config: &Arc<ArcSwap<ProxyConfig>>,
+    pending: &Arc<parking_lot::Mutex<Option<PendingProxyConfig>>>,
+    connection_filter: Option<&Arc<crate::connection_filter::GlobalConnectionFilter>>,
+    gate: &Arc<lorica_command::GenerationGate>,
+    worker_id: u32,
+) {
+    let commit = match inc.command().payload.clone() {
+        Some(lorica_command::command::Payload::ConfigReloadCommit(c)) => c,
+        _ => {
+            let _ = inc
+                .reply_error("malformed ConfigReloadCommit payload")
+                .await;
+            return;
+        }
+    };
+    if let Err(e) = gate.observe_commit(commit.generation) {
+        tracing::warn!(
+            worker_id,
+            generation = commit.generation,
+            error = %e,
+            "ConfigReloadCommit rejected: stale generation"
+        );
+        let _ = inc.reply_error(format!("stale commit: {e}")).await;
+        return;
+    }
+    // Pop the prepared snapshot atomically. It carries the ProxyConfig
+    // AND the connection-filter CIDRs AND any mTLS fingerprint drift,
+    // so the single `commit_prepared_reload` call below publishes them
+    // together - no partial-state window between ArcSwap and filter
+    // reload (audit H-3).
+    let prepared = {
+        let mut slot = pending.lock();
+        match slot.take() {
+            Some(p) if p.generation == commit.generation => Some(p.prepared),
+            Some(p) => {
+                let pending_gen = p.generation;
+                // Put it back: a late commit for an older generation
+                // should not clobber a fresher pending.
+                *slot = Some(p);
+                tracing::warn!(
+                    worker_id,
+                    pending_generation = pending_gen,
+                    commit_generation = commit.generation,
+                    "ConfigReloadCommit generation mismatch"
+                );
+                None
+            }
+            None => None,
+        }
+    };
+    match prepared {
+        Some(prepared) => {
+            crate::reload::commit_prepared_reload(proxy_config, connection_filter, prepared);
+            tracing::info!(
+                worker_id,
+                generation = commit.generation,
+                "ConfigReloadCommit: pending config swapped in"
+            );
+            let _ = inc.reply(lorica_command::Response::ok(0)).await;
+        }
+        None => {
+            let _ = inc
+                .reply_error(format!(
+                    "no matching pending for generation {}",
+                    commit.generation
+                ))
+                .await;
+        }
     }
 }
 
@@ -814,21 +1723,20 @@ fn extract_sticky_backend(cookie_header: &str) -> Option<&str> {
 }
 
 /// Generate a compact hex request ID (16 bytes = 32 hex chars).
+///
+/// Uses `OsRng` (getrandom) so request IDs are unpredictable and
+/// collision-resistant even under concurrent same-nanosecond requests
+/// on the same thread (audit M-5). The prior `DefaultHasher`
+/// implementation was SipHash-keyed per process and emitted
+/// deterministic output given `(now, thread_id)` inputs, so an
+/// attacker observing a few IDs could predict future ones.
 fn generate_request_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let rand: u64 = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        ts.hash(&mut h);
-        std::thread::current().id().hash(&mut h);
-        h.finish()
-    };
-    format!("{ts:016x}{rand:016x}")
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let hi = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+    let lo = u64::from_le_bytes(bytes[8..].try_into().expect("8 bytes"));
+    format!("{hi:016x}{lo:016x}")
 }
 
 /// Escape HTML special characters to prevent XSS when injecting dynamic values
@@ -845,27 +1753,6 @@ fn escape_html(s: &str) -> String {
 /// that could execute JavaScript (XSS). Keeps safe formatting tags intact.
 /// Precompiled regexes for HTML sanitization (compiled once, used on every
 /// error page render). Avoids ~300-500us of regex compilation per call.
-static RE_SCRIPT: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r"(?is)<script[\s>].*?</script>").expect("sanitize: script regex"));
-static RE_EVENTS: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)"#).expect("sanitize: event handler regex"));
-static RE_JS_URI: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r#"(?i)(href|src|action)\s*=\s*["']?\s*javascript:"#).expect("sanitize: javascript URI regex"));
-
-fn sanitize_html(html: &str) -> String {
-    let out = RE_SCRIPT.replace_all(html, "");
-    let out = RE_EVENTS.replace_all(&out, "");
-    let out = RE_JS_URI.replace_all(&out, r#"$1=""#);
-    out.into_owned()
-}
-
-fn extract_host(req: &lorica_http::RequestHeader) -> &str {
-    req.headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| req.uri.authority().map(|a| a.as_str()))
-        .unwrap_or("")
-}
 
 #[async_trait]
 impl ProxyHttp for LoricaProxy {
@@ -892,6 +1779,7 @@ impl ProxyHttp for LoricaProxy {
             waf_blocked: false,
             waf_detected: false,
             route_snapshot: None,
+            matched_route_entry: None,
             path_rewrite_regex: None,
             request_id: generate_request_id(),
             access_log_enabled: true,
@@ -907,6 +1795,12 @@ impl ProxyHttp for LoricaProxy {
             body_bytes_received: 0,
             waf_body_buffer: None,
             sticky_backend_id: None,
+            forward_auth_inject: Vec::new(),
+            mirror_pending: None,
+            mirror_body_state: None,
+            breaker_probe_backend: None,
+            response_rewrite_state: None,
+            response_rewrite_rules: None,
         }
     }
 
@@ -918,7 +1812,10 @@ impl ProxyHttp for LoricaProxy {
         if let Some(ref challenge_store) = self.acme_challenge_store {
             let path = session.req_header().uri.path();
             if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-                info!(token = token, "ACME challenge request intercepted, looking up token");
+                info!(
+                    token = token,
+                    "ACME challenge request intercepted, looking up token"
+                );
                 if let Some(key_auth) = challenge_store.get(token).await {
                     let mut header = ResponseHeader::build(200, None)?;
                     header.insert_header("Content-Type", "text/plain")?;
@@ -943,9 +1840,24 @@ impl ProxyHttp for LoricaProxy {
             let current = self.active_connections.load(Ordering::Relaxed);
             if current >= config.max_global_connections as u64 {
                 ctx.block_reason = Some("global connection limit".to_string());
-                let header = lorica_http::ResponseHeader::build(503, None)?;
+                // No route matched yet at this stage, so no per-route
+                // override is consultable: always render the default page.
+                let host_header = extract_host(session.req_header()).to_string();
+                let body = render_error_body(
+                    503,
+                    &ctx.request_id,
+                    &host_header,
+                    None,
+                    "Global connection limit exceeded",
+                );
+                let mut header = lorica_http::ResponseHeader::build(503, None)?;
+                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                header.insert_header("Content-Length", body.len().to_string())?;
                 session
-                    .write_response_header(Box::new(header), true)
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
                     .await?;
                 return Ok(true);
             }
@@ -1008,66 +1920,92 @@ impl ProxyHttp for LoricaProxy {
 
         // Ban list + IP blocklist checks (skipped for whitelisted IPs)
         if !is_whitelisted {
-          if let Some(ref ip) = check_ip {
-            let banned = if let Some(entry) = self.ban_list.get(ip) {
-                let (banned_at, duration_s) = entry.value();
-                if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
-                    drop(entry);
-                    // Ban expired - lazy cleanup
-                    self.ban_list.remove(ip);
-                    false
+            if let Some(ref ip) = check_ip {
+                let banned = if let Some(entry) = self.ban_list.get(ip) {
+                    let (banned_at, duration_s) = entry.value();
+                    if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
+                        drop(entry);
+                        // Ban expired - lazy cleanup
+                        self.ban_list.remove(ip);
+                        false
+                    } else {
+                        true
+                    }
                 } else {
-                    true
+                    false
+                };
+                if banned {
+                    ctx.block_reason = Some("IP banned".to_string());
+                    // Pre-route stage: no route override consultable.
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body =
+                        render_error_body(403, &ctx.request_id, &host_header, None, "IP banned");
+                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
                 }
-            } else {
-                false
-            };
-            if banned {
-                ctx.block_reason = Some("IP banned".to_string());
-                let header = lorica_http::ResponseHeader::build(403, None)?;
-                session
-                    .write_response_header(Box::new(header), true)
-                    .await?;
-                return Ok(true);
-            }
 
-            if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
-                warn!(
-                    ip = %ip,
-                    "request blocked by IP blocklist"
-                );
-                ctx.waf_blocked = true;
-                // Record as WAF event + Prometheus metric + persist
-                let path = req.uri.path();
-                let host_val = extract_host(req);
-                self.waf_engine.record_blocklist_event(ip, host_val, path);
-                lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
-                self.waf_counts
-                    .entry(("ip_blocklist".to_string(), "blocked".to_string()))
-                    .or_insert_with(|| AtomicU64::new(0))
-                    .fetch_add(1, Ordering::Relaxed);
-                if let Some(ref store) = self.log_store {
-                    let ev = lorica_waf::WafEvent {
-                        rule_id: 0,
-                        description: format!("IP {ip} blocked by IP blocklist"),
-                        category: lorica_waf::RuleCategory::IpBlocklist,
-                        severity: 5,
-                        matched_field: "client_ip".to_string(),
-                        matched_value: ip.to_string(),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        client_ip: ip.to_string(),
-                        route_hostname: { let h = extract_host(req); if h.is_empty() { "-" } else { h } }.to_string(),
-                        action: "blocked".to_string(),
-                    };
-                    let _ = store.insert_waf_event(&ev);
+                if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
+                    warn!(
+                        ip = %ip,
+                        "request blocked by IP blocklist"
+                    );
+                    ctx.waf_blocked = true;
+                    // Record as WAF event + Prometheus metric + persist
+                    let path = req.uri.path();
+                    let host_val = extract_host(req);
+                    self.waf_engine.record_blocklist_event(ip, host_val, path);
+                    lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
+                    self.waf_counts
+                        .entry(("ip_blocklist".to_string(), "blocked".to_string()))
+                        .or_insert_with(|| AtomicU64::new(0))
+                        .fetch_add(1, Ordering::Relaxed);
+                    if let Some(ref store) = self.log_store {
+                        let ev = lorica_waf::WafEvent {
+                            rule_id: 0,
+                            description: format!("IP {ip} blocked by IP blocklist"),
+                            category: lorica_waf::RuleCategory::IpBlocklist,
+                            severity: 5,
+                            matched_field: "client_ip".to_string(),
+                            matched_value: ip.to_string(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            client_ip: ip.to_string(),
+                            route_hostname: {
+                                let h = extract_host(req);
+                                if h.is_empty() {
+                                    "-"
+                                } else {
+                                    h
+                                }
+                            }
+                            .to_string(),
+                            action: "blocked".to_string(),
+                        };
+                        let _ = store.insert_waf_event(&ev);
+                    }
+                    // Pre-route stage: no route override consultable.
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body =
+                        render_error_body(403, &ctx.request_id, &host_header, None, "IP blocked");
+                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
                 }
-                let header = lorica_http::ResponseHeader::build(403, None)?;
-                session
-                    .write_response_header(Box::new(header), true)
-                    .await?;
-                return Ok(true);
             }
-        }
         } // end if !is_whitelisted (ban + blocklist)
 
         let host_raw = extract_host(req);
@@ -1076,11 +2014,14 @@ impl ProxyHttp for LoricaProxy {
         let path = req.uri.path();
         let query = req.uri.query();
 
-        // Find matching route (exact hostname first, then wildcard)
+        // Find matching route (exact hostname first, then wildcard).
+        // Cache the matched entry in ctx so upstream_peer does not
+        // re-run find_route on the same request.
         let entry = match config.find_route(host, path) {
             Some(e) => e,
             None => return Ok(false), // No route = let upstream_peer handle 404
         };
+        ctx.matched_route_entry = Some(Arc::clone(entry));
 
         // Store route snapshot, precompiled regex, and access log setting for later pipeline stages
         ctx.route_snapshot = Some(Arc::clone(&entry.route));
@@ -1096,9 +2037,22 @@ impl ProxyHttp for LoricaProxy {
                     .eq_ignore_ascii_case("websocket")
                 {
                     ctx.block_reason = Some("WebSocket disabled".to_string());
-                    let header = lorica_http::ResponseHeader::build(403, None)?;
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body = render_error_body(
+                        403,
+                        &ctx.request_id,
+                        &host_header,
+                        entry.route.error_page_html.as_deref(),
+                        "WebSocket upgrades disabled on this route",
+                    );
+                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
                     session
-                        .write_response_header(Box::new(header), true)
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
                         .await?;
                     return Ok(true);
                 }
@@ -1153,6 +2107,261 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
+        // Per-route token-bucket rate limit. Runs after ban/blocklist
+        // and redirects so that an abusive client is rejected before
+        // we touch WAF / mtls / forward_auth. See design § 6 and
+        // `lorica_limits::token_bucket::AuthoritativeBucket`.
+        //
+        // Whitelisted IPs bypass the limiter (same policy as WAF ban
+        // checks — an operator who added an IP to the whitelist has
+        // made a deliberate trust decision).
+        if let Some(ref rl) = entry.route.rate_limit {
+            if !is_whitelisted {
+                let scope_key = match rl.scope {
+                    lorica_config::models::RateLimitScope::PerIp => {
+                        ctx.client_ip.as_deref().unwrap_or("unknown").to_string()
+                    }
+                    lorica_config::models::RateLimitScope::PerRoute => "__route__".to_string(),
+                };
+                let key = format!("{}|{}", entry.route.id, scope_key);
+                let admitted =
+                    self.rate_limit_buckets
+                        .try_consume(&key, rl, 1, lorica_shmem::now_ns());
+                if !admitted {
+                    ctx.block_reason = Some("rate limited".to_string());
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body = render_error_body(
+                        429,
+                        &ctx.request_id,
+                        &host_header,
+                        entry.route.error_page_html.as_deref(),
+                        "Rate limit exceeded",
+                    );
+                    let mut header = lorica_http::ResponseHeader::build(429, None)?;
+                    // Retry-After in seconds. For any configured refill
+                    // rate >= 1 tok/s, 1 second is the right advice
+                    // (one token refills in <= 1 s). A zero refill means
+                    // a one-shot bucket that never refills - advise a
+                    // generous 60 s backoff instead of a tight loop.
+                    let retry_after: u64 = if rl.refill_per_sec >= 1 { 1 } else { 60 };
+                    header.insert_header("Retry-After", retry_after.to_string())?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        // mTLS client verification: runs before forward_auth so a
+        // request that failed to present a valid client cert is
+        // rejected cheaply (no auth sub-request spawned). The listener
+        // has already validated the cert chain against the union CA
+        // bundle; we just check presence and the per-route org
+        // allowlist.
+        //
+        // 495 / 496 are the semi-standard "SSL cert error" / "SSL cert
+        // required" codes used by Nginx; reqwest and common clients
+        // surface them as meaningful errors and they don't collide
+        // with our other rejection paths.
+        if let Some(ref enforcer) = entry.mtls_enforcer {
+            let verdict = evaluate_mtls(enforcer, downstream_ssl_digest(session).as_deref());
+            if let Some(status) = verdict {
+                ctx.block_reason = Some(format!("mtls rejected ({status})"));
+                let message = match status {
+                    496 => "SSL certificate required",
+                    495 => "SSL certificate error",
+                    _ => "Forbidden",
+                };
+                let host_header = extract_host(session.req_header()).to_string();
+                let body = render_error_body(
+                    status,
+                    &ctx.request_id,
+                    &host_header,
+                    entry.route.error_page_html.as_deref(),
+                    message,
+                );
+                let mut resp_header = ResponseHeader::build(status, None)?;
+                resp_header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                resp_header.insert_header("Content-Length", body.len().to_string())?;
+                session
+                    .write_response_header(Box::new(resp_header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        // Forward authentication: gate the request on an external auth
+        // service (Authelia / Authentik / Keycloak / oauth2-proxy). Runs
+        // after route match but before header/canary/path rules so a
+        // denied request never leaks into the backend-selection phase.
+        if let Some(ref fa_cfg) = entry.route.forward_auth {
+            // Detect TLS from the downstream socket, not HTTP version:
+            // h2c (HTTP/2 over plaintext) would otherwise be reported
+            // as https to the auth service, which is misleading and
+            // may trigger redirect loops.
+            let is_tls = session
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref())
+                .is_some();
+            let scheme = if is_tls { "https" } else { "http" };
+            let outcome = run_forward_auth_keyed(
+                fa_cfg,
+                req,
+                ctx.client_ip.as_deref(),
+                scheme,
+                &entry.route.id,
+                &self.verdict_cache,
+            )
+            .await;
+            match outcome {
+                ForwardAuthOutcome::Allow { response_headers } => {
+                    ctx.forward_auth_inject = response_headers;
+                }
+                ForwardAuthOutcome::Deny {
+                    status,
+                    headers,
+                    body,
+                } => {
+                    ctx.block_reason = Some(format!("forward auth denied ({status})"));
+                    let mut resp_header = ResponseHeader::build(status, None)?;
+                    for (name, value) in &headers {
+                        let _ = resp_header.insert_header(name.clone(), value);
+                    }
+                    let _ = resp_header.insert_header("Content-Length", body.len().to_string());
+                    session
+                        .write_response_header(Box::new(resp_header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
+                ForwardAuthOutcome::FailClosed { reason } => {
+                    tracing::warn!(
+                        route_id = %entry.route.id,
+                        reason = %reason,
+                        "forward auth fail-closed"
+                    );
+                    ctx.block_reason = Some(format!("forward auth error: {reason}"));
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body = render_error_body(
+                        503,
+                        &ctx.request_id,
+                        &host_header,
+                        entry.route.error_page_html.as_deref(),
+                        "Authentication service unavailable",
+                    );
+                    let mut resp_header = ResponseHeader::build(503, None)?;
+                    resp_header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    resp_header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(resp_header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Header rule matching (first match wins; sets backend override
+        // before path rules so a later path rule with its own backend_ids
+        // can still take precedence - "more specific wins"). Also
+        // emits a Prometheus counter so operators can see rule-match
+        // activity in metrics, not just logs. `rule_index = "default"`
+        // means no rule matched.
+        if !entry.route.header_rules.is_empty() {
+            let mut matched_idx: Option<usize> = None;
+            for (i, rule) in entry.route.header_rules.iter().enumerate() {
+                let value = req
+                    .headers
+                    .get(rule.header_name.as_str())
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let regex: Option<&regex::Regex> = entry
+                    .header_rule_regexes
+                    .get(i)
+                    .and_then(|opt| opt.as_deref());
+                if rule.matches(value, |v| regex.is_some_and(|re| re.is_match(v))) {
+                    matched_idx = Some(i);
+                    if let Some(b) = entry.header_rule_backends.get(i).and_then(|b| b.as_ref()) {
+                        ctx.matched_backends = Some(b.clone());
+                    }
+                    break;
+                }
+            }
+            match matched_idx {
+                Some(i) => {
+                    // Stack-allocated itoa buffer avoids the per-request
+                    // String allocation that the old `i.to_string()`
+                    // performed on every header-rule match. ~1-2% CPU
+                    // saved at high QPS on routes with many rules.
+                    let mut buf = itoa::Buffer::new();
+                    lorica_api::metrics::inc_header_rule_match(&entry.route.id, buf.format(i));
+                }
+                None => lorica_api::metrics::inc_header_rule_match(&entry.route.id, "default"),
+            }
+        }
+
+        // Canary traffic split: runs AFTER header rules (operator opt-in
+        // always wins) and BEFORE path rules (URL-specific overrides
+        // still win). The split is applied only when no earlier phase
+        // already set `matched_backends`, so a user with X-Version: beta
+        // is never accidentally rebalanced into the canary bucket for
+        // the default version. Requests without a client IP (Unix-socket
+        // listeners in tests, rare IPv6 edge cases) keep route defaults
+        // rather than being bucketed deterministically on an empty
+        // string.
+        if ctx.matched_backends.is_none() && !entry.route.traffic_splits.is_empty() {
+            if let Some(ref ip) = ctx.client_ip {
+                let bucket = canary_bucket(&entry.route.id, ip);
+                // Inline walk so we know which split matched (for the
+                // split_name metric label). Mirrors
+                // `pick_traffic_split_backends` logic; the helper stays
+                // as-is for its unit-test callers.
+                let mut cumulative: u32 = 0;
+                let mut matched_split_name: Option<&str> = None;
+                for (i, split) in entry.route.traffic_splits.iter().enumerate() {
+                    let w = split.weight_percent.min(100) as u32;
+                    if w == 0 {
+                        continue;
+                    }
+                    cumulative = cumulative.saturating_add(w).min(100);
+                    if (bucket as u32) < cumulative {
+                        if let Some(backends) =
+                            entry.traffic_split_backends.get(i).and_then(|b| b.as_ref())
+                        {
+                            ctx.matched_backends = Some(backends.clone());
+                            matched_split_name = Some(if split.name.is_empty() {
+                                "unnamed"
+                            } else {
+                                split.name.as_str()
+                            });
+                        }
+                        break;
+                    }
+                }
+                match matched_split_name {
+                    Some(name) => {
+                        lorica_api::metrics::inc_canary_split_selected(&entry.route.id, name)
+                    }
+                    None => {
+                        lorica_api::metrics::inc_canary_split_selected(&entry.route.id, "default")
+                    }
+                }
+            }
+        }
+
         // Path rule matching (first match wins, overrides route config)
         for (i, rule) in entry.route.path_rules.iter().enumerate() {
             if rule.matches(path) {
@@ -1167,13 +2376,70 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
+        // Request mirroring: fire-and-forget shadow copies. For body-
+        // less requests (GET/HEAD/DELETE, or any request without
+        // Content-Length / Transfer-Encoding) we spawn immediately.
+        // For body-bearing requests we stash the metadata in
+        // `ctx.mirror_pending` and fire in `request_body_filter` once
+        // the body is buffered - so shadow backends see the same
+        // request body as the primary, up to the configured
+        // max_body_bytes cap.
+        if let Some(ref mirror_cfg) = entry.route.mirror {
+            if !entry.mirror_backends.is_empty()
+                && mirror_sample_hit(&ctx.request_id, mirror_cfg.sample_percent)
+            {
+                let headers = build_mirror_forward_headers(req, &ctx.request_id);
+                let path = req
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_else(|| "/".to_string());
+                let method = req.method.clone();
+                let max_body = mirror_cfg.max_body_bytes as usize;
+                let body_expected = max_body > 0 && request_has_body(req);
+
+                if body_expected {
+                    // Defer mirror firing until request_body_filter has
+                    // buffered the full body.
+                    ctx.mirror_pending = Some(MirrorPending {
+                        cfg: mirror_cfg.clone(),
+                        backends: entry.mirror_backends.clone(),
+                        method,
+                        path_and_query: path,
+                        headers,
+                        request_id: ctx.request_id.clone(),
+                        max_body_bytes: max_body,
+                        route_id: entry.route.id.clone(),
+                    });
+                    ctx.mirror_body_state = Some(MirrorBodyState::Active(Vec::new()));
+                } else {
+                    // No body to buffer (or operator opted into
+                    // headers-only via max_body_bytes = 0): fire now.
+                    spawn_mirrors(
+                        mirror_cfg,
+                        &entry.mirror_backends,
+                        method,
+                        path,
+                        headers,
+                        None,
+                        ctx.request_id.clone(),
+                        entry.route.id.clone(),
+                    );
+                }
+            }
+        }
+
         // Maintenance mode - return 503 with optional custom HTML
         if let Some(ref route) = ctx.route_snapshot {
             if route.maintenance_mode {
-                let raw_html = route.error_page_html.as_deref().unwrap_or(
-                    "<html><body><h1>503 Service Unavailable</h1><p>This service is under maintenance.</p></body></html>",
+                let host_header = extract_host(session.req_header()).to_string();
+                let body_html = render_error_body(
+                    503,
+                    &ctx.request_id,
+                    &host_header,
+                    route.error_page_html.as_deref(),
+                    "Service under maintenance",
                 );
-                let body_html = sanitize_html(raw_html);
                 let mut header = ResponseHeader::build(503, None)?;
                 header.insert_header("Content-Type", "text/html; charset=utf-8")?;
                 header.insert_header("Content-Length", body_html.len().to_string())?;
@@ -1182,7 +2448,7 @@ impl ProxyHttp for LoricaProxy {
                     .write_response_header(Box::new(header), false)
                     .await?;
                 session
-                    .write_response_body(Some(bytes::Bytes::from(body_html.to_owned())), true)
+                    .write_response_body(Some(bytes::Bytes::from(body_html)), true)
                     .await?;
                 return Ok(true);
             }
@@ -1214,13 +2480,16 @@ impl ProxyHttp for LoricaProxy {
                             return false;
                         }
 
-                        // Check credential cache before running Argon2
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut h = DefaultHasher::new();
-                        cred.hash(&mut h);
-                        expected_hash.hash(&mut h);
-                        let cache_key = h.finish();
+                        // Check credential cache before running Argon2.
+                        // Key is the NUL-joined literal "{cred}\0{hash}"
+                        // so two distinct credentials cannot collide on
+                        // a truncated 64-bit digest (which, at a small
+                        // cache size, is not worth the bypass risk).
+                        let mut cache_key =
+                            String::with_capacity(cred.len() + 1 + expected_hash.len());
+                        cache_key.push_str(&cred);
+                        cache_key.push('\0');
+                        cache_key.push_str(expected_hash.as_str());
 
                         const AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
                         if let Some(verified_at) = self.basic_auth_cache.get(&cache_key) {
@@ -1230,11 +2499,11 @@ impl ProxyHttp for LoricaProxy {
                         }
 
                         // Cache miss or expired - run full Argon2 verification.
-                        // Parse the hash first; if it's corrupt, deny immediately.
-                        let parsed_hash = match argon2::PasswordHash::new(expected_hash) {
-                            Ok(h) => h,
-                            Err(_) => return false, // corrupt hash -> deny
-                        };
+                        // Parse the hash first; if it's corrupt, deny immediately
+                        // without paying the cost of block_in_place.
+                        if argon2::PasswordHash::new(expected_hash).is_err() {
+                            return false;
+                        }
                         // Offload CPU-intensive Argon2 to the blocking thread
                         // pool to avoid stalling the async proxy runtime.
                         let pass_bytes = pass.as_bytes().to_vec();
@@ -1251,7 +2520,8 @@ impl ProxyHttp for LoricaProxy {
                         if ok {
                             self.basic_auth_cache.insert(cache_key, Instant::now());
                             // Evict expired entries to prevent unbounded growth
-                            self.basic_auth_cache.retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
+                            self.basic_auth_cache
+                                .retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
                         }
                         ok
                     })
@@ -1272,7 +2542,10 @@ impl ProxyHttp for LoricaProxy {
         // Direct status response (return_status)
         if let Some(status) = ctx.route_snapshot.as_ref().and_then(|r| r.return_status) {
             ctx.block_reason = Some(format!("return_status {status}"));
-            if let Some(ref target) = ctx.route_snapshot.as_ref().and_then(|r| r.redirect_to.clone())
+            if let Some(ref target) = ctx
+                .route_snapshot
+                .as_ref()
+                .and_then(|r| r.redirect_to.clone())
             {
                 // return_status + redirect_to = redirect with specific status code
                 let redir_path = req.uri.path();
@@ -1295,7 +2568,11 @@ impl ProxyHttp for LoricaProxy {
         }
 
         // Redirect to external URL (read from snapshot, path rules may have overridden it)
-        if let Some(ref target) = ctx.route_snapshot.as_ref().and_then(|r| r.redirect_to.clone()) {
+        if let Some(ref target) = ctx
+            .route_snapshot
+            .as_ref()
+            .and_then(|r| r.redirect_to.clone())
+        {
             let redir_path = req.uri.path();
             let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
             let base = target.trim_end_matches('/');
@@ -1314,17 +2591,43 @@ impl ProxyHttp for LoricaProxy {
                 && !entry.route.ip_allowlist.iter().any(|a| ip_matches(ip, a))
             {
                 ctx.block_reason = Some("IP not in allowlist".to_string());
-                let header = lorica_http::ResponseHeader::build(403, None)?;
+                let host_header = extract_host(session.req_header()).to_string();
+                let body = render_error_body(
+                    403,
+                    &ctx.request_id,
+                    &host_header,
+                    entry.route.error_page_html.as_deref(),
+                    "IP not in allowlist",
+                );
+                let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                header.insert_header("Content-Length", body.len().to_string())?;
                 session
-                    .write_response_header(Box::new(header), true)
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
                     .await?;
                 return Ok(true);
             }
             if entry.route.ip_denylist.iter().any(|d| ip_matches(ip, d)) {
                 ctx.block_reason = Some("IP in denylist".to_string());
-                let header = lorica_http::ResponseHeader::build(403, None)?;
+                let host_header = extract_host(session.req_header()).to_string();
+                let body = render_error_body(
+                    403,
+                    &ctx.request_id,
+                    &host_header,
+                    entry.route.error_page_html.as_deref(),
+                    "IP in denylist",
+                );
+                let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                header.insert_header("Content-Length", body.len().to_string())?;
                 session
-                    .write_response_header(Box::new(header), true)
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
                     .await?;
                 return Ok(true);
             }
@@ -1346,9 +2649,22 @@ impl ProxyHttp for LoricaProxy {
                     "slowloris detected - slow request headers"
                 );
                 ctx.block_reason = Some("slowloris detected".to_string());
-                let header = lorica_http::ResponseHeader::build(408, None)?;
+                let host_header = extract_host(session.req_header()).to_string();
+                let body = render_error_body(
+                    408,
+                    &ctx.request_id,
+                    &host_header,
+                    entry.route.error_page_html.as_deref(),
+                    "Request headers took too long",
+                );
+                let mut header = lorica_http::ResponseHeader::build(408, None)?;
+                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                header.insert_header("Content-Length", body.len().to_string())?;
                 session
-                    .write_response_header(Box::new(header), true)
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
                     .await?;
                 return Ok(true);
             }
@@ -1374,9 +2690,24 @@ impl ProxyHttp for LoricaProxy {
                     "max connections exceeded for route (503)"
                 );
                 ctx.block_reason = Some("route connection limit".to_string());
-                let header = lorica_http::ResponseHeader::build(503, None)?;
+                let host_header = extract_host(session.req_header()).to_string();
+                let body = render_error_body(
+                    503,
+                    &ctx.request_id,
+                    &host_header,
+                    ctx.route_snapshot
+                        .as_ref()
+                        .and_then(|r| r.error_page_html.as_deref()),
+                    "Route connection limit exceeded",
+                );
+                let mut header = lorica_http::ResponseHeader::build(503, None)?;
+                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                header.insert_header("Content-Length", body.len().to_string())?;
                 session
-                    .write_response_header(Box::new(header), true)
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
                     .await?;
                 return Ok(true);
             }
@@ -1400,83 +2731,96 @@ impl ProxyHttp for LoricaProxy {
 
         // Per-route rate limiting (skipped for whitelisted IPs)
         if !is_whitelisted {
-          if let Some(rps) = entry.route.rate_limit_rps {
-            if let Some(ref ip) = check_ip {
-                let key = format!("{}:{}", entry.route.id, ip);
-                self.rate_limiter.observe(&key, 1);
-                let current_rate = self.rate_limiter.rate(&key);
-                let mut effective_limit = match entry.route.rate_limit_burst {
-                    Some(burst) => (rps + burst) as f64,
-                    None => rps as f64,
-                };
+            if let Some(rps) = entry.route.rate_limit_rps {
+                if let Some(ref ip) = check_ip {
+                    let key = format!("{}:{}", entry.route.id, ip);
+                    self.rate_limiter.observe(&key, 1);
+                    let current_rate = self.rate_limiter.rate(&key);
+                    let mut effective_limit = match entry.route.rate_limit_burst {
+                        Some(burst) => (rps + burst) as f64,
+                        None => rps as f64,
+                    };
 
-                // Adaptive flood defense: when global RPS exceeds the
-                // configured threshold, halve per-IP rate limits.
-                let threshold = config.flood_threshold_rps;
-                if threshold > 0 {
-                    let global_rps = self.global_rate.rate(&"global");
-                    if global_rps > threshold as f64 {
-                        effective_limit *= 0.5;
-                    }
-                }
-                // Store rate info for response headers (even if not throttled)
-                ctx.rate_limit_info = Some((rps, current_rate));
-
-                if current_rate > effective_limit {
-                    warn!(
-                        route_id = %entry.route.id,
-                        client_ip = %ip,
-                        current_rate = %current_rate,
-                        limit_rps = %rps,
-                        "request rate-limited (429)"
-                    );
-
-                    // Track rate limit violations for auto-ban
-                    if let Some(ban_threshold) = entry.route.auto_ban_threshold {
-                        let violation_key = format!("violation:{}", ip);
-                        self.rate_violations.observe(&violation_key, 1);
-                        let violations = self.rate_violations.rate(&violation_key);
-                        if violations > ban_threshold as f64 {
-                            let ban_duration = entry.route.auto_ban_duration_s;
-                            self.ban_list
-                                .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
-                            warn!(
-                                ip = %ip,
-                                violations = %violations,
-                                ban_duration_s = %ban_duration,
-                                "IP auto-banned for rate limit abuse"
-                            );
-                            // Dispatch ip_banned notification
-                            if let Some(ref sender) = self.alert_sender {
-                                sender.send(
-                                    lorica_notify::AlertEvent::new(
-                                        lorica_notify::events::AlertType::IpBanned,
-                                        format!("IP {} auto-banned for rate limit abuse", ip),
-                                    )
-                                    .with_detail("ip", ip.to_string())
-                                    .with_detail("violations", violations.to_string())
-                                    .with_detail("ban_duration_s", ban_duration.to_string()),
-                                );
-                            }
+                    // Adaptive flood defense: when global RPS exceeds the
+                    // configured threshold, halve per-IP rate limits.
+                    let threshold = config.flood_threshold_rps;
+                    if threshold > 0 {
+                        let global_rps = self.global_rate.rate(&"global");
+                        if global_rps > threshold as f64 {
+                            effective_limit *= 0.5;
                         }
                     }
+                    // Store rate info for response headers (even if not throttled)
+                    ctx.rate_limit_info = Some((rps, current_rate));
 
-                    let reset_ts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        + 1;
-                    ctx.block_reason = Some("rate limited".to_string());
-                    let mut header = lorica_http::ResponseHeader::build(429, None)?;
-                    header.insert_header("Retry-After", "1")?;
-                    header.insert_header("X-RateLimit-Reset", reset_ts.to_string())?;
-                    session
-                        .write_response_header(Box::new(header), true)
-                        .await?;
-                    return Ok(true);
+                    if current_rate > effective_limit {
+                        warn!(
+                            route_id = %entry.route.id,
+                            client_ip = %ip,
+                            current_rate = %current_rate,
+                            limit_rps = %rps,
+                            "request rate-limited (429)"
+                        );
+
+                        // Track rate limit violations for auto-ban
+                        if let Some(ban_threshold) = entry.route.auto_ban_threshold {
+                            let violation_key = format!("violation:{}", ip);
+                            self.rate_violations.observe(&violation_key, 1);
+                            let violations = self.rate_violations.rate(&violation_key);
+                            if violations > ban_threshold as f64 {
+                                let ban_duration = entry.route.auto_ban_duration_s;
+                                self.ban_list
+                                    .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
+                                warn!(
+                                    ip = %ip,
+                                    violations = %violations,
+                                    ban_duration_s = %ban_duration,
+                                    "IP auto-banned for rate limit abuse"
+                                );
+                                // Dispatch ip_banned notification
+                                if let Some(ref sender) = self.alert_sender {
+                                    sender.send(
+                                        lorica_notify::AlertEvent::new(
+                                            lorica_notify::events::AlertType::IpBanned,
+                                            format!("IP {} auto-banned for rate limit abuse", ip),
+                                        )
+                                        .with_detail("ip", ip.to_string())
+                                        .with_detail("violations", violations.to_string())
+                                        .with_detail("ban_duration_s", ban_duration.to_string()),
+                                    );
+                                }
+                            }
+                        }
+
+                        let reset_ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                            + 1;
+                        ctx.block_reason = Some("rate limited".to_string());
+                        let host_header = extract_host(session.req_header()).to_string();
+                        let body = render_error_body(
+                            429,
+                            &ctx.request_id,
+                            &host_header,
+                            entry.route.error_page_html.as_deref(),
+                            "Rate limit exceeded",
+                        );
+                        let mut header = lorica_http::ResponseHeader::build(429, None)?;
+                        header.insert_header("Retry-After", "1")?;
+                        header.insert_header("X-RateLimit-Reset", reset_ts.to_string())?;
+                        header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                        header.insert_header("Content-Length", body.len().to_string())?;
+                        session
+                            .write_response_header(Box::new(header), false)
+                            .await?;
+                        session
+                            .write_response_body(Some(bytes::Bytes::from(body)), true)
+                            .await?;
+                        return Ok(true);
+                    }
                 }
             }
-        }
         } // end if !is_whitelisted (rate limiting)
 
         // Skip WAF evaluation entirely if not enabled or IP is whitelisted (zero overhead)
@@ -1547,53 +2891,84 @@ impl ProxyHttp for LoricaProxy {
                 ctx.matched_host = Some(host.to_string());
                 ctx.matched_path = Some(path.to_string());
 
-                // WAF auto-ban: local per-process fallback for single-process mode.
-                // In multi-worker mode the supervisor counts violations globally
-                // across all workers and broadcasts BanIp commands. The local
-                // counter here serves as a fallback that still works in
-                // single-process deployments.
+                // WAF auto-ban counter. Two modes:
+                //
+                // - Multi-worker (`self.shmem.is_some()`): increment the
+                //   cross-worker `waf_auto_ban` atomic counter. The
+                //   supervisor reads the counter on each UDS WAF event,
+                //   decides when the threshold is crossed, broadcasts
+                //   `BanIp` to all workers, and resets the slot. Workers
+                //   never issue bans directly — the supervisor is the
+                //   sole authority so the ban is consistent across the
+                //   pool.
+                //
+                // - Single-process (`self.shmem.is_none()`): fall back to
+                //   the per-process `waf_violations` DashMap + local
+                //   `ban_list` insertion, as before.
                 if let Some(ref ip) = check_ip {
                     let config = self.config.load();
                     let threshold = config.waf_ban_threshold;
                     if threshold > 0 {
-                        let violations = self
-                            .waf_violations
-                            .entry(ip.to_string())
-                            .or_insert_with(|| AtomicU64::new(0))
-                            .fetch_add(1, Ordering::Relaxed)
-                            + 1;
-                        if violations >= threshold as u64 {
-                            let ban_duration = config.waf_ban_duration_s;
-                            self.ban_list
-                                .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
-                            self.waf_violations.remove(ip.as_str());
-                            warn!(
-                                ip = %ip,
-                                violations = %violations,
-                                ban_duration_s = %ban_duration,
-                                "IP auto-banned for repeated WAF violations (local counter)"
-                            );
-                            if let Some(ref sender) = self.alert_sender {
-                                sender.send(
-                                    lorica_notify::AlertEvent::new(
-                                        lorica_notify::events::AlertType::IpBanned,
-                                        format!(
-                                            "IP {} auto-banned for repeated WAF violations",
-                                            ip
-                                        ),
-                                    )
-                                    .with_detail("ip", ip.to_string())
-                                    .with_detail("violations", violations.to_string())
-                                    .with_detail("ban_duration_s", ban_duration.to_string()),
+                        if let Some(region) = self.shmem {
+                            // Multi-worker: just bump the shmem counter.
+                            let tagged = region.tagged(ip_to_shmem_key(ip.as_str()));
+                            let _ =
+                                region
+                                    .waf_auto_ban
+                                    .increment(tagged, 1, lorica_shmem::now_ns());
+                        } else {
+                            let violations = self
+                                .waf_violations
+                                .entry(ip.to_string())
+                                .or_insert_with(|| AtomicU64::new(0))
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
+                            if violations >= threshold as u64 {
+                                let ban_duration = config.waf_ban_duration_s;
+                                self.ban_list
+                                    .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
+                                self.waf_violations.remove(ip.as_str());
+                                warn!(
+                                    ip = %ip,
+                                    violations = %violations,
+                                    ban_duration_s = %ban_duration,
+                                    "IP auto-banned for repeated WAF violations (local counter)"
                                 );
+                                if let Some(ref sender) = self.alert_sender {
+                                    sender.send(
+                                        lorica_notify::AlertEvent::new(
+                                            lorica_notify::events::AlertType::IpBanned,
+                                            format!(
+                                                "IP {} auto-banned for repeated WAF violations",
+                                                ip
+                                            ),
+                                        )
+                                        .with_detail("ip", ip.to_string())
+                                        .with_detail("violations", violations.to_string())
+                                        .with_detail("ban_duration_s", ban_duration.to_string()),
+                                    );
+                                }
                             }
                         }
                     }
                 }
 
-                let header = lorica_http::ResponseHeader::build(403, None)?;
+                let host_header = extract_host(session.req_header()).to_string();
+                let body = render_error_body(
+                    403,
+                    &ctx.request_id,
+                    &host_header,
+                    entry.route.error_page_html.as_deref(),
+                    "Request blocked by WAF",
+                );
+                let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                header.insert_header("Content-Length", body.len().to_string())?;
                 session
-                    .write_response_header(Box::new(header), true)
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
                     .await?;
                 Ok(true)
             }
@@ -1645,7 +3020,11 @@ impl ProxyHttp for LoricaProxy {
             // Chunked transfer body size enforcement.
             // Content-Length based check is in request_filter; this catches
             // Transfer-Encoding: chunked requests that have no Content-Length.
-            if let Some(max) = ctx.route_snapshot.as_ref().and_then(|r| r.max_request_body_bytes) {
+            if let Some(max) = ctx
+                .route_snapshot
+                .as_ref()
+                .and_then(|r| r.max_request_body_bytes)
+            {
                 if ctx.body_bytes_received > max {
                     warn!(
                         received = ctx.body_bytes_received,
@@ -1673,6 +3052,66 @@ impl ProxyHttp for LoricaProxy {
                     }
                 }
             }
+
+            // Buffer body for mirror sub-request. Independent of WAF
+            // buffering: WAF caps at 1 MiB hardcoded, mirror uses the
+            // route's configurable max_body_bytes. Overflow switches
+            // the state to Overflowed so the mirror is skipped at
+            // end_of_stream (a truncated body would lie to the shadow).
+            if let Some(ref pending) = ctx.mirror_pending {
+                if let Some(state) = ctx.mirror_body_state.take() {
+                    match state {
+                        MirrorBodyState::Active(mut buf) => {
+                            if buf.len() + chunk.len() > pending.max_body_bytes {
+                                tracing::debug!(
+                                    max = pending.max_body_bytes,
+                                    "mirror: body exceeded max_body_bytes, skipping"
+                                );
+                                ctx.mirror_body_state = Some(MirrorBodyState::Overflowed);
+                            } else {
+                                buf.extend_from_slice(chunk);
+                                ctx.mirror_body_state = Some(MirrorBodyState::Active(buf));
+                            }
+                        }
+                        MirrorBodyState::Overflowed => {
+                            ctx.mirror_body_state = Some(MirrorBodyState::Overflowed);
+                        }
+                    }
+                }
+            }
+        }
+
+        // End of stream: fire the mirror sub-request with the buffered
+        // body (or skip it on overflow). Must happen regardless of
+        // WAF status - WAF may allow the request while the mirror has
+        // overflowed, or vice versa.
+        if end_of_stream {
+            if let (Some(pending), Some(body_state)) =
+                (ctx.mirror_pending.take(), ctx.mirror_body_state.take())
+            {
+                match body_state {
+                    MirrorBodyState::Active(buf) => {
+                        spawn_mirrors(
+                            &pending.cfg,
+                            &pending.backends,
+                            pending.method,
+                            pending.path_and_query,
+                            pending.headers,
+                            Some(buf),
+                            pending.request_id,
+                            pending.route_id,
+                        );
+                    }
+                    MirrorBodyState::Overflowed => {
+                        // Buffer exceeded max_body_bytes: skip silently.
+                        // Already logged at overflow time.
+                        lorica_api::metrics::inc_mirror_outcome(
+                            &pending.route_id,
+                            "dropped_oversize_body",
+                        );
+                    }
+                }
+            }
         }
 
         // When the full body is received, run WAF body evaluation
@@ -1687,12 +3126,9 @@ impl ProxyHttp for LoricaProxy {
                         _ => lorica_waf::WafMode::Detection,
                     };
 
-                    let mut verdict = self.waf_engine.evaluate_body(
-                        waf_mode,
-                        buf,
-                        host,
-                        client_ip,
-                    );
+                    let mut verdict = self
+                        .waf_engine
+                        .evaluate_body(waf_mode, buf, host, client_ip);
 
                     match verdict {
                         lorica_waf::WafVerdict::Blocked(ref mut events) => {
@@ -1715,9 +3151,26 @@ impl ProxyHttp for LoricaProxy {
                                 }
                             }
                             ctx.waf_blocked = true;
-                            let header = lorica_http::ResponseHeader::build(403, None)?;
+                            let host_header = extract_host(session.req_header()).to_string();
+                            let custom_html = ctx
+                                .route_snapshot
+                                .as_ref()
+                                .and_then(|r| r.error_page_html.as_deref());
+                            let body_html = render_error_body(
+                                403,
+                                &ctx.request_id,
+                                &host_header,
+                                custom_html,
+                                "Request body blocked by WAF",
+                            );
+                            let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                            header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                            header.insert_header("Content-Length", body_html.len().to_string())?;
                             session
-                                .write_response_header(Box::new(header), true)
+                                .write_response_header(Box::new(header), false)
+                                .await?;
+                            session
+                                .write_response_body(Some(bytes::Bytes::from(body_html)), true)
                                 .await?;
                             *body = None;
                             return Ok(());
@@ -1763,8 +3216,12 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
-        let route = match ctx.route_snapshot {
-            Some(ref r) if r.cache_enabled => r,
+        // Snapshot a few fields out of ctx.route_snapshot as owned
+        // values so we can re-borrow ctx mutably later in the function
+        // (cache_key_callback takes `&mut ctx`). Without this the
+        // short-lived immutable reborrow locks us out of the helper.
+        let (route_id, cache_max_bytes) = match ctx.route_snapshot {
+            Some(ref r) if r.cache_enabled => (r.id.clone(), r.cache_max_bytes),
             _ => return Ok(()),
         };
 
@@ -1791,20 +3248,38 @@ impl ProxyHttp for LoricaProxy {
             }
         }
 
-        // Enable the cache state machine with MemCache storage + LRU eviction
+        // Observability: peek the predictor for this key and count
+        // bypass hits BEFORE enabling the cache. Pingora's cache
+        // state machine will consult the same predictor again
+        // internally, but doing the observation here is the only
+        // place we have the route_id in scope. The double read is
+        // cheap (sharded LRU) compared to the cache-lock work it
+        // saves.
+        if let Ok(observed_key) = self.cache_key_callback(session, ctx) {
+            use lorica_cache::predictor::CacheablePredictor as _;
+            if !(*CACHE_PREDICTOR).cacheable_prediction(&observed_key) {
+                lorica_api::metrics::inc_cache_predictor_bypass(&route_id);
+            }
+        }
+
+        // Enable the cache state machine with MemCache storage + LRU eviction.
+        // The predictor is shared across all cache-enabled routes: responses
+        // marked uncacheable by the origin skip the cache state machine on
+        // the next request, avoiding cache-lock contention on known-bypass
+        // traffic.
         session.cache.enable(
             &*CACHE_BACKEND,
             Some(&*CACHE_EVICTION),
-            None, // no predictor
+            Some(*CACHE_PREDICTOR),
             Some(*CACHE_LOCK),
             None, // no option overrides
         );
 
         // Set max cacheable response size from route config
-        if route.cache_max_bytes > 0 {
+        if cache_max_bytes > 0 {
             session
                 .cache
-                .set_max_file_size_bytes(route.cache_max_bytes as usize);
+                .set_max_file_size_bytes(cache_max_bytes as usize);
         }
 
         Ok(())
@@ -1830,6 +3305,30 @@ impl ProxyHttp for LoricaProxy {
             format!("{host}{path_and_query}"),
             String::new(),
         ))
+    }
+
+    /// Partition the cache by request header values so responses that differ
+    /// based on client capabilities (content negotiation, localization,
+    /// auth tier, tenancy) stay separated under the same URL.
+    ///
+    /// Header names come from two sources, merged case-insensitively:
+    ///   1. The route's `cache_vary_headers` - operator-controlled, set
+    ///      regardless of what the origin advertises.
+    ///   2. The origin response's `Vary` header captured in the cached
+    ///      [`CacheMeta`] - respected as required by RFC 7234. `Vary: *`
+    ///      forces a URI-anchored variance so each URL keeps its own slot
+    ///      without sharing a variant across unrelated requests.
+    ///
+    /// Returning `None` (no headers contribute, or all target headers are
+    /// absent) means "no variance" and the asset is cached under its
+    /// primary key - the default state when this feature is unused.
+    fn cache_vary_filter(
+        &self,
+        meta: &CacheMeta,
+        ctx: &mut Self::CTX,
+        req: &lorica_http::RequestHeader,
+    ) -> Option<HashBinary> {
+        cache_vary_for_request(ctx.route_snapshot.as_deref(), meta, req)
     }
 
     /// Decide whether the upstream response should be admitted to cache.
@@ -1969,33 +3468,33 @@ impl ProxyHttp for LoricaProxy {
         };
 
         if code > 0 {
-            // Serve custom error page HTML if the route has one configured
-            let custom_served = if let Some(ref route) = ctx.route_snapshot {
-                if let Some(ref html) = route.error_page_html {
-                    let body = sanitize_html(html)
-                        .replace("{{status}}", &code.to_string())
-                        .replace("{{message}}", &escape_html(&e.to_string()));
-                    if let Ok(mut header) = ResponseHeader::build(code, None) {
-                        let _ = header.insert_header("Content-Type", "text/html; charset=utf-8");
-                        let _ = header.insert_header("Content-Length", body.len().to_string());
-                        let r1 = session
-                            .write_response_header(Box::new(header), false)
-                            .await;
-                        let r2 = session
-                            .write_response_body(Some(bytes::Bytes::from(body)), true)
-                            .await;
-                        r1.is_ok() && r2.is_ok()
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
+            // Always render an HTML error page: per-route `error_page_html`
+            // override if configured, default Lorica page otherwise.
+            let host_header = extract_host(session.req_header()).to_string();
+            let custom_html = ctx
+                .route_snapshot
+                .as_ref()
+                .and_then(|r| r.error_page_html.as_deref());
+            let body = render_error_body(
+                code,
+                &ctx.request_id,
+                &host_header,
+                custom_html,
+                &e.to_string(),
+            );
+            let served = if let Ok(mut header) = ResponseHeader::build(code, None) {
+                let _ = header.insert_header("Content-Type", "text/html; charset=utf-8");
+                let _ = header.insert_header("Content-Length", body.len().to_string());
+                let r1 = session.write_response_header(Box::new(header), false).await;
+                let r2 = session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
+                    .await;
+                r1.is_ok() && r2.is_ok()
             } else {
                 false
             };
 
-            if !custom_served {
+            if !served {
                 let _ = session.respond_error(code).await;
             }
         }
@@ -2017,16 +3516,25 @@ impl ProxyHttp for LoricaProxy {
         let host = host_raw.split(':').next().unwrap_or(host_raw);
 
         let path = req.uri.path();
-        let config = self.config.load();
 
-        // Find matching route (exact hostname first, then wildcard)
-        let entry = match config.find_route(host, path) {
-            Some(e) => e,
+        // Fast path: request_filter already matched and cached the
+        // entry. Fall back to a fresh find_route only when ctx is
+        // empty (e.g. request_filter returned Ok(false) and we need
+        // to emit a 404 through the normal upstream_peer path).
+        let config_guard;
+        let entry: Arc<RouteEntry> = match ctx.matched_route_entry.as_ref() {
+            Some(cached) => Arc::clone(cached),
             None => {
-                return Error::e_explain(
-                    ErrorType::HTTPStatus(404),
-                    format!("no route configured for host={host} path={path}"),
-                );
+                config_guard = self.config.load();
+                match config_guard.find_route(host, path) {
+                    Some(e) => Arc::clone(e),
+                    None => {
+                        return Error::e_explain(
+                            ErrorType::HTTPStatus(404),
+                            format!("no route configured for host={host} path={path}"),
+                        );
+                    }
+                }
             }
         };
 
@@ -2040,20 +3548,67 @@ impl ProxyHttp for LoricaProxy {
             ctx.access_log_enabled = entry.route.access_log_enabled;
         }
 
-        // Filter healthy backends (use path-rule override if set)
+        // Filter healthy backends (path-rule / header-rule / canary
+        // override wins when set).
+        //
+        // Intentional fail-closed design: when an override group
+        // (canary split, header rule, path rule) has all its backends
+        // Down / Draining / breaker-Open, we return 502 rather than
+        // silently falling back to the route's default backends. A
+        // silent fallback would mask a broken deployment - an
+        // operator rolling out a bad canary would see their primary
+        // absorb the traffic and assume the release is healthy. The
+        // explicit 502 (with the matching Prometheus counter) makes
+        // the failure visible. If a graceful fallback is desired on
+        // a given route, operators should use small weights on the
+        // canary split so the default band still covers the majority
+        // of traffic.
         let backends_source = if let Some(ref overridden) = ctx.matched_backends {
             overridden
         } else {
             &entry.backends
         };
-        let healthy_backends: Vec<&Backend> = backends_source
-            .iter()
-            .filter(|b| {
-                b.health_status != HealthStatus::Down
-                    && b.lifecycle_state == LifecycleState::Normal
-                    && self.circuit_breaker.is_available(&b.address)
-            })
-            .collect();
+        // Breaker admission is async (may hit the supervisor RPC in
+        // worker mode), so we walk the backends manually instead of a
+        // sync `filter()`. We also track which backend - if any - was
+        // admitted via a HalfOpen probe; the outcome report in
+        // `logging()` uses this to flag `was_probe` correctly.
+        let mut healthy_backends: Vec<&Backend> = Vec::with_capacity(backends_source.len());
+        let mut probe_backend: Option<String> = None;
+        for b in backends_source.iter() {
+            if b.health_status == HealthStatus::Down || b.lifecycle_state != LifecycleState::Normal
+            {
+                continue;
+            }
+            match self
+                .circuit_breaker_engine
+                .admit(&entry.route.id, &b.address)
+                .await
+            {
+                BreakerAdmission::Allow => healthy_backends.push(b),
+                BreakerAdmission::Probe => {
+                    // Only one probe per request; later Probes for the
+                    // same route-backend would deny anyway. Record the
+                    // first one and stop asking for more probes on
+                    // subsequent backends - `is_available` already
+                    // drained the slot, but a probe we don't use would
+                    // leave the breaker stuck in HalfOpen. For a
+                    // multi-backend route we still want to prefer the
+                    // probe-admitted backend (it's the only one that
+                    // can close the breaker on success), so we push
+                    // it to the head of the list.
+                    healthy_backends.insert(0, b);
+                    if probe_backend.is_none() {
+                        probe_backend = Some(b.address.clone());
+                    }
+                }
+                BreakerAdmission::Deny => {}
+            }
+        }
+        // Remember for logging(): the outcome report must flag
+        // `was_probe=true` for this specific backend so the supervisor
+        // can finalize the HalfOpen state machine.
+        ctx.breaker_probe_backend = probe_backend;
 
         if healthy_backends.is_empty() {
             return Error::e_explain(
@@ -2073,11 +3628,7 @@ impl ProxyHttp for LoricaProxy {
                 .get("cookie")
                 .and_then(|v| v.to_str().ok())
                 .and_then(extract_sticky_backend)
-                .and_then(|backend_id| {
-                    healthy_backends
-                        .iter()
-                        .position(|b| b.id == backend_id)
-                })
+                .and_then(|backend_id| healthy_backends.iter().position(|b| b.id == backend_id))
         } else {
             None
         };
@@ -2087,34 +3638,34 @@ impl ProxyHttp for LoricaProxy {
         let idx = if let Some(sticky_idx) = sticky_backend_idx {
             sticky_idx
         } else {
-        match entry.route.load_balancing {
-            LoadBalancing::PeakEwma => self.ewma_tracker.select_best(&healthy_backends),
-            LoadBalancing::Random => {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                ctx.start_time.hash(&mut hasher);
-                (hasher.finish() as usize) % healthy_backends.len()
+            match entry.route.load_balancing {
+                LoadBalancing::PeakEwma => self.ewma_tracker.select_best(&healthy_backends),
+                LoadBalancing::Random => {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    ctx.start_time.hash(&mut hasher);
+                    (hasher.finish() as usize) % healthy_backends.len()
+                }
+                LoadBalancing::LeastConn => {
+                    // Select the backend with the fewest active connections
+                    healthy_backends
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, b)| self.backend_connections.get(&b.address))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0)
+                }
+                _ => {
+                    // Smooth weighted round-robin (Nginx algorithm) - covers
+                    // RoundRobin and ConsistentHash
+                    let bw: Vec<(&str, i64)> = healthy_backends
+                        .iter()
+                        .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
+                        .collect();
+                    entry.wrr_state.next(&bw)
+                }
             }
-            LoadBalancing::LeastConn => {
-                // Select the backend with the fewest active connections
-                healthy_backends
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, b)| self.backend_connections.get(&b.address))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            }
-            _ => {
-                // Smooth weighted round-robin (Nginx algorithm) - covers
-                // RoundRobin and ConsistentHash
-                let bw: Vec<(&str, i64)> = healthy_backends
-                    .iter()
-                    .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
-                    .collect();
-                entry.wrr_state.next(&bw)
-            }
-        }
         };
         let backend = healthy_backends[idx];
 
@@ -2305,6 +3856,15 @@ impl ProxyHttp for LoricaProxy {
             upstream_request.remove_header(&name);
         }
 
+        // Forward-auth response headers: applied AFTER proxy_headers so
+        // auth-derived values like Remote-User take precedence over any
+        // static proxy_headers with the same name (an operator would be
+        // surprised if their basic `X-User: static` overrode the
+        // authenticated user's identity).
+        for (name, value) in &ctx.forward_auth_inject {
+            let _ = upstream_request.insert_header(name.clone(), value);
+        }
+
         Ok(())
     }
 
@@ -2418,7 +3978,171 @@ impl ProxyHttp for LoricaProxy {
             let _ = upstream_response.append_header("Set-Cookie", &cookie);
         }
 
+        // Decide if response-body rewriting will fire for this response.
+        // Done at header-phase so we can drop Content-Length (our
+        // rewritten body will have a different length) before the
+        // response line is sent.
+        //
+        // Skip HEAD requests: the response MUST report the Content-Length
+        // a GET would produce (RFC 7231 s4.3.2), and HEAD carries no
+        // body for us to rewrite. Stripping Content-Length here would
+        // break clients that size their follow-up GET based on HEAD.
+        //
+        // Also skip 1xx / 204 / 304 responses: they are defined as
+        // having no body, and stripping Content-Length on a 304 would
+        // corrupt the revalidation contract.
+        let is_head = session
+            .req_header()
+            .method
+            .as_str()
+            .eq_ignore_ascii_case("HEAD");
+        let status = upstream_response.status.as_u16();
+        let body_forbidden = matches!(status, 100..=199 | 204 | 304);
+        // v1 scope: response rewriting is mutually exclusive with
+        // caching. Pingora's cache captures raw upstream bytes and
+        // replays them through response_body_filter on cache hits,
+        // so naively combining the two would either double-rewrite
+        // (if the cache stored rewritten bytes) or silently break
+        // the stream framing (the cache relies on the
+        // upstream-reported Content-Length we would strip). Pick
+        // one per route; rewriting wins over caching with a loud
+        // warning, because rewriting is typically the stricter
+        // security / integrity requirement.
+        let cache_active = session.cache.enabled();
+        if cache_active && route.response_rewrite.is_some() {
+            tracing::warn!(
+                route_id = %route.id,
+                "response_rewrite disabled for this response because the route also has cache_enabled; caching + rewriting are mutually exclusive in v1"
+            );
+        }
+        if let Some(ref rr_cfg) = route.response_rewrite {
+            if !is_head && !body_forbidden && !cache_active {
+                let ct = upstream_response
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let ce = upstream_response
+                    .headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if should_rewrite_response(rr_cfg, ct, ce) {
+                    // Strip Content-Length; the framework will emit the
+                    // rewritten body as chunked. Transfer-Encoding is
+                    // likewise re-derived by the server.
+                    upstream_response.remove_header("content-length");
+                    ctx.response_rewrite_state = Some(ResponseRewriteState::Active(Vec::new()));
+                    // Resolve compiled rules ONCE from the cached
+                    // route entry and hand them to response_body_filter
+                    // via ctx. Prior code re-scanned routes on every
+                    // chunk (O(routes) per chunk under load); now the
+                    // per-chunk path is a pointer clone.
+                    if let Some(entry) = ctx.matched_route_entry.as_ref() {
+                        ctx.response_rewrite_rules =
+                            Some(Arc::new(entry.response_rewrite_compiled.clone()));
+                    }
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<std::time::Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Fast path: feature off for this response.
+        if ctx.response_rewrite_state.is_none() {
+            return Ok(None);
+        }
+
+        // Resolve the configured cap and compiled rules. Config absent
+        // would be an engine bug (we only set state when config exists)
+        // but guard anyway so we fail open (stream unchanged).
+        let (max_body_bytes, compiled) = {
+            let route = match ctx.route_snapshot.as_ref() {
+                Some(r) => r,
+                None => {
+                    ctx.response_rewrite_state = None;
+                    return Ok(None);
+                }
+            };
+            let cfg = match route.response_rewrite.as_ref() {
+                Some(c) => c,
+                None => {
+                    ctx.response_rewrite_state = None;
+                    return Ok(None);
+                }
+            };
+            (cfg.max_body_bytes as usize, route.clone())
+        };
+        // Compiled rules were resolved once in response_filter and
+        // stored in ctx - a pointer clone here, no per-chunk scan.
+        let rules = ctx
+            .response_rewrite_rules
+            .clone()
+            .unwrap_or_else(|| Arc::new(Vec::new()));
+        let route_id = compiled.id.as_str();
+
+        // Accumulate or overflow.
+        let state = ctx.response_rewrite_state.take();
+        let (mut buffer, was_overflowed) = match state {
+            Some(ResponseRewriteState::Active(buf)) => (buf, false),
+            Some(ResponseRewriteState::Overflowed) => (Vec::new(), true),
+            None => return Ok(None),
+        };
+
+        if was_overflowed {
+            // Already overflowed: stream chunks verbatim, state stays
+            // Overflowed until end_of_stream when we clear it.
+            if end_of_stream {
+                // no-op; drop state
+            } else {
+                ctx.response_rewrite_state = Some(ResponseRewriteState::Overflowed);
+            }
+            return Ok(None);
+        }
+
+        if let Some(chunk) = body.take() {
+            if buffer.len().saturating_add(chunk.len()) > max_body_bytes {
+                tracing::debug!(
+                    route_id = %route_id,
+                    max = max_body_bytes,
+                    "response_rewrite: body exceeded max_body_bytes, streaming verbatim"
+                );
+                // Flush what we buffered so far plus the current chunk.
+                // The downstream already received no bytes for this
+                // response (we've suppressed previous chunks), so the
+                // entire response body must be emitted now.
+                let mut flush = std::mem::take(&mut buffer);
+                flush.extend_from_slice(&chunk);
+                *body = Some(bytes::Bytes::from(flush));
+                ctx.response_rewrite_state = Some(ResponseRewriteState::Overflowed);
+                return Ok(None);
+            }
+            buffer.extend_from_slice(&chunk);
+            // Suppress the chunk: we'll emit the rewritten body at
+            // end_of_stream in one go.
+            *body = None;
+        }
+
+        if end_of_stream {
+            let rewritten = apply_response_rewrites(&buffer, rules.as_slice());
+            *body = Some(bytes::Bytes::from(rewritten));
+            // Drop state; no more chunks expected.
+        } else {
+            ctx.response_rewrite_state = Some(ResponseRewriteState::Active(buffer));
+        }
+
+        Ok(None)
     }
 
     fn response_compression_level(
@@ -2525,11 +4249,23 @@ impl ProxyHttp for LoricaProxy {
             self.active_connections.fetch_sub(1, Ordering::Relaxed);
             self.backend_connections.decrement(addr);
 
-            // Update circuit breaker: 5xx or connection error = failure, else success
-            if e.is_some() || status >= 500 {
-                self.circuit_breaker.record_failure(addr);
-            } else {
-                self.circuit_breaker.record_success(addr);
+            // Update circuit breaker: 5xx or connection error = failure, else success.
+            // Keyed by (route_id, backend) so a failing route does not punish
+            // sibling routes that share the same upstream IP:port. In
+            // worker mode the supervisor owns the state machine and
+            // `record(...)` issues an RPC; `was_probe` is derived from
+            // `ctx.breaker_probe_backend` so a HalfOpen probe can
+            // transition the breaker back to Closed on success.
+            if let Some(ref route_id) = ctx.route_id {
+                let success = e.is_none() && status < 500;
+                let was_probe = ctx
+                    .breaker_probe_backend
+                    .as_deref()
+                    .map(|probe_addr| probe_addr == addr.as_str())
+                    .unwrap_or(false);
+                self.circuit_breaker_engine
+                    .record(route_id, addr, success, was_probe)
+                    .await;
             }
         }
 
@@ -2575,11 +4311,7 @@ impl ProxyHttp for LoricaProxy {
         // errors (downstream/upstream resets, timeouts) as their latency
         // is not representative of backend performance.
         if let Some(ref route_id) = ctx.route_id {
-            if status != 101
-                && ctx.block_reason.is_none()
-                && !ctx.waf_blocked
-                && e.is_none()
-            {
+            if status != 101 && ctx.block_reason.is_none() && !ctx.waf_blocked && e.is_none() {
                 self.sla_collector.record(route_id, status, latency_ms);
             }
         }
@@ -2608,1350 +4340,4 @@ impl ProxyHttp for LoricaProxy {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-    use lorica_config::models::*;
-
-    fn make_route(id: &str, hostname: &str, path: &str, enabled: bool) -> Route {
-        let now = Utc::now();
-        Route {
-            id: id.into(),
-            hostname: hostname.into(),
-            path_prefix: path.into(),
-            certificate_id: None,
-            load_balancing: LoadBalancing::RoundRobin,
-            waf_enabled: false,
-            waf_mode: WafMode::Detection,
-            enabled,
-            force_https: false,
-            redirect_hostname: None,
-            redirect_to: None,
-            hostname_aliases: Vec::new(),
-            proxy_headers: std::collections::HashMap::new(),
-            response_headers: std::collections::HashMap::new(),
-            security_headers: "moderate".to_string(),
-            connect_timeout_s: 5,
-            read_timeout_s: 60,
-            send_timeout_s: 60,
-            strip_path_prefix: None,
-            add_path_prefix: None,
-            path_rewrite_pattern: None,
-            path_rewrite_replacement: None,
-            access_log_enabled: true,
-            proxy_headers_remove: Vec::new(),
-            response_headers_remove: Vec::new(),
-            max_request_body_bytes: None,
-            websocket_enabled: true,
-            rate_limit_rps: None,
-            rate_limit_burst: None,
-            ip_allowlist: Vec::new(),
-            ip_denylist: Vec::new(),
-            cors_allowed_origins: Vec::new(),
-            cors_allowed_methods: Vec::new(),
-            cors_max_age_s: None,
-            compression_enabled: false,
-            retry_attempts: None,
-            cache_enabled: false,
-            cache_ttl_s: 300,
-            cache_max_bytes: 52428800,
-            max_connections: None,
-            slowloris_threshold_ms: 5000,
-            auto_ban_threshold: None,
-            auto_ban_duration_s: 3600,
-            path_rules: vec![],
-            return_status: None,
-            sticky_session: false,
-            basic_auth_username: None,
-            basic_auth_password_hash: None,
-            stale_while_revalidate_s: 10,
-            stale_if_error_s: 60,
-            retry_on_methods: vec![],
-            maintenance_mode: false,
-            error_page_html: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    fn make_backend(id: &str, addr: &str) -> Backend {
-        let now = Utc::now();
-        Backend {
-            id: id.into(),
-            address: addr.into(),
-            name: String::new(),
-            group_name: String::new(),
-            weight: 100,
-            health_status: HealthStatus::Healthy,
-            health_check_enabled: true,
-            health_check_interval_s: 10,
-            health_check_path: None,
-            lifecycle_state: LifecycleState::Normal,
-            active_connections: 0,
-            tls_upstream: false,
-            tls_skip_verify: false,
-            tls_sni: None,
-            h2_upstream: false,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    fn make_certificate(id: &str, domain: &str) -> Certificate {
-        let now = Utc::now();
-        Certificate {
-            id: id.into(),
-            domain: domain.into(),
-            san_domains: vec![],
-            fingerprint: "sha256:test".into(),
-            cert_pem: "cert".into(),
-            key_pem: "key".into(),
-            issuer: "test".into(),
-            not_before: now,
-            not_after: now,
-            is_acme: false,
-            acme_auto_renew: false,
-            created_at: now,
-            acme_method: None,
-
-            acme_dns_provider_id: None,
-        }
-    }
-
-    #[test]
-    fn test_from_store_empty() {
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
-        assert!(config.routes_by_host.is_empty());
-    }
-
-    #[test]
-    fn test_from_store_single_route_with_backend() {
-        let route = make_route("r1", "example.com", "/", true);
-        let backend = make_backend("b1", "10.0.0.1:8080");
-        let links = vec![("r1".into(), "b1".into())];
-
-        let config = ProxyConfig::from_store(
-            vec![route],
-            vec![backend],
-            vec![],
-            links,
-            ProxyConfigGlobals::default(),
-        );
-        let entries = config.routes_by_host.get("example.com").unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].backends.len(), 1);
-        assert_eq!(entries[0].backends[0].address, "10.0.0.1:8080");
-    }
-
-    #[test]
-    fn test_from_store_disabled_routes_excluded() {
-        let r1 = make_route("r1", "example.com", "/", true);
-        let r2 = make_route("r2", "disabled.com", "/", false);
-
-        let config =
-            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], ProxyConfigGlobals::default());
-        assert!(config.routes_by_host.contains_key("example.com"));
-        assert!(!config.routes_by_host.contains_key("disabled.com"));
-    }
-
-    #[test]
-    fn test_from_store_longest_path_prefix_first() {
-        let r1 = make_route("r1", "example.com", "/", true);
-        let r2 = make_route("r2", "example.com", "/api", true);
-        let r3 = make_route("r3", "example.com", "/api/v1", true);
-
-        let config =
-            ProxyConfig::from_store(vec![r1, r2, r3], vec![], vec![], vec![], ProxyConfigGlobals::default());
-        let entries = config.routes_by_host.get("example.com").unwrap();
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].route.path_prefix, "/api/v1");
-        assert_eq!(entries[1].route.path_prefix, "/api");
-        assert_eq!(entries[2].route.path_prefix, "/");
-    }
-
-    #[test]
-    fn test_from_store_route_without_backends() {
-        let route = make_route("r1", "example.com", "/", true);
-
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
-        let entries = config.routes_by_host.get("example.com").unwrap();
-        assert!(entries[0].backends.is_empty());
-    }
-
-    #[test]
-    fn test_from_store_certificate_association() {
-        let mut route = make_route("r1", "example.com", "/", true);
-        route.certificate_id = Some("c1".into());
-        let cert = make_certificate("c1", "example.com");
-
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![cert], vec![], ProxyConfigGlobals::default());
-        let entries = config.routes_by_host.get("example.com").unwrap();
-        assert!(entries[0].certificate.is_some());
-        assert_eq!(
-            entries[0].certificate.as_ref().unwrap().domain,
-            "example.com"
-        );
-    }
-
-    #[test]
-    fn test_from_store_missing_certificate_is_none() {
-        let mut route = make_route("r1", "example.com", "/", true);
-        route.certificate_id = Some("nonexistent".into());
-
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
-        let entries = config.routes_by_host.get("example.com").unwrap();
-        assert!(entries[0].certificate.is_none());
-    }
-
-    #[test]
-    fn test_from_store_multiple_backends_per_route() {
-        let route = make_route("r1", "example.com", "/", true);
-        let b1 = make_backend("b1", "10.0.0.1:8080");
-        let b2 = make_backend("b2", "10.0.0.2:8080");
-        let links = vec![("r1".into(), "b1".into()), ("r1".into(), "b2".into())];
-
-        let config =
-            ProxyConfig::from_store(vec![route], vec![b1, b2], vec![], links, ProxyConfigGlobals::default());
-        let entries = config.routes_by_host.get("example.com").unwrap();
-        assert_eq!(entries[0].backends.len(), 2);
-    }
-
-    #[test]
-    fn test_from_store_multiple_hosts() {
-        let r1 = make_route("r1", "foo.com", "/", true);
-        let r2 = make_route("r2", "bar.com", "/", true);
-
-        let config =
-            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], ProxyConfigGlobals::default());
-        assert_eq!(config.routes_by_host.len(), 2);
-        assert!(config.routes_by_host.contains_key("foo.com"));
-        assert!(config.routes_by_host.contains_key("bar.com"));
-    }
-
-    #[test]
-    fn test_from_store_dangling_backend_link_ignored() {
-        let route = make_route("r1", "example.com", "/", true);
-        let links = vec![("r1".into(), "nonexistent-backend".into())];
-
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], links, ProxyConfigGlobals::default());
-        let entries = config.routes_by_host.get("example.com").unwrap();
-        assert!(entries[0].backends.is_empty());
-    }
-
-    #[test]
-    fn test_smooth_wrr_distribution() {
-        // 3 backends with equal weight: should distribute evenly
-        let state = SmoothWrrState::new(0);
-        let backends: Vec<(&str, i64)> = vec![("10.0.0.1:80", 100), ("10.0.0.2:80", 100), ("10.0.0.3:80", 100)];
-        let mut counts = [0usize; 3];
-        for _ in 0..30 {
-            let idx = state.next(&backends);
-            counts[idx] += 1;
-        }
-        // Each should get exactly 10 with equal weights
-        assert_eq!(counts[0], 10);
-        assert_eq!(counts[1], 10);
-        assert_eq!(counts[2], 10);
-    }
-
-    #[test]
-    fn test_smooth_wrr_weighted() {
-        // Weights 5,3,2: should distribute proportionally
-        let state = SmoothWrrState::new(0);
-        let backends: Vec<(&str, i64)> = vec![("10.0.0.1:80", 5), ("10.0.0.2:80", 3), ("10.0.0.3:80", 2)];
-        let mut counts = [0usize; 3];
-        for _ in 0..10 {
-            let idx = state.next(&backends);
-            counts[idx] += 1;
-        }
-        assert_eq!(counts[0], 5);
-        assert_eq!(counts[1], 3);
-        assert_eq!(counts[2], 2);
-    }
-
-    #[test]
-    fn test_smooth_wrr_worker_offset() {
-        // Two workers with different offsets should start on different backends
-        let state0 = SmoothWrrState::new(0);
-        let state1 = SmoothWrrState::new(1);
-        let backends: Vec<(&str, i64)> = vec![("10.0.0.1:80", 100), ("10.0.0.2:80", 100), ("10.0.0.3:80", 100)];
-        let first0 = state0.next(&backends);
-        let first1 = state1.next(&backends);
-        assert_ne!(first0, first1, "different workers should start on different backends");
-    }
-
-    // ---- Least Connections ----
-
-    #[test]
-    fn test_least_conn_selects_backend_with_fewest_connections() {
-        let bc = BackendConnections::new();
-        bc.increment("10.0.0.1:80");
-        bc.increment("10.0.0.1:80");
-        bc.increment("10.0.0.1:80");
-        bc.increment("10.0.0.2:80");
-
-        // 10.0.0.3:80 has 0 connections, should be selected
-        let backends = vec![
-            make_backend("b1", "10.0.0.1:80"),
-            make_backend("b2", "10.0.0.2:80"),
-            make_backend("b3", "10.0.0.3:80"),
-        ];
-
-        let idx = backends
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, b)| bc.get(&b.address))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
-        assert_eq!(idx, 2, "Should select backend with 0 connections");
-        assert_eq!(bc.get("10.0.0.1:80"), 3);
-        assert_eq!(bc.get("10.0.0.2:80"), 1);
-        assert_eq!(bc.get("10.0.0.3:80"), 0);
-    }
-
-    #[test]
-    fn test_least_conn_with_equal_connections() {
-        let bc = BackendConnections::new();
-        // All have 0 connections - should select index 0 (first min)
-        let backends = vec![
-            make_backend("b1", "10.0.0.1:80"),
-            make_backend("b2", "10.0.0.2:80"),
-        ];
-
-        let idx = backends
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, b)| bc.get(&b.address))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
-        assert_eq!(idx, 0, "Equal connections should select first backend");
-    }
-
-    #[test]
-    fn test_proxy_config_default_is_empty() {
-        let config = ProxyConfig::default();
-        assert!(config.routes_by_host.is_empty());
-    }
-
-    // ---- BackendConnections ----
-
-    #[test]
-    fn test_backend_connections_increment_decrement() {
-        let bc = BackendConnections::new();
-        bc.increment("10.0.0.1:8080");
-        bc.increment("10.0.0.1:8080");
-        assert_eq!(bc.get("10.0.0.1:8080"), 2);
-
-        bc.decrement("10.0.0.1:8080");
-        assert_eq!(bc.get("10.0.0.1:8080"), 1);
-    }
-
-    #[test]
-    fn test_backend_connections_unknown_backend() {
-        let bc = BackendConnections::new();
-        assert_eq!(bc.get("nonexistent:8080"), 0);
-    }
-
-    #[test]
-    fn test_backend_connections_multiple_backends() {
-        let bc = BackendConnections::new();
-        bc.increment("10.0.0.1:8080");
-        bc.increment("10.0.0.2:8080");
-        bc.increment("10.0.0.2:8080");
-        assert_eq!(bc.get("10.0.0.1:8080"), 1);
-        assert_eq!(bc.get("10.0.0.2:8080"), 2);
-    }
-
-    // ---- EWMA Tracker ----
-
-    #[test]
-    fn test_ewma_tracker_default_score() {
-        let tracker = EwmaTracker::new();
-        assert_eq!(tracker.get_score("10.0.0.1:8080"), 0.0);
-    }
-
-    #[test]
-    fn test_ewma_tracker_record_updates_score() {
-        let tracker = EwmaTracker::new();
-        tracker.record("10.0.0.1:8080", 100.0);
-        assert!(tracker.get_score("10.0.0.1:8080") > 0.0);
-    }
-
-    #[test]
-    fn test_ewma_tracker_selects_lowest_score() {
-        let tracker = EwmaTracker::new();
-        // Backend 1: high latency
-        for _ in 0..10 {
-            tracker.record("10.0.0.1:8080", 5000.0);
-        }
-        // Backend 2: low latency
-        for _ in 0..10 {
-            tracker.record("10.0.0.2:8080", 100.0);
-        }
-
-        let b1 = make_backend("b1", "10.0.0.1:8080");
-        let b2 = make_backend("b2", "10.0.0.2:8080");
-        let backends = vec![&b1, &b2];
-
-        let selected = tracker.select_best(&backends);
-        assert_eq!(selected, 1, "Should select the faster backend (index 1)");
-    }
-
-    #[test]
-    fn test_ewma_tracker_prefers_unscored() {
-        let tracker = EwmaTracker::new();
-        // Only score backend 1 (high latency)
-        tracker.record("10.0.0.1:8080", 5000.0);
-        // Backend 2 is unscored (score = 0.0, exploration priority)
-
-        let b1 = make_backend("b1", "10.0.0.1:8080");
-        let b2 = make_backend("b2", "10.0.0.2:8080");
-        let backends = vec![&b1, &b2];
-
-        let selected = tracker.select_best(&backends);
-        assert_eq!(
-            selected, 1,
-            "Should prefer unscored backend for exploration"
-        );
-    }
-
-    #[test]
-    fn test_ewma_tracker_decay() {
-        let tracker = EwmaTracker::new();
-        // Record very high latency
-        tracker.record("10.0.0.1:8080", 10000.0);
-        let score_after_high = tracker.get_score("10.0.0.1:8080");
-
-        // Record many low latency samples (should decay the high score)
-        for _ in 0..20 {
-            tracker.record("10.0.0.1:8080", 50.0);
-        }
-        let score_after_low = tracker.get_score("10.0.0.1:8080");
-
-        assert!(
-            score_after_low < score_after_high,
-            "Score should decrease after low-latency samples ({score_after_low} < {score_after_high})"
-        );
-    }
-
-    #[test]
-    fn test_ewma_tracker_empty_backends() {
-        let tracker = EwmaTracker::new();
-        let backends: Vec<&Backend> = vec![];
-        assert_eq!(tracker.select_best(&backends), 0);
-    }
-
-    // ---- Hostname Aliases ----
-
-    #[test]
-    fn test_from_store_hostname_aliases_indexed() {
-        let mut route = make_route("r1", "example.com", "/", true);
-        route.hostname_aliases = vec!["www.example.com".into(), "alias.example.com".into()];
-
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
-        assert!(config.routes_by_host.contains_key("example.com"));
-        assert!(config.routes_by_host.contains_key("www.example.com"));
-        assert!(config.routes_by_host.contains_key("alias.example.com"));
-
-        // All point to the same route
-        let primary = &config.routes_by_host["example.com"][0];
-        let alias = &config.routes_by_host["www.example.com"][0];
-        assert_eq!(primary.route.id, alias.route.id);
-    }
-
-    // ---- IP Matching ----
-
-    #[test]
-    fn test_ip_matches_exact() {
-        assert!(ip_matches("192.168.1.1", "192.168.1.1"));
-        assert!(!ip_matches("192.168.1.1", "192.168.1.2"));
-    }
-
-    #[test]
-    fn test_ip_matches_cidr_prefix() {
-        assert!(ip_matches("192.168.1.100", "192.168.1.0/24"));
-        assert!(ip_matches("192.168.1.1", "192.168.1.0/24"));
-        assert!(!ip_matches("192.168.2.1", "192.168.1.0/24"));
-        assert!(!ip_matches("10.0.0.1", "192.168.1.0/24"));
-        // Regression: old string prefix match would incorrectly match
-        // 10.1.2.3 against "10.1.2.30/24" because "10.1.2.3".starts_with("10.1.2.3")
-        assert!(!ip_matches("10.1.2.3", "10.1.2.30/32"));
-    }
-
-    // ---- Security Presets in ProxyConfig ----
-
-    #[test]
-    fn test_proxy_config_has_builtin_presets_by_default() {
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
-        let names: Vec<&str> = config
-            .security_presets
-            .iter()
-            .map(|p| p.name.as_str())
-            .collect();
-        assert!(names.contains(&"strict"));
-        assert!(names.contains(&"moderate"));
-        assert!(names.contains(&"none"));
-    }
-
-    #[test]
-    fn test_proxy_config_custom_preset_added() {
-        let custom = lorica_config::models::SecurityHeaderPreset {
-            name: "api-only".to_string(),
-            headers: std::collections::HashMap::from([(
-                "X-Custom-Header".to_string(),
-                "yes".to_string(),
-            )]),
-        };
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { custom_security_presets: vec![custom], ..Default::default() });
-        let found = config
-            .security_presets
-            .iter()
-            .find(|p| p.name == "api-only");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().headers["X-Custom-Header"], "yes");
-    }
-
-    #[test]
-    fn test_proxy_config_custom_preset_overrides_builtin() {
-        let custom_strict = lorica_config::models::SecurityHeaderPreset {
-            name: "strict".to_string(),
-            headers: std::collections::HashMap::from([(
-                "X-Frame-Options".to_string(),
-                "SAMEORIGIN".to_string(),
-            )]),
-        };
-        let config =
-            ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { custom_security_presets: vec![custom_strict], ..Default::default() });
-        let strict = config
-            .security_presets
-            .iter()
-            .find(|p| p.name == "strict")
-            .unwrap();
-        // The custom override should have replaced the builtin
-        assert_eq!(strict.headers["X-Frame-Options"], "SAMEORIGIN");
-        // And should NOT have the builtin headers that were not in the override
-        assert!(!strict.headers.contains_key("Content-Security-Policy"));
-    }
-
-    // ---- Wildcard Hostname Matching ----
-
-    #[test]
-    fn test_wildcard_hostname_matching() {
-        let route = make_route("r1", "*.example.com", "/", true);
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
-
-        // Should match subdomains
-        assert!(config.find_route("foo.example.com", "/").is_some());
-        assert!(config.find_route("bar.example.com", "/").is_some());
-
-        // Should NOT match bare domain
-        assert!(config.find_route("example.com", "/").is_none());
-
-        // Should NOT match deeper subdomains? (depends on implementation)
-        // *.example.com should match a.example.com but implementation may vary
-    }
-
-    #[test]
-    fn test_exact_match_takes_precedence_over_wildcard() {
-        let r1 = make_route("r1", "*.example.com", "/", true);
-        let r2 = make_route("r2", "specific.example.com", "/", true);
-        let config =
-            ProxyConfig::from_store(vec![r1, r2], vec![], vec![], vec![], ProxyConfigGlobals::default());
-
-        let entry = config.find_route("specific.example.com", "/").unwrap();
-        assert_eq!(entry.route.id, "r2"); // exact match wins
-
-        let entry = config.find_route("other.example.com", "/").unwrap();
-        assert_eq!(entry.route.id, "r1"); // wildcard matches
-    }
-
-    // ---- Rate Limiter ----
-
-    #[test]
-    fn test_rate_limiter_tracks_requests() {
-        let rate = lorica_limits::rate::Rate::new(Duration::from_secs(1));
-        let key = "route1:192.168.1.1";
-
-        // First interval: observe some requests
-        rate.observe(&key, 1);
-        rate.observe(&key, 1);
-        rate.observe(&key, 1);
-
-        // Within the same interval, rate() reports the previous interval (0 since first interval)
-        assert_eq!(rate.rate(&key), 0.0);
-
-        // After one interval passes, the rate should reflect the observed count
-        std::thread::sleep(Duration::from_millis(1100));
-        rate.observe(&key, 1); // trigger interval flip
-        let current_rate = rate.rate(&key);
-        assert!(
-            current_rate >= 2.0,
-            "Expected rate >= 2.0, got {current_rate}"
-        );
-    }
-
-    #[test]
-    fn test_rate_limiter_different_keys_are_independent() {
-        let rate = lorica_limits::rate::Rate::new(Duration::from_secs(1));
-        let key_a = "route1:10.0.0.1";
-        let key_b = "route1:10.0.0.2";
-
-        for _ in 0..10 {
-            rate.observe(&key_a, 1);
-        }
-        rate.observe(&key_b, 1);
-
-        // After interval flip, rates should differ
-        std::thread::sleep(Duration::from_millis(1100));
-        rate.observe(&key_a, 1);
-        rate.observe(&key_b, 1);
-
-        let rate_a = rate.rate(&key_a);
-        let rate_b = rate.rate(&key_b);
-        assert!(
-            rate_a > rate_b,
-            "Key A ({rate_a}) should have higher rate than Key B ({rate_b})"
-        );
-    }
-
-    #[test]
-    fn test_rate_limit_burst_threshold() {
-        // Verify that the burst logic allows rps + burst before triggering
-        let rps: u32 = 10;
-        let burst: u32 = 5;
-        let effective_limit = (rps + burst) as f64;
-
-        // A rate of 14.0 should be allowed (< 15)
-        assert!(14.0 <= effective_limit);
-        // A rate of 16.0 should be blocked (> 15)
-        assert!(16.0 > effective_limit);
-    }
-
-    // ---- Ban List ----
-
-    #[test]
-    fn test_ban_list_blocked_ip_detected() {
-        let ban_list: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
-
-        // Ban an IP
-        ban_list.insert("10.0.0.99".to_string(), Instant::now());
-
-        // Check that the IP is banned
-        let ip = "10.0.0.99";
-        let banned = ban_list
-            .get(ip)
-            .map(|entry| entry.value().elapsed() < Duration::from_secs(3600))
-            .unwrap_or(false);
-        assert!(banned, "Recently banned IP should be detected as banned");
-    }
-
-    #[test]
-    fn test_ban_list_expired_ban_allows_through() {
-        let ban_list: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
-
-        // Ban an IP with a time in the past (simulate expired ban)
-        ban_list.insert("10.0.0.99".to_string(), Instant::now());
-
-        // Check with zero-duration ban (expired immediately)
-        let ip = "10.0.0.99";
-        let banned = if let Some(entry) = ban_list.get(ip) {
-            if entry.value().elapsed() >= Duration::from_secs(0) {
-                drop(entry);
-                // Ban with 0s duration is immediately expired
-                ban_list.remove(ip);
-                false
-            } else {
-                true
-            }
-        } else {
-            false
-        };
-        assert!(
-            !banned,
-            "Expired ban should allow the IP through (lazy cleanup)"
-        );
-
-        // Verify the IP was removed from the ban list
-        assert!(
-            !ban_list.contains_key(ip),
-            "Expired ban should be removed from the ban list"
-        );
-    }
-
-    #[test]
-    fn test_ban_list_unbanned_ip_passes() {
-        let ban_list: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
-
-        // Ban a different IP
-        ban_list.insert("10.0.0.99".to_string(), Instant::now());
-
-        // Check an IP that is NOT banned
-        let ip = "10.0.0.50";
-        let banned = ban_list
-            .get(ip)
-            .map(|entry| entry.value().elapsed() < Duration::from_secs(3600))
-            .unwrap_or(false);
-        assert!(!banned, "Unbanned IP should not be detected as banned");
-    }
-
-    #[test]
-    fn test_auto_ban_after_threshold_violations() {
-        let rate_violations = Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(60)));
-        let ban_list: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
-
-        let ip = "10.0.0.99";
-        let ban_threshold: u32 = 5;
-        let violation_key = format!("violation:{}", ip);
-
-        // Simulate violations exceeding the threshold
-        // We need to fill the previous interval first, then check rate
-        for _ in 0..20 {
-            rate_violations.observe(&violation_key, 1);
-        }
-
-        // Wait for interval to flip so rate() returns the observed count
-        std::thread::sleep(Duration::from_millis(100));
-
-        // In the same interval, observe() accumulates but rate() reports
-        // the previous interval. For this test, we check the logic directly.
-        // The violation count within the current interval exceeds the threshold.
-        // In production, after the interval flips, rate() would report the count.
-        // Here we test the ban insertion logic directly.
-        let violations_count = 20; // We observed 20 violations
-        if violations_count > ban_threshold {
-            ban_list.insert(ip.to_string(), Instant::now());
-        }
-
-        assert!(
-            ban_list.contains_key(ip),
-            "IP should be auto-banned after exceeding violation threshold"
-        );
-    }
-
-    #[test]
-    fn test_ban_list_lazy_cleanup_removes_expired() {
-        let ban_list: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
-
-        // Insert two bans
-        ban_list.insert("10.0.0.1".to_string(), Instant::now());
-        ban_list.insert("10.0.0.2".to_string(), Instant::now());
-
-        // Lazy cleanup with 0s duration (all expired)
-        let ban_duration = Duration::from_secs(0);
-        let expired_ips: Vec<String> = ban_list
-            .iter()
-            .filter(|entry| entry.value().elapsed() >= ban_duration)
-            .map(|entry| entry.key().clone())
-            .collect();
-        for ip in expired_ips {
-            ban_list.remove(&ip);
-        }
-
-        assert!(ban_list.is_empty(), "All expired bans should be cleaned up");
-    }
-
-    // ---- Max Connections ----
-
-    #[test]
-    fn test_route_connections_counter_increment_decrement() {
-        let route_connections: Arc<DashMap<String, Arc<AtomicU64>>> = Arc::new(DashMap::new());
-
-        let route_id = "route-1";
-
-        // Get or create counter
-        let counter = route_connections
-            .entry(route_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .value()
-            .clone();
-
-        // Increment
-        let v = counter.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(v, 0);
-        let v = counter.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(v, 1);
-
-        // Decrement
-        counter.fetch_sub(1, Ordering::Relaxed);
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_route_connections_rejects_when_at_limit() {
-        let max_conn: u32 = 2;
-        let counter = Arc::new(AtomicU64::new(0));
-
-        // First two connections should succeed
-        let current = counter.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            current < max_conn as u64,
-            "First connection should be allowed"
-        );
-        let current = counter.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            current < max_conn as u64,
-            "Second connection should be allowed"
-        );
-
-        // Third connection should be rejected (current == max_conn)
-        let current = counter.fetch_add(1, Ordering::Relaxed);
-        let rejected = current >= max_conn as u64;
-        if rejected {
-            counter.fetch_sub(1, Ordering::Relaxed);
-        }
-        assert!(rejected, "Third connection should be rejected (503)");
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            2,
-            "Counter should remain at limit"
-        );
-    }
-
-    #[test]
-    fn test_route_connections_allows_after_release() {
-        let max_conn: u32 = 1;
-        let counter = Arc::new(AtomicU64::new(0));
-
-        // Take the only slot
-        let current = counter.fetch_add(1, Ordering::Relaxed);
-        assert!(current < max_conn as u64);
-
-        // Second should be rejected
-        let current = counter.fetch_add(1, Ordering::Relaxed);
-        assert!(current >= max_conn as u64);
-        counter.fetch_sub(1, Ordering::Relaxed);
-
-        // Release the first connection
-        counter.fetch_sub(1, Ordering::Relaxed);
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
-
-        // Now another connection should succeed
-        let current = counter.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            current < max_conn as u64,
-            "Connection should be allowed after release"
-        );
-    }
-
-    #[test]
-    fn test_route_connections_independent_routes() {
-        let route_connections: Arc<DashMap<String, Arc<AtomicU64>>> = Arc::new(DashMap::new());
-
-        // Create counters for two routes
-        let counter_a = route_connections
-            .entry("route-a".to_string())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .value()
-            .clone();
-        let counter_b = route_connections
-            .entry("route-b".to_string())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .value()
-            .clone();
-
-        counter_a.fetch_add(1, Ordering::Relaxed);
-        counter_a.fetch_add(1, Ordering::Relaxed);
-        counter_b.fetch_add(1, Ordering::Relaxed);
-
-        assert_eq!(counter_a.load(Ordering::Relaxed), 2);
-        assert_eq!(counter_b.load(Ordering::Relaxed), 1);
-    }
-
-    // ---- Slowloris Detection ----
-
-    #[test]
-    fn test_slowloris_detection_threshold_exceeded() {
-        let threshold_ms: i32 = 100;
-
-        // Simulate a request that took longer than the threshold
-        let start = Instant::now();
-        std::thread::sleep(Duration::from_millis(150));
-        let elapsed_ms = start.elapsed().as_millis() as i32;
-
-        assert!(
-            elapsed_ms > threshold_ms,
-            "Elapsed {elapsed_ms}ms should exceed threshold {threshold_ms}ms"
-        );
-    }
-
-    #[test]
-    fn test_slowloris_detection_within_threshold() {
-        let threshold_ms: i32 = 5000;
-
-        // A fast request should not trigger slowloris detection
-        let start = Instant::now();
-        let elapsed_ms = start.elapsed().as_millis() as i32;
-
-        assert!(
-            elapsed_ms <= threshold_ms,
-            "Elapsed {elapsed_ms}ms should be within threshold {threshold_ms}ms"
-        );
-    }
-
-    #[test]
-    fn test_slowloris_disabled_when_threshold_zero() {
-        let threshold_ms: i32 = 0;
-
-        // When threshold is 0, slowloris detection should be disabled
-        // The condition is: threshold > 0 && elapsed > threshold
-        let should_block = threshold_ms > 0;
-        assert!(
-            !should_block,
-            "Slowloris detection should be disabled when threshold is 0"
-        );
-    }
-
-    // ---- Global Flood Rate ----
-
-    #[test]
-    fn test_global_rate_tracks_requests() {
-        let global_rate = Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1)));
-
-        // Observe some requests
-        for _ in 0..50 {
-            global_rate.observe(&"global", 1);
-        }
-
-        // Within the same interval, rate() reports the previous interval (0)
-        assert_eq!(global_rate.rate(&"global"), 0.0);
-
-        // After interval flip, rate should reflect observed count
-        std::thread::sleep(Duration::from_millis(1100));
-        global_rate.observe(&"global", 1);
-        let rate = global_rate.rate(&"global");
-        assert!(rate >= 40.0, "Expected global rate >= 40.0, got {rate}");
-    }
-
-    #[test]
-    fn test_flood_threshold_halves_effective_limit() {
-        // When flood_threshold_rps > 0 and global RPS exceeds it,
-        // the effective per-IP rate limit should be halved.
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { flood_threshold_rps: 100, ..Default::default() });
-        assert_eq!(config.flood_threshold_rps, 100);
-
-        // Simulate: route has rate_limit_rps=50, burst=10 -> effective=60
-        // Under flood (global > 100), effective should become 30
-        let base_limit: f64 = (50 + 10) as f64;
-        let threshold = config.flood_threshold_rps;
-
-        // Normal conditions: global RPS below threshold
-        let global_rps_normal = 80.0;
-        let mut effective = base_limit;
-        if threshold > 0 && global_rps_normal > threshold as f64 {
-            effective *= 0.5;
-        }
-        assert_eq!(effective, 60.0, "No halving when below threshold");
-
-        // Flood conditions: global RPS above threshold
-        let global_rps_flood = 150.0;
-        let mut effective = base_limit;
-        if threshold > 0 && global_rps_flood > threshold as f64 {
-            effective *= 0.5;
-        }
-        assert_eq!(effective, 30.0, "Limit halved during flood");
-    }
-
-    #[test]
-    fn test_flood_threshold_zero_disables_defense() {
-        // When flood_threshold_rps is 0, adaptive defense is disabled
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
-        assert_eq!(config.flood_threshold_rps, 0);
-
-        let base_limit: f64 = 100.0;
-        let threshold = config.flood_threshold_rps;
-        let global_rps = 999999.0;
-        let mut effective = base_limit;
-        if threshold > 0 && global_rps > threshold as f64 {
-            effective *= 0.5;
-        }
-        assert_eq!(
-            effective, 100.0,
-            "No halving when threshold is 0 (disabled)"
-        );
-    }
-
-    #[test]
-    fn test_global_rate_decays_to_zero() {
-        let global_rate = Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1)));
-
-        for _ in 0..10 {
-            global_rate.observe(&"global", 1);
-        }
-
-        // Wait for two full intervals so data expires
-        std::thread::sleep(Duration::from_millis(2100));
-        let rate = global_rate.rate(&"global");
-        assert_eq!(
-            rate, 0.0,
-            "Rate should decay to 0 after 2 intervals of silence"
-        );
-    }
-
-    // ---- Catch-all Hostname ----
-
-    #[test]
-    fn test_catch_all_hostname() {
-        let route = make_route("r_catch", "_", "/", true);
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
-
-        // Catch-all "_" should match any hostname
-        assert!(config.find_route("anything.example.com", "/").is_some());
-        assert!(config.find_route("other.org", "/api").is_some());
-
-        let entry = config.find_route("random-host.net", "/").unwrap();
-        assert_eq!(entry.route.id, "r_catch");
-    }
-
-    #[test]
-    fn test_catch_all_after_exact() {
-        let exact = make_route("r_exact", "app.example.com", "/", true);
-        let catch_all = make_route("r_catch", "_", "/", true);
-        let config = ProxyConfig::from_store(
-            vec![exact, catch_all],
-            vec![],
-            vec![],
-            vec![],
-            ProxyConfigGlobals::default(),
-        );
-
-        // Exact hostname takes precedence
-        let entry = config.find_route("app.example.com", "/").unwrap();
-        assert_eq!(entry.route.id, "r_exact");
-
-        // Unknown hostname falls through to catch-all
-        let entry = config.find_route("unknown.org", "/").unwrap();
-        assert_eq!(entry.route.id, "r_catch");
-    }
-
-    // ---- Path Rule Matching ----
-
-    #[test]
-    fn test_path_rule_matching() {
-        let mut route = make_route("r1", "example.com", "/", true);
-        route.path_rules = vec![
-            PathRule {
-                path: "/api/v2".into(),
-                match_type: PathMatchType::Prefix,
-                backend_ids: None,
-                cache_enabled: Some(false),
-                cache_ttl_s: None,
-                response_headers: None,
-                response_headers_remove: None,
-                rate_limit_rps: None,
-                rate_limit_burst: None,
-                redirect_to: None,
-                return_status: None,
-            },
-            PathRule {
-                path: "/health".into(),
-                match_type: PathMatchType::Exact,
-                backend_ids: None,
-                cache_enabled: None,
-                cache_ttl_s: None,
-                response_headers: None,
-                response_headers_remove: None,
-                rate_limit_rps: None,
-                rate_limit_burst: None,
-                redirect_to: None,
-                return_status: Some(200),
-            },
-        ];
-
-        let config =
-            ProxyConfig::from_store(vec![route], vec![], vec![], vec![], ProxyConfigGlobals::default());
-
-        let entry = config.find_route("example.com", "/api/v2/users").unwrap();
-        assert_eq!(entry.route.id, "r1");
-
-        // Verify first path rule matches prefix
-        let matched = entry
-            .route
-            .path_rules
-            .iter()
-            .find(|r| r.matches("/api/v2/users"));
-        assert!(matched.is_some());
-        assert_eq!(matched.unwrap().path, "/api/v2");
-
-        // Verify exact match rule
-        let matched = entry
-            .route
-            .path_rules
-            .iter()
-            .find(|r| r.matches("/health"));
-        assert!(matched.is_some());
-        assert_eq!(matched.unwrap().return_status, Some(200));
-
-        // Verify exact match does not match prefix
-        let matched = entry
-            .route
-            .path_rules
-            .iter()
-            .find(|r| r.matches("/health/check"));
-        assert!(matched.is_none());
-    }
-
-    // ---- Trusted Proxies ----
-
-    #[test]
-    fn test_trusted_proxies_empty_by_default() {
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals::default());
-        assert!(config.trusted_proxies.is_empty());
-    }
-
-    #[test]
-    fn test_trusted_proxies_cidr_parsed() {
-        let cidrs = vec![
-            "192.168.0.0/16".to_string(),
-            "10.0.0.0/8".to_string(),
-        ];
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
-        assert_eq!(config.trusted_proxies.len(), 2);
-        // 192.168.1.1 is in 192.168.0.0/16
-        let addr: std::net::IpAddr = "192.168.1.1".parse().unwrap();
-        assert!(config.trusted_proxies.iter().any(|net| net.contains(&addr)));
-        // 172.16.0.1 is NOT in the configured ranges
-        let addr2: std::net::IpAddr = "172.16.0.1".parse().unwrap();
-        assert!(!config.trusted_proxies.iter().any(|net| net.contains(&addr2)));
-    }
-
-    #[test]
-    fn test_trusted_proxies_bare_ip_converted() {
-        let cidrs = vec!["10.0.0.1".to_string()];
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
-        assert_eq!(config.trusted_proxies.len(), 1);
-        let addr: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(config.trusted_proxies.iter().any(|net| net.contains(&addr)));
-        // Different IP should not match
-        let addr2: std::net::IpAddr = "10.0.0.2".parse().unwrap();
-        assert!(!config.trusted_proxies.iter().any(|net| net.contains(&addr2)));
-    }
-
-    #[test]
-    fn test_trusted_proxies_invalid_entries_skipped() {
-        let cidrs = vec![
-            "192.168.0.0/16".to_string(),
-            "not-a-cidr".to_string(),
-            "".to_string(),
-            "10.0.0.1".to_string(),
-        ];
-        let config = ProxyConfig::from_store(vec![], vec![], vec![], vec![], ProxyConfigGlobals { trusted_proxy_cidrs: cidrs, ..Default::default() });
-        // Only the valid CIDR and the valid bare IP should be parsed
-        assert_eq!(config.trusted_proxies.len(), 2);
-    }
-
-    // ---- Sticky sessions ----
-
-    #[test]
-    fn test_extract_sticky_backend_single_cookie() {
-        assert_eq!(
-            extract_sticky_backend("LORICA_SRV=abc-123"),
-            Some("abc-123")
-        );
-    }
-
-    #[test]
-    fn test_extract_sticky_backend_multiple_cookies() {
-        assert_eq!(
-            extract_sticky_backend("session=xyz; LORICA_SRV=backend-42; lang=en"),
-            Some("backend-42")
-        );
-    }
-
-    #[test]
-    fn test_extract_sticky_backend_absent() {
-        assert_eq!(
-            extract_sticky_backend("session=xyz; lang=en"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_extract_sticky_backend_empty() {
-        assert_eq!(extract_sticky_backend(""), None);
-    }
-
-    // ---- Cache Lock ----
-
-    #[test]
-    fn test_cache_lock_static_initializes() {
-        let lock: &'static CacheLock = *CACHE_LOCK;
-        let _: &'static lorica_cache::lock::CacheKeyLockImpl = lock;
-    }
-
-    // ---- Stale-while-error defaults ----
-
-    #[test]
-    fn test_cache_defaults_accessible() {
-        // Verify the CACHE_DEFAULTS_5MIN static compiles and is usable.
-        // The stale-while-revalidate (10s) and stale-if-error (60s) values
-        // are set inline in the constant definition.
-        let _defaults = &CACHE_DEFAULTS_5MIN;
-    }
-
-    // ---- HTML escape ----
-
-    #[test]
-    fn test_escape_html_basic() {
-        assert_eq!(escape_html("hello"), "hello");
-        assert_eq!(escape_html("<script>"), "&lt;script&gt;");
-        assert_eq!(escape_html("a&b"), "a&amp;b");
-        assert_eq!(escape_html("\"quoted\""), "&quot;quoted&quot;");
-        assert_eq!(escape_html("it's"), "it&#x27;s");
-    }
-
-    #[test]
-    fn test_escape_html_combined() {
-        let input = "<img src=x onerror=\"alert('xss')\">";
-        let escaped = escape_html(input);
-        assert!(!escaped.contains('<'));
-        assert!(!escaped.contains('>'));
-        assert!(!escaped.contains('"'));
-    }
-
-    // ---- HTML sanitize ----
-
-    #[test]
-    fn test_sanitize_html_strips_script() {
-        let input = "<h1>Error</h1><script>alert('xss')</script><p>Details</p>";
-        let sanitized = sanitize_html(input);
-        assert!(!sanitized.contains("<script"));
-        assert!(!sanitized.contains("alert"));
-        assert!(sanitized.contains("<h1>Error</h1>"));
-        assert!(sanitized.contains("<p>Details</p>"));
-    }
-
-    #[test]
-    fn test_sanitize_html_strips_event_handlers() {
-        let input = r#"<img src="x" onerror="alert(1)"><div onclick="steal()">"#;
-        let sanitized = sanitize_html(input);
-        assert!(!sanitized.contains("onerror"));
-        assert!(!sanitized.contains("onclick"));
-        assert!(sanitized.contains("<img"));
-        assert!(sanitized.contains("<div"));
-    }
-
-    #[test]
-    fn test_sanitize_html_strips_javascript_uri() {
-        let input = r#"<a href="javascript:alert(1)">click</a>"#;
-        let sanitized = sanitize_html(input);
-        assert!(!sanitized.contains("javascript:"));
-    }
-
-    #[test]
-    fn test_sanitize_html_preserves_safe_content() {
-        let input = "<html><body><h1>{{status}}</h1><p>{{message}}</p></body></html>";
-        let sanitized = sanitize_html(input);
-        assert_eq!(input, sanitized);
-    }
-
-    // ---- Basic auth credential cache ----
-
-    #[test]
-    fn test_basic_auth_cache_stores_and_retrieves() {
-        let cache: DashMap<u64, Instant> = DashMap::new();
-        let key: u64 = 12345;
-        cache.insert(key, Instant::now());
-        assert!(cache.get(&key).is_some());
-        assert!(cache.get(&key).unwrap().elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn test_basic_auth_cache_ttl_expiry() {
-        let cache: DashMap<u64, Instant> = DashMap::new();
-        let key: u64 = 99999;
-        // Insert with a timestamp in the past (simulate expired entry)
-        cache.insert(key, Instant::now() - Duration::from_secs(120));
-        let ttl = Duration::from_secs(60);
-        let is_valid = cache
-            .get(&key)
-            .map(|t| t.elapsed() < ttl)
-            .unwrap_or(false);
-        assert!(!is_valid, "Entry older than TTL should be considered expired");
-    }
-
-    #[test]
-    fn test_basic_auth_cache_key_changes_on_password() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut h1 = DefaultHasher::new();
-        "admin:password1".hash(&mut h1);
-        "$argon2id$hash1".hash(&mut h1);
-        let key1 = h1.finish();
-
-        let mut h2 = DefaultHasher::new();
-        "admin:password2".hash(&mut h2);
-        "$argon2id$hash1".hash(&mut h2);
-        let key2 = h2.finish();
-
-        assert_ne!(key1, key2, "Different passwords should produce different cache keys");
-    }
-
-    // ---- Retry on methods filtering ----
-
-    #[test]
-    fn test_retry_on_methods_empty_allows_all() {
-        let route = make_route("r1", "example.com", "/", true);
-        // retry_on_methods is empty by default - all methods eligible
-        assert!(route.retry_on_methods.is_empty());
-        // With retry_attempts set, max_request_retries should return Some
-        let mut r = route;
-        r.retry_attempts = Some(3);
-        assert_eq!(r.retry_attempts, Some(3));
-    }
-
-    #[test]
-    fn test_retry_on_methods_filters_post() {
-        let mut route = make_route("r1", "example.com", "/", true);
-        route.retry_attempts = Some(2);
-        route.retry_on_methods = vec!["GET".to_string(), "HEAD".to_string()];
-
-        // POST is not in the list - should be filtered out
-        let method = "POST";
-        let eligible = route.retry_on_methods.is_empty()
-            || route.retry_on_methods.iter().any(|m| m.eq_ignore_ascii_case(method));
-        assert!(!eligible, "POST should not be eligible for retry");
-
-        // GET is in the list - should be eligible
-        let method = "GET";
-        let eligible = route.retry_on_methods.is_empty()
-            || route.retry_on_methods.iter().any(|m| m.eq_ignore_ascii_case(method));
-        assert!(eligible, "GET should be eligible for retry");
-    }
-
-    // ---- Stale cache config per route ----
-
-    #[test]
-    fn test_stale_config_defaults() {
-        let route = make_route("r1", "example.com", "/", true);
-        assert_eq!(route.stale_while_revalidate_s, 10);
-        assert_eq!(route.stale_if_error_s, 60);
-    }
-
-    #[test]
-    fn test_stale_config_custom_values() {
-        let mut route = make_route("r1", "example.com", "/", true);
-        route.stale_while_revalidate_s = 30;
-        route.stale_if_error_s = 300;
-        assert_eq!(route.stale_while_revalidate_s, 30);
-        assert_eq!(route.stale_if_error_s, 300);
-    }
-
-    #[test]
-    fn test_stale_config_zero_disables() {
-        let mut route = make_route("r1", "example.com", "/", true);
-        route.stale_while_revalidate_s = 0;
-        route.stale_if_error_s = 0;
-        assert_eq!(route.stale_while_revalidate_s as u32, 0);
-        assert_eq!(route.stale_if_error_s as u32, 0);
-    }
-}
+mod tests;

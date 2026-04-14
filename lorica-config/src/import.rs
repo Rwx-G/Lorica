@@ -6,6 +6,9 @@ use crate::error::{ConfigError, Result};
 use crate::models::*;
 use crate::store::ConfigStore;
 
+/// Deserialized counterpart of [`crate::export::ExportData`]. Each
+/// collection defaults to empty on missing keys so partial imports
+/// remain valid.
 #[derive(Debug, Deserialize)]
 pub struct ImportData {
     pub version: u32,

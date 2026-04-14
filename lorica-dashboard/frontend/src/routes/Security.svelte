@@ -267,7 +267,7 @@
       <div class="stat-value">{stats.total_events}</div>
       <div class="stat-label">Total Events</div>
     </div>
-    {#each stats.by_category as cat}
+    {#each stats.by_category as cat (cat.category)}
       <div class="stat-card">
         <div class="stat-value">{cat.count}</div>
         <div class="stat-label">{categoryLabel(cat.category)}</div>
@@ -347,7 +347,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each events as event}
+            {#each events as event, i (i)}
               <tr>
                 <td class="mono">{formatTime(event.timestamp)}</td>
                 <td class="mono">{event.client_ip || '-'}</td>
@@ -382,7 +382,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each rules as rule}
+            {#each rules as rule (rule.id)}
               <tr class:disabled-rule={!rule.enabled}>
                 <td class="mono">{rule.id}</td>
                 <td><span class="category-badge">{categoryLabel(rule.category)}</span></td>
@@ -425,7 +425,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each customRules as rule}
+            {#each customRules as rule (rule.id)}
               <tr>
                 <td class="mono">{rule.id}</td>
                 <td><span class="category-badge">{categoryLabel(rule.category)}</span></td>
@@ -434,6 +434,7 @@
                 <td class="mono matched-value" title={rule.pattern}>{rule.pattern}</td>
                 <td>
                   <button class="btn-icon btn-icon-danger" onclick={() => (deletingCustomRule = rule)} title="Delete" aria-label="Delete">
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                     {@html trashIcon}
                   </button>
                 </td>
@@ -464,18 +465,18 @@
 
           <div class="form-row">
             <div class="form-group">
-              <label>Rule ID</label>
-              <input type="number" bind:value={crId} min="10000" />
+              <label for="custom-rule-id">Rule ID</label>
+              <input id="custom-rule-id" type="number" bind:value={crId} min="10000" />
             </div>
             <div class="form-group">
-              <label>Severity (1-5)</label>
-              <input type="number" bind:value={crSeverity} min="1" max="5" />
+              <label for="custom-rule-severity">Severity (1-5)</label>
+              <input id="custom-rule-severity" type="number" bind:value={crSeverity} min="1" max="5" />
             </div>
           </div>
 
           <div class="form-group">
-            <label>Category</label>
-            <select bind:value={crCategory}>
+            <label for="custom-rule-category">Category</label>
+            <select id="custom-rule-category" bind:value={crCategory}>
               <option value="sql_injection">SQL Injection</option>
               <option value="xss">XSS</option>
               <option value="path_traversal">Path Traversal</option>
@@ -485,13 +486,13 @@
           </div>
 
           <div class="form-group">
-            <label>Description <span class="required">*</span></label>
-            <input type="text" bind:value={crDescription} placeholder="Block known exploit pattern" />
+            <label for="custom-rule-description">Description <span class="required">*</span></label>
+            <input id="custom-rule-description" type="text" bind:value={crDescription} placeholder="Block known exploit pattern" />
           </div>
 
           <div class="form-group">
-            <label>Regex Pattern <span class="required">*</span></label>
-            <input type="text" bind:value={crPattern} placeholder="(?i)malicious_pattern" />
+            <label for="custom-rule-pattern">Regex Pattern <span class="required">*</span></label>
+            <input id="custom-rule-pattern" type="text" bind:value={crPattern} placeholder="(?i)malicious_pattern" />
             <span class="hint">Rust regex syntax. Case-insensitive with (?i) prefix.</span>
           </div>
 
@@ -568,7 +569,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each bans as ban}
+              {#each bans as ban (ban.ip)}
                 <tr>
                   <td class="mono">{ban.ip}</td>
                   <td>{formatDuration(ban.banned_seconds_ago)} ago</td>

@@ -1,0 +1,140 @@
+// Copyright 2026 Rwx-G (Lorica)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Cloudflare DNS-01 challenger using the Cloudflare API v4.
+
+use tracing::info;
+
+use super::DnsChallenger;
+
+/// Cloudflare DNS-01 challenger using the Cloudflare API v4.
+pub struct CloudflareDnsChallenger {
+    zone_id: String,
+    api_token: String,
+    client: reqwest::Client,
+}
+
+impl CloudflareDnsChallenger {
+    /// Construct a new challenger bound to a Cloudflare zone and API token.
+    pub fn new(zone_id: String, api_token: String) -> Self {
+        Self {
+            zone_id,
+            api_token,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Find the record ID for a given TXT record name.
+    async fn find_record_id(&self, name: &str) -> Result<Option<String>, String> {
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/zones/{}/dns_records?type=TXT&name={}",
+            self.zone_id, name
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_token))
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("Cloudflare API request failed: {e}"))?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Cloudflare API response parse error: {e}"))?;
+
+        if let Some(results) = body.get("result").and_then(|r| r.as_array()) {
+            if let Some(record) = results.first() {
+                if let Some(id) = record.get("id").and_then(|v| v.as_str()) {
+                    return Ok(Some(id.to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[async_trait::async_trait]
+impl DnsChallenger for CloudflareDnsChallenger {
+    async fn create_txt_record(&self, domain: &str, value: &str) -> Result<(), String> {
+        let record_name = format!("_acme-challenge.{domain}");
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/zones/{}/dns_records",
+            self.zone_id
+        );
+
+        let payload = serde_json::json!({
+            "type": "TXT",
+            "name": record_name,
+            "content": value,
+            "ttl": 120,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_token))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("Cloudflare create TXT record failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            return Err(format!("Cloudflare API returned {status}: {body}"));
+        }
+
+        info!(domain = %domain, record = %record_name, "Cloudflare DNS TXT record created");
+        Ok(())
+    }
+
+    async fn delete_txt_record(&self, domain: &str) -> Result<(), String> {
+        let record_name = format!("_acme-challenge.{domain}");
+        let record_id = self
+            .find_record_id(&record_name)
+            .await?
+            .ok_or_else(|| format!("TXT record '{record_name}' not found for deletion"))?;
+
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{record_id}",
+            self.zone_id
+        );
+
+        let resp = self
+            .client
+            .delete(&url)
+            .header("Authorization", format!("Bearer {}", self.api_token))
+            .send()
+            .await
+            .map_err(|e| format!("Cloudflare delete TXT record failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            return Err(format!("Cloudflare API delete returned {status}: {body}"));
+        }
+
+        info!(domain = %domain, record = %record_name, "Cloudflare DNS TXT record deleted");
+        Ok(())
+    }
+}
