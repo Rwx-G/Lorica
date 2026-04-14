@@ -547,6 +547,40 @@ fn run_supervisor(cli: Cli) {
 
         try_init_otel_from_settings(&store, "supervisor").await;
 
+        // Supervisor-side GeoIP auto-update. Workers load the `.mmdb`
+        // from disk at fork and keep their own copy (see the
+        // corresponding block in `run_worker`), so the supervisor's
+        // job here is to keep the on-disk file fresh. Workers pick up
+        // the refreshed copy on restart; a future `ReloadGeoIp`
+        // broadcast command could also live-reload, but v1.4.0 scopes
+        // that as a follow-up.
+        {
+            let s = store.lock().await;
+            if let Ok(settings) = s.get_global_settings() {
+                let path = settings.geoip_db_path.clone();
+                let auto_update = settings.geoip_auto_update_enabled;
+                drop(s);
+                if let Some(ref p) = path {
+                    if !p.trim().is_empty() && auto_update {
+                        let cfg = lorica_geoip::updater::UpdaterConfig::new(p.clone());
+                        // Dedicated resolver for the supervisor's use
+                        // only (sanity-checks the download before
+                        // writing to disk). Not shared with any
+                        // worker — each worker has its own resolver
+                        // bound to its own reader.
+                        let resolver = std::sync::Arc::new(
+                            lorica_geoip::GeoIpResolver::empty(),
+                        );
+                        let _handle = lorica_geoip::updater::spawn_updater(resolver, cfg);
+                        info!(
+                            path = %p,
+                            "supervisor: GeoIP auto-update task spawned"
+                        );
+                    }
+                }
+            }
+        }
+
         // UDS log stream: workers send access logs in real-time to the supervisor
         let log_sock_path = data_dir.join("log.sock");
         let _ = std::fs::remove_file(&log_sock_path); // clean stale socket
@@ -2991,6 +3025,30 @@ fn run_worker(
     // the supervisor via the pipelined RPC channel every 100 ms. See
     // `spawn_rate_limit_sync` below and design doc § 6.
     lorica_proxy.rate_limit_buckets = lorica::proxy_wiring::RateLimitEngine::local();
+    // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so worker
+    // lookups can resolve client IPs to country codes. Each worker
+    // keeps its own copy (the DB is small — ~3 MiB for DB-IP Lite
+    // Country — and the supervisor's auto-update job cannot push to
+    // already-forked workers, so a config reload that changes the
+    // path requires a proxy restart). Silent no-op when the path is
+    // unset.
+    {
+        let s = store.blocking_lock();
+        if let Ok(settings) = s.get_global_settings() {
+            if let Some(ref path) = settings.geoip_db_path {
+                if !path.trim().is_empty() {
+                    match lorica_proxy.geoip_resolver.load_from_path(path) {
+                        Ok(()) => info!(path = %path, "worker: GeoIP database loaded"),
+                        Err(e) => warn!(
+                            path = %path,
+                            error = %e,
+                            "worker: GeoIP database load failed; lookups will return None"
+                        ),
+                    }
+                }
+            }
+        }
+    }
     // Periodic basic-auth cache prune (PERF-8). Worker mode has no
     // supervisor TaskTracker available here; a local tracker is fine
     // because worker shutdown is orchestrated by the supervisor via
@@ -3382,6 +3440,38 @@ fn run_single_process(cli: Cli) {
         lorica_proxy.acme_challenge_store = Some(acme_challenge_store.clone());
         lorica_proxy.alert_sender = Some(alert_sender.clone());
         lorica_proxy.log_store = log_store.clone();
+
+        // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so
+        // the request_filter can resolve client IPs. If auto-update is
+        // enabled, also spawn the weekly refresh task inside the
+        // current tokio runtime. Silent no-op when the path is unset
+        // (installations without GeoIP pay nothing).
+        {
+            let s = store.lock().await;
+            if let Ok(settings) = s.get_global_settings() {
+                let path = settings.geoip_db_path.clone();
+                let auto_update = settings.geoip_auto_update_enabled;
+                drop(s);
+                if let Some(ref p) = path {
+                    if !p.trim().is_empty() {
+                        match lorica_proxy.geoip_resolver.load_from_path(p) {
+                            Ok(()) => info!(path = %p, "GeoIP database loaded"),
+                            Err(e) => warn!(
+                                path = %p,
+                                error = %e,
+                                "GeoIP database load failed; lookups will return None"
+                            ),
+                        }
+                    }
+                    if auto_update && !p.trim().is_empty() {
+                        let cfg = lorica_geoip::updater::UpdaterConfig::new(p.clone());
+                        let resolver = Arc::clone(&lorica_proxy.geoip_resolver);
+                        let _handle = lorica_geoip::updater::spawn_updater(resolver, cfg);
+                        info!(path = %p, "GeoIP auto-update task spawned");
+                    }
+                }
+            }
+        }
         // Periodic prune of expired basic-auth cache entries so a
         // password-spray with no successful logins cannot grow the
         // cache unboundedly until next restart (PERF-8).

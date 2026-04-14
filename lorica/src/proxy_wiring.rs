@@ -1097,6 +1097,15 @@ pub struct LoricaProxy {
     /// collapsing the divergence window from ~10-50 ms down to the
     /// UDS RTT between workers (microseconds). See design § 7 WPAR-8.
     pub pending_proxy_config: Arc<parking_lot::Mutex<Option<PendingProxyConfig>>>,
+    /// GeoIP country-code resolver (v1.4.0 Epic 2). Loaded from
+    /// `GlobalSettings.geoip_db_path` at startup and refreshed by
+    /// the supervisor's auto-update task when enabled. Every
+    /// request may consult the resolver but the check is a no-op
+    /// when no DB is loaded (resolver returns None, the GeoIP
+    /// guard falls through) so installations without a DB pay
+    /// nothing on the hot path besides the per-route-config
+    /// presence check.
+    pub geoip_resolver: Arc<lorica_geoip::GeoIpResolver>,
 }
 
 /// Prepared-but-not-yet-committed proxy config. Held by workers
@@ -1183,6 +1192,7 @@ impl LoricaProxy {
             rate_limit_buckets: RateLimitEngine::authoritative(),
             verdict_cache: VerdictCacheEngine::local(),
             pending_proxy_config: Arc::new(parking_lot::Mutex::new(None)),
+            geoip_resolver: Arc::new(lorica_geoip::GeoIpResolver::empty()),
         }
     }
 
@@ -2724,6 +2734,69 @@ impl ProxyHttp for LoricaProxy {
                     .write_response_body(Some(bytes::Bytes::from(body)), true)
                     .await?;
                 return Ok(true);
+            }
+        }
+
+        // Per-route GeoIP country filter (v1.4.0 Epic 2 story 2.4).
+        // Evaluated after IP allow/denylist so a specific IP always
+        // wins over a country rule, and before WAF so cheap
+        // geographic rejection happens before expensive regex
+        // matching. Unknown country (reserved / private ranges, DB
+        // miss) falls through without blocking so a legitimate
+        // client behind a corporate NAT is never accidentally denied
+        // — the operator can layer an explicit `ip_allowlist` on top
+        // when they want fail-close semantics.
+        if let Some(ref geoip_cfg) = entry.route.geoip {
+            if let Some(ref ip_str) = check_ip {
+                if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
+                    if let Some(country) = self.geoip_resolver.lookup_country(ip_addr) {
+                        use lorica_config::models::GeoIpMode;
+                        let blocked = match geoip_cfg.mode {
+                            GeoIpMode::Allowlist => !geoip_cfg
+                                .countries
+                                .iter()
+                                .any(|c| c.eq_ignore_ascii_case(country.as_str())),
+                            GeoIpMode::Denylist => geoip_cfg
+                                .countries
+                                .iter()
+                                .any(|c| c.eq_ignore_ascii_case(country.as_str())),
+                        };
+                        if blocked {
+                            let reason = format!(
+                                "GeoIP blocked ({country} via {})",
+                                match geoip_cfg.mode {
+                                    GeoIpMode::Allowlist => "allowlist",
+                                    GeoIpMode::Denylist => "denylist",
+                                }
+                            );
+                            ctx.block_reason = Some(reason.clone());
+                            let host_header = extract_host(session.req_header()).to_string();
+                            let body = render_error_body(
+                                403,
+                                &ctx.request_id,
+                                &host_header,
+                                entry.route.error_page_html.as_deref(),
+                                &reason,
+                            );
+                            let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                            header
+                                .insert_header("Content-Type", "text/html; charset=utf-8")?;
+                            header
+                                .insert_header("Content-Length", body.len().to_string())?;
+                            session
+                                .write_response_header(Box::new(header), false)
+                                .await?;
+                            session
+                                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                                .await?;
+                            return Ok(true);
+                        }
+                    }
+                    // `country` is None = DB miss / unknown range;
+                    // fall through without blocking. Operators that
+                    // want fail-close behaviour can layer
+                    // ip_allowlist on top.
+                }
             }
         }
 
