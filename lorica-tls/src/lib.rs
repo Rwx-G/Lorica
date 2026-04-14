@@ -18,6 +18,7 @@
 #![warn(clippy::all)]
 
 pub mod cert_resolver;
+pub mod no_debug;
 pub mod ocsp;
 
 use std::fs::File;
@@ -26,7 +27,11 @@ use std::path::Path;
 
 use log::warn;
 use lorica_error::{Error, ErrorType, OrErr, Result};
-pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
+// Was `pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};` against the
+// upstream `no_debug = "3.1.0"` crate. Now re-exports our inlined copy
+// (see src/no_debug.rs) so every downstream `use lorica_tls::NoDebug`
+// keeps working unchanged (audit SC-L-3).
+pub use crate::no_debug::{Ellipses, NoDebug, WithTypeInfo};
 
 pub use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 pub use rustls::server::ResolvesServerCert;
