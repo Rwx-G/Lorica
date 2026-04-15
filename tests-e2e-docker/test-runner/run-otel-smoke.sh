@@ -256,6 +256,38 @@ else
     fail "url.path expected '/', got '$URL_PATH'"
 fi
 
+# --- Log / trace correlation (story 1.5) ------------------------------------
+# The `http_request` tracing span carries `trace_id` as a recorded
+# field; the JSON fmt layer flattens span fields into each log record,
+# so after the request above runs the Lorica log must contain a line
+# mentioning the client's W3C trace_id. This is the operator-facing
+# promise: "grep your logs by trace_id and you will find the request,
+# even when OTel exporting is down". The entrypoint-otel.sh helper
+# tees the boot log to /shared/lorica.log so the test runner (which
+# has shared-otel mounted read-only) can read it without a docker
+# socket.
+log "=== OTel smoke: log/trace correlation ==="
+if [ ! -f /shared/lorica.log ]; then
+    fail "shared log file missing (entrypoint-otel.sh should tee to /shared/lorica.log)"
+else
+    # Give the fmt layer a moment — the request above already completed
+    # and the span was closed, but tracing's buffered writer may hold
+    # the line briefly.
+    sleep 1
+    if grep -q "\"trace_id\":\"${CLIENT_TRACE_ID}\"" /shared/lorica.log 2>/dev/null; then
+        ok "trace_id ${CLIENT_TRACE_ID} found in JSON log (log/trace correlation intact)"
+    elif grep -q "${CLIENT_TRACE_ID}" /shared/lorica.log 2>/dev/null; then
+        # The JSON layer may render the field without explicit quotes
+        # if the fmt config differs across versions; accept the more
+        # permissive match as long as the id literally appears.
+        ok "trace_id ${CLIENT_TRACE_ID} present in log (permissive match)"
+    else
+        fail "trace_id ${CLIENT_TRACE_ID} missing from /shared/lorica.log"
+        echo "--- last 20 log lines for debug ---"
+        tail -20 /shared/lorica.log 2>/dev/null || true
+    fi
+fi
+
 # --- Summary ---
 log "=== OTel smoke: summary ==="
 echo "Tests: $TOTAL | Passed: $PASS | Failed: $FAIL"

@@ -56,14 +56,17 @@ RUN if [ -n "$LORICA_FEATURES" ]; then \
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates socat curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates socat curl sqlite3 && rm -rf /var/lib/apt/lists/*
 RUN useradd -r -s /bin/false lorica
 RUN mkdir -p /var/lib/lorica && chown lorica:lorica /var/lib/lorica
 
 COPY --from=builder /app/target/release/lorica /usr/local/bin/lorica
 COPY tests-e2e-docker/entrypoint.sh /entrypoint.sh
 COPY tests-e2e-docker/entrypoint-workers.sh /entrypoint-workers.sh
-RUN chmod +x /entrypoint.sh /entrypoint-workers.sh
+COPY tests-e2e-docker/entrypoint-geoip.sh /entrypoint-geoip.sh
+COPY tests-e2e-docker/entrypoint-otel.sh /entrypoint-otel.sh
+COPY tests-e2e-docker/entrypoint-otel-workers.sh /entrypoint-otel-workers.sh
+RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh
 
 # Pre-create the `/shared` mount point owned by the non-root lorica
 # user so the entrypoint can write `/shared/admin_password` after the

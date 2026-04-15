@@ -134,6 +134,7 @@ services:
       dockerfile: tests-e2e-docker/Dockerfile
       args:
         LORICA_FEATURES: "otel"
+    entrypoint: ["/entrypoint-otel.sh"]
     profiles: ["otel"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -164,13 +165,123 @@ services:
     networks:
       - e2e
 
+  # ---- OTel E2E in WORKER MODE (v1.4.0 story 1.6) ---------------------
+  # Variant of the OTel profile that runs Lorica with `--workers 2` so
+  # the same smoke assertions exercise the forked-worker OTel init
+  # path. The separate `shared-otel-workers` volume keeps the
+  # admin_password + log.sock isolated from the single-process OTel
+  # container (they cannot share SQLite on the same data volume
+  # without cross-boot mutation; a second named volume is the
+  # cheapest safe split).
+  #
+  # Run with:
+  #   docker compose --profile otel-workers up --build
+  #   docker compose --profile otel-workers run --rm otel-smoke-workers
+  lorica-otel-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+      args:
+        LORICA_FEATURES: "otel"
+    entrypoint: ["/entrypoint-otel-workers.sh"]
+    profiles: ["otel-workers"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-otel-workers-data:/var/lib/lorica
+      - shared-otel-workers:/shared
+    depends_on:
+      - backend1
+      - jaeger-workers
+    networks:
+      - e2e
+
+  # A second Jaeger is required because the single-process `jaeger`
+  # service lives under the `otel` profile and Compose V2 does not
+  # cross-activate profiles. Sharing a Jaeger is possible with
+  # `profiles: ["otel", "otel-workers"]` but duplicating for clarity.
+  jaeger-workers:
+    image: jaegertracing/all-in-one:1.60
+    profiles: ["otel-workers"]
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - e2e
+
+  otel-smoke-workers:
+    build:
+      context: ./test-runner
+    profiles: ["otel-workers"]
+    entrypoint: ["bash", "run-otel-smoke.sh"]
+    depends_on:
+      - lorica-otel-workers
+      - jaeger-workers
+    volumes:
+      - shared-otel-workers:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-otel-workers:9443
+      - LORICA_PROXY=http://lorica-otel-workers:8080
+      - JAEGER_QUERY=http://jaeger-workers:16686
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
+  # ---- GeoIP E2E (v1.4.0 Epic 2, story 2.7) ---------------------------
+  # Optional profile that boots Lorica with a test `.mmdb` fixture
+  # mounted from the host (MaxMind's open `GeoIP2-Country-Test.mmdb`,
+  # Apache-2.0). The `geoip-smoke` runner drives requests with
+  # X-Forwarded-For headers pointing at known test IPs and asserts
+  # allowlist / denylist / fallthrough behavior plus the
+  # `lorica_geoip_block_total` Prometheus counter.
+  #
+  # Run with: docker compose --profile geoip up --build
+  #   docker compose --profile geoip run --rm geoip-smoke
+  lorica-geoip:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-geoip.sh"]
+    profiles: ["geoip"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-geoip-data:/var/lib/lorica
+      - shared-geoip:/shared
+      # Mount the test fixture read-only into the path the entrypoint
+      # pre-seeds into `global_settings.geoip_db_path`.
+      - ./fixtures/GeoIP2-Country-Test.mmdb:/var/lib/lorica/geoip-test.mmdb:ro
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  geoip-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["geoip"]
+    entrypoint: ["bash", "run-geoip-smoke.sh"]
+    depends_on:
+      - lorica-geoip
+    volumes:
+      - shared-geoip:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-geoip:9443
+      - LORICA_PROXY=http://lorica-geoip:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
   lorica-otel-data:
+  lorica-otel-workers-data:
+  lorica-geoip-data:
   shared:
   shared-workers:
   shared-otel:
+  shared-otel-workers:
+  shared-geoip:
 
 networks:
   e2e:
