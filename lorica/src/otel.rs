@@ -282,16 +282,34 @@ mod imp {
             let _ = old.shutdown();
         }
 
+        // OTLP/HTTP requires the signal-specific path on the URL
+        // (`/v1/traces` for spans). The opentelemetry-otlp 0.31
+        // builder uses `with_endpoint` as-is, so we append the path
+        // when the operator configured only the base URL — this
+        // matches the convention used by the OTel collector +
+        // Tempo + Jaeger HTTP receivers (all expose the four
+        // signal endpoints under the same base). The gRPC transport
+        // does not need this dance because the path is implicit in
+        // the proto definition.
+        let http_endpoint = || -> String {
+            let trimmed = cfg.endpoint.trim_end_matches('/');
+            if trimmed.ends_with("/v1/traces") {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/v1/traces")
+            }
+        };
+
         let exporter = match cfg.protocol {
             OtlpProtocol::HttpProto => SpanExporter::builder()
                 .with_http()
-                .with_endpoint(&cfg.endpoint)
+                .with_endpoint(http_endpoint())
                 .with_protocol(Protocol::HttpBinary)
                 .build()
                 .map_err(|e| format!("OTLP HTTP/protobuf exporter build failed: {e}"))?,
             OtlpProtocol::HttpJson => SpanExporter::builder()
                 .with_http()
-                .with_endpoint(&cfg.endpoint)
+                .with_endpoint(http_endpoint())
                 .with_protocol(Protocol::HttpJson)
                 .build()
                 .map_err(|e| format!("OTLP HTTP/JSON exporter build failed: {e}"))?,

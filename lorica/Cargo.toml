@@ -69,9 +69,9 @@ ipnet = "2"
 # OpenTelemetry (feature-gated, off by default)
 # Enabled via `--features otel`. Policy matches `route53` since v1.3.0
 # supply-chain audit SC-M-3: non-OTel users do not pay the dep-graph cost.
-opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.31", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", optional = true, default-features = false, features = ["trace", "http-proto", "grpc-tonic", "reqwest-client", "tls-ring", "tls-webpki-roots"] }
+opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["trace", "internal-logs"] }
+opentelemetry_sdk = { version = "0.31", optional = true, default-features = false, features = ["trace", "rt-tokio", "internal-logs"] }
+opentelemetry-otlp = { version = "0.31", optional = true, default-features = false, features = ["trace", "http-proto", "grpc-tonic", "reqwest-blocking-client", "tls-ring", "tls-webpki-roots", "internal-logs"] }
 opentelemetry-semantic-conventions = { version = "0.31", optional = true }
 tracing-opentelemetry = { version = "0.32", optional = true, default-features = false }
 

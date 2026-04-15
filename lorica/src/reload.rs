@@ -117,7 +117,87 @@ pub async fn reload_proxy_config_with_mtls(
     let prepared =
         build_proxy_config_inner(store, proxy_config, installed_mtls_fingerprint).await?;
     commit_prepared_reload(proxy_config, connection_filter, prepared);
+    apply_otel_settings_from_store(store).await;
     Ok(())
+}
+
+/// Re-apply the OTel settings stored in `GlobalSettings` to the live
+/// process. Called from each `reload_proxy_config*` so a dashboard
+/// edit to `otlp_endpoint` / `otlp_protocol` / `otlp_service_name`
+/// / `otlp_sampling_ratio` takes effect without a restart.
+///
+/// Strategy: snapshot the four fields, hash them, and only call
+/// `otel::init` (or `otel::shutdown` when the endpoint is cleared)
+/// when the snapshot diverges from the last applied value. Without
+/// the dedup we would tear down the BatchSpanProcessor on every
+/// route edit, which is needlessly expensive.
+async fn apply_otel_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
+    use std::sync::OnceLock;
+
+    static LAST_APPLIED: OnceLock<parking_lot::Mutex<Option<OtelSnapshot>>> = OnceLock::new();
+    let slot = LAST_APPLIED.get_or_init(|| parking_lot::Mutex::new(None));
+
+    let s = store.lock().await;
+    let settings = match s.get_global_settings() {
+        Ok(settings) => settings,
+        Err(_) => return,
+    };
+    drop(s);
+
+    let endpoint = settings
+        .otlp_endpoint
+        .as_ref()
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty());
+    let next = endpoint.map(|ep| OtelSnapshot {
+        endpoint: ep,
+        protocol: settings.otlp_protocol.clone(),
+        service_name: settings.otlp_service_name.clone(),
+        sampling_ratio: settings.otlp_sampling_ratio,
+    });
+
+    let mut last = slot.lock();
+    if *last == next {
+        return;
+    }
+
+    match (last.as_ref(), next.as_ref()) {
+        (_, Some(snapshot)) => {
+            let cfg = crate::otel::OtelConfig {
+                endpoint: snapshot.endpoint.clone(),
+                protocol: crate::otel::OtlpProtocol::from_settings(&snapshot.protocol),
+                service_name: snapshot.service_name.clone(),
+                sampling_ratio: snapshot.sampling_ratio,
+            };
+            match crate::otel::init(&cfg) {
+                Ok(()) => info!(
+                    endpoint = %cfg.endpoint,
+                    protocol = cfg.protocol.as_str(),
+                    service_name = %cfg.service_name,
+                    sampling_ratio = cfg.sampling_ratio,
+                    "OpenTelemetry tracing reloaded from settings"
+                ),
+                Err(e) => warn!(error = %e, "OpenTelemetry reload failed; previous provider stays live"),
+            }
+        }
+        (Some(_), None) => {
+            // Endpoint cleared: tear down so dashboard "disable"
+            // actually stops emitting spans.
+            crate::otel::shutdown();
+            info!("OpenTelemetry tracing disabled by settings change");
+        }
+        (None, None) => {}
+    }
+
+    *last = next;
+}
+
+#[derive(Clone, PartialEq)]
+struct OtelSnapshot {
+    endpoint: String,
+    protocol: String,
+    service_name: String,
+    sampling_ratio: f64,
 }
 
 async fn build_proxy_config_inner(
