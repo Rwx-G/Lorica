@@ -3035,6 +3035,33 @@ impl ProxyHttp for LoricaProxy {
                     let now_secs = chrono::Utc::now().timestamp();
                     let secret = lorica_challenge::secret::handle();
                     let secret_ref = secret.as_deref();
+                    // Cross-worker verdict cache (story 3.6 closure):
+                    // in worker mode, consult the supervisor-owned
+                    // cache BEFORE running HMAC verify so a cookie
+                    // issued on a sibling worker is honoured without
+                    // a fresh verify on this worker. Local-mode
+                    // evaluator handles the in-process cache
+                    // internally; Rpc-mode hits this path.
+                    let ip_prefix = lorica_challenge::IpPrefix::from_ip(ip_addr);
+                    let cached_cookie_hit = if matches!(
+                        self.verdict_cache,
+                        VerdictCacheEngine::Rpc { .. }
+                    ) {
+                        if let Some(cookie) = verdict_cookie {
+                            crate::bot::rpc_cache_check(
+                                &self.verdict_cache,
+                                &entry.route.id,
+                                &ip_prefix,
+                                cookie,
+                                now_secs,
+                            )
+                            .await
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     let inputs = crate::bot::EvalInputs {
                         client_ip: ip_addr,
                         country,
@@ -3046,6 +3073,7 @@ impl ProxyHttp for LoricaProxy {
                         hmac_secret: secret_ref,
                         route_id: &entry.route.id,
                         config: bot_cfg,
+                        cached_cookie_hit,
                     };
                     match crate::bot::evaluate(&inputs) {
                         crate::bot::Decision::Pass { reason } => {
@@ -3054,6 +3082,49 @@ impl ProxyHttp for LoricaProxy {
                                 reason = reason.as_str(),
                                 "bot-protection: pass"
                             );
+                            // In Rpc mode AND on a fresh HMAC-verify
+                            // hit (not a cache short-circuit), push
+                            // the verdict to the supervisor cache so
+                            // the next request on any worker skips
+                            // the verify. Fire-and-forget — a failed
+                            // push just means the next request
+                            // re-verifies, which is the same as a
+                            // cache miss. Skips pushes when the hit
+                            // already came from the cache (to avoid
+                            // refreshing TTL on every request, which
+                            // would extend the cookie's effective
+                            // life past its `expires_at`).
+                            if reason == crate::bot::PassReason::ValidCookie
+                                && cached_cookie_hit.is_none()
+                                && matches!(
+                                    self.verdict_cache,
+                                    VerdictCacheEngine::Rpc { .. }
+                                )
+                            {
+                                if let (Some(cookie), Some(secret)) = (verdict_cookie, secret_ref)
+                                {
+                                    if let Ok(payload) =
+                                        lorica_challenge::cookie::verify(cookie, secret, now_secs)
+                                    {
+                                        let engine = self.verdict_cache.clone();
+                                        let route_id = entry.route.id.clone();
+                                        let ip_prefix_c = ip_prefix.clone();
+                                        let cookie_c = cookie.to_string();
+                                        let exp = payload.expires_at;
+                                        tokio::spawn(async move {
+                                            crate::bot::rpc_cache_push(
+                                                &engine,
+                                                &route_id,
+                                                &ip_prefix_c,
+                                                &cookie_c,
+                                                exp,
+                                                now_secs,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                }
+                            }
                             // Metric + OTel span attribute. A valid
                             // cookie yields outcome=passed; any of
                             // the bypass reasons yields

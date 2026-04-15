@@ -453,6 +453,14 @@ pub struct EvalInputs<'a> {
     /// simply has no PTR). Caller (request_filter) schedules an
     /// async populate for the NEXT request on a miss.
     pub rdns_name: Option<String>,
+    /// Remote-verdict cache hit from the supervisor RPC cache
+    /// (worker mode only). `Some(expires_at_secs)` = the RPC
+    /// cache reported this cookie as Allow with the given expiry;
+    /// evaluate() short-circuits to Pass::ValidCookie without
+    /// running HMAC verify. `None` = RPC cache miss OR
+    /// single-process mode (which uses the sync local cache
+    /// inside `evaluate`).
+    pub cached_cookie_hit: Option<i64>,
     /// Request `User-Agent` header value, if any. Empty string if
     /// the client did not send one.
     pub user_agent: &'a str,
@@ -491,12 +499,19 @@ pub fn evaluate(inputs: &EvalInputs<'_>) -> Decision {
     if let Some(cookie) = inputs.verdict_cookie {
         let expected_prefix = IpPrefix::from_ip(inputs.client_ip);
 
-        // 1a. Short-circuit via the per-process verdict cache. Saves
-        //     the HMAC-SHA256 verify on repeat requests from the
-        //     same client — small but measurable at high RPS. The
-        //     cache key includes the route_id + IP prefix so a
-        //     stolen cookie played against a different route or a
-        //     different NAT gateway never hits a stale entry.
+        // 1a. Short-circuit via the RPC cache hit (worker mode) OR
+        //     the per-process local cache (single-process mode).
+        //     `cached_cookie_hit` is populated upstream by the
+        //     request_filter when the RPC cache returned an Allow;
+        //     `cache_check` is the sync local-cache path that
+        //     single-process mode relies on.
+        if let Some(expires_at) = inputs.cached_cookie_hit {
+            if expires_at > inputs.now {
+                return Decision::Pass {
+                    reason: PassReason::ValidCookie,
+                };
+            }
+        }
         if cache_check(inputs.route_id, &expected_prefix, cookie, inputs.now).is_some() {
             return Decision::Pass {
                 reason: PassReason::ValidCookie,
@@ -646,13 +661,19 @@ pub fn route_id_bytes(route_id: &str) -> [u8; 16] {
 /// entries — same shape as `forward_auth::FORWARD_AUTH_VERDICT_CACHE`,
 /// so the memory ceiling is deterministic and tiny.
 ///
-/// Cross-worker sharing via `VerdictCacheEngine::Rpc` was evaluated
-/// during story 3.6 and deferred to a follow-up: the HMAC-SHA256
-/// verify is already fast enough that the RPC hop to the
-/// supervisor would be a NET LOSS at typical scales. Each worker
-/// therefore keeps its own cache and a client that hits a
-/// different worker on its second request pays the HMAC re-verify
-/// cost once.
+/// This is the `Local` path of the cache. The worker-mode `Rpc`
+/// path is layered on top in `proxy_wiring::request_filter`: the
+/// request_filter calls [`rpc_cache_check`] BEFORE the sync
+/// `evaluate()`, stashes any hit in `EvalInputs.cached_cookie_hit`,
+/// and `evaluate()` short-circuits to Pass::ValidCookie on a hit
+/// without touching the sync cache. On a miss that then HMAC-
+/// verifies, the request_filter fire-and-forgets a push via
+/// [`rpc_cache_push`]. This matches the design-doc § 3.6
+/// requirement that bot verdict state propagates across workers
+/// using the existing `VerdictCacheEngine::Rpc` plumbing — no new
+/// RPC endpoint needed, the supervisor just stores opaque
+/// (route_id, cookie) tuples and we flavour the route_id with a
+/// `bot\0` prefix so our entries cannot collide with forward_auth's.
 ///
 /// Cached value is the cookie's `expires_at` (seconds since UNIX
 /// epoch). Lookup checks `expires_at > now` before accepting the
@@ -752,6 +773,108 @@ pub fn cache_reset_for_test() {
     VERDICT_ORDER.lock().clear();
 }
 
+/// Flavour a route_id for the cross-worker bot verdict cache. The
+/// `bot\0` prefix partitions our entries from forward_auth's on the
+/// shared supervisor cache. The IP prefix is folded in so different
+/// NATs never collide.
+fn rpc_verdict_route_id(route_id: &str, ip_prefix: &IpPrefix) -> String {
+    let prefix_hex: String = ip_prefix
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("bot\0{route_id}\0{prefix_hex}")
+}
+
+/// RPC cache lookup (worker mode). Delegates to the supervisor's
+/// verdict cache via the existing `VerdictLookup` wire protocol.
+/// The supervisor is oblivious to bot-vs-forward_auth — the
+/// `bot\0` route_id prefix is enough to partition namespaces. Returns
+/// the cached cookie's `expires_at` in seconds on Allow-hit, `None`
+/// on miss or any RPC failure (fail-open: a flaky supervisor
+/// connection must never DoS the data plane).
+pub async fn rpc_cache_check(
+    engine: &crate::proxy_wiring::VerdictCacheEngine,
+    route_id: &str,
+    ip_prefix: &IpPrefix,
+    cookie: &str,
+    now_secs: i64,
+) -> Option<i64> {
+    use crate::proxy_wiring::VerdictCacheEngine;
+    let key_route = rpc_verdict_route_id(route_id, ip_prefix);
+    match engine {
+        // Local path is handled inside `evaluate()` via the sync
+        // `cache_check` helper — the request_filter should call
+        // this function only when it knows the engine is `Rpc`.
+        // For completeness we also honour `Local` here by
+        // delegating to the sync path.
+        VerdictCacheEngine::Local => cache_check(route_id, ip_prefix, cookie, now_secs),
+        VerdictCacheEngine::Rpc { endpoint, timeout } => {
+            let payload = lorica_command::command::Payload::VerdictLookup(
+                lorica_command::VerdictLookup {
+                    route_id: key_route,
+                    cookie: cookie.to_string(),
+                },
+            );
+            let resp = endpoint
+                .request_rpc(lorica_command::CommandType::VerdictLookup, payload, *timeout)
+                .await
+                .ok()?;
+            let lorica_command::response::Payload::VerdictResult(v) = resp.payload? else {
+                return None;
+            };
+            if !v.found
+                || lorica_command::Verdict::from_i32(v.verdict)
+                    != lorica_command::Verdict::Allow
+            {
+                return None;
+            }
+            // The supervisor returns remaining TTL in ms; convert
+            // to absolute `expires_at` in seconds so the caller
+            // compares against `now_secs` uniformly.
+            Some(now_secs + (v.ttl_ms as i64) / 1000)
+        }
+    }
+}
+
+/// RPC cache push (worker mode). Fire-and-forget: a failed push
+/// just means the next request re-runs HMAC verify, which is the
+/// same as a miss.
+pub async fn rpc_cache_push(
+    engine: &crate::proxy_wiring::VerdictCacheEngine,
+    route_id: &str,
+    ip_prefix: &IpPrefix,
+    cookie: &str,
+    expires_at: i64,
+    now_secs: i64,
+) {
+    use crate::proxy_wiring::VerdictCacheEngine;
+    let key_route = rpc_verdict_route_id(route_id, ip_prefix);
+    match engine {
+        VerdictCacheEngine::Local => {
+            cache_insert(route_id, ip_prefix, cookie, expires_at);
+        }
+        VerdictCacheEngine::Rpc { endpoint, timeout } => {
+            let ttl_ms = ((expires_at - now_secs).max(0) * 1000) as u64;
+            let payload = lorica_command::command::Payload::VerdictPush(
+                lorica_command::VerdictPush {
+                    route_id: key_route,
+                    cookie: cookie.to_string(),
+                    verdict: lorica_command::Verdict::Allow as i32,
+                    // Bot verdicts carry no response headers — the
+                    // cookie IS the verdict. Empty vec keeps the
+                    // wire payload minimal.
+                    response_headers: Vec::<lorica_command::ForwardAuthHeader>::new(),
+                    ttl_ms,
+                },
+            );
+            let _ = endpoint
+                .request_rpc(lorica_command::CommandType::VerdictPush, payload, *timeout)
+                .await;
+        }
+    }
+}
+
 /// Check whether `ip` matches a CIDR string. Accepts both bare IPs
 /// (treated as /32 or /128) and `addr/len` forms. Returns false on
 /// any parse error — validator-enforced input should never fail to
@@ -817,6 +940,7 @@ mod tests {
             hmac_secret: None,
             route_id: "route-abc",
             config: c,
+            cached_cookie_hit: None,
         }
     }
 
@@ -1298,11 +1422,58 @@ mod tests {
             hmac_secret: None,
             route_id,
             config: &c,
+            cached_cookie_hit: None,
         };
         match evaluate(&i) {
             Decision::Pass { reason } => assert_eq!(reason, PassReason::ValidCookie),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn rpc_cached_cookie_hit_short_circuits_evaluate() {
+        // Worker mode: `cached_cookie_hit` set upstream by the
+        // request_filter (after a VerdictLookup hit). evaluate()
+        // MUST skip the HMAC verify path entirely and return
+        // Pass::ValidCookie.
+        let c = cfg();
+        let mut i = inputs(&c, "");
+        i.verdict_cookie = Some("any-cookie-string");
+        i.cached_cookie_hit = Some(i.now + 3600);
+        match evaluate(&i) {
+            Decision::Pass { reason } => assert_eq!(reason, PassReason::ValidCookie),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpc_cached_cookie_hit_expired_is_ignored() {
+        // Stale cached hit (expires_at < now) must NOT short-
+        // circuit. Evaluator falls through to the sync local cache
+        // / HMAC verify path.
+        let c = cfg();
+        let mut i = inputs(&c, "");
+        i.verdict_cookie = Some("any-cookie-string");
+        i.cached_cookie_hit = Some(i.now - 10);
+        // No HMAC secret, cookie won't verify through the fallback
+        // path, so the evaluator must return Challenge.
+        assert!(matches!(evaluate(&i), Decision::Challenge));
+    }
+
+    #[test]
+    fn rpc_verdict_route_id_flavours_bot_prefix() {
+        // The `bot\0` prefix ensures our RPC cache entries cannot
+        // collide with forward_auth entries on the shared
+        // supervisor cache. The IP prefix is folded in so two
+        // clients behind different NAT gateways never share a
+        // cache entry even with the same cookie.
+        use std::net::{IpAddr, Ipv4Addr};
+        let p1 = IpPrefix::from_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));
+        let p2 = IpPrefix::from_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let a = rpc_verdict_route_id("r", &p1);
+        let b = rpc_verdict_route_id("r", &p2);
+        assert_ne!(a, b);
+        assert!(a.starts_with("bot\0r\0"));
     }
 
     #[test]
