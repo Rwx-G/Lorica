@@ -194,20 +194,21 @@ fn validate_bot_protection(
         ip_cidrs.push(trimmed.to_string());
     }
 
-    // ASN-based bypass needs a dedicated ASN database (DB-IP / MaxMind
-    // `.mmdb`) + a rDNS resolver chain + a lookup cache, none of which
-    // landed in v1.4.0. Reject non-empty lists up front with a clear
-    // message rather than silently persist a config that request_filter
-    // cannot enforce. Tracked as a post-v1.4.0 follow-up; the field
-    // stays in `BotBypassRules` so the future story can enable it
-    // without a schema migration.
-    if !cfg.bypass.asns.is_empty() {
-        return Err(ApiError::BadRequest(
-            "bot_protection.bypass.asns: ASN-based bypass is not yet supported in \
-             v1.4.0 (tracked as a follow-up that ships alongside an ASN database \
-             distribution). Leave the list empty for now"
-                .into(),
-        ));
+    // ASN-based bypass (v1.4.0 follow-up now landed). Resolver is
+    // `lorica_geoip::AsnResolver` loaded from
+    // `GlobalSettings.asn_db_path`. When the DB is missing at
+    // request time, `asn_handle().lookup_asn()` returns `None` and
+    // the request falls through to the remaining bypass categories
+    // — the config is accepted, it just does not fire until the
+    // operator points `asn_db_path` at an ASN `.mmdb`.
+    check_cap("asns", cfg.bypass.asns.len())?;
+    for n in &cfg.bypass.asns {
+        if *n == 0 {
+            return Err(ApiError::BadRequest(
+                "bot_protection.bypass.asns: 0 is not a valid ASN (IANA reserves 0)"
+                    .into(),
+            ));
+        }
     }
     let asns = cfg.bypass.asns.clone();
 
@@ -730,24 +731,33 @@ mod bot_protection_validation_tests {
     }
 
     #[test]
-    fn rejects_non_empty_asn_list() {
-        // ASN-based bypass is a v1.4.x follow-up (needs an ASN DB).
-        // Until it ships, the API must reject the config rather
-        // than persist a silently-ignored list.
+    fn accepts_non_empty_asn_list() {
+        // Now that the ASN resolver shipped, non-empty lists are
+        // a legal config. The resolver runs lookups at request time;
+        // an absent ASN DB makes the bypass a silent no-op.
         let mut c = baseline();
         c.bypass.asns = vec![15169, 8075];
+        let out = validate_bot_protection(&c).expect("non-empty asns must pass");
+        assert_eq!(out.bypass.asns, vec![15169, 8075]);
+    }
+
+    #[test]
+    fn rejects_zero_asn() {
+        // ASN 0 is IANA-reserved; allowing it in a bypass list would
+        // be a misconfiguration that silently never matches (the DB
+        // never returns 0 for a real IP).
+        let mut c = baseline();
+        c.bypass.asns = vec![0];
         match validate_bot_protection(&c) {
             Err(ApiError::BadRequest(msg)) => {
-                assert!(msg.contains("ASN"), "msg={msg}");
-                assert!(msg.contains("not yet supported"), "msg={msg}");
+                assert!(msg.contains("IANA reserves 0"), "msg={msg}");
             }
-            other => panic!("expected BadRequest rejection, got {other:?}"),
+            other => panic!("expected BadRequest, got {other:?}"),
         }
     }
 
     #[test]
     fn accepts_empty_asn_list() {
-        // Empty list must pass — asn bypass is "disabled" by default.
         let mut c = baseline();
         c.bypass.asns = vec![];
         validate_bot_protection(&c).expect("empty asns must pass");

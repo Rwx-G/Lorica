@@ -34,7 +34,10 @@
 //! job keeps serving the old DB on transient errors and only swaps
 //! once a fresh copy has passed a sanity check.
 
+pub mod asn;
 pub mod updater;
+
+pub use asn::{AsnDbStatus, AsnResolver};
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};

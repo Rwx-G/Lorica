@@ -3074,6 +3074,7 @@ fn run_worker(
     // below picks up updater-written files on disk. Silent no-op
     // when the path is unset.
     lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
+    lorica::geoip::set_asn_handle(Arc::clone(&lorica_proxy.asn_resolver));
     {
         let s = store.blocking_lock();
         if let Ok(settings) = s.get_global_settings() {
@@ -3085,6 +3086,18 @@ fn run_worker(
                             path = %path,
                             error = %e,
                             "worker: GeoIP database load failed; lookups will return None"
+                        ),
+                    }
+                }
+            }
+            if let Some(ref path) = settings.asn_db_path {
+                if !path.trim().is_empty() {
+                    match lorica_proxy.asn_resolver.load_from_path(path) {
+                        Ok(()) => info!(path = %path, "worker: ASN database loaded"),
+                        Err(e) => warn!(
+                            path = %path,
+                            error = %e,
+                            "worker: ASN database load failed; lookups will return None"
                         ),
                     }
                 }
@@ -3493,10 +3506,12 @@ fn run_single_process(cli: Cli) {
         // hot-swap the DB when the dashboard changes the path,
         // without forcing a restart.
         lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
+        lorica::geoip::set_asn_handle(Arc::clone(&lorica_proxy.asn_resolver));
         {
             let s = store.lock().await;
             if let Ok(settings) = s.get_global_settings() {
                 let path = settings.geoip_db_path.clone();
+                let asn_path = settings.asn_db_path.clone();
                 let auto_update = settings.geoip_auto_update_enabled;
                 drop(s);
                 if let Some(ref p) = path {
@@ -3515,6 +3530,18 @@ fn run_single_process(cli: Cli) {
                         let resolver = Arc::clone(&lorica_proxy.geoip_resolver);
                         let _handle = lorica_geoip::updater::spawn_updater(resolver, cfg);
                         info!(path = %p, "GeoIP auto-update task spawned");
+                    }
+                }
+                if let Some(ref p) = asn_path {
+                    if !p.trim().is_empty() {
+                        match lorica_proxy.asn_resolver.load_from_path(p) {
+                            Ok(()) => info!(path = %p, "ASN database loaded"),
+                            Err(e) => warn!(
+                                path = %p,
+                                error = %e,
+                                "ASN database load failed; lookups will return None"
+                            ),
+                        }
                     }
                 }
             }

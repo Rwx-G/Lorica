@@ -256,6 +256,26 @@
     </div>
 
     <div class="form-row">
+      <div class="form-group" class:modified={isModified('bot_bypass_asns')}>
+        <label for="bot-bypass-asns">
+          Bypass &mdash; ASNs <span class="hint">(comma-separated, `AS` prefix optional)</span>
+        </label>
+        {#if isImported('bot_bypass_asns')}<span class="imported-badge">imported</span>{/if}
+        <input
+          id="bot-bypass-asns"
+          type="text"
+          bind:value={form.bot_bypass_asns}
+          placeholder="e.g. 15169, 13335"
+          autocomplete="off"
+        />
+        <span class="hint">
+          Requires an ASN database loaded (Settings &rarr; ASN). Without a DB
+          the bypass is a silent no-op. ASN 0 is IANA-reserved and rejected.
+        </span>
+      </div>
+    </div>
+
+    <div class="form-row">
       <div class="form-group" class:modified={isModified('bot_bypass_countries')}>
         <label for="bot-bypass-countries">
           Bypass &mdash; Countries <span class="hint">(ISO 3166-1 alpha-2, comma-separated)</span>
@@ -319,11 +339,11 @@
     </div>
 
     <p class="section-hint">
-      <strong>ASN bypass</strong> and <strong>rDNS bypass</strong> are listed in
-      the design doc but deferred to a v1.4.x follow-up: ASN needs a dedicated
-      database distribution; rDNS needs a forward-confirmation DNS pipeline
-      (design § 10.3 flags rDNS-without-forward-confirm as a must-not
-      regression). The API rejects non-empty lists for both today.
+      <strong>rDNS bypass</strong> from the design doc is still deferred to a
+      v1.4.x follow-up: it needs a forward-confirmation DNS pipeline (design §
+      10.3 flags rDNS-without-forward-confirm as a must-not regression). The
+      API rejects non-empty lists for that field today. All four other
+      categories (IP CIDR, ASN, country, User-Agent) are live.
     </p>
   {/if}
 </div>

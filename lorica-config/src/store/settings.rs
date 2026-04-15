@@ -133,6 +133,9 @@ impl ConfigStore {
                 "bot_hmac_secret_hex" => {
                     settings.bot_hmac_secret_hex = value;
                 }
+                "asn_db_path" => {
+                    settings.asn_db_path = if value.is_empty() { None } else { Some(value) };
+                }
                 _ => {}
             }
         }
@@ -271,6 +274,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('bot_hmac_secret_hex', ?1)",
             params![settings.bot_hmac_secret_hex],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('asn_db_path', ?1)",
+            params![settings.asn_db_path.as_deref().unwrap_or("")],
         )?;
         Ok(())
     }

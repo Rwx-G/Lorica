@@ -235,6 +235,8 @@ pub enum PassReason {
     OnlyCountryGateMiss,
     /// Bypass category matched: IP CIDR list.
     BypassIpCidr,
+    /// Bypass category matched: ASN list (v1.4.0 follow-up).
+    BypassAsn,
     /// Bypass category matched: country list.
     BypassCountry,
     /// Bypass category matched: User-Agent regex list.
@@ -248,6 +250,7 @@ impl PassReason {
             PassReason::ValidCookie => "cookie",
             PassReason::OnlyCountryGateMiss => "only_country_miss",
             PassReason::BypassIpCidr => "bypass_ip",
+            PassReason::BypassAsn => "bypass_asn",
             PassReason::BypassCountry => "bypass_country",
             PassReason::BypassUserAgent => "bypass_ua",
         }
@@ -265,6 +268,13 @@ pub struct EvalInputs<'a> {
     /// the DB is not loaded or the IP is outside any indexed
     /// prefix.
     pub country: Option<String>,
+    /// Resolved Autonomous System Number from the ASN resolver
+    /// (v1.4.0 follow-up closing the asn-bypass deferred item).
+    /// `None` when the ASN DB is not loaded or the IP is not
+    /// indexed. Callers that do not need ASN bypass can pass
+    /// `None` unconditionally — the evaluator just skips the
+    /// ASN arm.
+    pub asn: Option<u32>,
     /// Request `User-Agent` header value, if any. Empty string if
     /// the client did not send one.
     pub user_agent: &'a str,
@@ -358,7 +368,19 @@ pub fn evaluate(inputs: &EvalInputs<'_>) -> Decision {
         }
     }
 
-    // 3. Country bypass.
+    // 3. ASN bypass. Evaluated before country so an operator
+    //    allow-listing all of Googlebot's ASN does not have to
+    //    also allow-list the USA + IE + every other country the
+    //    crawler operates out of.
+    if let Some(client_asn) = inputs.asn {
+        if inputs.config.bypass.asns.contains(&client_asn) {
+            return Decision::Pass {
+                reason: PassReason::BypassAsn,
+            };
+        }
+    }
+
+    // 4. Country bypass.
     if let Some(country) = inputs.country.as_deref() {
         if inputs
             .config
@@ -597,6 +619,7 @@ mod tests {
         EvalInputs {
             client_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)),
             country: Some("FR".to_string()),
+            asn: None,
             user_agent: ua,
             verdict_cookie: None,
             now: 1_700_000_000,
@@ -668,6 +691,29 @@ mod tests {
             Decision::Pass { reason } => assert_eq!(reason, PassReason::BypassIpCidr),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn bypass_asn_matches() {
+        let mut c = cfg();
+        c.bypass.asns = vec![15169, 8075];
+        let mut i = inputs(&c, "");
+        i.asn = Some(15169);
+        match evaluate(&i) {
+            Decision::Pass { reason } => assert_eq!(reason, PassReason::BypassAsn),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn bypass_asn_no_db_loaded_falls_through() {
+        // When the ASN resolver has no DB loaded, `inputs.asn` is
+        // None and the config's asn list must not match — the
+        // evaluator skips straight to the remaining categories.
+        let mut c = cfg();
+        c.bypass.asns = vec![15169];
+        let i = inputs(&c, "Mozilla/5.0"); // asn = None per default
+        assert!(matches!(evaluate(&i), Decision::Challenge));
     }
 
     #[test]
@@ -919,6 +965,7 @@ mod tests {
         let i = EvalInputs {
             client_ip: ip,
             country: None,
+            asn: None,
             user_agent: "",
             verdict_cookie: Some(cookie),
             now,

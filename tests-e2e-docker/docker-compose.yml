@@ -288,6 +288,7 @@ services:
       - lorica-bot-data:/var/lib/lorica
       - shared-bot:/shared
       - ./fixtures/GeoIP2-Country-Test.mmdb:/var/lib/lorica/geoip-test.mmdb:ro
+      - ./fixtures/GeoLite2-ASN-Test.mmdb:/var/lib/lorica/asn-test.mmdb:ro
     depends_on:
       - backend1
     networks:

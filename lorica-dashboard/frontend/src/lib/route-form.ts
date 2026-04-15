@@ -133,6 +133,7 @@ export interface RouteFormState {
   bot_pow_difficulty: number;
   bot_captcha_alphabet: string;
   bot_bypass_ip_cidrs: string;
+  bot_bypass_asns: string;
   bot_bypass_countries: string;
   bot_bypass_user_agents: string;
   bot_only_country: string;
@@ -220,6 +221,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   bot_captcha_alphabet:
     '23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ',
   bot_bypass_ip_cidrs: '',
+  bot_bypass_asns: '',
   bot_bypass_countries: '',
   bot_bypass_user_agents: '',
   bot_only_country: '',
@@ -261,8 +263,8 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'geoip_mode', 'geoip_countries',
     'bot_enabled', 'bot_mode', 'bot_cookie_ttl_s', 'bot_pow_difficulty',
     'bot_captcha_alphabet',
-    'bot_bypass_ip_cidrs', 'bot_bypass_countries', 'bot_bypass_user_agents',
-    'bot_only_country',
+    'bot_bypass_ip_cidrs', 'bot_bypass_asns', 'bot_bypass_countries',
+    'bot_bypass_user_agents', 'bot_only_country',
   ],
   path_rules: ['path_rules'],
   header_rules: ['header_rules'],
@@ -428,6 +430,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
       route.bot_protection?.captcha_alphabet ??
       '23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ',
     bot_bypass_ip_cidrs: (route.bot_protection?.bypass?.ip_cidrs ?? []).join(', '),
+    bot_bypass_asns: (route.bot_protection?.bypass?.asns ?? []).map(String).join(', '),
     bot_bypass_countries: (route.bot_protection?.bypass?.countries ?? []).join(', '),
     bot_bypass_user_agents: (route.bot_protection?.bypass?.user_agents ?? []).join('\n'),
     bot_only_country: (route.bot_protection?.only_country ?? []).join(', '),
@@ -685,11 +688,19 @@ function botProtectionFormToRequest(
 
   const bypass: {
     ip_cidrs?: string[];
+    asns?: number[];
     countries?: string[];
     user_agents?: string[];
   } = {};
   const ip_cidrs = csv(form.bot_bypass_ip_cidrs);
   if (ip_cidrs.length > 0) bypass.ip_cidrs = ip_cidrs;
+  // ASN entries parse to integers. We keep only well-formed
+  // positive values so a stray `AS15169` or empty row does not
+  // poison the list (the API validator also rejects zero).
+  const asns = csv(form.bot_bypass_asns)
+    .map((v) => Number(v.replace(/^AS/i, '')))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (asns.length > 0) bypass.asns = asns;
   const countries = csv(form.bot_bypass_countries);
   if (countries.length > 0) bypass.countries = countries;
   const user_agents = lines(form.bot_bypass_user_agents);

@@ -46,6 +46,7 @@ pub struct UpdateSettingsRequest {
     pub otlp_sampling_ratio: Option<f64>,
     pub geoip_db_path: Option<String>,
     pub geoip_auto_update_enabled: Option<bool>,
+    pub asn_db_path: Option<String>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -270,6 +271,24 @@ pub async fn update_settings(
     }
     if let Some(auto_update) = body.geoip_auto_update_enabled {
         settings.geoip_auto_update_enabled = auto_update;
+    }
+    if let Some(ref path) = body.asn_db_path {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            settings.asn_db_path = None;
+        } else {
+            if !trimmed.starts_with('/') {
+                return Err(ApiError::BadRequest(
+                    "asn_db_path must be an absolute path (starting with '/')".into(),
+                ));
+            }
+            if trimmed.len() > 4096 {
+                return Err(ApiError::BadRequest(
+                    "asn_db_path too long (> 4096 chars)".into(),
+                ));
+            }
+            settings.asn_db_path = Some(trimmed.to_string());
+        }
     }
 
     store.update_global_settings(&settings)?;

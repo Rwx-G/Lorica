@@ -122,11 +122,15 @@ ok "session ready"
 log "=== bot smoke: configure global settings ==="
 SET=$(api_put /api/v1/settings '{
     "trusted_proxies": ["0.0.0.0/0", "::/0"],
-    "geoip_db_path": "/var/lib/lorica/geoip-test.mmdb"
+    "geoip_db_path": "/var/lib/lorica/geoip-test.mmdb",
+    "asn_db_path": "/var/lib/lorica/asn-test.mmdb"
 }')
 [ "$(echo "$SET" | jq -r '.data.geoip_db_path // empty')" = "/var/lib/lorica/geoip-test.mmdb" ] \
     && ok "trusted_proxies + geoip_db_path persisted" \
     || fail "settings update failed: $SET"
+[ "$(echo "$SET" | jq -r '.data.asn_db_path // empty')" = "/var/lib/lorica/asn-test.mmdb" ] \
+    && ok "asn_db_path persisted" \
+    || fail "asn_db_path persist failed: $SET"
 
 sleep 2
 
@@ -436,6 +440,50 @@ if [ "$CODE" = "200" ] && grep -q "crypto.subtle" "$RESP"; then
     ok "bypass IP CIDR: client outside /24 still challenged"
 else
     fail "bypass IP CIDR: outside /24 expected challenge, body missing PoW"
+fi
+rm -f "$RESP"
+
+# --- Bypass matrix: ASN --------------------------------------------------
+log "=== bot smoke: bypass matrix — ASN ==="
+UP=$(api_put "/api/v1/routes/${ROUTE_ID}" "{
+    \"hostname\": \"bot-test.local\",
+    \"path_prefix\": \"/\",
+    \"backend_ids\": [\"${BACKEND_ID}\"],
+    \"enabled\": true,
+    \"bot_protection\": {
+        \"mode\": \"javascript\",
+        \"cookie_ttl_s\": 3600,
+        \"pow_difficulty\": 14,
+        \"captcha_alphabet\": \"23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ\",
+        \"bypass\": {\"asns\": [15169]}
+    }
+}")
+sleep 2
+# 1.0.0.1 resolves to AS15169 in the MaxMind test fixture.
+RESP=$(mktemp)
+CODE=$(curl -s -o "$RESP" -w '%{http_code}' \
+    -H "Host: bot-test.local" \
+    -H "X-Forwarded-For: 1.0.0.1" \
+    -H "Accept: text/html" \
+    "${PROXY}/")
+if [ "$CODE" = "200" ] && ! grep -q "crypto.subtle" "$RESP"; then
+    ok "bypass ASN: AS15169 client (1.0.0.1) → backend passthrough"
+else
+    fail "bypass ASN: AS15169 client expected passthrough, got challenge"
+fi
+rm -f "$RESP"
+
+# An IP outside the fixture's ASN index still sees the challenge.
+RESP=$(mktemp)
+CODE=$(curl -s -o "$RESP" -w '%{http_code}' \
+    -H "Host: bot-test.local" \
+    -H "X-Forwarded-For: $IP_UNKNOWN" \
+    -H "Accept: text/html" \
+    "${PROXY}/")
+if [ "$CODE" = "200" ] && grep -q "crypto.subtle" "$RESP"; then
+    ok "bypass ASN: unknown-ASN client still challenged"
+else
+    fail "bypass ASN: unknown-ASN client expected challenge"
 fi
 rm -f "$RESP"
 

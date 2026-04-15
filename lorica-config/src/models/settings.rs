@@ -205,6 +205,12 @@ pub struct GlobalSettings {
     /// loaded DB so a transient network blip never blocks requests.
     #[serde(default)]
     pub geoip_auto_update_enabled: bool,
+    /// Filesystem path to the ASN `.mmdb` (v1.4.0 Epic 3 follow-up
+    /// that closes `bot_protection.bypass.asns`). Same format as
+    /// `geoip_db_path`; DB-IP ASN Lite (CC-BY 4.0) is the default
+    /// source. `None` = ASN resolver disabled at runtime.
+    #[serde(default)]
+    pub asn_db_path: Option<String>,
     /// HMAC secret used to sign the bot-protection verdict cookie
     /// (v1.4.0 Epic 3). 32 raw bytes, stored as a hex string so the
     /// existing key-value `global_settings` table does not need a
@@ -312,6 +318,7 @@ impl Default for GlobalSettings {
             otlp_sampling_ratio: default_otlp_sampling_ratio(),
             geoip_db_path: None,
             geoip_auto_update_enabled: false,
+            asn_db_path: None,
             bot_hmac_secret_hex: String::new(),
         }
     }

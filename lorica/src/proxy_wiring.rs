@@ -1114,6 +1114,13 @@ pub struct LoricaProxy {
     /// nothing on the hot path besides the per-route-config
     /// presence check.
     pub geoip_resolver: Arc<lorica_geoip::GeoIpResolver>,
+    /// ASN resolver (v1.4.0 Epic 3 follow-up closing the
+    /// `bot_protection.bypass.asns` deferred item). Same shape as
+    /// `geoip_resolver`: loaded from `GlobalSettings.asn_db_path`
+    /// at startup, hot-swappable. `AsnResolver::empty()` at
+    /// construction so installations without an ASN DB pay
+    /// nothing on the hot path.
+    pub asn_resolver: Arc<lorica_geoip::AsnResolver>,
     /// Bot-protection challenge engine (v1.4.0 Epic 3). Holds the
     /// in-process pending-challenge stash (keyed by server-side
     /// nonce) that the submit handler consumes on verify. Cookie /
@@ -1210,6 +1217,7 @@ impl LoricaProxy {
             verdict_cache: VerdictCacheEngine::local(),
             pending_proxy_config: Arc::new(parking_lot::Mutex::new(None)),
             geoip_resolver: Arc::new(lorica_geoip::GeoIpResolver::empty()),
+            asn_resolver: Arc::new(lorica_geoip::AsnResolver::empty()),
             bot_engine: Arc::new(crate::bot::BotEngine::new()),
         }
     }
@@ -2971,6 +2979,13 @@ impl ProxyHttp for LoricaProxy {
                         .geoip_resolver
                         .lookup_country(ip_addr)
                         .map(|c| c.as_str().to_string());
+                    // ASN lookup via the hot-swappable resolver.
+                    // Returns None when no DB is loaded — the
+                    // evaluator treats that as "asn bypass
+                    // disabled for this request" and falls through
+                    // to the remaining categories. Zero-cost when
+                    // the operator has no ASN DB configured.
+                    let asn = self.asn_resolver.lookup_asn(ip_addr);
                     let ua = session
                         .req_header()
                         .headers
@@ -2990,6 +3005,7 @@ impl ProxyHttp for LoricaProxy {
                     let inputs = crate::bot::EvalInputs {
                         client_ip: ip_addr,
                         country,
+                        asn,
                         user_agent: ua,
                         verdict_cookie,
                         now: now_secs,
@@ -3016,6 +3032,7 @@ impl ProxyHttp for LoricaProxy {
                                 crate::bot::PassReason::Disabled => "passed",
                                 crate::bot::PassReason::OnlyCountryGateMiss => "bypassed",
                                 crate::bot::PassReason::BypassIpCidr
+                                | crate::bot::PassReason::BypassAsn
                                 | crate::bot::PassReason::BypassCountry
                                 | crate::bot::PassReason::BypassUserAgent => "bypassed",
                             };

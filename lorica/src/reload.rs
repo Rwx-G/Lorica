@@ -119,8 +119,62 @@ pub async fn reload_proxy_config_with_mtls(
     commit_prepared_reload(proxy_config, connection_filter, prepared);
     apply_otel_settings_from_store(store).await;
     apply_geoip_settings_from_store(store).await;
+    apply_asn_settings_from_store(store).await;
     apply_bot_secret_from_store(store).await;
     Ok(())
+}
+
+/// Hot-reload the ASN resolver from `GlobalSettings.asn_db_path`.
+/// Same pattern as `apply_geoip_settings_from_store` — parallels
+/// are intentional so both DBs follow one operator-visible model.
+async fn apply_asn_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
+    use std::sync::OnceLock;
+
+    static LAST_APPLIED: OnceLock<parking_lot::Mutex<Option<String>>> = OnceLock::new();
+    let slot = LAST_APPLIED.get_or_init(|| parking_lot::Mutex::new(None));
+
+    let resolver = match crate::geoip::asn_handle() {
+        Some(r) => r,
+        None => return,
+    };
+
+    let s = store.lock().await;
+    let settings = match s.get_global_settings() {
+        Ok(settings) => settings,
+        Err(_) => return,
+    };
+    drop(s);
+
+    let next = settings
+        .asn_db_path
+        .as_ref()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+
+    let mut last = slot.lock();
+    if *last == next {
+        return;
+    }
+
+    match next.as_ref() {
+        Some(path) => match resolver.load_from_path(path) {
+            Ok(()) => info!(path = %path, "ASN database hot-reloaded from settings"),
+            Err(e) => {
+                warn!(
+                    path = %path,
+                    error = %e,
+                    "ASN hot-reload failed; previous DB stays live"
+                );
+                return;
+            }
+        },
+        None => {
+            resolver.unload();
+            info!("ASN database unloaded by settings change (asn_db_path cleared)");
+        }
+    }
+
+    *last = next;
 }
 
 /// Re-apply the bot-protection HMAC secret stored in
