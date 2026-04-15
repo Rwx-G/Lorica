@@ -179,6 +179,14 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             let raw: Option<String> = row.get::<_, Option<String>>(63).unwrap_or(None);
             raw.and_then(|s| serde_json::from_str(&s).ok())
         },
+        bot_protection: {
+            // Column index 64 (v1.4.0 story 3.3 migration V35). Same
+            // forgiving parse policy as geoip above — a corrupt JSON
+            // blob on one row degrades the feature to off for that
+            // route but does not take the proxy down.
+            let raw: Option<String> = row.get::<_, Option<String>>(64).unwrap_or(None);
+            raw.and_then(|s| serde_json::from_str(&s).ok())
+        },
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

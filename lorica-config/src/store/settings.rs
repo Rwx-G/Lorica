@@ -130,6 +130,9 @@ impl ConfigStore {
                 "geoip_auto_update_enabled" => {
                     settings.geoip_auto_update_enabled = value == "true" || value == "1";
                 }
+                "bot_hmac_secret_hex" => {
+                    settings.bot_hmac_secret_hex = value;
+                }
                 _ => {}
             }
         }
@@ -264,6 +267,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('geoip_auto_update_enabled', ?1)",
             params![settings.geoip_auto_update_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('bot_hmac_secret_hex', ?1)",
+            params![settings.bot_hmac_secret_hex],
         )?;
         Ok(())
     }

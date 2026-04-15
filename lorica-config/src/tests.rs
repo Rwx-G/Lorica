@@ -77,6 +77,7 @@ mod tests {
             mtls: None,
             rate_limit: None,
             geoip: None,
+            bot_protection: None,
             created_at: now,
             updated_at: now,
         }

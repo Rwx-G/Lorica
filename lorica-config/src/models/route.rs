@@ -605,6 +605,15 @@ pub struct Route {
     /// disabled for this route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geoip: Option<GeoIpConfig>,
+    /// Per-route bot-protection challenge (v1.4.0 Epic 3). When set,
+    /// `request_filter` evaluates the five bypass categories, then
+    /// either issues / verifies the HMAC-signed verdict cookie or
+    /// serves the mode-specific challenge page (Cookie refresh, JS
+    /// proof-of-work, or image captcha). See
+    /// `docs/architecture/bot-protection.md` for the full design.
+    /// `None` = filter disabled for this route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_protection: Option<BotProtectionConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -658,6 +667,123 @@ impl GeoIpConfig {
             GeoIpMode::Denylist => matched,
         }
     }
+}
+
+/// Mode for the per-route bot-protection challenge. Ordered by
+/// increasing user friction: `Cookie` is a passive refresh redirect,
+/// `Javascript` runs a SHA-256 PoW in the browser, `Captcha` shows
+/// an image the user types. Serialised lowercase on the API wire.
+/// See `docs/architecture/bot-protection.md` § 3 for the rationale
+/// behind the graded model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BotProtectionMode {
+    Cookie,
+    Javascript,
+    Captcha,
+}
+
+/// Five-category bypass rule set. Each non-empty field is a
+/// separate early-exit to the backend — the order of evaluation is
+/// documented in the architecture doc § 6.3. A request matching ANY
+/// rule skips the challenge entirely. Rules are additive: setting
+/// `ip_cidrs` does not disable the other categories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BotBypassRules {
+    /// CIDRs (e.g. `"10.0.0.0/8"`, `"2001:db8::/32"`) that skip the
+    /// challenge when the client IP matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip_cidrs: Vec<String>,
+    /// Autonomous System Numbers. Bypass when the client's resolved
+    /// ASN (via rDNS + ASN database lookup; see story 3.5 for the
+    /// lookup plumbing) is in this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asns: Vec<u32>,
+    /// ISO 3166-1 alpha-2 country codes. Bypass when the GeoIP
+    /// resolver returns one of these codes. Case-normalised
+    /// uppercase by the API validator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub countries: Vec<String>,
+    /// Regular expressions matched against the `User-Agent` request
+    /// header. Each pattern must compile as a Rust `regex` crate
+    /// regex (no lookahead / backreference). Operator typically
+    /// pairs this with `rdns` for safety: UA alone is trivially
+    /// spoofable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_agents: Vec<String>,
+    /// Reverse-DNS suffixes (e.g. `"googlebot.com"`). Bypass when
+    /// the client IP's PTR lookup returns a hostname ending in one
+    /// of these suffixes AND a forward A/AAAA lookup on the PTR
+    /// result returns the same client IP (forward confirmation is
+    /// enforced by the request-filter implementation; see story
+    /// 3.5. Without it a hostile resolver can spoof any PTR).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rdns: Vec<String>,
+}
+
+impl BotBypassRules {
+    /// True iff every category is empty. Used by the request-filter
+    /// to short-circuit the bypass matrix evaluation.
+    pub fn is_empty(&self) -> bool {
+        self.ip_cidrs.is_empty()
+            && self.asns.is_empty()
+            && self.countries.is_empty()
+            && self.user_agents.is_empty()
+            && self.rdns.is_empty()
+    }
+}
+
+/// Per-route bot-protection filter. Evaluated after GeoIP, before
+/// forward_auth. See `docs/architecture/bot-protection.md` for the
+/// wire format and threat model. Default field values match what
+/// the dashboard offers when the operator enables the feature
+/// without customising every knob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotProtectionConfig {
+    pub mode: BotProtectionMode,
+    /// Verdict cookie lifetime in seconds. Default 86400 (24 h);
+    /// the API validator caps at 604800 (7 days) so a compromised
+    /// cookie cannot live longer than one week regardless of
+    /// operator misconfiguration.
+    #[serde(default = "default_cookie_ttl_s")]
+    pub cookie_ttl_s: u32,
+    /// PoW difficulty (leading-zero bits of the SHA-256 result).
+    /// Must be in 14..=22. Default 18 ≈ 800 ms median solve on
+    /// desktop, 2 s on mobile. Ignored for non-Javascript modes
+    /// but persisted so flipping modes does not lose the tuning.
+    #[serde(default = "default_pow_difficulty")]
+    pub pow_difficulty: u8,
+    /// Captcha code alphabet. Default excludes confusables and the
+    /// two glyphs the default `captcha` crate font cannot render.
+    /// API validator rejects strings shorter than 10 chars, non-
+    /// ASCII-printable chars, and duplicates. Ignored for non-
+    /// Captcha modes but persisted.
+    #[serde(default = "default_captcha_alphabet")]
+    pub captcha_alphabet: String,
+    /// Bypass matrix. All categories default to empty lists — the
+    /// feature starts in "challenge every request" mode and the
+    /// operator whitelists over time.
+    #[serde(default)]
+    pub bypass: BotBypassRules,
+    /// Inverse country gate. When `Some(list)`, the challenge fires
+    /// ONLY for requests whose resolved country is in the list;
+    /// all other traffic passes through with no challenge. `None`
+    /// means the filter applies to all traffic (the bypass rules
+    /// are the only escape hatch). Codes normalised uppercase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only_country: Option<Vec<String>>,
+}
+
+fn default_cookie_ttl_s() -> u32 {
+    86_400
+}
+
+fn default_pow_difficulty() -> u8 {
+    18
+}
+
+fn default_captcha_alphabet() -> String {
+    "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ".to_string()
 }
 
 impl Route {

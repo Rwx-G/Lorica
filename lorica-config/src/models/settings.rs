@@ -205,6 +205,19 @@ pub struct GlobalSettings {
     /// loaded DB so a transient network blip never blocks requests.
     #[serde(default)]
     pub geoip_auto_update_enabled: bool,
+    /// HMAC secret used to sign the bot-protection verdict cookie
+    /// (v1.4.0 Epic 3). 32 raw bytes, stored as a hex string so the
+    /// existing key-value `global_settings` table does not need a
+    /// BLOB column. Generated on first boot if absent; rotated on
+    /// every certificate renewal so cookie lifetime is capped at
+    /// the cert TTL. Never serialised over the API (the field is
+    /// scrubbed from `GET /api/v1/settings` responses at the API
+    /// layer — a leaked hex secret is equivalent to a forgeable
+    /// cookie for the full cookie TTL across every route). Empty
+    /// string = "not yet initialised"; the first reload after
+    /// startup populates it via `secret::generate` + persist.
+    #[serde(default)]
+    pub bot_hmac_secret_hex: String,
 }
 
 fn default_waf_ban_threshold() -> i32 {
@@ -299,6 +312,7 @@ impl Default for GlobalSettings {
             otlp_sampling_ratio: default_otlp_sampling_ratio(),
             geoip_db_path: None,
             geoip_auto_update_enabled: false,
+            bot_hmac_secret_hex: String::new(),
         }
     }
 }
