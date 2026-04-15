@@ -34,3 +34,25 @@ own NOTICE / README. The `.mmdb` file format is compatible with
 MaxMind's GeoLite2, so operators with a MaxMind license can opt out
 of the DB-IP source by pointing `geoip_db_path` at their own file
 and disabling `geoip_auto_update_enabled`.
+
+Dashboard world-map asset
+-------------------------
+
+The country-picker widget on the dashboard Protection tab bundles
+the SVG world map file at `lorica-dashboard/frontend/src/assets/
+world-map.svg`, which is a derivative of the Wikimedia Commons
+"BlankMap-World" file published by user "Canuckguy" (and successive
+contributors).
+
+  "BlankMap-World.svg" is licensed under Creative Commons
+  Attribution-ShareAlike 3.0 Unported (CC BY-SA 3.0,
+  https://creativecommons.org/licenses/by-sa/3.0/).
+  Source: https://commons.wikimedia.org/wiki/File:BlankMap-World.svg
+
+Operators redistributing a Lorica binary or image MUST preserve this
+attribution. The map is only used to render a country picker; no
+derivative of it appears in proxied traffic. If the CC BY-SA
+attribution requirement is incompatible with your redistribution,
+delete `lorica-dashboard/frontend/src/assets/world-map.svg` before
+building the dashboard — the picker component falls back to a plain
+text input on a missing asset.

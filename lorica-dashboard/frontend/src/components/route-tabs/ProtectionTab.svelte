@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { RouteFormState } from '../../lib/route-form';
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
+  import CountryPicker from '../CountryPicker.svelte';
 
   interface Props {
     form: RouteFormState;
@@ -116,18 +117,12 @@
 
   <div class="form-row">
     <div class="form-group" class:modified={isModified('geoip_countries')}>
-      <label for="geoip-countries">Countries <span class="hint">(ISO 3166-1 alpha-2, comma-separated)</span></label>
       {#if isImported('geoip_countries')}<span class="imported-badge">imported</span>{/if}
-      <input
-        id="geoip-countries"
-        type="text"
+      <CountryPicker
+        label="Countries"
         bind:value={form.geoip_countries}
-        placeholder="e.g. FR, DE, IT"
-        autocomplete="off"
+        hint="Click a country on the map to toggle. Codes normalised to uppercase, duplicates collapsed. Max 300 entries."
       />
-      <span class="hint">
-        Codes normalised to uppercase, duplicates collapsed. Max 300 entries.
-      </span>
     </div>
   </div>
 
@@ -277,20 +272,12 @@
 
     <div class="form-row">
       <div class="form-group" class:modified={isModified('bot_bypass_countries')}>
-        <label for="bot-bypass-countries">
-          Bypass &mdash; Countries <span class="hint">(ISO 3166-1 alpha-2, comma-separated)</span>
-        </label>
         {#if isImported('bot_bypass_countries')}<span class="imported-badge">imported</span>{/if}
-        <input
-          id="bot-bypass-countries"
-          type="text"
+        <CountryPicker
+          label="Bypass — Countries"
           bind:value={form.bot_bypass_countries}
-          placeholder="e.g. FR, DE"
-          autocomplete="off"
+          hint="Click a country on the map to allow-list it. Requires a GeoIP database loaded (Settings → Observability)."
         />
-        <span class="hint">
-          Requires a GeoIP database loaded (Settings &rarr; GeoIP).
-        </span>
       </div>
     </div>
 
@@ -319,22 +306,12 @@
 
     <div class="form-row">
       <div class="form-group" class:modified={isModified('bot_only_country')}>
-        <label for="bot-only-country">
-          <code>only_country</code> gate <span class="hint">(comma-separated, empty = disabled)</span>
-        </label>
         {#if isImported('bot_only_country')}<span class="imported-badge">imported</span>{/if}
-        <input
-          id="bot-only-country"
-          type="text"
+        <CountryPicker
+          label="only_country gate (empty = disabled)"
           bind:value={form.bot_only_country}
-          placeholder="e.g. RU, CN"
-          autocomplete="off"
+          hint="Click a country on the map to restrict the challenge to its traffic. When set, the challenge fires ONLY for these countries; everyone else passes through. Useful when protection is geo-targeted."
         />
-        <span class="hint">
-          When set, the challenge fires <strong>only</strong> for these
-          countries; everyone else passes through. Useful when protection is
-          geo-targeted.
-        </span>
       </div>
     </div>
 
