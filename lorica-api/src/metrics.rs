@@ -636,6 +636,60 @@ mod tests {
     }
 
     #[test]
+    fn test_inc_geoip_block_increments_counter() {
+        // Story 2.5 coverage: exercise the counter through its public
+        // entry point and scrape the Prometheus text format to prove
+        // the (route_id, country, mode) triple actually shows up.
+        // Use unique-per-test label values so this case does not race
+        // with other tests reading from the shared REGISTRY.
+        inc_geoip_block("metrics-test-rt", "ZZ", "denylist");
+        inc_geoip_block("metrics-test-rt", "ZZ", "denylist");
+        inc_geoip_block("metrics-test-rt", "ZZ", "allowlist");
+
+        let encoder = TextEncoder::new();
+        let families = REGISTRY.gather();
+        let mut buf = Vec::new();
+        encoder
+            .encode(&families, &mut buf)
+            .expect("test setup: encode metrics");
+        let text = String::from_utf8(buf).expect("test setup: metrics output is UTF-8");
+
+        // Both label combos must be present, and the denylist count
+        // must be 2 (two inc calls above).
+        let deny_line = text
+            .lines()
+            .find(|l| {
+                l.starts_with("lorica_geoip_block_total{")
+                    && l.contains("route_id=\"metrics-test-rt\"")
+                    && l.contains("country=\"ZZ\"")
+                    && l.contains("mode=\"denylist\"")
+            })
+            .unwrap_or_else(|| panic!("denylist counter missing. text=\n{text}"));
+        let allow_line = text
+            .lines()
+            .find(|l| {
+                l.starts_with("lorica_geoip_block_total{")
+                    && l.contains("route_id=\"metrics-test-rt\"")
+                    && l.contains("country=\"ZZ\"")
+                    && l.contains("mode=\"allowlist\"")
+            })
+            .unwrap_or_else(|| panic!("allowlist counter missing. text=\n{text}"));
+
+        let deny_val: u64 = deny_line
+            .split_whitespace()
+            .next_back()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("denylist value unparseable: {deny_line}"));
+        let allow_val: u64 = allow_line
+            .split_whitespace()
+            .next_back()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("allowlist value unparseable: {allow_line}"));
+        assert_eq!(deny_val, 2, "expected 2 denylist increments");
+        assert_eq!(allow_val, 1, "expected 1 allowlist increment");
+    }
+
+    #[test]
     fn test_bounded_labels() {
         // Simulate high-cardinality attack: many different route_ids
         // With route_id (not hostname), this is bounded by DB routes

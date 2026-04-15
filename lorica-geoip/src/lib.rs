@@ -156,16 +156,30 @@ impl GeoIpResolver {
                 other => GeoIpError::Parse { source: other },
             })?;
 
-        // Sanity-check: look up a known-non-reserved IP. 8.8.8.8 is
-        // Google DNS (US, been assigned since ~2009). A DB that
-        // claims to be country-level but returns nothing here is
-        // either corrupt or the wrong DB type.
-        let sanity_ip: IpAddr = "8.8.8.8".parse().unwrap();
-        let sanity_hit = maxminddb_lookup_country(&reader, sanity_ip);
-        if sanity_hit.is_none() {
-            return Err(GeoIpError::SanityCheck(
-                "lookup for 8.8.8.8 returned no country; DB likely wrong type or empty".into(),
-            ));
+        // Sanity-check: look up a list of well-known public IPs and
+        // a probe from the MaxMind `GeoIP2-Country-Test.mmdb` fixture
+        // so the check passes on real production DBs (DB-IP / MaxMind
+        // GeoLite2, which all index 8.8.8.8 / 1.1.1.1) AND on the
+        // open-licensed test fixture we ship in `tests-e2e-docker/`
+        // (which only indexes 214.78.120.0/22). Accept the DB as
+        // valid if ANY of the probes resolves — a DB that parses as
+        // `.mmdb` but returns None for every one of these is either
+        // empty, the wrong database type, or corrupt in a way the
+        // format parser missed.
+        let sanity_probes: &[&str] = &[
+            "8.8.8.8",         // Google DNS (US) — every real country DB
+            "1.1.1.1",         // Cloudflare (AU) — fallback if GOOG is missing
+            "214.78.120.5",    // MaxMind GeoIP2-Country-Test fixture hit (US)
+        ];
+        let any_hit = sanity_probes
+            .iter()
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .any(|ip| maxminddb_lookup_country(&reader, ip).is_some());
+        if !any_hit {
+            return Err(GeoIpError::SanityCheck(format!(
+                "no sanity probe resolved to a country (tried {}); DB likely wrong type or empty",
+                sanity_probes.join(", ")
+            )));
         }
 
         let meta = reader.metadata.clone();

@@ -185,6 +185,108 @@ mod rate_limit_tests {
     }
 }
 
+#[cfg(test)]
+mod geoip_validation_tests {
+    use super::*;
+    use lorica_config::models::{GeoIpConfig, GeoIpMode};
+
+    fn cfg(mode: GeoIpMode, countries: &[&str]) -> GeoIpConfig {
+        GeoIpConfig {
+            mode,
+            countries: countries.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn normalises_country_case() {
+        let out = validate_geoip(&cfg(GeoIpMode::Denylist, &["us", "Fr", "DE"])).unwrap();
+        assert_eq!(out.countries, vec!["US", "FR", "DE"]);
+    }
+
+    #[test]
+    fn trims_and_dedupes() {
+        // Whitespace padding + duplicate after case-folding.
+        let out = validate_geoip(&cfg(GeoIpMode::Denylist, &[" us ", "US", "fr"])).unwrap();
+        assert_eq!(out.countries, vec!["US", "FR"]);
+    }
+
+    #[test]
+    fn skips_empty_entries() {
+        let out = validate_geoip(&cfg(GeoIpMode::Denylist, &["", "US", "   "])).unwrap();
+        assert_eq!(out.countries, vec!["US"]);
+    }
+
+    #[test]
+    fn rejects_non_alpha2() {
+        match validate_geoip(&cfg(GeoIpMode::Denylist, &["USA"])) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("USA"), "msg={msg}");
+                assert!(msg.contains("alpha-2"), "msg={msg}");
+            }
+            other => panic!("expected BadRequest on 3-letter code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_digits() {
+        assert!(matches!(
+            validate_geoip(&cfg(GeoIpMode::Denylist, &["U1"])),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_allowlist_with_empty_list() {
+        // Allowlist with no countries = block everyone; must be rejected
+        // so the operator sees the mistake at API time instead of at
+        // traffic time.
+        match validate_geoip(&cfg(GeoIpMode::Allowlist, &[])) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("allowlist"), "msg={msg}");
+                assert!(msg.contains("empty"), "msg={msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_denylist_with_empty_list() {
+        // Denylist + empty = "block nobody", legal no-op (equivalent
+        // to `geoip: null`, useful when keeping the row around for
+        // quick re-enable).
+        let out = validate_geoip(&cfg(GeoIpMode::Denylist, &[])).unwrap();
+        assert_eq!(out.mode, GeoIpMode::Denylist);
+        assert!(out.countries.is_empty());
+    }
+
+    #[test]
+    fn rejects_oversize_list() {
+        // 301 distinct ASCII alpha-2 combos would exceed MAX_COUNTRIES.
+        // We cheat by generating synthetic duplicates - dedup kicks
+        // first though, so pad with distinct codes.
+        let mut long: Vec<String> = Vec::with_capacity(301);
+        for a in b'A'..=b'Z' {
+            for b in b'A'..=b'Z' {
+                if long.len() >= 301 {
+                    break;
+                }
+                long.push(format!("{}{}", a as char, b as char));
+            }
+        }
+        assert!(long.len() > 300);
+        let cfg = GeoIpConfig {
+            mode: GeoIpMode::Denylist,
+            countries: long,
+        };
+        match validate_geoip(&cfg) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("at most 300"), "msg={msg}");
+            }
+            other => panic!("expected BadRequest on oversize list, got {other:?}"),
+        }
+    }
+}
+
 /// Full JSON view of a route returned by list / get / create / update endpoints.
 #[derive(Serialize)]
 pub struct RouteResponse {

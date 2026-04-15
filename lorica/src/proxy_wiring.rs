@@ -2808,27 +2808,20 @@ impl ProxyHttp for LoricaProxy {
 
                     if let Some(ref geoip_cfg) = entry.route.geoip {
                         use lorica_config::models::GeoIpMode;
-                        let blocked = match geoip_cfg.mode {
-                            GeoIpMode::Allowlist => !geoip_cfg
-                                .countries
-                                .iter()
-                                .any(|c| c.eq_ignore_ascii_case(country.as_str())),
-                            GeoIpMode::Denylist => geoip_cfg
-                                .countries
-                                .iter()
-                                .any(|c| c.eq_ignore_ascii_case(country.as_str())),
-                        };
-                        if blocked {
+                        if geoip_cfg.blocks(country.as_str()) {
                             let mode_str = match geoip_cfg.mode {
                                 GeoIpMode::Allowlist => "allowlist",
                                 GeoIpMode::Denylist => "denylist",
                             };
                             // Prometheus counter: bounded cardinality
                             // (routes * ~240 countries * 2 modes).
-                            let route_label =
-                                ctx.route_id.as_deref().unwrap_or("_unknown");
+                            // Use `entry.route.id` directly — the
+                            // per-request `ctx.route_id` is only
+                            // assigned further down the filter (after
+                            // response_headers + auth checks) and
+                            // would show up as "_unknown" here.
                             lorica_api::metrics::inc_geoip_block(
-                                route_label,
+                                entry.route.id.as_str(),
                                 country.as_str(),
                                 mode_str,
                             );

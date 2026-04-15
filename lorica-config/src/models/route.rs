@@ -633,6 +633,33 @@ pub struct GeoIpConfig {
     pub countries: Vec<String>,
 }
 
+impl GeoIpConfig {
+    /// Decide whether a given `country` (ISO 3166-1 alpha-2, any case)
+    /// should be blocked by this filter. Pure / side-effect-free so
+    /// the request filter can call it directly and unit tests can
+    /// exhaustively exercise the allow / deny branches without
+    /// standing up a proxy session.
+    ///
+    /// Semantics:
+    /// - Allowlist: country MUST appear in `self.countries`; miss = block.
+    /// - Denylist:  country MUST NOT appear in `self.countries`; hit = block.
+    ///
+    /// Case-insensitive: the persisted form is already uppercased by
+    /// API validation but callers that get the country from another
+    /// source (GeoIP DB reader returns uppercase ISO codes too) still
+    /// get consistent behaviour if the comparison arms diverge.
+    pub fn blocks(&self, country: &str) -> bool {
+        let matched = self
+            .countries
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(country));
+        match self.mode {
+            GeoIpMode::Allowlist => !matched,
+            GeoIpMode::Denylist => matched,
+        }
+    }
+}
+
 impl Route {
     /// Return a clone of this route with any `Some(_)` field of `rule`
     /// merged on top (cache, rate-limit, headers, redirect, return
@@ -719,4 +746,75 @@ fn default_slowloris_threshold_ms() -> i32 {
 
 fn default_auto_ban_duration_s() -> i32 {
     3600
+}
+
+#[cfg(test)]
+mod geoip_config_tests {
+    use super::{GeoIpConfig, GeoIpMode};
+
+    fn cfg(mode: GeoIpMode, countries: &[&str]) -> GeoIpConfig {
+        GeoIpConfig {
+            mode,
+            countries: countries.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn denylist_blocks_listed_country() {
+        let c = cfg(GeoIpMode::Denylist, &["US", "CN"]);
+        assert!(c.blocks("US"));
+        assert!(c.blocks("CN"));
+    }
+
+    #[test]
+    fn denylist_passes_unlisted_country() {
+        let c = cfg(GeoIpMode::Denylist, &["US", "CN"]);
+        assert!(!c.blocks("FR"));
+        assert!(!c.blocks("JP"));
+    }
+
+    #[test]
+    fn allowlist_passes_listed_country() {
+        let c = cfg(GeoIpMode::Allowlist, &["FR", "DE"]);
+        assert!(!c.blocks("FR"));
+        assert!(!c.blocks("DE"));
+    }
+
+    #[test]
+    fn allowlist_blocks_unlisted_country() {
+        let c = cfg(GeoIpMode::Allowlist, &["FR", "DE"]);
+        assert!(c.blocks("US"));
+        assert!(c.blocks("CN"));
+    }
+
+    #[test]
+    fn case_insensitive_match() {
+        // The GeoIP reader returns uppercase codes and the API
+        // validator uppercases on write, but this guarantees callers
+        // that somehow pass lowercase still get consistent behaviour.
+        let c = cfg(GeoIpMode::Denylist, &["US"]);
+        assert!(c.blocks("us"));
+        assert!(c.blocks("uS"));
+        assert!(c.blocks("Us"));
+    }
+
+    #[test]
+    fn denylist_with_empty_list_passes_everything() {
+        // Legal no-op, kept as a shape so the route can be toggled
+        // on quickly by adding entries later.
+        let c = cfg(GeoIpMode::Denylist, &[]);
+        assert!(!c.blocks("US"));
+        assert!(!c.blocks("FR"));
+    }
+
+    #[test]
+    fn allowlist_with_empty_list_blocks_everything() {
+        // API validation rejects this shape at write time; the
+        // runtime would still have to cope if a migration or manual
+        // edit bypasses the API. Verifies the safe-by-default
+        // behaviour.
+        let c = cfg(GeoIpMode::Allowlist, &[]);
+        assert!(c.blocks("US"));
+        assert!(c.blocks("FR"));
+    }
 }
