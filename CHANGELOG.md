@@ -11,6 +11,7 @@ Author: Rwx-G
 
 ### Fixed
 
+- Bot-protection `/lorica/bot/solve` endpoint mis-rejected solutions with 403 when the client was reached via a trusted proxy (v1.4.0 Epic 3 follow-up surfaced by the `bot` E2E profile). The challenge-render path unwrapped X-Forwarded-For and stashed the pending entry's IP prefix under the resolved client's /24 or /64, but the cross-cutting `/lorica/bot/solve` interception read the raw TCP client address. The stashed prefix and the solve-time prefix did not match, so the "client network changed" guard fired on every legitimate solve. The interception now runs the same XFF-trust check as `request_filter` proper (direct TCP client ∈ `trusted_proxies` → honour the leftmost XFF entry).
 - `lorica_geoip_block_total` Prometheus counter label `route_id` was always `_unknown` in worker mode and often `_unknown` in single-process (v1.4.0 Epic 2 follow-up surfaced by the new `geoip` E2E profile). The counter callsite in `proxy_wiring::request_filter` read `ctx.route_id` which is only populated further down the filter (after response-headers, forward-auth, etc.), so a GeoIP rejection always fired with the unset fallback. Switched to `entry.route.id` which is already bound in scope at the point the rule evaluates
 - GeoIP DB sanity check was too strict for test fixtures (v1.4.0 Epic 2 follow-up). `load_from_path` rejected any `.mmdb` where `8.8.8.8` did not resolve, which blocked the MaxMind open-licensed test fixture we ship in `tests-e2e-docker/fixtures/`. The check now tries a list of probes (8.8.8.8, 1.1.1.1, and a known-hit from the MaxMind test fixture) and accepts the DB if ANY of them resolves — strict enough to reject an empty / wrong-type DB, permissive enough to accept test databases that index a partial IPv4 space
 - OTLP HTTP exporter endpoint composition (v1.4.0 Epic 1 follow-up to story 1.4a). opentelemetry-otlp 0.31 does not auto-suffix the signal path onto `with_endpoint(base_url)` for HTTP transports — the POST lands on `/` and Jaeger / Tempo / the OTel collector all reply 404. `lorica::otel::init` now appends `/v1/traces` when the configured `otlp_endpoint` does not already include it, so operators can paste the base URL from their collector and still get spans through. gRPC transport is unchanged (the path is implicit in the proto definition).
@@ -120,6 +121,28 @@ Author: Rwx-G
   containing `"` cannot escape the attribute context. 11 unit
   tests cover escaping, field propagation, optional contact-line
   rendering, difficulty-dependent hint text, and UTF-8 declaration
+- **Bot-protection E2E Docker smoke + TESTING-GUIDE section 20**
+  (v1.4.0 Epic 3, stories 3.9 + 3.10). New docker-compose `bot`
+  profile with a `lorica-bot` container (default features, GeoIP
+  fixture mounted so the country-bypass resolves for known test
+  IPs) and a `bot-smoke` test-runner. 30 assertions on a real
+  Docker run, green end-to-end: Cookie mode (challenge page +
+  Set-Cookie + passthrough-on-replay), JavaScript PoW (mine at
+  difficulty 14 via a `python3` helper embedded in the shell
+  script, POST nonce+counter to `/lorica/bot/solve`, 302 +
+  Set-Cookie, passthrough on replay, wrong-counter replay is
+  rejected with 403), Captcha (page renders with an
+  `/lorica/bot/captcha/{nonce}` image URL, `Content-Type:
+  image/png`, unknown nonce returns 404), all three functional
+  bypass categories (IP CIDR, country, UA regex), the
+  `only_country` inverse gate, and the Prometheus counter
+  increments across the `{shown, passed, bypassed}` outcomes.
+  TESTING-GUIDE section 20 walks through each mode with copy-
+  pasteable curl + python recipes, lists the metrics to watch,
+  and documents the four v1.4.0 limitations (ASN / rDNS deferred,
+  cross-worker stash per-worker, HMAC rotation on cert renewal
+  not yet auto-wired, rDNS-without-forward-confirm explicitly
+  marked as a must-not regression)
 - **Dashboard Bot Protection tab section** (v1.4.0 Epic 3, story
   3.8). Under Routes &rarr; Protection, below the GeoIP filter:
   a toggle switch to enable / disable per route, a mode dropdown

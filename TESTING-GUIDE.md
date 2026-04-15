@@ -531,3 +531,149 @@ attribute.
 - DB-IP Lite Country attribution lives in `NOTICE` per CC-BY 4.0
   requirements. Commercial deployments that redistribute the
   Lorica binary must preserve that attribution.
+
+---
+
+## 20. Bot protection (v1.4.0 Epic 3)
+
+Three graded challenge modes, self-hosted, no third-party
+dependency:
+
+- **Cookie** (passive): renders a `meta http-equiv="refresh"`
+  page that sets a verdict cookie. Catches casual scripts that
+  don't persist cookies. Zero UX cost for real browsers.
+- **JavaScript** (SHA-256 proof-of-work): default mode. ~50 ms to
+  ~12 s of client CPU depending on the difficulty setting.
+- **Captcha**: PNG image + text-input form. Human interaction
+  required; the mode of last resort.
+
+Evaluated after GeoIP, before forward_auth. Five-category bypass
+matrix (IP CIDR, country, User-Agent regex — plus ASN and rDNS
+placeholders deferred to a post-v1.4.0 follow-up). Optional
+`only_country` inverse gate that fires the challenge ONLY for the
+listed countries.
+
+**Enable per route in 90 seconds:**
+
+```bash
+# Assume you have a route (replace ROUTE_ID + session cookie below).
+ROUTE_ID=...
+SESS=...
+
+# Pick JavaScript mode with the default difficulty of 18
+# (~800 ms median solve on desktop).
+curl -s -b "$SESS" \
+  -X PUT "https://lorica.local:9443/api/v1/routes/$ROUTE_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bot_protection": {
+      "mode": "javascript",
+      "cookie_ttl_s": 86400,
+      "pow_difficulty": 18,
+      "captcha_alphabet": "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ",
+      "bypass": {
+        "ip_cidrs": ["10.0.0.0/8"],
+        "user_agents": ["(?i)googlebot|bingbot"]
+      }
+    }
+  }'
+```
+
+The dashboard Protection tab exposes the same fields with a
+slider for PoW difficulty and a live "expected median solve
+time" hint.
+
+**Test all three modes from a shell:**
+
+A good way to check the proxy is wired end-to-end is to drive
+each mode with `curl` + `python3` (the ready-made Docker smoke is
+at `tests-e2e-docker/test-runner/run-bot-smoke.sh` — 30
+assertions covering all three modes, the bypass matrix, the
+Prometheus counter, and the captcha image endpoint).
+
+### Cookie mode
+
+```bash
+curl -sv -c jar.txt -H "Host: my-route.local" http://localhost:8080/
+# Look for `Set-Cookie: lorica_bot_verdict=...` in the response.
+curl -sv -b jar.txt -H "Host: my-route.local" http://localhost:8080/
+# Second request passes through to the backend.
+```
+
+### JavaScript mode
+
+```bash
+# Fetch the challenge page + extract the nonce + difficulty.
+PAGE=$(curl -s -H "Host: my-route.local" http://localhost:8080/)
+NONCE=$(echo "$PAGE" | grep -oP 'NONCE_HEX = "\K[0-9a-f]+')
+DIFF=$(echo "$PAGE" | grep -oP 'DIFFICULTY = \K\d+')
+
+# Mine the PoW counter. At difficulty 18 this is ~800 ms on x86.
+COUNTER=$(python3 - "$NONCE" "$DIFF" <<'PY'
+import hashlib, sys
+nonce, diff = sys.argv[1], int(sys.argv[2])
+full, rem = diff // 8, diff % 8
+mask = (0xFF << (8 - rem)) & 0xFF if rem else 0
+for c in range(0, 1 << 30):
+    d = hashlib.sha256((nonce + str(c)).encode()).digest()
+    if all(b == 0 for b in d[:full]):
+        if rem == 0 or (d[full] & mask) == 0:
+            print(c); break
+PY
+)
+
+# Submit. Expect 302 + Set-Cookie.
+curl -si -c jar.txt -X POST \
+  -H "Host: my-route.local" \
+  -d "nonce=$NONCE&counter=$COUNTER" \
+  http://localhost:8080/lorica/bot/solve
+```
+
+### Captcha mode
+
+A shell cannot solve a real image captcha. Drive the endpoint
+manually (or in Selenium / Playwright) to complete the loop;
+the smoke test validates only the render + image-serve + nonce
+handling pieces mechanically.
+
+**Metrics to watch:**
+
+```
+lorica_bot_challenge_total{route_id, mode, outcome}
+# outcome ∈ { shown | passed | failed | bypassed }.
+```
+
+**OTel span attributes** (on every request):
+
+- `bot_protection.challenge.outcome` — same labels as the counter.
+- `bot_protection.challenge.mode` — cookie / javascript / captcha.
+- `bot_protection.challenge.reason` — `valid_cookie` / `bypass_ip`
+  / `bypass_country` / `bypass_ua` / `only_country_miss`. Finer
+  grain than the Prometheus counter so Jaeger / Tempo can break
+  down the `bypassed` bucket without inflating the metric's
+  cardinality.
+
+**Known limitations for v1.4.0:**
+
+- **ASN bypass** and **rDNS bypass** are rejected by the API
+  validator with "not yet supported". Both need infrastructure
+  (ASN DB + forward-confirmation DNS pipeline) that did not land
+  in v1.4.0. Three out of five bypass categories are functional:
+  `ip_cidrs`, `countries`, `user_agents`. Tracked as v1.4.x
+  follow-ups; the schema is already in place so the next story
+  ships without a migration.
+- **Cross-worker pending-challenge stash** is per-worker.
+  A client that hits worker A for the challenge and worker B for
+  the solve gets a fresh challenge (minor UX cost: one extra
+  round trip). Front multi-worker Lorica with a sticky-session
+  load balancer if this matters. Full cross-worker stash is a
+  v1.4.x follow-up via an extended `VerdictCacheEngine::Rpc`.
+- **HMAC secret rotation on cert renewal** is wired at the
+  reload-hook level but the cert-renewal path itself does not
+  call `rotate_bot_hmac_secret` yet. First-boot generate +
+  persist works; explicit rotation is a v1.4.x UI addition.
+- **rDNS without forward confirmation** is a documented
+  backdoor — an rDNS-bypass implementation that skips forward
+  confirm would be a regression. The `bypass.rdns` field stays
+  in the model so the follow-up ships without a schema change,
+  but the API rejects non-empty lists in the meantime.

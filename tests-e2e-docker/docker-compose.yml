@@ -271,17 +271,57 @@ services:
     networks:
       - e2e
 
+  # ---- Bot-protection E2E (v1.4.0 Epic 3 story 3.9) -------------------
+  # Runs the default Lorica image; the smoke drives everything over
+  # the management API (trusted_proxies + geoip_db_path + route
+  # creation). The geoip test fixture is mounted so the
+  # country-based bypass match resolves for the known-US IP the
+  # smoke uses.
+  lorica-bot:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["bot"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-bot-data:/var/lib/lorica
+      - shared-bot:/shared
+      - ./fixtures/GeoIP2-Country-Test.mmdb:/var/lib/lorica/geoip-test.mmdb:ro
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  bot-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["bot"]
+    entrypoint: ["bash", "run-bot-smoke.sh"]
+    depends_on:
+      - lorica-bot
+    volumes:
+      - shared-bot:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-bot:9443
+      - LORICA_PROXY=http://lorica-bot:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
   lorica-otel-data:
   lorica-otel-workers-data:
   lorica-geoip-data:
+  lorica-bot-data:
   shared:
   shared-workers:
   shared-otel:
   shared-otel-workers:
   shared-geoip:
+  shared-bot:
 
 networks:
   e2e:

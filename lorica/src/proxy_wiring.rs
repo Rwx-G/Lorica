@@ -2008,10 +2008,36 @@ impl ProxyHttp for LoricaProxy {
         {
             let path = session.req_header().uri.path().to_string();
             if crate::bot::is_bot_solve_path(&path) {
-                let client_ip = session
+                // Client IP must go through the SAME XFF unwrap that
+                // the challenge-render path used; otherwise the
+                // stashed entry's IP prefix (XFF-unwrapped) won't
+                // match the current TCP client's prefix and the
+                // handler rejects with 403 "client network changed".
+                // Duplicates the xff_used logic from the main
+                // request_filter block below, because that block is
+                // skipped entirely when we take this early return.
+                let config = self.config.load();
+                let tcp_ip = session
                     .client_addr()
                     .and_then(|addr| addr.as_inet())
                     .map(|a| a.ip());
+                let xff_header = session
+                    .req_header()
+                    .headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok());
+                let direct_is_trusted = tcp_ip.is_some_and(|ip| {
+                    config.trusted_proxies.iter().any(|net| net.contains(&ip))
+                });
+                let client_ip = if direct_is_trusted {
+                    xff_header
+                        .and_then(|xff| {
+                            xff.split(',').next().unwrap_or(xff).trim().parse().ok()
+                        })
+                        .or(tcp_ip)
+                } else {
+                    tcp_ip
+                };
                 let now_secs = chrono::Utc::now().timestamp();
                 let secret = lorica_challenge::secret::handle();
                 let secret_ref = secret.as_deref();

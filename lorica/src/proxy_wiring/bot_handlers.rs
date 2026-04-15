@@ -86,6 +86,7 @@ pub async fn handle_solve(
         // consumed (replay attempt) or never existed. The response
         // does not distinguish the two so a scanner cannot probe
         // for valid nonces.
+        debug!(nonce = %nonce, "bot-solve: no stashed entry for nonce");
         return write_plain(session, 403, "challenge expired or unknown").await;
     };
 
