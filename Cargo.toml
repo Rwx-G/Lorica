@@ -28,6 +28,7 @@ members = [
     "lorica-notify",
     "lorica-bench",
     "lorica-geoip",
+    "lorica-challenge",
 ]
 
 exclude = ["fuzz"]

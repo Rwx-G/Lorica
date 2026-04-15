@@ -34,6 +34,47 @@ Author: Rwx-G
 - Log / trace correlation assertion in `run-otel-smoke.sh` (v1.4.0 Epic 1 story 1.5 coverage). New `entrypoint-otel.sh` tees Lorica's JSON log to `/shared/lorica.log`; after the traced request fires, the smoke greps for the client's W3C `trace_id` in the log, proving the `span.record("trace_id", ...)` on the `http_request` root span flattens into the fmt layer's JSON output. Without this assertion, earlier smokes would have regressed silently if the fmt layer was ever refactored to drop span fields
 - OTel log/trace correlation check in the smoke is non-destructive when the log file is missing (soft fail with diagnostic tail) so an operator debugging a compose file typo sees useful context instead of a cryptic grep miss
 - Unit tests for `GeoIpConfig::blocks()` (7 cases) extracted into `lorica-config` so the allowlist / denylist decision rule is directly verifiable without a proxy session; `request_filter` now calls the extracted method instead of inlining the match. Unit tests for the API validator `validate_geoip` (8 cases covering case normalisation, trimming, dedup, alpha-2 enforcement, oversize-list cap, and the allowlist-must-be-non-empty rule). Unit test for `inc_geoip_block` that exercises the Prometheus counter through the public API and scrapes the text format to prove the `(route_id, country, mode)` triple shows up with the expected count. HTTP mock integration tests for `lorica_geoip::updater::run_once` covering the 404, `TooSmall`, `TooLarge`, and `Validation` error branches (uses a minimal `std::net::TcpListener` server in a worker thread — no new dev-deps beyond extending `tokio` with `net` + `rt-multi-thread`)
+- **Bot-protection design doc** (v1.4.0 Epic 3, story 3.1) at
+  `docs/architecture/bot-protection.md`. Specifies the three graded
+  challenge modes (Cookie, JavaScript PoW, image captcha), the
+  HMAC-signed verdict cookie wire format (route_id + /24 v4 or /64
+  v6 IP prefix + expires_at + mode, 41 or 46 bytes before base64url),
+  the PoW algorithm (SHA-256 over `hex_nonce || counter_decimal`
+  with 14–22 configurable leading zero bits), the captcha alphabet
+  defaults, the five-category bypass matrix (IP CIDRs, ASNs,
+  countries, User-Agent regex, rDNS with forward confirmation),
+  the `only_country` inverse gate, the HMAC secret lifecycle
+  (rotated on each cert renewal so cookie validity is capped at
+  the cert TTL), and the exact request-filter placement (after
+  GeoIP, before forward_auth). Includes an in-scope / out-of-scope
+  threat model and an implementation-checklist that maps 1:1 to the
+  remaining stories
+- **`lorica-challenge` crate** (v1.4.0 Epic 3, story 3.2). New
+  workspace member with three modules: `cookie` (HMAC-SHA256 sign /
+  verify with `subtle::ConstantTimeEq` on the tag, ± 30 s clock-skew
+  grace at verify time, deterministic wire size 41 / 46 bytes before
+  base64url — size pinned by tests), `pow` (`Challenge::new` with
+  mandatory difficulty bound 14..=22, hex-encoded 16-byte nonce,
+  `verify_solution` with O(1) SHA-256 check + bit-mask comparison,
+  plus test-only `mine` for reproducible round-trip tests),
+  `captcha` (image generation via the pure-Rust `captcha = "1.0"`
+  crate with a curated alphabet that excludes both visual confusables
+  `0/O/1/l/I` and the glyphs the default font cannot render `L/o`;
+  verify is case-insensitive with constant-time compare), and
+  `secret` (process-wide HMAC-SHA256 key in `ArcSwap<Option<Arc<[u8;
+  32]>>>`, hot-swappable via `rotate`, generated from `OsRng` via
+  `generate`). 52 unit tests covering every public boundary: HMAC
+  forgery attempts (flipped payload byte, flipped tag byte, wrong
+  secret), length and discriminator validation, NAT-tolerance
+  semantics (same /24 or /64 still validates), expiry grace, PoW
+  off-by-one, bit-mask behaviour across byte boundaries, captcha
+  alphabet rules, mismatch detection, and RNG non-determinism. No
+  `unwrap` on any user-reachable path. Dep footprint: RustCrypto
+  (hmac 0.12 + sha2 0.10 + subtle 2), base64 0.22, rand 0.8,
+  arc-swap 1, once_cell 1, captcha 1.0 (which pulls image + lodepng
+  for PNG encoding); all version-pinned to match the existing
+  `Cargo.lock` transitive resolution so the workspace does not pull
+  two copies of anything
 - Criterion microbenchmark suite for the OTel hot path (`cargo bench --bench otel_overhead`): three groups (`otel_traceparent`, `otel_active_span`, `otel_per_request`) cover the six atomic operations that every request touches (parse valid / malformed traceparent, synthesise from request_id, derive child traceparent, serialise wire format, span creation / is_recording / end / set_str / set_i64 / set_status) plus two end-to-end scenarios that aggregate the full OTel touch-points a single request incurs. Runs under both default and `--features otel` so operators can quantify the cost of compiling the feature in without installing a real provider. Reference numbers (Docker `rust:1-bookworm`, bench profile, 30-sample criterion run): `parse_valid` 77 ns / 76 ns (-0.8 % under `otel`), `parse_malformed` 31 ns / 29 ns (-5.6 %), `synthesise_from_request_id` 140 ns / 150 ns (+7.0 %), `child_from_parent` 123 ns / 132 ns (+7.8 %), `to_header_value` 99 ns / 91 ns (-9.0 %), `empty_construction` 23 ps / near-ZST. Aggregate per-request OTel touch-point budget stays under 500 ns with the feature off (W3C parse + child + serialise + ZST span ops) and under 600 ns with the feature on but no provider installed — well within the ROADMAP-stated "< 2 % proxy overhead at sampling 0.1" target. Exercised by CI as part of the standard bench harness (criterion 0.5) alongside the existing `circuit_breaker` and `canary_bucket` benches
 
 ## [1.3.0] - 2026-04-14
