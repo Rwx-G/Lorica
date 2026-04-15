@@ -3330,3 +3330,378 @@ async fn test_workers_with_metrics() {
     assert_eq!(workers[0]["pid"], 12345);
     assert_eq!(workers[0]["healthy"], serde_json::json!(true));
 }
+
+// ---------------------------------------------------------------------------
+// Bot-protection clear semantics: `bot_protection_disable: true` must remove
+// an existing config, since the axum JSON layer cannot distinguish absent
+// from null so a null-clear scheme would be ambiguous. See crud.rs comment
+// on `bot_protection_disable` for the design rationale.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_update_route_bot_protection_disable_clears_existing_config() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // 1. Create a route.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "hostname": "bot-disable.example.com" });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/routes")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    let route_id = json["data"]["id"].as_str().expect("test setup").to_string();
+
+    // 2. PUT a bot_protection config on it (install path).
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "bot_protection": {
+            "mode": "javascript",
+            "cookie_ttl_s": 3600,
+            "pow_difficulty": 18,
+            "captcha_alphabet": "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ",
+        }
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/routes/{route_id}"))
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    assert_eq!(json["data"]["bot_protection"]["mode"], "javascript");
+
+    // 3. PUT `bot_protection_disable: true` with no config: must clear.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "bot_protection_disable": true });
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/routes/{route_id}"))
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    assert!(
+        json["data"]["bot_protection"].is_null(),
+        "bot_protection must be null after disable: got {}",
+        json["data"]["bot_protection"]
+    );
+}
+
+#[tokio::test]
+async fn test_update_route_bot_protection_disable_wins_over_concurrent_config() {
+    // Contract: when BOTH `bot_protection_disable: true` AND a
+    // `bot_protection` body are sent in the same PUT, disable wins.
+    // Rationale: the combination is a client bug; picking either
+    // side predictably is better than guessing. crud.rs:1740 uses
+    // if/else-if so `disable` is checked first.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "hostname": "bot-disable-wins.example.com" });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/routes")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    let route_id = json["data"]["id"].as_str().expect("test setup").to_string();
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "bot_protection_disable": true,
+        "bot_protection": {
+            "mode": "captcha",
+            "cookie_ttl_s": 3600,
+            "pow_difficulty": 18,
+            "captcha_alphabet": "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ",
+        }
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/routes/{route_id}"))
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    assert!(
+        json["data"]["bot_protection"].is_null(),
+        "disable must win over concurrent config: got {}",
+        json["data"]["bot_protection"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HMAC rotation wiring: the certificate-renewal handlers call
+// `AppState::rotate_bot_hmac_on_cert_event`, which must write a new
+// 32-byte (64-hex-char) secret to `global_settings.bot_hmac_secret_hex`.
+// This test exercises the rotation entry point directly and asserts
+// the persisted hex changes. The in-memory install (ArcSwap) is the
+// responsibility of `lorica::reload::apply_bot_secret_from_store` and
+// is covered by its own unit tests in the `lorica` crate.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_rotate_bot_hmac_persists_new_hex_secret() {
+    let (state, _session_store, _rate_limiter) = test_state().await;
+
+    // Seed a known starting secret so we can assert rotation changed it.
+    let initial_hex = "a".repeat(64);
+    {
+        let s = state.store.lock().await;
+        let mut cur = s.get_global_settings().expect("test setup");
+        cur.bot_hmac_secret_hex = initial_hex.clone();
+        s.update_global_settings(&cur).expect("test setup");
+    }
+
+    // Rotate.
+    state.rotate_bot_hmac_on_cert_event().await;
+
+    // Verify the hex changed and is 64 chars of lowercase hex.
+    let s = state.store.lock().await;
+    let new_hex = s
+        .get_global_settings()
+        .expect("test setup")
+        .bot_hmac_secret_hex;
+    drop(s);
+    assert_ne!(
+        new_hex, initial_hex,
+        "rotation must produce a different secret"
+    );
+    assert_eq!(new_hex.len(), 64, "rotated secret must be 64 hex chars");
+    assert!(
+        new_hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "rotated secret must be valid hex: {new_hex}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OTel collector reachability probe: the dashboard "Test connection"
+// button POSTs to /api/v1/settings/otel/test, which reports whether
+// the persisted otlp_endpoint accepts a connection. Cover three cases:
+//   - endpoint set + mock HTTP server running = {ok: true}
+//   - endpoint set + nothing listening on the port = {ok: false}
+//   - endpoint unset = {ok: false} with the "save a URL first" hint
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_otel_connection_endpoint_unset_returns_save_first_message() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/settings/otel/test")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["ok"], serde_json::json!(false));
+    let msg = json["data"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("otlp_endpoint is not set"),
+        "unexpected message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_otel_connection_reachable_when_mock_server_responds() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Spawn a minimal HTTP/1.1 server on a random local port. It
+    // reads until the blank-line end of headers, then replies 202.
+    // The test_otel_connection probe posts with an empty body +
+    // Content-Length: 0, so "headers only" is enough to serve it.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("test setup");
+    let addr = listener.local_addr().expect("test setup");
+    let _server = tokio::spawn(async move {
+        // One connection is enough for one probe.
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            // Read until we see "\r\n\r\n" or the peer half-closes.
+            let mut total = Vec::new();
+            loop {
+                let n = match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                total.extend_from_slice(&buf[..n]);
+                if total.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if total.len() > 16_384 {
+                    break;
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Persist the mock server as the OTLP endpoint. The probe path
+    // appends /v1/traces for http-proto, which our dummy server
+    // ignores — it answers any path.
+    {
+        let s = state.store.lock().await;
+        let mut cur = s.get_global_settings().expect("test setup");
+        cur.otlp_endpoint = Some(format!("http://{addr}"));
+        cur.otlp_protocol = "http-proto".to_string();
+        s.update_global_settings(&cur).expect("test setup");
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/settings/otel/test")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(
+        json["data"]["ok"],
+        serde_json::json!(true),
+        "mock server must look reachable: {json}"
+    );
+    let msg = json["data"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("reachable"),
+        "expected 'reachable' in message: {msg}"
+    );
+    assert!(
+        json["data"]["latency_ms"].is_u64(),
+        "latency_ms must be a number: {json}"
+    );
+}
+
+#[tokio::test]
+async fn test_otel_connection_unreachable_when_port_is_dead() {
+    // Bind and immediately drop to reserve a port number that we
+    // KNOW nothing is listening on. Racing another test for this
+    // port is fine: the assertion is on "ok: false", which holds
+    // regardless of which process eventually wins the port.
+    let addr = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test setup");
+        listener.local_addr().expect("test setup")
+    };
+
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    {
+        let s = state.store.lock().await;
+        let mut cur = s.get_global_settings().expect("test setup");
+        cur.otlp_endpoint = Some(format!("http://{addr}"));
+        cur.otlp_protocol = "http-proto".to_string();
+        s.update_global_settings(&cur).expect("test setup");
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/settings/otel/test")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["ok"], serde_json::json!(false));
+    let msg = json["data"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("unreachable"),
+        "expected 'unreachable' in message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_bot_hmac_is_non_deterministic_across_calls() {
+    // Two back-to-back rotations on the same state must produce two
+    // different secrets — the rotation path pulls fresh bytes from
+    // `rand::rngs::OsRng`, so a collision here means the CSPRNG call
+    // was accidentally swapped for a deterministic generator.
+    let (state, _session_store, _rate_limiter) = test_state().await;
+
+    state.rotate_bot_hmac_on_cert_event().await;
+    let first = {
+        let s = state.store.lock().await;
+        s.get_global_settings()
+            .expect("test setup")
+            .bot_hmac_secret_hex
+    };
+
+    state.rotate_bot_hmac_on_cert_event().await;
+    let second = {
+        let s = state.store.lock().await;
+        s.get_global_settings()
+            .expect("test setup")
+            .bot_hmac_secret_hex
+    };
+
+    assert_ne!(first, second);
+}

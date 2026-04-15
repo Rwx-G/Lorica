@@ -357,6 +357,73 @@ services:
     networks:
       - e2e
 
+  # ---- rDNS bypass E2E (v1.4.0 Epic 3 follow-up) ---------------------
+  # Exercises the bot-protection `bypass.rdns` category with
+  # forward-confirmed PTR matching. Lorica's hickory-resolver is
+  # re-pointed at the `dnsmasq` sidecar at entrypoint time so the
+  # test zone from fixtures/dnsmasq-rdns.conf resolves. The smoke
+  # asserts:
+  #   - PTR-matched + forward-confirmed client bypasses the challenge.
+  #   - PTR-matched but forward-spoofed client DOES NOT bypass (the
+  #     forward-confirm step protects against hostile resolvers).
+  #
+  # Run with:
+  #   docker compose --profile rdns up --build
+  #   docker compose --profile rdns run --rm rdns-smoke
+  dnsmasq:
+    image: strm/dnsmasq:latest
+    profiles: ["rdns"]
+    # dnsmasq needs NET_ADMIN to bind UDP/53 in some container
+    # runtimes. NET_BIND_SERVICE is the narrower cap when available.
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./fixtures/dnsmasq-rdns.conf:/etc/dnsmasq.conf:ro
+    command: ["-k", "--log-facility=-", "--conf-file=/etc/dnsmasq.conf"]
+    networks:
+      - e2e
+
+  lorica-rdns:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-rdns.sh"]
+    profiles: ["rdns"]
+    # entrypoint writes /etc/resolv.conf before lorica starts; that
+    # requires root for this profile only. The bot-protection
+    # process itself is still unprivileged — the entrypoint sets
+    # resolv.conf and then `lorica` runs as root in the test image
+    # (fine for E2E; production .deb installs still drop privs).
+    user: "0:0"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-rdns-data:/var/lib/lorica
+      - shared-rdns:/shared
+    depends_on:
+      - backend1
+      - dnsmasq
+    networks:
+      - e2e
+
+  rdns-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["rdns"]
+    entrypoint: ["bash", "run-rdns-smoke.sh"]
+    depends_on:
+      - lorica-rdns
+      - dnsmasq
+    volumes:
+      - shared-rdns:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-rdns:9443
+      - LORICA_PROXY=http://lorica-rdns:8080
+      - BACKEND1_ADDR=backend1:80
+      - DNSMASQ_ADDR=dnsmasq:53
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
@@ -365,6 +432,7 @@ volumes:
   lorica-geoip-data:
   lorica-bot-data:
   lorica-bot-workers-data:
+  lorica-rdns-data:
   shared:
   shared-workers:
   shared-bot-workers:
@@ -372,6 +440,7 @@ volumes:
   shared-otel-workers:
   shared-geoip:
   shared-bot:
+  shared-rdns:
 
 networks:
   e2e:

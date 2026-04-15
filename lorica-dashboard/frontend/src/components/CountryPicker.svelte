@@ -4,6 +4,11 @@
   // map is bundled INTO the dashboard asset pipeline so the .deb
   // carries it by default — no runtime fetch, no CDN.
   import worldMapUrl from '../assets/world-map.svg?url';
+  import {
+    parseCountryValue,
+    findIsoCodeInAncestry,
+    toggleCountry,
+  } from '../lib/country-picker';
 
   interface Props {
     /// Bound value: comma-separated list of ISO 3166-1 alpha-2
@@ -30,22 +35,9 @@
   // when the country is tiny like Malta).
   let search = $state('');
 
-  function parse(v: string): Set<string> {
-    return new Set(
-      v
-        .split(/[,\s]+/)
-        .map((s) => s.trim().toUpperCase())
-        .filter((s) => s.length === 2)
-    );
-  }
-
-  function serialize(s: Set<string>): string {
-    return Array.from(s).sort().join(', ');
-  }
-
   // Externally-driven value changes -> rebuild selection Set.
   $effect(() => {
-    const incoming = parse(value);
+    const incoming = parseCountryValue(value);
     if (selected.size !== incoming.size ||
         ![...selected].every((c) => incoming.has(c))) {
       selected = incoming;
@@ -72,37 +64,18 @@
 
   function handleClick(e: MouseEvent) {
     const target = e.target as SVGElement;
-    // Walk up to the nearest element with an `id` attribute — the
-    // Wikimedia map nests small islands inside `<g id="XX">`
-    // groups, so a click on the child `<path>` still hits the
-    // country group on ancestor traversal.
-    let cur: Element | null = target;
-    let iso = '';
-    while (cur && cur !== svgContainer) {
-      const id = cur.getAttribute?.('id') ?? '';
-      if (id.length === 2) {
-        iso = id.toUpperCase();
-        break;
-      }
-      cur = cur.parentElement;
-    }
+    const iso = findIsoCodeInAncestry(target, svgContainer ?? null);
     if (!iso) return;
-    const next = new Set(selected);
-    if (next.has(iso)) {
-      next.delete(iso);
-    } else {
-      next.add(iso);
-    }
+    const { next, csv } = toggleCountry(selected, iso);
     selected = next;
-    value = serialize(next);
+    value = csv;
     applyHighlights();
   }
 
   function removeChip(iso: string) {
-    const next = new Set(selected);
-    next.delete(iso);
+    const { next, csv } = toggleCountry(selected, iso);
     selected = next;
-    value = serialize(next);
+    value = csv;
     applyHighlights();
   }
 

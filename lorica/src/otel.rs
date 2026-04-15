@@ -397,6 +397,84 @@ mod imp {
 
 pub use imp::{init, shutdown};
 
+#[cfg(all(test, feature = "otel"))]
+mod shutdown_tests {
+    //! Lifecycle coverage for the `imp::shutdown` path that the
+    //! supervisor drain hook calls right before the runtime drops
+    //! (see `main.rs` for the SIGTERM handler). The contract is:
+    //!
+    //! - `shutdown()` without a prior `init()` is a legal no-op (the
+    //!   supervisor path MUST tolerate the "otel feature on, endpoint
+    //!   never configured" case).
+    //! - `shutdown()` after a successful `init()` drops the provider
+    //!   so a subsequent `init()` rebuilds from scratch.
+    //! - `shutdown()` is idempotent: calling it twice in a row does
+    //!   not panic.
+    //!
+    //! The full batch-exporter flush contract is covered by the Jaeger
+    //! E2E smoke (`run-otel-smoke.sh`) which observes spans landing
+    //! in the collector AFTER the proxy process was signalled. This
+    //! module keeps the contract honest at unit-test time so a
+    //! refactor of the shutdown path does not regress the flush
+    //! guarantee unnoticed until the E2E profile runs.
+
+    use super::{imp, OtelConfig, OtlpProtocol};
+
+    fn dummy_cfg(endpoint: &str) -> OtelConfig {
+        OtelConfig {
+            endpoint: endpoint.to_string(),
+            protocol: OtlpProtocol::HttpProto,
+            service_name: "lorica-unit-test".to_string(),
+            sampling_ratio: 1.0,
+        }
+    }
+
+    #[test]
+    fn shutdown_is_noop_before_init() {
+        // Must not panic when PROVIDER has never held a value.
+        imp::shutdown();
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        // Calling shutdown twice in a row is legal: the drain hook
+        // calls it unconditionally, and a reload may already have
+        // torn the provider down. Idempotence is a hard requirement.
+        imp::shutdown();
+        imp::shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn init_then_shutdown_round_trips() {
+        // Pointing at a nonexistent endpoint is fine — the batch
+        // exporter build is lazy wrt connectivity, so init() succeeds
+        // as long as the URL parses. shutdown() then flushes + drops
+        // the provider without panicking, which is the entire
+        // contract the drain hook relies on.
+        let cfg = dummy_cfg("http://127.0.0.1:1");
+        imp::init(&cfg).expect("init must succeed for a parseable URL");
+        imp::shutdown();
+        // Second init after shutdown must also succeed: the reload
+        // path calls init() repeatedly on settings changes.
+        imp::init(&cfg).expect("re-init after shutdown must succeed");
+        imp::shutdown();
+    }
+
+    #[test]
+    fn init_rejects_empty_endpoint_without_installing_provider() {
+        // Design-doc contract: "Empty endpoint = disabled at runtime".
+        // Must return Ok(()) so the caller's log line on failure
+        // does not fire, and MUST NOT install a provider (a follow-up
+        // shutdown then has nothing to flush).
+        let cfg = dummy_cfg("");
+        imp::init(&cfg).expect("empty endpoint must be Ok no-op");
+        // No direct way to assert "no provider installed" without
+        // exposing the static; shutdown() being a no-op under this
+        // condition is the observable guarantee.
+        imp::shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

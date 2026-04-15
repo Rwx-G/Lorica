@@ -281,4 +281,59 @@ mod tests {
             Some(Some("googlebot.com".to_string()))
         );
     }
+
+    /// `resolve_and_cache` must populate the cache even when the PTR
+    /// lookup fails or forward-confirm does not match (the negative
+    /// entry prevents a hot-path from re-resolving the same IP every
+    /// request). Pointing the resolver at a black-hole nameserver
+    /// exercises the failure path without needing a real DNS server
+    /// in the test — the PTR lookup times out and `resolve_and_cache`
+    /// returns None, but the cache entry still lands.
+    ///
+    /// This covers the implicit "fail-closed with cached negative"
+    /// contract that the request_filter relies on for the rDNS
+    /// bypass category.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_and_cache_writes_negative_entry_on_resolver_failure() {
+        use hickory_resolver::config::{NameServerConfig, Protocol};
+        use std::net::SocketAddr;
+
+        // 127.0.0.1:1 is deliberately a port nothing listens on —
+        // UDP sends will drop / time out. The short opts below cap
+        // the test at ≤ 1 s wall-clock.
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut config = ResolverConfig::new();
+        config.add_name_server(NameServerConfig {
+            socket_addr: addr,
+            protocol: Protocol::Udp,
+            tls_dns_name: None,
+            trust_negative_responses: false,
+            bind_addr: None,
+        });
+        let mut opts = ResolverOpts::default();
+        opts.timeout = Duration::from_millis(200);
+        opts.attempts = 1;
+        // Disable caching INSIDE hickory so our 200 ms budget is not
+        // eaten by retry warm-up.
+        opts.cache_size = 0;
+
+        let resolver = RdnsResolver::with_config(config, opts);
+        let ip: IpAddr = "192.0.2.42".parse().unwrap();
+
+        // Pre-flight: cache is empty.
+        let now = unix_now();
+        assert!(resolver.cache_check(ip, now).is_none());
+
+        // Resolve: PTR times out, returns None.
+        let got = resolver.resolve_and_cache(ip).await;
+        assert!(got.is_none(), "black-hole nameserver must not resolve");
+
+        // Post-condition: the cache now has a negative entry, so
+        // cache_check returns `Some(None)` — the request filter uses
+        // this to skip re-resolving the same IP on the hot path.
+        match resolver.cache_check(ip, now) {
+            Some(None) => {}
+            other => panic!("expected Some(None) negative cache entry, got {other:?}"),
+        }
+    }
 }

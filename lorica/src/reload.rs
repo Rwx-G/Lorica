@@ -668,3 +668,66 @@ pub async fn reload_cert_resolver(
         Err(e) => warn!(error = %e, "failed to reload TLS certificate resolver"),
     }
 }
+
+#[cfg(test)]
+mod bot_secret_hex_tests {
+    use super::{encode_bot_secret_hex, parse_bot_secret_hex};
+
+    #[test]
+    fn round_trip_preserves_bytes() {
+        let bytes = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4,
+            0xc3, 0xd2, 0xe1, 0xf0,
+        ];
+        let hex = encode_bot_secret_hex(&bytes);
+        assert_eq!(hex.len(), 64);
+        let decoded = parse_bot_secret_hex(&hex).expect("round-trip must decode");
+        assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn encode_is_lowercase() {
+        let bytes = [0xABu8; 32];
+        let hex = encode_bot_secret_hex(&bytes);
+        assert!(
+            hex.chars().all(|c| !c.is_ascii_uppercase()),
+            "encoded hex must be lowercase: {hex}"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_uppercase_and_mixed_case_hex() {
+        // Operator-hand-edited DB rows might mix case; the decoder
+        // must be tolerant there even though the encoder emits lower.
+        let upper = "A".repeat(64);
+        let decoded = parse_bot_secret_hex(&upper).expect("uppercase must decode");
+        assert_eq!(decoded, [0xAAu8; 32]);
+
+        let mixed = "aAbBcCdDeEfF0011".repeat(4);
+        assert_eq!(mixed.len(), 64);
+        parse_bot_secret_hex(&mixed).expect("mixed-case must decode");
+    }
+
+    #[test]
+    fn parse_trims_surrounding_whitespace() {
+        // Hex copied from the dashboard form field often carries a
+        // trailing newline — the helper strips it.
+        let hex = format!("  {}\n", "0".repeat(64));
+        parse_bot_secret_hex(&hex).expect("trimmed hex must decode");
+    }
+
+    #[test]
+    fn parse_rejects_wrong_length() {
+        assert!(parse_bot_secret_hex("").is_none());
+        assert!(parse_bot_secret_hex(&"0".repeat(63)).is_none());
+        assert!(parse_bot_secret_hex(&"0".repeat(65)).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_non_hex_characters() {
+        let mut bad = "0".repeat(63);
+        bad.push('z');
+        assert!(parse_bot_secret_hex(&bad).is_none());
+    }
+}
