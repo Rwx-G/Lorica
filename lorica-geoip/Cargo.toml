@@ -32,4 +32,4 @@ tokio = { version = "1", features = ["fs", "io-util", "time", "rt"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net"] }

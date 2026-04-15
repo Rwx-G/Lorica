@@ -118,7 +118,88 @@ pub async fn reload_proxy_config_with_mtls(
         build_proxy_config_inner(store, proxy_config, installed_mtls_fingerprint).await?;
     commit_prepared_reload(proxy_config, connection_filter, prepared);
     apply_otel_settings_from_store(store).await;
+    apply_geoip_settings_from_store(store).await;
     Ok(())
+}
+
+/// Re-apply the GeoIP settings stored in `GlobalSettings` to the live
+/// process. Called from each `reload_proxy_config*` so a dashboard
+/// edit to `geoip_db_path` takes effect without a restart.
+///
+/// Semantics:
+/// - Path changed to a non-empty value → `load_from_path` on the
+///   process-wide resolver (atomic ArcSwap; in-flight lookups on the
+///   old DB complete unaffected). Failure keeps the old DB live and
+///   emits a `warn!` so the operator sees the problem on the next
+///   settings save.
+/// - Path cleared → `unload()` so `lookup_country` returns `None`
+///   and GeoIP rules stop firing.
+/// - Path unchanged from the previous snapshot → no-op (dedup, so
+///   unrelated settings edits do not churn the resolver).
+///
+/// The updater task started at boot (if `geoip_auto_update_enabled`
+/// was true) is NOT re-spawned here: a path change under an already-
+/// running updater simply means the next 24-hour tick lands on the
+/// new target. Flipping auto-update on / off at runtime still
+/// requires a restart in v1.4.0 — tracked as a follow-up because the
+/// updater's JoinHandle is not reachable from the reload path today.
+async fn apply_geoip_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
+    use std::sync::OnceLock;
+
+    static LAST_APPLIED: OnceLock<parking_lot::Mutex<Option<String>>> = OnceLock::new();
+    let slot = LAST_APPLIED.get_or_init(|| parking_lot::Mutex::new(None));
+
+    let resolver = match crate::geoip::handle() {
+        Some(r) => r,
+        // No resolver registered: either the startup path hasn't run
+        // yet (early boot) or we are in a test harness. Nothing to
+        // do; a later reload call after `set_handle` will pick up
+        // the persisted setting.
+        None => return,
+    };
+
+    let s = store.lock().await;
+    let settings = match s.get_global_settings() {
+        Ok(settings) => settings,
+        Err(_) => return,
+    };
+    drop(s);
+
+    let next = settings
+        .geoip_db_path
+        .as_ref()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+
+    let mut last = slot.lock();
+    if *last == next {
+        return;
+    }
+
+    match next.as_ref() {
+        Some(path) => {
+            match resolver.load_from_path(path) {
+                Ok(()) => info!(path = %path, "GeoIP database hot-reloaded from settings"),
+                Err(e) => {
+                    warn!(
+                        path = %path,
+                        error = %e,
+                        "GeoIP hot-reload failed; previous DB stays live"
+                    );
+                    // Do not advance the "last applied" snapshot on
+                    // failure so a follow-up save attempt retries the
+                    // load instead of silently no-op'ing.
+                    return;
+                }
+            }
+        }
+        None => {
+            resolver.unload();
+            info!("GeoIP database unloaded by settings change (geoip_db_path cleared)");
+        }
+    }
+
+    *last = next;
 }
 
 /// Re-apply the OTel settings stored in `GlobalSettings` to the live

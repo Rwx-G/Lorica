@@ -3068,10 +3068,12 @@ fn run_worker(
     // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so worker
     // lookups can resolve client IPs to country codes. Each worker
     // keeps its own copy (the DB is small — ~3 MiB for DB-IP Lite
-    // Country — and the supervisor's auto-update job cannot push to
-    // already-forked workers, so a config reload that changes the
-    // path requires a proxy restart). Silent no-op when the path is
-    // unset.
+    // Country). The resolver handle is stashed in the per-worker
+    // `lorica::geoip` static so the config-reload path can hot-swap
+    // the DB on setting change, and a periodic 24-hour reload task
+    // below picks up updater-written files on disk. Silent no-op
+    // when the path is unset.
+    lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
     {
         let s = store.blocking_lock();
         if let Ok(settings) = s.get_global_settings() {
@@ -3483,9 +3485,14 @@ fn run_single_process(cli: Cli) {
 
         // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so
         // the request_filter can resolve client IPs. If auto-update is
-        // enabled, also spawn the weekly refresh task inside the
+        // enabled, also spawn the periodic refresh task inside the
         // current tokio runtime. Silent no-op when the path is unset
-        // (installations without GeoIP pay nothing).
+        // (installations without GeoIP pay nothing). The resolver
+        // handle is also stashed in the process-wide `lorica::geoip`
+        // static so `reload::apply_geoip_settings_from_store` can
+        // hot-swap the DB when the dashboard changes the path,
+        // without forcing a restart.
+        lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
         {
             let s = store.lock().await;
             if let Ok(settings) = s.get_global_settings() {

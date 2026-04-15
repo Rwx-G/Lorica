@@ -40,10 +40,15 @@ use thiserror::Error;
 use crate::{GeoIpError, GeoIpResolver};
 
 /// How often the auto-update task ticks. The DB-IP Lite feed is
-/// refreshed monthly but we check weekly so a mid-month
-/// regeneration (rare but happens when the maintainer ships a fix)
-/// is picked up within 7 days.
-pub const UPDATE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// refreshed monthly, but a 24-hour cadence keeps Lorica within one
+/// day of any mid-month regeneration (happens when the upstream
+/// maintainer ships a fix or the geolocation dataset is re-scored),
+/// and matches the cadence operators expect from other IP-reputation
+/// feeds. Bandwidth cost stays trivial: the gzip is ~3 MiB so one
+/// download per day is a rounding error on any internet link, and
+/// the atomic ArcSwap publish means in-flight requests are never
+/// blocked.
+pub const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Conservative floor for the uncompressed `.mmdb` size. The DB-IP
 /// Lite Country feed ships ~3 MiB uncompressed; anything smaller
@@ -368,5 +373,150 @@ mod tests {
         assert_eq!(cfg.target_path.to_str(), Some("/var/lib/lorica/geoip.mmdb"));
         assert_eq!(cfg.interval, UPDATE_INTERVAL);
         assert!(cfg.url_template.contains("{tag}"));
+    }
+
+    // -- HTTP integration tests -----------------------------------
+    //
+    // Spin up a minimal HTTP/1.1 server on 127.0.0.1 in a dedicated
+    // std thread (blocking TcpListener is simpler than wiring a
+    // tokio server here, since `run_once` already drives a tokio
+    // runtime via reqwest). The server serves exactly one canned
+    // response then shuts down. These cover story 2.3's error paths
+    // without relying on the DB-IP CDN being reachable (the CI
+    // sandbox blocks outbound DNS).
+
+    // `std::io::Read` is already in module scope (see the gzip
+    // decoder path above); only Write is tests-local.
+    use std::io::Write as _;
+    use std::net::TcpListener;
+
+    fn spawn_mock_server(
+        response: Vec<u8>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("test setup: bind mock HTTP");
+        let addr = listener.local_addr().expect("test setup: local_addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            // Drain the request headers so reqwest's buffered writer
+            // does not see a RST before the response lands.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(&response);
+            let _ = stream.flush();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn http_response(status_line: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn gzip_of(bytes: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn test_cfg(base_url: &str) -> UpdaterConfig {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // NamedTempFile drop would unlink the path; convert to a
+        // persistent path the updater can rename onto.
+        let _ = tmp.close();
+        UpdaterConfig {
+            target_path: path,
+            url_template: format!("{base_url}/dbip-{{tag}}.mmdb.gz"),
+            interval: Duration::from_secs(3600),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_once_returns_download_error_on_http_404() {
+        let (base, _h) = spawn_mock_server(http_response("404 Not Found", b"nope"));
+        let cfg = test_cfg(&base);
+        let resolver = GeoIpResolver::empty();
+        let err = run_once(&resolver, &cfg).await.unwrap_err();
+        match err {
+            UpdateError::Download(msg) => {
+                assert!(msg.contains("404"), "msg={msg}");
+            }
+            other => panic!("expected Download error on 404, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_once_rejects_small_gzip_as_too_small() {
+        // Valid gzip payload but the uncompressed bytes sit well under
+        // MIN_MMDB_SIZE. Boundary-enforcement check for the size
+        // floor; without it a truncated upstream would silently
+        // install a broken DB.
+        let tiny = gzip_of(b"not-really-an-mmdb");
+        let (base, _h) = spawn_mock_server(http_response("200 OK", &tiny));
+        let cfg = test_cfg(&base);
+        let resolver = GeoIpResolver::empty();
+        let err = run_once(&resolver, &cfg).await.unwrap_err();
+        match err {
+            UpdateError::TooSmall { got, min } => {
+                assert!(got < min, "got={got} min={min}");
+                assert_eq!(min, MIN_MMDB_SIZE);
+            }
+            other => panic!("expected TooSmall, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_once_rejects_garbage_as_validation_error() {
+        // 2 MiB of zeros gzips extremely well (down to ~2 KiB), so
+        // the server-side payload stays tiny, but after decompression
+        // we clear MIN_MMDB_SIZE and the maxminddb reader rejects it
+        // at validation. Exercises the `Validation` variant of
+        // UpdateError which is the last line of defense.
+        let payload = vec![0u8; 2 * 1024 * 1024];
+        let gz = gzip_of(&payload);
+        let (base, _h) = spawn_mock_server(http_response("200 OK", &gz));
+        let cfg = test_cfg(&base);
+        let resolver = GeoIpResolver::empty();
+        let err = run_once(&resolver, &cfg).await.unwrap_err();
+        match err {
+            UpdateError::Validation(_) => { /* expected */ }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The target_path must NOT have been created - the temp
+        // file got removed and the rename never fired.
+        assert!(
+            !cfg.target_path.exists(),
+            "target_path leaked on validation failure"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_once_rejects_oversized_compressed_body() {
+        // Serve MAX_GZIP_SIZE + 1024 bytes. The early content-length
+        // check fires first; this confirms the gzip-side cap is wired
+        // and we do not allocate the full download into memory.
+        let big = vec![0u8; (MAX_GZIP_SIZE + 1024) as usize];
+        let (base, _h) = spawn_mock_server(http_response("200 OK", &big));
+        let cfg = test_cfg(&base);
+        let resolver = GeoIpResolver::empty();
+        let err = run_once(&resolver, &cfg).await.unwrap_err();
+        match err {
+            UpdateError::TooLarge { got, cap } => {
+                assert!(got > cap, "got={got} cap={cap}");
+                assert_eq!(cap, MAX_GZIP_SIZE);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
     }
 }
