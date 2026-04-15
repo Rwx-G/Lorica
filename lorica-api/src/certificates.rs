@@ -260,6 +260,7 @@ pub async fn create_certificate(
     let store = state.store.lock().await;
     store.create_certificate(&cert)?;
     drop(store);
+    state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
     Ok(json_data_with_status(
@@ -351,6 +352,7 @@ pub async fn update_certificate(
 
     store.update_certificate(&cert)?;
     drop(store);
+    state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
     Ok(json_data(cert_to_response(&cert)))
 }
@@ -432,6 +434,7 @@ pub async fn generate_self_signed(
     let store = state.store.lock().await;
     store.create_certificate(&certificate)?;
     drop(store);
+    state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
     Ok(json_data_with_status(

@@ -428,6 +428,11 @@ export interface UpdateRouteRequest {
   rate_limit?: RateLimitConfig;
   geoip?: GeoIpConfig;
   bot_protection?: BotProtectionConfig;
+  /// Explicit "clear" flag on update PUT: wipes the existing
+  /// `bot_protection` column. Omitting the flag AND omitting
+  /// `bot_protection` leaves the stored value alone — the
+  /// "missing = no-op" contract preserved for every other field.
+  bot_protection_disable?: boolean;
 }
 
 export interface BackendResponse {

@@ -107,6 +107,63 @@ impl AppState {
             let _ = tx.send(next);
         }
     }
+
+    /// Rotate the bot-protection HMAC secret (v1.4.0 Epic 3,
+    /// follow-up to story 3.5a). Called from every certificate
+    /// install / renew success path — the design doc calls for
+    /// "rotate the secret on every cert renewal so cookie
+    /// lifetime is capped at the cert TTL".
+    ///
+    /// Generates fresh 32 bytes via `OsRng`, persists the hex
+    /// form to `GlobalSettings.bot_hmac_secret_hex`, and leaves
+    /// the actual in-memory swap to the next
+    /// `apply_bot_secret_from_store` invocation (which fires on
+    /// every subsequent `reload_proxy_config*`, triggered by the
+    /// cert-save site's own `notify_config_changed` call). Two
+    /// consecutive writes would double-rotate in a tight renewal
+    /// loop, which is fine — the user just solves the challenge
+    /// once more.
+    ///
+    /// Tolerates failures: a DB write error is `warn!`-logged
+    /// and silently ignored so a bot-protection secret issue
+    /// cannot block a certificate renewal (cert renewal is the
+    /// higher-priority operation).
+    pub async fn rotate_bot_hmac_on_cert_event(&self) {
+        let new_bytes: [u8; 32] = {
+            use rand::RngCore;
+            let mut out = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut out);
+            out
+        };
+        let mut hex_buf = String::with_capacity(64);
+        for b in new_bytes.iter() {
+            hex_buf.push_str(&format!("{b:02x}"));
+        }
+        let s = self.store.lock().await;
+        match s.get_global_settings() {
+            Ok(mut cur) => {
+                cur.bot_hmac_secret_hex = hex_buf;
+                if let Err(e) = s.update_global_settings(&cur) {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to persist rotated bot HMAC secret; previous secret stays live"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to read global settings for bot HMAC rotation"
+                );
+                return;
+            }
+        }
+        drop(s);
+        tracing::info!(
+            "bot-protection HMAC secret rotated on cert event (outstanding verdict cookies invalidated)"
+        );
+    }
 }
 
 /// Build the axum router with all API routes.

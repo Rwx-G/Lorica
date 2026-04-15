@@ -620,6 +620,13 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     rate_limit: rateLimitFormToRequest(form, isUpdate),
     geoip: geoipFormToRequest(form, isUpdate),
     bot_protection: botProtectionFormToRequest(form, isUpdate),
+    // Explicit clear signal on update when the operator toggles
+    // bot-protection off. The API contract is `missing = no-op`,
+    // so we only emit the flag when both (a) this is an update
+    // AND (b) the user has disabled the feature. A newly-created
+    // route with bot_enabled=false simply omits the
+    // bot_protection field (undefined above).
+    bot_protection_disable: isUpdate && !form.bot_enabled ? true : undefined,
   };
 }
 

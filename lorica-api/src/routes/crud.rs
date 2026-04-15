@@ -989,11 +989,18 @@ pub struct UpdateRouteRequest {
     /// time so the operator cannot accidentally block everything.
     pub geoip: Option<lorica_config::models::GeoIpConfig>,
     /// Update semantics: missing = leave alone; present = validate +
-    /// install/replace. To clear, POST `{ "bot_protection": null }`
-    /// (axum's `Json<...>` treats `null` as `None` — not present in
-    /// the Rust struct means "leave alone"). See story 3.3 for the
-    /// validation rules.
+    /// install/replace. See story 3.3 for the validation rules.
+    /// To CLEAR an existing config (toggle bot-protection off on
+    /// a route that already had it configured), set
+    /// `bot_protection_disable: true`. Without this boolean the
+    /// axum JSON layer cannot distinguish "absent field" from
+    /// "field explicitly set to null", so a clear-by-null scheme
+    /// would be brittle. The boolean + config-struct pair keeps
+    /// the three cases orthogonal: neither sent = no-op, config
+    /// sent = install, disable=true = clear.
     pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
+    #[serde(default)]
+    pub bot_protection_disable: Option<bool>,
 }
 
 fn route_to_response(
@@ -1668,19 +1675,15 @@ pub async fn update_route(
             route.geoip = Some(validate_geoip(g)?);
         }
     }
-    if let Some(ref b) = body.bot_protection {
-        // No "empty list clears" semantics for bot_protection: the
-        // mode itself is mandatory, so any present-and-non-null
-        // body triggers validation and replaces. To explicitly
-        // disable bot protection on an existing route, the API
-        // client POSTs `{"bot_protection": null}` which the
-        // Deserialize layer maps to `None`, leaving this branch
-        // unentered and the existing route field untouched — which
-        // preserves the "missing = leave alone" contract. For
-        // actual disable, the dashboard currently sends the route
-        // without the field and the config DB keeps the old value;
-        // use delete+recreate to clear. This is acceptable for
-        // v1.4.0 and can be tightened in a follow-up PR.
+    if body.bot_protection_disable == Some(true) {
+        // Explicit clear signal from the dashboard when the
+        // operator toggles bot-protection OFF on a route that
+        // previously had a config. Mutually exclusive with
+        // sending a new `bot_protection` body (would be a
+        // contradiction — `disable` wins so the API contract
+        // stays predictable).
+        route.bot_protection = None;
+    } else if let Some(ref b) = body.bot_protection {
         route.bot_protection = Some(validate_bot_protection(b)?);
     }
     route.updated_at = Utc::now();
