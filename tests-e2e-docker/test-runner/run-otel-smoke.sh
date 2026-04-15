@@ -178,47 +178,45 @@ else
 fi
 
 # BatchSpanProcessor schedules export; give it a few seconds to flush.
-# The bridge auto-generates a fresh OTel `traceID` per request and
-# stamps the W3C client `trace_id` as a span tag (the bridge's
-# `on_new_span` runs before our `OpenTelemetrySpanExt::set_parent`
-# call, so the OTel-side trace_id does not inherit from the W3C
-# parent — known limitation, follow-up tracked in CHANGELOG /
-# ROADMAP). The smoke therefore queries by service name + recent
-# time range and matches on the W3C trace_id we recorded in the
-# `trace_id` tag.
+# Since the v1.4.0 fix to wrap `request_filter` in
+# `.instrument(span).await` with the W3C remote context attached
+# before `info_span!` expansion, the OTel traceID on the exported
+# span MUST match the client's W3C trace_id. We first look up the
+# trace by id (the strict continuity check); the fallback scan by
+# service is kept as a regression guard for the previous
+# (broken) behaviour.
 log "waiting for span export to Jaeger..."
-SPANS_JSON=""
+TRACE_JSON=""
 for i in $(seq 1 30); do
-    LIST=$(curl -sf "${JAEGER}/api/traces?service=lorica&limit=20" 2>/dev/null || echo '{}')
-    COUNT=$(echo "$LIST" | jq '.data | length' 2>/dev/null || echo 0)
-    if [ "$COUNT" -gt 0 ] 2>/dev/null; then
-        SPANS_JSON="$LIST"
+    BYID=$(curl -sf "${JAEGER}/api/traces/${CLIENT_TRACE_ID}" 2>/dev/null || echo '{}')
+    if echo "$BYID" | jq -e '.data[0].spans | length > 0' >/dev/null 2>&1; then
+        TRACE_JSON="$BYID"
         break
     fi
     sleep 1
 done
 
-if [ -z "$SPANS_JSON" ]; then
-    fail "no Lorica spans appeared in Jaeger after 30 s"
+if [ -z "$TRACE_JSON" ]; then
+    fail "no trace with id ${CLIENT_TRACE_ID} in Jaeger after 30 s"
+    LIST=$(curl -sf "${JAEGER}/api/traces?service=lorica&limit=5" 2>/dev/null || echo '{}')
+    echo "Fallback: traces for service=lorica follow (for debug):"
+    echo "$LIST" | jq -r '.data[].traceID' | head -5
     exit 1
 fi
-ok "Lorica spans landed in Jaeger ($(echo "$SPANS_JSON" | jq '.data | length') traces)"
+ok "trace ${CLIENT_TRACE_ID} landed in Jaeger (OTel traceID matches W3C client trace_id)"
 
-# --- Find the http_request span carrying our W3C trace_id tag ---
+# --- Find the http_request span inside the matched trace ---
 log "=== OTel smoke: verify span attributes ==="
-LORICA_SPAN=$(echo "$SPANS_JSON" | jq -c "
-    .data[].spans[] |
-    select(.operationName == \"http_request\") |
-    select((.tags // []) | any(.key == \"trace_id\" and .value == \"${CLIENT_TRACE_ID}\"))
+LORICA_SPAN=$(echo "$TRACE_JSON" | jq -c "
+    .data[0].spans[] | select(.operationName == \"http_request\")
 " | head -1)
 
 if [ -z "$LORICA_SPAN" ] || [ "$LORICA_SPAN" = "null" ]; then
-    fail "no http_request span carrying our client trace_id ($CLIENT_TRACE_ID)"
-    # Dump trace IDs we did get for debugging.
-    echo "$SPANS_JSON" | jq -r '.data[].spans[] | select(.operationName == "http_request") | .tags[] | select(.key == "trace_id") | .value' | head -5
+    fail "no http_request span inside trace ${CLIENT_TRACE_ID}"
+    echo "$TRACE_JSON" | jq -r '.data[0].spans[].operationName' | head -10
     exit 1
 fi
-ok "found http_request span with our trace_id tag"
+ok "http_request span present in trace"
 
 # Tags in Jaeger format: array of {key, type, value} objects.
 get_tag() {

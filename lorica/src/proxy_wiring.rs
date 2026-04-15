@@ -1848,10 +1848,74 @@ impl ProxyHttp for LoricaProxy {
         }
     }
 
-    #[tracing::instrument(
-        name = "http_request",
-        skip_all,
-        fields(
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // W3C trace context capture. Runs before everything else so
+        // even ACME challenges carry a traceparent forward. If the
+        // client sent a well-formed header we keep the trace_id and
+        // roll a new parent_id (Lorica sits between client and
+        // origin); otherwise we synthesise a fresh trace seeded on
+        // the request_id so backend sidecars can still correlate.
+        // Parsing is ~50 ns and runs regardless of the `otel` feature
+        // so header pass-through is always available.
+        let incoming = session
+            .req_header()
+            .headers
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::otel::TraceParent::parse);
+        if let Some(ref parent) = incoming {
+            ctx.outgoing_traceparent = Some(parent.child(&ctx.request_id));
+            ctx.traceparent_from_client = true;
+        } else {
+            ctx.outgoing_traceparent =
+                Some(crate::otel::traceparent_from_request_id(&ctx.request_id));
+            ctx.traceparent_from_client = false;
+        }
+        ctx.incoming_traceparent = incoming;
+
+        // Build the per-request tracing span. With the `otel` feature
+        // on, the tracing_opentelemetry bridge mirrors this into an
+        // OTel span via `on_new_span` *at span creation time* — and
+        // the bridge latches `trace_id` right then from the currently-
+        // attached OTel Context. Calling `OpenTelemetrySpanExt::set_parent`
+        // AFTER creation only updates `OtelData.parent_cx`, not the
+        // already-frozen builder trace_id, so the OTel span ends up
+        // with an SDK-generated trace_id that does not match the
+        // client's W3C header.
+        //
+        // Fix: attach the W3C remote span context as the current
+        // OTel context BEFORE `info_span!` expansion, via
+        // `Context::attach()`. The guard lives just long enough for
+        // the macro to evaluate — `on_new_span` reads
+        // `Context::current()`, picks up our remote parent, and
+        // bakes the client's trace_id into the builder. We drop the
+        // guard as the `info_span!` expression returns, so nothing
+        // downstream inherits the attached context by accident.
+        // The resulting `tracing::Span` carries the right trace_id
+        // and can still be `set_parent`-ed later for edge cases.
+        #[cfg(feature = "otel")]
+        let _otel_cx_guard = ctx.incoming_traceparent.as_ref().and_then(|p| {
+            use opentelemetry::trace::{
+                SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState,
+            };
+            use opentelemetry::Context;
+            let tid = TraceId::from_hex(&p.trace_id).ok()?;
+            let sid = SpanId::from_hex(&p.parent_id).ok()?;
+            let sc = SpanContext::new(
+                tid,
+                sid,
+                TraceFlags::new(p.flags),
+                true, // remote
+                TraceState::default(),
+            );
+            Some(Context::new().with_remote_span_context(sc).attach())
+        });
+
+        let span = tracing::info_span!(
+            "http_request",
             otel.kind = "server",
             http.request.method = %session.req_header().method.as_str(),
             url.path = %session.req_header().uri.path(),
@@ -1865,98 +1929,36 @@ impl ProxyHttp for LoricaProxy {
             network.peer.address = tracing::field::Empty,
             lorica.latency_ms = tracing::field::Empty,
             lorica.trace.origin = tracing::field::Empty,
-        )
-    )]
-    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool>
-    where
-        Self::CTX: Send + Sync,
-    {
-        // Capture the span created by `#[instrument]` so downstream
-        // hooks can nest under it via `parent = &ctx.root_tracing_span`.
-        // When the `tracing_opentelemetry` bridge is installed
-        // (init_logging + otel::init both wired), the whole hook
-        // tree renders as a single nested OTel trace per request.
-        ctx.root_tracing_span = tracing::Span::current();
-        // W3C trace context capture. Runs before everything else so
-        // even ACME challenges carry a traceparent forward (ACME
-        // responders are themselves interesting to trace). If the
-        // client sent a well-formed header we keep the trace_id and
-        // roll a new parent_id (Lorica sits between client and
-        // origin); otherwise we synthesise a fresh trace seeded on
-        // the request_id so backend sidecars can still correlate.
-        // Parsing is ~50 ns and runs regardless of the `otel` feature
-        // so header pass-through is always available.
-        {
-            let incoming = session
-                .req_header()
-                .headers
-                .get("traceparent")
-                .and_then(|v| v.to_str().ok())
-                .and_then(crate::otel::TraceParent::parse);
-            if let Some(ref parent) = incoming {
-                ctx.outgoing_traceparent = Some(parent.child(&ctx.request_id));
-                ctx.traceparent_from_client = true;
-            } else {
-                ctx.outgoing_traceparent = Some(
-                    crate::otel::traceparent_from_request_id(&ctx.request_id),
-                );
-                ctx.traceparent_from_client = false;
-            }
-            ctx.incoming_traceparent = incoming;
+            otel.status_code = tracing::field::Empty,
+            error.message = tracing::field::Empty,
+        );
 
-            // Now that the outgoing traceparent exists, stamp the
-            // `trace_id` and `span_id` fields on the current tracing
-            // span so every subsequent tracing::info! / warn! inside
-            // request_filter (and inside any function it calls that
-            // does not open its own span) carries them in the log
-            // output. For downstream hooks (upstream_request_filter,
-            // response_filter, logging), their own #[instrument]
-            // attribute reads the same fields directly from ctx.
-            if let Some(ref tp) = ctx.outgoing_traceparent {
-                let span = tracing::Span::current();
-                span.record("trace_id", tp.trace_id.as_str());
-                span.record("span_id", tp.parent_id.as_str());
-            }
-        }
-
-        // Link the current `http_request` tracing span (created by
-        // the `#[instrument]` on this function, captured above into
-        // `ctx.root_tracing_span`) to the client's W3C parent via
-        // the OpenTelemetry bridge when the `otel` feature is on.
-        // `tracing_opentelemetry::OpenTelemetrySpanExt::set_parent`
-        // seeds the tracing span with a remote span context so the
-        // exported OTel span shows the client as its parent in
-        // Jaeger / Tempo. No-op when the `otel` feature is off (the
-        // `set_parent` method is unavailable so the whole block is
-        // `cfg`-gated) or when the client did not send a valid
-        // traceparent.
+        // Drop the context guard now that the span has latched its
+        // trace_id. Any subsequent code that inherits from
+        // `Context::current()` (e.g. a manually-created OTel span
+        // inside a child helper) will see the surrounding context,
+        // not the W3C remote parent we briefly attached.
         #[cfg(feature = "otel")]
-        if let Some(ref parent) = ctx.incoming_traceparent {
-            use opentelemetry::trace::{
-                SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId,
-                TraceState,
-            };
-            use opentelemetry::Context;
-            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-            if let (Ok(tid), Ok(sid)) = (
-                TraceId::from_hex(&parent.trace_id),
-                SpanId::from_hex(&parent.parent_id),
-            ) {
-                let sc = SpanContext::new(
-                    tid,
-                    sid,
-                    TraceFlags::new(parent.flags),
-                    true, // remote
-                    TraceState::default(),
-                );
-                let cx = Context::new().with_remote_span_context(sc);
-                // `set_parent` returns the receiver to enable
-                // chaining; we have no follow-up call so the
-                // returned Span is dropped intentionally.
-                let _ = tracing::Span::current().set_parent(cx);
-            }
-        }
+        drop(_otel_cx_guard);
 
+        // Stamp the log-correlation fields now so the first events
+        // inside the body (ACME challenge log, flood log) see them.
+        if let Some(ref tp) = ctx.outgoing_traceparent {
+            span.record("trace_id", tp.trace_id.as_str());
+            span.record("span_id", tp.parent_id.as_str());
+        }
+        ctx.root_tracing_span = span.clone();
+
+        // Run the body instrumented with the span. `.instrument`
+        // re-enters the span on every poll so log records + nested
+        // `#[instrument]` child hooks (upstream_request_filter,
+        // response_filter, logging, fail_to_proxy) inherit it as
+        // their parent without the body having to thread the span
+        // manually. Kept as an inline `async move` rather than a
+        // separate method because `impl ProxyHttp for LoricaProxy`
+        // only accepts trait methods.
+        use tracing::Instrument as _;
+        async move {
         // ACME HTTP-01 challenge intercept (must respond before any other check)
         if let Some(ref challenge_store) = self.acme_challenge_store {
             let path = session.req_header().uri.path();
@@ -3222,6 +3224,7 @@ impl ProxyHttp for LoricaProxy {
             }
             lorica_waf::WafVerdict::Pass => Ok(false),
         }
+        }.instrument(span).await
     }
 
     /// Handle incoming request body chunks.

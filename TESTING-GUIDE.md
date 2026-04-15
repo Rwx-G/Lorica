@@ -437,21 +437,19 @@ is deterministic.
   because `lorica_core::Server::run_forever()` exits the process
   without a pre-exit hook. Supervisor + single-process flush
   cleanly. Follow-up noted in CHANGELOG.
-- **W3C trace_id continuity broken on the Lorica OTel span**: the
-  `tracing_opentelemetry` bridge calls `tracer.span_builder()`
-  inside `on_new_span` at `#[instrument]` entry — by the time
-  `OpenTelemetrySpanExt::set_parent(remote_w3c_context)` runs inside
-  the `request_filter` body, the OTel span has already been created
-  with an SDK-generated trace_id. The W3C client trace_id is still
-  recorded on the exported span as a `trace_id` tag (searchable in
-  Jaeger / Tempo), but the OTel-side traceID does not match the
-  client's. The outgoing W3C traceparent to the upstream still
-  carries the correct trace_id (wire-format propagation is separate
-  from OTel span creation — see story 1.3), so backend sidecars see
-  a continuous trace; only the Lorica span itself sits on a
-  different traceID in the collector. Fix requires wrapping the
-  whole `request_filter` body in `.instrument(span).await` so
-  `set_parent` runs before `on_new_span`; tracked as a follow-up.
+- **W3C trace_id continuity** is end-to-end: the Lorica OTel span's
+  `traceID` matches the client's `traceparent` trace_id byte-for-byte.
+  `request_filter` attaches the remote W3C `SpanContext` to the
+  current OTel context via `Context::attach()` BEFORE the
+  `tracing::info_span!` macro expands — so the
+  `tracing_opentelemetry` bridge's `on_new_span` callback latches
+  the client's trace_id into the `SpanBuilder` at span creation
+  (not the SDK's auto-generated one). The body then runs via
+  `.instrument(span).await`. When a client does not send a
+  `traceparent`, the OTel span takes the SDK-generated trace_id and
+  Lorica's outgoing `traceparent` header to the upstream uses the
+  same id — backend sidecars see a continuous trace in either
+  direction.
 
 ### 19. GeoIP country filter
 
