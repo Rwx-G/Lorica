@@ -3075,6 +3075,23 @@ fn run_worker(
     // when the path is unset.
     lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
     lorica::geoip::set_asn_handle(Arc::clone(&lorica_proxy.asn_resolver));
+    // rDNS resolver (v1.4.0 follow-up). Must be built inside the
+    // worker's tokio runtime because hickory-resolver's
+    // TokioAsyncResolver latches onto the current runtime at
+    // construction. `rt.enter()` gives us that context.
+    {
+        let _rt_guard = rt.enter();
+        match lorica::bot_rdns::RdnsResolver::from_system_conf() {
+            Ok(r) => {
+                lorica::bot_rdns::set_handle(Arc::new(r));
+                info!("worker: rDNS resolver initialised from system resolv.conf");
+            }
+            Err(e) => warn!(
+                error = %e,
+                "worker: rDNS resolver init failed; bot_protection.bypass.rdns will be a silent no-op"
+            ),
+        }
+    }
     {
         let s = store.blocking_lock();
         if let Ok(settings) = s.get_global_settings() {
@@ -3507,6 +3524,21 @@ fn run_single_process(cli: Cli) {
         // without forcing a restart.
         lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
         lorica::geoip::set_asn_handle(Arc::clone(&lorica_proxy.asn_resolver));
+        // rDNS resolver for bot-protection's rdns bypass (v1.4.0
+        // follow-up). Built from the system resolv.conf — a
+        // missing / broken file is not fatal, it just disables
+        // the rDNS bypass category for this process (other
+        // bot-protection categories keep working).
+        match lorica::bot_rdns::RdnsResolver::from_system_conf() {
+            Ok(r) => {
+                lorica::bot_rdns::set_handle(Arc::new(r));
+                info!("rDNS resolver initialised from system resolv.conf");
+            }
+            Err(e) => warn!(
+                error = %e,
+                "rDNS resolver init failed; bot_protection.bypass.rdns will be a silent no-op"
+            ),
+        }
         {
             let s = store.lock().await;
             if let Ok(settings) = s.get_global_settings() {

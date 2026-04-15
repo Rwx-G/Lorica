@@ -2986,6 +2986,39 @@ impl ProxyHttp for LoricaProxy {
                     // to the remaining categories. Zero-cost when
                     // the operator has no ASN DB configured.
                     let asn = self.asn_resolver.lookup_asn(ip_addr);
+                    // Forward-confirmed rDNS from the per-process
+                    // cache. Cache miss on the hot path is
+                    // intentional: the rDNS lookup is O(~network
+                    // RTT) and must not block request_filter. We
+                    // spawn a populate task so the NEXT request
+                    // from the same IP gets a hit, then proceed
+                    // with rdns_name = None for this request (the
+                    // evaluator treats that as "rdns bypass does
+                    // not fire").
+                    let rdns_name: Option<String> = if bot_cfg.bypass.rdns.is_empty() {
+                        // Zero-cost when the operator has no rDNS
+                        // bypass configured — do not even probe the
+                        // cache.
+                        None
+                    } else if let Some(resolver) = crate::bot_rdns::handle() {
+                        let now_i = chrono::Utc::now().timestamp();
+                        match resolver.cache_check(ip_addr, now_i) {
+                            Some(cached) => cached,
+                            None => {
+                                // Fire-and-forget populate. Bounded
+                                // by hickory's timeout + attempts
+                                // config (≤ 6 s). Dropped on
+                                // runtime shutdown.
+                                let resolver = resolver.clone();
+                                tokio::spawn(async move {
+                                    let _ = resolver.resolve_and_cache(ip_addr).await;
+                                });
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let ua = session
                         .req_header()
                         .headers
@@ -3006,6 +3039,7 @@ impl ProxyHttp for LoricaProxy {
                         client_ip: ip_addr,
                         country,
                         asn,
+                        rdns_name,
                         user_agent: ua,
                         verdict_cookie,
                         now: now_secs,
@@ -3033,6 +3067,7 @@ impl ProxyHttp for LoricaProxy {
                                 crate::bot::PassReason::OnlyCountryGateMiss => "bypassed",
                                 crate::bot::PassReason::BypassIpCidr
                                 | crate::bot::PassReason::BypassAsn
+                                | crate::bot::PassReason::BypassRdns
                                 | crate::bot::PassReason::BypassCountry
                                 | crate::bot::PassReason::BypassUserAgent => "bypassed",
                             };

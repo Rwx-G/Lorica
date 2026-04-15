@@ -21,7 +21,7 @@
 //! paths are cheaper to audit when each is explicit.
 
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;

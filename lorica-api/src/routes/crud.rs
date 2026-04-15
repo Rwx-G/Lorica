@@ -241,25 +241,50 @@ fn validate_bot_protection(
         user_agents.push(trimmed.to_string());
     }
 
-    // rDNS-based bypass requires a DNS resolver with forward-
-    // confirmation (resolve PTR, then forward A/AAAA on the PTR
-    // result, accept only if the forward resolves back to the
-    // client IP). Without forward confirm, any hostile PTR record
-    // can spoof `googlebot.com` and bypass the challenge — the
-    // design doc calls this out as a MUST-NOT regression. The
-    // resolver plumbing + the LRU cache + the bounded async
-    // lookup did not land in v1.4.0. Reject non-empty lists up
-    // front. The field stays in `BotBypassRules` so a future
-    // story can enable it without a schema migration.
-    if !cfg.bypass.rdns.is_empty() {
-        return Err(ApiError::BadRequest(
-            "bot_protection.bypass.rdns: rDNS-based bypass is not yet supported in \
-             v1.4.0 (requires a forward-confirmation DNS pipeline that lands in a \
-             follow-up). Leave the list empty for now"
-                .into(),
-        ));
+    // rDNS-based bypass (v1.4.0 follow-up now landed). Forward-
+    // confirmation is enforced in-process by
+    // `lorica::bot_rdns::RdnsResolver` (resolve PTR then confirm
+    // one of the resulting names forward-resolves back to the
+    // client IP — without this a hostile resolver could trivially
+    // spoof any PTR and bypass).
+    //
+    // Shape rules: printable ASCII, no leading dot, contains at
+    // least one dot (a bare TLD like `com` would match every
+    // `.com` host and is almost always an operator mistake).
+    // Lowercase the suffix for case-insensitive matching against
+    // the resolved host.
+    check_cap("rdns", cfg.bypass.rdns.len())?;
+    let mut rdns: Vec<String> = Vec::with_capacity(cfg.bypass.rdns.len());
+    for raw in &cfg.bypass.rdns {
+        let trimmed = raw.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return Err(ApiError::BadRequest(
+                "bot_protection.bypass.rdns: empty entry".into(),
+            ));
+        }
+        if !trimmed.chars().all(|c| c.is_ascii_graphic()) {
+            return Err(ApiError::BadRequest(format!(
+                "bot_protection.bypass.rdns: '{trimmed}' contains non-ASCII-printable character"
+            )));
+        }
+        if trimmed.starts_with('.') {
+            return Err(ApiError::BadRequest(format!(
+                "bot_protection.bypass.rdns: '{trimmed}' must not start with a dot"
+            )));
+        }
+        // Allow a trailing dot (canonical DNS form) but require at
+        // least two labels. `com` = 0 internal dots → reject.
+        // `com.` = trailing dot only → reject.
+        let no_trail = trimmed.trim_end_matches('.');
+        if !no_trail.contains('.') {
+            return Err(ApiError::BadRequest(format!(
+                "bot_protection.bypass.rdns: '{trimmed}' must contain at least one \
+                 dot (a bare TLD like 'com' would match every `.com` host and \
+                 is almost always a mistake)"
+            )));
+        }
+        rdns.push(trimmed);
     }
-    let rdns: Vec<String> = Vec::new();
 
     // only_country: same shape rules as bypass.countries.
     let only_country = match cfg.only_country.as_ref() {
@@ -672,20 +697,47 @@ mod bot_protection_validation_tests {
     }
 
     #[test]
-    fn rejects_non_empty_rdns_list() {
-        // rDNS bypass requires the forward-confirmation pipeline
-        // that lands post-v1.4.0. Until then reject non-empty
-        // lists so operators do not persist configs silently
-        // ignored at request time.
+    fn accepts_non_empty_rdns_list() {
         let mut c = baseline();
-        c.bypass.rdns = vec!["googlebot.com".to_string()];
+        c.bypass.rdns = vec!["GoogleBot.com".to_string(), "search.msn.com".to_string()];
+        let out = validate_bot_protection(&c).expect("non-empty rdns must pass");
+        assert_eq!(out.bypass.rdns, vec!["googlebot.com", "search.msn.com"]);
+    }
+
+    #[test]
+    fn rejects_bare_tld_in_rdns() {
+        let mut c = baseline();
+        c.bypass.rdns = vec!["com".to_string()];
         match validate_bot_protection(&c) {
             Err(ApiError::BadRequest(msg)) => {
-                assert!(msg.contains("rDNS"), "msg={msg}");
-                assert!(msg.contains("not yet supported"), "msg={msg}");
+                assert!(msg.contains("bare TLD"), "msg={msg}");
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_leading_dot_in_rdns() {
+        let mut c = baseline();
+        c.bypass.rdns = vec![".googlebot.com".to_string()];
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("must not start with a dot"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bare_trailing_dot_tld_in_rdns() {
+        // `com.` is a TLD with canonical trailing dot — still a
+        // bare TLD that would match every .com host.
+        let mut c = baseline();
+        c.bypass.rdns = vec!["com.".to_string()];
+        assert!(matches!(
+            validate_bot_protection(&c),
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     #[test]

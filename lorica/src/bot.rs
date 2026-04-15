@@ -237,6 +237,9 @@ pub enum PassReason {
     BypassIpCidr,
     /// Bypass category matched: ASN list (v1.4.0 follow-up).
     BypassAsn,
+    /// Bypass category matched: forward-confirmed rDNS suffix
+    /// list (v1.4.0 follow-up).
+    BypassRdns,
     /// Bypass category matched: country list.
     BypassCountry,
     /// Bypass category matched: User-Agent regex list.
@@ -251,6 +254,7 @@ impl PassReason {
             PassReason::OnlyCountryGateMiss => "only_country_miss",
             PassReason::BypassIpCidr => "bypass_ip",
             PassReason::BypassAsn => "bypass_asn",
+            PassReason::BypassRdns => "bypass_rdns",
             PassReason::BypassCountry => "bypass_country",
             PassReason::BypassUserAgent => "bypass_ua",
         }
@@ -275,6 +279,13 @@ pub struct EvalInputs<'a> {
     /// `None` unconditionally — the evaluator just skips the
     /// ASN arm.
     pub asn: Option<u32>,
+    /// Forward-confirmed rDNS name for the client IP (v1.4.0
+    /// follow-up closing the rdns-bypass deferred item). `Some(name)`
+    /// = the hot-path cache returned a confirmed PTR; `None` = no
+    /// cached result (cache miss, lookup in flight, or the IP
+    /// simply has no PTR). Caller (request_filter) schedules an
+    /// async populate for the NEXT request on a miss.
+    pub rdns_name: Option<String>,
     /// Request `User-Agent` header value, if any. Empty string if
     /// the client did not send one.
     pub user_agent: &'a str,
@@ -391,6 +402,18 @@ pub fn evaluate(inputs: &EvalInputs<'_>) -> Decision {
         {
             return Decision::Pass {
                 reason: PassReason::BypassCountry,
+            };
+        }
+    }
+
+    // 3b. Forward-confirmed rDNS bypass. The forward-confirm
+    //     happens upstream of the evaluator (in `bot_rdns`);
+    //     we just match the confirmed name against the operator's
+    //     suffix list here.
+    if let Some(ref name) = inputs.rdns_name {
+        if crate::bot_rdns::suffix_matches(name, &inputs.config.bypass.rdns) {
+            return Decision::Pass {
+                reason: PassReason::BypassRdns,
             };
         }
     }
@@ -620,6 +643,7 @@ mod tests {
             client_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)),
             country: Some("FR".to_string()),
             asn: None,
+            rdns_name: None,
             user_agent: ua,
             verdict_cookie: None,
             now: 1_700_000_000,
@@ -713,6 +737,41 @@ mod tests {
         let mut c = cfg();
         c.bypass.asns = vec![15169];
         let i = inputs(&c, "Mozilla/5.0"); // asn = None per default
+        assert!(matches!(evaluate(&i), Decision::Challenge));
+    }
+
+    #[test]
+    fn bypass_rdns_matches_forward_confirmed_name() {
+        let mut c = cfg();
+        c.bypass.rdns = vec!["googlebot.com".to_string()];
+        let mut i = inputs(&c, "");
+        i.rdns_name = Some("crawl-123.googlebot.com".to_string());
+        match evaluate(&i) {
+            Decision::Pass { reason } => assert_eq!(reason, PassReason::BypassRdns),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn bypass_rdns_ignores_unconfirmed_lookup() {
+        // When the request filter could not cache a forward-
+        // confirmed name (miss, or lookup in flight), rdns_name
+        // stays None — the evaluator must NOT grant the bypass.
+        let mut c = cfg();
+        c.bypass.rdns = vec!["googlebot.com".to_string()];
+        let i = inputs(&c, ""); // rdns_name = None per default
+        assert!(matches!(evaluate(&i), Decision::Challenge));
+    }
+
+    #[test]
+    fn bypass_rdns_rejects_sibling_host() {
+        // Forward-confirmed name `fakegooglebot.com` does NOT
+        // match `googlebot.com`. This is the exact attack the
+        // suffix-matching anchor guards against.
+        let mut c = cfg();
+        c.bypass.rdns = vec!["googlebot.com".to_string()];
+        let mut i = inputs(&c, "");
+        i.rdns_name = Some("fakegooglebot.com".to_string());
         assert!(matches!(evaluate(&i), Decision::Challenge));
     }
 
@@ -966,6 +1025,7 @@ mod tests {
             client_ip: ip,
             country: None,
             asn: None,
+            rdns_name: None,
             user_agent: "",
             verdict_cookie: Some(cookie),
             now,
