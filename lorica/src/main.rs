@@ -3289,22 +3289,23 @@ fn run_worker(
 
     info!(worker_id = id, "starting proxy engine");
 
-    // NOTE on OTel shutdown in workers: `Server::run_forever()` returns
-    // `!` (process::exit), so there is no reachable post-serve flush
-    // hook here. Workers rely on the BatchSpanProcessor's periodic
-    // export (default ~5 s interval) to drain spans during steady-state
-    // operation; a worker killed abruptly mid-interval may lose at
-    // most the last N seconds of spans. For graceful shutdown, the
-    // supervisor broadcasts drain + SIGTERM, workers exit, and the
-    // supervisor's own `lorica::otel::shutdown()` fires in the parent
-    // process. A future lorica-core change to expose a pre-exit hook
-    // would let workers flush their own exporter. Tracked as a
-    // follow-up.
-
+    // OTel graceful shutdown in workers (v1.4.0 story 1.6
+    // completion): `Server::run_forever()` is `run() + exit(0)`
+    // which drops the post-serve flush entirely. We inline the
+    // equivalent — `server.run(RunArgs::default())` drives the
+    // graceful-drain loop exactly like `run_forever` would, then
+    // we call `otel::shutdown()` before `std::process::exit(0)`.
+    // Result: the BatchSpanProcessor drains any in-flight spans
+    // AFTER the worker finishes serving and BEFORE the process
+    // exits, so a SIGTERM mid-export does not lose the last N
+    // seconds of spans.
     let mut server = lorica_core::server::Server::new(None).expect("failed to create proxy server");
     server.set_listen_fds(fds);
     server.add_service(proxy_service);
-    server.run_forever();
+    server.run(lorica_core::server::RunArgs::default());
+    info!(worker_id = id, "proxy engine drained; flushing OTel spans");
+    lorica::otel::shutdown();
+    std::process::exit(0);
 }
 
 // ---------------------------------------------------------------------------
