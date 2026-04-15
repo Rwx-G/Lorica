@@ -40,7 +40,7 @@ use lorica_http::ResponseHeader;
 use lorica_proxy::{FailToProxy, ProxyHttp, Session};
 use lorica_waf::WafEngine;
 use once_cell::sync::Lazy;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Smooth weighted round-robin state (Nginx algorithm).
 /// Each backend address has a `current_weight` that increases by `effective_weight`
@@ -1139,6 +1139,7 @@ pub struct PendingProxyConfig {
 // RateLimitEngine moved to proxy_wiring/engines.rs to keep this
 // file below the refactor threshold. Re-exported here so
 // `lorica::proxy_wiring::BreakerEngine` (etc.) still resolves.
+pub mod bot_handlers;
 pub mod forward_auth;
 #[cfg(test)]
 pub(crate) use forward_auth::{
@@ -1988,6 +1989,57 @@ impl ProxyHttp for LoricaProxy {
                         .await?;
                     return Ok(true);
                 }
+            }
+        }
+
+        // Bot-protection cross-cutting endpoints (v1.4.0 Epic 3
+        // story 3.5). Two Lorica-handled paths below the `/lorica/bot/`
+        // namespace: POST `/lorica/bot/solve` (verify a submitted
+        // PoW / captcha, issue verdict cookie) and GET
+        // `/lorica/bot/captcha/{nonce}` (serve the captcha PNG).
+        // Both are handled here because they are route-independent:
+        // the stashed entry carries the route_id the cookie gets
+        // bound to, and the captcha nonce is self-scoped. Client IP
+        // extraction + cookie-bound scope validation happen inside
+        // the handlers.
+        {
+            let path = session.req_header().uri.path().to_string();
+            if crate::bot::is_bot_solve_path(&path) {
+                let client_ip = session
+                    .client_addr()
+                    .and_then(|addr| addr.as_inet())
+                    .map(|a| a.ip());
+                let now_secs = chrono::Utc::now().timestamp();
+                let secret = lorica_challenge::secret::handle();
+                let secret_ref = secret.as_deref();
+                if let Some(ip) = client_ip {
+                    return bot_handlers::handle_solve(
+                        session,
+                        &self.bot_engine,
+                        secret_ref,
+                        ip,
+                        now_secs,
+                    )
+                    .await;
+                }
+                // No client address is exotic but real (tests,
+                // non-TCP transports). Fail closed so we never
+                // issue a cookie to a request we cannot attribute.
+                let msg = "client address unavailable";
+                let mut header = ResponseHeader::build(503, None)?;
+                header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                header.insert_header("Content-Length", msg.len().to_string())?;
+                session
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from_static(msg.as_bytes())), true)
+                    .await?;
+                return Ok(true);
+            }
+            if let Some(nonce) = crate::bot::parse_bot_captcha_path(&path) {
+                return bot_handlers::handle_captcha_image(session, &self.bot_engine, nonce)
+                    .await;
             }
         }
 
@@ -2866,6 +2918,93 @@ impl ProxyHttp for LoricaProxy {
                 // ip_allowlist on top. No OTel attribute when
                 // country is unknown — omitting is semantically
                 // clearer than setting an empty string.
+            }
+        }
+
+        // Per-route bot-protection evaluation (v1.4.0 Epic 3
+        // story 3.5). Runs after GeoIP (so the `bypass.countries`
+        // and `only_country` checks can use the resolved country)
+        // and before forward_auth (so we do not pay an IdP RTT on
+        // a request we are about to block anyway). Only the
+        // request-path enters this block; `POST /lorica/bot/solve`
+        // and the captcha image GET are intercepted earlier.
+        if let Some(ref bot_cfg) = entry.route.bot_protection {
+            if let Some(ref ip_str) = check_ip {
+                if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
+                    // Resolve country once for the bypass + gate
+                    // evaluation (the per-request OTel span already
+                    // got stamped in the GeoIP block above, but the
+                    // country string is not preserved — re-resolve
+                    // here; the resolver lookup is a single
+                    // decode_path call on the mmdb reader, well
+                    // under 1 µs).
+                    let country = self
+                        .geoip_resolver
+                        .lookup_country(ip_addr)
+                        .map(|c| c.as_str().to_string());
+                    let ua = session
+                        .req_header()
+                        .headers
+                        .get(http::header::USER_AGENT)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let cookie_header = session
+                        .req_header()
+                        .headers
+                        .get(http::header::COOKIE)
+                        .and_then(|v| v.to_str().ok());
+                    let verdict_cookie = cookie_header
+                        .and_then(crate::bot::extract_verdict_cookie);
+                    let now_secs = chrono::Utc::now().timestamp();
+                    let secret = lorica_challenge::secret::handle();
+                    let secret_ref = secret.as_deref();
+                    let inputs = crate::bot::EvalInputs {
+                        client_ip: ip_addr,
+                        country,
+                        user_agent: ua,
+                        verdict_cookie,
+                        now: now_secs,
+                        hmac_secret: secret_ref,
+                        route_id: &entry.route.id,
+                        config: bot_cfg,
+                    };
+                    match crate::bot::evaluate(&inputs) {
+                        crate::bot::Decision::Pass { reason } => {
+                            debug!(
+                                route_id = %entry.route.id,
+                                reason = reason.as_str(),
+                                "bot-protection: pass"
+                            );
+                        }
+                        crate::bot::Decision::Challenge => {
+                            // Render the original request URI so a
+                            // successful solve bounces the user back
+                            // to where they came from (path + query).
+                            let req = session.req_header();
+                            let path_and_q = req
+                                .uri
+                                .path_and_query()
+                                .map(|pq| pq.as_str().to_string())
+                                .unwrap_or_else(|| "/".to_string());
+                            let accept_html = bot_handlers::accept_prefers_html(
+                                req.headers
+                                    .get(http::header::ACCEPT)
+                                    .and_then(|v| v.to_str().ok()),
+                            );
+                            return bot_handlers::serve_challenge(
+                                session,
+                                &self.bot_engine,
+                                bot_cfg,
+                                &entry.route.id,
+                                ip_addr,
+                                &path_and_q,
+                                accept_html,
+                                now_secs,
+                            )
+                            .await;
+                        }
+                    }
+                }
             }
         }
 

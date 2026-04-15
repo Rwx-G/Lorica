@@ -175,7 +175,37 @@ Author: Rwx-G
   `BotBypassRules` so the follow-up stories ship without a schema
   migration. Three out of five bypass categories are fully
   functional for v1.4.0: `ip_cidrs`, `countries`, `user_agents`
-- Criterion microbenchmark suite for the OTel hot path (`cargo bench --bench otel_overhead`): three groups (`otel_traceparent`, `otel_active_span`, `otel_per_request`) cover the six atomic operations that every request touches (parse valid / malformed traceparent, synthesise from request_id, derive child traceparent, serialise wire format, span creation / is_recording / end / set_str / set_i64 / set_status) plus two end-to-end scenarios that aggregate the full OTel touch-points a single request incurs. Runs under both default and `--features otel` so operators can quantify the cost of compiling the feature in without installing a real provider. Reference numbers (Docker `rust:1-bookworm`, bench profile, 30-sample criterion run): `parse_valid` 77 ns / 76 ns (-0.8 % under `otel`), `parse_malformed` 31 ns / 29 ns (-5.6 %), `synthesise_from_request_id` 140 ns / 150 ns (+7.0 %), `child_from_parent` 123 ns / 132 ns (+7.8 %), `to_header_value` 99 ns / 91 ns (-9.0 %), `empty_construction` 23 ps / near-ZST. Aggregate per-request OTel touch-point budget stays under 500 ns with the feature off (W3C parse + child + serialise + ZST span ops) and under 600 ns with the feature on but no provider installed — well within the ROADMAP-stated "< 2 % proxy overhead at sampling 0.1" target. Exercised by CI as part of the standard bench harness (criterion 0.5) alongside the existing `circuit_breaker` and `canary_bucket` benches
+- **Bot-protection `request_filter` session wiring** (v1.4.0 Epic
+  3, story 3.5d). New `lorica::proxy_wiring::bot_handlers` submodule
+  carries the three session-interactive handlers + form / cookie /
+  response helpers. `request_filter` now intercepts the two
+  Lorica-handled cross-cutting URLs early (right after the ACME
+  challenge): `POST /lorica/bot/solve` goes to `handle_solve`
+  (body read bounded at 2 KiB, form parse, take stashed entry,
+  dispatch by mode, verify, mint verdict cookie bound to stashed
+  route_id + IP prefix, 302 to the stashed return URL), and
+  `GET /lorica/bot/captcha/{nonce}` goes to
+  `handle_captcha_image` (PNG lookup + one-shot `Cache-Control:
+  no-store, private` so no proxy caches the short-lived image).
+  After the GeoIP stage, every route with `bot_protection` is
+  evaluated via `crate::bot::evaluate`: Pass → request forwards;
+  Challenge → `serve_challenge` renders the mode-specific page,
+  stashes the pending entry (PoW difficulty / captcha expected
+  text + PNG bytes), and writes the HTML (or plain-text 403 when
+  the Accept header does not advertise `text/html`, so curl / wget
+  see a line instead of a blob of HTML). Cookie-mode is special:
+  no server-side stash + no solve round trip, the page IS the
+  verdict issuance (meta-refresh bounces + Set-Cookie header).
+  Form parsing is a 50-line local implementation of
+  application/x-www-form-urlencoded (percent decode + `+` as
+  space + skip-malformed) — no new dependency. `Set-Cookie`
+  header includes `HttpOnly`, `SameSite=Lax`, `Max-Age`, `Path=/`;
+  `Secure` is deliberately omitted for dev-HTTP deployments and
+  can become per-route in a follow-up. 9 new unit tests cover the
+  form parser (percent, plus-as-space, malformed, truncated
+  escapes), Accept-HTML detection, cookie header shape, and
+  hex ↔ 16-byte round-trips
+- **Bot-protection HMAC secret lifecycle** (v1.4.0 Epic 3, story: three groups (`otel_traceparent`, `otel_active_span`, `otel_per_request`) cover the six atomic operations that every request touches (parse valid / malformed traceparent, synthesise from request_id, derive child traceparent, serialise wire format, span creation / is_recording / end / set_str / set_i64 / set_status) plus two end-to-end scenarios that aggregate the full OTel touch-points a single request incurs. Runs under both default and `--features otel` so operators can quantify the cost of compiling the feature in without installing a real provider. Reference numbers (Docker `rust:1-bookworm`, bench profile, 30-sample criterion run): `parse_valid` 77 ns / 76 ns (-0.8 % under `otel`), `parse_malformed` 31 ns / 29 ns (-5.6 %), `synthesise_from_request_id` 140 ns / 150 ns (+7.0 %), `child_from_parent` 123 ns / 132 ns (+7.8 %), `to_header_value` 99 ns / 91 ns (-9.0 %), `empty_construction` 23 ps / near-ZST. Aggregate per-request OTel touch-point budget stays under 500 ns with the feature off (W3C parse + child + serialise + ZST span ops) and under 600 ns with the feature on but no provider installed — well within the ROADMAP-stated "< 2 % proxy overhead at sampling 0.1" target. Exercised by CI as part of the standard bench harness (criterion 0.5) alongside the existing `circuit_breaker` and `canary_bucket` benches
 
 ## [1.3.0] - 2026-04-14
 

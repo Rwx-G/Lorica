@@ -193,15 +193,20 @@ pub fn render_pow_page(
 /// Render the image-captcha page. `image_url` points at the
 /// one-shot URL that serves the PNG; `submit_url` is where the
 /// user's answer is POSTed (typically the same URL as the
-/// challenge page itself, distinguished by method). Both are
-/// escaped into attribute context.
+/// challenge page itself, distinguished by method). `nonce` is
+/// the server-side stash key echoed back in a hidden form field
+/// so the verifier can pull the expected text out of the stash.
+/// Every string is escaped into its respective attribute /
+/// element context.
 pub fn render_captcha_page(
     image_url: &str,
     submit_url: &str,
+    nonce: &str,
     operator_contact: Option<&str>,
 ) -> String {
     let image_esc = html_escape(image_url);
     let submit_esc = html_escape(submit_url);
+    let nonce_esc = html_escape(nonce);
     let contact_line = render_contact_line(operator_contact);
     format!(
         r#"<!DOCTYPE html>
@@ -218,6 +223,7 @@ pub fn render_captcha_page(
 <p class="muted">Type the characters shown in the image below. The match is case-insensitive.</p>
 <img src="{image_esc}" alt="Captcha image (if you cannot read it, reload the page)" class="captcha">
 <form action="{submit_esc}" method="post" autocomplete="off">
+<input type="hidden" name="nonce" value="{nonce_esc}">
 <label for="answer" class="muted">Answer</label>
 <input id="answer" name="answer" type="text" spellcheck="false" autocapitalize="off" required autofocus>
 <button type="submit">Submit</button>
@@ -408,10 +414,12 @@ mod tests {
 
     #[test]
     fn captcha_page_wires_image_and_submit_urls() {
-        let page = render_captcha_page("/captcha/abc", "/solve", None);
+        let page = render_captcha_page("/captcha/abc", "/solve", "nonce123", None);
         assert!(page.contains("src=\"/captcha/abc\""));
         assert!(page.contains("action=\"/solve\""));
         assert!(page.contains("name=\"answer\""));
+        assert!(page.contains("name=\"nonce\""));
+        assert!(page.contains("value=\"nonce123\""));
         assert!(page.contains("autofocus"));
     }
 
@@ -450,7 +458,7 @@ mod tests {
         let c = Challenge::new(14, 0, 300).unwrap();
         let cookie = render_cookie_refresh_page("/", None);
         let pow = render_pow_page(&c, "/", None);
-        let captcha = render_captcha_page("/c", "/s", None);
+        let captcha = render_captcha_page("/c", "/s", "n", None);
         for p in [cookie, pow, captcha] {
             assert!(p.contains("charset=\"utf-8\""), "page missing charset: {p}");
         }
