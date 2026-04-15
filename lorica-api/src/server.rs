@@ -256,6 +256,10 @@ pub fn build_router(
         .route("/api/v1/settings", get(crate::settings::get_settings))
         .route("/api/v1/settings", put(crate::settings::update_settings))
         .route(
+            "/api/v1/settings/otel/test",
+            post(crate::settings::test_otel_connection),
+        )
+        .route(
             "/api/v1/dns-providers",
             get(crate::dns_providers::list_dns_providers),
         )

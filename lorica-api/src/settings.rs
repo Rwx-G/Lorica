@@ -297,6 +297,98 @@ pub async fn update_settings(
     Ok(json_data(settings))
 }
 
+/// POST /api/v1/settings/otel/test - probe the currently-persisted
+/// OTLP endpoint for reachability. Used by the dashboard's
+/// "Test connection" button. Does NOT mutate state; does NOT
+/// re-init the OTel provider. Just opens a plain HTTP(S)
+/// connection to the endpoint's `/v1/traces` path (for http-proto
+/// / http-json) or to the base URL (grpc — we cannot speak the
+/// HTTP/2 gRPC preamble from reqwest so "TCP open" is all we
+/// assert) and reports status + round-trip latency.
+///
+/// Any HTTP status code (including 4xx and 5xx) counts as
+/// "reachable" — the collector is answering, even if it does not
+/// like our empty request. Connection refused, DNS failure or
+/// timeout count as "unreachable".
+pub async fn test_otel_connection(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use std::time::{Duration, Instant};
+
+    let store = state.store.lock().await;
+    let settings = store.get_global_settings()?;
+    drop(store);
+
+    let endpoint = settings
+        .otlp_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(endpoint) = endpoint else {
+        return Ok(json_data(serde_json::json!({
+            "ok": false,
+            "message": "otlp_endpoint is not set; save a collector URL first.",
+        })));
+    };
+
+    // Compose the probe URL: for HTTP transports collectors
+    // canonically expose `/v1/traces`. For gRPC we just hit the
+    // base URL — the plain HTTP client will get a protocol error
+    // from the gRPC listener, which still means "TCP is open".
+    let protocol = settings.otlp_protocol.as_str();
+    let probe_url = match protocol {
+        "http-proto" | "http-json" => {
+            let trimmed = endpoint.trim_end_matches('/');
+            if trimmed.ends_with("/v1/traces") {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/v1/traces")
+            }
+        }
+        _ => endpoint.to_string(),
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(json_data(serde_json::json!({
+                "ok": false,
+                "message": format!("reqwest client build failed: {e}"),
+            })));
+        }
+    };
+
+    let start = Instant::now();
+    // A minimal empty POST is the most representative probe: real
+    // traffic is also POST. Collectors reject it with 400 / 415
+    // (wrong content type) which still proves reachability.
+    let result = client
+        .post(&probe_url)
+        .header("Content-Type", "application/x-protobuf")
+        .body(Vec::<u8>::new())
+        .send()
+        .await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    let payload = match result {
+        Ok(resp) => serde_json::json!({
+            "ok": true,
+            "message": format!("reachable (HTTP {})", resp.status().as_u16()),
+            "latency_ms": latency_ms,
+        }),
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "message": format!("unreachable: {e}"),
+            "latency_ms": latency_ms,
+        }),
+    };
+
+    Ok(json_data(payload))
+}
+
 fn validate_cidr_list(entries: &[String], field: &str) -> Result<(), ApiError> {
     for entry in entries {
         let trimmed = entry.trim();

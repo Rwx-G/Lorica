@@ -584,6 +584,15 @@ export interface GlobalSettingsResponse {
   waf_whitelist_ips: string[];
   connection_deny_cidrs: string[];
   connection_allow_cidrs: string[];
+  // Observability (v1.4.0 OTel). Empty endpoint = exporter off.
+  otlp_endpoint?: string | null;
+  otlp_protocol?: string;
+  otlp_service_name?: string;
+  otlp_sampling_ratio?: number;
+  // GeoIP + ASN DBs. Empty path = feature off.
+  geoip_db_path?: string | null;
+  geoip_auto_update_enabled?: boolean;
+  asn_db_path?: string | null;
 }
 
 export interface UpdateSettingsRequest {
@@ -605,6 +614,23 @@ export interface UpdateSettingsRequest {
   waf_whitelist_ips?: string[];
   connection_deny_cidrs?: string[];
   connection_allow_cidrs?: string[];
+  otlp_endpoint?: string | null;
+  otlp_protocol?: string;
+  otlp_service_name?: string;
+  otlp_sampling_ratio?: number;
+  geoip_db_path?: string | null;
+  geoip_auto_update_enabled?: boolean;
+  asn_db_path?: string | null;
+}
+
+/// Result of the "Test connection" probe on the OTel settings
+/// section. The backend mints a canary span with the
+/// currently-configured endpoint + protocol and reports whether
+/// the collector accepted it.
+export interface OtelTestResponse {
+  ok: boolean;
+  message: string;
+  latency_ms?: number;
 }
 
 export interface NotificationConfigResponse {
@@ -782,6 +808,14 @@ export const api = {
 
   updateSettings: (body: UpdateSettingsRequest) =>
     request<GlobalSettingsResponse>('PUT', '/settings', body),
+
+  // Mint a single canary OTel span via the CURRENTLY persisted
+  // `otlp_endpoint` + `otlp_protocol`. Used by the "Test
+  // connection" button on the Observability settings section so
+  // the operator sees "collector reachable" before saving a
+  // change. Does not mutate state.
+  testOtel: () =>
+    request<OtelTestResponse>('POST', '/settings/otel/test', {}),
 
   // Notifications
   listNotifications: () =>

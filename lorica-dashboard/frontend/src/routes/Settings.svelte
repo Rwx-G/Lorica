@@ -12,6 +12,7 @@
   import SettingsNotifications from '../components/settings/SettingsNotifications.svelte';
   import AppearanceTab from '../components/settings-tabs/AppearanceTab.svelte';
   import GlobalConfigTab from '../components/settings-tabs/GlobalConfigTab.svelte';
+  import ObservabilityTab from '../components/settings-tabs/ObservabilityTab.svelte';
   import SecurityPresetsTab from '../components/settings-tabs/SecurityPresetsTab.svelte';
   import BanRulesTab from '../components/settings-tabs/BanRulesTab.svelte';
   import NotificationHistoryTab from '../components/settings-tabs/NotificationHistoryTab.svelte';
@@ -20,7 +21,33 @@
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
-  let settingsForm = $state({ management_port: 9443, log_level: 'info', default_health_check_interval_s: 10, cert_warning_days: 30, cert_critical_days: 7, max_global_connections: 0, flood_threshold_rps: 0, waf_ban_threshold: 5, waf_ban_duration_s: 3600, access_log_retention: 100000, sla_purge_enabled: false, sla_purge_retention_days: 90, sla_purge_schedule: 'first_of_month', trusted_proxies: '', waf_whitelist_ips: '', connection_deny_cidrs: '', connection_allow_cidrs: '' });
+  let settingsForm = $state({
+    management_port: 9443,
+    log_level: 'info',
+    default_health_check_interval_s: 10,
+    cert_warning_days: 30,
+    cert_critical_days: 7,
+    max_global_connections: 0,
+    flood_threshold_rps: 0,
+    waf_ban_threshold: 5,
+    waf_ban_duration_s: 3600,
+    access_log_retention: 100000,
+    sla_purge_enabled: false,
+    sla_purge_retention_days: 90,
+    sla_purge_schedule: 'first_of_month',
+    trusted_proxies: '',
+    waf_whitelist_ips: '',
+    connection_deny_cidrs: '',
+    connection_allow_cidrs: '',
+    // Observability (v1.4.0)
+    otlp_endpoint: '',
+    otlp_protocol: 'http-proto',
+    otlp_service_name: 'lorica',
+    otlp_sampling_ratio: 0.1,
+    geoip_db_path: '',
+    geoip_auto_update_enabled: false,
+    asn_db_path: '',
+  });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
   let settingsError = $state('');
@@ -56,6 +83,7 @@
   const defaultSections: Record<string, boolean> = {
     appearance: true,
     global: true,
+    observability: true,
     dns_providers: true,
     notifications: true,
     presets: true,
@@ -95,7 +123,21 @@
       error = settingsRes.error.message;
     } else if (settingsRes.data) {
       settings = settingsRes.data;
-      settingsForm = { ...settingsRes.data, trusted_proxies: (settingsRes.data.trusted_proxies ?? []).join('\n'), waf_whitelist_ips: (settingsRes.data.waf_whitelist_ips ?? []).join('\n'), connection_deny_cidrs: (settingsRes.data.connection_deny_cidrs ?? []).join('\n'), connection_allow_cidrs: (settingsRes.data.connection_allow_cidrs ?? []).join('\n') };
+      settingsForm = {
+        ...settingsRes.data,
+        trusted_proxies: (settingsRes.data.trusted_proxies ?? []).join('\n'),
+        waf_whitelist_ips: (settingsRes.data.waf_whitelist_ips ?? []).join('\n'),
+        connection_deny_cidrs: (settingsRes.data.connection_deny_cidrs ?? []).join('\n'),
+        connection_allow_cidrs: (settingsRes.data.connection_allow_cidrs ?? []).join('\n'),
+        otlp_endpoint: settingsRes.data.otlp_endpoint ?? '',
+        otlp_protocol: settingsRes.data.otlp_protocol ?? 'http-proto',
+        otlp_service_name: settingsRes.data.otlp_service_name ?? 'lorica',
+        otlp_sampling_ratio: settingsRes.data.otlp_sampling_ratio ?? 0.1,
+        geoip_db_path: settingsRes.data.geoip_db_path ?? '',
+        geoip_auto_update_enabled:
+          settingsRes.data.geoip_auto_update_enabled ?? false,
+        asn_db_path: settingsRes.data.asn_db_path ?? '',
+      };
       customPresets = settingsRes.data.custom_security_presets ?? [];
     }
     if (notifRes.data) {
@@ -160,13 +202,32 @@
         .split('\n')
         .map((s: string) => s.trim())
         .filter((s: string) => s.length > 0),
+      // Observability string fields: empty string → null so the
+      // backend "clear" semantic fires (treat missing endpoint
+      // as "OTel off", not as "OTel set to empty string").
+      otlp_endpoint: settingsForm.otlp_endpoint.trim() || null,
+      geoip_db_path: settingsForm.geoip_db_path.trim() || null,
+      asn_db_path: settingsForm.asn_db_path.trim() || null,
     };
     const res = await api.updateSettings(payload);
     if (res.error) {
       settingsError = res.error.message;
     } else if (res.data) {
       settings = res.data;
-      settingsForm = { ...res.data, trusted_proxies: (res.data.trusted_proxies ?? []).join('\n'), waf_whitelist_ips: (res.data.waf_whitelist_ips ?? []).join('\n'), connection_deny_cidrs: (res.data.connection_deny_cidrs ?? []).join('\n'), connection_allow_cidrs: (res.data.connection_allow_cidrs ?? []).join('\n') };
+      settingsForm = {
+        ...res.data,
+        trusted_proxies: (res.data.trusted_proxies ?? []).join('\n'),
+        waf_whitelist_ips: (res.data.waf_whitelist_ips ?? []).join('\n'),
+        connection_deny_cidrs: (res.data.connection_deny_cidrs ?? []).join('\n'),
+        connection_allow_cidrs: (res.data.connection_allow_cidrs ?? []).join('\n'),
+        otlp_endpoint: res.data.otlp_endpoint ?? '',
+        otlp_protocol: res.data.otlp_protocol ?? 'http-proto',
+        otlp_service_name: res.data.otlp_service_name ?? 'lorica',
+        otlp_sampling_ratio: res.data.otlp_sampling_ratio ?? 0.1,
+        geoip_db_path: res.data.geoip_db_path ?? '',
+        geoip_auto_update_enabled: res.data.geoip_auto_update_enabled ?? false,
+        asn_db_path: res.data.asn_db_path ?? '',
+      };
       settingsMsg = 'Settings saved.';
       setTimeout(() => settingsMsg = '', 3000);
     }
@@ -201,6 +262,16 @@
       {settingsMsg}
       {settingsError}
       onSave={saveSettings}
+    />
+
+    <ObservabilityTab
+      bind:settingsForm
+      expanded={expandedSections.observability}
+      toggleSection={() => toggleSection('observability')}
+      onSave={saveSettings}
+      {settingsSaving}
+      {settingsMsg}
+      {settingsError}
     />
 
     <SecurityPresetsTab
