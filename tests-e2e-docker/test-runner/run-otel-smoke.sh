@@ -121,13 +121,18 @@ OTEL_UPDATE=$(api_put /api/v1/settings '{
     "otlp_sampling_ratio": 1.0
 }')
 assert_json "$OTEL_UPDATE" '.data.otlp_endpoint' 'http://jaeger:4318' 'otlp_endpoint persisted'
-# Float serialisation may render 1.0 as "1" or "1.0" depending on the
-# JSON writer; accept both.
-SAMPLING=$(echo "$OTEL_UPDATE" | jq -r '.data.otlp_sampling_ratio')
-case "$SAMPLING" in
-    1|1.0) ok "sampling_ratio persisted (= $SAMPLING)" ;;
-    *) fail "sampling_ratio persisted (expected 1 or 1.0, got '$SAMPLING')" ;;
-esac
+# API encoder emits f64 1.0 as JSON `1.0` (serde_json + ryu), the DB
+# now uses `{:?}` format so the stored string is `"1.0"` too. jq's
+# `-r` on a JSON integer-valued float will strip the decimal down
+# to `1`, but `.data.otlp_sampling_ratio | tonumber == 1` is a
+# value-level comparison that sidesteps jq's rendering choice
+# entirely — compares the JSON number to integer 1.
+SAMPLING_OK=$(echo "$OTEL_UPDATE" | jq -r '.data.otlp_sampling_ratio | tonumber == 1')
+if [ "$SAMPLING_OK" = "true" ]; then
+    ok "sampling_ratio persisted (= 1.0)"
+else
+    fail "sampling_ratio persisted (expected 1.0, got '$(echo "$OTEL_UPDATE" | jq -r '.data.otlp_sampling_ratio')')"
+fi
 
 # Settings changes trigger a reload, which in turn re-calls
 # otel::init. Give the provider a moment to swap.

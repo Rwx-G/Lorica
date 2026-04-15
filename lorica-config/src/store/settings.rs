@@ -248,7 +248,14 @@ impl ConfigStore {
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_sampling_ratio', ?1)",
-            params![settings.otlp_sampling_ratio.to_string()],
+            // `f64::to_string` renders `1.0` as `"1"` which round-trips
+            // through `parse::<f64>` just fine but confuses downstream
+            // consumers (the API JSON encoder emits `1.0`, so the
+            // stored string and the API echo diverge). `{:?}` goes via
+            // Debug's Grisu3 formatter which always keeps the decimal
+            // point (`1.0` stays `"1.0"`, `0.1` stays `"0.1"`), giving
+            // a canonical round-trippable form.
+            params![format!("{:?}", settings.otlp_sampling_ratio)],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('geoip_db_path', ?1)",
