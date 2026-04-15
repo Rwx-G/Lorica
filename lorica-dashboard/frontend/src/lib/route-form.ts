@@ -119,6 +119,23 @@ export interface RouteFormState {
   // are ISO 3166-1 alpha-2 comma-separated (e.g. "FR,DE,IT").
   geoip_mode: 'allowlist' | 'denylist';
   geoip_countries: string;
+  // Bot protection (v1.4.0 Epic 3). `bot_enabled = false` means
+  // the feature is off for this route; the other fields are
+  // persisted regardless so toggling the switch does not lose
+  // configured values. Bypass user-agent patterns are
+  // newline-separated (one regex per line) because commas may
+  // legitimately appear inside a regex and would be a UX trap
+  // with CSV. `bot_only_country` empty = challenge applies to
+  // every request (bypass rules are the only escape hatch).
+  bot_enabled: boolean;
+  bot_mode: 'cookie' | 'javascript' | 'captcha';
+  bot_cookie_ttl_s: number;
+  bot_pow_difficulty: number;
+  bot_captcha_alphabet: string;
+  bot_bypass_ip_cidrs: string;
+  bot_bypass_countries: string;
+  bot_bypass_user_agents: string;
+  bot_only_country: string;
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -196,6 +213,16 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   rate_limit_scope: 'per_ip',
   geoip_mode: 'denylist',
   geoip_countries: '',
+  bot_enabled: false,
+  bot_mode: 'javascript',
+  bot_cookie_ttl_s: 86400,
+  bot_pow_difficulty: 18,
+  bot_captcha_alphabet:
+    '23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ',
+  bot_bypass_ip_cidrs: '',
+  bot_bypass_countries: '',
+  bot_bypass_user_agents: '',
+  bot_only_country: '',
 };
 
 // Tab field mappings for dot indicators
@@ -232,6 +259,10 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'auto_ban_threshold', 'auto_ban_duration_s',
     'rate_limit_capacity', 'rate_limit_refill_per_sec', 'rate_limit_scope',
     'geoip_mode', 'geoip_countries',
+    'bot_enabled', 'bot_mode', 'bot_cookie_ttl_s', 'bot_pow_difficulty',
+    'bot_captcha_alphabet',
+    'bot_bypass_ip_cidrs', 'bot_bypass_countries', 'bot_bypass_user_agents',
+    'bot_only_country',
   ],
   path_rules: ['path_rules'],
   header_rules: ['header_rules'],
@@ -389,6 +420,17 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     rate_limit_scope: route.rate_limit?.scope ?? 'per_ip',
     geoip_mode: route.geoip?.mode ?? 'denylist',
     geoip_countries: (route.geoip?.countries ?? []).join(', '),
+    bot_enabled: route.bot_protection != null,
+    bot_mode: route.bot_protection?.mode ?? 'javascript',
+    bot_cookie_ttl_s: route.bot_protection?.cookie_ttl_s ?? 86400,
+    bot_pow_difficulty: route.bot_protection?.pow_difficulty ?? 18,
+    bot_captcha_alphabet:
+      route.bot_protection?.captcha_alphabet ??
+      '23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ',
+    bot_bypass_ip_cidrs: (route.bot_protection?.bypass?.ip_cidrs ?? []).join(', '),
+    bot_bypass_countries: (route.bot_protection?.bypass?.countries ?? []).join(', '),
+    bot_bypass_user_agents: (route.bot_protection?.bypass?.user_agents ?? []).join('\n'),
+    bot_only_country: (route.bot_protection?.only_country ?? []).join(', '),
   };
 }
 
@@ -577,6 +619,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     mtls: mtlsFormToRequest(form, isUpdate),
     rate_limit: rateLimitFormToRequest(form, isUpdate),
     geoip: geoipFormToRequest(form, isUpdate),
+    bot_protection: botProtectionFormToRequest(form, isUpdate),
   };
 }
 
@@ -600,6 +643,62 @@ function geoipFormToRequest(
     return isUpdate ? { mode: 'denylist', countries: [] } : undefined;
   }
   return { mode: form.geoip_mode, countries };
+}
+
+function botProtectionFormToRequest(
+  form: RouteFormState,
+  _isUpdate: boolean,
+): {
+  mode: 'cookie' | 'javascript' | 'captcha';
+  cookie_ttl_s: number;
+  pow_difficulty: number;
+  captcha_alphabet: string;
+  bypass: {
+    ip_cidrs?: string[];
+    asns?: number[];
+    countries?: string[];
+    user_agents?: string[];
+    rdns?: string[];
+  };
+  only_country?: string[];
+} | undefined {
+  // Feature toggled off → omit the field entirely. Update
+  // semantics on the backend say "missing = leave alone" so an
+  // operator that toggles OFF via a PUT is currently a no-op;
+  // proper "clear on update" support is a v1.4.x follow-up noted
+  // in the docs.
+  if (!form.bot_enabled) {
+    return undefined;
+  }
+
+  const csv = (s: string) =>
+    s.split(/[,\s]+/).map((c) => c.trim()).filter((c) => c.length > 0);
+  const lines = (s: string) =>
+    s.split(/\r?\n/).map((c) => c.trim()).filter((c) => c.length > 0);
+
+  const bypass: {
+    ip_cidrs?: string[];
+    countries?: string[];
+    user_agents?: string[];
+  } = {};
+  const ip_cidrs = csv(form.bot_bypass_ip_cidrs);
+  if (ip_cidrs.length > 0) bypass.ip_cidrs = ip_cidrs;
+  const countries = csv(form.bot_bypass_countries);
+  if (countries.length > 0) bypass.countries = countries;
+  const user_agents = lines(form.bot_bypass_user_agents);
+  if (user_agents.length > 0) bypass.user_agents = user_agents;
+
+  const only_country = csv(form.bot_only_country);
+  const only_country_opt = only_country.length > 0 ? only_country : undefined;
+
+  return {
+    mode: form.bot_mode,
+    cookie_ttl_s: form.bot_cookie_ttl_s,
+    pow_difficulty: form.bot_pow_difficulty,
+    captcha_alphabet: form.bot_captcha_alphabet,
+    bypass,
+    only_country: only_country_opt,
+  };
 }
 
 function rateLimitFormToRequest(

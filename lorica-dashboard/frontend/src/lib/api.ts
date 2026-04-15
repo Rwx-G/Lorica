@@ -164,6 +164,7 @@ export interface RouteResponse {
   mtls?: MtlsConfigResponse | null;
   rate_limit?: RateLimitConfig | null;
   geoip?: GeoIpConfig | null;
+  bot_protection?: BotProtectionConfig | null;
   created_at: string;
   updated_at: string;
 }
@@ -181,6 +182,25 @@ export type GeoIpMode = 'allowlist' | 'denylist';
 export interface GeoIpConfig {
   mode: GeoIpMode;
   countries: string[];
+}
+
+export type BotProtectionMode = 'cookie' | 'javascript' | 'captcha';
+
+export interface BotBypassRules {
+  ip_cidrs?: string[];
+  asns?: number[];
+  countries?: string[];
+  user_agents?: string[];
+  rdns?: string[];
+}
+
+export interface BotProtectionConfig {
+  mode: BotProtectionMode;
+  cookie_ttl_s: number;
+  pow_difficulty: number;
+  captcha_alphabet: string;
+  bypass: BotBypassRules;
+  only_country?: string[] | null;
 }
 
 export interface HeaderRuleResponse {
@@ -340,6 +360,7 @@ export interface CreateRouteRequest {
   mtls?: MtlsConfigRequest;
   rate_limit?: RateLimitConfig;
   geoip?: GeoIpConfig;
+  bot_protection?: BotProtectionConfig;
 }
 
 
@@ -406,6 +427,7 @@ export interface UpdateRouteRequest {
   mtls?: MtlsConfigRequest;
   rate_limit?: RateLimitConfig;
   geoip?: GeoIpConfig;
+  bot_protection?: BotProtectionConfig;
 }
 
 export interface BackendResponse {

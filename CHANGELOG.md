@@ -120,6 +120,25 @@ Author: Rwx-G
   containing `"` cannot escape the attribute context. 11 unit
   tests cover escaping, field propagation, optional contact-line
   rendering, difficulty-dependent hint text, and UTF-8 declaration
+- **Dashboard Bot Protection tab section** (v1.4.0 Epic 3, story
+  3.8). Under Routes &rarr; Protection, below the GeoIP filter:
+  a toggle switch to enable / disable per route, a mode dropdown
+  (Cookie / JavaScript / Captcha), cookie-TTL input (1..=604800),
+  and mode-specific controls. JavaScript mode surfaces the PoW
+  difficulty slider (14..=22) with live "expected median solve
+  time" hint text that matches the scale table in the design doc
+  — the slider value flips the hint between "~50 ms", "~800 ms
+  (~2 s on mobile)", "~12 s (UX degraded on mobile)" so the
+  operator sees the friction-vs-bot-cost trade without reading
+  the spec. Captcha mode surfaces the alphabet editor with the
+  curated default pre-filled. Bypass editor has three sub-sections:
+  IP CIDRs (comma-separated), countries (ISO alpha-2), User-Agent
+  regexes (newline-separated because commas legitimately appear
+  in regex syntax); `only_country` inverse gate below. ASN and
+  rDNS bypass deferred-to-follow-up status surfaced inline. Form
+  state + API mapping wired in `lib/route-form.ts` + `lib/api.ts`
+  (new `BotProtectionConfig` / `BotProtectionMode` / `BotBypassRules`
+  types). 178 frontend tests PASS, `svelte-check` clean
 - **Bot-protection verdict cache** (v1.4.0 Epic 3, story 3.6).
   Per-process DashMap cache of (route_id, IP prefix, cookie hash)
   → expires_at. `evaluate()` checks the cache BEFORE re-running

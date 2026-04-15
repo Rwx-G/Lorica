@@ -130,6 +130,202 @@
       </span>
     </div>
   </div>
+
+  <div class="section-divider">
+    <h4>Bot protection <span class="hint">(per route)</span></h4>
+    <p class="section-hint">
+      Graded challenge gate evaluated after GeoIP and before forward_auth.
+      Three modes in increasing friction: <strong>Cookie</strong> (passive,
+      catches scripts that do not persist cookies), <strong>JavaScript</strong>
+      (SHA-256 proof-of-work, ~50 ms to ~12 s on the client depending on
+      difficulty), <strong>Captcha</strong> (image + text, human interaction).
+      Bypass rules (IP CIDRs / countries / User-Agent regex) short-circuit the
+      challenge; first match wins. <code>only_country</code> inverse gate fires
+      the challenge only for the listed countries — leave empty to challenge
+      every request. See <code>docs/architecture/bot-protection.md</code> for
+      the full design + threat model.
+    </p>
+  </div>
+
+  <div class="form-row">
+    <div class="form-group" class:modified={isModified('bot_enabled')}>
+      <label>
+        {#if isImported('bot_enabled')}<span class="imported-badge">imported</span>{/if}
+        <input type="checkbox" bind:checked={form.bot_enabled} />
+        Enable bot protection
+      </label>
+      <span class="hint">
+        Off = skip the bot-protection stage entirely for this route.
+      </span>
+    </div>
+  </div>
+
+  {#if form.bot_enabled}
+    <div class="form-row">
+      <div class="form-group" class:modified={isModified('bot_mode')}>
+        <label for="bot-mode">Mode</label>
+        {#if isImported('bot_mode')}<span class="imported-badge">imported</span>{/if}
+        <select id="bot-mode" bind:value={form.bot_mode}>
+          <option value="cookie">Cookie (passive, zero UX cost)</option>
+          <option value="javascript">JavaScript PoW (default)</option>
+          <option value="captcha">Captcha (image, human interaction)</option>
+        </select>
+      </div>
+      <div class="form-group" class:modified={isModified('bot_cookie_ttl_s')}>
+        <label for="bot-cookie-ttl">Cookie TTL <span class="hint">(seconds, 1&hellip;604800)</span></label>
+        {#if isImported('bot_cookie_ttl_s')}<span class="imported-badge">imported</span>{/if}
+        <input
+          id="bot-cookie-ttl"
+          type="number"
+          min="1"
+          max="604800"
+          bind:value={form.bot_cookie_ttl_s}
+        />
+        <span class="hint">
+          Default 86400 (24 h). API caps at 604800 = 7 days.
+        </span>
+      </div>
+    </div>
+
+    {#if form.bot_mode === 'javascript'}
+      <div class="form-row">
+        <div class="form-group" class:modified={isModified('bot_pow_difficulty')}>
+          <label for="bot-pow">
+            PoW difficulty <span class="hint">(leading zero bits, 14&hellip;22)</span>
+          </label>
+          {#if isImported('bot_pow_difficulty')}<span class="imported-badge">imported</span>{/if}
+          <input
+            id="bot-pow"
+            type="range"
+            min="14"
+            max="22"
+            bind:value={form.bot_pow_difficulty}
+          />
+          <span class="hint">
+            Current: <strong>{form.bot_pow_difficulty} bits</strong> &mdash;
+            expected median solve
+            {#if form.bot_pow_difficulty <= 14}~50 ms
+            {:else if form.bot_pow_difficulty <= 16}~200 ms
+            {:else if form.bot_pow_difficulty <= 18}~800 ms (~2 s on mobile)
+            {:else if form.bot_pow_difficulty <= 20}~3 s
+            {:else}~12 s (UX degraded on mobile)
+            {/if}
+          </span>
+        </div>
+      </div>
+    {/if}
+
+    {#if form.bot_mode === 'captcha'}
+      <div class="form-row">
+        <div class="form-group" class:modified={isModified('bot_captcha_alphabet')}>
+          <label for="bot-alphabet">Captcha alphabet</label>
+          {#if isImported('bot_captcha_alphabet')}<span class="imported-badge">imported</span>{/if}
+          <input
+            id="bot-alphabet"
+            type="text"
+            bind:value={form.bot_captcha_alphabet}
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span class="hint">
+            Default excludes confusables (<code>0/O/1/l/I</code>) and glyphs the
+            bundled font does not render (<code>L/o</code>). Min 10 chars, max 128;
+            ASCII printable only, no duplicates (all enforced by the API validator).
+          </span>
+        </div>
+      </div>
+    {/if}
+
+    <div class="form-row">
+      <div class="form-group" class:modified={isModified('bot_bypass_ip_cidrs')}>
+        <label for="bot-bypass-ips">
+          Bypass &mdash; IP CIDRs <span class="hint">(comma-separated)</span>
+        </label>
+        {#if isImported('bot_bypass_ip_cidrs')}<span class="imported-badge">imported</span>{/if}
+        <input
+          id="bot-bypass-ips"
+          type="text"
+          bind:value={form.bot_bypass_ip_cidrs}
+          placeholder="e.g. 10.0.0.0/8, 2001:db8::/32"
+          autocomplete="off"
+        />
+        <span class="hint">
+          Office subnets, health-check probes. Max 500 entries.
+        </span>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group" class:modified={isModified('bot_bypass_countries')}>
+        <label for="bot-bypass-countries">
+          Bypass &mdash; Countries <span class="hint">(ISO 3166-1 alpha-2, comma-separated)</span>
+        </label>
+        {#if isImported('bot_bypass_countries')}<span class="imported-badge">imported</span>{/if}
+        <input
+          id="bot-bypass-countries"
+          type="text"
+          bind:value={form.bot_bypass_countries}
+          placeholder="e.g. FR, DE"
+          autocomplete="off"
+        />
+        <span class="hint">
+          Requires a GeoIP database loaded (Settings &rarr; GeoIP).
+        </span>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group" class:modified={isModified('bot_bypass_user_agents')}>
+        <label for="bot-bypass-ua">
+          Bypass &mdash; User-Agent regexes <span class="hint">(one per line)</span>
+        </label>
+        {#if isImported('bot_bypass_user_agents')}<span class="imported-badge">imported</span>{/if}
+        <textarea
+          id="bot-bypass-ua"
+          rows="4"
+          bind:value={form.bot_bypass_user_agents}
+          placeholder={'(?i)^Mozilla/5\\.0 .* Firefox/\n(?i)googlebot'}
+          autocomplete="off"
+          spellcheck="false"
+        ></textarea>
+        <span class="hint">
+          Rust <code>regex</code> crate syntax (no lookahead, no backreference).
+          Patterns compiled at API save time; a bad regex is rejected up front.
+          Trivially spoofable on its own &mdash; pair with IP CIDRs or a future
+          rDNS match.
+        </span>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group" class:modified={isModified('bot_only_country')}>
+        <label for="bot-only-country">
+          <code>only_country</code> gate <span class="hint">(comma-separated, empty = disabled)</span>
+        </label>
+        {#if isImported('bot_only_country')}<span class="imported-badge">imported</span>{/if}
+        <input
+          id="bot-only-country"
+          type="text"
+          bind:value={form.bot_only_country}
+          placeholder="e.g. RU, CN"
+          autocomplete="off"
+        />
+        <span class="hint">
+          When set, the challenge fires <strong>only</strong> for these
+          countries; everyone else passes through. Useful when protection is
+          geo-targeted.
+        </span>
+      </div>
+    </div>
+
+    <p class="section-hint">
+      <strong>ASN bypass</strong> and <strong>rDNS bypass</strong> are listed in
+      the design doc but deferred to a v1.4.x follow-up: ASN needs a dedicated
+      database distribution; rDNS needs a forward-confirmation DNS pipeline
+      (design § 10.3 flags rDNS-without-forward-confirm as a must-not
+      regression). The API rejects non-empty lists for both today.
+    </p>
+  {/if}
 </div>
 
 <style>
