@@ -1583,6 +1583,33 @@ async fn handle_metrics_request(
     report.backend_conn_entries = backend_conn_entries;
     report.request_entries = request_entries;
     report.waf_entries = waf_entries;
+    // Cross-worker counter aggregation (v1.4.0 follow-up). Ships
+    // every non-typed per-worker counter (bot_challenge,
+    // geoip_block, forward_auth_cache, ...) to the supervisor so
+    // `/metrics` at the supervisor sees the union across workers.
+    // lorica-api exposes the snapshot as `(name, labels, value)`
+    // tuples; translate into the lorica-command wire shape here —
+    // keeps lorica-api free of the lorica-command dep.
+    report.generic_counters = lorica_api::metrics::snapshot_per_worker_counters()
+        .into_iter()
+        .map(|(name, label_pairs, value)| {
+            // Flatten name=value pairs into alternating strings on
+            // the wire (`["route_id", "uuid", "mode", "cookie", ...]`).
+            // The supervisor re-pairs them at apply time. This keeps
+            // the wire format flat while preserving the label-name
+            // metadata needed for positional reorder.
+            let mut labels: Vec<String> = Vec::with_capacity(label_pairs.len() * 2);
+            for (k, v) in label_pairs {
+                labels.push(k);
+                labels.push(v);
+            }
+            lorica_command::GenericCounterEntry {
+                name,
+                labels,
+                value,
+            }
+        })
+        .collect();
 
     let _ = inc
         .reply(lorica_command::Response::ok_with(

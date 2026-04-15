@@ -438,6 +438,38 @@ pub struct MetricsReport {
     /// Per-category/action WAF event counts (cumulative).
     #[prost(message, repeated, tag = "11")]
     pub waf_entries: Vec<WafCountEntry>,
+    /// Generic per-worker counter deltas (v1.4.0 follow-up
+    /// closing the cross-worker counter-aggregation gap). Each
+    /// entry is `{metric_name, label_values, value}` where
+    /// `label_values` mirrors the label order the supervisor's
+    /// `IntCounterVec` declared at registration. The supervisor
+    /// applies these deltas to its own metrics registry on each
+    /// scrape so Prometheus sees the union across all workers
+    /// for counters the typed fields above do not cover
+    /// (`lorica_geoip_block_total`, `lorica_bot_challenge_total`,
+    /// `lorica_forward_auth_cache_total`,
+    /// `lorica_header_rule_match_total`,
+    /// `lorica_canary_split_selected_total`,
+    /// `lorica_mirror_outcome_total`,
+    /// `lorica_cache_predictor_bypass_total`).
+    #[prost(message, repeated, tag = "12")]
+    pub generic_counters: Vec<GenericCounterEntry>,
+}
+
+/// One generic counter delta in a [`MetricsReport`]. `labels` is
+/// an ordered list of label values matching the registration order
+/// the supervisor uses when it declared the counter. `value` is
+/// the cumulative count on the worker (not a delta) — the
+/// supervisor reconciles by replacing the per-worker snapshot and
+/// re-summing on every scrape.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GenericCounterEntry {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, repeated, tag = "2")]
+    pub labels: Vec<String>,
+    #[prost(uint64, tag = "3")]
+    pub value: u64,
 }
 
 impl MetricsReport {
@@ -458,6 +490,7 @@ impl MetricsReport {
             backend_conn_entries: Vec::new(),
             request_entries: Vec::new(),
             waf_entries: Vec::new(),
+            generic_counters: Vec::new(),
         }
     }
 }

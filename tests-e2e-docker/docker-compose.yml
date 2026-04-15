@@ -348,12 +348,12 @@ services:
       - LORICA_API=http://lorica-bot-workers:9443
       - LORICA_PROXY=http://lorica-bot-workers:8080
       - BACKEND1_ADDR=backend1:80
-      # The bot-protection Prometheus counter is currently per-
-      # worker (same behaviour as `lorica_geoip_block_total`). The
-      # supervisor's `/metrics` does not aggregate it. The smoke's
-      # counter-delta check would always fail in worker mode even
-      # though the functional flow works; set this to skip it.
-      - BOT_SMOKE_SKIP_METRICS=1
+      # Counter aggregation now lands (v1.4.0 follow-up):
+      # per-worker counters ship on `MetricsReport.generic_counters`
+      # and the supervisor applies them to its own registry on
+      # every scrape. The smoke's counter-delta checks therefore
+      # run under workers mode too; the skip flag would mask any
+      # aggregation regression.
     networks:
       - e2e
 

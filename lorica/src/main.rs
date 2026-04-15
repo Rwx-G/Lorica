@@ -1056,6 +1056,32 @@ fn run_supervisor(cli: Cli) {
                                                 waf_counts,
                                             )
                                             .await;
+                                        // Cross-worker generic-counter
+                                        // aggregation (v1.4.0
+                                        // follow-up).
+                                        // Pair up the flat ["k","v","k","v",...]
+                                        // list back into (String, String) label
+                                        // pairs. Odd trailing entries are
+                                        // silently dropped — safe default
+                                        // since a truncated wire payload
+                                        // just skips the affected metric.
+                                        let gc: Vec<(String, Vec<(String, String)>, u64)> =
+                                            report
+                                                .generic_counters
+                                                .iter()
+                                                .map(|e| {
+                                                    let pairs: Vec<(String, String)> = e
+                                                        .labels
+                                                        .chunks_exact(2)
+                                                        .map(|c| (c[0].clone(), c[1].clone()))
+                                                        .collect();
+                                                    (e.name.clone(), pairs, e.value)
+                                                })
+                                                .collect();
+                                        lorica_api::metrics::apply_worker_generic_counters(
+                                            worker_id,
+                                            &gc,
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -1605,6 +1631,23 @@ fn run_supervisor(cli: Cli) {
                                                                 agg_metrics
                                                                     .update_worker(id, report.cache_hits, report.cache_misses, report.active_connections, bans, ewma, backend_conns, req_counts, waf_counts)
                                                                     .await;
+                                                                let gc: Vec<(String, Vec<(String, String)>, u64)> =
+                                                                    report
+                                                                        .generic_counters
+                                                                        .iter()
+                                                                        .map(|e| {
+                                                                            let pairs: Vec<(String, String)> = e
+                                                                                .labels
+                                                                                .chunks_exact(2)
+                                                                                .map(|c| (c[0].clone(), c[1].clone()))
+                                                                                .collect();
+                                                                            (e.name.clone(), pairs, e.value)
+                                                                        })
+                                                                        .collect();
+                                                                lorica_api::metrics::apply_worker_generic_counters(
+                                                                    id,
+                                                                    &gc,
+                                                                );
                                                             }
                                                         }
                                                         Err(e) => warn!(worker_id = id, error = %e, "restarted worker heartbeat recv failed"),
@@ -2454,6 +2497,27 @@ async fn pull_all_metrics_via_rpc(
                             waf_counts,
                         )
                         .await;
+                    // Cross-worker counter aggregation (v1.4.0
+                    // follow-up). Apply the per-worker snapshot
+                    // to the supervisor's own prometheus registry
+                    // so the supervisor's `/metrics` sees the
+                    // union of every worker's counters for
+                    // bot_challenge / geoip_block / forward_auth
+                    // cache / header rule match / canary split /
+                    // mirror outcome / cache predictor bypass.
+                    let gc: Vec<(String, Vec<(String, String)>, u64)> = report
+                        .generic_counters
+                        .iter()
+                        .map(|e| {
+                            let pairs: Vec<(String, String)> = e
+                                .labels
+                                .chunks_exact(2)
+                                .map(|c| (c[0].clone(), c[1].clone()))
+                                .collect();
+                            (e.name.clone(), pairs, e.value)
+                        })
+                        .collect();
+                    lorica_api::metrics::apply_worker_generic_counters(wid, &gc);
                 }
                 _ => {
                     lorica_api::metrics::inc_supervisor_rpc_outcome("metrics_pull", "error");
