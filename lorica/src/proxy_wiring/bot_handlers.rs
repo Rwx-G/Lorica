@@ -135,8 +135,18 @@ pub async fn handle_solve(
 
     if let Err(e) = verdict {
         debug!(error = ?e, "bot-solve: verify failed");
+        lorica_api::metrics::inc_bot_challenge(
+            &entry.route_id,
+            entry.mode.as_str(),
+            "failed",
+        );
         return write_plain(session, 403, "wrong answer").await;
     }
+    lorica_api::metrics::inc_bot_challenge(
+        &entry.route_id,
+        entry.mode.as_str(),
+        "passed",
+    );
 
     // Success: mint verdict cookie bound to the stashed route_id
     // and IP prefix. Use the stashed cookie_ttl_s so a per-route
@@ -228,7 +238,12 @@ pub async fn serve_challenge(
         BotProtectionMode::Captcha => Mode::Captcha,
     };
 
+    let mode_str = mode.as_str();
     if !content_type_prefers_html {
+        // Non-HTML client → plain-text fallback. Still counts as
+        // "shown" for metrics because the filter served a
+        // challenge response — it just rendered as text.
+        lorica_api::metrics::inc_bot_challenge(route_id, mode_str, "shown");
         let body = chrender::render_plaintext_fallback(mode, None);
         let mut header = ResponseHeader::build(403, None)?;
         header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
@@ -277,6 +292,14 @@ pub async fn serve_challenge(
             };
             let cookie_value = cookie::sign(&payload, &secret);
             let set_cookie = build_set_cookie_header(&cookie_value, cfg.cookie_ttl_s);
+
+            // Cookie mode's page IS the verdict issuance — the
+            // browser that follows the meta-refresh AND carries
+            // the cookie back is what we let through. Count it as
+            // "passed" here rather than "shown" because the user
+            // effectively completed the challenge in this one
+            // response.
+            lorica_api::metrics::inc_bot_challenge(route_id, mode_str, "passed");
 
             let body = chrender::render_cookie_refresh_page(return_url, None);
             let mut header = ResponseHeader::build(200, None)?;
@@ -372,6 +395,13 @@ pub async fn serve_challenge(
             html
         }
     };
+
+    // Challenge HTML page served for PoW / Captcha modes. Cookie
+    // mode took an early return above (its page IS the verdict
+    // issuance; counted as "passed" there when the user follows
+    // the refresh). Increment "shown" here so Prometheus sees
+    // every challenge-served event.
+    lorica_api::metrics::inc_bot_challenge(route_id, mode_str, "shown");
 
     let mut header = ResponseHeader::build(200, None)?;
     header.insert_header("Content-Type", "text/html; charset=utf-8")?;

@@ -1941,6 +1941,9 @@ impl ProxyHttp for LoricaProxy {
             lorica.trace.origin = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
             error.message = tracing::field::Empty,
+            bot_protection.challenge.outcome = tracing::field::Empty,
+            bot_protection.challenge.mode = tracing::field::Empty,
+            bot_protection.challenge.reason = tracing::field::Empty,
         );
 
         // Drop the context guard now that the span has latched its
@@ -2974,6 +2977,45 @@ impl ProxyHttp for LoricaProxy {
                                 route_id = %entry.route.id,
                                 reason = reason.as_str(),
                                 "bot-protection: pass"
+                            );
+                            // Metric + OTel span attribute. A valid
+                            // cookie yields outcome=passed; any of
+                            // the bypass reasons yields
+                            // outcome=bypassed. The detailed bypass
+                            // category lives on the OTel span
+                            // attribute so Prometheus cardinality
+                            // stays bounded.
+                            let outcome = match reason {
+                                crate::bot::PassReason::ValidCookie => "passed",
+                                crate::bot::PassReason::Disabled => "passed",
+                                crate::bot::PassReason::OnlyCountryGateMiss => "bypassed",
+                                crate::bot::PassReason::BypassIpCidr
+                                | crate::bot::PassReason::BypassCountry
+                                | crate::bot::PassReason::BypassUserAgent => "bypassed",
+                            };
+                            let mode_str = match bot_cfg.mode {
+                                lorica_config::models::BotProtectionMode::Cookie => "cookie",
+                                lorica_config::models::BotProtectionMode::Javascript => {
+                                    "javascript"
+                                }
+                                lorica_config::models::BotProtectionMode::Captcha => "captcha",
+                            };
+                            lorica_api::metrics::inc_bot_challenge(
+                                entry.route.id.as_str(),
+                                mode_str,
+                                outcome,
+                            );
+                            ctx.root_tracing_span.record(
+                                "bot_protection.challenge.outcome",
+                                outcome,
+                            );
+                            ctx.root_tracing_span.record(
+                                "bot_protection.challenge.mode",
+                                mode_str,
+                            );
+                            ctx.root_tracing_span.record(
+                                "bot_protection.challenge.reason",
+                                reason.as_str(),
                             );
                         }
                         crate::bot::Decision::Challenge => {

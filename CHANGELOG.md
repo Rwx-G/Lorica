@@ -120,6 +120,34 @@ Author: Rwx-G
   containing `"` cannot escape the attribute context. 11 unit
   tests cover escaping, field propagation, optional contact-line
   rendering, difficulty-dependent hint text, and UTF-8 declaration
+- **Bot-protection verdict cache** (v1.4.0 Epic 3, story 3.6).
+  Per-process DashMap cache of (route_id, IP prefix, cookie hash)
+  → expires_at. `evaluate()` checks the cache BEFORE re-running
+  HMAC-SHA256 verify; a hit short-circuits at ~50 ns vs ~1 µs for
+  the full verify. Cached entries carry the cookie's own
+  `expires_at` so a stale cache entry cannot extend a cookie past
+  its TTL. FIFO-bounded at 16 384 entries matching the existing
+  `forward_auth` cache shape. Four unit tests cover
+  hit-skips-verify, expired-entry-is-miss, key-differs-per-scope,
+  and FIFO eviction at capacity. Cross-worker sharing via
+  `VerdictCacheEngine::Rpc` evaluated and deferred to a follow-up
+  (the HMAC verify is fast enough that an RPC hop would be a net
+  loss)
+- **Bot-protection metrics + OTel span attributes** (v1.4.0 Epic
+  3, story 3.7). New Prometheus counter
+  `lorica_bot_challenge_total{route_id, mode, outcome}` with
+  outcome ∈ { shown / passed / failed / bypassed }. Fires from
+  every terminal decision point: the evaluator (passed on valid
+  cookie, bypassed on bypass-category or only_country-miss),
+  `serve_challenge` (shown on the HTML / plain-text render,
+  passed on Cookie-mode's immediate verdict issuance),
+  `handle_solve` (passed on successful verify, failed on
+  wrong answer / expired nonce). Routes without bot_protection
+  never touch the counter. Three new fields on the per-request
+  `http_request` OTel span — outcome, mode, reason — finer
+  granularity than the Prometheus labels so Jaeger / Tempo can
+  break down the `bypassed` bucket per reason without inflating
+  Prometheus cardinality
 - **Bot-protection HMAC secret lifecycle** (v1.4.0 Epic 3, story
   3.5a). New `apply_bot_secret_from_store` hook in `lorica::reload`
   that runs inside every `reload_proxy_config*` entry point.

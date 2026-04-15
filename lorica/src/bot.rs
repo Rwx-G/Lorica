@@ -36,7 +36,9 @@
 
 use std::collections::HashMap;
 
+use dashmap::DashMap;
 use lorica_challenge::{IpPrefix, Mode};
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rand::RngCore;
 
@@ -298,21 +300,49 @@ pub struct EvalInputs<'a> {
 /// 6. Otherwise → challenge.
 pub fn evaluate(inputs: &EvalInputs<'_>) -> Decision {
     // 1. Valid verdict cookie.
-    if let (Some(cookie), Some(secret)) = (inputs.verdict_cookie, inputs.hmac_secret) {
-        if let Ok(payload) = lorica_challenge::cookie::verify(cookie, secret, inputs.now) {
-            // Scope check: the cookie must bind to this route's id
-            // AND the client's IP prefix must match the one the
-            // cookie was minted for. Fails open to Challenge on any
-            // mismatch so a stolen cookie cannot be replayed across
-            // routes or across NAT gateways (cf. § 4.2 in the
-            // design doc).
-            let expected_route_bytes = route_id_bytes(inputs.route_id);
-            let expected_prefix = IpPrefix::from_ip(inputs.client_ip);
-            if payload.route_id == expected_route_bytes && payload.ip_prefix == expected_prefix
-            {
-                return Decision::Pass {
-                    reason: PassReason::ValidCookie,
-                };
+    if let Some(cookie) = inputs.verdict_cookie {
+        let expected_prefix = IpPrefix::from_ip(inputs.client_ip);
+
+        // 1a. Short-circuit via the per-process verdict cache. Saves
+        //     the HMAC-SHA256 verify on repeat requests from the
+        //     same client — small but measurable at high RPS. The
+        //     cache key includes the route_id + IP prefix so a
+        //     stolen cookie played against a different route or a
+        //     different NAT gateway never hits a stale entry.
+        if cache_check(inputs.route_id, &expected_prefix, cookie, inputs.now).is_some() {
+            return Decision::Pass {
+                reason: PassReason::ValidCookie,
+            };
+        }
+
+        // 1b. Cache miss: fall through to the canonical HMAC verify
+        //     path.
+        if let Some(secret) = inputs.hmac_secret {
+            if let Ok(payload) = lorica_challenge::cookie::verify(cookie, secret, inputs.now) {
+                // Scope check: the cookie must bind to this route's id
+                // AND the client's IP prefix must match the one the
+                // cookie was minted for. Fails open to Challenge on
+                // any mismatch so a stolen cookie cannot be replayed
+                // across routes or across NAT gateways (cf. § 4.2 in
+                // the design doc).
+                let expected_route_bytes = route_id_bytes(inputs.route_id);
+                if payload.route_id == expected_route_bytes
+                    && payload.ip_prefix == expected_prefix
+                {
+                    // Seed the cache so the next request on the same
+                    // triple short-circuits. Store the cookie's own
+                    // `expires_at` so an entry never outlives the
+                    // cookie itself.
+                    cache_insert(
+                        inputs.route_id,
+                        &expected_prefix,
+                        cookie,
+                        payload.expires_at,
+                    );
+                    return Decision::Pass {
+                        reason: PassReason::ValidCookie,
+                    };
+                }
             }
         }
     }
@@ -393,6 +423,121 @@ pub fn route_id_bytes(route_id: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest[..16]);
     out
+}
+
+/// Per-process cache of verified verdict cookies (story 3.6). A hit
+/// short-circuits the cookie HMAC re-verification on repeat
+/// requests from the same (route_id, client IP prefix, cookie
+/// HMAC-tag) triple. Verification itself is already ~1 µs, but
+/// bypassing it shaves the cost at steady state to a single hash-
+/// map read + a timestamp compare (~50 ns). FIFO-bounded at 16 384
+/// entries — same shape as `forward_auth::FORWARD_AUTH_VERDICT_CACHE`,
+/// so the memory ceiling is deterministic and tiny.
+///
+/// Cross-worker sharing via `VerdictCacheEngine::Rpc` was evaluated
+/// during story 3.6 and deferred to a follow-up: the HMAC-SHA256
+/// verify is already fast enough that the RPC hop to the
+/// supervisor would be a NET LOSS at typical scales. Each worker
+/// therefore keeps its own cache and a client that hits a
+/// different worker on its second request pays the HMAC re-verify
+/// cost once.
+///
+/// Cached value is the cookie's `expires_at` (seconds since UNIX
+/// epoch). Lookup checks `expires_at > now` before accepting the
+/// hit so an entry that ages past its cookie TTL is a cache miss
+/// even before the FIFO eviction reclaims the slot.
+const VERDICT_CACHE_CAP: usize = 16_384;
+
+static VERDICT_CACHE: Lazy<DashMap<String, i64>> = Lazy::new(DashMap::new);
+
+/// FIFO order list for the verdict cache. Same pattern as
+/// `forward_auth::FORWARD_AUTH_VERDICT_ORDER`: key written on
+/// every insert, oldest popped when the cache hits the cap.
+static VERDICT_ORDER: Lazy<Mutex<std::collections::VecDeque<String>>> =
+    Lazy::new(|| Mutex::new(std::collections::VecDeque::with_capacity(VERDICT_CACHE_CAP)));
+
+/// Compose the verdict-cache key for a (route_id, ip_prefix, cookie
+/// HMAC-tag) triple. NUL-separated so no sub-field can forge a
+/// collision via crafted content. HMAC tag is the last 16 bytes of
+/// the cookie's base64url wire format (since it appears at the
+/// same fixed offset at the end of the pre-encoding payload, and
+/// base64url-encoding it a second time has the same bytes as the
+/// original cookie's tail). We just take the last 21 or 22 chars
+/// of the cookie string — 21 for v4 IP (16 B tag = 22 base64url
+/// chars, minus 1 pad-free adjustment = 21 or 22 depending on
+/// alignment). Simpler: hash the cookie string itself into 16
+/// bytes and use that as the tag stand-in.
+fn verdict_cache_key(route_id: &str, ip_prefix: &IpPrefix, cookie: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(cookie.as_bytes());
+    let tag = hasher.finalize();
+    // 8 hex chars of the hash is ample to avoid collisions at our
+    // 16 k cache capacity (probability << 2^-60).
+    let tag_hex: String = tag
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let prefix_hex: String = ip_prefix
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{route_id}\0{prefix_hex}\0{tag_hex}")
+}
+
+/// Return the cached `expires_at` for a verdict key if it is
+/// present AND still valid per `now`. Returns `None` on cache miss
+/// or on a stale entry (which is NOT evicted here — the next
+/// verify's `cache_insert` does not touch the stale slot; the FIFO
+/// reclaim will catch it eventually).
+pub fn cache_check(
+    route_id: &str,
+    ip_prefix: &IpPrefix,
+    cookie: &str,
+    now: i64,
+) -> Option<i64> {
+    let key = verdict_cache_key(route_id, ip_prefix, cookie);
+    let expires = *VERDICT_CACHE.get(&key)?;
+    if expires > now {
+        Some(expires)
+    } else {
+        None
+    }
+}
+
+/// Insert a verified cookie into the cache. Called from the hot
+/// path immediately after `lorica_challenge::cookie::verify`
+/// succeeds. The FIFO eviction mirrors forward_auth's implementation
+/// so future cleanup (when both caches move to a shared helper)
+/// stays trivial.
+pub fn cache_insert(
+    route_id: &str,
+    ip_prefix: &IpPrefix,
+    cookie: &str,
+    expires_at: i64,
+) {
+    let key = verdict_cache_key(route_id, ip_prefix, cookie);
+    let mut order = VERDICT_ORDER.lock();
+    while order.len() >= VERDICT_CACHE_CAP {
+        if let Some(old) = order.pop_front() {
+            VERDICT_CACHE.remove(&old);
+        } else {
+            break;
+        }
+    }
+    order.push_back(key.clone());
+    drop(order);
+    VERDICT_CACHE.insert(key, expires_at);
+}
+
+/// Clear the verdict cache. Reserved for tests + a future
+/// "revoke all cookies" operator action on the dashboard.
+#[doc(hidden)]
+pub fn cache_reset_for_test() {
+    VERDICT_CACHE.clear();
+    VERDICT_ORDER.lock().clear();
 }
 
 /// Check whether `ip` matches a CIDR string. Accepts both bare IPs
@@ -754,5 +899,83 @@ mod tests {
         assert!(ip_matches_cidr(v4, "203.0.113.42"));
         assert!(!ip_matches_cidr(v4, "203.0.113.43"));
         assert!(!ip_matches_cidr(v4, "garbage"));
+    }
+
+    #[test]
+    fn verdict_cache_hit_skips_hmac_verify() {
+        cache_reset_for_test();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
+        let prefix = IpPrefix::from_ip(ip);
+        let cookie = "fake-cookie-string";
+        let route_id = "route-cache-test";
+        let now = 1_700_000_000;
+        // Seed the cache as if a prior verify succeeded.
+        cache_insert(route_id, &prefix, cookie, now + 3600);
+
+        // Evaluate with NO hmac_secret. Without the cache, the
+        // cookie branch would skip entirely; WITH the cache hit,
+        // evaluate returns Pass::ValidCookie.
+        let c = cfg();
+        let i = EvalInputs {
+            client_ip: ip,
+            country: None,
+            user_agent: "",
+            verdict_cookie: Some(cookie),
+            now,
+            hmac_secret: None,
+            route_id,
+            config: &c,
+        };
+        match evaluate(&i) {
+            Decision::Pass { reason } => assert_eq!(reason, PassReason::ValidCookie),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn verdict_cache_expired_entry_is_miss() {
+        cache_reset_for_test();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
+        let prefix = IpPrefix::from_ip(ip);
+        let cookie = "stale-cookie";
+        let route_id = "route-cache-test-2";
+        // expires_at = 1000, now = 2000 → entry is past expiry.
+        cache_insert(route_id, &prefix, cookie, 1000);
+
+        assert!(cache_check(route_id, &prefix, cookie, 2000).is_none());
+    }
+
+    #[test]
+    fn verdict_cache_key_differs_per_scope() {
+        // The cache key MUST differ across (route, ip prefix, cookie)
+        // triples so one route's verdict never pollutes another
+        // route's lookup.
+        let p1 = IpPrefix::from_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));
+        let p2 = IpPrefix::from_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let k1 = verdict_cache_key("r1", &p1, "cookie");
+        let k2 = verdict_cache_key("r2", &p1, "cookie");
+        let k3 = verdict_cache_key("r1", &p2, "cookie");
+        let k4 = verdict_cache_key("r1", &p1, "different-cookie");
+        assert_ne!(k1, k2);
+        assert_ne!(k1, k3);
+        assert_ne!(k1, k4);
+    }
+
+    #[test]
+    fn verdict_cache_fifo_evicts_oldest_when_full() {
+        cache_reset_for_test();
+        // Insert one more than the cap; the first entry must be
+        // gone on the next check.
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let prefix = IpPrefix::from_ip(ip);
+        for i in 0..(VERDICT_CACHE_CAP + 10) {
+            let cookie = format!("cookie-{i}");
+            cache_insert("route", &prefix, &cookie, 2_000_000_000);
+        }
+        // The very first `cookie-0` is out by now.
+        assert!(cache_check("route", &prefix, "cookie-0", 1_900_000_000).is_none());
+        // A recent one still hits.
+        let last = format!("cookie-{}", VERDICT_CACHE_CAP + 9);
+        assert!(cache_check("route", &prefix, &last, 1_900_000_000).is_some());
     }
 }

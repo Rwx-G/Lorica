@@ -366,6 +366,44 @@ pub fn inc_geoip_block(route_id: &str, country: &str, mode: &str) {
         .inc();
 }
 
+/// Counter: bot-protection challenge outcomes per route (v1.4.0
+/// Epic 3 story 3.7). Labels:
+/// - `route_id`: bounded by the number of configured routes.
+/// - `mode`: `"cookie"` / `"javascript"` / `"captcha"` (the mode
+///   the route was configured with at the time of the event).
+/// - `outcome`: `"shown"` (challenge page served), `"passed"`
+///   (verdict cookie verified OR solve succeeded), `"failed"`
+///   (wrong PoW / captcha answer, or cookie scope mismatch), or
+///   `"bypassed"` (one of the five bypass categories matched —
+///   detail carried on the OTel span, not the metric).
+///
+/// Cardinality bound: routes × 3 modes × 4 outcomes, well inside
+/// Prometheus comfort on any plausible deployment. Routes without
+/// `bot_protection` configured never touch this counter.
+static BOT_CHALLENGE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "bot_challenge_total",
+            "Bot-protection challenge outcomes (outcome=shown|passed|failed|bypassed)"
+        )
+        .namespace("lorica"),
+        &["route_id", "mode", "outcome"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one bot-protection challenge outcome. Called from the
+/// proxy request filter on every bot-protection decision that
+/// reaches a terminal state: pass, challenge render, or verify
+/// result.
+pub fn inc_bot_challenge(route_id: &str, mode: &str, outcome: &str) {
+    BOT_CHALLENGE_TOTAL
+        .with_label_values(&[route_id, mode, outcome])
+        .inc();
+}
+
 /// Counter: notification events dropped by the bounded broadcast
 /// channel, labeled by drop reason (`lag` = subscriber fell behind,
 /// `closed` = channel closed). Bounded-cardinality: only two labels.
