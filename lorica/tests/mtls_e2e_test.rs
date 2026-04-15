@@ -254,6 +254,7 @@ fn mtls_route(ca_pem: &str, required: bool, orgs: Vec<&str>) -> Route {
         }),
         rate_limit: None,
         geoip: None,
+        bot_protection: None,
         created_at: now,
         updated_at: now,
     }

@@ -119,7 +119,139 @@ pub async fn reload_proxy_config_with_mtls(
     commit_prepared_reload(proxy_config, connection_filter, prepared);
     apply_otel_settings_from_store(store).await;
     apply_geoip_settings_from_store(store).await;
+    apply_bot_secret_from_store(store).await;
     Ok(())
+}
+
+/// Re-apply the bot-protection HMAC secret stored in
+/// `GlobalSettings.bot_hmac_secret_hex` to the live process
+/// (v1.4.0 Epic 3). Called from every `reload_proxy_config*` so a
+/// cert-renewal-triggered `rotate_bot_hmac_secret` persistence
+/// takes effect without a proxy restart.
+///
+/// First-boot contract: if the persisted hex is empty (fresh
+/// install before the bot-protection feature has ever been
+/// enabled), this helper generates a random 32-byte secret, writes
+/// it back to the DB, and installs it in memory. Subsequent
+/// reloads read the same hex and install it (idempotent — dedup is
+/// by value, not by "already run once").
+///
+/// Failure modes:
+/// - Hex in the DB is malformed / wrong length: `warn!`, generate a
+///   fresh one, overwrite. A hand-edited bad row cannot leave the
+///   secret slot empty. Outstanding cookies signed with the
+///   previous (good) bytes stop validating — acceptable degradation
+///   for a corrupt config.
+/// - DB write failure: `warn!`, leave the in-memory slot alone.
+///   The process serves traffic with whatever secret is installed
+///   (or without bot-protection until the next reload succeeds).
+async fn apply_bot_secret_from_store(store: &Arc<Mutex<ConfigStore>>) {
+    use std::sync::OnceLock;
+
+    static LAST_APPLIED: OnceLock<parking_lot::Mutex<Option<[u8; 32]>>> = OnceLock::new();
+    let slot = LAST_APPLIED.get_or_init(|| parking_lot::Mutex::new(None));
+
+    let s = store.lock().await;
+    let settings = match s.get_global_settings() {
+        Ok(settings) => settings,
+        Err(_) => return,
+    };
+    drop(s);
+
+    // Decode persisted hex if present + correctly shaped; otherwise
+    // generate a fresh secret and schedule it for persistence.
+    let (bytes, persist_back) = match parse_bot_secret_hex(&settings.bot_hmac_secret_hex) {
+        Some(b) => (b, false),
+        None => {
+            if !settings.bot_hmac_secret_hex.trim().is_empty() {
+                warn!(
+                    "bot_hmac_secret_hex in DB is malformed or wrong length; generating a fresh secret"
+                );
+            } else {
+                info!("bot-protection HMAC secret not set; generating on first boot");
+            }
+            (lorica_challenge::secret::generate(), true)
+        }
+    };
+
+    // Dedup: if the decoded (or generated) bytes match the last
+    // installed value AND nothing needs persisting, skip the
+    // ArcSwap store + the DB write.
+    {
+        let mut last = slot.lock();
+        let changed = match *last {
+            Some(prev) => prev != bytes,
+            None => true,
+        };
+        if !changed && !persist_back {
+            return;
+        }
+        *last = Some(bytes);
+    }
+
+    lorica_challenge::secret::install(bytes);
+
+    if persist_back {
+        let hex = encode_bot_secret_hex(&bytes);
+        let s = store.lock().await;
+        match s.get_global_settings() {
+            Ok(mut cur) => {
+                cur.bot_hmac_secret_hex = hex;
+                if let Err(e) = s.update_global_settings(&cur) {
+                    warn!(
+                        error = %e,
+                        "failed to persist newly-generated bot HMAC secret; next boot will regenerate"
+                    );
+                } else {
+                    info!("bot-protection HMAC secret persisted to SQLite");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "failed to read global settings to persist bot HMAC secret"
+                );
+            }
+        }
+    }
+}
+
+/// Parse a 64-char hex string into a fixed 32-byte secret. Returns
+/// `None` on malformed hex or wrong length — callers treat that as
+/// "regenerate". Kept module-private because the wire format is an
+/// internal contract between `GlobalSettings.bot_hmac_secret_hex`
+/// and the in-memory slot.
+fn parse_bot_secret_hex(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = hex_digit(chunk[0])?;
+        let lo = hex_digit(chunk[1])?;
+        out[i] = hi << 4 | lo;
+    }
+    Some(out)
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Encode 32 raw bytes into a 64-char lowercase hex string. Paired
+/// with [`parse_bot_secret_hex`]; round-trip-equal.
+fn encode_bot_secret_hex(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// Re-apply the GeoIP settings stored in `GlobalSettings` to the live

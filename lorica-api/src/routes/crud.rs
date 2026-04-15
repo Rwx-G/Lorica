@@ -194,7 +194,21 @@ fn validate_bot_protection(
         ip_cidrs.push(trimmed.to_string());
     }
 
-    check_cap("asns", cfg.bypass.asns.len())?;
+    // ASN-based bypass needs a dedicated ASN database (DB-IP / MaxMind
+    // `.mmdb`) + a rDNS resolver chain + a lookup cache, none of which
+    // landed in v1.4.0. Reject non-empty lists up front with a clear
+    // message rather than silently persist a config that request_filter
+    // cannot enforce. Tracked as a post-v1.4.0 follow-up; the field
+    // stays in `BotBypassRules` so the future story can enable it
+    // without a schema migration.
+    if !cfg.bypass.asns.is_empty() {
+        return Err(ApiError::BadRequest(
+            "bot_protection.bypass.asns: ASN-based bypass is not yet supported in \
+             v1.4.0 (tracked as a follow-up that ships alongside an ASN database \
+             distribution). Leave the list empty for now"
+                .into(),
+        ));
+    }
     let asns = cfg.bypass.asns.clone();
 
     check_cap("countries", cfg.bypass.countries.len())?;
@@ -226,39 +240,25 @@ fn validate_bot_protection(
         user_agents.push(trimmed.to_string());
     }
 
-    check_cap("rdns", cfg.bypass.rdns.len())?;
-    let mut rdns: Vec<String> = Vec::with_capacity(cfg.bypass.rdns.len());
-    for raw in &cfg.bypass.rdns {
-        let trimmed = raw.trim().to_ascii_lowercase();
-        if trimmed.is_empty() {
-            return Err(ApiError::BadRequest(
-                "bot_protection.bypass.rdns: empty entry".into(),
-            ));
-        }
-        // A PTR-suffix match is a substring check at the end of a
-        // DNS name, so we only enforce the cheap shape rules:
-        // printable ASCII, no leading dot, contains at least one
-        // dot (`google.com` matches, `com` alone would match every
-        // .com domain and is almost always an operator mistake).
-        if !trimmed.chars().all(|c| c.is_ascii_graphic()) {
-            return Err(ApiError::BadRequest(format!(
-                "bot_protection.bypass.rdns: '{trimmed}' contains non-ASCII-printable character"
-            )));
-        }
-        if trimmed.starts_with('.') {
-            return Err(ApiError::BadRequest(format!(
-                "bot_protection.bypass.rdns: '{trimmed}' must not start with a dot"
-            )));
-        }
-        if !trimmed.contains('.') {
-            return Err(ApiError::BadRequest(format!(
-                "bot_protection.bypass.rdns: '{trimmed}' must contain at least one \
-                 dot (a bare TLD like 'com' would match every `.com` host and \
-                 is almost always a mistake)"
-            )));
-        }
-        rdns.push(trimmed);
+    // rDNS-based bypass requires a DNS resolver with forward-
+    // confirmation (resolve PTR, then forward A/AAAA on the PTR
+    // result, accept only if the forward resolves back to the
+    // client IP). Without forward confirm, any hostile PTR record
+    // can spoof `googlebot.com` and bypass the challenge — the
+    // design doc calls this out as a MUST-NOT regression. The
+    // resolver plumbing + the LRU cache + the bounded async
+    // lookup did not land in v1.4.0. Reject non-empty lists up
+    // front. The field stays in `BotBypassRules` so a future
+    // story can enable it without a schema migration.
+    if !cfg.bypass.rdns.is_empty() {
+        return Err(ApiError::BadRequest(
+            "bot_protection.bypass.rdns: rDNS-based bypass is not yet supported in \
+             v1.4.0 (requires a forward-confirmation DNS pipeline that lands in a \
+             follow-up). Leave the list empty for now"
+                .into(),
+        ));
     }
+    let rdns: Vec<String> = Vec::new();
 
     // only_country: same shape rules as bypass.countries.
     let only_country = match cfg.only_country.as_ref() {
@@ -671,35 +671,27 @@ mod bot_protection_validation_tests {
     }
 
     #[test]
-    fn rejects_bare_tld_in_rdns() {
+    fn rejects_non_empty_rdns_list() {
+        // rDNS bypass requires the forward-confirmation pipeline
+        // that lands post-v1.4.0. Until then reject non-empty
+        // lists so operators do not persist configs silently
+        // ignored at request time.
         let mut c = baseline();
-        c.bypass.rdns = vec!["com".to_string()];
+        c.bypass.rdns = vec!["googlebot.com".to_string()];
         match validate_bot_protection(&c) {
             Err(ApiError::BadRequest(msg)) => {
-                assert!(msg.contains("bare TLD"), "msg={msg}");
+                assert!(msg.contains("rDNS"), "msg={msg}");
+                assert!(msg.contains("not yet supported"), "msg={msg}");
             }
             other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn rejects_leading_dot_in_rdns() {
+    fn accepts_empty_rdns_list() {
         let mut c = baseline();
-        c.bypass.rdns = vec![".googlebot.com".to_string()];
-        match validate_bot_protection(&c) {
-            Err(ApiError::BadRequest(msg)) => {
-                assert!(msg.contains("must not start with a dot"), "msg={msg}");
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn lowercases_rdns_suffix() {
-        let mut c = baseline();
-        c.bypass.rdns = vec!["GoogleBot.com".to_string()];
-        let out = validate_bot_protection(&c).unwrap();
-        assert_eq!(out.bypass.rdns, vec!["googlebot.com"]);
+        c.bypass.rdns = vec![];
+        validate_bot_protection(&c).expect("empty rdns must pass");
     }
 
     #[test]
@@ -735,6 +727,30 @@ mod bot_protection_validation_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_non_empty_asn_list() {
+        // ASN-based bypass is a v1.4.x follow-up (needs an ASN DB).
+        // Until it ships, the API must reject the config rather
+        // than persist a silently-ignored list.
+        let mut c = baseline();
+        c.bypass.asns = vec![15169, 8075];
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("ASN"), "msg={msg}");
+                assert!(msg.contains("not yet supported"), "msg={msg}");
+            }
+            other => panic!("expected BadRequest rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_empty_asn_list() {
+        // Empty list must pass — asn bypass is "disabled" by default.
+        let mut c = baseline();
+        c.bypass.asns = vec![];
+        validate_bot_protection(&c).expect("empty asns must pass");
     }
 }
 

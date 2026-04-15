@@ -245,6 +245,7 @@ fn test_route(rate_limit: Option<RateLimit>) -> Route {
         mtls: None,
         rate_limit,
         geoip: None,
+        bot_protection: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

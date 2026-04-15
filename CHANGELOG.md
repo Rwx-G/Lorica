@@ -120,6 +120,61 @@ Author: Rwx-G
   containing `"` cannot escape the attribute context. 11 unit
   tests cover escaping, field propagation, optional contact-line
   rendering, difficulty-dependent hint text, and UTF-8 declaration
+- **Bot-protection HMAC secret lifecycle** (v1.4.0 Epic 3, story
+  3.5a). New `apply_bot_secret_from_store` hook in `lorica::reload`
+  that runs inside every `reload_proxy_config*` entry point.
+  First-boot path: reads the persisted hex secret from
+  `GlobalSettings.bot_hmac_secret_hex`; generates + persists a fresh
+  32-byte secret via `lorica_challenge::secret::generate` if the
+  column is empty or malformed (log at info! / warn!). Subsequent
+  reloads read the same hex, dedup via an in-memory snapshot, and
+  install via `secret::rotate` when it changes (enables the
+  cert-renewal rotation path that lands in story 3.8 without any
+  further plumbing). Hex parse + encode helpers are private to
+  the reload module because the wire format is a library-internal
+  contract. `lorica` now depends on `lorica-challenge` + `sha2 0.10`
+  for the request-filter integration that lands in 3.5c
+- **Bot-protection evaluator + in-process challenge stash** (v1.4.0
+  Epic 3, story 3.5c — foundations). New `lorica::bot` module with
+  two concerns: (a) `BotEngine`, a `parking_lot::Mutex<HashMap>`
+  stash for pending PoW and captcha challenges with
+  `fresh_nonce` (16-byte hex via `OsRng`), `insert` (overwrite-on-
+  collision — 2^-128 collision probability makes the branch
+  unobservable in practice), `take` (atomic remove + return, so a
+  single challenge can be verified at most once — replay defence),
+  `captcha_image` (read-only PNG lookup that does NOT consume the
+  entry, so a user can reload the image without losing the
+  challenge), and `prune_expired`; (b) `evaluate`, a pure-logic
+  decision function with signature `EvalInputs -> Decision` that
+  walks the bypass matrix in strict order per the design doc §
+  6.3 — verdict cookie check (with route+IP-prefix scope
+  validation), IP CIDR, country, User-Agent regex, then the
+  `only_country` inverse gate. Returns `Decision::Pass {
+  reason: PassReason }` or `Decision::Challenge`. The `PassReason`
+  variants are wired up for the Prometheus counter that lands in
+  story 3.7. URL-path routing helpers `is_bot_solve_path` /
+  `parse_bot_captcha_path` recognise the two Lorica-handled bot
+  endpoints with query-string tolerance and path-traversal
+  rejection. 16 unit tests cover the cookie-scope guards (wrong
+  route id, wrong IP prefix, both reject), the bypass-matrix
+  ordering, the `only_country` gate in the three states (match,
+  miss, country unknown), engine stash semantics (round-trip,
+  take-consumes, prune-expired, captcha-image-never-consumes),
+  URL-path parsing, and cookie extraction across whitespace
+  variants. Actual wiring into `proxy_wiring::request_filter` is
+  the next logical commit
+- **v1.4.0 scope: ASN + rDNS bypass deferred** (v1.4.0 Epic 3,
+  story 3.5b). `bot_protection.bypass.asns` and
+  `bot_protection.bypass.rdns` both require significant
+  infrastructure that did not land in v1.4.0 (ASN database +
+  resolver for the former; a forward-confirmation DNS pipeline for
+  the latter — an rDNS match without forward-confirm is a
+  documented backdoor). The API validator now rejects non-empty
+  lists for both categories with a clear error message pointing
+  at the "tracked as a follow-up" status. Fields remain in
+  `BotBypassRules` so the follow-up stories ship without a schema
+  migration. Three out of five bypass categories are fully
+  functional for v1.4.0: `ip_cidrs`, `countries`, `user_agents`
 - Criterion microbenchmark suite for the OTel hot path (`cargo bench --bench otel_overhead`): three groups (`otel_traceparent`, `otel_active_span`, `otel_per_request`) cover the six atomic operations that every request touches (parse valid / malformed traceparent, synthesise from request_id, derive child traceparent, serialise wire format, span creation / is_recording / end / set_str / set_i64 / set_status) plus two end-to-end scenarios that aggregate the full OTel touch-points a single request incurs. Runs under both default and `--features otel` so operators can quantify the cost of compiling the feature in without installing a real provider. Reference numbers (Docker `rust:1-bookworm`, bench profile, 30-sample criterion run): `parse_valid` 77 ns / 76 ns (-0.8 % under `otel`), `parse_malformed` 31 ns / 29 ns (-5.6 %), `synthesise_from_request_id` 140 ns / 150 ns (+7.0 %), `child_from_parent` 123 ns / 132 ns (+7.8 %), `to_header_value` 99 ns / 91 ns (-9.0 %), `empty_construction` 23 ps / near-ZST. Aggregate per-request OTel touch-point budget stays under 500 ns with the feature off (W3C parse + child + serialise + ZST span ops) and under 600 ns with the feature on but no provider installed — well within the ROADMAP-stated "< 2 % proxy overhead at sampling 0.1" target. Exercised by CI as part of the standard bench harness (criterion 0.5) alongside the existing `circuit_breaker` and `canary_bucket` benches
 
 ## [1.3.0] - 2026-04-14

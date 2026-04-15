@@ -257,6 +257,7 @@ fn test_route(rewrite: Option<ResponseRewriteConfig>) -> Route {
         mtls: None,
         rate_limit: None,
         geoip: None,
+        bot_protection: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

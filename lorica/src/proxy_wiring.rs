@@ -1114,6 +1114,14 @@ pub struct LoricaProxy {
     /// nothing on the hot path besides the per-route-config
     /// presence check.
     pub geoip_resolver: Arc<lorica_geoip::GeoIpResolver>,
+    /// Bot-protection challenge engine (v1.4.0 Epic 3). Holds the
+    /// in-process pending-challenge stash (keyed by server-side
+    /// nonce) that the submit handler consumes on verify. Cookie /
+    /// JS PoW / Captcha modes all share the same stash; a request
+    /// that never reaches the challenge stage pays nothing (the
+    /// evaluator short-circuits when `route.bot_protection` is
+    /// `None`).
+    pub bot_engine: Arc<crate::bot::BotEngine>,
 }
 
 /// Prepared-but-not-yet-committed proxy config. Held by workers
@@ -1201,6 +1209,7 @@ impl LoricaProxy {
             verdict_cache: VerdictCacheEngine::local(),
             pending_proxy_config: Arc::new(parking_lot::Mutex::new(None)),
             geoip_resolver: Arc::new(lorica_geoip::GeoIpResolver::empty()),
+            bot_engine: Arc::new(crate::bot::BotEngine::new()),
         }
     }
 
