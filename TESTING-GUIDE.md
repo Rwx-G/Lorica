@@ -583,6 +583,40 @@ The dashboard Protection tab exposes the same fields with a
 slider for PoW difficulty and a live "expected median solve
 time" hint.
 
+**To enable ASN bypass**, point `asn_db_path` at an ASN `.mmdb`:
+
+```bash
+curl -s -b "$SESS" -X PUT "https://lorica.local:9443/api/v1/settings" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "asn_db_path": "/var/lib/lorica/dbip-asn-lite.mmdb"
+  }'
+```
+
+DB-IP ASN Lite (CC-BY 4.0, monthly refresh, no account
+required) is the default free source — download from
+<https://db-ip.com/db/download/ip-to-asn-lite>, gunzip to
+`/var/lib/lorica/`. Per-route configuration then lists the ASN
+numbers to bypass: `{"bypass": {"asns": [15169, 8075]}}` (AS15169
+= Google, AS8075 = Microsoft). ASN 0 is IANA-reserved and
+rejected by the API. Without a DB pointed at, the ASN bypass is
+a silent no-op — the other bypass categories still work.
+
+**To enable rDNS bypass**, just list the suffixes; the resolver
+is built from the system `/etc/resolv.conf` at startup:
+
+```bash
+{"bypass": {"rdns": ["googlebot.com", "search.msn.com"]}}
+```
+
+Forward-confirmation is mandatory in the implementation — a
+hostile PTR pointing at `googlebot.com` only passes if the
+forward A/AAAA lookup on `googlebot.com` resolves back to the
+client IP. Cache TTL is 1 h per client IP; the hot path never
+blocks (first request from a new IP passes through to the
+challenge, the populate task runs in the background so the
+second request hits the cache).
+
 **Test all three modes from a shell:**
 
 A good way to check the proxy is wired end-to-end is to drive
@@ -653,27 +687,35 @@ lorica_bot_challenge_total{route_id, mode, outcome}
   down the `bypassed` bucket without inflating the metric's
   cardinality.
 
-**Known limitations for v1.4.0:**
+**v1.4.0 feature completeness:**
 
-- **ASN bypass** and **rDNS bypass** are rejected by the API
-  validator with "not yet supported". Both need infrastructure
-  (ASN DB + forward-confirmation DNS pipeline) that did not land
-  in v1.4.0. Three out of five bypass categories are functional:
-  `ip_cidrs`, `countries`, `user_agents`. Tracked as v1.4.x
-  follow-ups; the schema is already in place so the next story
-  ships without a migration.
-- **Cross-worker pending-challenge stash** is per-worker.
-  A client that hits worker A for the challenge and worker B for
-  the solve gets a fresh challenge (minor UX cost: one extra
-  round trip). Front multi-worker Lorica with a sticky-session
-  load balancer if this matters. Full cross-worker stash is a
-  v1.4.x follow-up via an extended `VerdictCacheEngine::Rpc`.
-- **HMAC secret rotation on cert renewal** is wired at the
-  reload-hook level but the cert-renewal path itself does not
-  call `rotate_bot_hmac_secret` yet. First-boot generate +
-  persist works; explicit rotation is a v1.4.x UI addition.
-- **rDNS without forward confirmation** is a documented
-  backdoor — an rDNS-bypass implementation that skips forward
-  confirm would be a regression. The `bypass.rdns` field stays
-  in the model so the follow-up ships without a schema change,
-  but the API rejects non-empty lists in the meantime.
+All five bypass categories are functional: `ip_cidrs`,
+`countries`, `user_agents`, `asns` (needs
+`asn_db_path` pointing at a `.mmdb` ASN database — DB-IP ASN
+Lite is the CC-BY 4.0 default source), and `rdns` (uses the
+system resolver with mandatory forward confirmation — a PTR
+match is only honoured when a forward A/AAAA lookup on the
+resulting name returns the client's IP). Cross-worker pending-
+challenge stash lands via SQLite (schema V36): a client
+solving on worker A can submit on worker B, atomic
+`DELETE...RETURNING` on take gives first-solver-wins replay
+defence. HMAC secret rotates on every cert install / renewal
+(all seven cert success paths — ACME HTTP-01 / DNS-01 auto +
+manual, periodic renewal, manual upload, update, self-signed
+generator). Dashboard bot-protection tab exposes every knob
+including a dedicated ASN bypass input.
+
+**Known tradeoffs (not bugs):**
+
+- The Prometheus counter `lorica_bot_challenge_total` is
+  per-worker. In worker mode the supervisor's `/metrics` does
+  not aggregate — same behaviour as
+  `lorica_geoip_block_total`. Scrape each worker's `/metrics`
+  directly (reachable via the WPAR-7 pull-on-scrape RPC) to
+  see the counts. Deferred to a future pass that ships
+  cross-worker counter aggregation for all per-route metrics.
+- Dropping a stale verdict cookie wholesale on cert renewal is
+  a UX cost (one extra solve per renewal cycle). With default
+  Let's Encrypt cadence of ≤ 90 days + 24 h default cookie
+  TTL, this is invisible in practice. Operators who find it
+  noisy can increase `cookie_ttl_s` up to the 7-day API cap.
