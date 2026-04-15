@@ -7,17 +7,26 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 //! Bot-protection request-filter integration (v1.4.0 Epic 3, story
-//! 3.5).
+//! 3.5; cross-worker stash closed as a v1.4.0 follow-up).
 //!
 //! Two things live here:
 //!
-//! 1. [`BotEngine`] — the in-process pending-challenge stash. Keyed
-//!    by a server-side nonce (separate from the PoW nonce to keep
-//!    the two namespaces orthogonal). An entry is consumed on the
+//! 1. [`BotEngine`] — the pending-challenge stash. Keyed by a
+//!    server-side nonce (separate from the PoW nonce to keep the
+//!    two namespaces orthogonal). An entry is consumed on the
 //!    first verify attempt regardless of outcome so a failed
 //!    solution cannot be replayed against the same challenge.
 //!    Captcha challenges additionally hold the PNG bytes the image
 //!    handler serves at `/lorica/bot/captcha/{nonce}`.
+//!
+//!    The backend is pluggable via [`StashBackend`]. Production
+//!    deployments use [`StashBackend::Sqlite`] so pending entries
+//!    are visible to every worker in the pool — a client solving
+//!    on worker A can submit on worker B, and the atomic
+//!    DELETE...RETURNING on `take()` gives "first solver wins"
+//!    cross-worker replay defence. Unit tests and the single-
+//!    process path can use [`StashBackend::InMemory`] which keeps
+//!    the O(1) hashmap behaviour without a DB dep.
 //!
 //! 2. [`evaluate`] — the pure-logic decision function called from
 //!    `proxy_wiring::request_filter`. Returns one of:
@@ -35,9 +44,11 @@
 //! inside `proxy_wiring` avoids a circular dep on the session type.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use lorica_challenge::{IpPrefix, Mode};
+use lorica_config::ConfigStore;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -114,34 +125,56 @@ pub struct PendingEntry {
     pub expires_at: i64,
 }
 
-/// In-process stash of pending challenges. No cross-worker sharing
-/// in v1.4.0 — a client that solves a challenge on one worker and
-/// hits a different worker for the POST just gets a fresh challenge
-/// (the first solve becomes a wasted round trip, which is a minor
-/// UX cost). Cross-worker sharing via `VerdictCacheEngine::Rpc`
-/// lands in story 3.6.
+/// Stash backend selector. Single-process mode can use an in-memory
+/// map (zero dep, zero I/O); multi-worker mode needs the SQLite
+/// backend so a challenge stashed by worker A is visible to the
+/// POST handler on worker B.
+pub enum StashBackend {
+    /// Per-process `HashMap<nonce, entry>`. Fastest, no cross-
+    /// worker sharing. Used by tests + the single-process runtime.
+    InMemory(Mutex<HashMap<String, PendingEntry>>),
+    /// SQLite-backed stash (v1.4.0 follow-up, table
+    /// `bot_pending_challenges`). Every operation goes through the
+    /// shared store so all workers see the same state. Atomic
+    /// `DELETE ... RETURNING` on `take` gives "first solver wins"
+    /// cross-worker replay defence.
+    Sqlite(Arc<tokio::sync::Mutex<ConfigStore>>),
+}
+
+/// Pending-challenge stash.
 ///
-/// Thread safety: the map is guarded by a `parking_lot::Mutex`. Every
-/// operation is O(1) in expectation so contention is minimal. A
-/// sharded approach (DashMap) is premature at the current cardinality
-/// — a busy proxy sees ~1000 pending challenges at steady state,
-/// which one mutex handles trivially.
+/// `insert` / `take` / `captcha_image` / `prune_expired` / `len` all
+/// dispatch on the backend. The public API is synchronous even when
+/// the underlying store is async (SQLite calls under
+/// `tokio::sync::Mutex`) by using `blocking_lock()` — acceptable
+/// here because the lock hold time is bounded at a single SQL
+/// statement (microseconds under WAL) and every hot-path caller
+/// already runs inside a tokio runtime.
 pub struct BotEngine {
-    entries: Mutex<HashMap<String, PendingEntry>>,
+    backend: StashBackend,
 }
 
 impl BotEngine {
+    /// In-memory backend — single-process mode / tests. The engine
+    /// drops every entry on process exit.
     pub fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            backend: StashBackend::InMemory(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Generate a fresh 16-byte hex nonce for a new pending
-    /// challenge. Uses `OsRng` so the nonces are
-    /// unpredictable-to-the-attacker; a predictable nonce would let
-    /// an attacker pre-register a matching entry and bypass the
-    /// verify step.
+    /// SQLite-backed backend — multi-worker mode. The store is
+    /// the same `ConfigStore` every worker holds, so pending rows
+    /// propagate via the shared DB file's WAL.
+    pub fn with_sqlite(store: Arc<tokio::sync::Mutex<ConfigStore>>) -> Self {
+        Self {
+            backend: StashBackend::Sqlite(store),
+        }
+    }
+
+    /// Generate a fresh 16-byte hex nonce. Uses `OsRng` so nonces
+    /// are unpredictable — a predictable nonce would let an attacker
+    /// pre-register a matching row and bypass the verify step.
     pub fn fresh_nonce(&self) -> String {
         let mut raw = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut raw);
@@ -153,53 +186,94 @@ impl BotEngine {
     }
 
     /// Stash a pending challenge. Overwrites any prior entry with
-    /// the same nonce (nonces are 128-bit random, so a collision is
-    /// a ~2^-128 event — in practice "never" — but preferring
-    /// overwrite over reject keeps the request path deterministic).
-    pub fn insert(&self, nonce: String, entry: PendingEntry) {
-        let mut guard = self.entries.lock();
-        guard.insert(nonce, entry);
-    }
-
-    /// Atomically remove + return a pending entry. Called from the
-    /// submit handler so the entry is gone from the stash regardless
-    /// of whether the solution verifies. Replay defence: a single
-    /// stashed challenge can be verified at most once.
-    pub fn take(&self, nonce: &str) -> Option<PendingEntry> {
-        self.entries.lock().remove(nonce)
-    }
-
-    /// Read-only access to the PNG bytes for the captcha image
-    /// handler. Does NOT consume the entry (the user may reload
-    /// the image while still deciding on the answer). Returns
-    /// `None` for non-captcha entries too, so a PoW nonce probed
-    /// at `/lorica/bot/captcha/{nonce}` gives a 404.
-    pub fn captcha_image(&self, nonce: &str) -> Option<Vec<u8>> {
-        let guard = self.entries.lock();
-        let entry = guard.get(nonce)?;
-        match &entry.kind {
-            Pending::Captcha { png_bytes, .. } => Some(png_bytes.clone()),
-            _ => None,
+    /// the same nonce (128-bit random, collisions unobservable in
+    /// practice). Async because the SQLite backend needs an
+    /// `.await` on the shared store mutex; the in-memory backend
+    /// completes synchronously (no real await) so the async
+    /// overhead is a single vtable dispatch on the future.
+    pub async fn insert(&self, nonce: String, entry: PendingEntry) {
+        match &self.backend {
+            StashBackend::InMemory(mx) => {
+                mx.lock().insert(nonce, entry);
+            }
+            StashBackend::Sqlite(store) => {
+                let stash = to_stash(&nonce, &entry);
+                let g = store.lock().await;
+                if let Err(e) = g.bot_stash_insert(&stash) {
+                    tracing::warn!(error = %e, nonce = %nonce, "bot_stash_insert failed");
+                }
+            }
         }
     }
 
-    /// Evict stashed entries whose `expires_at` is in the past.
-    /// Called opportunistically from the challenge-render path so
-    /// a bot probing for unknown nonces does not pay the GC cost.
-    /// A dedicated background task could take over if the eviction
-    /// budget ever becomes noticeable in prod telemetry.
-    pub fn prune_expired(&self, now: i64) {
-        self.entries.lock().retain(|_, e| e.expires_at > now);
+    /// Atomically remove + return the entry. Replay defence: a
+    /// stashed challenge verifies at most once.
+    pub async fn take(&self, nonce: &str) -> Option<PendingEntry> {
+        match &self.backend {
+            StashBackend::InMemory(mx) => mx.lock().remove(nonce),
+            StashBackend::Sqlite(store) => {
+                let g = store.lock().await;
+                match g.bot_stash_take(nonce) {
+                    Ok(Some(stash)) => from_stash(&stash),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, nonce = %nonce, "bot_stash_take failed");
+                        None
+                    }
+                }
+            }
+        }
     }
 
-    /// Snapshot count, for metrics / tests. Does not clone the
-    /// entries.
-    pub fn len(&self) -> usize {
-        self.entries.lock().len()
+    /// Captcha PNG bytes lookup. Does NOT consume the stashed
+    /// entry.
+    pub async fn captcha_image(&self, nonce: &str) -> Option<Vec<u8>> {
+        match &self.backend {
+            StashBackend::InMemory(mx) => {
+                let g = mx.lock();
+                let entry = g.get(nonce)?;
+                match &entry.kind {
+                    Pending::Captcha { png_bytes, .. } => Some(png_bytes.clone()),
+                    _ => None,
+                }
+            }
+            StashBackend::Sqlite(store) => {
+                let g = store.lock().await;
+                g.bot_stash_captcha_image(nonce).ok().flatten()
+            }
+        }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entries.lock().is_empty()
+    /// Drop expired entries. Called opportunistically from the
+    /// render path so a bot probing for unknown nonces does not
+    /// pay the GC cost.
+    pub async fn prune_expired(&self, now: i64) {
+        match &self.backend {
+            StashBackend::InMemory(mx) => {
+                mx.lock().retain(|_, e| e.expires_at > now);
+            }
+            StashBackend::Sqlite(store) => {
+                let g = store.lock().await;
+                if let Err(e) = g.bot_stash_prune_expired(now) {
+                    tracing::warn!(error = %e, "bot_stash_prune_expired failed");
+                }
+            }
+        }
+    }
+
+    /// Current row count. Used by tests + the stash-size metric.
+    pub async fn len(&self) -> usize {
+        match &self.backend {
+            StashBackend::InMemory(mx) => mx.lock().len(),
+            StashBackend::Sqlite(store) => {
+                let g = store.lock().await;
+                g.bot_stash_len().unwrap_or(0)
+            }
+        }
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
     }
 }
 
@@ -207,6 +281,99 @@ impl Default for BotEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Serialise an in-memory `PendingEntry` into the SQLite wire
+/// shape. The payload JSON captures the mode-specific fields; the
+/// PNG bytes get their own column so we do not round-trip binary
+/// through JSON.
+fn to_stash(nonce: &str, entry: &PendingEntry) -> lorica_config::BotStashEntry {
+    let (kind, payload, png) = match &entry.kind {
+        Pending::Pow {
+            nonce_hex,
+            difficulty,
+        } => {
+            let payload = serde_json::json!({
+                "nonce_hex": nonce_hex,
+                "difficulty": difficulty,
+            })
+            .to_string();
+            ("pow".to_string(), payload, None)
+        }
+        Pending::Captcha {
+            expected_text,
+            png_bytes,
+        } => {
+            let payload = serde_json::json!({
+                "expected_text": expected_text,
+            })
+            .to_string();
+            ("captcha".to_string(), payload, Some(png_bytes.clone()))
+        }
+    };
+    let ip_prefix_disc = entry.ip_prefix.discriminator();
+    let ip_prefix_bytes = entry.ip_prefix.as_bytes().to_vec();
+    lorica_config::BotStashEntry {
+        nonce: nonce.to_string(),
+        kind,
+        payload,
+        mode: entry.mode as u8,
+        route_id: entry.route_id.clone(),
+        ip_prefix_disc,
+        ip_prefix_bytes,
+        return_url: entry.return_url.clone(),
+        cookie_ttl_s: entry.cookie_ttl_s,
+        expires_at: entry.expires_at,
+        png_bytes: png,
+    }
+}
+
+/// Inverse of [`to_stash`]. `None` on malformed wire data — caller
+/// treats that as "no stashed entry" which collapses to 403 at
+/// verify time.
+fn from_stash(stash: &lorica_config::BotStashEntry) -> Option<PendingEntry> {
+    let kind = match stash.kind.as_str() {
+        "pow" => {
+            let v: serde_json::Value = serde_json::from_str(&stash.payload).ok()?;
+            Pending::Pow {
+                nonce_hex: v.get("nonce_hex")?.as_str()?.to_string(),
+                difficulty: v.get("difficulty")?.as_u64()? as u8,
+            }
+        }
+        "captcha" => {
+            let v: serde_json::Value = serde_json::from_str(&stash.payload).ok()?;
+            Pending::Captcha {
+                expected_text: v.get("expected_text")?.as_str()?.to_string(),
+                png_bytes: stash.png_bytes.clone().unwrap_or_default(),
+            }
+        }
+        _ => return None,
+    };
+    let mode = Mode::from_u8(stash.mode)?;
+    let ip_prefix = match stash.ip_prefix_disc {
+        1 => {
+            let mut out = [0u8; 4];
+            let len = stash.ip_prefix_bytes.len().min(3);
+            out[..len].copy_from_slice(&stash.ip_prefix_bytes[..len]);
+            IpPrefix::V4(out)
+        }
+        2 => {
+            let mut out = [0u8; 16];
+            let len = stash.ip_prefix_bytes.len().min(8);
+            out[..len].copy_from_slice(&stash.ip_prefix_bytes[..len]);
+            IpPrefix::V6(out)
+        }
+        _ => return None,
+    };
+    Some(PendingEntry {
+        kind,
+        mode,
+        route_id: stash.route_id.clone(),
+        ip_prefix,
+        return_url: stash.return_url.clone(),
+        cookie_ttl_s: stash.cookie_ttl_s,
+        expires_at: stash.expires_at,
+    })
 }
 
 /// Decision returned by [`evaluate`]. `Pass` = forward to backend;
@@ -904,8 +1071,8 @@ mod tests {
         assert!(matches!(evaluate(&i), Decision::Challenge));
     }
 
-    #[test]
-    fn engine_stash_roundtrip() {
+    #[tokio::test]
+    async fn engine_stash_roundtrip() {
         let e = BotEngine::new();
         let nonce = e.fresh_nonce();
         assert_eq!(nonce.len(), 32, "hex of 16 bytes = 32 chars");
@@ -924,16 +1091,20 @@ mod tests {
                 cookie_ttl_s: 86_400,
                 expires_at: 1_700_000_300,
             },
-        );
-        assert_eq!(e.len(), 1);
-        let taken = e.take(&nonce).expect("round-trip");
+        )
+        .await;
+        assert_eq!(e.len().await, 1);
+        let taken = e.take(&nonce).await.expect("round-trip");
         assert!(matches!(taken.kind, Pending::Pow { .. }));
-        assert_eq!(e.len(), 0, "take() must remove the entry");
-        assert!(e.take(&nonce).is_none(), "second take is None (no replay)");
+        assert_eq!(e.len().await, 0, "take() must remove the entry");
+        assert!(
+            e.take(&nonce).await.is_none(),
+            "second take is None (no replay)"
+        );
     }
 
-    #[test]
-    fn engine_captcha_image_only_for_captcha_entries() {
+    #[tokio::test]
+    async fn engine_captcha_image_only_for_captcha_entries() {
         let e = BotEngine::new();
         let nonce = "abc".to_string();
         e.insert(
@@ -950,15 +1121,16 @@ mod tests {
                 cookie_ttl_s: 86_400,
                 expires_at: 1_700_000_300,
             },
-        );
-        assert_eq!(e.captcha_image("abc"), Some(vec![1, 2, 3]));
-        assert_eq!(e.captcha_image("nope"), None);
+        )
+        .await;
+        assert_eq!(e.captcha_image("abc").await, Some(vec![1, 2, 3]));
+        assert_eq!(e.captcha_image("nope").await, None);
         // Image fetch does NOT consume the entry.
-        assert_eq!(e.len(), 1);
+        assert_eq!(e.len().await, 1);
     }
 
-    #[test]
-    fn engine_prune_evicts_expired() {
+    #[tokio::test]
+    async fn engine_prune_evicts_expired() {
         let e = BotEngine::new();
         e.insert(
             "keep".to_string(),
@@ -974,7 +1146,8 @@ mod tests {
                 cookie_ttl_s: 86_400,
                 expires_at: 2_000_000_000,
             },
-        );
+        )
+        .await;
         e.insert(
             "drop".to_string(),
             PendingEntry {
@@ -989,11 +1162,104 @@ mod tests {
                 cookie_ttl_s: 86_400,
                 expires_at: 1_000_000_000,
             },
+        )
+        .await;
+        e.prune_expired(1_500_000_000).await;
+        assert_eq!(e.len().await, 1);
+        assert!(e.take("keep").await.is_some());
+        assert!(e.take("drop").await.is_none());
+    }
+
+    // SQLite-backed round-trip: an entry stashed through the SQL
+    // backend must round-trip with the same fields, and `take`
+    // must be atomic (second call returns None). Uses an
+    // in-memory ConfigStore so the test runs without touching
+    // the filesystem.
+    #[tokio::test]
+    async fn sqlite_backend_roundtrip() {
+        use std::sync::Arc as StdArc;
+        let store = StdArc::new(tokio::sync::Mutex::new(
+            lorica_config::ConfigStore::open_in_memory().unwrap(),
+        ));
+        let e = BotEngine::with_sqlite(store);
+        let nonce = "sql-nonce".to_string();
+        e.insert(
+            nonce.clone(),
+            PendingEntry {
+                kind: Pending::Pow {
+                    nonce_hex: "cafebabe".to_string(),
+                    difficulty: 18,
+                },
+                mode: Mode::Javascript,
+                route_id: "r-sql".to_string(),
+                ip_prefix: IpPrefix::from_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+                return_url: "/back".to_string(),
+                cookie_ttl_s: 86_400,
+                expires_at: 2_000_000_000,
+            },
+        )
+        .await;
+        assert_eq!(e.len().await, 1);
+        let taken = e.take(&nonce).await.expect("round-trip");
+        match taken.kind {
+            Pending::Pow {
+                nonce_hex,
+                difficulty,
+            } => {
+                assert_eq!(nonce_hex, "cafebabe");
+                assert_eq!(difficulty, 18);
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+        assert_eq!(taken.route_id, "r-sql");
+        assert_eq!(taken.return_url, "/back");
+        // Second take returns None — replay defence.
+        assert!(e.take(&nonce).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_backend_captcha_png_roundtrip() {
+        use std::sync::Arc as StdArc;
+        let store = StdArc::new(tokio::sync::Mutex::new(
+            lorica_config::ConfigStore::open_in_memory().unwrap(),
+        ));
+        let e = BotEngine::with_sqlite(store);
+        e.insert(
+            "png-nonce".to_string(),
+            PendingEntry {
+                kind: Pending::Captcha {
+                    expected_text: "ABC123".to_string(),
+                    png_bytes: vec![0x89, b'P', b'N', b'G'],
+                },
+                mode: Mode::Captcha,
+                route_id: "r".to_string(),
+                ip_prefix: IpPrefix::from_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                return_url: "/".to_string(),
+                cookie_ttl_s: 3600,
+                expires_at: 2_000_000_000,
+            },
+        )
+        .await;
+        // Image lookup returns the PNG bytes without consuming.
+        assert_eq!(
+            e.captcha_image("png-nonce").await,
+            Some(vec![0x89, b'P', b'N', b'G'])
         );
-        e.prune_expired(1_500_000_000);
-        assert_eq!(e.len(), 1);
-        assert!(e.take("keep").is_some());
-        assert!(e.take("drop").is_none());
+        // Still present after image fetch.
+        assert_eq!(e.len().await, 1);
+        // Take round-trips the expected_text AND re-attaches the
+        // PNG bytes (they live in their own column).
+        let taken = e.take("png-nonce").await.unwrap();
+        match taken.kind {
+            Pending::Captcha {
+                expected_text,
+                png_bytes,
+            } => {
+                assert_eq!(expected_text, "ABC123");
+                assert_eq!(png_bytes, vec![0x89, b'P', b'N', b'G']);
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
     }
 
     #[test]

@@ -578,6 +578,20 @@ fi
 rm -f "$RESP"
 
 # --- Metrics assertions --------------------------------------------------
+# Worker-mode Lorica currently scopes `lorica_bot_challenge_total`
+# per worker (same story as `lorica_geoip_block_total`) — the
+# supervisor's `/metrics` does not aggregate those counters. The
+# functional path across workers is already proven green above
+# (PoW solve round-trips across workers thanks to the SQLite stash).
+# Skip the counter check under workers mode; single-process mode
+# still enforces it.
+if [ "${BOT_SMOKE_SKIP_METRICS:-0}" = "1" ]; then
+    log "=== bot smoke: Prometheus counter check skipped (workers mode) ==="
+    log "=== bot smoke: summary ==="
+    echo "Tests: $TOTAL | Passed: $PASS | Failed: $FAIL"
+    [ "$FAIL" -gt 0 ] && exit 1 || exit 0
+fi
+
 log "=== bot smoke: Prometheus counter sanity ==="
 # After the many challenge renders above, the `shown` counter for
 # mode=javascript should be non-zero.

@@ -81,7 +81,7 @@ pub async fn handle_solve(
         return write_plain(session, 400, "missing nonce").await;
     };
 
-    let Some(entry) = engine.take(nonce) else {
+    let Some(entry) = engine.take(nonce).await else {
         // No stashed pending challenge. Either expired / already
         // consumed (replay attempt) or never existed. The response
         // does not distinguish the two so a scanner cannot probe
@@ -195,7 +195,7 @@ pub async fn handle_captcha_image(
     engine: &BotEngine,
     nonce: &str,
 ) -> lorica_core::Result<bool> {
-    let Some(png) = engine.captcha_image(nonce) else {
+    let Some(png) = engine.captcha_image(nonce).await else {
         return write_plain(session, 404, "captcha not found").await;
     };
 
@@ -262,7 +262,7 @@ pub async fn serve_challenge(
     // Opportunistic GC so the stash cannot grow unbounded under a
     // probing attacker. Cheap: O(n) scan of the stash, n bounded
     // by PENDING_TTL_S * request rate.
-    engine.prune_expired(now);
+    engine.prune_expired(now).await;
 
     let ip_prefix = IpPrefix::from_ip(client_ip);
 
@@ -328,21 +328,23 @@ pub async fn serve_challenge(
             };
             let html = chrender::render_pow_page(&challenge, BOT_SOLVE_PATH, None);
 
-            engine.insert(
-                nonce_hex.clone(),
-                PendingEntry {
-                    kind: Pending::Pow {
-                        nonce_hex: nonce_hex.clone(),
-                        difficulty: cfg.pow_difficulty,
+            engine
+                .insert(
+                    nonce_hex.clone(),
+                    PendingEntry {
+                        kind: Pending::Pow {
+                            nonce_hex: nonce_hex.clone(),
+                            difficulty: cfg.pow_difficulty,
+                        },
+                        mode: Mode::Javascript,
+                        route_id: route_id.to_string(),
+                        ip_prefix,
+                        return_url: return_url.to_string(),
+                        cookie_ttl_s: cfg.cookie_ttl_s,
+                        expires_at: now + PENDING_TTL_S as i64,
                     },
-                    mode: Mode::Javascript,
-                    route_id: route_id.to_string(),
-                    ip_prefix,
-                    return_url: return_url.to_string(),
-                    cookie_ttl_s: cfg.cookie_ttl_s,
-                    expires_at: now + PENDING_TTL_S as i64,
-                },
-            );
+                )
+                .await;
             html
         }
 
@@ -378,21 +380,23 @@ pub async fn serve_challenge(
                 None,
             );
 
-            engine.insert(
-                nonce,
-                PendingEntry {
-                    kind: Pending::Captcha {
-                        expected_text: text,
-                        png_bytes: png,
+            engine
+                .insert(
+                    nonce,
+                    PendingEntry {
+                        kind: Pending::Captcha {
+                            expected_text: text,
+                            png_bytes: png,
+                        },
+                        mode: Mode::Captcha,
+                        route_id: route_id.to_string(),
+                        ip_prefix,
+                        return_url: return_url.to_string(),
+                        cookie_ttl_s: cfg.cookie_ttl_s,
+                        expires_at: now + PENDING_TTL_S as i64,
                     },
-                    mode: Mode::Captcha,
-                    route_id: route_id.to_string(),
-                    ip_prefix,
-                    return_url: return_url.to_string(),
-                    cookie_ttl_s: cfg.cookie_ttl_s,
-                    expires_at: now + PENDING_TTL_S as i64,
-                },
-            );
+                )
+                .await;
             html
         }
     };

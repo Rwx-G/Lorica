@@ -310,6 +310,53 @@ services:
     networks:
       - e2e
 
+  # Bot-protection E2E in WORKER MODE. Same smoke as above, but
+  # Lorica runs with `--workers 2` so the SQLite-backed pending
+  # stash is exercised across workers. A challenge stashed on one
+  # worker must be consumable on the other — the smoke PoW-solves
+  # after re-configuring the route, which inherently alternates
+  # which worker handles each call via the default round-robin
+  # connection distribution.
+  lorica-bot-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["bot-workers"]
+    entrypoint: ["/entrypoint-workers.sh"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-bot-workers-data:/var/lib/lorica
+      - shared-bot-workers:/shared
+      - ./fixtures/GeoIP2-Country-Test.mmdb:/var/lib/lorica/geoip-test.mmdb:ro
+      - ./fixtures/GeoLite2-ASN-Test.mmdb:/var/lib/lorica/asn-test.mmdb:ro
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  bot-smoke-workers:
+    build:
+      context: ./test-runner
+    profiles: ["bot-workers"]
+    entrypoint: ["bash", "run-bot-smoke.sh"]
+    depends_on:
+      - lorica-bot-workers
+    volumes:
+      - shared-bot-workers:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-bot-workers:9443
+      - LORICA_PROXY=http://lorica-bot-workers:8080
+      - BACKEND1_ADDR=backend1:80
+      # The bot-protection Prometheus counter is currently per-
+      # worker (same behaviour as `lorica_geoip_block_total`). The
+      # supervisor's `/metrics` does not aggregate it. The smoke's
+      # counter-delta check would always fail in worker mode even
+      # though the functional flow works; set this to skip it.
+      - BOT_SMOKE_SKIP_METRICS=1
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
@@ -317,8 +364,10 @@ volumes:
   lorica-otel-workers-data:
   lorica-geoip-data:
   lorica-bot-data:
+  lorica-bot-workers-data:
   shared:
   shared-workers:
+  shared-bot-workers:
   shared-otel:
   shared-otel-workers:
   shared-geoip:

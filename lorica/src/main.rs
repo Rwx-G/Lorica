@@ -3060,6 +3060,12 @@ fn run_worker(
     lorica_proxy.request_counts = worker_request_counts;
     lorica_proxy.waf_counts = worker_waf_counts;
     lorica_proxy.waf_engine = waf_engine;
+    // Worker mode needs the SQLite-backed bot-protection stash so
+    // a challenge stashed here is visible to the POST handler on
+    // a sibling worker. The in-memory default would stash only
+    // locally and a worker-B POST would always fail-closed with
+    // 403 "challenge expired or unknown".
+    lorica_proxy.bot_engine = Arc::new(lorica::bot::BotEngine::with_sqlite(Arc::clone(&store)));
     lorica_proxy.shmem = shmem_region;
     // Worker mode: rate-limit engine runs as a local cache synced with
     // the supervisor via the pipelined RPC channel every 100 ms. See
