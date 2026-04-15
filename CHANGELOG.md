@@ -75,6 +75,51 @@ Author: Rwx-G
   for PNG encoding); all version-pinned to match the existing
   `Cargo.lock` transitive resolution so the workspace does not pull
   two copies of anything
+- **Bot-protection config model + migration V35** (v1.4.0 Epic 3,
+  story 3.3). New `Route.bot_protection: Option<BotProtectionConfig>`
+  field in `lorica-config::models::route` carrying `mode` (Cookie /
+  Javascript / Captcha), `cookie_ttl_s` (u32, default 86400, capped
+  at 604800 = 7 days), `pow_difficulty` (u8 in 14..=22, default 18),
+  `captcha_alphabet` (String, default excludes `0/O/1/l/I` and the
+  font-unsupported `L/o`), a `bypass: BotBypassRules` sub-struct
+  (ip_cidrs, asns, countries, user_agents, rdns), and
+  `only_country: Option<Vec<String>>` inverse gate. New
+  `GlobalSettings.bot_hmac_secret_hex` field for the process-wide
+  HMAC secret (hex-encoded so the key-value `global_settings` table
+  does not need a BLOB column). Idempotent `ALTER TABLE routes ADD
+  COLUMN bot_protection TEXT` migration — existing rows serialise
+  as NULL. `validate_bot_protection` in `lorica-api::routes::crud`
+  enforces difficulty bounds, alphabet shape (10..=128 ASCII-
+  printable chars, no duplicates), CIDR syntax, ISO alpha-2 country
+  codes (case-normalised to upper), UA regex compilation, rDNS
+  shape rules (no bare TLD, no leading dot, printable ASCII), and
+  a 500-entry cap per bypass category. 19 unit tests cover every
+  rejection branch. RouteResponse + CreateRouteRequest +
+  UpdateRouteRequest all expose the new field over the API, and
+  the existing `route_to_response` / create / update handlers are
+  wired end-to-end
+- **Bot-protection challenge rendering** (v1.4.0 Epic 3, story 3.4).
+  New `lorica_challenge::render` module produces self-contained
+  HTML pages for the three modes — no external CSS, no CDN, no
+  remote script. `render_cookie_refresh_page` emits a
+  `meta http-equiv="refresh"` bounce for the passive mode;
+  `render_pow_page` embeds an inline SHA-256 PoW worker using
+  `crypto.subtle.digest` with chunked async execution and
+  `requestAnimationFrame`-based progress updates so the UI stays
+  responsive at high difficulty; `render_captcha_page` places the
+  one-shot signed image URL + a single-field form. Every page
+  carries a `<noscript>` fallback block that never loads anything
+  remotely, embeds a `prefers-color-scheme: dark` media query for
+  mobile dark-mode users, and uses system fonts (no web-font
+  fetch). `render_plaintext_fallback` produces a short 403 body
+  for clients that did not advertise `text/html` in Accept so
+  curl / wget see a meaningful message. HTML escaping covers the
+  five dangerous characters (`& < > " '`) on every substituted
+  value — regression-tested so a route hostname containing
+  `</script>` cannot break out of the JS block, and a submit URL
+  containing `"` cannot escape the attribute context. 11 unit
+  tests cover escaping, field propagation, optional contact-line
+  rendering, difficulty-dependent hint text, and UTF-8 declaration
 - Criterion microbenchmark suite for the OTel hot path (`cargo bench --bench otel_overhead`): three groups (`otel_traceparent`, `otel_active_span`, `otel_per_request`) cover the six atomic operations that every request touches (parse valid / malformed traceparent, synthesise from request_id, derive child traceparent, serialise wire format, span creation / is_recording / end / set_str / set_i64 / set_status) plus two end-to-end scenarios that aggregate the full OTel touch-points a single request incurs. Runs under both default and `--features otel` so operators can quantify the cost of compiling the feature in without installing a real provider. Reference numbers (Docker `rust:1-bookworm`, bench profile, 30-sample criterion run): `parse_valid` 77 ns / 76 ns (-0.8 % under `otel`), `parse_malformed` 31 ns / 29 ns (-5.6 %), `synthesise_from_request_id` 140 ns / 150 ns (+7.0 %), `child_from_parent` 123 ns / 132 ns (+7.8 %), `to_header_value` 99 ns / 91 ns (-9.0 %), `empty_construction` 23 ps / near-ZST. Aggregate per-request OTel touch-point budget stays under 500 ns with the feature off (W3C parse + child + serialise + ZST span ops) and under 600 ns with the feature on but no provider installed — well within the ROADMAP-stated "< 2 % proxy overhead at sampling 0.1" target. Exercised by CI as part of the standard bench harness (criterion 0.5) alongside the existing `circuit_breaker` and `canary_bucket` benches
 
 ## [1.3.0] - 2026-04-14

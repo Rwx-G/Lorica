@@ -46,6 +46,7 @@
 pub mod captcha;
 pub mod cookie;
 pub mod pow;
+pub mod render;
 pub mod secret;
 
 use thiserror::Error;
