@@ -7,7 +7,7 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 //! Bot-protection request-filter integration (v1.4.0 Epic 3, story
-//! 3.5; cross-worker stash closed as a v1.4.0 follow-up).
+//! 3.5). Cross-worker stash uses SQLite (table `bot_pending_challenges`).
 //!
 //! Two things live here:
 //!
@@ -133,8 +133,8 @@ pub enum StashBackend {
     /// Per-process `HashMap<nonce, entry>`. Fastest, no cross-
     /// worker sharing. Used by tests + the single-process runtime.
     InMemory(Mutex<HashMap<String, PendingEntry>>),
-    /// SQLite-backed stash (v1.4.0 follow-up, table
-    /// `bot_pending_challenges`). Every operation goes through the
+    /// SQLite-backed stash (table `bot_pending_challenges`).
+    /// Every operation goes through the
     /// shared store so all workers see the same state. Atomic
     /// `DELETE ... RETURNING` on `take` gives "first solver wins"
     /// cross-worker replay defence.
@@ -402,10 +402,9 @@ pub enum PassReason {
     OnlyCountryGateMiss,
     /// Bypass category matched: IP CIDR list.
     BypassIpCidr,
-    /// Bypass category matched: ASN list (v1.4.0 follow-up).
+    /// Bypass category matched: ASN list.
     BypassAsn,
-    /// Bypass category matched: forward-confirmed rDNS suffix
-    /// list (v1.4.0 follow-up).
+    /// Bypass category matched: forward-confirmed rDNS suffix list.
     BypassRdns,
     /// Bypass category matched: country list.
     BypassCountry,
@@ -439,15 +438,13 @@ pub struct EvalInputs<'a> {
     /// the DB is not loaded or the IP is outside any indexed
     /// prefix.
     pub country: Option<String>,
-    /// Resolved Autonomous System Number from the ASN resolver
-    /// (v1.4.0 follow-up closing the asn-bypass deferred item).
+    /// Resolved Autonomous System Number from the ASN resolver.
     /// `None` when the ASN DB is not loaded or the IP is not
     /// indexed. Callers that do not need ASN bypass can pass
-    /// `None` unconditionally — the evaluator just skips the
+    /// `None` unconditionally - the evaluator just skips the
     /// ASN arm.
     pub asn: Option<u32>,
-    /// Forward-confirmed rDNS name for the client IP (v1.4.0
-    /// follow-up closing the rdns-bypass deferred item). `Some(name)`
+    /// Forward-confirmed rDNS name for the client IP. `Some(name)`
     /// = the hot-path cache returned a confirmed PTR; `None` = no
     /// cached result (cache miss, lookup in flight, or the IP
     /// simply has no PTR). Caller (request_filter) schedules an
@@ -479,6 +476,11 @@ pub struct EvalInputs<'a> {
     pub route_id: &'a str,
     /// The route's `bot_protection` config.
     pub config: &'a lorica_config::models::BotProtectionConfig,
+    /// Pre-compiled User-Agent regex set from RouteEntry. When `Some`,
+    /// the evaluator uses `is_match` on the set instead of compiling
+    /// patterns per-request. `None` falls back to per-pattern compile
+    /// (backwards-compatible, but slower).
+    pub ua_regex_set: Option<&'a regex::RegexSet>,
 }
 
 /// Evaluate bot-protection policy for a single request. Pure
@@ -600,21 +602,27 @@ pub fn evaluate(inputs: &EvalInputs<'_>) -> Decision {
         }
     }
 
-    // 4. User-Agent regex bypass. Pattern compilation was already
-    //    validated at write time; compiling per-evaluation here is
-    //    ~200 ns per pattern on x86 and acceptable at the scale we
-    //    run (bounded at 500 patterns max, typically <10 in prod).
-    //    A future optimisation can cache a compiled Regex alongside
-    //    the config, but the current shape keeps state minimal.
+    // 4. User-Agent regex bypass. When a pre-compiled RegexSet is
+    //    available (built once at config-reload in RouteEntry), use
+    //    it for O(1) match against all patterns. Falls back to
+    //    per-pattern compile when the set is absent (test helpers).
     if !inputs.user_agent.is_empty() {
-        for pat in &inputs.config.bypass.user_agents {
-            if regex::Regex::new(pat)
-                .map(|r| r.is_match(inputs.user_agent))
-                .unwrap_or(false)
-            {
+        if let Some(set) = inputs.ua_regex_set {
+            if set.is_match(inputs.user_agent) {
                 return Decision::Pass {
                     reason: PassReason::BypassUserAgent,
                 };
+            }
+        } else {
+            for pat in &inputs.config.bypass.user_agents {
+                if regex::Regex::new(pat)
+                    .map(|r| r.is_match(inputs.user_agent))
+                    .unwrap_or(false)
+                {
+                    return Decision::Pass {
+                        reason: PassReason::BypassUserAgent,
+                    };
+                }
             }
         }
     }
@@ -941,6 +949,7 @@ mod tests {
             route_id: "route-abc",
             config: c,
             cached_cookie_hit: None,
+            ua_regex_set: None,
         }
     }
 
@@ -1423,6 +1432,7 @@ mod tests {
             route_id,
             config: &c,
             cached_cookie_hit: None,
+            ua_regex_set: None,
         };
         match evaluate(&i) {
             Decision::Pass { reason } => assert_eq!(reason, PassReason::ValidCookie),

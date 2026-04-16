@@ -374,11 +374,23 @@ pub async fn test_otel_connection(
     let latency_ms = start.elapsed().as_millis() as u64;
 
     let payload = match result {
-        Ok(resp) => serde_json::json!({
-            "ok": true,
-            "message": format!("reachable (HTTP {})", resp.status().as_u16()),
-            "latency_ms": latency_ms,
-        }),
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let detail = if status >= 400 {
+                format!(
+                    "collector responded (HTTP {status}); \
+                     endpoint is reachable but rejected the probe - \
+                     check authentication or content-type settings"
+                )
+            } else {
+                format!("reachable (HTTP {status})")
+            };
+            serde_json::json!({
+                "ok": true,
+                "message": detail,
+                "latency_ms": latency_ms,
+            })
+        }
         Err(e) => serde_json::json!({
             "ok": false,
             "message": format!("unreachable: {e}"),

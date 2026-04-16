@@ -40,15 +40,11 @@ use thiserror::Error;
 use crate::{GeoIpError, GeoIpResolver};
 
 /// How often the auto-update task ticks. The DB-IP Lite feed is
-/// refreshed monthly, but a 24-hour cadence keeps Lorica within one
-/// day of any mid-month regeneration (happens when the upstream
-/// maintainer ships a fix or the geolocation dataset is re-scored),
-/// and matches the cadence operators expect from other IP-reputation
-/// feeds. Bandwidth cost stays trivial: the gzip is ~3 MiB so one
-/// download per day is a rounding error on any internet link, and
-/// the atomic ArcSwap publish means in-flight requests are never
-/// blocked.
-pub const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// refreshed monthly (first day of each month); a weekly cadence
+/// keeps Lorica within 7 days of a mid-month re-score while staying
+/// well within the DB-IP free-tier fair-use policy. Bandwidth cost
+/// is trivial: ~3 MiB gzip per download.
+pub const UPDATE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Conservative floor for the uncompressed `.mmdb` size. The DB-IP
 /// Lite Country feed ships ~3 MiB uncompressed; anything smaller

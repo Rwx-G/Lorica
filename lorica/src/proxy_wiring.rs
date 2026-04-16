@@ -174,6 +174,11 @@ pub struct RouteEntry {
     /// this route require a cert, did it present one, does the
     /// organization match) happen in `request_filter`.
     pub mtls_enforcer: Option<MtlsEnforcer>,
+    /// Pre-compiled regex set for bot-protection `bypass.user_agents`.
+    /// Built once at config-reload time so the per-request evaluate()
+    /// path does not re-compile patterns on every hit. `None` when
+    /// bot-protection is disabled or the UA bypass list is empty.
+    pub bot_ua_regex_set: Option<Arc<regex::RegexSet>>,
 }
 
 /// Runtime-side view of a route's mTLS policy: the bits we check at
@@ -443,6 +448,28 @@ impl ProxyConfig {
                 allowed_organizations: m.allowed_organizations.clone(),
             });
 
+            let bot_ua_regex_set = route
+                .bot_protection
+                .as_ref()
+                .and_then(|bp| {
+                    let pats = &bp.bypass.user_agents;
+                    if pats.is_empty() {
+                        return None;
+                    }
+                    match regex::RegexSet::new(pats) {
+                        Ok(set) => Some(Arc::new(set)),
+                        Err(e) => {
+                            warn!(
+                                route_id = %route.id,
+                                error = %e,
+                                "bot bypass UA regex set failed to compile; \
+                                 UA bypass disabled for this route"
+                            );
+                            None
+                        }
+                    }
+                });
+
             let entry = Arc::new(RouteEntry {
                 route: Arc::new(route.clone()),
                 backends: route_backends,
@@ -456,6 +483,7 @@ impl ProxyConfig {
                 mirror_backends,
                 response_rewrite_compiled,
                 mtls_enforcer,
+                bot_ua_regex_set,
             });
 
             routes_by_host
@@ -3101,6 +3129,7 @@ impl ProxyHttp for LoricaProxy {
                         route_id: &entry.route.id,
                         config: bot_cfg,
                         cached_cookie_hit,
+                        ua_regex_set: entry.bot_ua_regex_set.as_deref(),
                     };
                     match crate::bot::evaluate(&inputs) {
                         crate::bot::Decision::Pass { reason } => {
@@ -4282,19 +4311,19 @@ impl ProxyHttp for LoricaProxy {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
         self.backend_connections.increment(&backend.address);
 
-        let mut peer = Box::new(HttpPeer::new(
+        let sni = if backend.tls_upstream {
+            backend
+                .tls_sni
+                .clone()
+                .unwrap_or_else(|| entry.route.hostname.clone())
+        } else {
+            String::new()
+        };
+        let mut peer = Box::new(HttpPeer::try_new(
             &*backend.address,
             backend.tls_upstream,
-            if backend.tls_upstream {
-                // SNI priority: backend tls_sni override > route hostname
-                backend
-                    .tls_sni
-                    .clone()
-                    .unwrap_or_else(|| entry.route.hostname.clone())
-            } else {
-                String::new()
-            },
-        ));
+            sni,
+        )?);
 
         // Force HTTP/2 upstream if configured on the backend
         if backend.h2_upstream {

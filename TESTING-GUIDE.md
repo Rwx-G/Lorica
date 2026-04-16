@@ -548,10 +548,9 @@ dependency:
   required; the mode of last resort.
 
 Evaluated after GeoIP, before forward_auth. Five-category bypass
-matrix (IP CIDR, country, User-Agent regex — plus ASN and rDNS
-placeholders deferred to a post-v1.4.0 follow-up). Optional
-`only_country` inverse gate that fires the challenge ONLY for the
-listed countries.
+matrix (IP CIDR, ASN, country, User-Agent regex, rDNS with forward
+confirmation). Optional `only_country` inverse gate that fires the
+challenge ONLY for the listed countries.
 
 **Enable per route in 90 seconds:**
 

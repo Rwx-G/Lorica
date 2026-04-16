@@ -136,6 +136,7 @@ export interface RouteFormState {
   bot_bypass_asns: string;
   bot_bypass_countries: string;
   bot_bypass_user_agents: string;
+  bot_bypass_rdns: string;
   bot_only_country: string;
 }
 
@@ -224,6 +225,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   bot_bypass_asns: '',
   bot_bypass_countries: '',
   bot_bypass_user_agents: '',
+  bot_bypass_rdns: '',
   bot_only_country: '',
 };
 
@@ -264,7 +266,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'bot_enabled', 'bot_mode', 'bot_cookie_ttl_s', 'bot_pow_difficulty',
     'bot_captcha_alphabet',
     'bot_bypass_ip_cidrs', 'bot_bypass_asns', 'bot_bypass_countries',
-    'bot_bypass_user_agents', 'bot_only_country',
+    'bot_bypass_user_agents', 'bot_bypass_rdns', 'bot_only_country',
   ],
   path_rules: ['path_rules'],
   header_rules: ['header_rules'],
@@ -433,6 +435,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     bot_bypass_asns: (route.bot_protection?.bypass?.asns ?? []).map(String).join(', '),
     bot_bypass_countries: (route.bot_protection?.bypass?.countries ?? []).join(', '),
     bot_bypass_user_agents: (route.bot_protection?.bypass?.user_agents ?? []).join('\n'),
+    bot_bypass_rdns: (route.bot_protection?.bypass?.rdns ?? []).join('\n'),
     bot_only_country: (route.bot_protection?.only_country ?? []).join(', '),
   };
 }
@@ -691,6 +694,7 @@ function botProtectionFormToRequest(
     asns?: number[];
     countries?: string[];
     user_agents?: string[];
+    rdns?: string[];
   } = {};
   const ip_cidrs = csv(form.bot_bypass_ip_cidrs);
   if (ip_cidrs.length > 0) bypass.ip_cidrs = ip_cidrs;
@@ -705,6 +709,8 @@ function botProtectionFormToRequest(
   if (countries.length > 0) bypass.countries = countries;
   const user_agents = lines(form.bot_bypass_user_agents);
   if (user_agents.length > 0) bypass.user_agents = user_agents;
+  const rdns = lines(form.bot_bypass_rdns);
+  if (rdns.length > 0) bypass.rdns = rdns;
 
   const only_country = csv(form.bot_only_country);
   const only_country_opt = only_country.length > 0 ? only_country : undefined;

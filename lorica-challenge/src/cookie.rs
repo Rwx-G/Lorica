@@ -100,6 +100,11 @@ pub fn encode_payload(p: &Payload) -> Vec<u8> {
     out.extend_from_slice(p.ip_prefix.as_bytes());
     // expires_at fits in u32 until 2106; stored little-endian for
     // consistency with the rest of the Lorica SQLite wire format.
+    debug_assert!(
+        p.expires_at >= 0 && p.expires_at <= u32::MAX as i64,
+        "expires_at {0} does not fit in u32 (negative or past 2106)",
+        p.expires_at
+    );
     let exp_u32 = p.expires_at.clamp(0, u32::MAX as i64) as u32;
     out.extend_from_slice(&exp_u32.to_le_bytes());
     out.push(p.mode as u8);

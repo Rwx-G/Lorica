@@ -298,8 +298,27 @@
         <span class="hint">
           Rust <code>regex</code> crate syntax (no lookahead, no backreference).
           Patterns compiled at API save time; a bad regex is rejected up front.
-          Trivially spoofable on its own &mdash; pair with IP CIDRs or a future
-          rDNS match.
+          Trivially spoofable on its own - pair with IP CIDRs or rDNS suffixes.
+        </span>
+      </div>
+
+      <div class="form-group" class:modified={isModified('bot_bypass_rdns')}>
+        <label for="bot-bypass-rdns">
+          Bypass - rDNS suffixes <span class="hint">(one per line)</span>
+        </label>
+        {#if isImported('bot_bypass_rdns')}<span class="imported-badge">imported</span>{/if}
+        <textarea
+          id="bot-bypass-rdns"
+          rows="3"
+          bind:value={form.bot_bypass_rdns}
+          placeholder={'googlebot.com\nsearch.msn.com'}
+          autocomplete="off"
+          spellcheck="false"
+        ></textarea>
+        <span class="hint">
+          Domain suffixes matched against the client IP's PTR record. Forward
+          confirmation is enforced: the PTR name must resolve back to the
+          client IP (A/AAAA match). Lookups are async with a 1 h cache.
         </span>
       </div>
     </div>
@@ -316,11 +335,10 @@
     </div>
 
     <p class="section-hint">
-      <strong>rDNS bypass</strong> from the design doc is still deferred to a
-      v1.4.x follow-up: it needs a forward-confirmation DNS pipeline (design §
-      10.3 flags rDNS-without-forward-confirm as a must-not regression). The
-      API rejects non-empty lists for that field today. All four other
-      categories (IP CIDR, ASN, country, User-Agent) are live.
+      All five bypass categories are live: IP CIDR, ASN, country, User-Agent
+      regex, and rDNS with mandatory forward confirmation (design § 10.3).
+      rDNS lookups are async with a 1 h cache; the first request from a new IP
+      may still see the challenge while the background resolve populates.
     </p>
   {/if}
 </div>

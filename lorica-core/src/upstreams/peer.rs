@@ -23,7 +23,7 @@ use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
 use derivative::Derivative;
 use lorica_error::ErrorType::{InternalError, SocketError};
-use lorica_error::OrErr;
+use lorica_error::{OkOrErr, OrErr};
 use lorica_error::Result;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -491,9 +491,25 @@ impl HttpPeer {
 
     /// Create a new [`HttpPeer`] with the given socket address and TLS settings.
     pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Self {
-        let mut addrs_iter = address.to_socket_addrs().unwrap(); //TODO: handle error
-        let addr = addrs_iter.next().unwrap();
-        Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni)
+        Self::try_new(address, tls, sni)
+            .expect("DNS resolution failed for backend address")
+    }
+
+    /// Fallible variant of [`new`](Self::new). Returns an error when DNS
+    /// resolution fails (e.g. transient network blip, misconfigured
+    /// backend hostname) instead of panicking the proxy thread.
+    pub fn try_new<A: ToInetSocketAddrs>(
+        address: A,
+        tls: bool,
+        sni: String,
+    ) -> Result<Self> {
+        let mut addrs_iter = address
+            .to_socket_addrs()
+            .or_err(SocketError, "failed to resolve backend address")?;
+        let addr = addrs_iter
+            .next()
+            .or_err(SocketError, "backend address resolved to zero addresses")?;
+        Ok(Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni))
     }
 
     /// Create a new [`HttpPeer`] with the given path to Unix domain socket and TLS settings.
