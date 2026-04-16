@@ -165,7 +165,13 @@ pub async fn handle_solve(
         expires_at: now + entry.cookie_ttl_s as i64,
         mode: entry.mode,
     };
-    let cookie_value = cookie::sign(&payload, secret);
+    let cookie_value = match cookie::sign(&payload, secret) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "bot-solve: cookie sign failed");
+            return write_plain(session, 500, "internal error").await;
+        }
+    };
     let set_cookie = build_set_cookie_header(&cookie_value, entry.cookie_ttl_s);
 
     info!(
@@ -291,7 +297,13 @@ pub async fn serve_challenge(
                 expires_at: now + cfg.cookie_ttl_s as i64,
                 mode: Mode::Cookie,
             };
-            let cookie_value = cookie::sign(&payload, &secret);
+            let cookie_value = match cookie::sign(&payload, &secret) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "bot-cookie: cookie sign failed");
+                    return write_plain(session, 500, "internal error").await;
+                }
+            };
             let set_cookie = build_set_cookie_header(&cookie_value, cfg.cookie_ttl_s);
 
             // Cookie mode's page IS the verdict issuance — the

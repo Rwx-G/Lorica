@@ -1149,7 +1149,7 @@ mod tests {
             expires_at: 1_700_000_000 + 86_400,
             mode: Mode::Javascript,
         };
-        let cookie = sign(&payload, &secret);
+        let cookie = sign(&payload, &secret).unwrap();
 
         let c = cfg();
         let mut i = inputs(&c, "");
@@ -1173,7 +1173,7 @@ mod tests {
             expires_at: 1_700_000_000 + 86_400,
             mode: Mode::Javascript,
         };
-        let cookie = sign(&payload, &secret);
+        let cookie = sign(&payload, &secret).unwrap();
 
         let c = cfg();
         let mut i = inputs(&c, "");
@@ -1196,7 +1196,7 @@ mod tests {
             expires_at: 1_700_000_000 + 86_400,
             mode: Mode::Javascript,
         };
-        let cookie = sign(&payload, &secret);
+        let cookie = sign(&payload, &secret).unwrap();
 
         let c = cfg();
         let mut i = inputs(&c, "");

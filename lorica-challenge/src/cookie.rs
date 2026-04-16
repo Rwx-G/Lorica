@@ -91,7 +91,7 @@ pub struct Payload {
 /// [`sign`] and by tests; exposed in case callers need to compute
 /// the HMAC manually (e.g. a future multi-region Lorica that
 /// cross-signs cookies).
-pub fn encode_payload(p: &Payload) -> Vec<u8> {
+pub fn encode_payload(p: &Payload) -> crate::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(
         PAYLOAD_PREFIX_LEN + p.ip_prefix.as_bytes().len() + PAYLOAD_SUFFIX_LEN,
     );
@@ -100,25 +100,26 @@ pub fn encode_payload(p: &Payload) -> Vec<u8> {
     out.extend_from_slice(p.ip_prefix.as_bytes());
     // expires_at fits in u32 until 2106; stored little-endian for
     // consistency with the rest of the Lorica SQLite wire format.
-    debug_assert!(
-        p.expires_at >= 0 && p.expires_at <= u32::MAX as i64,
-        "expires_at {0} does not fit in u32 (negative or past 2106)",
-        p.expires_at
-    );
-    let exp_u32 = p.expires_at.clamp(0, u32::MAX as i64) as u32;
+    if p.expires_at < 0 || p.expires_at > u32::MAX as i64 {
+        return Err(crate::ChallengeError::Internal(
+            "expires_at does not fit in u32 (negative or past 2106)",
+        ));
+    }
+    let exp_u32 = p.expires_at as u32;
     out.extend_from_slice(&exp_u32.to_le_bytes());
     out.push(p.mode as u8);
-    out
+    Ok(out)
 }
 
 /// Mint a verdict cookie. Returns the base64url string that goes
-/// into the `Set-Cookie` header value.
-pub fn sign(p: &Payload, secret: &[u8; 32]) -> String {
-    let payload = encode_payload(p);
+/// into the `Set-Cookie` header value, or a `ChallengeError` when
+/// the payload fails validation (e.g. `expires_at` out of u32 range).
+pub fn sign(p: &Payload, secret: &[u8; 32]) -> crate::Result<String> {
+    let payload = encode_payload(p)?;
     let tag = hmac_tag(secret, &payload);
     let mut wire = payload;
     wire.extend_from_slice(&tag);
-    URL_SAFE_NO_PAD.encode(&wire)
+    Ok(URL_SAFE_NO_PAD.encode(&wire))
 }
 
 /// Verify a verdict cookie. Returns the decoded payload on
@@ -264,7 +265,7 @@ mod tests {
     fn sign_and_verify_v4_roundtrip() {
         let secret = test_secret();
         let p = test_payload_v4();
-        let cookie = sign(&p, &secret);
+        let cookie = sign(&p, &secret).unwrap();
         let got = verify(&cookie, &secret, 1_900_000_000).expect("fresh cookie must verify");
         assert_eq!(got.route_id, p.route_id);
         assert_eq!(got.ip_prefix, p.ip_prefix);
@@ -276,7 +277,7 @@ mod tests {
     fn sign_and_verify_v6_roundtrip() {
         let secret = test_secret();
         let p = test_payload_v6();
-        let cookie = sign(&p, &secret);
+        let cookie = sign(&p, &secret).unwrap();
         let got = verify(&cookie, &secret, 1_900_000_000).expect("fresh cookie must verify");
         assert_eq!(got.ip_prefix, p.ip_prefix);
         assert_eq!(got.mode, p.mode);
@@ -292,7 +293,7 @@ mod tests {
     #[test]
     fn verify_rejects_truncated_cookie() {
         let secret = test_secret();
-        let cookie = sign(&test_payload_v4(), &secret);
+        let cookie = sign(&test_payload_v4(), &secret).unwrap();
         // Lop off the last 2 chars of the base64 string, which
         // removes ~10 bits of the tag. Shape check must fire before
         // the HMAC check.
@@ -304,7 +305,7 @@ mod tests {
     #[test]
     fn verify_rejects_flipped_payload_byte() {
         let secret = test_secret();
-        let cookie = sign(&test_payload_v4(), &secret);
+        let cookie = sign(&test_payload_v4(), &secret).unwrap();
         let mut wire = URL_SAFE_NO_PAD.decode(&cookie).unwrap();
         // Flip one bit of the route_id. HMAC tag should no longer match.
         wire[0] ^= 0x01;
@@ -316,7 +317,7 @@ mod tests {
     #[test]
     fn verify_rejects_flipped_tag_byte() {
         let secret = test_secret();
-        let cookie = sign(&test_payload_v4(), &secret);
+        let cookie = sign(&test_payload_v4(), &secret).unwrap();
         let mut wire = URL_SAFE_NO_PAD.decode(&cookie).unwrap();
         let last = wire.len() - 1;
         wire[last] ^= 0x80;
@@ -328,7 +329,7 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_secret() {
         let secret = test_secret();
-        let cookie = sign(&test_payload_v4(), &secret);
+        let cookie = sign(&test_payload_v4(), &secret).unwrap();
         let other = [0xFFu8; 32];
         let err = verify(&cookie, &other, 1_900_000_000).unwrap_err();
         assert!(matches!(err, ChallengeError::BadSignature), "{err:?}");
@@ -341,7 +342,7 @@ mod tests {
             expires_at: 1_000_000_000,
             ..test_payload_v4()
         };
-        let cookie = sign(&p, &secret);
+        let cookie = sign(&p, &secret).unwrap();
         // now = 1h past expiry, well beyond the 30s skew grace.
         let err = verify(&cookie, &secret, 1_000_003_600).unwrap_err();
         assert!(matches!(err, ChallengeError::Expired { .. }), "{err:?}");
@@ -354,7 +355,7 @@ mod tests {
             expires_at: 1_000_000_000,
             ..test_payload_v4()
         };
-        let cookie = sign(&p, &secret);
+        let cookie = sign(&p, &secret).unwrap();
         // now = 10s past expiry, inside the 30s grace.
         let ok = verify(&cookie, &secret, 1_000_000_010).expect("within skew");
         assert_eq!(ok.expires_at, 1_000_000_000);
@@ -363,7 +364,7 @@ mod tests {
     #[test]
     fn verify_rejects_invalid_ip_discriminator() {
         let secret = test_secret();
-        let cookie = sign(&test_payload_v4(), &secret);
+        let cookie = sign(&test_payload_v4(), &secret).unwrap();
         let mut wire = URL_SAFE_NO_PAD.decode(&cookie).unwrap();
         wire[16] = 9; // neither 1 nor 2
         let tampered = URL_SAFE_NO_PAD.encode(&wire);
@@ -375,14 +376,14 @@ mod tests {
     fn cookie_size_v4_is_deterministic() {
         // Document the wire-size guarantee: 41 raw bytes before
         // base64url, which rounds up to 55 chars (no padding).
-        let cookie = sign(&test_payload_v4(), &test_secret());
+        let cookie = sign(&test_payload_v4(), &test_secret()).unwrap();
         assert_eq!(cookie.len(), 55, "expected 55 chars, got '{cookie}'");
     }
 
     #[test]
     fn cookie_size_v6_is_deterministic() {
         // 46 raw bytes → 62 base64url chars (no padding).
-        let cookie = sign(&test_payload_v6(), &test_secret());
+        let cookie = sign(&test_payload_v6(), &test_secret()).unwrap();
         assert_eq!(cookie.len(), 62, "expected 62 chars, got '{cookie}'");
     }
 
@@ -397,7 +398,7 @@ mod tests {
             ip_prefix: IpPrefix::from_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42))),
             ..test_payload_v4()
         };
-        let cookie = sign(&p, &secret);
+        let cookie = sign(&p, &secret).unwrap();
         let got = verify(&cookie, &secret, 1_900_000_000).unwrap();
         // Caller will separately compare got.ip_prefix with
         // IpPrefix::from_ip(new_client_ip) — they must be equal.
