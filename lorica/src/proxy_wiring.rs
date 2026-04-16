@@ -129,6 +129,9 @@ impl SmoothWrrState {
 }
 
 /// In-memory snapshot of a route and its backends for fast lookup.
+/// Some fields are only read via the `Debug` derive (diagnostic
+/// serialisation) or by conditional code paths; `dead_code` is
+/// suppressed to keep the struct complete.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct RouteEntry {
@@ -4640,7 +4643,7 @@ impl ProxyHttp for LoricaProxy {
 
         // Inject sticky session cookie
         if let Some(ref backend_id) = ctx.sticky_backend_id {
-            let cookie = format!("LORICA_SRV={backend_id}; Path=/; HttpOnly; SameSite=Lax");
+            let cookie = format!("LORICA_SRV={backend_id}; Path=/; Secure; HttpOnly; SameSite=Lax");
             let _ = upstream_response.append_header("Set-Cookie", &cookie);
         }
 

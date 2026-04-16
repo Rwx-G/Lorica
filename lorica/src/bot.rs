@@ -733,6 +733,7 @@ fn verdict_cache_key(route_id: &str, ip_prefix: &IpPrefix, cookie: &str) -> Stri
 /// or on a stale entry (which is NOT evicted here — the next
 /// verify's `cache_insert` does not touch the stale slot; the FIFO
 /// reclaim will catch it eventually).
+#[doc(hidden)]
 pub fn cache_check(
     route_id: &str,
     ip_prefix: &IpPrefix,
@@ -753,7 +754,7 @@ pub fn cache_check(
 /// succeeds. The FIFO eviction mirrors forward_auth's implementation
 /// so future cleanup (when both caches move to a shared helper)
 /// stays trivial.
-pub fn cache_insert(
+pub(crate) fn cache_insert(
     route_id: &str,
     ip_prefix: &IpPrefix,
     cookie: &str,
@@ -773,10 +774,11 @@ pub fn cache_insert(
     VERDICT_CACHE.insert(key, expires_at);
 }
 
-/// Clear the verdict cache. Reserved for tests + a future
-/// "revoke all cookies" operator action on the dashboard.
+/// Clear the process-wide verdict cache. Used by unit tests to
+/// isolate cache state between test cases, and reserved for a
+/// future "revoke all cookies" operator action on the dashboard.
 #[doc(hidden)]
-pub fn cache_reset_for_test() {
+pub(crate) fn cache_reset_for_test() {
     VERDICT_CACHE.clear();
     VERDICT_ORDER.lock().clear();
 }

@@ -547,13 +547,14 @@ pub(crate) fn accept_prefers_html(accept_header: Option<&str>) -> bool {
 /// `SameSite=Lax` so a cross-origin navigation that requires auth
 /// (OAuth redirect, IdP hop) still carries the verdict. `HttpOnly`
 /// so JavaScript cannot read or exfiltrate the cookie. `Secure`
-/// is NOT set here: Lorica may be reached over plaintext HTTP in a
-/// dev environment, and the operator's TLS fronting (when it
-/// exists) already enforces HTTPS-only transport at the wire
-/// level. A future flag could toggle `Secure` per-route.
+/// `Secure` is set unconditionally: verdict cookies are security
+/// tokens and must never transit over plaintext. Dev environments
+/// running plain HTTP will not receive the cookie (correct
+/// behaviour - the challenge re-fires on every request, which is
+/// the safe degradation).
 fn build_set_cookie_header(value: &str, max_age_s: u32) -> String {
     format!(
-        "{VERDICT_COOKIE_NAME}={value}; Max-Age={max_age_s}; Path=/; HttpOnly; SameSite=Lax"
+        "{VERDICT_COOKIE_NAME}={value}; Max-Age={max_age_s}; Path=/; Secure; HttpOnly; SameSite=Lax"
     )
 }
 

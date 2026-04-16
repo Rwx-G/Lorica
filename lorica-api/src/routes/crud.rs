@@ -194,7 +194,7 @@ fn validate_bot_protection(
         ip_cidrs.push(trimmed.to_string());
     }
 
-    // ASN-based bypass (v1.4.0 follow-up now landed). Resolver is
+    // ASN-based bypass (v1.4.0 Epic 3). Resolver is
     // `lorica_geoip::AsnResolver` loaded from
     // `GlobalSettings.asn_db_path`. When the DB is missing at
     // request time, `asn_handle().lookup_asn()` returns `None` and
@@ -241,7 +241,7 @@ fn validate_bot_protection(
         user_agents.push(trimmed.to_string());
     }
 
-    // rDNS-based bypass (v1.4.0 follow-up now landed). Forward-
+    // rDNS-based bypass (v1.4.0 Epic 3). Forward-
     // confirmation is enforced in-process by
     // `lorica::bot_rdns::RdnsResolver` (resolve PTR then confirm
     // one of the resulting names forward-resolves back to the

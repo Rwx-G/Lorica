@@ -48,7 +48,10 @@ async function request<T>(
   }
 
   if (!res.ok) {
-    return { error: (json.error as ApiError) ?? { code: 'unknown', message: res.statusText } };
+    const err = json.error && typeof json.error === 'object' && 'code' in json.error
+      ? (json.error as ApiError)
+      : { code: 'unknown', message: res.statusText };
+    return { error: err };
   }
   return { data: json.data as T };
 }

@@ -165,7 +165,12 @@
       </button>
     </div>
 
-    <div class="map-container" bind:this={svgContainer}>
+    <div
+      class="map-container"
+      bind:this={svgContainer}
+      role="application"
+      aria-label="World map country picker - click a country to select it"
+    >
       {#if !ready}<p class="loading">Loading map...</p>{/if}
     </div>
 
