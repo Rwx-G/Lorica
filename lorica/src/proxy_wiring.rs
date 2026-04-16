@@ -1277,6 +1277,32 @@ impl LoricaProxy {
         })
     }
 
+    /// Spawn a background prune task for the bot-protection pending
+    /// stash. Without this, expired challenges only get cleaned up
+    /// when a new challenge happens to render (opportunistic prune
+    /// in bot_handlers). Under low traffic or JavaScript-only routes,
+    /// expired rows could accumulate until the 10K row cap evicts
+    /// them. This task runs every 60 s and is cheap: a single
+    /// `DELETE WHERE expires_at <= ?` on the SQLite table.
+    pub fn spawn_bot_stash_prune(
+        &self,
+        tracker: &tokio_util::task::TaskTracker,
+    ) -> tokio::task::JoinHandle<()> {
+        let engine = Arc::clone(&self.bot_engine);
+        tracker.spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.tick().await; // skip the immediate tick
+            loop {
+                ticker.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                engine.prune_expired(now).await;
+            }
+        })
+    }
+
     /// Spawn a background prune task for `rate_limit_buckets`.
     ///
     /// For `scope = per_ip` every distinct client IP gets its own

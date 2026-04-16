@@ -3214,6 +3214,7 @@ fn run_worker(
         Duration::from_secs(60),
         Duration::from_secs(5 * 60),
     );
+    let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&worker_auth_prune_tracker);
     // Spawn the cross-worker sync task when the supervisor provided
     // an RPC socketpair (production worker mode). The task drains
     // `LocalBucket::take_delta` every 100 ms, pushes the batch via
@@ -3661,6 +3662,7 @@ fn run_single_process(cli: Cli) {
             Duration::from_secs(60),
             Duration::from_secs(5 * 60),
         );
+        let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&single_task_tracker);
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
