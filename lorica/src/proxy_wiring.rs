@@ -2098,7 +2098,7 @@ impl ProxyHttp for LoricaProxy {
         // extraction + cookie-bound scope validation happen inside
         // the handlers.
         {
-            let path = session.req_header().uri.path().to_string();
+            let path: String = session.req_header().uri.path().to_owned();
             if crate::bot::is_bot_solve_path(&path) {
                 // Client IP must go through the SAME XFF unwrap that
                 // the challenge-render path used; otherwise the
@@ -2975,9 +2975,14 @@ impl ProxyHttp for LoricaProxy {
         // client behind a corporate NAT is never accidentally denied
         // — the operator can layer an explicit `ip_allowlist` on top
         // when they want fail-close semantics.
+        // GeoIP country resolved once and cached for both the geoip
+        // block check and the bot-protection bypass evaluator,
+        // avoiding a redundant mmdb decode_path call on the hot path.
+        let mut cached_country: Option<String> = None;
         if let Some(ref ip_str) = check_ip {
             if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
                 if let Some(country) = self.geoip_resolver.lookup_country(ip_addr) {
+                    cached_country = Some(country.as_str().to_string());
                     // Always stamp the country on the root tracing
                     // span — the attribute is useful even on requests
                     // that are not blocked (traffic analytics per
@@ -3052,17 +3057,10 @@ impl ProxyHttp for LoricaProxy {
         if let Some(ref bot_cfg) = entry.route.bot_protection {
             if let Some(ref ip_str) = check_ip {
                 if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
-                    // Resolve country once for the bypass + gate
-                    // evaluation (the per-request OTel span already
-                    // got stamped in the GeoIP block above, but the
-                    // country string is not preserved — re-resolve
-                    // here; the resolver lookup is a single
-                    // decode_path call on the mmdb reader, well
-                    // under 1 µs).
-                    let country = self
-                        .geoip_resolver
-                        .lookup_country(ip_addr)
-                        .map(|c| c.as_str().to_string());
+                    // Reuse the country resolved in the GeoIP block
+                    // above (cached_country) to avoid a redundant
+                    // mmdb decode_path call on every request.
+                    let country = cached_country.clone();
                     // ASN lookup via the hot-swappable resolver.
                     // Returns None when no DB is loaded — the
                     // evaluator treats that as "asn bypass

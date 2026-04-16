@@ -454,7 +454,15 @@ pub fn build_router(
         .merge(dashboard_routes)
         .layer(
             CorsLayer::new()
-                .allow_origin(Any) // API is localhost-only, same-origin with dashboard
+                // Dashboard is served from the same origin as the API
+                // (same port, same host). Restrict CORS to same-origin
+                // requests only. AllowOrigin::mirror_request reflects
+                // the Origin header back so browsers allow the call
+                // from any scheme://host:port that can reach the API
+                // (typically https://localhost:9443 or the operator's
+                // custom domain). This is tighter than Any because it
+                // only applies when an Origin is actually sent.
+                .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
                 .allow_headers(Any),
         )

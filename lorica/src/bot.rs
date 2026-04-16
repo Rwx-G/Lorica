@@ -176,11 +176,12 @@ impl BotEngine {
     /// are unpredictable — a predictable nonce would let an attacker
     /// pre-register a matching row and bypass the verify step.
     pub fn fresh_nonce(&self) -> String {
+        use std::fmt::Write;
         let mut raw = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut raw);
         let mut out = String::with_capacity(32);
         for b in raw.iter() {
-            out.push_str(&format!("{b:02x}"));
+            let _ = write!(out, "{b:02x}");
         }
         out
     }
@@ -729,17 +730,20 @@ fn verdict_cache_key(route_id: &str, ip_prefix: &IpPrefix, cookie: &str) -> Stri
     let tag = hasher.finalize();
     // 8 hex chars of the hash is ample to avoid collisions at our
     // 16 k cache capacity (probability << 2^-60).
-    let tag_hex: String = tag
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let prefix_hex: String = ip_prefix
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    format!("{route_id}\0{prefix_hex}\0{tag_hex}")
+    use std::fmt::Write;
+    let prefix_bytes = ip_prefix.as_bytes();
+    // Pre-allocate: route_id + \0 + prefix_hex + \0 + tag_hex(16 chars)
+    let mut key = String::with_capacity(route_id.len() + 2 + prefix_bytes.len() * 2 + 16);
+    key.push_str(route_id);
+    key.push('\0');
+    for b in prefix_bytes {
+        let _ = write!(key, "{b:02x}");
+    }
+    key.push('\0');
+    for b in tag.iter().take(8) {
+        let _ = write!(key, "{b:02x}");
+    }
+    key
 }
 
 /// Return the cached `expires_at` for a verdict key if it is
@@ -802,12 +806,16 @@ pub(crate) fn cache_reset_for_test() {
 /// shared supervisor cache. The IP prefix is folded in so different
 /// NATs never collide.
 fn rpc_verdict_route_id(route_id: &str, ip_prefix: &IpPrefix) -> String {
-    let prefix_hex: String = ip_prefix
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    format!("bot\0{route_id}\0{prefix_hex}")
+    use std::fmt::Write;
+    let prefix_bytes = ip_prefix.as_bytes();
+    let mut key = String::with_capacity(4 + route_id.len() + 1 + prefix_bytes.len() * 2);
+    key.push_str("bot\0");
+    key.push_str(route_id);
+    key.push('\0');
+    for b in prefix_bytes {
+        let _ = write!(key, "{b:02x}");
+    }
+    key
 }
 
 /// RPC cache lookup (worker mode). Delegates to the supervisor's

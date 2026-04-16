@@ -71,7 +71,7 @@ log "Lorica API ready"
 ADMIN_PW=""
 for i in $(seq 1 60); do
     if [ -f /shared/admin_password ]; then
-        ADMIN_PW=$(cat /shared/admin_password | tr -d '[:space:]')
+        ADMIN_PW=$(tr -d '[:space:]' < /shared/admin_password)
         break
     fi
     sleep 1
