@@ -205,18 +205,38 @@ pub async fn update_settings(
         if trimmed.is_empty() {
             settings.otlp_endpoint = None;
         } else {
-            // Accept http:// or https:// URLs (OTLP/HTTP and OTLP/gRPC both
-            // use HTTP-scheme URLs; gRPC transport is negotiated by the
-            // `otlp_protocol` field, not the URL scheme).
-            if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            // Validate scheme + host to reject malformed input.
+            // RFC-1918 / loopback targets are NOT blocked because
+            // internal collectors (docker-compose, k8s sidecar) are
+            // the primary deployment pattern and the API is auth-gated.
+            let is_https = trimmed.starts_with("https://");
+            let is_http = trimmed.starts_with("http://");
+            if !is_http && !is_https {
                 return Err(ApiError::BadRequest(
                     "otlp_endpoint must start with http:// or https://".into(),
+                ));
+            }
+            let after_scheme = if is_https { &trimmed[8..] } else { &trimmed[7..] };
+            if after_scheme.is_empty()
+                || after_scheme.starts_with('/')
+                || after_scheme.starts_with(':')
+            {
+                return Err(ApiError::BadRequest(
+                    "otlp_endpoint must contain a hostname after the scheme".into(),
                 ));
             }
             if trimmed.len() > 2048 {
                 return Err(ApiError::BadRequest(
                     "otlp_endpoint too long (> 2048 chars)".into(),
                 ));
+            }
+            if is_http {
+                tracing::warn!(
+                    endpoint = %trimmed,
+                    "OTLP endpoint uses plaintext HTTP; trace data \
+                     (URLs, IPs, error messages) will transit in cleartext. \
+                     Use https:// in production."
+                );
             }
             settings.otlp_endpoint = Some(trimmed.to_string());
         }
@@ -252,10 +272,6 @@ pub async fn update_settings(
         if trimmed.is_empty() {
             settings.geoip_db_path = None;
         } else {
-            // Require an absolute path so the supervisor does not end
-            // up looking for the DB relative to whatever cwd it was
-            // started from. Bounded at 4 KiB to match typical PATH_MAX
-            // on Linux without trusting libc's limits.
             if !trimmed.starts_with('/') {
                 return Err(ApiError::BadRequest(
                     "geoip_db_path must be an absolute path (starting with '/')".into(),
@@ -264,6 +280,14 @@ pub async fn update_settings(
             if trimmed.len() > 4096 {
                 return Err(ApiError::BadRequest(
                     "geoip_db_path too long (> 4096 chars)".into(),
+                ));
+            }
+            // Reject path traversal components. The path is operator-
+            // supplied via the authenticated API, but defence-in-depth
+            // prevents accidentally writing outside /var/lib/lorica.
+            if trimmed.contains("/../") || trimmed.ends_with("/..") {
+                return Err(ApiError::BadRequest(
+                    "geoip_db_path must not contain path traversal (../)".into(),
                 ));
             }
             settings.geoip_db_path = Some(trimmed.to_string());
@@ -285,6 +309,11 @@ pub async fn update_settings(
             if trimmed.len() > 4096 {
                 return Err(ApiError::BadRequest(
                     "asn_db_path too long (> 4096 chars)".into(),
+                ));
+            }
+            if trimmed.contains("/../") || trimmed.ends_with("/..") {
+                return Err(ApiError::BadRequest(
+                    "asn_db_path must not contain path traversal (../)".into(),
                 ));
             }
             settings.asn_db_path = Some(trimmed.to_string());

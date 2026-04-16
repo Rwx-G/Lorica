@@ -150,6 +150,22 @@ pub async fn run_once(
 ) -> Result<(), UpdateError> {
     let url = build_download_url(&cfg.url_template, Utc::now());
 
+    // Enforce HTTPS: the download carries an executable data file
+    // (mmdb lookups influence access-control decisions). TLS is the
+    // integrity mechanism since DB-IP does not publish checksums.
+    // Loopback is exempted so unit tests with a local mock server
+    // still work (no real network, no integrity concern).
+    let is_loopback_http = url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://[::1]")
+        || url.starts_with("http://localhost");
+    if !url.starts_with("https://") && !is_loopback_http {
+        return Err(UpdateError::Download(
+            "download URL must use HTTPS for integrity (got HTTP); \
+             loopback URLs are exempted for testing"
+                .into(),
+        ));
+    }
+
     tracing::info!(url = %url, "geoip updater: downloading database");
 
     // 1. Ensure parent dir exists. `create_dir_all` is idempotent

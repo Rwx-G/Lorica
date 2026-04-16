@@ -38,12 +38,46 @@ pub struct BotStashEntry {
     pub png_bytes: Option<Vec<u8>>,
 }
 
+/// Maximum captcha PNG size (512 KiB). The `captcha` crate's
+/// default output is ~15 KiB; anything beyond 512 KiB is either a
+/// bug or a crafted payload trying to inflate the DB on disk.
+const MAX_PNG_BYTES: usize = 512 * 1024;
+
+/// Maximum pending challenges in the stash. Bounds disk + memory
+/// usage under sustained bot traffic. When the cap is reached, the
+/// oldest rows are evicted before the new insert.
+const MAX_STASH_ROWS: usize = 10_000;
+
 impl ConfigStore {
-    /// Insert a pending challenge. Overwrites any prior row keyed
-    /// by the same nonce — nonces are 128 bits random so collisions
-    /// are a ~2^-128 event, but the INSERT OR REPLACE keeps the
-    /// request path deterministic.
+    /// Insert a pending challenge. Enforces a PNG size cap and a
+    /// global row limit with oldest-first eviction to prevent
+    /// disk/memory exhaustion from sustained bot traffic.
     pub fn bot_stash_insert(&self, entry: &BotStashEntry) -> Result<()> {
+        if let Some(ref png) = entry.png_bytes {
+            if png.len() > MAX_PNG_BYTES {
+                return Err(crate::error::ConfigError::Validation(format!(
+                    "captcha PNG too large ({} bytes, max {})",
+                    png.len(),
+                    MAX_PNG_BYTES,
+                )));
+            }
+        }
+        // Evict oldest rows when the stash is at capacity.
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM bot_pending_challenges",
+            [],
+            |row| row.get(0),
+        )?;
+        if count as usize >= MAX_STASH_ROWS {
+            let to_evict = (count as usize - MAX_STASH_ROWS + 1) as i64;
+            self.conn.execute(
+                "DELETE FROM bot_pending_challenges WHERE rowid IN (
+                     SELECT rowid FROM bot_pending_challenges
+                     ORDER BY expires_at ASC LIMIT ?1
+                 )",
+                params![to_evict],
+            )?;
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO bot_pending_challenges
              (nonce, kind, payload, mode, route_id, ip_prefix_disc,
@@ -73,14 +107,15 @@ impl ConfigStore {
     /// will NOT both succeed — only one wins, the other gets
     /// `None` and rejects with 403 "challenge expired or unknown".
     /// This is the cross-worker replay defence.
-    pub fn bot_stash_take(&self, nonce: &str) -> Result<Option<BotStashEntry>> {
+    pub fn bot_stash_take(&self, nonce: &str, now: i64) -> Result<Option<BotStashEntry>> {
         let mut stmt = self.conn.prepare(
-            "DELETE FROM bot_pending_challenges WHERE nonce = ?1
+            "DELETE FROM bot_pending_challenges
+             WHERE nonce = ?1 AND expires_at > ?2
              RETURNING nonce, kind, payload, mode, route_id,
                        ip_prefix_disc, ip_prefix_bytes, return_url,
                        cookie_ttl_s, expires_at, png_bytes",
         )?;
-        let mut rows = stmt.query(params![nonce])?;
+        let mut rows = stmt.query(params![nonce, now])?;
         if let Some(row) = rows.next()? {
             Ok(Some(BotStashEntry {
                 nonce: row.get(0)?,
@@ -170,12 +205,12 @@ mod tests {
         let store = ConfigStore::open_in_memory().unwrap();
         let e = entry("abc", "pow", 2_000_000_000);
         store.bot_stash_insert(&e).unwrap();
-        let taken = store.bot_stash_take("abc").unwrap().expect("round-trip");
+        let taken = store.bot_stash_take("abc", 1_900_000_000).unwrap().expect("round-trip");
         assert_eq!(taken.nonce, "abc");
         assert_eq!(taken.kind, "pow");
         assert_eq!(taken.mode, 2);
         // second take returns None — first solver wins.
-        assert!(store.bot_stash_take("abc").unwrap().is_none());
+        assert!(store.bot_stash_take("abc", 1_900_000_000).unwrap().is_none());
     }
 
     #[test]
@@ -183,8 +218,8 @@ mod tests {
         let store = ConfigStore::open_in_memory().unwrap();
         let e = entry("once", "pow", 2_000_000_000);
         store.bot_stash_insert(&e).unwrap();
-        assert!(store.bot_stash_take("once").unwrap().is_some());
-        assert!(store.bot_stash_take("once").unwrap().is_none());
+        assert!(store.bot_stash_take("once", 1_900_000_000).unwrap().is_some());
+        assert!(store.bot_stash_take("once", 1_900_000_000).unwrap().is_none());
         assert_eq!(store.bot_stash_len().unwrap(), 0);
     }
 
@@ -200,7 +235,7 @@ mod tests {
         // Image fetch must NOT remove the row — user can reload.
         assert_eq!(store.bot_stash_len().unwrap(), 1);
         // Still present + takeable.
-        assert!(store.bot_stash_take("cap1").unwrap().is_some());
+        assert!(store.bot_stash_take("cap1", 1_900_000_000).unwrap().is_some());
     }
 
     #[test]
@@ -220,7 +255,7 @@ mod tests {
         let pruned = store.bot_stash_prune_expired(1_800_000_000).unwrap();
         assert_eq!(pruned, 2);
         assert_eq!(store.bot_stash_len().unwrap(), 1);
-        assert!(store.bot_stash_take("keep").unwrap().is_some());
+        assert!(store.bot_stash_take("keep", 1_900_000_000).unwrap().is_some());
     }
 
     #[test]
@@ -231,7 +266,7 @@ mod tests {
         let mut e2 = entry("dup", "captcha", 2_000_000_100);
         e2.mode = 3;
         store.bot_stash_insert(&e2).unwrap();
-        let taken = store.bot_stash_take("dup").unwrap().unwrap();
+        let taken = store.bot_stash_take("dup", 1_900_000_000).unwrap().unwrap();
         assert_eq!(taken.kind, "captcha");
         assert_eq!(taken.mode, 3);
         assert_eq!(store.bot_stash_len().unwrap(), 0);

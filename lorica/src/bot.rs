@@ -206,14 +206,28 @@ impl BotEngine {
         }
     }
 
-    /// Atomically remove + return the entry. Replay defence: a
-    /// stashed challenge verifies at most once.
+    /// Atomically remove + return the entry if it has not expired.
+    /// Replay defence: a stashed challenge verifies at most once.
+    /// The `now` parameter is checked atomically in the SQL DELETE
+    /// (SQLite backend) so a clock-skew race cannot redeem an
+    /// expired challenge.
     pub async fn take(&self, nonce: &str) -> Option<PendingEntry> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         match &self.backend {
-            StashBackend::InMemory(mx) => mx.lock().remove(nonce),
+            StashBackend::InMemory(mx) => {
+                let entry = mx.lock().remove(nonce)?;
+                if entry.expires_at > now {
+                    Some(entry)
+                } else {
+                    None
+                }
+            }
             StashBackend::Sqlite(store) => {
                 let g = store.lock().await;
-                match g.bot_stash_take(nonce) {
+                match g.bot_stash_take(nonce, now) {
                     Ok(Some(stash)) => from_stash(&stash),
                     Ok(None) => None,
                     Err(e) => {
@@ -1224,7 +1238,7 @@ mod tests {
                 ip_prefix: IpPrefix::from_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 return_url: "/".to_string(),
                 cookie_ttl_s: 86_400,
-                expires_at: 1_700_000_300,
+                expires_at: 4_000_000_000,
             },
         )
         .await;
@@ -1254,7 +1268,7 @@ mod tests {
                 ip_prefix: IpPrefix::from_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 return_url: "/".to_string(),
                 cookie_ttl_s: 86_400,
-                expires_at: 1_700_000_300,
+                expires_at: 4_000_000_000,
             },
         )
         .await;
