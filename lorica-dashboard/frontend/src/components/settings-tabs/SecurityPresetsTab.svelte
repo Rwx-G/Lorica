@@ -144,7 +144,7 @@
           </tbody>
         </table>
       </div>
-      <div class="settings-actions-left">
+      <div class="settings-dialog-actions">
         <button class="btn btn-primary" onclick={openPresetCreate}>Add Preset</button>
       </div>
     </div>

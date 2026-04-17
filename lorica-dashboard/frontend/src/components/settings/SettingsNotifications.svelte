@@ -221,7 +221,7 @@
           </table>
         </div>
       {/if}
-      <div class="settings-actions-left">
+      <div class="settings-dialog-actions">
         <button class="btn btn-primary" onclick={openNotifCreate}>Add Channel</button>
       </div>
     </div>
