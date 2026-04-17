@@ -17,6 +17,7 @@ services:
       - backend1
       - backend2
       - backend-tls
+      - backend-h2
     networks:
       - e2e
 
