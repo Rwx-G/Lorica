@@ -3,6 +3,7 @@
 //! Certificate private keys (`key_pem`) are encrypted at rest using the
 //! encryption helpers in `super` when an encryption key is configured.
 
+use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
 
 use super::row_helpers::parse_datetime;
@@ -107,10 +108,19 @@ impl ConfigStore {
 
     /// Reassign all routes referencing `old_cert_id` to `new_cert_id`.
     /// Returns the number of routes updated.
+    ///
+    /// The `updated_at` timestamp is produced from Rust as an RFC3339
+    /// string rather than delegating to SQLite's `datetime('now')`:
+    /// SQLite would write the SQL-plain format `2026-04-17 19:13:17`
+    /// which is NOT RFC3339 (no `T` separator, no timezone), and the
+    /// next config reload would fail to deserialise the row, crash-
+    /// looping every worker. Seen in the wild during an ACME renewal
+    /// on 2026-04-17 - see `docs/backlog.md` entry #7.
     pub fn reassign_certificate(&self, old_cert_id: &str, new_cert_id: &str) -> Result<usize> {
+        let now_rfc3339 = Utc::now().to_rfc3339();
         let updated = self.conn.execute(
-            "UPDATE routes SET certificate_id = ?1, updated_at = datetime('now') WHERE certificate_id = ?2",
-            params![new_cert_id, old_cert_id],
+            "UPDATE routes SET certificate_id = ?1, updated_at = ?2 WHERE certificate_id = ?3",
+            params![new_cert_id, now_rfc3339, old_cert_id],
         )?;
         Ok(updated)
     }

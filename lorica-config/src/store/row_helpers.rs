@@ -7,16 +7,45 @@
 
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 
 use crate::error::{ConfigError, Result};
 use crate::models::*;
 
-/// Parse an RFC3339 datetime string into a UTC `DateTime`.
+/// Parse a datetime string from SQLite into a UTC `DateTime`.
+///
+/// Accepts two formats:
+///
+/// 1. **RFC3339** (canonical, e.g. `2026-04-17T19:13:17Z` or
+///    `2026-04-17T19:13:17+00:00`). This is what every Rust writer in
+///    the codebase emits via `DateTime::to_rfc3339()`.
+///
+/// 2. **SQLite SQL-plain** (`2026-04-17 19:13:17`, space separator, no
+///    timezone). SQLite's `datetime('now')` - used as the `DEFAULT`
+///    on several schema columns and as a raw SQL fragment in older
+///    paths - produces this format. Interpreted as UTC. A historical
+///    ACME renewal path (`certs.rs::reassign_certificate`) wrote this
+///    format and caused every worker to crash-loop on the next
+///    config reload; the write side was fixed to emit RFC3339 but
+///    legacy rows may still carry the old format, hence the fallback
+///    here to keep future loads crash-safe.
 pub(super) fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| ConfigError::Validation(format!("invalid datetime '{s}': {e}")))
+    // Canonical path: RFC3339 with explicit timezone.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    // Fallback: SQLite SQL-plain. Parse as naive, assume UTC - matches
+    // SQLite's documented convention for `datetime('now')`.
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(naive.and_utc());
+    }
+    // Some SQLite builds emit fractional seconds. Try that shape too.
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Ok(naive.and_utc());
+    }
+    Err(ConfigError::Validation(format!(
+        "invalid datetime '{s}': expected RFC3339 (2026-04-17T19:13:17Z) or SQLite format (2026-04-17 19:13:17)"
+    )))
 }
 
 /// Parse an optional RFC3339 datetime string.
@@ -371,4 +400,63 @@ pub(super) fn row_to_sla_bucket(row: &rusqlite::Row<'_>) -> rusqlite::Result<Res
         cfg_status_max: row.get(15)?,
         cfg_target_pct: row.get(16)?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_datetime_rfc3339_z() {
+        let dt = parse_datetime("2026-04-17T19:13:17Z").expect("rfc3339 with Z");
+        assert_eq!(dt.to_rfc3339(), "2026-04-17T19:13:17+00:00");
+    }
+
+    #[test]
+    fn parse_datetime_rfc3339_offset() {
+        let dt = parse_datetime("2026-04-17T21:13:17+02:00").expect("rfc3339 with offset");
+        assert_eq!(dt.to_rfc3339(), "2026-04-17T19:13:17+00:00");
+    }
+
+    #[test]
+    fn parse_datetime_sqlite_plain() {
+        // SQLite's datetime('now') emits this exact shape. A historical
+        // ACME renewal path wrote it to routes.updated_at and every
+        // worker crash-looped on the next reload. The fallback here
+        // keeps the load crash-safe if any row still carries the
+        // legacy format.
+        let dt = parse_datetime("2026-04-17 19:13:17").expect("sqlite plain");
+        assert_eq!(dt.to_rfc3339(), "2026-04-17T19:13:17+00:00");
+    }
+
+    #[test]
+    fn parse_datetime_sqlite_plain_fractional() {
+        let dt = parse_datetime("2026-04-17 19:13:17.123").expect("sqlite plain + ms");
+        assert_eq!(dt.to_rfc3339(), "2026-04-17T19:13:17.123+00:00");
+    }
+
+    #[test]
+    fn parse_datetime_garbage_rejected() {
+        let err = parse_datetime("not a datetime").expect_err("garbage should reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("invalid datetime"), "{msg}");
+    }
+
+    #[test]
+    fn parse_datetime_empty_rejected() {
+        assert!(parse_datetime("").is_err());
+    }
+
+    #[test]
+    fn parse_optional_datetime_none() {
+        let got = parse_optional_datetime(None).expect("None ok");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn parse_optional_datetime_some_sqlite_plain() {
+        let got = parse_optional_datetime(Some("2026-04-17 19:13:17".to_string()))
+            .expect("Some sqlite plain ok");
+        assert!(got.is_some());
+    }
 }
