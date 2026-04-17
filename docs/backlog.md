@@ -6,13 +6,13 @@ Bug fixes, improvements, and maintenance tasks. For new features, see the Roadma
 
 | # | Item | Type | Notes |
 |---|------|------|-------|
-| 6 | `return_status` path renders an empty body | Bug | `lorica/src/proxy_wiring.rs:2889-2915` writes `ResponseHeader::build(status, None)` with no body when a route has `return_status` set (and no `redirect_to`). Neither the built-in branded error page nor the custom `error_page_html` is rendered. Inconsistent with every other terminal path (403 from IP blocklist/WAF/GeoIP, 429 from rate limit, 502/504 from upstream failures) which all go through `render_error_body()`. Fix: route the `return_status` branch through `render_error_body(status, route.error_page_html.as_deref())`. Estimated ~30 lines. Tracked in UXUI.md as finding #26. |
 
 
 ## Resolved
 
 | # | Item | Type | Resolution |
 |---|------|------|------------|
+| 6 | `return_status` path renders an empty body | Bug | Fixed in v1.4.0. The `proxy_wiring::request_filter` branch for `return_status` (without `redirect_to`) used to write `ResponseHeader::build(status, None)` and no body, so clients received the status code with a blank page - inconsistent with every other terminal path that funnels through `render_error_body()`. The operator's optional `error_page_html` template was also ignored. Now routed through `render_error_body(status, error_page_html)` with `Content-Type: text/html; charset=utf-8` and explicit `Content-Length`. The per-path rule's `error_page_html` overrides the route-level default when set (picked up from `ctx.route_snapshot`). |
 | 1 | Global IP whitelist for WAF bypass | Fix | Resolved in v1.1.0 - Global WAF whitelist IPs in Settings |
 | 2 | WAF pattern tuning (body scan false positives) | Fix | Resolved in v1.1.0 - Path traversal and protocol violation rules excluded from body scanning |
 | 3 | SLA accuracy in worker mode | Fix | Resolved in v1.1.0 - Supervisor checks thresholds on every flush cycle |
