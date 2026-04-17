@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   // Vite ships the SVG as a URL at build time (?url suffix). The
   // map is bundled INTO the dashboard asset pipeline so the .deb
-  // carries it by default — no runtime fetch, no CDN.
+  // carries it by default - no runtime fetch, no CDN.
   import worldMapUrl from '../assets/world-map.svg?url';
   import {
     parseCountryValue,
@@ -176,7 +176,7 @@
 
     <div class="chips">
       {#if selected.size === 0}
-        <span class="muted">No country selected — click on the map to add.</span>
+        <span class="muted">No country selected - click on the map to add.</span>
       {:else}
         {#each [...selected].sort() as iso (iso)}
           <button type="button" class="chip" onclick={() => removeChip(iso)} title="Click to remove">

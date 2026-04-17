@@ -7,7 +7,7 @@
 /// Parse a user-supplied CSV (commas OR whitespace-separated) of
 /// ISO 3166-1 alpha-2 codes into a Set of normalised upper-case
 /// codes. Whitespace-trimmed, case-folded, filtered to length-2
-/// entries — anything else drops silently.
+/// entries - anything else drops silently.
 export function parseCountryValue(v: string): Set<string> {
   return new Set(
     v
@@ -26,7 +26,7 @@ export function serializeCountryValue(s: Set<string>): string {
 }
 
 /// Walk up a DOM subtree looking for the first ancestor whose
-/// `id` attribute is exactly two characters — the ISO code
+/// `id` attribute is exactly two characters - the ISO code
 /// convention used by the Wikimedia SVG map. Returns the code
 /// upper-cased, or `null` when no match (click hit a group that
 /// does not represent a country, e.g. the background).

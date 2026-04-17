@@ -101,7 +101,7 @@
         .join(' · ');
       faTest = {
         status: 'ok',
-        summary: `${res.data.status} in ${res.data.elapsed_ms} ms${hdrSummary ? ` — ${hdrSummary}` : ''}`,
+        summary: `${res.data.status} in ${res.data.elapsed_ms} ms${hdrSummary ? ` - ${hdrSummary}` : ''}`,
       };
     }
   }

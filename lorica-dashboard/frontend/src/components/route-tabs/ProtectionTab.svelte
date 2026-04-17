@@ -136,7 +136,7 @@
       difficulty), <strong>Captcha</strong> (image + text, human interaction).
       Bypass rules (IP CIDRs / countries / User-Agent regex) short-circuit the
       challenge; first match wins. <code>only_country</code> inverse gate fires
-      the challenge only for the listed countries — leave empty to challenge
+      the challenge only for the listed countries - leave empty to challenge
       every request. See <code>docs/architecture/bot-protection.md</code> for
       the full design + threat model.
     </p>
@@ -274,7 +274,7 @@
       <div class="form-group" class:modified={isModified('bot_bypass_countries')}>
         {#if isImported('bot_bypass_countries')}<span class="imported-badge">imported</span>{/if}
         <CountryPicker
-          label="Bypass — Countries"
+          label="Bypass - Countries"
           bind:value={form.bot_bypass_countries}
           hint="Click a country on the map to allow-list it. Requires a GeoIP database loaded (Settings → Observability)."
         />
