@@ -47,6 +47,7 @@ pub struct UpdateSettingsRequest {
     pub geoip_db_path: Option<String>,
     pub geoip_auto_update_enabled: Option<bool>,
     pub asn_db_path: Option<String>,
+    pub asn_auto_update_enabled: Option<bool>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -318,6 +319,9 @@ pub async fn update_settings(
             }
             settings.asn_db_path = Some(trimmed.to_string());
         }
+    }
+    if let Some(auto_update) = body.asn_auto_update_enabled {
+        settings.asn_auto_update_enabled = auto_update;
     }
 
     store.update_global_settings(&settings)?;

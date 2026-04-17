@@ -433,7 +433,7 @@ export interface UpdateRouteRequest {
   bot_protection?: BotProtectionConfig;
   /// Explicit "clear" flag on update PUT: wipes the existing
   /// `bot_protection` column. Omitting the flag AND omitting
-  /// `bot_protection` leaves the stored value alone — the
+  /// `bot_protection` leaves the stored value alone - the
   /// "missing = no-op" contract preserved for every other field.
   bot_protection_disable?: boolean;
 }
@@ -596,6 +596,7 @@ export interface GlobalSettingsResponse {
   geoip_db_path?: string | null;
   geoip_auto_update_enabled?: boolean;
   asn_db_path?: string | null;
+  asn_auto_update_enabled?: boolean;
 }
 
 export interface UpdateSettingsRequest {
@@ -624,6 +625,7 @@ export interface UpdateSettingsRequest {
   geoip_db_path?: string | null;
   geoip_auto_update_enabled?: boolean;
   asn_db_path?: string | null;
+  asn_auto_update_enabled?: boolean;
 }
 
 /// Result of the "Test connection" probe on the OTel settings

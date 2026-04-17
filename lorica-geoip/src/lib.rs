@@ -39,6 +39,17 @@ pub mod updater;
 
 pub use asn::{AsnDbStatus, AsnResolver};
 
+/// Minimal abstraction over a resolver that loads an `.mmdb` file
+/// from disk and validates it in-place. Used by the auto-update task
+/// so the same downloader pipeline can refresh either a country DB
+/// (`GeoIpResolver`) or an ASN DB (`AsnResolver`).
+pub trait MmdbResolver: Send + Sync {
+    /// Load the database at `path` into the live slot. Returns
+    /// `GeoIpError` on parse / sanity-probe failure; the slot is left
+    /// unchanged on error so the previously-loaded DB stays live.
+    fn load_from_path(&self, path: &Path) -> Result<(), GeoIpError>;
+}
+
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -232,6 +243,18 @@ impl GeoIpResolver {
 impl Default for GeoIpResolver {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+impl MmdbResolver for GeoIpResolver {
+    fn load_from_path(&self, path: &Path) -> Result<(), GeoIpError> {
+        GeoIpResolver::load_from_path(self, path)
+    }
+}
+
+impl MmdbResolver for AsnResolver {
+    fn load_from_path(&self, path: &Path) -> Result<(), GeoIpError> {
+        AsnResolver::load_from_path(self, path)
     }
 }
 

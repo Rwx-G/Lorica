@@ -37,7 +37,7 @@ use flate2::read::GzDecoder;
 use std::io::Read;
 use thiserror::Error;
 
-use crate::{GeoIpError, GeoIpResolver};
+use crate::{GeoIpError, GeoIpResolver, MmdbResolver};
 
 /// How often the auto-update task ticks. The DB-IP Lite feed is
 /// refreshed monthly (first day of each month); a weekly cadence
@@ -74,6 +74,11 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_URL_TEMPLATE: &str =
     "https://download.db-ip.com/free/dbip-country-lite-{tag}.mmdb.gz";
 
+/// Default download URL template for the DB-IP ASN Lite feed. Same
+/// `{tag}` placeholder semantics as [`DEFAULT_URL_TEMPLATE`].
+pub const DEFAULT_ASN_URL_TEMPLATE: &str =
+    "https://download.db-ip.com/free/dbip-asn-lite-{tag}.mmdb.gz";
+
 /// Typed errors for the auto-update path. Callers can distinguish
 /// a transient network blip from a persistent validation failure so
 /// metrics / alerts can fire on the persistent case only.
@@ -95,7 +100,7 @@ pub enum UpdateError {
 
 /// Runtime configuration for the auto-update task. Most operators
 /// only set `target_path`; the rest have sensible defaults.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UpdaterConfig {
     /// Filesystem path where the live `.mmdb` is kept. Typically
     /// matches `GlobalSettings.geoip_db_path`. Must be writable by
@@ -107,6 +112,25 @@ pub struct UpdaterConfig {
     /// Poll interval between download attempts. Defaults to 7 days.
     /// Lower values only make sense for testing.
     pub interval: Duration,
+    /// Optional callback fired after each successful refresh (i.e.
+    /// the new `.mmdb` is on disk and validated). The supervisor uses
+    /// this to broadcast a config-reload signal to the workers so
+    /// they pick up the freshly-downloaded file - without this, the
+    /// workers continue serving lookups against their original
+    /// (possibly empty / stale) in-memory copy until the next
+    /// dashboard save or process restart.
+    pub on_success: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for UpdaterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdaterConfig")
+            .field("target_path", &self.target_path)
+            .field("url_template", &self.url_template)
+            .field("interval", &self.interval)
+            .field("on_success", &self.on_success.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
 }
 
 impl UpdaterConfig {
@@ -115,6 +139,7 @@ impl UpdaterConfig {
             target_path: target_path.into(),
             url_template: DEFAULT_URL_TEMPLATE.to_string(),
             interval: UPDATE_INTERVAL,
+            on_success: None,
         }
     }
 }
@@ -145,7 +170,7 @@ fn build_download_url(template: &str, now: chrono::DateTime<Utc>) -> String {
 /// `resolver`; the target_path on disk is not touched (partial
 /// downloads land in a temp file that is removed on failure).
 pub async fn run_once(
-    resolver: &GeoIpResolver,
+    resolver: &dyn MmdbResolver,
     cfg: &UpdaterConfig,
 ) -> Result<(), UpdateError> {
     let url = build_download_url(&cfg.url_template, Utc::now());
@@ -290,6 +315,20 @@ pub async fn run_once(
         "geoip updater: database refreshed"
     );
 
+    // 7. Notify the supervisor that a fresh DB landed on disk so it
+    //    can broadcast a config-reload to the workers. Without this,
+    //    workers keep serving lookups against their stale in-memory
+    //    copy until the next dashboard save or process restart -
+    //    which means a freshly-downloaded ASN / GeoIP DB on first
+    //    boot is invisible to the data plane until the operator does
+    //    something. The callback is supervisor-registered (see
+    //    `lorica::reload::apply_auto_update_flip`); when absent
+    //    (single-process mode where the proxy resolver IS the one we
+    //    just updated) the call is a no-op.
+    if let Some(ref cb) = cfg.on_success {
+        cb();
+    }
+
     Ok(())
 }
 
@@ -303,20 +342,41 @@ pub fn spawn_updater(
     resolver: Arc<GeoIpResolver>,
     cfg: UpdaterConfig,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_updater_generic(resolver, cfg, "geoip")
+}
+
+/// ASN-specific variant of [`spawn_updater`]. Same pipeline, different
+/// resolver type and log tag. Call from the supervisor boot path (or
+/// the reload hook) when `asn_auto_update_enabled` is true and
+/// `asn_db_path` is set.
+pub fn spawn_asn_updater(
+    resolver: Arc<crate::AsnResolver>,
+    cfg: UpdaterConfig,
+) -> tokio::task::JoinHandle<()> {
+    spawn_updater_generic(resolver, cfg, "asn")
+}
+
+fn spawn_updater_generic<R: MmdbResolver + 'static>(
+    resolver: Arc<R>,
+    cfg: UpdaterConfig,
+    log_tag: &'static str,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match run_once(&resolver, &cfg).await {
+            match run_once(resolver.as_ref(), &cfg).await {
                 Ok(()) => {
                     tracing::info!(
+                        tag = log_tag,
                         next_in_s = cfg.interval.as_secs(),
-                        "geoip updater: success, sleeping until next tick"
+                        "mmdb updater: success, sleeping until next tick"
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
+                        tag = log_tag,
                         error = %e,
                         next_in_s = cfg.interval.as_secs(),
-                        "geoip updater: cycle failed, serving previous DB; will retry on next tick"
+                        "mmdb updater: cycle failed, serving previous DB; will retry on next tick"
                     );
                 }
             }

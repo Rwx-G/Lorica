@@ -211,6 +211,13 @@ pub struct GlobalSettings {
     /// source. `None` = ASN resolver disabled at runtime.
     #[serde(default)]
     pub asn_db_path: Option<String>,
+    /// Whether Lorica should periodically download a fresh DB-IP ASN
+    /// Lite snapshot and hot-swap the in-memory reader. Same cadence
+    /// and opt-in semantics as `geoip_auto_update_enabled`. Default
+    /// `false` so operators explicitly opt in after reading the
+    /// CC-BY 4.0 attribution note.
+    #[serde(default)]
+    pub asn_auto_update_enabled: bool,
     /// HMAC secret used to sign the bot-protection verdict cookie
     /// (v1.4.0 Epic 3). 32 raw bytes, stored as a hex string so the
     /// existing key-value `global_settings` table does not need a
@@ -319,6 +326,7 @@ impl Default for GlobalSettings {
             geoip_db_path: None,
             geoip_auto_update_enabled: false,
             asn_db_path: None,
+            asn_auto_update_enabled: false,
             bot_hmac_secret_hex: String::new(),
         }
     }

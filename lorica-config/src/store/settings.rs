@@ -136,6 +136,9 @@ impl ConfigStore {
                 "asn_db_path" => {
                     settings.asn_db_path = if value.is_empty() { None } else { Some(value) };
                 }
+                "asn_auto_update_enabled" => {
+                    settings.asn_auto_update_enabled = value == "true" || value == "1";
+                }
                 _ => {}
             }
         }
@@ -278,6 +281,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('asn_db_path', ?1)",
             params![settings.asn_db_path.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('asn_auto_update_enabled', ?1)",
+            params![settings.asn_auto_update_enabled.to_string()],
         )?;
         Ok(())
     }
