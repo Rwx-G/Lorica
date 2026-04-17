@@ -105,7 +105,7 @@
           <FieldHelpButton fieldLabel="Access log enabled" onhelp={() => { activeHelp = 'access_log_enabled'; }} />
         </label>
         {#if isImported('access_log_enabled')}<span class="imported-badge">imported</span>{/if}
-        <span class="hint">Per-request log lines for this route. Global format / destination set in Settings.</span>
+        <span class="hint">Per-request log lines for this route.</span>
       </div>
 
     </div>
@@ -156,7 +156,7 @@
         </label>
         {#if isImported('return_status')}<span class="imported-badge">imported</span>{/if}
         <input id="return-status" type="number" min="100" max="599" bind:value={form.return_status} placeholder="e.g. 403, 404, 410" />
-        <span class="hint">Respond with this HTTP status instead of proxying. Combine with Redirect to for 301 / 302.</span>
+        <span class="hint">Respond with this status instead of proxying.</span>
       </div>
 
       <div class="form-group" class:modified={isModified('error_page_html')}>
@@ -166,7 +166,7 @@
         </label>
         <textarea id="error-page-html" rows="6" bind:value={form.error_page_html}
           placeholder={'<html><body><h1>{{status}}</h1><p>{{message}}</p></body></html>'}></textarea>
-        <span class="hint">Optional. Overrides Lorica's built-in branded error page. Leave empty to keep the default.</span>
+        <span class="hint">Optional override of Lorica's built-in error page.</span>
       </div>
 
     </div>

@@ -20,13 +20,12 @@
   import SecurityTab from './route-tabs/SecurityTab.svelte';
   import ProtectionTab from './route-tabs/ProtectionTab.svelte';
   import UpstreamTab from './route-tabs/UpstreamTab.svelte';
-  // Absorbed tabs (no longer registered at top level):
-  // - HeadersTab, CorsTab -> Transform subsections (inlined)
-  // - ResponseRewriteTab -> Transform > Response body rewrite (still
-  //   imported by TransformTab as an embedded panel)
-  // - TimeoutsTab path rewrite -> Transform > Path rewrite (inlined)
-  // - TimeoutsTab timeouts + retry -> UpstreamTab (renamed component)
-  // - PathRulesTab, HeaderRulesTab, CanaryTab -> Routing subsections
+  // Former standalone tabs (HeadersTab, CorsTab, TimeoutsTab) have
+  // been absorbed as inline subsections and their files deleted.
+  // Still-alive tab components that live as embedded panels inside
+  // RoutingTab / TransformTab: CanaryTab, HeaderRulesTab, PathRulesTab,
+  // ResponseRewriteTab. They are imported by their parent tab, not
+  // registered here.
 
   interface Props {
     open: boolean;

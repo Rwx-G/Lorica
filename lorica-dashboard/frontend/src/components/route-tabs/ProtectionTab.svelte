@@ -172,7 +172,7 @@
           <option value="denylist">Denylist (block listed countries)</option>
           <option value="allowlist">Allowlist (block everything except listed)</option>
         </select>
-        <span class="hint">Empty country list in denylist mode = filter disabled. Allowlist with empty list is rejected (would block everything).</span>
+        <span class="hint">Empty list + denylist = filter off. Empty list + allowlist = rejected by API.</span>
       </div>
       <div class="form-group" class:modified={isModified('geoip_countries')}>
         {#if isImported('geoip_countries')}<span class="imported-badge">imported</span>{/if}

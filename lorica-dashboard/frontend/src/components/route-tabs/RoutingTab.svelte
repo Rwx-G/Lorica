@@ -150,7 +150,7 @@
           <span>Sticky sessions</span>
           <FieldHelpButton fieldLabel="Sticky sessions" onhelp={() => { activeHelp = 'sticky_session'; }} />
         </label>
-        <span class="hint">Returns a client to the same backend via a LORICA_SRV cookie. Useful for stateful apps.</span>
+        <span class="hint">Pins a client to the same backend via a LORICA_SRV cookie.</span>
       </div>
 
     </div>

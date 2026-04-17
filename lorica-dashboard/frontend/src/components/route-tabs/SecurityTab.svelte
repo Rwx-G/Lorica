@@ -177,7 +177,7 @@
           <label for="ip-deny">IP denylist</label>
           {#if isImported('ip_denylist')}<span class="imported-badge">imported</span>{/if}
           <textarea id="ip-deny" rows="3" bind:value={form.ip_denylist} placeholder="203.0.113.0/24"></textarea>
-          <span class="hint">One CIDR or IP per line. Applied only if allowlist was empty or accepted the client.</span>
+          <span class="hint">One CIDR or IP per line. Runs after the allowlist.</span>
         </div>
       </div>
     </div>
@@ -263,7 +263,7 @@
         disabled={!form.forward_auth_address}
         title={!form.forward_auth_address ? 'Set an auth service URL above to enable this option' : ''}
       />
-      <span class="hint">Comma or newline-separated; copied from the auth response into the upstream request on 2xx only.</span>
+      <span class="hint">Comma / newline-separated. Copied from auth response to upstream on 2xx only.</span>
     </div>
   </div>
 

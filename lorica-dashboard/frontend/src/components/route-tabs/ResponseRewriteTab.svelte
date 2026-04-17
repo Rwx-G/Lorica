@@ -106,7 +106,7 @@
           max="134217728"
           bind:value={form.response_rewrite_max_body_bytes}
         />
-        <span class="hint">Responses larger than this stream through unchanged. Default 1 MiB (1048576). Max 128 MiB.</span>
+        <span class="hint">Responses larger than this stream through unchanged. Default 1 MiB, max 128 MiB.</span>
       </div>
       <div class="form-group">
         <label for="rr-ct">Content-Type prefixes (CSV)</label>
