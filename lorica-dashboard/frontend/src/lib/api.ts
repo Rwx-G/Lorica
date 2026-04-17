@@ -533,15 +533,24 @@ export interface LogsQuery {
   after_id?: number;
 }
 
+export interface DiskUsage {
+  mount_point: string;
+  total_bytes: number;
+  used_bytes: number;
+  usage_percent: number;
+}
+
 export interface HostMetrics {
   cpu_usage_percent: number;
   cpu_count: number;
   memory_total_bytes: number;
   memory_used_bytes: number;
   memory_usage_percent: number;
-  disk_total_bytes: number;
-  disk_used_bytes: number;
-  disk_usage_percent: number;
+  /// Root filesystem (`/`). `null` when sysinfo cannot read it.
+  disk_root: DiskUsage | null;
+  /// Filesystem holding the Lorica data-dir (typically `/var/lib/lorica`).
+  /// Same mount as `disk_root` on a single-disk host.
+  disk_data: DiskUsage | null;
 }
 
 export interface ProcessMetrics {

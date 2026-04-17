@@ -2647,6 +2647,7 @@ dependencies = [
  "lorica-dashboard",
  "lorica-notify",
  "lorica-waf",
+ "nix",
  "once_cell",
  "parking_lot",
  "pem",

@@ -29,12 +29,30 @@ pub struct HostMetrics {
     pub memory_used_bytes: u64,
     /// Memory usage percentage (0-100).
     pub memory_usage_percent: f64,
-    /// Total disk space in bytes (root mount).
-    pub disk_total_bytes: u64,
-    /// Used disk space in bytes.
-    pub disk_used_bytes: u64,
-    /// Disk usage percentage (0-100).
-    pub disk_usage_percent: f64,
+    /// Root filesystem (`/`). Null if the mount cannot be read.
+    pub disk_root: Option<DiskUsage>,
+    /// Filesystem that holds the Lorica data-dir (typically
+    /// `/var/lib/lorica`). Picked as the mount entry with the
+    /// longest path prefix that `data_dir` starts with. Null if
+    /// resolution fails. On a typical single-disk host this is the
+    /// same filesystem as `disk_root`; the frontend surfaces both
+    /// so an operator whose data-dir lives on a dedicated volume
+    /// sees the relevant one at a glance.
+    pub disk_data: Option<DiskUsage>,
+}
+
+/// One filesystem's usage snapshot. Used for both the root mount
+/// and the data-dir mount.
+#[derive(Serialize)]
+pub struct DiskUsage {
+    /// Absolute path of the mount point (e.g. `/` or `/var/lib`).
+    pub mount_point: String,
+    /// Total bytes available to users on this filesystem.
+    pub total_bytes: u64,
+    /// Bytes currently in use (total - available).
+    pub used_bytes: u64,
+    /// Usage percentage (0-100).
+    pub usage_percent: f64,
 }
 
 /// Lorica process resource usage.
@@ -123,17 +141,17 @@ pub async fn get_system(
         0.0
     };
 
-    // Disk (aggregate all disks)
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    let (disk_total, disk_available) = disks.iter().fold((0u64, 0u64), |(total, avail), d| {
-        (total + d.total_space(), avail + d.available_space())
-    });
-    let disk_used = disk_total.saturating_sub(disk_available);
-    let disk_percent = if disk_total > 0 {
-        (disk_used as f64 / disk_total as f64) * 100.0
-    } else {
-        0.0
-    };
+    // Disk: two distinct entries, root (`/`) and the mount holding
+    // the Lorica data-dir. We call statvfs(2) directly on each path
+    // rather than summing `Disks::new_with_refreshed_list()`, for
+    // two reasons: sysinfo's list-based aggregation double-counts
+    // tmpfs / bind mounts / overlayfs, and sysinfo's
+    // `available_space()` excludes reserved root blocks - which
+    // inflates the computed "used" by the reserved pool (~5 % of
+    // total on ext4 default). statvfs gives us the same numbers as
+    // `df -h`.
+    let disk_root = disk_usage_statvfs(std::path::Path::new("/"));
+    let disk_data = disk_usage_statvfs(&state.data_dir);
 
     // Process metrics
     let pid = Pid::from_u32(std::process::id());
@@ -161,9 +179,8 @@ pub async fn get_system(
             memory_total_bytes: mem_total,
             memory_used_bytes: mem_used,
             memory_usage_percent: (mem_percent * 10.0).round() / 10.0,
-            disk_total_bytes: disk_total,
-            disk_used_bytes: disk_used,
-            disk_usage_percent: (disk_percent * 10.0).round() / 10.0,
+            disk_root,
+            disk_data,
         },
         process: ProcessMetrics {
             memory_bytes: proc_mem,
@@ -179,4 +196,46 @@ pub async fn get_system(
     };
 
     Ok(json_data(response))
+}
+
+/// Run `statvfs(path)` and translate the result into a `DiskUsage`
+/// that matches `df -h`'s columns:
+///
+/// - `total_bytes` = (f_blocks - reserved) * f_frsize, the capacity
+///   visible to a non-root user. Matches df's "Size" column.
+/// - `used_bytes`  = (f_blocks - f_bfree) * f_frsize, matches df's
+///   "Used" column (the bytes currently written to the filesystem,
+///   independent of the reserved-for-root pool).
+/// - `usage_percent` = used / (used + avail), matches df's "Use%"
+///   column exactly.
+///
+/// Returns `None` if the path does not exist, is on a filesystem
+/// that does not support statvfs, or the call fails.
+fn disk_usage_statvfs(path: &std::path::Path) -> Option<DiskUsage> {
+    let stat = nix::sys::statvfs::statvfs(path).ok()?;
+
+    let frsize = stat.fragment_size();
+    let blocks = stat.blocks();
+    let free = stat.blocks_free();
+    let avail = stat.blocks_available();
+    let reserved = free.saturating_sub(avail);
+    let used_blocks = blocks.saturating_sub(free);
+    let visible_blocks = blocks.saturating_sub(reserved);
+
+    let total_bytes = visible_blocks * frsize;
+    let used_bytes = used_blocks * frsize;
+    let avail_bytes = avail * frsize;
+    let denom = used_bytes + avail_bytes;
+    let percent = if denom > 0 {
+        (used_bytes as f64 / denom as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Some(DiskUsage {
+        mount_point: path.to_string_lossy().into_owned(),
+        total_bytes,
+        used_bytes,
+        usage_percent: (percent * 10.0).round() / 10.0,
+    })
 }

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
@@ -39,6 +40,12 @@ pub struct AppState {
     pub system_cache: Arc<Mutex<SystemCache>>,
     pub active_connections: Arc<AtomicU64>,
     pub started_at: Instant,
+    /// Lorica data directory (`--data-dir`, typically `/var/lib/lorica`).
+    /// Used by `get_system` to report the disk usage of the filesystem
+    /// that actually holds Lorica's SQLite DB, TLS archives, and MMDB
+    /// files - which is what an operator cares about, distinct from
+    /// the root filesystem.
+    pub data_dir: PathBuf,
     /// HTTP proxy port (for load test URL construction).
     pub http_port: u16,
     /// HTTPS proxy port (for load test URL construction).
