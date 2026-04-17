@@ -511,6 +511,7 @@ mod tests {
             target_path: path,
             url_template: format!("{base_url}/dbip-{{tag}}.mmdb.gz"),
             interval: Duration::from_secs(3600),
+            on_success: None,
         }
     }
 

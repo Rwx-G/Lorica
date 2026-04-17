@@ -793,9 +793,9 @@ pub(crate) fn cache_insert(
 }
 
 /// Clear the process-wide verdict cache. Used by unit tests to
-/// isolate cache state between test cases, and reserved for a
-/// future "revoke all cookies" operator action on the dashboard.
-#[doc(hidden)]
+/// isolate cache state between test cases. When a "revoke all
+/// cookies" operator action lands (dashboard), drop the cfg guard.
+#[cfg(test)]
 pub(crate) fn cache_reset_for_test() {
     VERDICT_CACHE.clear();
     VERDICT_ORDER.lock().clear();

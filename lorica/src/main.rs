@@ -39,6 +39,10 @@ const DEFAULT_MANAGEMENT_PORT: u16 = 9443;
 const DEFAULT_HTTP_PORT: u16 = 8080;
 const DEFAULT_HTTPS_PORT: u16 = 8443;
 
+/// Wire shape a worker sends for each generic counter slot:
+/// `(counter_name, [(label_key, label_value), ...], value)`.
+type GenericCounterRow = (String, Vec<(String, String)>, u64);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "lorica",
@@ -1080,7 +1084,7 @@ fn run_supervisor(cli: Cli) {
                                         // silently dropped — safe default
                                         // since a truncated wire payload
                                         // just skips the affected metric.
-                                        let gc: Vec<(String, Vec<(String, String)>, u64)> =
+                                        let gc: Vec<GenericCounterRow> =
                                             report
                                                 .generic_counters
                                                 .iter()
@@ -1647,7 +1651,7 @@ fn run_supervisor(cli: Cli) {
                                                                 agg_metrics
                                                                     .update_worker(id, report.cache_hits, report.cache_misses, report.active_connections, bans, ewma, backend_conns, req_counts, waf_counts)
                                                                     .await;
-                                                                let gc: Vec<(String, Vec<(String, String)>, u64)> =
+                                                                let gc: Vec<GenericCounterRow> =
                                                                     report
                                                                         .generic_counters
                                                                         .iter()
@@ -2521,7 +2525,7 @@ async fn pull_all_metrics_via_rpc(
                     // bot_challenge / geoip_block / forward_auth
                     // cache / header rule match / canary split /
                     // mirror outcome / cache predictor bypass.
-                    let gc: Vec<(String, Vec<(String, String)>, u64)> = report
+                    let gc: Vec<GenericCounterRow> = report
                         .generic_counters
                         .iter()
                         .map(|e| {
