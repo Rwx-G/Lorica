@@ -62,6 +62,13 @@
   function isImported(field: string): boolean {
     return importedFields?.has(field) ?? false;
   }
+
+  // Sticky session + traffic split can contradict: sticky pins a
+  // client via LORICA_SRV cookie, traffic splits route by IP hash.
+  // A returning client with a sticky cookie may land on a backend
+  // outside the canary bucket their IP was assigned to.
+  // (Resolves UXUI.md finding #25.)
+  let stickyVsSplitClash = $derived(form.sticky_session && form.traffic_splits.length > 0);
 </script>
 
 <div class="tab-content">
@@ -151,6 +158,14 @@
           <FieldHelpButton fieldLabel="Sticky sessions" onhelp={() => { activeHelp = 'sticky_session'; }} />
         </label>
         <span class="hint">Pins a client to the same backend via a LORICA_SRV cookie.</span>
+        {#if stickyVsSplitClash}
+          <div class="warn-banner" role="note">
+            <strong>Sticky sessions conflict with traffic splits.</strong>
+            A returning client with a LORICA_SRV cookie may land on a
+            backend outside the split bucket their IP was hashed into.
+            Turn off sticky sessions when running a fair canary.
+          </div>
+        {/if}
       </div>
 
     </div>
@@ -437,6 +452,18 @@
 
 <style>
   .tab-content { display: flex; flex-direction: column; gap: 1.25rem; }
+
+  .warn-banner {
+    margin-top: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(245, 158, 11, 0.08);
+    border-left: 3px solid var(--color-orange, #f59e0b);
+    border-radius: 0 0.25rem 0.25rem 0;
+    font-size: 0.8125rem;
+    color: var(--color-text);
+    line-height: 1.45;
+  }
+  .warn-banner strong { color: var(--color-text-heading); }
 
   .eval-order-banner {
     font-size: 0.8125rem;

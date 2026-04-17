@@ -37,6 +37,17 @@
   function isImported(field: string): boolean {
     return importedFields?.has(field) ?? false;
   }
+
+  // Setting Access-Control-* in the free-form Response headers block
+  // clashes with the dedicated CORS subsection, which already emits
+  // those headers when origins are configured. The merge is
+  // last-write-wins so the result is order-dependent and surprising.
+  // (Resolves UXUI.md finding #24.)
+  let corsInResponseHeaders = $derived.by(() => {
+    const hasCors = /(^|\n)\s*access-control-/i.test(form.response_headers);
+    const corsConfigured = form.cors_allowed_origins.trim().length > 0;
+    return hasCors && corsConfigured;
+  });
 </script>
 
 <div class="tab-content">
@@ -75,6 +86,16 @@
       onhelp={() => { activeHelp = 'section:response_headers'; }}
     />
     <div class="subsection-body">
+      {#if corsInResponseHeaders}
+        <div class="warn-banner" role="note">
+          <strong>CORS clash detected.</strong>
+          You have CORS origins configured (subsection below) and
+          <code>Access-Control-*</code> headers listed here.
+          The response filter merges both with last-write-wins semantics, so the final
+          headers are order-dependent. Configure CORS below and leave
+          <code>Access-Control-*</code> out of this list.
+        </div>
+      {/if}
       <div class="form-group" class:modified={isModified('response_headers')}>
         <label for="response-headers">Custom response headers</label>
         {#if isImported('response_headers')}<span class="imported-badge">imported</span>{/if}
@@ -391,6 +412,19 @@
   .subsection-body-panel {
     padding: 0.75rem 0.875rem 1rem;
   }
+
+  .warn-banner {
+    margin-bottom: 1rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(245, 158, 11, 0.08);
+    border-left: 3px solid var(--color-orange, #f59e0b);
+    border-radius: 0 0.25rem 0.25rem 0;
+    font-size: 0.8125rem;
+    color: var(--color-text);
+    line-height: 1.45;
+  }
+  .warn-banner strong { color: var(--color-text-heading); }
+  .warn-banner code { background: rgba(0,0,0,0.08); padding: 0 0.25rem; border-radius: 2px; }
 
   .form-group { margin-bottom: 1rem; }
   .form-group:last-child { margin-bottom: 0.5rem; }

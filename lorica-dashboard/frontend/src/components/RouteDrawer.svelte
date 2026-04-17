@@ -13,6 +13,7 @@
     validateRouteFormWithTab,
   } from '../lib/route-form';
   import { showToast } from '../lib/toast';
+  import ConfirmDialog from './ConfirmDialog.svelte';
   import GeneralTab from './route-tabs/GeneralTab.svelte';
   import RoutingTab from './route-tabs/RoutingTab.svelte';
   import TransformTab from './route-tabs/TransformTab.svelte';
@@ -84,6 +85,44 @@
   let hasUnsavedChanges = $derived(open && initialFormJson ? JSON.stringify(form) !== initialFormJson : false);
 
   let modifiedFields: Set<string> = $derived(getModifiedFields(form));
+
+  /**
+   * Flag changes that have a large blast radius if saved by mistake.
+   * Displayed as a warn banner above the footer's Save button so the
+   * operator reads "you are about to do X to a live route" before
+   * clicking. Empty list (or create mode) = no banner.
+   *
+   * Resolves UXUI.md finding #18.
+   */
+  let riskyChanges: string[] = $derived.by(() => {
+    if (!editing) return [];
+    const warnings: string[] = [];
+
+    if (form.load_balancing !== editing.load_balancing) {
+      warnings.push(
+        `Load balancing algorithm: ${editing.load_balancing} -> ${form.load_balancing}. Breaks sticky affinity for existing sessions.`,
+      );
+    }
+    if ((form.certificate_id || '') !== (editing.certificate_id || '')) {
+      const before = editing.certificate_id ? 'a TLS cert' : 'HTTP only';
+      const after = form.certificate_id ? 'a different TLS cert' : 'HTTP only';
+      warnings.push(
+        `TLS certificate: ${before} -> ${after}. Clients may see a handshake error during rollout.`,
+      );
+    }
+    if (editing.waf_enabled && !form.waf_enabled) {
+      warnings.push(
+        'WAF disabled: auto-ban will stop firing and incoming traffic is no longer inspected against the rule set.',
+      );
+    }
+    const initialMtlsRequired = Boolean(editing.mtls?.required);
+    if (!initialMtlsRequired && form.mtls_required && form.mtls_ca_cert_pem.trim()) {
+      warnings.push(
+        'mTLS required just turned on: clients without a valid client certificate will be rejected with 496.',
+      );
+    }
+    return warnings;
+  });
 
   /**
    * Summary chips rendered in the drawer header, right under the
@@ -197,11 +236,20 @@
     return fields.some((f) => modifiedFields.has(f));
   }
 
+  // Confirmation modal for discarding unsaved changes. Replaces the
+  // previous `window.confirm` which broke theming and A11y.
+  let showUnsavedConfirm = $state(false);
+
   function handleClose() {
     if (hasUnsavedChanges) {
-      const confirmed = window.confirm('You have unsaved changes. Discard them?');
-      if (!confirmed) return;
+      showUnsavedConfirm = true;
+      return;
     }
+    onclose();
+  }
+
+  function confirmDiscardAndClose() {
+    showUnsavedConfirm = false;
     onclose();
   }
 
@@ -298,11 +346,17 @@
           <button
             class="tab-btn"
             class:active={activeTab === tab.id}
+            aria-label={tabHasModifiedFields(tab.id) ? `${tab.label} (modified)` : tab.label}
             onclick={() => { activeTab = tab.id; }}
           >
             {tab.label}
             {#if tabHasModifiedFields(tab.id)}
-              <span class="tab-dot" title="This tab has non-default values"></span>
+              <span
+                class="tab-dot"
+                role="img"
+                aria-label="has non-default values"
+                title="This tab has non-default values"
+              ></span>
             {/if}
           </button>
         {/each}
@@ -329,13 +383,36 @@
 
       <!-- Footer -->
       <div class="drawer-footer">
-        <button class="btn btn-cancel" onclick={handleClose}>Cancel</button>
-        <button class="btn btn-primary" disabled={formSubmitting} onclick={handleSubmit}>
-          {formSubmitting ? 'Saving...' : editing ? 'Update' : 'Create'}
-        </button>
+        {#if riskyChanges.length > 0}
+          <div class="risky-banner" role="note">
+            <strong>Risky change{riskyChanges.length > 1 ? 's' : ''} before save:</strong>
+            <ul>
+              {#each riskyChanges as w, i (i)}
+                <li>{w}</li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+        <div class="drawer-footer-actions">
+          <button class="btn btn-cancel" onclick={handleClose}>Cancel</button>
+          <button class="btn btn-primary" disabled={formSubmitting} onclick={handleSubmit}>
+            {formSubmitting ? 'Saving...' : editing ? 'Update' : 'Create'}
+          </button>
+        </div>
       </div>
     </div>
   </div>
+{/if}
+
+{#if showUnsavedConfirm}
+  <ConfirmDialog
+    title="Discard unsaved changes?"
+    message="You have unsaved edits in this drawer. Closing now will lose them."
+    confirmLabel="Discard"
+    confirmStyle="danger"
+    onconfirm={confirmDiscardAndClose}
+    oncancel={() => { showUnsavedConfirm = false; }}
+  />
 {/if}
 
 <script lang="ts" module>
@@ -536,14 +613,22 @@
     border-bottom-color: var(--color-primary);
   }
 
+  /* Tab-dot visual. The primary-colour fill signals "modified" to
+     sighted users; the 1px outer ring keeps the dot visible when
+     color perception alone is not enough (contrast + forced-colors
+     modes, WCAG 1.4.1). Screen readers read the paired aria-label
+     on both the button and the dot itself. */
   .tab-dot {
     position: absolute;
     top: 0.5rem;
     right: 0.25rem;
-    width: 6px;
-    height: 6px;
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
     background: var(--color-primary);
+    box-shadow: 0 0 0 1px var(--color-bg-card);
+    outline: 1px solid var(--color-primary);
+    outline-offset: 0;
   }
 
   .drawer-body {
@@ -554,12 +639,36 @@
 
   .drawer-footer {
     display: flex;
-    justify-content: flex-end;
+    flex-direction: column;
     gap: 0.75rem;
     padding: 1rem 1.5rem;
     border-top: 1px solid var(--color-border);
     flex-shrink: 0;
   }
+
+  .drawer-footer-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.75rem;
+  }
+
+  /* Risky-change warn banner. Shown above the Save button so an
+     operator reads the warning before clicking Update. Lists each
+     risky change (LB algo change, TLS cert swap, WAF disabled, mTLS
+     required turned on) as a bullet so the blast radius is explicit. */
+  .risky-banner {
+    padding: 0.625rem 0.875rem;
+    background: rgba(245, 158, 11, 0.08);
+    border-left: 3px solid var(--color-orange, #f59e0b);
+    border-radius: 0 0.25rem 0.25rem 0;
+    font-size: 0.8125rem;
+    color: var(--color-text);
+    line-height: 1.45;
+  }
+  .risky-banner strong { display: block; color: var(--color-text-heading); margin-bottom: 0.25rem; }
+  .risky-banner ul { margin: 0; padding-left: 1.125rem; }
+  .risky-banner li { margin-bottom: 0.25rem; }
+  .risky-banner li:last-child { margin-bottom: 0; }
 
   @media (max-width: 960px) {
     .drawer {

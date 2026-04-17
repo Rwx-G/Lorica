@@ -31,6 +31,13 @@
   function isImported(field: string): boolean {
     return importedFields?.has(field) ?? false;
   }
+
+  // Caching and response body rewrite are mutually exclusive at the
+  // proxy layer - the cache wins and rewrites are silently skipped
+  // to avoid serving stale rewritten bytes after a rule edit. Warn
+  // the operator before they save a combination that will no-op.
+  // (Resolves UXUI.md finding #21.)
+  let cacheRewriteClash = $derived(form.cache_enabled && form.response_rewrite_rules.length > 0);
 </script>
 
 <div class="tab-content">
@@ -44,6 +51,14 @@
       onhelp={() => { activeHelp = 'section:cache_config'; }}
     />
     <div class="subsection-body">
+      {#if cacheRewriteClash}
+        <div class="warn-banner" role="note">
+          <strong>Caching + response body rewrite are mutually exclusive.</strong>
+          This route has response-rewrite rules configured (Transform &rarr; Response body rewrite).
+          With caching on, rewrites are silently skipped so cached bytes do not drift from the active rules.
+          Turn caching off or clear the rewrite rules to use either feature.
+        </div>
+      {/if}
       <div class="form-group" class:modified={isModified('cache_enabled')}>
         <label class="checkbox-item">
           <input type="checkbox" bind:checked={form.cache_enabled} />
@@ -298,6 +313,18 @@
     border-radius: 0 0 0.5rem 0.5rem;
     padding: 1rem 1rem 0.5rem;
   }
+
+  .warn-banner {
+    margin-bottom: 1rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(245, 158, 11, 0.08);
+    border-left: 3px solid var(--color-orange, #f59e0b);
+    border-radius: 0 0.25rem 0.25rem 0;
+    font-size: 0.8125rem;
+    color: var(--color-text);
+    line-height: 1.45;
+  }
+  .warn-banner strong { color: var(--color-text-heading); }
 
   .form-group { margin-bottom: 1rem; }
   .form-group:last-child { margin-bottom: 0.5rem; }

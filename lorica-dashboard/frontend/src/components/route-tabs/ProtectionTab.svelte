@@ -237,6 +237,15 @@
               {/if}
             </span>
           </div>
+        {:else}
+          <!-- Ghost hint: the PoW difficulty slider exists but only
+               applies to JavaScript mode. Surface its presence so an
+               operator scrolling Cookie / Captcha mode does not think
+               it is missing. -->
+          <div class="form-group ghost-hint" aria-hidden="true">
+            <label>PoW difficulty</label>
+            <span class="hint">Available after selecting JavaScript mode above.</span>
+          </div>
         {/if}
 
         {#if form.bot_mode === 'captcha'}
@@ -245,6 +254,11 @@
             {#if isImported('bot_captcha_alphabet')}<span class="imported-badge">imported</span>{/if}
             <input id="bot-alphabet" type="text" bind:value={form.bot_captcha_alphabet} autocomplete="off" spellcheck="false" />
             <span class="hint">Default excludes confusables (<code>0/O/1/l/I</code>) and glyphs the bundled font cannot render (<code>L/o</code>). Min 10, max 128 ASCII printable, no duplicates.</span>
+          </div>
+        {:else}
+          <div class="form-group ghost-hint" aria-hidden="true">
+            <label>Captcha alphabet</label>
+            <span class="hint">Available after selecting Captcha mode above.</span>
           </div>
         {/if}
 
@@ -478,6 +492,18 @@
     border-top: none;
     border-radius: 0 0 0.5rem 0.5rem;
     padding: 1rem 1rem 0.5rem;
+  }
+
+  /* Ghost placeholder for mode-dependent fields. Displayed grayed
+     out when the sibling field is hidden behind a mode toggle, so
+     an operator knows the field exists without flipping the toggle
+     to find out. */
+  .ghost-hint {
+    opacity: 0.55;
+    pointer-events: none;
+  }
+  .ghost-hint label {
+    font-style: italic;
   }
 
   .warn-banner {
