@@ -14,6 +14,7 @@
   } from '../lib/route-form';
   import { showToast } from '../lib/toast';
   import GeneralTab from './route-tabs/GeneralTab.svelte';
+  import RoutingTab from './route-tabs/RoutingTab.svelte';
   import TimeoutsTab from './route-tabs/TimeoutsTab.svelte';
   import SecurityTab from './route-tabs/SecurityTab.svelte';
   import HeadersTab from './route-tabs/HeadersTab.svelte';
@@ -46,6 +47,7 @@
 
   const TABS = [
     { id: 'general', label: 'General' },
+    { id: 'routing', label: 'Routing' },
     { id: 'timeouts', label: 'Timeouts' },
     { id: 'security', label: 'Security' },
     { id: 'headers', label: 'Headers' },
@@ -198,7 +200,9 @@
       <!-- Tab content -->
       <div class="drawer-body">
         {#if activeTab === 'general'}
-          <GeneralTab bind:form={form} {backends} {certificates} editing={!!editing} {importedFields} />
+          <GeneralTab bind:form={form} editing={!!editing} {importedFields} />
+        {:else if activeTab === 'routing'}
+          <RoutingTab bind:form={form} {backends} {certificates} {importedFields} />
         {:else if activeTab === 'timeouts'}
           <TimeoutsTab bind:form={form} {importedFields} />
         {:else if activeTab === 'security'}
@@ -255,7 +259,11 @@
   .drawer {
     position: relative;
     z-index: 1;
-    width: 900px;
+    /* clamp(min, preferred, max): 900px minimum on narrow screens,
+       55 % of viewport for comfortable editing on full-HD and above,
+       1280px hard cap so 4K screens do not drown the form in
+       whitespace. */
+    width: clamp(900px, 55vw, 1280px);
     max-width: 100vw;
     height: 100vh;
     background: var(--color-bg-card);

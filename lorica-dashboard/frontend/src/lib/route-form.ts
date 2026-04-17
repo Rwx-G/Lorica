@@ -230,15 +230,23 @@ export const ROUTE_DEFAULTS: RouteFormState = {
 // Tab field mappings for dot indicators
 export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   general: [
-    'hostname', 'path_prefix', 'force_https', 'redirect_hostname', 'redirect_to',
-    'hostname_aliases', 'websocket_enabled', 'access_log_enabled',
-    'compression_enabled', 'waf_enabled', 'return_status', 'sticky_session', 'error_page_html',
+    // Identity + Response override only (v1.4.0 UX refactor pass 1).
+    'hostname', 'path_prefix', 'hostname_aliases',
+    'websocket_enabled', 'access_log_enabled',
+    'redirect_to', 'redirect_hostname', 'return_status', 'error_page_html',
+  ],
+  routing: [
+    // Default backends subsection (v1.4.0 pass 1). Canary / HeaderRules /
+    // PathRules / Mirror migrate here in the next pass.
+    'backend_ids', 'certificate_id', 'load_balancing', 'force_https', 'sticky_session',
   ],
   timeouts: [
     'connect_timeout_s', 'read_timeout_s', 'send_timeout_s',
     'strip_path_prefix', 'add_path_prefix', 'path_rewrite_pattern', 'path_rewrite_replacement', 'retry_attempts', 'retry_on_methods',
   ],
   security: [
+    // WAF moved in from General (v1.4.0 pass 1).
+    'waf_enabled', 'waf_mode',
     'security_headers', 'max_body_mb', 'rate_limit_rps',
     'rate_limit_burst', 'ip_allowlist', 'ip_denylist',
     'basic_auth_username', 'basic_auth_password',
@@ -270,7 +278,11 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   header_rules: ['header_rules'],
   traffic_splits: ['traffic_splits'],
   mirror: ['mirror_backend_ids', 'mirror_sample_percent', 'mirror_timeout_ms', 'mirror_max_body_bytes'],
-  response_rewrite: ['response_rewrite_rules', 'response_rewrite_max_body_bytes', 'response_rewrite_content_type_prefixes'],
+  response_rewrite: [
+    'response_rewrite_rules', 'response_rewrite_max_body_bytes', 'response_rewrite_content_type_prefixes',
+    // Compression temporarily hosted here until Transform tab absorbs it in the next pass.
+    'compression_enabled',
+  ],
 };
 
 function recordToText(rec: Record<string, string>): string {
@@ -614,7 +626,11 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     // authoritative. Omitting the field keeps the backend's "missing =
     // no-op" contract, so a stale-form save cannot overwrite a freshly-
     // toggled value.
-    error_page_html: form.error_page_html || undefined,
+    // Clear-on-empty: empty text -> send "" on update (backend clears
+    // the stored value), `undefined` on create (no field = use default).
+    // Previously sent `undefined` on both, which meant an operator
+    // wiping the textarea could not actually clear the stored HTML.
+    error_page_html: form.error_page_html || (isUpdate ? '' : undefined),
     cache_vary_headers: tokenListToArray(form.cache_vary_headers).length > 0
       ? tokenListToArray(form.cache_vary_headers)
       : empty([]),

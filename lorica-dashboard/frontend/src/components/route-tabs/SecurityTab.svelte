@@ -112,6 +112,7 @@
        feature families. Anchor jumps let users go directly to the
        one they want to configure without scrolling the full form. -->
   <nav class="tab-toc" aria-label="Security subsections">
+    <a href="#sec-waf">WAF</a>
     <a href="#sec-headers">Headers &amp; limits</a>
     <a href="#sec-ip-lists">IP lists</a>
     <a href="#sec-basic-auth">Basic auth</a>
@@ -119,6 +120,34 @@
     <a href="#sec-mirror">Mirroring</a>
     <a href="#sec-mtls">mTLS</a>
   </nav>
+
+  <section id="sec-waf" class="subsection-anchor">
+    <h3 class="subsection-heading">WAF (Web Application Firewall)</h3>
+    <p class="subsection-hint">
+      Inspects incoming request payloads against a rule set (SQL injection,
+      XSS, path traversal, ...) and blocks or logs matches.
+    </p>
+
+    <div class="form-group" class:modified={isModified('waf_enabled')}>
+      <label class="checkbox-item">
+        <input type="checkbox" bind:checked={form.waf_enabled} />
+        <span>Enable WAF</span>
+      </label>
+      {#if isImported('waf_enabled')}<span class="imported-badge">imported</span>{/if}
+    </div>
+
+    {#if form.waf_enabled}
+      <div class="form-group" class:modified={isModified('waf_mode')}>
+        <label for="waf-mode">WAF Mode</label>
+        {#if isImported('waf_mode')}<span class="imported-badge">imported</span>{/if}
+        <select id="waf-mode" bind:value={form.waf_mode}>
+          <option value="detection">Detection (log only)</option>
+          <option value="blocking">Blocking (reject 403)</option>
+        </select>
+        <span class="hint">Start in Detection for a few days, then flip to Blocking once the baseline is clean.</span>
+      </div>
+    {/if}
+  </section>
 
   <section id="sec-headers" class="subsection-anchor">
   <div class="form-group" class:modified={isModified('security_headers')}>
@@ -475,6 +504,22 @@
     /* Offset anchor target by the sticky TOC height + header
        padding so the anchored h3 isn't hidden under the rail. */
     scroll-margin-top: 4rem;
+  }
+
+  .subsection-heading {
+    margin: 0 0 0.375rem;
+    font-size: 0.875rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--color-text-heading);
+  }
+
+  .subsection-hint {
+    margin: 0 0 0.75rem;
+    font-size: 0.8125rem;
+    color: var(--color-text-muted);
+    line-height: 1.4;
   }
 
   .form-group { margin-bottom: 1rem; }
