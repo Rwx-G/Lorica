@@ -530,7 +530,13 @@ gpg --verify lorica.deb.asc lorica.deb
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for planned features across upcoming releases (v1.3.0 - v2.0.0).
+| Version | Features | Status |
+|---------|----------|--------|
+| **v1.4.0** | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Current |
+| v1.5.0 | Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) | Planned |
+| v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 See [COMPARISON.md](COMPARISON.md) for a detailed feature comparison with Nginx, Traefik, HAProxy, Caddy, BunkerWeb, Sozu, and Pingora.
 
