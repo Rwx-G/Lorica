@@ -99,6 +99,18 @@
         // width/height that Wikimedia hardcodes.
         const svg = svgContainer.querySelector('svg');
         if (svg) {
+          // The Wikimedia SVG ships with width=2754 height=1398 but no
+          // viewBox. Without one, CSS width/height just resize the
+          // display box while inner content keeps rendering in its
+          // native 2754x1398 coordinate space -> only the top-left
+          // quadrant is visible through the container. Inject a
+          // viewBox that matches the intrinsic dimensions so
+          // preserveAspectRatio=xMidYMid meet scales the map to fit.
+          if (!svg.hasAttribute('viewBox')) {
+            const nativeW = svg.getAttribute('width') ?? '2754';
+            const nativeH = svg.getAttribute('height') ?? '1398';
+            svg.setAttribute('viewBox', `0 0 ${nativeW} ${nativeH}`);
+          }
           svg.removeAttribute('width');
           svg.removeAttribute('height');
           svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
@@ -235,7 +247,14 @@
   }
   .map-container {
     width: 100%;
-    max-height: 500px;
+    /* The bundled SVG has width="2754" height="1398" but no viewBox;
+       without an aspect-ratio here the SVG renders at its intrinsic
+       size (1398 px tall) when the parent grants it full available
+       width, and max-height: 500px on the SVG clips it hard so only
+       the top slice shows. Locking the container to the map's
+       native 2754:1398 ratio makes height track width, so no
+       clipping regardless of the tab's current padding. */
+    aspect-ratio: 2754 / 1398;
     overflow: hidden;
     border: 1px solid var(--color-border, #ddd);
     border-radius: 6px;
@@ -243,8 +262,7 @@
   }
   .map-container :global(svg) {
     width: 100%;
-    height: auto;
-    max-height: 500px;
+    height: 100%;
     display: block;
   }
   .map-container :global(path),

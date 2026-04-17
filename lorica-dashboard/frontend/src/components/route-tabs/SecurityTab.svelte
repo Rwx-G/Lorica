@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { RouteFormState } from '../../lib/route-form';
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
+  import SubsectionHeader from '../SubsectionHeader.svelte';
 
   import { api, type SecurityHeaderPreset, type BackendResponse } from '../../lib/api';
 
@@ -103,118 +104,114 @@
   <!-- In-tab table of contents: the Security tab hosts 6 unrelated
        feature families. Anchor jumps let users go directly to the
        one they want to configure without scrolling the full form. -->
-  <nav class="tab-toc" aria-label="Security subsections">
-    <a href="#sec-waf">WAF</a>
-    <a href="#sec-headers">Headers &amp; limits</a>
-    <a href="#sec-ip-lists">IP lists</a>
-    <a href="#sec-basic-auth">Basic auth</a>
-    <a href="#sec-forward-auth">Forward auth</a>
-    <a href="#sec-mtls">mTLS</a>
-  </nav>
-
-  <section id="sec-waf" class="subsection-anchor">
-    <h3 class="subsection-heading">WAF (Web Application Firewall)</h3>
-    <p class="subsection-hint">
-      Inspects incoming request payloads against a rule set (SQL injection,
-      XSS, path traversal, ...) and blocks or logs matches.
-    </p>
-
-    <div class="form-group" class:modified={isModified('waf_enabled')}>
-      <label class="checkbox-item">
-        <input type="checkbox" bind:checked={form.waf_enabled} />
-        <span>Enable WAF</span>
-      </label>
-      {#if isImported('waf_enabled')}<span class="imported-badge">imported</span>{/if}
-    </div>
-
-    {#if form.waf_enabled}
-      <div class="form-group" class:modified={isModified('waf_mode')}>
-        <label for="waf-mode">WAF Mode</label>
-        {#if isImported('waf_mode')}<span class="imported-badge">imported</span>{/if}
-        <select id="waf-mode" bind:value={form.waf_mode}>
-          <option value="detection">Detection (log only)</option>
-          <option value="blocking">Blocking (reject 403)</option>
-        </select>
-        <span class="hint">Start in Detection for a few days, then flip to Blocking once the baseline is clean.</span>
+  <section id="sec-waf" class="subsection">
+    <SubsectionHeader
+      title="WAF (Web Application Firewall)"
+      description="Inspects incoming request payloads against a rule set (SQL injection, XSS, path traversal, ...) and blocks or logs matches."
+      accent="red"
+    />
+    <div class="subsection-body">
+      <div class="form-group" class:modified={isModified('waf_enabled')}>
+        <label class="checkbox-item">
+          <input type="checkbox" bind:checked={form.waf_enabled} />
+          <span>Enable WAF</span>
+        </label>
+        {#if isImported('waf_enabled')}<span class="imported-badge">imported</span>{/if}
       </div>
-    {/if}
+
+      {#if form.waf_enabled}
+        <div class="form-group" class:modified={isModified('waf_mode')}>
+          <label for="waf-mode">WAF Mode</label>
+          {#if isImported('waf_mode')}<span class="imported-badge">imported</span>{/if}
+          <select id="waf-mode" bind:value={form.waf_mode}>
+            <option value="detection">Detection (log only)</option>
+            <option value="blocking">Blocking (reject 403)</option>
+          </select>
+          <span class="hint">Start in Detection for a few days, then flip to Blocking once the baseline is clean.</span>
+        </div>
+      {/if}
+    </div>
   </section>
 
-  <section id="sec-headers" class="subsection-anchor">
-  <div class="form-group" class:modified={isModified('security_headers')}>
-    <label for="security-headers">Security headers preset</label>
-    {#if isImported('security_headers')}<span class="imported-badge">imported</span>{/if}
-    <select id="security-headers" bind:value={form.security_headers}>
-      <option value="strict">Strict</option>
-      <option value="moderate">Moderate</option>
-      <option value="none">None</option>
-      {#each customPresets as preset (preset.name)}
-        <option value={preset.name}>{preset.name} (custom)</option>
-      {/each}
-    </select>
-    <span class="hint">Nginx: add_header Strict-Transport-Security... | Traefik: Headers middleware</span>
-  </div>
-
-  <div class="form-row form-row-3">
-    <div class="form-group" class:modified={isModified('max_body_mb')}>
-      <label for="max-body">Max body (MB)</label>
-      {#if isImported('max_body_mb')}<span class="imported-badge">imported</span>{/if}
-      <input id="max-body" type="number" min="0" step="1" bind:value={form.max_body_mb} placeholder="No limit" />
-      <span class="hint">Nginx: client_max_body_size | Traefik: Buffering maxRequestBodyBytes</span>
+  <section id="sec-preset" class="subsection">
+    <SubsectionHeader
+      title="Security headers preset"
+      description="Ship standard security headers (HSTS, CSP, X-Frame-Options, Referrer-Policy, ...) in one click. Presets are managed in Settings; add custom ones there."
+      accent="orange"
+    />
+    <div class="subsection-body">
+      <div class="form-group" class:modified={isModified('security_headers')}>
+        <label for="security-headers">Preset</label>
+        {#if isImported('security_headers')}<span class="imported-badge">imported</span>{/if}
+        <select id="security-headers" bind:value={form.security_headers}>
+          <option value="strict">Strict</option>
+          <option value="moderate">Moderate</option>
+          <option value="none">None</option>
+          {#each customPresets as preset (preset.name)}
+            <option value={preset.name}>{preset.name} (custom)</option>
+          {/each}
+        </select>
+        <span class="hint">
+          Body size limit and rate limit moved to the <strong>Protection</strong> tab in the v1.4.0 UX refactor.
+          The legacy <code>rate_limit_rps</code> / <code>rate_limit_burst</code> fields are deprecated in favour of the token-bucket under Protection &rarr; Rate limit.
+        </span>
+      </div>
     </div>
-    <div class="form-group" class:modified={isModified('rate_limit_rps')}>
-      <label for="rate-rps">Rate limit RPS</label>
-      {#if isImported('rate_limit_rps')}<span class="imported-badge">imported</span>{/if}
-      <input id="rate-rps" type="number" min="1" bind:value={form.rate_limit_rps} placeholder="No limit" />
-      <span class="hint">Nginx: limit_req zone rate=Xr/s | Traefik: RateLimit middleware</span>
-    </div>
-    <div class="form-group" class:modified={isModified('rate_limit_burst')}>
-      <label for="rate-burst">Rate limit burst</label>
-      {#if isImported('rate_limit_burst')}<span class="imported-badge">imported</span>{/if}
-      <input id="rate-burst" type="number" min="1" bind:value={form.rate_limit_burst} placeholder="No limit" />
-    </div>
-  </div>
   </section>
 
-  <section id="sec-ip-lists" class="subsection-anchor">
-  <div class="form-row">
-    <div class="form-group" class:modified={isModified('ip_allowlist')}>
-      <label for="ip-allow">IP allowlist <span class="hint">(one per line)</span></label>
-      {#if isImported('ip_allowlist')}<span class="imported-badge">imported</span>{/if}
-      <textarea id="ip-allow" rows="3" bind:value={form.ip_allowlist} placeholder="192.168.1.0/24&#10;10.0.0.1"></textarea>
+  <section id="sec-ip-lists" class="subsection">
+    <SubsectionHeader
+      title="IP allow / deny"
+      description="Per-route IP access control. Allowlist wins over denylist (allowlist evaluated first). For network-level pre-TLS filtering, see Settings > Network > connection_deny_cidrs."
+      accent="purple"
+    />
+    <div class="subsection-body">
+      <div class="form-row">
+        <div class="form-group" class:modified={isModified('ip_allowlist')}>
+          <label for="ip-allow">IP allowlist</label>
+          {#if isImported('ip_allowlist')}<span class="imported-badge">imported</span>{/if}
+          <textarea id="ip-allow" rows="3" bind:value={form.ip_allowlist} placeholder={'192.168.1.0/24\n10.0.0.1'}></textarea>
+          <span class="hint">One CIDR or IP per line. Empty = no allowlist (accept all, then apply denylist).</span>
+        </div>
+        <div class="form-group" class:modified={isModified('ip_denylist')}>
+          <label for="ip-deny">IP denylist</label>
+          {#if isImported('ip_denylist')}<span class="imported-badge">imported</span>{/if}
+          <textarea id="ip-deny" rows="3" bind:value={form.ip_denylist} placeholder="203.0.113.0/24"></textarea>
+          <span class="hint">One CIDR or IP per line. Applied only if allowlist was empty or accepted the client.</span>
+        </div>
+      </div>
     </div>
-    <div class="form-group" class:modified={isModified('ip_denylist')}>
-      <label for="ip-deny">IP denylist <span class="hint">(one per line)</span></label>
-      {#if isImported('ip_denylist')}<span class="imported-badge">imported</span>{/if}
-      <textarea id="ip-deny" rows="3" bind:value={form.ip_denylist} placeholder="203.0.113.0/24"></textarea>
-    </div>
-  </div>
   </section>
 
-  <section id="sec-basic-auth" class="subsection-anchor">
-  <div class="form-row">
-    <div class="form-group" class:modified={isModified('basic_auth_username')}>
-      <label for="basic-auth-user">Basic auth username</label>
-      <input id="basic-auth-user" type="text" bind:value={form.basic_auth_username} placeholder="Leave empty to disable" />
-      <span class="hint">HTTP Basic Auth for staging or internal tools. Nginx: auth_basic | Traefik: BasicAuth middleware</span>
+  <section id="sec-basic-auth" class="subsection">
+    <SubsectionHeader
+      title="Basic auth"
+      description="HTTP Basic Auth credential gate. Useful for staging or internal tools. Password hashed with Argon2id before storage."
+      accent="cyan"
+    />
+    <div class="subsection-body">
+      <div class="form-row">
+        <div class="form-group" class:modified={isModified('basic_auth_username')}>
+          <label for="basic-auth-user">Username</label>
+          <input id="basic-auth-user" type="text" bind:value={form.basic_auth_username} placeholder="Leave empty to disable" />
+          <span class="hint">Nginx: <code>auth_basic</code> | Traefik: BasicAuth middleware.</span>
+        </div>
+        <div class="form-group" class:modified={isModified('basic_auth_password')}>
+          <label for="basic-auth-pass">Password</label>
+          <input id="basic-auth-pass" type="password" bind:value={form.basic_auth_password} placeholder={form.basic_auth_username ? '(unchanged)' : 'Leave empty to disable'} />
+          <span class="hint">Send a new value to change it. Stored as Argon2id hash.</span>
+        </div>
+      </div>
     </div>
-    <div class="form-group" class:modified={isModified('basic_auth_password')}>
-      <label for="basic-auth-pass">Basic auth password</label>
-      <input id="basic-auth-pass" type="password" bind:value={form.basic_auth_password} placeholder={form.basic_auth_username ? '(unchanged)' : 'Leave empty to disable'} />
-      <span class="hint">Password is hashed (Argon2id) before storage. Send a new value to change it.</span>
-    </div>
-  </div>
-
   </section>
 
-  <section id="sec-forward-auth" class="subsection-anchor">
-  <h3 class="subsection-title">Forward authentication</h3>
-  <p class="subsection-hint">
-    Before proxying to the upstream, issue a GET sub-request to an external
-    auth service (Authelia, Authentik, Keycloak, oauth2-proxy). 2xx = allow,
-    401/403/3xx = forwarded verbatim to the client (so Authelia's login
-    redirect works), other = fail closed 503.
-  </p>
+  <section id="sec-forward-auth" class="subsection">
+    <SubsectionHeader
+      title="Forward authentication"
+      description="Before proxying to the upstream, issue a GET sub-request to an external auth service (Authelia, Authentik, Keycloak, oauth2-proxy). 2xx = allow, 401/403/3xx = forwarded verbatim (login redirect works)."
+      accent="teal"
+    />
+    <div class="subsection-body">
 
   <div class="form-group" class:modified={form.forward_auth_address !== ''}>
     <label for="fa-address">Auth service URL</label>
@@ -270,19 +267,16 @@
     </div>
   </div>
 
+    </div>
   </section>
 
-  <section id="sec-mtls" class="subsection-anchor">
-  <h3 class="subsection-title">mTLS client verification</h3>
-  <p class="subsection-hint">
-    Require connecting clients to present an X.509 certificate signed by
-    the configured CA bundle. Chain validation happens at the TLS
-    handshake; this route gates the request with
-    <code>required</code> (no-cert &rarr; 496) and an optional
-    organization allowlist (non-matching O= &rarr; 495). Changes to the
-    CA PEM need a restart; toggling <code>required</code> or editing the
-    allowlist hot-reloads.
-  </p>
+  <section id="sec-mtls" class="subsection">
+    <SubsectionHeader
+      title="mTLS client verification"
+      description="Require clients to present an X.509 certificate signed by the configured CA bundle. Chain validation at TLS handshake; required toggle + optional O= allowlist. CA PEM changes need a restart; toggling required and editing the allowlist hot-reload."
+      accent="slate"
+    />
+    <div class="subsection-body">
 
   <div class="form-group" class:modified={form.mtls_ca_cert_pem !== ''}>
     <label for="mtls-ca">Client CA bundle (PEM)</label>
@@ -365,65 +359,34 @@
       </span>
     </div>
   </div>
+    </div>
   </section>
 </div>
 
 <style>
-  .tab-content { display: flex; flex-direction: column; gap: 0; }
+  .tab-content { display: flex; flex-direction: column; gap: 1.25rem; }
 
-  /* In-tab table of contents. Sticks near the top of the scroll
-     container so operators can jump to any subsection without
-     losing context. Scrolls horizontally on narrow screens rather
-     than wrapping to two rows - keeps the tab body's vertical
-     space predictable. */
-  .tab-toc {
+  /* Subsection shell + body, same pattern as Routing / Transform /
+     Protection. Each subsection is a card with a SubsectionHeader
+     (coloured top-border + tinted background) and a form body
+     below. */
+  .subsection {
     display: flex;
-    flex-wrap: wrap;
-    gap: 0.375rem;
-    padding: 0.5rem 0 0.75rem;
-    margin-bottom: 0.5rem;
-    border-bottom: 1px solid var(--color-border-subtle, var(--color-border));
-    position: sticky;
-    top: 0;
-    background: var(--color-bg, #fff);
-    z-index: 1;
-  }
-  .tab-toc a {
-    padding: 0.25rem 0.5rem;
-    border-radius: 0.25rem;
-    font-size: 0.75rem;
-    color: var(--color-text-muted);
-    text-decoration: none;
-    border: 1px solid transparent;
-  }
-  .tab-toc a:hover {
-    background: rgba(59, 130, 246, 0.08);
-    color: var(--color-primary);
-    border-color: rgba(59, 130, 246, 0.25);
-  }
-  .subsection-anchor {
-    /* Offset anchor target by the sticky TOC height + header
-       padding so the anchored h3 isn't hidden under the rail. */
-    scroll-margin-top: 4rem;
+    flex-direction: column;
+    border-radius: 0.5rem;
+    overflow: hidden;
   }
 
-  .subsection-heading {
-    margin: 0 0 0.375rem;
-    font-size: 0.875rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--color-text-heading);
-  }
-
-  .subsection-hint {
-    margin: 0 0 0.75rem;
-    font-size: 0.8125rem;
-    color: var(--color-text-muted);
-    line-height: 1.4;
+  .subsection-body {
+    background: var(--color-bg-card);
+    border: 1px solid var(--color-border);
+    border-top: none;
+    border-radius: 0 0 0.5rem 0.5rem;
+    padding: 1rem 1rem 0.5rem;
   }
 
   .form-group { margin-bottom: 1rem; }
+  .form-group:last-child { margin-bottom: 0.5rem; }
   .form-group.modified { border-left: 3px solid var(--color-primary); padding-left: 0.75rem; }
 
   .form-group label {
@@ -432,21 +395,6 @@
     font-weight: 500;
     color: var(--color-text-muted);
     margin-bottom: 0.375rem;
-  }
-
-  .subsection-title {
-    font-size: 0.875rem;
-    font-weight: 600;
-    color: var(--color-text);
-    margin: 1.25rem 0 0.25rem;
-    padding-top: 0.75rem;
-    border-top: 1px solid var(--color-border);
-  }
-  .subsection-hint {
-    font-size: 0.75rem;
-    color: var(--color-text-muted);
-    margin: 0 0 0.75rem;
-    line-height: 1.4;
   }
   /* Disabled inputs: explicit token colors rather than opacity so
      the resulting text still meets WCAG 4.5:1 on both light and

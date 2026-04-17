@@ -267,10 +267,12 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'retry_attempts', 'retry_on_methods',
   ],
   security: [
-    // WAF moved in from General (v1.4.0 pass 1).
+    // WAF absorbed from General (v1.4.0 pass 1).
     'waf_enabled', 'waf_mode',
-    'security_headers', 'max_body_mb', 'rate_limit_rps',
-    'rate_limit_burst', 'ip_allowlist', 'ip_denylist',
+    // Security headers preset (body-size limit and legacy rate_limit
+    // moved to Protection in pass 4).
+    'security_headers',
+    'ip_allowlist', 'ip_denylist',
     'basic_auth_username', 'basic_auth_password',
     'forward_auth_address', 'forward_auth_timeout_ms', 'forward_auth_response_headers',
     'mtls_ca_cert_pem', 'mtls_required', 'mtls_allowed_organizations',
@@ -281,10 +283,17 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'cache_vary_headers',
   ],
   protection: [
-    'max_connections', 'slowloris_threshold_ms',
-    'auto_ban_threshold', 'auto_ban_duration_s',
+    // Rate limit (token bucket, cross-worker)
     'rate_limit_capacity', 'rate_limit_refill_per_sec', 'rate_limit_scope',
+    // Connection limits
+    'max_connections', 'slowloris_threshold_ms',
+    // Body size limit (absorbed from Security in pass 4)
+    'max_body_mb',
+    // Auto-ban (depends on WAF being enabled; warning banner when not)
+    'auto_ban_threshold', 'auto_ban_duration_s',
+    // GeoIP
     'geoip_mode', 'geoip_countries',
+    // Bot protection
     'bot_enabled', 'bot_mode', 'bot_cookie_ttl_s', 'bot_pow_difficulty',
     'bot_captcha_alphabet',
     'bot_bypass_ip_cidrs', 'bot_bypass_asns', 'bot_bypass_countries',
@@ -906,11 +915,12 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
   if (form.connect_timeout_s < 1 || form.connect_timeout_s > 3600) return r('Connect timeout must be between 1 and 3600', 'upstream');
   if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return r('Read timeout must be between 1 and 3600', 'upstream');
   if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return r('Send timeout must be between 1 and 3600', 'upstream');
-  if (form.max_body_mb && Number(form.max_body_mb) <= 0) return r('Max body size must be greater than 0', 'security');
-  if (form.rate_limit_rps && Number(form.rate_limit_rps) <= 0) return r('Rate limit RPS must be greater than 0', 'security');
-  if (form.rate_limit_burst && Number(form.rate_limit_burst) <= 0) return r('Rate limit burst must be greater than 0', 'security');
+  if (form.max_body_mb && Number(form.max_body_mb) <= 0) return r('Max body size must be greater than 0', 'protection');
+  // Legacy rate_limit_rps / rate_limit_burst UI removed in pass 4; these branches are dead weight but kept in case imported data carries stale values - route them at Protection since that is where the modern rate limit lives now.
+  if (form.rate_limit_rps && Number(form.rate_limit_rps) <= 0) return r('Rate limit RPS must be greater than 0', 'protection');
+  if (form.rate_limit_burst && Number(form.rate_limit_burst) <= 0) return r('Rate limit burst must be greater than 0', 'protection');
   if (form.rate_limit_rps && form.rate_limit_burst && Number(form.rate_limit_burst) < Number(form.rate_limit_rps)) {
-    return r('Rate limit burst must be >= RPS', 'security');
+    return r('Rate limit burst must be >= RPS', 'protection');
   }
   if (form.cors_max_age_s && Number(form.cors_max_age_s) <= 0) return r('CORS max age must be greater than 0', 'transform');
   const allowErr = validateIpList(form.ip_allowlist);
