@@ -2905,10 +2905,35 @@ impl ProxyHttp for LoricaProxy {
                     .write_response_header(Box::new(header), true)
                     .await?;
             } else {
-                // return_status alone = direct response with empty body
-                let header = lorica_http::ResponseHeader::build(status, None)?;
+                // return_status alone = direct response. Route the body
+                // through render_error_body() so operators get Lorica's
+                // branded error page (or their own error_page_html when
+                // configured), consistent with every other terminal
+                // branch (403 IP / WAF / GeoIP, 429 rate limit,
+                // 502 / 504 upstream). Previously this path wrote empty
+                // headers only, which produced a blank page for
+                // return_status routes.
+                let host_header = extract_host(session.req_header()).to_string();
+                let error_page_html = ctx
+                    .route_snapshot
+                    .as_ref()
+                    .and_then(|r| r.error_page_html.as_deref())
+                    .map(|s| s.to_string());
+                let body = render_error_body(
+                    status,
+                    &ctx.request_id,
+                    &host_header,
+                    error_page_html.as_deref(),
+                    &format!("return_status {status}"),
+                );
+                let mut header = lorica_http::ResponseHeader::build(status, None)?;
+                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                header.insert_header("Content-Length", body.len().to_string())?;
                 session
-                    .write_response_header(Box::new(header), true)
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
                     .await?;
             }
             return Ok(true);

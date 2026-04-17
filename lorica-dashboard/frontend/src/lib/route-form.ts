@@ -636,8 +636,19 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     path_rules: pathRuleFormToRequest(form.path_rules) ?? (isUpdate ? [] : undefined),
     return_status: form.return_status ? Number(form.return_status) : empty(0),
     sticky_session: form.sticky_session,
-    basic_auth_username: form.basic_auth_username || undefined,
-    basic_auth_password: form.basic_auth_password || undefined,
+    // Basic auth clear-on-empty: clearing the username on an update
+    // disables the feature, so send "" (explicit clear) instead of
+    // undefined ("leave unchanged"). The password field is nuanced:
+    //   - non-empty  -> send it (rotate password)
+    //   - empty + username also cleared  -> send "" to drop the stored hash
+    //   - empty + username still present -> send undefined to preserve the
+    //     existing Argon2id hash ("Send a new value to change it." hint)
+    basic_auth_username: form.basic_auth_username || (isUpdate ? '' : undefined),
+    basic_auth_password: form.basic_auth_password
+      ? form.basic_auth_password
+      : isUpdate && !form.basic_auth_username
+        ? ''
+        : undefined,
     stale_while_revalidate_s: form.stale_while_revalidate_s,
     stale_if_error_s: form.stale_if_error_s,
     retry_on_methods: csvToArray(form.retry_on_methods).length > 0 ? csvToArray(form.retry_on_methods) : empty([]),

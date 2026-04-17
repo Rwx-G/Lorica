@@ -86,6 +86,112 @@
 
   let modifiedFields: Set<string> = $derived(getModifiedFields(form));
 
+  /**
+   * Summary chips rendered in the drawer header, right under the
+   * hostname preview. Each chip is one derived fact about the route
+   * so an operator can tell at a glance which features are armed
+   * without clicking into the tabs. Resolves finding #14.
+   *
+   * Tones map to the palette used for subsection accents elsewhere
+   * in the drawer (blue / cyan / purple / red / orange / slate /
+   * teal / pink) so the header picks up the same colour language.
+   */
+  type Chip = { label: string; tone: 'blue' | 'cyan' | 'purple' | 'red' | 'orange' | 'slate' | 'teal' | 'pink' | 'green' };
+  let summaryChips: Chip[] = $derived.by(() => {
+    const chips: Chip[] = [];
+
+    // TLS
+    if (form.certificate_id) {
+      chips.push({ label: form.force_https ? 'TLS (forced)' : 'TLS', tone: 'green' });
+    }
+
+    // Terminal responses (short-circuit proxy)
+    if (form.redirect_to || form.redirect_hostname) {
+      chips.push({ label: 'Redirect', tone: 'pink' });
+    }
+    if (form.return_status) {
+      chips.push({ label: `Returns ${form.return_status}`, tone: 'pink' });
+    }
+
+    // Routing decorations
+    if (form.sticky_session) {
+      chips.push({ label: 'Sticky', tone: 'cyan' });
+    }
+    if (form.traffic_splits.length > 0) {
+      const total = form.traffic_splits.reduce((s, t) => s + (t.weight_percent || 0), 0);
+      chips.push({ label: `Split ${total}%`, tone: 'cyan' });
+    }
+    if (form.header_rules.length > 0) {
+      chips.push({ label: `${form.header_rules.length} header rule${form.header_rules.length > 1 ? 's' : ''}`, tone: 'purple' });
+    }
+    if (form.path_rules.length > 0) {
+      chips.push({ label: `${form.path_rules.length} path rule${form.path_rules.length > 1 ? 's' : ''}`, tone: 'orange' });
+    }
+    if (form.mirror_backend_ids.length > 0) {
+      chips.push({ label: `Mirror ${form.mirror_sample_percent}%`, tone: 'slate' });
+    }
+
+    // Security
+    if (form.waf_enabled) {
+      chips.push({
+        label: form.waf_mode === 'blocking' ? 'WAF blocking' : 'WAF detect',
+        tone: 'red',
+      });
+    }
+    if (form.basic_auth_username) {
+      chips.push({ label: 'Basic auth', tone: 'cyan' });
+    }
+    if (form.forward_auth_address) {
+      chips.push({ label: 'Forward auth', tone: 'teal' });
+    }
+    if (form.mtls_ca_cert_pem.trim()) {
+      chips.push({
+        label: form.mtls_required ? 'mTLS required' : 'mTLS optional',
+        tone: 'slate',
+      });
+    }
+
+    // Protection
+    if (form.rate_limit_capacity && Number(form.rate_limit_capacity) > 0) {
+      chips.push({
+        label: `Rate ${form.rate_limit_refill_per_sec}/s`,
+        tone: 'blue',
+      });
+    }
+    if (form.geoip_mode && form.geoip_countries.trim()) {
+      const countries = form.geoip_countries
+        .split(/[,\s]+/)
+        .filter((c) => c.length > 0);
+      const preview = countries.slice(0, 2).join(',');
+      const more = countries.length > 2 ? `+${countries.length - 2}` : '';
+      chips.push({
+        label: `GeoIP ${form.geoip_mode === 'denylist' ? 'deny' : 'allow'} ${preview}${more}`,
+        tone: 'orange',
+      });
+    }
+    if (form.bot_enabled) {
+      const mode =
+        form.bot_mode === 'javascript'
+          ? `JS(${form.bot_pow_difficulty})`
+          : form.bot_mode === 'captcha'
+            ? 'Captcha'
+            : 'Cookie';
+      chips.push({ label: `Bot ${mode}`, tone: 'pink' });
+    }
+
+    // Cache
+    if (form.cache_enabled) {
+      chips.push({ label: `Cache ${form.cache_ttl_s}s`, tone: 'cyan' });
+    }
+
+    // Transform (compression is the smallest flag worth surfacing)
+    if (form.compression_enabled) {
+      chips.push({ label: 'gzip', tone: 'teal' });
+    }
+
+    return chips;
+  });
+
   function tabHasModifiedFields(tabId: string): boolean {
     const fields = TAB_FIELDS[tabId];
     if (!fields) return false;
@@ -161,9 +267,18 @@
       <!-- Header -->
       <div class="drawer-header">
         <div class="drawer-header-left">
-          <h2>{editing ? 'Edit Route' : 'New Route'}</h2>
-          {#if form.hostname}
-            <span class="hostname-preview">{form.hostname}{form.path_prefix !== '/' ? form.path_prefix : ''}</span>
+          <div class="drawer-title-row">
+            <h2>{editing ? 'Edit Route' : 'New Route'}</h2>
+            {#if form.hostname}
+              <span class="hostname-preview">{form.hostname}{form.path_prefix !== '/' ? form.path_prefix : ''}</span>
+            {/if}
+          </div>
+          {#if summaryChips.length > 0}
+            <div class="summary-chips" aria-label="Effective configuration summary">
+              {#each summaryChips as chip, i (i)}
+                <span class="chip" data-tone={chip.tone}>{chip.label}</span>
+              {/each}
+            </div>
           {/if}
         </div>
         <div class="drawer-header-right">
@@ -276,6 +391,14 @@
 
   .drawer-header-left {
     display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .drawer-title-row {
+    display: flex;
     align-items: baseline;
     gap: 1rem;
     min-width: 0;
@@ -294,6 +417,39 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+
+  /* Summary chips: a compact, colour-coded read-out of the route's
+     effective configuration. Stays visible regardless of the active
+     tab so an operator can tell at a glance "this route has WAF
+     blocking, GeoIP deny FR, and a 301 redirect" without clicking
+     through each tab. */
+  .summary-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3125rem;
+    max-width: 100%;
+  }
+
+  .chip {
+    display: inline-block;
+    padding: 0.125rem 0.5rem;
+    border-radius: 9999px;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    line-height: 1.4;
+    white-space: nowrap;
+    border: 1px solid transparent;
+  }
+
+  .chip[data-tone='blue']   { color: #3b82f6; background: rgba(59,  130, 246, 0.12); border-color: rgba(59,  130, 246, 0.25); }
+  .chip[data-tone='green']  { color: #10b981; background: rgba(16,  185, 129, 0.12); border-color: rgba(16,  185, 129, 0.25); }
+  .chip[data-tone='purple'] { color: #8b5cf6; background: rgba(139, 92,  246, 0.12); border-color: rgba(139, 92,  246, 0.25); }
+  .chip[data-tone='cyan']   { color: #06b6d4; background: rgba(6,   182, 212, 0.12); border-color: rgba(6,   182, 212, 0.25); }
+  .chip[data-tone='red']    { color: #ef4444; background: rgba(239, 68,  68,  0.12); border-color: rgba(239, 68,  68,  0.25); }
+  .chip[data-tone='orange'] { color: #f59e0b; background: rgba(245, 158, 11,  0.12); border-color: rgba(245, 158, 11,  0.25); }
+  .chip[data-tone='slate']  { color: #64748b; background: rgba(100, 116, 139, 0.12); border-color: rgba(100, 116, 139, 0.25); }
+  .chip[data-tone='teal']   { color: #14b8a6; background: rgba(20,  184, 166, 0.12); border-color: rgba(20,  184, 166, 0.25); }
+  .chip[data-tone='pink']   { color: #ec4899; background: rgba(236, 72,  153, 0.12); border-color: rgba(236, 72,  153, 0.25); }
 
   .drawer-header-right {
     display: flex;
