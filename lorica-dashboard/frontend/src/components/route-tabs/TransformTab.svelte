@@ -5,6 +5,7 @@
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
   import ResponseRewriteTab from './ResponseRewriteTab.svelte';
+  import { validateRegex } from '../../lib/validators';
 
   interface Props {
     form: RouteFormState;
@@ -48,6 +49,14 @@
     const corsConfigured = form.cors_allowed_origins.trim().length > 0;
     return hasCors && corsConfigured;
   });
+
+  // Blur-time regex syntax validator. The API still enforces Rust
+  // `regex`-crate semantics on save; this catches obvious typos (bad
+  // escape, unterminated group) before the tab switch.
+  let pathRewriteRegexError = $state<string | null>(null);
+  function checkPathRewriteRegex() {
+    pathRewriteRegexError = validateRegex(form.path_rewrite_pattern);
+  }
 </script>
 
 <div class="tab-content">
@@ -173,8 +182,18 @@
             Regex rewrite pattern
             <FieldHelpButton fieldLabel="Regex rewrite pattern" onhelp={() => { activeHelp = 'path_rewrite_regex'; }} />
           </label>
-          <input id="rewrite-pattern" type="text" bind:value={form.path_rewrite_pattern} placeholder="^/api/v1/(.*)" />
+          <input
+            id="rewrite-pattern"
+            type="text"
+            class:invalid={pathRewriteRegexError !== null}
+            bind:value={form.path_rewrite_pattern}
+            onblur={checkPathRewriteRegex}
+            placeholder="^/api/v1/(.*)"
+          />
           <span class="hint">Rust regex syntax. Linear time, ReDoS-safe. Applied after strip/add.</span>
+          {#if pathRewriteRegexError}
+            <span class="field-error" role="alert">{pathRewriteRegexError}</span>
+          {/if}
         </div>
         <div class="form-group" class:modified={isModified('path_rewrite_replacement')}>
           <label for="rewrite-replacement">Regex rewrite replacement</label>
@@ -450,6 +469,18 @@
   }
 
   .form-group input:focus { outline: none; border-color: var(--color-primary); }
+
+  .form-group input.invalid {
+    border-color: var(--color-red, #ef4444);
+    background: rgba(239, 68, 68, 0.05);
+  }
+
+  .field-error {
+    display: block;
+    margin-top: 0.25rem;
+    font-size: 0.6875rem;
+    color: var(--color-red, #ef4444);
+  }
 
   .form-group textarea {
     width: 100%;

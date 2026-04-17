@@ -5,6 +5,8 @@
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
+  import ChipListInput from '../ChipListInput.svelte';
+  import { validateCidr, validateAsn, validateDnsSuffix } from '../../lib/validators';
 
   interface Props {
     form: RouteFormState;
@@ -265,15 +267,27 @@
         <div class="form-group" class:modified={isModified('bot_bypass_ip_cidrs')}>
           <label for="bot-bypass-ips">Bypass - IP CIDRs</label>
           {#if isImported('bot_bypass_ip_cidrs')}<span class="imported-badge">imported</span>{/if}
-          <input id="bot-bypass-ips" type="text" bind:value={form.bot_bypass_ip_cidrs} placeholder="e.g. 10.0.0.0/8, 2001:db8::/32" autocomplete="off" />
-          <span class="hint">Comma-separated. Office subnets, health-check probes. Max 500 entries.</span>
+          <ChipListInput
+            bind:value={form.bot_bypass_ip_cidrs}
+            separator="csv"
+            validator={validateCidr}
+            placeholder="e.g. 10.0.0.0/8, 2001:db8::/32"
+            ariaLabel="Bot bypass IP CIDR list"
+          />
+          <span class="hint">Office subnets, health-check probes. Press Enter or comma to add. Max 500 entries.</span>
         </div>
 
         <div class="form-group" class:modified={isModified('bot_bypass_asns')}>
           <label for="bot-bypass-asns">Bypass - ASNs</label>
           {#if isImported('bot_bypass_asns')}<span class="imported-badge">imported</span>{/if}
-          <input id="bot-bypass-asns" type="text" bind:value={form.bot_bypass_asns} placeholder="e.g. 15169, 13335" autocomplete="off" />
-          <span class="hint">Comma-separated, <code>AS</code> prefix optional. Requires an ASN database loaded (Settings &rarr; Network). ASN 0 is IANA-reserved and rejected.</span>
+          <ChipListInput
+            bind:value={form.bot_bypass_asns}
+            separator="csv"
+            validator={validateAsn}
+            placeholder="e.g. 15169, 13335"
+            ariaLabel="Bot bypass ASN list"
+          />
+          <span class="hint"><code>AS</code> prefix optional. Requires an ASN database loaded (Settings &rarr; Network). ASN 0 is IANA-reserved and rejected.</span>
         </div>
 
         <div class="form-group" class:modified={isModified('bot_bypass_countries')}>
@@ -299,9 +313,13 @@
         <div class="form-group" class:modified={isModified('bot_bypass_rdns')}>
           <label for="bot-bypass-rdns">Bypass - rDNS suffixes</label>
           {#if isImported('bot_bypass_rdns')}<span class="imported-badge">imported</span>{/if}
-          <textarea id="bot-bypass-rdns" rows="3" bind:value={form.bot_bypass_rdns}
-            placeholder={'googlebot.com\nsearch.msn.com'}
-            autocomplete="off" spellcheck="false"></textarea>
+          <ChipListInput
+            bind:value={form.bot_bypass_rdns}
+            separator="lines"
+            validator={validateDnsSuffix}
+            placeholder="e.g. googlebot.com, search.msn.com"
+            ariaLabel="Bot bypass rDNS suffix list"
+          />
           <span class="hint">
             Domain suffixes matched against the client IP's PTR record. Forward confirmation is enforced: the PTR name must resolve back to the client IP (A/AAAA match). Lookups are async with a 1 h cache.
           </span>

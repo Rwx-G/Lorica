@@ -2,6 +2,8 @@
   import type { RouteFormState } from '../../lib/route-form';
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
   import SubsectionHeader from '../SubsectionHeader.svelte';
+  import ChipListInput from '../ChipListInput.svelte';
+  import { validateCidr, validateUrl } from '../../lib/validators';
 
   import { api, type SecurityHeaderPreset, type BackendResponse } from '../../lib/api';
 
@@ -56,6 +58,14 @@
 
   let mtlsValidation: ActionState = $state({ status: 'idle' });
   let faTest: ActionState = $state({ status: 'idle' });
+
+  // Blur-time validation for forward_auth_address so the operator
+  // sees an "must start with http:// or https://" hint the moment
+  // they leave the field instead of at save time.
+  let forwardAuthUrlError = $state<string | null>(null);
+  function checkForwardAuthUrl() {
+    forwardAuthUrlError = validateUrl(form.forward_auth_address);
+  }
 
   async function runMtlsValidate() {
     const pem = form.mtls_ca_cert_pem.trim();
@@ -170,14 +180,26 @@
         <div class="form-group" class:modified={isModified('ip_allowlist')}>
           <label for="ip-allow">IP allowlist</label>
           {#if isImported('ip_allowlist')}<span class="imported-badge">imported</span>{/if}
-          <textarea id="ip-allow" rows="3" bind:value={form.ip_allowlist} placeholder={'192.168.1.0/24\n10.0.0.1'}></textarea>
-          <span class="hint">One CIDR or IP per line. Empty = no allowlist (accept all, then apply denylist).</span>
+          <ChipListInput
+            bind:value={form.ip_allowlist}
+            separator="lines"
+            validator={validateCidr}
+            placeholder="192.168.1.0/24"
+            ariaLabel="IP allowlist"
+          />
+          <span class="hint">CIDR or bare IP. Empty = accept all then apply denylist.</span>
         </div>
         <div class="form-group" class:modified={isModified('ip_denylist')}>
           <label for="ip-deny">IP denylist</label>
           {#if isImported('ip_denylist')}<span class="imported-badge">imported</span>{/if}
-          <textarea id="ip-deny" rows="3" bind:value={form.ip_denylist} placeholder="203.0.113.0/24"></textarea>
-          <span class="hint">One CIDR or IP per line. Runs after the allowlist.</span>
+          <ChipListInput
+            bind:value={form.ip_denylist}
+            separator="lines"
+            validator={validateCidr}
+            placeholder="203.0.113.0/24"
+            ariaLabel="IP denylist"
+          />
+          <span class="hint">CIDR or bare IP. Runs after the allowlist.</span>
         </div>
       </div>
     </div>
@@ -220,8 +242,13 @@
       type="text"
       bind:value={form.forward_auth_address}
       placeholder="http://authelia.internal:9091/api/verify"
+      onblur={checkForwardAuthUrl}
+      class:invalid={forwardAuthUrlError !== null}
     />
     <span class="hint">Empty = feature disabled. Must be an absolute http(s):// URL.</span>
+    {#if forwardAuthUrlError}
+      <span class="field-error" role="alert">{forwardAuthUrlError}</span>
+    {/if}
     <div class="inline-action">
       <button
         type="button"
@@ -432,6 +459,18 @@
 
   .form-group select:focus,
   .form-group input:focus { outline: none; border-color: var(--color-primary); }
+
+  .form-group input.invalid {
+    border-color: var(--color-red, #ef4444);
+    background: rgba(239, 68, 68, 0.05);
+  }
+
+  .field-error {
+    display: block;
+    margin-top: 0.25rem;
+    font-size: 0.6875rem;
+    color: var(--color-red, #ef4444);
+  }
 
   .form-group textarea {
     width: 100%;
