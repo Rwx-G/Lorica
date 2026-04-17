@@ -63,11 +63,11 @@ impl ConfigStore {
             }
         }
         // Evict oldest rows when the stash is at capacity.
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM bot_pending_challenges",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM bot_pending_challenges", [], |row| {
+                    row.get(0)
+                })?;
         if count as usize >= MAX_STASH_ROWS {
             let to_evict = (count as usize - MAX_STASH_ROWS + 1) as i64;
             self.conn.execute(
@@ -166,11 +166,11 @@ impl ConfigStore {
 
     /// Current row count. Used for the stash-length metric + tests.
     pub fn bot_stash_len(&self) -> Result<usize> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM bot_pending_challenges",
-            [],
-            |row| row.get(0),
-        )?;
+        let n: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM bot_pending_challenges", [], |row| {
+                    row.get(0)
+                })?;
         Ok(n as usize)
     }
 }
@@ -205,12 +205,18 @@ mod tests {
         let store = ConfigStore::open_in_memory().unwrap();
         let e = entry("abc", "pow", 2_000_000_000);
         store.bot_stash_insert(&e).unwrap();
-        let taken = store.bot_stash_take("abc", 1_900_000_000).unwrap().expect("round-trip");
+        let taken = store
+            .bot_stash_take("abc", 1_900_000_000)
+            .unwrap()
+            .expect("round-trip");
         assert_eq!(taken.nonce, "abc");
         assert_eq!(taken.kind, "pow");
         assert_eq!(taken.mode, 2);
         // second take returns None — first solver wins.
-        assert!(store.bot_stash_take("abc", 1_900_000_000).unwrap().is_none());
+        assert!(store
+            .bot_stash_take("abc", 1_900_000_000)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -218,8 +224,14 @@ mod tests {
         let store = ConfigStore::open_in_memory().unwrap();
         let e = entry("once", "pow", 2_000_000_000);
         store.bot_stash_insert(&e).unwrap();
-        assert!(store.bot_stash_take("once", 1_900_000_000).unwrap().is_some());
-        assert!(store.bot_stash_take("once", 1_900_000_000).unwrap().is_none());
+        assert!(store
+            .bot_stash_take("once", 1_900_000_000)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .bot_stash_take("once", 1_900_000_000)
+            .unwrap()
+            .is_none());
         assert_eq!(store.bot_stash_len().unwrap(), 0);
     }
 
@@ -235,7 +247,10 @@ mod tests {
         // Image fetch must NOT remove the row — user can reload.
         assert_eq!(store.bot_stash_len().unwrap(), 1);
         // Still present + takeable.
-        assert!(store.bot_stash_take("cap1", 1_900_000_000).unwrap().is_some());
+        assert!(store
+            .bot_stash_take("cap1", 1_900_000_000)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -249,19 +264,30 @@ mod tests {
     #[test]
     fn prune_removes_expired_rows() {
         let store = ConfigStore::open_in_memory().unwrap();
-        store.bot_stash_insert(&entry("keep", "pow", 2_000_000_000)).unwrap();
-        store.bot_stash_insert(&entry("drop1", "pow", 1_000_000_000)).unwrap();
-        store.bot_stash_insert(&entry("drop2", "captcha", 1_500_000_000)).unwrap();
+        store
+            .bot_stash_insert(&entry("keep", "pow", 2_000_000_000))
+            .unwrap();
+        store
+            .bot_stash_insert(&entry("drop1", "pow", 1_000_000_000))
+            .unwrap();
+        store
+            .bot_stash_insert(&entry("drop2", "captcha", 1_500_000_000))
+            .unwrap();
         let pruned = store.bot_stash_prune_expired(1_800_000_000).unwrap();
         assert_eq!(pruned, 2);
         assert_eq!(store.bot_stash_len().unwrap(), 1);
-        assert!(store.bot_stash_take("keep", 1_900_000_000).unwrap().is_some());
+        assert!(store
+            .bot_stash_take("keep", 1_900_000_000)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
     fn replace_on_nonce_collision() {
         let store = ConfigStore::open_in_memory().unwrap();
-        store.bot_stash_insert(&entry("dup", "pow", 2_000_000_000)).unwrap();
+        store
+            .bot_stash_insert(&entry("dup", "pow", 2_000_000_000))
+            .unwrap();
         // Same nonce, different mode → replaces.
         let mut e2 = entry("dup", "captcha", 2_000_000_100);
         e2.mode = 3;

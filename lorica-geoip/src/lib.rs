@@ -161,14 +161,13 @@ impl GeoIpResolver {
     /// / wrong database type).
     pub fn load_from_path<P: AsRef<Path>>(&self, path: P) -> Result<(), GeoIpError> {
         let path_ref = path.as_ref();
-        let reader =
-            maxminddb::Reader::open_readfile(path_ref).map_err(|e| match e {
-                maxminddb::MaxMindDbError::Io(source) => GeoIpError::Io {
-                    path: path_ref.to_path_buf(),
-                    source,
-                },
-                other => GeoIpError::Parse { source: other },
-            })?;
+        let reader = maxminddb::Reader::open_readfile(path_ref).map_err(|e| match e {
+            maxminddb::MaxMindDbError::Io(source) => GeoIpError::Io {
+                path: path_ref.to_path_buf(),
+                source,
+            },
+            other => GeoIpError::Parse { source: other },
+        })?;
 
         // Sanity-check: look up a list of well-known public IPs and
         // a probe from the MaxMind `GeoIP2-Country-Test.mmdb` fixture
@@ -181,9 +180,9 @@ impl GeoIpResolver {
         // empty, the wrong database type, or corrupt in a way the
         // format parser missed.
         let sanity_probes: &[&str] = &[
-            "8.8.8.8",         // Google DNS (US) — every real country DB
-            "1.1.1.1",         // Cloudflare (AU) — fallback if GOOG is missing
-            "214.78.120.5",    // MaxMind GeoIP2-Country-Test fixture hit (US)
+            "8.8.8.8",      // Google DNS (US) — every real country DB
+            "1.1.1.1",      // Cloudflare (AU) — fallback if GOOG is missing
+            "214.78.120.5", // MaxMind GeoIP2-Country-Test fixture hit (US)
         ];
         let any_hit = sanity_probes
             .iter()
@@ -204,7 +203,8 @@ impl GeoIpResolver {
             build_epoch: meta.build_epoch,
         };
 
-        self.inner.store(Some(Arc::new(LoadedDb { reader, status })));
+        self.inner
+            .store(Some(Arc::new(LoadedDb { reader, status })));
         tracing::info!(
             path = %path_ref.display(),
             node_count = meta.node_count,

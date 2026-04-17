@@ -36,8 +36,7 @@ use crate::{ChallengeError, Result};
 /// Keeping the list hard-coded and visible makes it auditable:
 /// future `captcha` upgrades that change the font character set
 /// must be paired with a review of this string.
-pub const DEFAULT_ALPHABET: &str =
-    "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ";
+pub const DEFAULT_ALPHABET: &str = "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ";
 
 /// Minimum alphabet length. Below 10 characters the brute-force
 /// search space gets thin (6-char code with a 9-symbol alphabet =

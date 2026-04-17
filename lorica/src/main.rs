@@ -169,41 +169,42 @@ fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
     // static so flushes continue until shutdown; the stdout path
     // uses ANSI colours. Daily rotation with 14-file retention
     // bounds disk usage on unattended installs.
-    let (writer, ansi): (tracing_subscriber::fmt::writer::BoxMakeWriter, bool) =
-        if let Some(path) = log_file {
-            let dir = std::path::Path::new(path)
-                .parent()
-                .unwrap_or(std::path::Path::new("."));
-            let filename = std::path::Path::new(path)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("lorica.log");
-            let appender = tracing_appender::rolling::RollingFileAppender::builder()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix(filename)
-                .max_log_files(14)
-                .build(dir);
-            let appender = match appender {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!(
+    let (writer, ansi): (tracing_subscriber::fmt::writer::BoxMakeWriter, bool) = if let Some(path) =
+        log_file
+    {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("lorica.log");
+        let appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(filename)
+            .max_log_files(14)
+            .build(dir);
+        let appender = match appender {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!(
                         "warning: rolling log appender failed for {path}: {e}; falling back to non-rotating append"
                     );
-                    tracing_appender::rolling::never(dir, filename)
-                }
-            };
-            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-            let _ = LOG_GUARD.set(guard);
-            (
-                tracing_subscriber::fmt::writer::BoxMakeWriter::new(non_blocking),
-                false,
-            )
-        } else {
-            (
-                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout),
-                true,
-            )
+                tracing_appender::rolling::never(dir, filename)
+            }
         };
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let _ = LOG_GUARD.set(guard);
+        (
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(non_blocking),
+            false,
+        )
+    } else {
+        (
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout),
+            true,
+        )
+    };
 
     // JSON and text fmt layers have different concrete types, so
     // the whole subscriber must be built separately in each branch
@@ -238,12 +239,11 @@ fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
             let noop_tracer = opentelemetry::global::tracer("lorica");
             let initial = tracing_opentelemetry::layer().with_tracer(noop_tracer);
             let (otel_bridge, handle) = tracing_subscriber::reload::Layer::new(initial);
-            let hook: Box<
-                dyn Fn(opentelemetry::global::BoxedTracer) + Send + Sync,
-            > = Box::new(move |tracer| {
-                let _ = handle
-                    .modify(|l| *l = tracing_opentelemetry::layer().with_tracer(tracer));
-            });
+            let hook: Box<dyn Fn(opentelemetry::global::BoxedTracer) + Send + Sync> =
+                Box::new(move |tracer| {
+                    let _ =
+                        handle.modify(|l| *l = tracing_opentelemetry::layer().with_tracer(tracer));
+                });
             let _ = lorica::otel::OTEL_RELOAD_HOOK.set(hook);
             subscriber.with(otel_bridge).init();
         }
@@ -264,12 +264,11 @@ fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
             let noop_tracer = opentelemetry::global::tracer("lorica");
             let initial = tracing_opentelemetry::layer().with_tracer(noop_tracer);
             let (otel_bridge, handle) = tracing_subscriber::reload::Layer::new(initial);
-            let hook: Box<
-                dyn Fn(opentelemetry::global::BoxedTracer) + Send + Sync,
-            > = Box::new(move |tracer| {
-                let _ = handle
-                    .modify(|l| *l = tracing_opentelemetry::layer().with_tracer(tracer));
-            });
+            let hook: Box<dyn Fn(opentelemetry::global::BoxedTracer) + Send + Sync> =
+                Box::new(move |tracer| {
+                    let _ =
+                        handle.modify(|l| *l = tracing_opentelemetry::layer().with_tracer(tracer));
+                });
             let _ = lorica::otel::OTEL_RELOAD_HOOK.set(hook);
             subscriber.with(otel_bridge).init();
         }
@@ -3952,10 +3951,7 @@ fn run_single_process(cli: Cli) {
 ///
 /// Errors are logged at `warn!` and swallowed: observability is not
 /// a critical path, so a misconfigured endpoint never blocks startup.
-async fn try_init_otel_from_settings(
-    store: &Arc<Mutex<lorica_config::ConfigStore>>,
-    role: &str,
-) {
+async fn try_init_otel_from_settings(store: &Arc<Mutex<lorica_config::ConfigStore>>, role: &str) {
     let s = store.lock().await;
     let gs = match s.get_global_settings() {
         Ok(gs) => gs,

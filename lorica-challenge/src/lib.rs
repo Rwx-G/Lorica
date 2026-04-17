@@ -135,7 +135,7 @@ impl Mode {
 /// against `203.0.114.0/24`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpPrefix {
-    V4([u8; 4]), // first 3 bytes significant, byte 3 zero-padded
+    V4([u8; 4]),  // first 3 bytes significant, byte 3 zero-padded
     V6([u8; 16]), // first 8 bytes significant, bytes 8..16 zero-padded
 }
 
@@ -231,10 +231,7 @@ mod tests {
         match p {
             IpPrefix::V6(b) => {
                 // First 8 bytes kept.
-                assert_eq!(
-                    &b[..8],
-                    &[0x20, 0x01, 0x0d, 0xb8, 0x85, 0xa3, 0x00, 0x00]
-                );
+                assert_eq!(&b[..8], &[0x20, 0x01, 0x0d, 0xb8, 0x85, 0xa3, 0x00, 0x00]);
                 // Low 8 zeroed.
                 assert_eq!(&b[8..], &[0u8; 8]);
             }

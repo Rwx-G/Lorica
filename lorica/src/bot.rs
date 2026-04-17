@@ -98,10 +98,7 @@ pub enum Pending {
     /// JavaScript PoW: client must find a counter such that
     /// `SHA-256(nonce_hex || counter_decimal)` has `difficulty`
     /// leading zero bits.
-    Pow {
-        nonce_hex: String,
-        difficulty: u8,
-    },
+    Pow { nonce_hex: String, difficulty: u8 },
     /// Image captcha: client must submit the text shown in the
     /// PNG. The PNG bytes are kept here so
     /// [`BotEngine::captcha_image`] can serve them at
@@ -395,9 +392,7 @@ fn from_stash(stash: &lorica_config::BotStashEntry) -> Option<PendingEntry> {
 /// `Challenge` = render the challenge page.
 #[derive(Debug, Clone)]
 pub enum Decision {
-    Pass {
-        reason: PassReason,
-    },
+    Pass { reason: PassReason },
     Challenge,
 }
 
@@ -546,8 +541,7 @@ pub fn evaluate(inputs: &EvalInputs<'_>) -> Decision {
                 // across routes or across NAT gateways (cf. § 4.2 in
                 // the design doc).
                 let expected_route_bytes = route_id_bytes(inputs.route_id);
-                if payload.route_id == expected_route_bytes
-                    && payload.ip_prefix == expected_prefix
+                if payload.route_id == expected_route_bytes && payload.ip_prefix == expected_prefix
                 {
                     // Seed the cache so the next request on the same
                     // triple short-circuits. Store the cookie's own
@@ -648,9 +642,10 @@ pub fn evaluate(inputs: &EvalInputs<'_>) -> Decision {
     //    choice is to pass (the operator opted into "only these
     //    countries" which implies "the rest are trusted").
     if let Some(only) = inputs.config.only_country.as_ref() {
-        let matches = inputs.country.as_deref().is_some_and(|c| {
-            only.iter().any(|oc| oc.eq_ignore_ascii_case(c))
-        });
+        let matches = inputs
+            .country
+            .as_deref()
+            .is_some_and(|c| only.iter().any(|oc| oc.eq_ignore_ascii_case(c)));
         if !matches {
             return Decision::Pass {
                 reason: PassReason::OnlyCountryGateMiss,
@@ -752,12 +747,7 @@ fn verdict_cache_key(route_id: &str, ip_prefix: &IpPrefix, cookie: &str) -> Stri
 /// verify's `cache_insert` does not touch the stale slot; the FIFO
 /// reclaim will catch it eventually).
 #[doc(hidden)]
-pub fn cache_check(
-    route_id: &str,
-    ip_prefix: &IpPrefix,
-    cookie: &str,
-    now: i64,
-) -> Option<i64> {
+pub fn cache_check(route_id: &str, ip_prefix: &IpPrefix, cookie: &str, now: i64) -> Option<i64> {
     let key = verdict_cache_key(route_id, ip_prefix, cookie);
     let expires = *VERDICT_CACHE.get(&key)?;
     if expires > now {
@@ -772,12 +762,7 @@ pub fn cache_check(
 /// succeeds. The FIFO eviction mirrors forward_auth's implementation
 /// so future cleanup (when both caches move to a shared helper)
 /// stays trivial.
-pub(crate) fn cache_insert(
-    route_id: &str,
-    ip_prefix: &IpPrefix,
-    cookie: &str,
-    expires_at: i64,
-) {
+pub(crate) fn cache_insert(route_id: &str, ip_prefix: &IpPrefix, cookie: &str, expires_at: i64) {
     let key = verdict_cache_key(route_id, ip_prefix, cookie);
     let mut order = VERDICT_ORDER.lock();
     while order.len() >= VERDICT_CACHE_CAP {
@@ -842,22 +827,24 @@ pub async fn rpc_cache_check(
         // delegating to the sync path.
         VerdictCacheEngine::Local => cache_check(route_id, ip_prefix, cookie, now_secs),
         VerdictCacheEngine::Rpc { endpoint, timeout } => {
-            let payload = lorica_command::command::Payload::VerdictLookup(
-                lorica_command::VerdictLookup {
+            let payload =
+                lorica_command::command::Payload::VerdictLookup(lorica_command::VerdictLookup {
                     route_id: key_route,
                     cookie: cookie.to_string(),
-                },
-            );
+                });
             let resp = endpoint
-                .request_rpc(lorica_command::CommandType::VerdictLookup, payload, *timeout)
+                .request_rpc(
+                    lorica_command::CommandType::VerdictLookup,
+                    payload,
+                    *timeout,
+                )
                 .await
                 .ok()?;
             let lorica_command::response::Payload::VerdictResult(v) = resp.payload? else {
                 return None;
             };
             if !v.found
-                || lorica_command::Verdict::from_i32(v.verdict)
-                    != lorica_command::Verdict::Allow
+                || lorica_command::Verdict::from_i32(v.verdict) != lorica_command::Verdict::Allow
             {
                 return None;
             }
@@ -888,8 +875,8 @@ pub async fn rpc_cache_push(
         }
         VerdictCacheEngine::Rpc { endpoint, timeout } => {
             let ttl_ms = ((expires_at - now_secs).max(0) * 1000) as u64;
-            let payload = lorica_command::command::Payload::VerdictPush(
-                lorica_command::VerdictPush {
+            let payload =
+                lorica_command::command::Payload::VerdictPush(lorica_command::VerdictPush {
                     route_id: key_route,
                     cookie: cookie.to_string(),
                     verdict: lorica_command::Verdict::Allow as i32,
@@ -898,8 +885,7 @@ pub async fn rpc_cache_push(
                     // wire payload minimal.
                     response_headers: Vec::<lorica_command::ForwardAuthHeader>::new(),
                     ttl_ms,
-                },
-            );
+                });
             let _ = endpoint
                 .request_rpc(lorica_command::CommandType::VerdictPush, payload, *timeout)
                 .await;
@@ -944,9 +930,7 @@ pub fn extract_verdict_cookie(cookie_header: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lorica_config::models::{
-        BotBypassRules, BotProtectionConfig, BotProtectionMode,
-    };
+    use lorica_config::models::{BotBypassRules, BotProtectionConfig, BotProtectionMode};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn cfg() -> BotProtectionConfig {
@@ -1017,10 +1001,7 @@ mod tests {
         );
         assert_eq!(extract_verdict_cookie("session=xyz"), None);
         // No stray "lorica_bot_verdictX=..." match.
-        assert_eq!(
-            extract_verdict_cookie("lorica_bot_verdictX=abc"),
-            None
-        );
+        assert_eq!(extract_verdict_cookie("lorica_bot_verdictX=abc"), None);
     }
 
     #[test]

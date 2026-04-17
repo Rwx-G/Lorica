@@ -217,7 +217,11 @@ pub async fn update_settings(
                     "otlp_endpoint must start with http:// or https://".into(),
                 ));
             }
-            let after_scheme = if is_https { &trimmed[8..] } else { &trimmed[7..] };
+            let after_scheme = if is_https {
+                &trimmed[8..]
+            } else {
+                &trimmed[7..]
+            };
             if after_scheme.is_empty()
                 || after_scheme.starts_with('/')
                 || after_scheme.starts_with(':')

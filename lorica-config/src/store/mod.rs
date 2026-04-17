@@ -569,10 +569,9 @@ impl ConfigStore {
         // The supervisor's shared-memory `.mmdb` reader (loaded from
         // `GlobalSettings.geoip_db_path`) is the lookup source; a NULL
         // column skips the GeoIP check entirely for that route.
-        let _ = self.conn.execute(
-            "ALTER TABLE routes ADD COLUMN geoip TEXT DEFAULT NULL",
-            [],
-        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE routes ADD COLUMN geoip TEXT DEFAULT NULL", []);
 
         // V35: per-route bot-protection challenge (v1.4.0 Epic 3
         // story 3.3). JSON blob or NULL (feature off by default).

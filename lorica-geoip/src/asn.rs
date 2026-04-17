@@ -66,22 +66,21 @@ impl AsnResolver {
     /// mistakenly loaded as ASN, empty fixture, corrupted file).
     pub fn load_from_path<P: AsRef<Path>>(&self, path: P) -> Result<(), GeoIpError> {
         let path_ref = path.as_ref();
-        let reader =
-            maxminddb::Reader::open_readfile(path_ref).map_err(|e| match e {
-                maxminddb::MaxMindDbError::Io(source) => GeoIpError::Io {
-                    path: path_ref.to_path_buf(),
-                    source,
-                },
-                other => GeoIpError::Parse { source: other },
-            })?;
+        let reader = maxminddb::Reader::open_readfile(path_ref).map_err(|e| match e {
+            maxminddb::MaxMindDbError::Io(source) => GeoIpError::Io {
+                path: path_ref.to_path_buf(),
+                source,
+            },
+            other => GeoIpError::Parse { source: other },
+        })?;
 
         let sanity_probes: &[&str] = &[
-            "8.8.8.8",    // Google (AS15169) — every real ASN DB
-            "1.1.1.1",    // Cloudflare (AS13335) — fallback
+            "8.8.8.8",        // Google (AS15169) — every real ASN DB
+            "1.1.1.1",        // Cloudflare (AS13335) — fallback
             "208.67.222.222", // OpenDNS (AS36692) — second fallback
-            "1.0.0.1",    // MaxMind GeoLite2-ASN-Test fixture hit
-                          // (AS15169 in the open test dataset we
-                          // ship under tests-e2e-docker/fixtures/).
+            "1.0.0.1",        // MaxMind GeoLite2-ASN-Test fixture hit
+                              // (AS15169 in the open test dataset we
+                              // ship under tests-e2e-docker/fixtures/).
         ];
         let any_hit = sanity_probes
             .iter()
@@ -102,7 +101,8 @@ impl AsnResolver {
             build_epoch: meta.build_epoch,
         };
 
-        self.inner.store(Some(Arc::new(LoadedAsnDb { reader, status })));
+        self.inner
+            .store(Some(Arc::new(LoadedAsnDb { reader, status })));
         tracing::info!(
             path = %path_ref.display(),
             node_count = meta.node_count,
@@ -141,10 +141,7 @@ impl Default for AsnResolver {
 /// Module-private lookup helper. Decodes only the
 /// `autonomous_system_number` field — ~2x cheaper than deserialising
 /// the full record and no struct boilerplate to keep in sync.
-fn lookup_asn_inner(
-    reader: &maxminddb::Reader<Vec<u8>>,
-    ip: IpAddr,
-) -> Option<u32> {
+fn lookup_asn_inner(reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> Option<u32> {
     use maxminddb::PathElement;
 
     let result = reader.lookup(ip).ok()?;

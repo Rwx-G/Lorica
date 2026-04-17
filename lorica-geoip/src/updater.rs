@@ -169,10 +169,7 @@ fn build_download_url(template: &str, now: chrono::DateTime<Utc>) -> String {
 /// On any failure, the previously-loaded DB (if any) stays in
 /// `resolver`; the target_path on disk is not touched (partial
 /// downloads land in a temp file that is removed on failure).
-pub async fn run_once(
-    resolver: &dyn MmdbResolver,
-    cfg: &UpdaterConfig,
-) -> Result<(), UpdateError> {
+pub async fn run_once(resolver: &dyn MmdbResolver, cfg: &UpdaterConfig) -> Result<(), UpdateError> {
     let url = build_download_url(&cfg.url_template, Utc::now());
 
     // Enforce HTTPS: the download carries an executable data file
@@ -277,10 +274,7 @@ pub async fn run_once(
     //    target. `tempfile` would be simpler but we deliberately
     //    place the temp alongside the target so `rename` is a
     //    same-filesystem operation (atomic by POSIX guarantee).
-    let parent = cfg
-        .target_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let parent = cfg.target_path.parent().unwrap_or_else(|| Path::new("."));
     let basename = cfg
         .target_path
         .file_name()
@@ -462,11 +456,8 @@ mod tests {
     use std::io::Write as _;
     use std::net::TcpListener;
 
-    fn spawn_mock_server(
-        response: Vec<u8>,
-    ) -> (String, std::thread::JoinHandle<()>) {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").expect("test setup: bind mock HTTP");
+    fn spawn_mock_server(response: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test setup: bind mock HTTP");
         let addr = listener.local_addr().expect("test setup: local_addr");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = match listener.accept() {

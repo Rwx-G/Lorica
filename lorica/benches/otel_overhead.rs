@@ -126,5 +126,9 @@ fn bench_full_request_traceparent(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_traceparent_parse, bench_full_request_traceparent);
+criterion_group!(
+    benches,
+    bench_traceparent_parse,
+    bench_full_request_traceparent
+);
 criterion_main!(benches);

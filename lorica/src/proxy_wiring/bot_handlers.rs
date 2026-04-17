@@ -36,8 +36,8 @@ use lorica_proxy::Session;
 use tracing::{debug, info, warn};
 
 use crate::bot::{
-    route_id_bytes, BotEngine, Pending, PendingEntry, BOT_CAPTCHA_PATH_PREFIX,
-    BOT_SOLVE_PATH, VERDICT_COOKIE_NAME,
+    route_id_bytes, BotEngine, Pending, PendingEntry, BOT_CAPTCHA_PATH_PREFIX, BOT_SOLVE_PATH,
+    VERDICT_COOKIE_NAME,
 };
 
 /// Upper bound on the POST body we read on `/lorica/bot/solve`.
@@ -102,8 +102,12 @@ pub async fn handle_solve(
     // across NAT gateways (cf. design doc § 4.2).
     let now_prefix = IpPrefix::from_ip(client_ip);
     if now_prefix != entry.ip_prefix {
-        return write_plain(session, 403, "client network changed since challenge was issued")
-            .await;
+        return write_plain(
+            session,
+            403,
+            "client network changed since challenge was issued",
+        )
+        .await;
     }
 
     // Dispatch by mode.
@@ -136,18 +140,10 @@ pub async fn handle_solve(
 
     if let Err(e) = verdict {
         debug!(error = ?e, "bot-solve: verify failed");
-        lorica_api::metrics::inc_bot_challenge(
-            &entry.route_id,
-            entry.mode.as_str(),
-            "failed",
-        );
+        lorica_api::metrics::inc_bot_challenge(&entry.route_id, entry.mode.as_str(), "failed");
         return write_plain(session, 403, "wrong answer").await;
     }
-    lorica_api::metrics::inc_bot_challenge(
-        &entry.route_id,
-        entry.mode.as_str(),
-        "passed",
-    );
+    lorica_api::metrics::inc_bot_challenge(&entry.route_id, entry.mode.as_str(), "passed");
 
     // Success: mint verdict cookie bound to the stashed route_id
     // and IP prefix. Use the stashed cookie_ttl_s so a per-route
@@ -188,7 +184,9 @@ pub async fn handle_solve(
     session
         .write_response_header(Box::new(header), false)
         .await?;
-    session.write_response_body(Some(Bytes::new()), true).await?;
+    session
+        .write_response_body(Some(Bytes::new()), true)
+        .await?;
     Ok(true)
 }
 
@@ -215,7 +213,9 @@ pub async fn handle_captcha_image(
     session
         .write_response_header(Box::new(header), false)
         .await?;
-    session.write_response_body(Some(Bytes::from(png)), true).await?;
+    session
+        .write_response_body(Some(Bytes::from(png)), true)
+        .await?;
     Ok(true)
 }
 
@@ -331,8 +331,8 @@ pub async fn serve_challenge(
 
         BotProtectionMode::Javascript => {
             let nonce_hex = engine.fresh_nonce();
-            let raw = hex_to_16_bytes(&nonce_hex)
-                .expect("fresh_nonce returns a 32-char hex string");
+            let raw =
+                hex_to_16_bytes(&nonce_hex).expect("fresh_nonce returns a 32-char hex string");
             let challenge = pow::Challenge {
                 nonce: raw,
                 difficulty: cfg.pow_difficulty,
@@ -385,12 +385,7 @@ pub async fn serve_challenge(
 
             let nonce = engine.fresh_nonce();
             let image_url = format!("{BOT_CAPTCHA_PATH_PREFIX}{nonce}");
-            let html = chrender::render_captcha_page(
-                &image_url,
-                BOT_SOLVE_PATH,
-                &nonce,
-                None,
-            );
+            let html = chrender::render_captcha_page(&image_url, BOT_SOLVE_PATH, &nonce, None);
 
             engine
                 .insert(
@@ -573,11 +568,7 @@ fn build_set_cookie_header(value: &str, max_age_s: u32) -> String {
 /// Cheap shared path for small status responses (405 / 400 / 403 /
 /// 404 / 413 / 503 / plaintext). Kept private because every caller
 /// uses a literal status + message.
-async fn write_plain(
-    session: &mut Session,
-    status: u16,
-    msg: &str,
-) -> lorica_core::Result<bool> {
+async fn write_plain(session: &mut Session, status: u16, msg: &str) -> lorica_core::Result<bool> {
     let mut header = ResponseHeader::build(status, None)?;
     header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
     header.insert_header("Content-Length", msg.len().to_string())?;
@@ -667,7 +658,9 @@ mod tests {
     #[test]
     fn accept_html_detection() {
         assert!(accept_prefers_html(Some("text/html")));
-        assert!(accept_prefers_html(Some("text/html,application/xhtml+xml,*/*;q=0.8")));
+        assert!(accept_prefers_html(Some(
+            "text/html,application/xhtml+xml,*/*;q=0.8"
+        )));
         assert!(accept_prefers_html(Some("application/xhtml+xml")));
         assert!(!accept_prefers_html(Some("application/json")));
         assert!(!accept_prefers_html(Some("*/*")));
@@ -686,8 +679,10 @@ mod tests {
 
     #[test]
     fn hex_16_roundtrip() {
-        let raw: [u8; 16] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                             0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10];
+        let raw: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
         let hex = "0102030405060708090a0b0c0d0e0f10";
         assert_eq!(hex_to_16_bytes(hex), Some(raw));
         // Wrong length.

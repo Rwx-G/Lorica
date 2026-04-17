@@ -92,9 +92,8 @@ pub struct Payload {
 /// the HMAC manually (e.g. a future multi-region Lorica that
 /// cross-signs cookies).
 pub fn encode_payload(p: &Payload) -> crate::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(
-        PAYLOAD_PREFIX_LEN + p.ip_prefix.as_bytes().len() + PAYLOAD_SUFFIX_LEN,
-    );
+    let mut out =
+        Vec::with_capacity(PAYLOAD_PREFIX_LEN + p.ip_prefix.as_bytes().len() + PAYLOAD_SUFFIX_LEN);
     out.extend_from_slice(&p.route_id);
     out.push(p.ip_prefix.discriminator());
     out.extend_from_slice(p.ip_prefix.as_bytes());
@@ -148,8 +147,7 @@ pub fn verify(cookie: &str, secret: &[u8; 32], now: i64) -> Result<Payload> {
             ))
         }
     };
-    let expected_len =
-        PAYLOAD_PREFIX_LEN + ip_bytes_len + PAYLOAD_SUFFIX_LEN + TAG_LEN;
+    let expected_len = PAYLOAD_PREFIX_LEN + ip_bytes_len + PAYLOAD_SUFFIX_LEN + TAG_LEN;
     if wire.len() != expected_len {
         return Err(ChallengeError::Malformed(
             "cookie length does not match IP discriminator",
@@ -219,8 +217,8 @@ fn hmac_tag(secret: &[u8; 32], bytes: &[u8]) -> [u8; TAG_LEN] {
     // direct copy into the inner / outer pad. Panic surface:
     // `Hmac::new_from_slice` only errors on key length issues,
     // which is impossible here since the key type is fixed-size.
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
     mac.update(bytes);
     let full = mac.finalize().into_bytes();
     let mut out = [0u8; TAG_LEN];

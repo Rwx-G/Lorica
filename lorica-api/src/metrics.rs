@@ -466,9 +466,15 @@ pub fn snapshot_per_worker_counters() -> Vec<GenericCounterTuple> {
     use prometheus::core::Collector;
 
     let vecs: [(&str, &IntCounterVec); 7] = [
-        ("lorica_cache_predictor_bypass_total", &CACHE_PREDICTOR_BYPASS_TOTAL),
+        (
+            "lorica_cache_predictor_bypass_total",
+            &CACHE_PREDICTOR_BYPASS_TOTAL,
+        ),
         ("lorica_header_rule_match_total", &HEADER_RULE_MATCH_TOTAL),
-        ("lorica_canary_split_selected_total", &CANARY_SPLIT_SELECTED_TOTAL),
+        (
+            "lorica_canary_split_selected_total",
+            &CANARY_SPLIT_SELECTED_TOTAL,
+        ),
         ("lorica_mirror_outcome_total", &MIRROR_OUTCOME_TOTAL),
         ("lorica_forward_auth_cache_total", &FORWARD_AUTH_CACHE_TOTAL),
         ("lorica_geoip_block_total", &GEOIP_BLOCK_TOTAL),
@@ -518,10 +524,7 @@ static SUPERVISOR_GENERIC_SNAPSHOT: Lazy<
 /// receives a POSITIVE delta only: a dropped worker's state stays
 /// in the last scrape until another `MetricsReport` arrives or a
 /// `forget_worker` call removes it.
-pub fn apply_worker_generic_counters(
-    worker_id: u32,
-    entries: &[GenericCounterTuple],
-) {
+pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTuple]) {
     // Registered label order for each per-worker counter vec.
     // MUST match the `&[...]` passed to `IntCounterVec::new` at
     // the corresponding `Lazy::new` above. The apply path walks
@@ -1007,7 +1010,10 @@ mod tests {
         let v = BOT_CHALLENGE_TOTAL
             .with_label_values(&["agg-test-rt", "cookie", "shown"])
             .get();
-        assert_eq!(v, 9, "regressed snapshot must not decrement supervisor counter");
+        assert_eq!(
+            v, 9,
+            "regressed snapshot must not decrement supervisor counter"
+        );
 
         // Forgetting worker 2 clears its snapshot — but the
         // supervisor counter stays where it is (Prometheus
@@ -1045,10 +1051,12 @@ mod tests {
         inc_bot_challenge("snapshot-test", "javascript", "passed");
         let snap = snapshot_per_worker_counters();
         let hit = snap.iter().find(|(n, pairs, _)| {
-            n == "lorica_bot_challenge_total"
-                && pairs.iter().any(|(_, v)| v == "snapshot-test")
+            n == "lorica_bot_challenge_total" && pairs.iter().any(|(_, v)| v == "snapshot-test")
         });
-        assert!(hit.is_some(), "incremented counter should appear in snapshot");
+        assert!(
+            hit.is_some(),
+            "incremented counter should appear in snapshot"
+        );
         // None of the entries should have value 0 — that's the
         // skip-zero-entries guard.
         for (_, _, v) in &snap {

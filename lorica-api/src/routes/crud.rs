@@ -184,8 +184,7 @@ fn validate_bot_protection(
                 "bot_protection.bypass.ip_cidrs: empty entry".into(),
             ));
         }
-        if trimmed.parse::<ipnet::IpNet>().is_err()
-            && trimmed.parse::<std::net::IpAddr>().is_err()
+        if trimmed.parse::<ipnet::IpNet>().is_err() && trimmed.parse::<std::net::IpAddr>().is_err()
         {
             return Err(ApiError::BadRequest(format!(
                 "bot_protection.bypass.ip_cidrs: '{trimmed}' is not a valid IP or CIDR"
@@ -205,8 +204,7 @@ fn validate_bot_protection(
     for n in &cfg.bypass.asns {
         if *n == 0 {
             return Err(ApiError::BadRequest(
-                "bot_protection.bypass.asns: 0 is not a valid ASN (IANA reserves 0)"
-                    .into(),
+                "bot_protection.bypass.asns: 0 is not a valid ASN (IANA reserves 0)".into(),
             ));
         }
     }
@@ -300,9 +298,7 @@ fn validate_bot_protection(
             let mut normalised: Vec<String> = Vec::with_capacity(list.len());
             for raw in list {
                 let trimmed = raw.trim();
-                if trimmed.len() != 2
-                    || !trimmed.chars().all(|c| c.is_ascii_alphabetic())
-                {
+                if trimmed.len() != 2 || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
                     return Err(ApiError::BadRequest(format!(
                         "bot_protection.only_country: '{trimmed}' is not a valid ISO \
                          3166-1 alpha-2 code"
@@ -539,17 +535,14 @@ mod geoip_validation_tests {
 #[cfg(test)]
 mod bot_protection_validation_tests {
     use super::*;
-    use lorica_config::models::{
-        BotBypassRules, BotProtectionConfig, BotProtectionMode,
-    };
+    use lorica_config::models::{BotBypassRules, BotProtectionConfig, BotProtectionMode};
 
     fn baseline() -> BotProtectionConfig {
         BotProtectionConfig {
             mode: BotProtectionMode::Javascript,
             cookie_ttl_s: 86_400,
             pow_difficulty: 18,
-            captcha_alphabet:
-                "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ".to_string(),
+            captcha_alphabet: "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ".to_string(),
             bypass: BotBypassRules::default(),
             only_country: None,
         }
@@ -767,7 +760,10 @@ mod bot_protection_validation_tests {
         let mut c = baseline();
         c.only_country = Some(vec!["fr".to_string(), "DE".to_string()]);
         let out = validate_bot_protection(&c).unwrap();
-        assert_eq!(out.only_country, Some(vec!["FR".to_string(), "DE".to_string()]));
+        assert_eq!(
+            out.only_country,
+            Some(vec!["FR".to_string(), "DE".to_string()])
+        );
     }
 
     #[test]

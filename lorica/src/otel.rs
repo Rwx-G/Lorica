@@ -89,10 +89,7 @@ impl TraceParent {
 
     /// Render back to the wire format (version `00`).
     pub fn to_header_value(&self) -> String {
-        format!(
-            "00-{}-{}-{:02x}",
-            self.trace_id, self.parent_id, self.flags
-        )
+        format!("00-{}-{}-{:02x}", self.trace_id, self.parent_id, self.flags)
     }
 
     /// Derive a new traceparent that shares the same trace_id but
@@ -277,7 +274,9 @@ mod imp {
 
         // Tear down any previous provider under the same lock so two
         // concurrent reloads cannot leak exporters.
-        let mut slot = PROVIDER.lock().map_err(|e| format!("otel mutex poisoned: {e}"))?;
+        let mut slot = PROVIDER
+            .lock()
+            .map_err(|e| format!("otel mutex poisoned: {e}"))?;
         if let Some(old) = slot.take() {
             let _ = old.shutdown();
         }
@@ -379,7 +378,6 @@ mod imp {
             let _ = provider.shutdown();
         }
     }
-
 }
 
 #[cfg(not(feature = "otel"))]
@@ -493,17 +491,28 @@ mod tests {
     #[test]
     fn traceparent_rejects_malformed() {
         // Wrong version
-        assert!(TraceParent::parse("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none());
+        assert!(
+            TraceParent::parse("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none()
+        );
         // Short trace_id
         assert!(TraceParent::parse("00-4bf92f3577b34da6a3ce-00f067aa0ba902b7-01").is_none());
         // Non-hex char in parent_id
-        assert!(TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0bXX02b7-01").is_none());
+        assert!(
+            TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0bXX02b7-01").is_none()
+        );
         // All-zero trace_id (reserved)
-        assert!(TraceParent::parse("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none());
+        assert!(
+            TraceParent::parse("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none()
+        );
         // All-zero parent_id (reserved)
-        assert!(TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01").is_none());
+        assert!(
+            TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01").is_none()
+        );
         // Extra fields (future versions not supported)
-        assert!(TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-ff").is_none());
+        assert!(
+            TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-ff")
+                .is_none()
+        );
         // Empty
         assert!(TraceParent::parse("").is_none());
     }
@@ -554,10 +563,19 @@ mod tests {
     #[test]
     fn otlp_protocol_round_trip() {
         assert_eq!(OtlpProtocol::from_settings("grpc"), OtlpProtocol::Grpc);
-        assert_eq!(OtlpProtocol::from_settings("http-proto"), OtlpProtocol::HttpProto);
-        assert_eq!(OtlpProtocol::from_settings("http-json"), OtlpProtocol::HttpJson);
+        assert_eq!(
+            OtlpProtocol::from_settings("http-proto"),
+            OtlpProtocol::HttpProto
+        );
+        assert_eq!(
+            OtlpProtocol::from_settings("http-json"),
+            OtlpProtocol::HttpJson
+        );
         // Unknown falls back to http-proto (API validation rejects bad values anyway).
-        assert_eq!(OtlpProtocol::from_settings("bogus"), OtlpProtocol::HttpProto);
+        assert_eq!(
+            OtlpProtocol::from_settings("bogus"),
+            OtlpProtocol::HttpProto
+        );
         assert_eq!(OtlpProtocol::Grpc.as_str(), "grpc");
         assert_eq!(OtlpProtocol::HttpProto.as_str(), "http-proto");
         assert_eq!(OtlpProtocol::HttpJson.as_str(), "http-json");

@@ -237,10 +237,7 @@ mod tests {
 
     #[test]
     fn suffix_matches_multiple_patterns() {
-        let suffixes = vec![
-            "googlebot.com".to_string(),
-            "search.msn.com".to_string(),
-        ];
+        let suffixes = vec!["googlebot.com".to_string(), "search.msn.com".to_string()];
         assert!(suffix_matches("msnbot.search.msn.com", &suffixes));
         // `google.com` is not in the suffix list — must not match
         // even though it looks like it could belong to Google.

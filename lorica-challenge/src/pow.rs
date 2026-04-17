@@ -271,8 +271,7 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_length_nonce() {
         // 30 hex chars -> 15 bytes, one short of NONCE_LEN.
-        let err = verify_solution("aabbccddeeff00112233445566778", 0, 100, 14, 200)
-            .unwrap_err();
+        let err = verify_solution("aabbccddeeff00112233445566778", 0, 100, 14, 200).unwrap_err();
         assert!(matches!(err, ChallengeError::Malformed(_)), "{err:?}");
     }
 

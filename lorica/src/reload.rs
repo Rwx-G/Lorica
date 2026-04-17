@@ -145,9 +145,8 @@ pub async fn apply_supervisor_settings_from_store(store: &Arc<Mutex<ConfigStore>
 /// landed file from disk via their own `apply_*_settings_from_store`
 /// hooks, which keeps the data plane in sync without a manual
 /// dashboard save or process restart.
-static SUPERVISOR_RELOAD_TRIGGER: once_cell::sync::OnceCell<
-    tokio::sync::watch::Sender<u64>,
-> = once_cell::sync::OnceCell::new();
+static SUPERVISOR_RELOAD_TRIGGER: once_cell::sync::OnceCell<tokio::sync::watch::Sender<u64>> =
+    once_cell::sync::OnceCell::new();
 
 /// Called once at supervisor boot with the same `watch::Sender` that
 /// the API uses for `notify_config_changed`. Subsequent calls are
@@ -487,10 +486,7 @@ fn apply_auto_update_flip<R: Send + Sync + 'static>(
     url_template: &'static str,
     resolver: Arc<R>,
     log_tag: &'static str,
-    spawn_fn: fn(
-        Arc<R>,
-        lorica_geoip::updater::UpdaterConfig,
-    ) -> tokio::task::JoinHandle<()>,
+    spawn_fn: fn(Arc<R>, lorica_geoip::updater::UpdaterConfig) -> tokio::task::JoinHandle<()>,
 ) {
     let mut guard = slot.lock();
     let should_run = enabled && path.is_some();
@@ -586,7 +582,9 @@ pub(crate) async fn apply_otel_settings_from_store(store: &Arc<Mutex<ConfigStore
                     sampling_ratio = cfg.sampling_ratio,
                     "OpenTelemetry tracing reloaded from settings"
                 ),
-                Err(e) => warn!(error = %e, "OpenTelemetry reload failed; previous provider stays live"),
+                Err(e) => {
+                    warn!(error = %e, "OpenTelemetry reload failed; previous provider stays live")
+                }
             }
         }
         (Some(_), None) => {
