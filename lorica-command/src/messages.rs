@@ -837,6 +837,7 @@ mod tests {
             backend_conn_entries: Vec::new(),
             request_entries: Vec::new(),
             waf_entries: Vec::new(),
+            generic_counters: Vec::new(),
         };
         let encoded = report.encode_to_vec();
         let decoded = MetricsReport::decode(&encoded[..]).expect("decode failed");

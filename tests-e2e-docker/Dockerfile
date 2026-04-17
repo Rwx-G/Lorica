@@ -1,10 +1,15 @@
 # Stage 1: Build frontend
+# Lorica's canonical package manager is pnpm (see CLAUDE.md); the
+# npm package-lock.json drifts because dep bumps only refresh
+# pnpm-lock.yaml. Using pnpm here keeps the e2e image in sync with
+# the local dev build and the .deb build flow.
 FROM node:22-slim AS frontend
+RUN npm install -g pnpm@10
 WORKDIR /app/lorica-dashboard/frontend
-COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/package-lock.json* ./
-RUN npm ci
+COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 COPY lorica-dashboard/frontend/ ./
-RUN npm run build
+RUN pnpm run build
 
 # Stage 2: Build Rust binary
 FROM rust:1-bookworm AS builder
