@@ -206,22 +206,15 @@
     <span class="hint">Routes returning clients to the same backend via a cookie (LORICA_SRV). Useful for stateful applications.</span>
   </div>
 
-  <div class="form-group" class:modified={isModified('maintenance_mode')}>
-    <label class="checkbox-item">
-      <input type="checkbox" bind:checked={form.maintenance_mode} />
-      <span>Maintenance mode</span>
-    </label>
-    <span class="hint">Returns 503 with Retry-After header. Uses custom error page HTML if configured.</span>
-  </div>
-
-  {#if form.maintenance_mode || form.error_page_html}
   <div class="form-group" class:modified={isModified('error_page_html')}>
     <label for="error-page-html">Custom error page HTML</label>
     <textarea id="error-page-html" rows="6" bind:value={form.error_page_html}
       placeholder={'<html><body><h1>{{status}}</h1><p>{{message}}</p></body></html>'}></textarea>
-    <span class="hint">Used for maintenance 503 and upstream errors (502/504). Placeholders: {"{{status}}"}, {"{{message}}"}</span>
+    <span class="hint">
+      Rendered for maintenance 503 (toggle from the Routes list) and upstream
+      errors (502/504). Placeholders: {"{{status}}"}, {"{{message}}"}
+    </span>
   </div>
-  {/if}
 </div>
 
 <style>

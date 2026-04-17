@@ -90,7 +90,6 @@ export interface RouteFormState {
   stale_while_revalidate_s: number;
   stale_if_error_s: number;
   retry_on_methods: string;
-  maintenance_mode: boolean;
   error_page_html: string;
   cache_vary_headers: string;
   header_rules: HeaderRuleFormState[];
@@ -192,7 +191,6 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   stale_while_revalidate_s: 10,
   stale_if_error_s: 60,
   retry_on_methods: '',
-  maintenance_mode: false,
   error_page_html: '',
   cache_vary_headers: '',
   header_rules: [],
@@ -234,7 +232,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   general: [
     'hostname', 'path_prefix', 'force_https', 'redirect_hostname', 'redirect_to',
     'hostname_aliases', 'websocket_enabled', 'access_log_enabled',
-    'compression_enabled', 'waf_enabled', 'return_status', 'sticky_session', 'maintenance_mode', 'error_page_html',
+    'compression_enabled', 'waf_enabled', 'return_status', 'sticky_session', 'error_page_html',
   ],
   timeouts: [
     'connect_timeout_s', 'read_timeout_s', 'send_timeout_s',
@@ -386,7 +384,6 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     stale_while_revalidate_s: route.stale_while_revalidate_s ?? 10,
     stale_if_error_s: route.stale_if_error_s ?? 60,
     retry_on_methods: (route.retry_on_methods ?? []).join(', '),
-    maintenance_mode: route.maintenance_mode ?? false,
     error_page_html: route.error_page_html ?? '',
     cache_vary_headers: (route.cache_vary_headers ?? []).join(', '),
     header_rules: (route.header_rules ?? []).map((r) => ({
@@ -612,7 +609,11 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     stale_while_revalidate_s: form.stale_while_revalidate_s,
     stale_if_error_s: form.stale_if_error_s,
     retry_on_methods: csvToArray(form.retry_on_methods).length > 0 ? csvToArray(form.retry_on_methods) : empty([]),
-    maintenance_mode: form.maintenance_mode,
+    // maintenance_mode is deliberately NOT sent from the drawer: it is
+    // toggled from the Routes list (inline button) so the drawer is not
+    // authoritative. Omitting the field keeps the backend's "missing =
+    // no-op" contract, so a stale-form save cannot overwrite a freshly-
+    // toggled value.
     error_page_html: form.error_page_html || undefined,
     cache_vary_headers: tokenListToArray(form.cache_vary_headers).length > 0
       ? tokenListToArray(form.cache_vary_headers)

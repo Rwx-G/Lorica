@@ -42,6 +42,28 @@
   // Delete state
   let deletingRoute: RouteResponse | null = $state(null);
 
+  // Prevents a double-click from firing two PUTs before the list reloads.
+  let togglingRouteId: string | null = $state(null);
+
+  async function toggleMaintenance(route: RouteResponse) {
+    if (togglingRouteId === route.id) return;
+    togglingRouteId = route.id;
+    const next = !route.maintenance_mode;
+    const res = await api.updateRoute(route.id, { maintenance_mode: next });
+    if (res.error) {
+      showToast(`Failed to toggle maintenance: ${res.error.message}`, 'error');
+    } else {
+      showToast(
+        next
+          ? `Maintenance ON for ${route.hostname}${route.path_prefix}`
+          : `Maintenance OFF for ${route.hostname}${route.path_prefix}`,
+        'success',
+      );
+    }
+    togglingRouteId = null;
+    await loadData();
+  }
+
   async function loadData() {
     loading = true;
     error = '';
@@ -186,11 +208,14 @@
         </thead>
         <tbody>
           {#each filteredRoutes as route (route.id)}
-            <tr>
+            <tr class:row-maintenance={route.maintenance_mode}>
               <td class="hostname">
                 {route.hostname}
                 {#if route.hostname_aliases.length > 0}
                   <span class="alias-badge" title={route.hostname_aliases.join(', ')}>+{route.hostname_aliases.length}</span>
+                {/if}
+                {#if route.maintenance_mode}
+                  <span class="maintenance-badge" title="Route is in maintenance: all requests return 503">MAINT</span>
                 {/if}
               </td>
               <td class="mono">{route.path_prefix}</td>
@@ -225,6 +250,18 @@
                 <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => openEditForm(route)}>
                   <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html editIcon}
+                </button>
+                <button
+                  class="btn-icon btn-icon-maintenance"
+                  class:active={route.maintenance_mode}
+                  title={route.maintenance_mode ? 'Disable maintenance mode' : 'Enable maintenance mode (returns 503 to all requests)'}
+                  aria-label={route.maintenance_mode ? 'Disable maintenance' : 'Enable maintenance'}
+                  aria-pressed={route.maintenance_mode}
+                  disabled={togglingRouteId === route.id}
+                  onclick={() => toggleMaintenance(route)}
+                >
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                  {@html wrenchIcon}
                 </button>
                 <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => { deletingRoute = route; }}>
                   <!-- eslint-disable-next-line svelte/no-at-html-tags -->
@@ -266,6 +303,7 @@
 <script lang="ts" module>
   const editIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
   const trashIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+  const wrenchIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>';
 </script>
 
 <style>
@@ -342,5 +380,33 @@
 
   .enabled-indicator.off {
     color: var(--color-text-muted);
+  }
+
+  /* Whole-row visual: tint + left border accent so the operator
+     sees at a glance which routes are serving 503. Applies to every
+     <td> so the background covers the full row edge-to-edge even
+     when individual cells set their own backgrounds. */
+  tr.row-maintenance td {
+    background: var(--color-orange-subtle, rgba(255, 170, 0, 0.08));
+  }
+  tr.row-maintenance td:first-child {
+    box-shadow: inset 3px 0 0 0 var(--color-orange, #f59e0b);
+  }
+
+  .maintenance-badge {
+    display: inline-block;
+    padding: 0.125rem 0.5rem;
+    margin-left: var(--space-2);
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    background: var(--color-orange-subtle);
+    color: var(--color-orange);
+    cursor: help;
+  }
+
+  .btn-icon-maintenance.active {
+    color: var(--color-orange);
   }
 </style>
