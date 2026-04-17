@@ -1506,6 +1506,7 @@ impl LoricaProxy {
                             connection_filter.as_ref(),
                             &gate,
                             worker_id,
+                            &store,
                         )
                         .await;
                     }
@@ -1787,6 +1788,7 @@ async fn handle_config_reload_commit(
     connection_filter: Option<&Arc<crate::connection_filter::GlobalConnectionFilter>>,
     gate: &Arc<lorica_command::GenerationGate>,
     worker_id: u32,
+    store: &Arc<tokio::sync::Mutex<lorica_config::ConfigStore>>,
 ) {
     let commit = match inc.command().payload.clone() {
         Some(lorica_command::command::Payload::ConfigReloadCommit(c)) => c,
@@ -1840,6 +1842,18 @@ async fn handle_config_reload_commit(
                 generation = commit.generation,
                 "ConfigReloadCommit: pending config swapped in"
             );
+            // Apply the per-process resolver hooks so the worker's
+            // GeoIP / ASN / OTel / bot-HMAC state stays in sync with
+            // the supervisor on every commit. Without these calls,
+            // the pipelined RPC reload would only swap the proxy
+            // config, leaving stale resolver state until a process
+            // restart - which is the issue that caused
+            // freshly-downloaded `.mmdb` files to never become
+            // visible to worker lookups.
+            crate::reload::apply_otel_settings_from_store(store).await;
+            crate::reload::apply_geoip_settings_from_store(store).await;
+            crate::reload::apply_asn_settings_from_store(store).await;
+            crate::reload::apply_bot_secret_from_store(store).await;
             let _ = inc.reply(lorica_command::Response::ok(0)).await;
         }
         None => {

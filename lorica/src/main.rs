@@ -587,39 +587,28 @@ fn run_supervisor(cli: Cli) {
 
         try_init_otel_from_settings(&store, "supervisor").await;
 
-        // Supervisor-side GeoIP auto-update. Workers load the `.mmdb`
-        // from disk at fork and keep their own copy (see the
+        // Supervisor-side GeoIP / ASN state. Workers load the `.mmdb`
+        // files from disk at fork and keep their own copy (see the
         // corresponding block in `run_worker`), so the supervisor's
-        // job here is to keep the on-disk file fresh. Workers pick up
-        // the refreshed copy on restart; a future `ReloadGeoIp`
-        // broadcast command could also live-reload, but v1.4.0 scopes
-        // that as a follow-up.
-        {
-            let s = store.lock().await;
-            if let Ok(settings) = s.get_global_settings() {
-                let path = settings.geoip_db_path.clone();
-                let auto_update = settings.geoip_auto_update_enabled;
-                drop(s);
-                if let Some(ref p) = path {
-                    if !p.trim().is_empty() && auto_update {
-                        let cfg = lorica_geoip::updater::UpdaterConfig::new(p.clone());
-                        // Dedicated resolver for the supervisor's use
-                        // only (sanity-checks the download before
-                        // writing to disk). Not shared with any
-                        // worker — each worker has its own resolver
-                        // bound to its own reader.
-                        let resolver = std::sync::Arc::new(
-                            lorica_geoip::GeoIpResolver::empty(),
-                        );
-                        let _handle = lorica_geoip::updater::spawn_updater(resolver, cfg);
-                        info!(
-                            path = %p,
-                            "supervisor: GeoIP auto-update task spawned"
-                        );
-                    }
-                }
-            }
-        }
+        // job here is to keep the on-disk files fresh via the auto-
+        // update task AND to expose a registered resolver handle so
+        // the config-reload hook can spawn / abort the updater on
+        // `*_auto_update_enabled` toggles from the dashboard.
+        //
+        // The actual spawn happens inside `apply_geoip_settings_from_store`
+        // / `apply_asn_settings_from_store` (called from the first
+        // `reload_proxy_config` below), which reads the persisted
+        // flag and starts the updater when it is true. This unifies
+        // the boot-time path with the runtime hot-reload path so the
+        // two can never drift.
+        let supervisor_geoip = std::sync::Arc::new(lorica_geoip::GeoIpResolver::empty());
+        let supervisor_asn = std::sync::Arc::new(lorica_geoip::AsnResolver::empty());
+        lorica::geoip::set_handle(std::sync::Arc::clone(&supervisor_geoip));
+        lorica::geoip::set_asn_handle(std::sync::Arc::clone(&supervisor_asn));
+        // `apply_supervisor_settings_from_store` boot call happens
+        // below, AFTER `register_supervisor_reload_trigger`, so the
+        // "is_supervisor" guard in `apply_auto_update_flip` sees the
+        // trigger in place and allows the spawn.
 
         // UDS log stream: workers send access logs in real-time to the supervisor
         let log_sock_path = data_dir.join("log.sock");
@@ -703,6 +692,20 @@ fn run_supervisor(cli: Cli) {
         let reload_bc_tx_clone = reload_bc_tx.clone();
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
 
+        // Register the watch sender with the reload module so the
+        // GeoIP / ASN auto-update task can bump it after every
+        // successful download. That triggers the worker reload
+        // coordinator below, which makes the freshly-downloaded
+        // .mmdb visible to the data plane without a manual save.
+        lorica::reload::register_supervisor_reload_trigger(config_reload_tx.clone());
+
+        // Fire the hot-reload path once at boot so the updater
+        // tasks spawn if `*_auto_update_enabled` is persisted true.
+        // Must run AFTER `register_supervisor_reload_trigger` above
+        // so the supervisor-guard in `apply_auto_update_flip` lets
+        // the spawn through.
+        lorica::reload::apply_supervisor_settings_from_store(&store).await;
+
         // Per-worker RPC endpoint table. Used by the config-reload
         // coordinator (§ 7 WPAR-8) to fan out `ConfigReloadPrepare`
         // and `ConfigReloadCommit` in two phases. Each worker's spawn
@@ -741,8 +744,20 @@ fn run_supervisor(cli: Cli) {
         let endpoints_for_reload = Arc::clone(&worker_rpc_endpoints);
         let reload_generation_clone = Arc::clone(&reload_generation);
         let rl_policy_for_reload = Arc::clone(&rl_policy_cache);
+        let supervisor_reload_store = Arc::clone(&store);
         tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
+                // Apply the per-process hot-reload hooks (GeoIP / ASN
+                // updater task lifecycle, OTel exporter, bot HMAC
+                // secret) on the SUPERVISOR side. Worker reload runs
+                // independently via the RPC two-phase coordinator
+                // below. Without this call, supervisor-side state
+                // (auto-update task spawn / abort, OTel exporter)
+                // would only refresh at boot time.
+                lorica::reload::apply_supervisor_settings_from_store(
+                    &supervisor_reload_store,
+                )
+                .await;
                 let seq = bridge_seq.fetch_add(1, Ordering::Relaxed);
                 // Two-phase RPC reload (WPAR-8) when any worker has a
                 // registered endpoint.
@@ -3611,45 +3626,12 @@ fn run_single_process(cli: Cli) {
                 "rDNS resolver init failed; bot_protection.bypass.rdns will be a silent no-op"
             ),
         }
-        {
-            let s = store.lock().await;
-            if let Ok(settings) = s.get_global_settings() {
-                let path = settings.geoip_db_path.clone();
-                let asn_path = settings.asn_db_path.clone();
-                let auto_update = settings.geoip_auto_update_enabled;
-                drop(s);
-                if let Some(ref p) = path {
-                    if !p.trim().is_empty() {
-                        match lorica_proxy.geoip_resolver.load_from_path(p) {
-                            Ok(()) => info!(path = %p, "GeoIP database loaded"),
-                            Err(e) => warn!(
-                                path = %p,
-                                error = %e,
-                                "GeoIP database load failed; lookups will return None"
-                            ),
-                        }
-                    }
-                    if auto_update && !p.trim().is_empty() {
-                        let cfg = lorica_geoip::updater::UpdaterConfig::new(p.clone());
-                        let resolver = Arc::clone(&lorica_proxy.geoip_resolver);
-                        let _handle = lorica_geoip::updater::spawn_updater(resolver, cfg);
-                        info!(path = %p, "GeoIP auto-update task spawned");
-                    }
-                }
-                if let Some(ref p) = asn_path {
-                    if !p.trim().is_empty() {
-                        match lorica_proxy.asn_resolver.load_from_path(p) {
-                            Ok(()) => info!(path = %p, "ASN database loaded"),
-                            Err(e) => warn!(
-                                path = %p,
-                                error = %e,
-                                "ASN database load failed; lookups will return None"
-                            ),
-                        }
-                    }
-                }
-            }
-        }
+        // Load + auto-update spawn are handled by
+        // `apply_supervisor_settings_from_store` further down, after
+        // `register_supervisor_reload_trigger`. That call does the
+        // initial load via the same hot-reload path that fires on
+        // every dashboard save, so boot and runtime behave identically.
+
         // Periodic prune of expired basic-auth cache entries so a
         // password-spray with no successful logins cannot grow the
         // cache unboundedly until next restart (PERF-8).
@@ -3739,6 +3721,21 @@ fn run_single_process(cli: Cli) {
 
         // Create config reload channel so API mutations can trigger proxy reload
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
+
+        // Register with the reload module so the GeoIP / ASN auto-
+        // update task can bump the watch after every successful
+        // download. Same rationale as the supervisor path: the
+        // updater must be spawned in THIS process (we own the
+        // resolver that serves requests), and the flag doubles as
+        // a "this process owns the updater" marker for
+        // `apply_auto_update_flip`.
+        lorica::reload::register_supervisor_reload_trigger(config_reload_tx.clone());
+
+        // Fire the hot-reload path once at boot so the resolvers
+        // load from disk AND the updater tasks spawn if
+        // `*_auto_update_enabled` is persisted true. Must run AFTER
+        // `register_supervisor_reload_trigger` above.
+        lorica::reload::apply_supervisor_settings_from_store(&store).await;
 
         // Clone sla_collector before the async move closure captures it
         let reload_sla_collector = Arc::clone(&sla_collector);

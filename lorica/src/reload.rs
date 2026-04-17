@@ -124,10 +124,52 @@ pub async fn reload_proxy_config_with_mtls(
     Ok(())
 }
 
+/// Supervisor-only entry point. Re-applies the process-local hooks
+/// (OTel exporter, GeoIP / ASN updater task lifecycle, bot HMAC
+/// secret) when the dashboard saves a new `GlobalSettings` document.
+/// The supervisor's `config_reload_tx` listener does not call
+/// [`reload_proxy_config`] (only workers do, via the two-phase RPC
+/// coordinator), so without this entry point the supervisor would
+/// never re-evaluate `geoip_auto_update_enabled` after boot.
+pub async fn apply_supervisor_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
+    apply_otel_settings_from_store(store).await;
+    apply_geoip_settings_from_store(store).await;
+    apply_asn_settings_from_store(store).await;
+    apply_bot_secret_from_store(store).await;
+}
+
+/// Supervisor-side reload trigger registered at boot. The
+/// auto-update task fires this after a successful `.mmdb` download
+/// so the supervisor's config-reload coordinator broadcasts a
+/// ConfigReload to every worker. Workers then re-read the freshly
+/// landed file from disk via their own `apply_*_settings_from_store`
+/// hooks, which keeps the data plane in sync without a manual
+/// dashboard save or process restart.
+static SUPERVISOR_RELOAD_TRIGGER: once_cell::sync::OnceCell<
+    tokio::sync::watch::Sender<u64>,
+> = once_cell::sync::OnceCell::new();
+
+/// Called once at supervisor boot with the same `watch::Sender` that
+/// the API uses for `notify_config_changed`. Subsequent calls are
+/// silently ignored (the trigger is a process-wide singleton).
+pub fn register_supervisor_reload_trigger(tx: tokio::sync::watch::Sender<u64>) {
+    let _ = SUPERVISOR_RELOAD_TRIGGER.set(tx);
+}
+
+/// Bump the supervisor's reload watch by one. Called from the
+/// updater's `on_success` callback. No-op when no trigger has been
+/// registered (e.g. single-process mode, test harness).
+fn fire_supervisor_reload() {
+    if let Some(tx) = SUPERVISOR_RELOAD_TRIGGER.get() {
+        tx.send_modify(|seq| *seq = seq.wrapping_add(1));
+        info!("supervisor reload broadcast triggered after auto-update download");
+    }
+}
+
 /// Hot-reload the ASN resolver from `GlobalSettings.asn_db_path`.
 /// Same pattern as `apply_geoip_settings_from_store` — parallels
 /// are intentional so both DBs follow one operator-visible model.
-async fn apply_asn_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
+pub(crate) async fn apply_asn_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
     use std::sync::OnceLock;
 
     static LAST_APPLIED: OnceLock<parking_lot::Mutex<Option<String>>> = OnceLock::new();
@@ -151,30 +193,44 @@ async fn apply_asn_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
 
-    let mut last = slot.lock();
-    if *last == next {
-        return;
-    }
-
-    match next.as_ref() {
-        Some(path) => match resolver.load_from_path(path) {
-            Ok(()) => info!(path = %path, "ASN database hot-reloaded from settings"),
-            Err(e) => {
-                warn!(
-                    path = %path,
-                    error = %e,
-                    "ASN hot-reload failed; previous DB stays live"
-                );
-                return;
+    {
+        let mut last = slot.lock();
+        if *last != next {
+            match next.as_ref() {
+                Some(path) => match resolver.load_from_path(path) {
+                    Ok(()) => {
+                        info!(path = %path, "ASN database hot-reloaded from settings");
+                        *last = next.clone();
+                    }
+                    Err(e) => {
+                        // Same reasoning as the GeoIP path: missing
+                        // file is the expected case when the operator
+                        // just enabled auto-update with a fresh path.
+                        info!(
+                            path = %path,
+                            error = %e,
+                            "ASN database not yet present on disk; auto-update task (if enabled) will download it"
+                        );
+                    }
+                },
+                None => {
+                    resolver.unload();
+                    info!("ASN database unloaded by settings change (asn_db_path cleared)");
+                    *last = next.clone();
+                }
             }
-        },
-        None => {
-            resolver.unload();
-            info!("ASN database unloaded by settings change (asn_db_path cleared)");
         }
     }
 
-    *last = next;
+    apply_auto_update_flip(
+        &ASN_UPDATER_HANDLE,
+        settings.asn_auto_update_enabled,
+        next.clone(),
+        lorica_geoip::updater::DEFAULT_ASN_URL_TEMPLATE,
+        Arc::clone(&resolver),
+        "asn",
+        lorica_geoip::updater::spawn_asn_updater,
+    );
 }
 
 /// Re-apply the bot-protection HMAC secret stored in
@@ -199,7 +255,7 @@ async fn apply_asn_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
 /// - DB write failure: `warn!`, leave the in-memory slot alone.
 ///   The process serves traffic with whatever secret is installed
 ///   (or without bot-protection until the next reload succeeds).
-async fn apply_bot_secret_from_store(store: &Arc<Mutex<ConfigStore>>) {
+pub(crate) async fn apply_bot_secret_from_store(store: &Arc<Mutex<ConfigStore>>) {
     use std::sync::OnceLock;
 
     static LAST_APPLIED: OnceLock<parking_lot::Mutex<Option<[u8; 32]>>> = OnceLock::new();
@@ -323,13 +379,12 @@ fn encode_bot_secret_hex(bytes: &[u8; 32]) -> String {
 /// - Path unchanged from the previous snapshot → no-op (dedup, so
 ///   unrelated settings edits do not churn the resolver).
 ///
-/// The updater task started at boot (if `geoip_auto_update_enabled`
-/// was true) is NOT re-spawned here: a path change under an already-
-/// running updater simply means the next 24-hour tick lands on the
-/// new target. Flipping auto-update on / off at runtime still
-/// requires a restart in v1.4.0 — tracked as a follow-up because the
-/// updater's JoinHandle is not reachable from the reload path today.
-async fn apply_geoip_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
+/// The auto-update task is now hot-reloadable: flipping
+/// `geoip_auto_update_enabled` from false to true spawns the updater;
+/// flipping back to false aborts the running task. The task's
+/// `JoinHandle` is kept in a process-wide OnceLock so the reload hook
+/// can reach it.
+pub(crate) async fn apply_geoip_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
     use std::sync::OnceLock;
 
     static LAST_APPLIED: OnceLock<parking_lot::Mutex<Option<String>>> = OnceLock::new();
@@ -357,35 +412,122 @@ async fn apply_geoip_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
 
-    let mut last = slot.lock();
-    if *last == next {
-        return;
-    }
-
-    match next.as_ref() {
-        Some(path) => {
-            match resolver.load_from_path(path) {
-                Ok(()) => info!(path = %path, "GeoIP database hot-reloaded from settings"),
-                Err(e) => {
-                    warn!(
-                        path = %path,
-                        error = %e,
-                        "GeoIP hot-reload failed; previous DB stays live"
-                    );
-                    // Do not advance the "last applied" snapshot on
-                    // failure so a follow-up save attempt retries the
-                    // load instead of silently no-op'ing.
-                    return;
+    {
+        let mut last = slot.lock();
+        if *last != next {
+            match next.as_ref() {
+                Some(path) => match resolver.load_from_path(path) {
+                    Ok(()) => {
+                        info!(path = %path, "GeoIP database hot-reloaded from settings");
+                        *last = next.clone();
+                    }
+                    Err(e) => {
+                        // File missing / unreadable is the EXPECTED case
+                        // when auto-update is enabled with a not-yet-
+                        // downloaded path: the updater task we spawn
+                        // below will fetch and write it. Log at info
+                        // level so a fresh-install boot does not look
+                        // like a misconfiguration. Do NOT advance the
+                        // snapshot - a future save retries the load
+                        // once the file exists.
+                        info!(
+                            path = %path,
+                            error = %e,
+                            "GeoIP database not yet present on disk; auto-update task (if enabled) will download it"
+                        );
+                    }
+                },
+                None => {
+                    resolver.unload();
+                    info!("GeoIP database unloaded by settings change (geoip_db_path cleared)");
+                    *last = next.clone();
                 }
             }
         }
-        None => {
-            resolver.unload();
-            info!("GeoIP database unloaded by settings change (geoip_db_path cleared)");
-        }
     }
 
-    *last = next;
+    // Auto-update task lifecycle: flip false->true spawns, flip
+    // true->false aborts. Path-only changes are ignored - the running
+    // updater picks up the new `target_path` on the next tick via
+    // `UpdaterConfig` which is built fresh on each spawn. The file
+    // existing on disk is NOT a precondition: the whole point of
+    // the updater is to populate it.
+    apply_auto_update_flip(
+        &GEOIP_UPDATER_HANDLE,
+        settings.geoip_auto_update_enabled,
+        next.clone(),
+        lorica_geoip::updater::DEFAULT_URL_TEMPLATE,
+        Arc::clone(&resolver),
+        "geoip",
+        lorica_geoip::updater::spawn_updater,
+    );
+}
+
+/// Process-wide handle to the running GeoIP auto-update task. `None`
+/// when auto-update is off; `Some(_)` while the task is live so the
+/// reload hook can abort it on toggle.
+static GEOIP_UPDATER_HANDLE: once_cell::sync::Lazy<
+    parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
+
+/// Same pattern as GEOIP_UPDATER_HANDLE but for the ASN auto-update
+/// task.
+static ASN_UPDATER_HANDLE: once_cell::sync::Lazy<
+    parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
+
+/// Generic auto-update flip handler: aborts any running task, then
+/// spawns a new one when `enabled && path.is_some()`. The
+/// `spawn_fn` closure is the only piece that varies between GeoIP
+/// (`spawn_updater`) and ASN (`spawn_asn_updater`).
+fn apply_auto_update_flip<R: Send + Sync + 'static>(
+    slot: &parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    enabled: bool,
+    path: Option<String>,
+    url_template: &'static str,
+    resolver: Arc<R>,
+    log_tag: &'static str,
+    spawn_fn: fn(
+        Arc<R>,
+        lorica_geoip::updater::UpdaterConfig,
+    ) -> tokio::task::JoinHandle<()>,
+) {
+    let mut guard = slot.lock();
+    let should_run = enabled && path.is_some();
+    let is_running = guard.is_some();
+
+    // Only the supervisor process owns the auto-update task. Worker
+    // processes read the freshly-downloaded file from disk via their
+    // own resolver-reload hook. Running the updater in every worker
+    // would stampede the DB-IP feed AND corrupt the on-disk
+    // `.tmp` file via the concurrent rename contention. Detect the
+    // supervisor by the presence of the registered reload trigger:
+    // only `run_supervisor` calls `register_supervisor_reload_trigger`.
+    let is_supervisor = SUPERVISOR_RELOAD_TRIGGER.get().is_some();
+
+    if should_run && !is_running && is_supervisor {
+        if let Some(p) = path {
+            let mut cfg = lorica_geoip::updater::UpdaterConfig::new(p.clone());
+            cfg.url_template = url_template.to_string();
+            // Wire the supervisor-side reload trigger: after each
+            // successful download, bump the config-reload watch so
+            // the workers re-read the new file from disk via their
+            // own RPC reload path.
+            cfg.on_success = Some(std::sync::Arc::new(fire_supervisor_reload));
+            let handle = spawn_fn(resolver, cfg);
+            *guard = Some(handle);
+            info!(
+                tag = log_tag,
+                path = %p,
+                "auto-update task spawned via hot-reload"
+            );
+        }
+    } else if !should_run && is_running {
+        if let Some(h) = guard.take() {
+            h.abort();
+            info!(tag = log_tag, "auto-update task stopped via hot-reload");
+        }
+    }
 }
 
 /// Re-apply the OTel settings stored in `GlobalSettings` to the live
@@ -398,7 +540,7 @@ async fn apply_geoip_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
 /// when the snapshot diverges from the last applied value. Without
 /// the dedup we would tear down the BatchSpanProcessor on every
 /// route edit, which is needlessly expensive.
-async fn apply_otel_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
+pub(crate) async fn apply_otel_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
     use std::sync::OnceLock;
 
     static LAST_APPLIED: OnceLock<parking_lot::Mutex<Option<OtelSnapshot>>> = OnceLock::new();
