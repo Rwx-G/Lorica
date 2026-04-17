@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { RouteFormState, PathRuleFormState } from '../../lib/route-form';
   import type { BackendResponse } from '../../lib/api';
+  import BackendCheckboxList from '../BackendCheckboxList.svelte';
 
   interface Props {
     form: RouteFormState;
@@ -139,18 +140,12 @@
             <!-- Backend override -->
             <div class="override-section">
               <span class="override-title">Backend override</span>
-              {#if backends.length === 0}
-                <p class="text-muted small">No backends available</p>
-              {:else}
-                <div class="checkbox-list">
-                  {#each backends as b (b.id)}
-                    <label class="checkbox-item">
-                      <input type="checkbox" checked={rule.backend_ids.includes(b.id)} onchange={() => toggleBackend(rule, b.id)} />
-                      <span>{b.name ? `${b.name} (${b.address})` : b.address}</span>
-                    </label>
-                  {/each}
-                </div>
-              {/if}
+              <BackendCheckboxList
+                {backends}
+                selected={rule.backend_ids}
+                onToggle={(id) => toggleBackend(rule, id)}
+                showHealth={false}
+              />
             </div>
 
             <!-- Cache override -->

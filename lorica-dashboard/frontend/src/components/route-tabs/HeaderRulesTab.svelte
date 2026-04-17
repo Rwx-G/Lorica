@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { RouteFormState, HeaderRuleFormState } from '../../lib/route-form';
   import type { BackendResponse } from '../../lib/api';
+  import BackendCheckboxList from '../BackendCheckboxList.svelte';
 
   interface Props {
     form: RouteFormState;
@@ -192,18 +193,12 @@
                 Leave unchecked to keep the route's default backends (useful for future
                 extensions of this rule that don't route traffic).
               </p>
-              {#if backends.length === 0}
-                <p class="text-muted small">No backends available.</p>
-              {:else}
-                <div class="checkbox-list">
-                  {#each backends as b (b.id)}
-                    <label class="checkbox-item">
-                      <input type="checkbox" checked={rule.backend_ids.includes(b.id)} onchange={() => toggleBackend(rule, b.id)} />
-                      <span>{b.name ? `${b.name} (${b.address})` : b.address}</span>
-                    </label>
-                  {/each}
-                </div>
-              {/if}
+              <BackendCheckboxList
+                {backends}
+                selected={rule.backend_ids}
+                onToggle={(id) => toggleBackend(rule, id)}
+                showHealth={false}
+              />
             </div>
           </div>
         {/if}

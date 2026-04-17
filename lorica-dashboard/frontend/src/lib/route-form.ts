@@ -236,9 +236,16 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'redirect_to', 'redirect_hostname', 'return_status', 'error_page_html',
   ],
   routing: [
-    // Default backends subsection (v1.4.0 pass 1). Canary / HeaderRules /
-    // PathRules / Mirror migrate here in the next pass.
+    // Default backends
     'backend_ids', 'certificate_id', 'load_balancing', 'force_https', 'sticky_session',
+    // Traffic splits (absorbed from former Canary tab)
+    'traffic_splits',
+    // Header-based routes (absorbed from former Header Rules tab)
+    'header_rules',
+    // Path-based overrides (absorbed from former Path Rules tab)
+    'path_rules',
+    // Shadow / Mirror (absorbed from the Security tab)
+    'mirror_backend_ids', 'mirror_sample_percent', 'mirror_timeout_ms', 'mirror_max_body_bytes',
   ],
   timeouts: [
     'connect_timeout_s', 'read_timeout_s', 'send_timeout_s',
@@ -274,10 +281,7 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'bot_bypass_ip_cidrs', 'bot_bypass_asns', 'bot_bypass_countries',
     'bot_bypass_user_agents', 'bot_bypass_rdns', 'bot_only_country',
   ],
-  path_rules: ['path_rules'],
-  header_rules: ['header_rules'],
-  traffic_splits: ['traffic_splits'],
-  mirror: ['mirror_backend_ids', 'mirror_sample_percent', 'mirror_timeout_ms', 'mirror_max_body_bytes'],
+  // path_rules, header_rules, traffic_splits, mirror all absorbed into routing.
   response_rewrite: [
     'response_rewrite_rules', 'response_rewrite_max_body_bytes', 'response_rewrite_content_type_prefixes',
     // Compression temporarily hosted here until Transform tab absorbs it in the next pass.
@@ -910,15 +914,15 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
   let totalWeight = 0;
   for (const s of form.traffic_splits) {
     if (!Number.isInteger(s.weight_percent) || s.weight_percent < 0 || s.weight_percent > 100) {
-      return r(`Traffic split weight must be 0..100 (got ${s.weight_percent})`, 'traffic_splits');
+      return r(`Traffic split weight must be 0..100 (got ${s.weight_percent})`, 'routing');
     }
     if (s.weight_percent > 0 && s.backend_ids.length === 0) {
-      return r('Traffic split with non-zero weight must select at least one backend', 'traffic_splits');
+      return r('Traffic split with non-zero weight must select at least one backend', 'routing');
     }
     totalWeight += s.weight_percent;
   }
   if (totalWeight > 100) {
-    return r(`Traffic splits: cumulative weight must be <= 100 (got ${totalWeight})`, 'traffic_splits');
+    return r(`Traffic splits: cumulative weight must be <= 100 (got ${totalWeight})`, 'routing');
   }
   // Forward auth
   if (form.forward_auth_address.trim() !== '') {
@@ -931,19 +935,19 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
       return r('Forward auth timeout must be 1..60000 ms', 'security');
     }
   }
-  // Mirror
+  // Mirror (absorbed into Routing tab in the v1.4.0 UX refactor)
   if (form.mirror_backend_ids.length > 0) {
     const pct = Number(form.mirror_sample_percent);
     if (!Number.isInteger(pct) || pct < 0 || pct > 100) {
-      return r('Mirror sample percent must be 0..100', 'security');
+      return r('Mirror sample percent must be 0..100', 'routing');
     }
     const mt = Number(form.mirror_timeout_ms);
     if (!Number.isInteger(mt) || mt < 1 || mt > 60000) {
-      return r('Mirror timeout must be 1..60000 ms', 'security');
+      return r('Mirror timeout must be 1..60000 ms', 'routing');
     }
     const mb = Number(form.mirror_max_body_bytes);
     if (!Number.isInteger(mb) || mb < 0 || mb > 128 * 1048576) {
-      return r('Mirror max body bytes must be 0..134217728 (128 MiB; 0 = headers only)', 'security');
+      return r('Mirror max body bytes must be 0..134217728 (128 MiB; 0 = headers only)', 'routing');
     }
   }
   // Response rewrite

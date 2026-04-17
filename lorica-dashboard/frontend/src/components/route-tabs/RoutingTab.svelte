@@ -2,10 +2,14 @@
   import type { RouteFormState } from '../../lib/route-form';
   import type { BackendResponse, CertificateResponse } from '../../lib/api';
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
-  import StatusBadge from '../StatusBadge.svelte';
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
+  import BackendCheckboxList from '../BackendCheckboxList.svelte';
+  import CanaryTab from './CanaryTab.svelte';
+  import HeaderRulesTab from './HeaderRulesTab.svelte';
+  import PathRulesTab from './PathRulesTab.svelte';
+  import RoutingMirror from './RoutingMirror.svelte';
 
   interface Props {
     form: RouteFormState;
@@ -27,6 +31,10 @@
   let activeHelp = $state<
     | null
     | 'section:default_backends'
+    | 'section:traffic_splits'
+    | 'section:header_rules'
+    | 'section:path_rules'
+    | 'section:mirror'
     | 'backend_ids'
     | 'certificate_id'
     | 'load_balancing'
@@ -57,35 +65,43 @@
 </script>
 
 <div class="tab-content">
-  <!-- ============ Default backends ============ -->
+
+  <!-- Evaluation order banner. Resolves finding #23. The visible
+       order of subsections below is INVERSE of evaluation order:
+       foundation (Default, eval step 4) first, overrides going up
+       to the first-evaluated Header-based routes. The number badge
+       on each section's header shows the actual evaluation step. -->
+  <div class="eval-order-banner" role="note">
+    <strong>Evaluation order:</strong>
+    Header-based routes (<span class="step">1</span>) &rarr; Traffic splits (<span class="step">2</span>) &rarr; Path-based overrides (<span class="step">3</span>) &rarr; Default backends (<span class="step">4</span>).
+    First match wins.
+  </div>
+
+  <!-- ============ Default backends (eval step 4, foundation) ============ -->
   <section class="subsection">
     <SubsectionHeader
       title="Default backends"
-      description="The primary backend pool, TLS termination, and how requests are distributed when no header/path/canary rule matches."
-      accent="routing"
+      description="The primary backend pool, TLS termination, and how requests are distributed when no header / path / traffic-split rule matches. Foundation of this route."
+      accent="green"
+      order={4}
+      orderLabel="Evaluated 4th (fallback). Runs when no other rule matches."
       onhelp={() => { activeHelp = 'section:default_backends'; }}
     />
     <div class="subsection-body">
 
       <div class="form-group">
-        <label>
+        <label id="default-backends-label">
           <span>Backends</span>
           <FieldHelpButton fieldLabel="Backends" onhelp={() => { activeHelp = 'backend_ids'; }} />
         </label>
         {#if isImported('backend_ids')}<span class="imported-badge">imported</span>{/if}
-        {#if backends.length === 0}
-          <p class="text-muted small">No backends available - create one first in the Backends page.</p>
-        {:else}
-          <div class="checkbox-list">
-            {#each backends as b (b.id)}
-              <label class="checkbox-item">
-                <input type="checkbox" checked={form.backend_ids.includes(b.id)} onchange={() => toggleBackend(b.id)} />
-                <span>{b.name ? `${b.name} (${b.address})` : b.address}</span>
-                <StatusBadge status={b.health_status === 'healthy' ? 'healthy' : b.health_status === 'degraded' ? 'degraded' : b.health_status === 'down' ? 'down' : 'unknown'} />
-              </label>
-            {/each}
-          </div>
-        {/if}
+        <BackendCheckboxList
+          {backends}
+          selected={form.backend_ids}
+          onToggle={toggleBackend}
+          ariaLabelledBy="default-backends-label"
+          emptyMessage="No backends available - create one first in the Backends page."
+        />
         <span class="hint">Tick every backend this route may use. Tick 2+ for redundancy + load balancing.</span>
       </div>
 
@@ -140,15 +156,64 @@
     </div>
   </section>
 
-  <!-- ============ Placeholder: upcoming subsections ============ -->
-  <section class="upcoming">
-    <p class="upcoming-title">Coming in the next v1.4.0 refactor passes:</p>
-    <ul>
-      <li><strong>Traffic splits</strong> - weighted canary distribution (currently in the Canary tab).</li>
-      <li><strong>Header-based routes</strong> - route by request header to alternate backends (currently in the Header Rules tab).</li>
-      <li><strong>Path-based routes</strong> - per-path backend / cache / status overrides (currently in the Path Rules tab).</li>
-      <li><strong>Shadow / Mirror</strong> - copy traffic to a debug backend for testing (currently in the Security tab).</li>
-    </ul>
+  <!-- ============ Header-based routes (eval step 1, top priority) ============ -->
+  <section class="subsection">
+    <SubsectionHeader
+      title="Header-based routes"
+      description="Route by request header value (exact / prefix / regex) to alternate backend pools. First to evaluate; overrides every other routing decision below."
+      accent="purple"
+      order={1}
+      orderLabel="Evaluated 1st. First match wins and short-circuits everything else."
+      onhelp={() => { activeHelp = 'section:header_rules'; }}
+    />
+    <div class="subsection-body subsection-body-panel">
+      <HeaderRulesTab bind:form={form} {backends} {importedFields} />
+    </div>
+  </section>
+
+  <!-- ============ Traffic splits - canary (eval step 2) ============ -->
+  <section class="subsection">
+    <SubsectionHeader
+      title="Traffic splits"
+      description="Weighted canary distribution across the Default backends (see above) and alternate backend pools. Sticky per client IP."
+      accent="cyan"
+      order={2}
+      orderLabel="Evaluated 2nd. Runs after header-based routes, before path-based overrides."
+      onhelp={() => { activeHelp = 'section:traffic_splits'; }}
+    />
+    <div class="subsection-body subsection-body-panel">
+      <CanaryTab bind:form={form} {backends} {importedFields} />
+    </div>
+  </section>
+
+  <!-- ============ Path-based overrides (eval step 3) ============ -->
+  <section class="subsection">
+    <SubsectionHeader
+      title="Path-based overrides"
+      description="Per-path backend / cache / headers / rate-limit / redirect / return-status overrides. Evaluated after header-rules and traffic splits."
+      accent="orange"
+      order={3}
+      orderLabel="Evaluated 3rd. Runs after header-based routes and traffic splits."
+      onhelp={() => { activeHelp = 'section:path_rules'; }}
+    />
+    <div class="subsection-body subsection-body-panel">
+      <PathRulesTab bind:form={form} {backends} {importedFields} />
+    </div>
+  </section>
+
+  <!-- ============ Shadow / Mirror (parallel, not in eval chain) ============ -->
+  <section class="subsection">
+    <SubsectionHeader
+      title="Shadow / Mirror"
+      description="Fire-and-forget copy of every request to alternate backends. Runs in parallel with the primary routing decision. Responses discarded. Useful for shadow-testing a new version."
+      accent="slate"
+      order="//"
+      orderLabel="Runs in parallel with the primary routing decision. Not part of the first-match chain."
+      onhelp={() => { activeHelp = 'section:mirror'; }}
+    />
+    <div class="subsection-body">
+      <RoutingMirror bind:form={form} {backends} />
+    </div>
   </section>
 </div>
 
@@ -164,6 +229,106 @@
       requests are distributed across them (Load Balancing), the TLS
       termination cert, HTTP-to-HTTPS redirection, and optional client
       affinity (Sticky sessions).
+    </p>
+  </HelpModal>
+{:else if activeHelp === 'section:traffic_splits'}
+  <HelpModal title="Traffic splits (canary)" onclose={() => { activeHelp = null; }}>
+    <p>
+      Deterministic weighted distribution of incoming traffic to alternate
+      backend pools. Client affinity is sticky per source IP so a given
+      client always hits the same bucket.
+    </p>
+    <p>Typical use cases:</p>
+    <ul>
+      <li><strong>Canary release</strong> - 5 % of traffic to the new
+        backend version, 95 % to the stable one.</li>
+      <li><strong>Blue/green cutover</strong> - flip from 100/0 to 0/100
+        over a few saves.</li>
+      <li><strong>A/B tests</strong> - 50/50 to two backends with the
+        same contract but different implementations.</li>
+    </ul>
+    <p>
+      Each split declares a weight percent and a backend pool. The sum of
+      weights must not exceed 100 - the remainder routes to the Default
+      backends section above. Sticky sessions (Default backends subsection)
+      can pin a client outside the split they belong to; keep sticky off
+      when running a fair canary.
+    </p>
+  </HelpModal>
+{:else if activeHelp === 'section:header_rules'}
+  <HelpModal title="Header-based routes" onclose={() => { activeHelp = null; }}>
+    <p>
+      Route a request to an alternate backend pool when a specific header
+      matches a rule. First match wins; evaluated <strong>before</strong>
+      traffic splits and path-based overrides.
+    </p>
+    <p>Match types:</p>
+    <ul>
+      <li><strong>Exact</strong> - header value equals the rule value
+        byte-for-byte.</li>
+      <li><strong>Prefix</strong> - header value starts with the rule
+        value.</li>
+      <li><strong>Regex</strong> - header value matches a full-line
+        regex. Invalid regex disables the rule; a "disabled" pill shows.</li>
+    </ul>
+    <p>
+      Typical use cases: multi-tenant routing by <code>X-Tenant-Id</code>,
+      API versioning by <code>X-Version</code>, feature flags by a client
+      header, routing by <code>User-Agent</code> for legacy browsers.
+    </p>
+  </HelpModal>
+{:else if activeHelp === 'section:path_rules'}
+  <HelpModal title="Path-based overrides" onclose={() => { activeHelp = null; }}>
+    <p>
+      Per-path overrides that apply after the backend pool is selected
+      (by default / header-rule / traffic-split) and before the upstream
+      call. Each rule declares a path match (prefix or exact) and any
+      subset of these overrides:
+    </p>
+    <ul>
+      <li><strong>Backend override</strong> - send matching requests to a
+        different pool.</li>
+      <li><strong>Cache override</strong> - force caching on/off for this
+        path with a custom TTL.</li>
+      <li><strong>Response headers</strong> - add or remove headers on
+        responses from this path.</li>
+      <li><strong>Rate limiting</strong> - per-path token bucket (RPS
+        and burst).</li>
+      <li><strong>Redirect</strong> - 301 redirect for this path.</li>
+      <li><strong>Return status</strong> - respond with a fixed status
+        without calling the backend.</li>
+    </ul>
+    <p>
+      Rules are evaluated in order (drag to reorder). First match wins.
+      Empty overrides mean "inherit from the route default".
+    </p>
+  </HelpModal>
+{:else if activeHelp === 'section:mirror'}
+  <HelpModal title="Shadow / Mirror" onclose={() => { activeHelp = null; }}>
+    <p>
+      Copy every matching request to alternate <em>shadow</em> backends
+      in parallel with the primary call. Mirror responses are
+      <strong>discarded</strong>; the client only ever sees the primary
+      response.
+    </p>
+    <p>
+      Shadow backends receive <code>X-Lorica-Mirror: 1</code> so they
+      can filter this traffic out of their analytics, logs, and
+      side-effects (no double-writes, no double-sends).
+    </p>
+    <p>
+      Use cases:
+    </p>
+    <ul>
+      <li>Test a new backend version against real production traffic
+        without affecting users.</li>
+      <li>Capture a replay corpus without impacting the primary path.</li>
+      <li>Compare the old and new implementations' behaviour side-by-side.</li>
+    </ul>
+    <p>
+      v1 mirrors method + URL + headers only, not the request body.
+      Sampling is deterministic per <code>X-Request-Id</code>: the same
+      logical request is either always mirrored or never mirrored.
     </p>
   </HelpModal>
 {:else if activeHelp === 'backend_ids'}
@@ -226,7 +391,7 @@
     </ul>
     <p>
       Changing this on a live route with <strong>Sticky sessions</strong>
-      on can break existing client affinity - most algorithms don't give
+      on can break existing client affinity - most algorithms do not give
       the same backend for the same client.
     </p>
   </HelpModal>
@@ -273,6 +438,34 @@
 <style>
   .tab-content { display: flex; flex-direction: column; gap: 1.25rem; }
 
+  .eval-order-banner {
+    font-size: 0.8125rem;
+    padding: 0.5rem 0.75rem;
+    border-left: 3px solid var(--color-green, #10b981);
+    background: rgba(16, 185, 129, 0.08);
+    color: var(--color-text);
+    border-radius: 0 0.25rem 0.25rem 0;
+  }
+
+  .eval-order-banner strong {
+    color: var(--color-text-heading);
+  }
+
+  .eval-order-banner .step {
+    display: inline-block;
+    min-width: 1.125rem;
+    padding: 0 0.25rem;
+    margin: 0 0.0625rem;
+    border-radius: 9999px;
+    background: var(--color-bg-card);
+    border: 1px solid var(--color-border);
+    font-size: 0.6875rem;
+    font-weight: 700;
+    color: var(--color-text-heading);
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+
   .subsection {
     display: flex;
     flex-direction: column;
@@ -286,6 +479,13 @@
     border-top: none;
     border-radius: 0 0 0.5rem 0.5rem;
     padding: 1rem 1rem 0.5rem;
+  }
+
+  /* When composing an existing tab component (Canary / HeaderRules /
+     PathRules), the child already paints its own tab-content wrapper,
+     so strip our own padding so we do not double-indent. */
+  .subsection-body-panel {
+    padding: 0.25rem 0.5rem 0.5rem;
   }
 
   .form-group { margin-bottom: 1rem; }
@@ -353,29 +553,5 @@
     color: var(--color-primary);
     margin-left: 0.375rem;
     vertical-align: middle;
-  }
-
-  .upcoming {
-    background: var(--color-bg-input);
-    border: 1px dashed var(--color-border);
-    border-radius: 0.5rem;
-    padding: 1rem;
-    font-size: 0.8125rem;
-    color: var(--color-text-muted);
-  }
-
-  .upcoming-title {
-    font-weight: 600;
-    margin: 0 0 0.5rem;
-    color: var(--color-text);
-  }
-
-  .upcoming ul {
-    margin: 0;
-    padding-left: 1.25rem;
-  }
-
-  .upcoming li {
-    margin-bottom: 0.25rem;
   }
 </style>

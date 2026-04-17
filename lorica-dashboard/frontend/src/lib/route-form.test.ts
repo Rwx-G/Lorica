@@ -1397,7 +1397,8 @@ describe('validateRouteFormWithTab', () => {
       }),
     );
     expect(r.message).toMatch(/weight/);
-    expect(r.tab).toBe('traffic_splits');
+    // Traffic splits got absorbed into the Routing tab in the v1.4.0 UX refactor.
+    expect(r.tab).toBe('routing');
   });
 
   it('attributes forward auth errors to the security tab', () => {

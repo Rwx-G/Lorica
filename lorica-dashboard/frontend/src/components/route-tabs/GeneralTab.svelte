@@ -40,7 +40,7 @@
     <SubsectionHeader
       title="Identity"
       description="Who this route is and which requests it matches."
-      accent="identity"
+      accent="blue"
       onhelp={() => { activeHelp = 'section:identity'; }}
     />
     <div class="subsection-body">
@@ -116,29 +116,37 @@
     <SubsectionHeader
       title="Response override"
       description="Short-circuit the proxy and answer directly. Maintenance mode is toggled from the Routes list."
-      accent="behavior"
+      accent="pink"
       onhelp={() => { activeHelp = 'section:response_override'; }}
     />
     <div class="subsection-body">
 
       <div class="form-group" class:modified={isModified('redirect_to')}>
         <label for="redirect-to">
-          Redirect to
+          Redirect to (full URL)
           <FieldHelpButton fieldLabel="Redirect to" onhelp={() => { activeHelp = 'redirect_to'; }} />
         </label>
         {#if isImported('redirect_to')}<span class="imported-badge">imported</span>{/if}
-        <input id="redirect-to" type="text" bind:value={form.redirect_to} placeholder="https://example.com" />
-        <span class="hint">Full URL. Responds 301 with this location; original path appended. Backends not used.</span>
+        <input id="redirect-to" type="text" bind:value={form.redirect_to} placeholder="https://example.com/legacy" />
+        <span class="hint">
+          Use when you want full control: force a specific scheme (http/https),
+          optionally prepend a path prefix. 301 with your URL + request's path
+          &amp; query appended.
+        </span>
       </div>
 
       <div class="form-group" class:modified={isModified('redirect_hostname')}>
         <label for="redirect-hostname">
-          Redirect to another host
+          Redirect to another host (canonical)
           <FieldHelpButton fieldLabel="Redirect to another host" onhelp={() => { activeHelp = 'redirect_hostname'; }} />
         </label>
         {#if isImported('redirect_hostname')}<span class="imported-badge">imported</span>{/if}
-        <input id="redirect-hostname" type="text" bind:value={form.redirect_hostname} placeholder="e.g. duckduckgo.com" />
-        <span class="hint">Hostname-only 301; path + query preserved. Different from "Redirect to".</span>
+        <input id="redirect-hostname" type="text" bind:value={form.redirect_hostname} placeholder="e.g. example.com" />
+        <span class="hint">
+          Use for canonical-host redirects (e.g. <code>www.example.com</code> &rarr;
+          <code>example.com</code>). Hostname-only; preserves the client's scheme
+          and path. Automatic loop guard: no redirect when already on the target.
+        </span>
       </div>
 
       <div class="form-group" class:modified={isModified('return_status')}>
@@ -294,42 +302,77 @@
     </p>
   </HelpModal>
 {:else if activeHelp === 'redirect_to'}
-  <HelpModal title="Redirect to" onclose={() => { activeHelp = null; }}>
+  <HelpModal title="Redirect to (full URL)" onclose={() => { activeHelp = null; }}>
     <p>
-      Full URL to which every request is redirected with a 301. No backend
-      is called. The original path is appended to the target URL.
+      301 redirect to the URL you paste. Accepts a scheme (<code>http://</code>
+      or <code>https://</code>), a hostname, and optionally a base path. No
+      backend is called. The request's path + query are appended to your URL.
     </p>
-    <p>
-      Example: route matches <code>example.com</code>,
-      <code>Redirect to = https://new-example.com</code>. A request to
-      <code>example.com/foo?bar=1</code> receives
-      <code>301 Location: https://new-example.com/foo?bar=1</code>.
-    </p>
-    <p>
-      Useful for domain migrations or forcing a canonical URL. For hostname-only
-      redirects without scheme change, prefer <strong>Redirect to another host</strong>.
-    </p>
+    <p><strong>Examples:</strong></p>
+    <ul>
+      <li>
+        <code>https://new.com</code> + request <code>/foo?bar=1</code>
+        <br>&rarr; <code>Location: https://new.com/foo?bar=1</code>
+      </li>
+      <li>
+        <code>https://new.com/api</code> + request <code>/foo</code>
+        <br>&rarr; <code>Location: https://new.com/api/foo</code>
+        (path prefix prepended)
+      </li>
+      <li>
+        <code>http://insecure.internal</code> on an HTTPS request
+        <br>&rarr; <code>Location: http://insecure.internal/...</code>
+        (scheme downgrades - use cautiously)
+      </li>
+    </ul>
+    <p><strong>Use this when</strong>:</p>
+    <ul>
+      <li>You need to force a specific scheme regardless of the client's.</li>
+      <li>You want to prepend a path (e.g. migrating to a sub-path).</li>
+      <li>You are redirecting to a different TLD / domain.</li>
+    </ul>
+    <p><strong>No self-loop guard</strong>: if you point this at the same
+    hostname the route serves, clients will be redirected forever. For
+    canonical-host cleanup (<code>www &rarr; apex</code>), use
+    <strong>Redirect to another host</strong> below instead - it has a loop
+    guard built in.</p>
   </HelpModal>
 {:else if activeHelp === 'redirect_hostname'}
-  <HelpModal title="Redirect to another host" onclose={() => { activeHelp = null; }}>
+  <HelpModal title="Redirect to another host (canonical)" onclose={() => { activeHelp = null; }}>
     <p>
-      Lighter-weight redirect that <strong>only rewrites the hostname</strong>.
-      Scheme is preserved (http stays http, https stays https); path + query
-      are preserved as-is.
+      Lightweight 301 redirect that <strong>only changes the hostname</strong>.
+      Scheme is preserved from the client's request (HTTP stays HTTP, HTTPS
+      stays HTTPS); path + query are preserved as-is.
+    </p>
+    <p><strong>Examples:</strong></p>
+    <ul>
+      <li>
+        <code>example.com</code> on request
+        <code>https://www.example.com/foo?bar=1</code>
+        <br>&rarr; <code>Location: https://example.com/foo?bar=1</code>
+      </li>
+      <li>
+        Same rule, client comes via HTTP
+        <br>&rarr; <code>Location: http://example.com/foo?bar=1</code>
+        (scheme preserved)
+      </li>
+    </ul>
+    <p><strong>Use this when</strong>:</p>
+    <ul>
+      <li>You want canonical-host enforcement (<code>www.x.com</code>
+        &rarr; <code>x.com</code>, or vice-versa).</li>
+      <li>You want to preserve whatever scheme the client came in on.</li>
+      <li>You need an automatic loop guard: if the request already arrives
+        on the target host, no redirect fires.</li>
+    </ul>
+    <p>
+      Input must be a bare hostname (no scheme, no path). For scheme
+      changes or path-prefixing, use <strong>Redirect to (full URL)</strong>
+      above.
     </p>
     <p>
-      Example: route matches <code>example.com</code>,
-      <code>Redirect to another host = duckduckgo.com</code>. A request to
-      <code>https://example.com/foo?bar=1</code> receives
-      <code>301 Location: https://duckduckgo.com/foo?bar=1</code>.
-    </p>
-    <p>
-      Useful when you want to preserve deep links while changing the
-      authority (domain renames, canonicalisation).
-    </p>
-    <p>
-      Evaluated before <code>Redirect to</code> in the proxy chain. If both
-      are set, this one wins.
+      Evaluated <em>before</em> <code>Redirect to</code> in the proxy chain.
+      If both are set, this one wins.
     </p>
   </HelpModal>
 {:else if activeHelp === 'return_status'}

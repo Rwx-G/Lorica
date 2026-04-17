@@ -21,10 +21,9 @@
   import CorsTab from './route-tabs/CorsTab.svelte';
   import CachingTab from './route-tabs/CachingTab.svelte';
   import ProtectionTab from './route-tabs/ProtectionTab.svelte';
-  import PathRulesTab from './route-tabs/PathRulesTab.svelte';
-  import HeaderRulesTab from './route-tabs/HeaderRulesTab.svelte';
-  import CanaryTab from './route-tabs/CanaryTab.svelte';
   import ResponseRewriteTab from './route-tabs/ResponseRewriteTab.svelte';
+  // PathRulesTab, HeaderRulesTab, CanaryTab are absorbed into RoutingTab
+  // as subsections; no longer registered as top-level tabs.
 
   interface Props {
     open: boolean;
@@ -54,9 +53,6 @@
     { id: 'cors', label: 'CORS' },
     { id: 'caching', label: 'Caching' },
     { id: 'protection', label: 'Protection' },
-    { id: 'path_rules', label: 'Path Rules' },
-    { id: 'header_rules', label: 'Header Rules' },
-    { id: 'traffic_splits', label: 'Canary' },
     { id: 'response_rewrite', label: 'Rewrite' },
   ];
 
@@ -215,12 +211,6 @@
           <CachingTab bind:form={form} {importedFields} />
         {:else if activeTab === 'protection'}
           <ProtectionTab bind:form={form} {importedFields} />
-        {:else if activeTab === 'path_rules'}
-          <PathRulesTab bind:form={form} {backends} {importedFields} />
-        {:else if activeTab === 'header_rules'}
-          <HeaderRulesTab bind:form={form} {backends} {importedFields} />
-        {:else if activeTab === 'traffic_splits'}
-          <CanaryTab bind:form={form} {backends} {importedFields} />
         {:else if activeTab === 'response_rewrite'}
           <ResponseRewriteTab bind:form={form} {importedFields} />
         {/if}
