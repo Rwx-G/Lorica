@@ -481,11 +481,13 @@
     padding: 1rem 1rem 0.5rem;
   }
 
-  /* When composing an existing tab component (Canary / HeaderRules /
-     PathRules), the child already paints its own tab-content wrapper,
-     so strip our own padding so we do not double-indent. */
+  /* Wraps an embedded tab component (Canary / HeaderRules /
+     PathRules). The child paints its own tab-content wrapper with no
+     outer padding, so we add breathing room around it on all sides -
+     otherwise inline buttons like "Add rule" end up flush against
+     the panel edge. */
   .subsection-body-panel {
-    padding: 0.25rem 0.5rem 0.5rem;
+    padding: 0.75rem 0.875rem 1rem;
   }
 
   .form-group { margin-bottom: 1rem; }

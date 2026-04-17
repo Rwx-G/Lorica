@@ -171,24 +171,6 @@
       </div>
     {/each}
   {/if}
-
-  <!-- Compression toggle (temporarily hosted here before Transform tab lands) -->
-  <section class="compression-section">
-    <h3 class="subsection-heading">Compression</h3>
-    <p class="subsection-hint">
-      Applies gzip/br compression to responses that advertise a matching
-      Accept-Encoding. Lives here temporarily: will move to the Transform
-      tab alongside Headers / CORS / Path rewrite / Body rewrite in an
-      upcoming v1.4.0 pass.
-    </p>
-    <div class="form-group">
-      <label class="checkbox-item">
-        <input type="checkbox" bind:checked={form.compression_enabled} />
-        <span>Enable compression</span>
-      </label>
-      {#if importedFields?.has('compression_enabled')}<span class="imported-badge">imported</span>{/if}
-    </div>
-  </section>
 </div>
 
 <script lang="ts" module>
@@ -239,27 +221,4 @@
   code { font-family: ui-monospace, monospace; font-size: 0.75rem; background: var(--color-bg); padding: 0.05rem 0.25rem; border-radius: 0.25rem; }
 
   .imported-badge { display: inline-block; padding: 0.0625rem 0.375rem; border-radius: 9999px; font-size: 0.625rem; font-weight: 600; text-transform: uppercase; background: rgba(59, 130, 246, 0.15); color: var(--color-primary); vertical-align: middle; }
-  .compression-section {
-    margin-top: 1.5rem;
-    padding-top: 1rem;
-    border-top: 1px solid var(--color-border);
-  }
-  .subsection-heading {
-    margin: 0 0 0.375rem;
-    font-size: 0.875rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--color-text-heading);
-  }
-  .subsection-hint {
-    margin: 0 0 0.75rem;
-    font-size: 0.8125rem;
-    color: var(--color-text-muted);
-    line-height: 1.4;
-    background: var(--color-orange-subtle, rgba(245, 158, 11, 0.08));
-    border-left: 3px solid var(--color-orange, #f59e0b);
-    padding: 0.5rem 0.75rem;
-    border-radius: 0.25rem;
-  }
 </style>

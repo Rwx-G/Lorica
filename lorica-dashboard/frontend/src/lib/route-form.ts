@@ -247,9 +247,24 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     // Shadow / Mirror (absorbed from the Security tab)
     'mirror_backend_ids', 'mirror_sample_percent', 'mirror_timeout_ms', 'mirror_max_body_bytes',
   ],
-  timeouts: [
+  transform: [
+    // Request headers
+    'proxy_headers', 'proxy_headers_remove',
+    // Response headers
+    'response_headers', 'response_headers_remove',
+    // CORS
+    'cors_allowed_origins', 'cors_allowed_methods', 'cors_max_age_s',
+    // Path rewrite (moved in from former Timeouts tab)
+    'strip_path_prefix', 'add_path_prefix', 'path_rewrite_pattern', 'path_rewrite_replacement',
+    // Response body rewrite (absorbed from former Rewrite tab)
+    'response_rewrite_rules', 'response_rewrite_max_body_bytes', 'response_rewrite_content_type_prefixes',
+    // Compression
+    'compression_enabled',
+  ],
+  upstream: [
+    // Renamed from the former Timeouts tab. Path rewrite fields moved to Transform.
     'connect_timeout_s', 'read_timeout_s', 'send_timeout_s',
-    'strip_path_prefix', 'add_path_prefix', 'path_rewrite_pattern', 'path_rewrite_replacement', 'retry_attempts', 'retry_on_methods',
+    'retry_attempts', 'retry_on_methods',
   ],
   security: [
     // WAF moved in from General (v1.4.0 pass 1).
@@ -260,14 +275,8 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'forward_auth_address', 'forward_auth_timeout_ms', 'forward_auth_response_headers',
     'mtls_ca_cert_pem', 'mtls_required', 'mtls_allowed_organizations',
   ],
-  headers: [
-    'proxy_headers', 'proxy_headers_remove',
-    'response_headers', 'response_headers_remove',
-  ],
-  cors: [
-    'cors_allowed_origins', 'cors_allowed_methods', 'cors_max_age_s',
-  ],
-  caching: [
+  cache: [
+    // Renamed from 'caching' (v1.4.0 UX refactor).
     'cache_enabled', 'cache_ttl_s', 'cache_max_mb', 'stale_while_revalidate_s', 'stale_if_error_s',
     'cache_vary_headers',
   ],
@@ -282,11 +291,9 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'bot_bypass_user_agents', 'bot_bypass_rdns', 'bot_only_country',
   ],
   // path_rules, header_rules, traffic_splits, mirror all absorbed into routing.
-  response_rewrite: [
-    'response_rewrite_rules', 'response_rewrite_max_body_bytes', 'response_rewrite_content_type_prefixes',
-    // Compression temporarily hosted here until Transform tab absorbs it in the next pass.
-    'compression_enabled',
-  ],
+  // headers, cors, response_rewrite all absorbed into transform.
+  // caching renamed to cache.
+  // timeouts split: path rewrite -> transform, everything else -> upstream.
 };
 
 function recordToText(rec: Record<string, string>): string {
@@ -896,16 +903,16 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
   const hostErr = validateHostname(form.hostname);
   if (hostErr) return r(hostErr, 'general');
   if (form.path_prefix && !form.path_prefix.startsWith('/')) return r('Path prefix must start with /', 'general');
-  if (form.connect_timeout_s < 1 || form.connect_timeout_s > 3600) return r('Connect timeout must be between 1 and 3600', 'timeouts');
-  if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return r('Read timeout must be between 1 and 3600', 'timeouts');
-  if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return r('Send timeout must be between 1 and 3600', 'timeouts');
+  if (form.connect_timeout_s < 1 || form.connect_timeout_s > 3600) return r('Connect timeout must be between 1 and 3600', 'upstream');
+  if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return r('Read timeout must be between 1 and 3600', 'upstream');
+  if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return r('Send timeout must be between 1 and 3600', 'upstream');
   if (form.max_body_mb && Number(form.max_body_mb) <= 0) return r('Max body size must be greater than 0', 'security');
   if (form.rate_limit_rps && Number(form.rate_limit_rps) <= 0) return r('Rate limit RPS must be greater than 0', 'security');
   if (form.rate_limit_burst && Number(form.rate_limit_burst) <= 0) return r('Rate limit burst must be greater than 0', 'security');
   if (form.rate_limit_rps && form.rate_limit_burst && Number(form.rate_limit_burst) < Number(form.rate_limit_rps)) {
     return r('Rate limit burst must be >= RPS', 'security');
   }
-  if (form.cors_max_age_s && Number(form.cors_max_age_s) <= 0) return r('CORS max age must be greater than 0', 'cors');
+  if (form.cors_max_age_s && Number(form.cors_max_age_s) <= 0) return r('CORS max age must be greater than 0', 'transform');
   const allowErr = validateIpList(form.ip_allowlist);
   if (allowErr) return r(`IP allowlist: ${allowErr}`, 'security');
   const denyErr = validateIpList(form.ip_denylist);
@@ -954,26 +961,26 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
   if (form.response_rewrite_rules.length > 0) {
     const mb = Number(form.response_rewrite_max_body_bytes);
     if (!Number.isInteger(mb) || mb < 1 || mb > 128 * 1048576) {
-      return r('Response rewrite max body bytes must be 1..134217728 (128 MiB)', 'response_rewrite');
+      return r('Response rewrite max body bytes must be 1..134217728 (128 MiB)', 'transform');
     }
     for (let i = 0; i < form.response_rewrite_rules.length; i++) {
       const rule = form.response_rewrite_rules[i];
       if (!rule.pattern.trim()) {
-        return r(`Response rewrite rule ${i + 1}: pattern must not be empty`, 'response_rewrite');
+        return r(`Response rewrite rule ${i + 1}: pattern must not be empty`, 'transform');
       }
       if (rule.is_regex) {
         try {
            
           new RegExp(rule.pattern);
         } catch (e) {
-          return r(`Response rewrite rule ${i + 1}: invalid regex (${(e as Error).message})`, 'response_rewrite');
+          return r(`Response rewrite rule ${i + 1}: invalid regex (${(e as Error).message})`, 'transform');
         }
       }
       const maxStr = rule.max_replacements.trim();
       if (maxStr !== '') {
         const n = Number(maxStr);
         if (!Number.isInteger(n) || n < 1) {
-          return r(`Response rewrite rule ${i + 1}: max_replacements must be a positive integer (or empty for unlimited)`, 'response_rewrite');
+          return r(`Response rewrite rule ${i + 1}: max_replacements must be a positive integer (or empty for unlimited)`, 'transform');
         }
       }
     }

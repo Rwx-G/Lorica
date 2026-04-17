@@ -15,15 +15,18 @@
   import { showToast } from '../lib/toast';
   import GeneralTab from './route-tabs/GeneralTab.svelte';
   import RoutingTab from './route-tabs/RoutingTab.svelte';
-  import TimeoutsTab from './route-tabs/TimeoutsTab.svelte';
-  import SecurityTab from './route-tabs/SecurityTab.svelte';
-  import HeadersTab from './route-tabs/HeadersTab.svelte';
-  import CorsTab from './route-tabs/CorsTab.svelte';
+  import TransformTab from './route-tabs/TransformTab.svelte';
   import CachingTab from './route-tabs/CachingTab.svelte';
+  import SecurityTab from './route-tabs/SecurityTab.svelte';
   import ProtectionTab from './route-tabs/ProtectionTab.svelte';
-  import ResponseRewriteTab from './route-tabs/ResponseRewriteTab.svelte';
-  // PathRulesTab, HeaderRulesTab, CanaryTab are absorbed into RoutingTab
-  // as subsections; no longer registered as top-level tabs.
+  import UpstreamTab from './route-tabs/UpstreamTab.svelte';
+  // Absorbed tabs (no longer registered at top level):
+  // - HeadersTab, CorsTab -> Transform subsections (inlined)
+  // - ResponseRewriteTab -> Transform > Response body rewrite (still
+  //   imported by TransformTab as an embedded panel)
+  // - TimeoutsTab path rewrite -> Transform > Path rewrite (inlined)
+  // - TimeoutsTab timeouts + retry -> UpstreamTab (renamed component)
+  // - PathRulesTab, HeaderRulesTab, CanaryTab -> Routing subsections
 
   interface Props {
     open: boolean;
@@ -47,13 +50,11 @@
   const TABS = [
     { id: 'general', label: 'General' },
     { id: 'routing', label: 'Routing' },
-    { id: 'timeouts', label: 'Timeouts' },
+    { id: 'transform', label: 'Transform' },
+    { id: 'cache', label: 'Cache' },
     { id: 'security', label: 'Security' },
-    { id: 'headers', label: 'Headers' },
-    { id: 'cors', label: 'CORS' },
-    { id: 'caching', label: 'Caching' },
     { id: 'protection', label: 'Protection' },
-    { id: 'response_rewrite', label: 'Rewrite' },
+    { id: 'upstream', label: 'Upstream' },
   ];
 
   // Reset form when drawer opens - untrack body so form/editing changes
@@ -199,20 +200,16 @@
           <GeneralTab bind:form={form} editing={!!editing} {importedFields} />
         {:else if activeTab === 'routing'}
           <RoutingTab bind:form={form} {backends} {certificates} {importedFields} />
-        {:else if activeTab === 'timeouts'}
-          <TimeoutsTab bind:form={form} {importedFields} />
+        {:else if activeTab === 'transform'}
+          <TransformTab bind:form={form} {importedFields} />
+        {:else if activeTab === 'cache'}
+          <CachingTab bind:form={form} {importedFields} />
         {:else if activeTab === 'security'}
           <SecurityTab bind:form={form} {importedFields} {customPresets} {backends} initialMtlsCaCertPem={editing?.mtls?.ca_cert_pem ?? ''} />
-        {:else if activeTab === 'headers'}
-          <HeadersTab bind:form={form} {importedFields} />
-        {:else if activeTab === 'cors'}
-          <CorsTab bind:form={form} {importedFields} />
-        {:else if activeTab === 'caching'}
-          <CachingTab bind:form={form} {importedFields} />
         {:else if activeTab === 'protection'}
           <ProtectionTab bind:form={form} {importedFields} />
-        {:else if activeTab === 'response_rewrite'}
-          <ResponseRewriteTab bind:form={form} {importedFields} />
+        {:else if activeTab === 'upstream'}
+          <UpstreamTab bind:form={form} {importedFields} />
         {/if}
       </div>
 
