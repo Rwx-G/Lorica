@@ -178,7 +178,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 <p align="center">
   <img src="docs/screenshots/routesDrawer.png" alt="Route Configuration Drawer" width="100%">
-  <br><em>Route editor with 50+ settings across 11 tabs (General, Timeouts, Security, Headers, CORS, Caching, Protection, Path Rules, Header Rules, Canary, Rewrite)</em>
+  <br><em>Route editor with 50+ settings across 7 tabs (General, Routing, Transform, Protection, Security, Cache, Upstream)</em>
 </p>
 
 <p align="center">

@@ -1,14 +1,14 @@
 # Bot protection architecture
 
 Author: Romain G.
-Status: Design — implementation lands across v1.4.0 Epic 3
+Status: Design - implementation lands across v1.4.0 Epic 3
 (stories 3.2 through 3.10).
 
 This document specifies Lorica's self-hosted bot-protection stack:
 three graded challenge modes (Cookie, JavaScript proof-of-work,
 image captcha), an HMAC-signed verdict cookie, a five-category
 bypass matrix, and an inverse-country gate. The design avoids any
-third-party dependency — no Cloudflare Turnstile, no reCAPTCHA, no
+third-party dependency - no Cloudflare Turnstile, no reCAPTCHA, no
 hCaptcha, no remote scoring API. Every verdict is computed inside
 Lorica.
 
@@ -43,7 +43,7 @@ exclusions are documented in § 10.
 5. **Bounded hot-path cost.** A request carrying a valid cookie
    pays exactly one HMAC verify (≈ 1 µs on commodity hardware). A
    request without a cookie pays the challenge render (once per
-   NAT gateway worth of clients, caching skipped by design — see
+   NAT gateway worth of clients, caching skipped by design - see
    § 3.1) or the bypass-list scan if any bypass is configured.
 
 ## 2. Non-goals
@@ -52,7 +52,7 @@ exclusions are documented in § 10.
   headless-Chrome farm and real-browser fingerprints defeats JS
   PoW, and a low-wage CAPTCHA-farm defeats the image challenge.
   This stack targets automated crawlers, vulnerability scanners,
-  and casual credential-stuffing scripts — not nation-states or
+  and casual credential-stuffing scripts - not nation-states or
   funded adversaries.
 - **Replace WAF or rate-limiting.** Bot protection sits on top of
   the existing defences. A request that passes the challenge still
@@ -73,7 +73,7 @@ exclusions are documented in § 10.
 
 Renders a minimal HTML page with a `<meta http-equiv="refresh">`
 that bounces the browser back to the original URL carrying a
-freshly-minted verdict cookie. This is *not* a CAPTCHA — any
+freshly-minted verdict cookie. This is *not* a CAPTCHA - any
 browser that executes the refresh passes, scripts that follow
 redirects without cookie jar handling do not.
 
@@ -93,7 +93,7 @@ zero bits (N configurable 14–22). The counter that satisfies the
 target is POSTed back; Lorica verifies in ~1 µs and sets the
 verdict cookie.
 
-**Algorithm:** SHA-256 — the browser's `crypto.subtle.digest` is
+**Algorithm:** SHA-256 - the browser's `crypto.subtle.digest` is
 faster than any pure-JS implementation and works offline. No
 external fetch from the challenge page.
 
@@ -109,7 +109,7 @@ external fetch from the challenge page.
 
 Each additional bit doubles expected solve time. An attacker
 running headless Chrome pays the same CPU budget as a real
-browser — the cost asymmetry favours the defender when the
+browser - the cost asymmetry favours the defender when the
 attacker operates at scale.
 
 **Cost:** one extra round trip + N-dependent CPU on the client.
@@ -128,7 +128,7 @@ types the code; server verifies and sets the verdict cookie.
 
 **Cost:** one extra round trip + human reading time. **Bypass:**
 paid CAPTCHA-solving services (~$1 per 1000 solves). The
-mitigation is that the friction is now measured in human hours —
+mitigation is that the friction is now measured in human hours -
 economics of automated abuse change shape.
 
 ## 4. Verdict cookie format
@@ -151,8 +151,8 @@ encoded: ~60 bytes, fits in any reasonable `Set-Cookie` header.
 
 ### 4.2 IP prefix binding
 
-The HMAC includes a **prefix** of the client IP — `/24` for IPv4
-and `/64` for IPv6 — rather than the full address. Rationale:
+The HMAC includes a **prefix** of the client IP - `/24` for IPv4
+and `/64` for IPv6 - rather than the full address. Rationale:
 
 - **NAT tolerance.** A home router rotates the outbound port (and
   occasionally the address) between requests from the same
@@ -186,7 +186,7 @@ in the SQLite config DB under `global_settings.bot_hmac_secret`.
 Rotated **on every certificate renewal** (so the secret lifetime is
 capped at ≤ cert_ttl, typically 90 days for ACME Let's Encrypt, 1
 year for manual certs). Rotation invalidates all outstanding
-verdict cookies — an acceptable UX cost given the rotation cadence.
+verdict cookies - an acceptable UX cost given the rotation cadence.
 
 Mechanism: the ACME renewal path (`src/acme/*`) and the manual cert
 upload path both call `lorica_challenge::rotate_hmac_secret()`
@@ -242,7 +242,7 @@ Challenge generation is O(nonce_write + secret_hmac), roughly 1
 smallest rendered challenge page (~1.5 KiB) maxes out at ~800k
 renders/s, which is below the typical Lorica CPU budget for any
 other request handler. No additional rate-limit is applied on the
-challenge render itself — the existing per-route rate limit in
+challenge render itself - the existing per-route rate limit in
 `lorica::proxy_wiring::RateLimitEngine` covers it.
 
 ## 6. Bypass matrix
@@ -256,7 +256,7 @@ wins and skips the challenge entirely:
 | 2 | `asns` | rDNS → IP → ASN lookup matches | trust "all of Googlebot's ASN" without listing every IP |
 | 3 | `countries` | GeoIP resolved country ∈ list | internal-only service scoped to 1 country |
 | 4 | `user_agents` | Regex match on `User-Agent` header | allowlist `Mozilla/5.0 (compatible; Googlebot/.*)` with rDNS forward-confirmation as a separate belt-and-braces check |
-| 5 | `rdns` | PTR record suffix matches | `googlebot.com`, `search.msn.com` — the canonical crawler identity signal |
+| 5 | `rdns` | PTR record suffix matches | `googlebot.com`, `search.msn.com` - the canonical crawler identity signal |
 
 ### 6.1 rDNS spoofing defence
 
@@ -271,7 +271,7 @@ implementation uses.
 Cache TTL for the rDNS + forward confirm is 1 h, keyed by client
 IP. A bounded LRU (16k entries) caps memory. On cache miss the
 challenge is shown (fail-closed) rather than the rDNS being
-resolved inline — a DNS-slow query must not block the hot path.
+resolved inline - a DNS-slow query must not block the hot path.
 The cache is populated asynchronously on the FIRST match attempt
 for a given IP so subsequent requests from the same IP get the
 fast path.
@@ -285,7 +285,7 @@ used domestically: enable JS PoW only for traffic from known
 bot-farm jurisdictions, and let everyone else through with zero
 friction.
 
-`only_country` is evaluated AFTER the bypass rules — so an IP in
+`only_country` is evaluated AFTER the bypass rules - so an IP in
 `ip_cidrs` bypasses regardless of country, but a foreign IP that
 is not in any bypass still gets the challenge only if
 `only_country` matches.
@@ -318,7 +318,7 @@ otherwise → render challenge page
 3. **Rotation.** ACME renewal and manual cert upload both call
    `lorica_challenge::rotate_hmac_secret`. Writes a new 32-byte
    random secret, triggers a reload, and logs at `info!`. Old
-   cookies stop verifying immediately — users re-solve on their
+   cookies stop verifying immediately - users re-solve on their
    next request. Given typical ACME cadence (≤ 90 days) and the
    default 24-h cookie TTL, the operator-visible consequence is
    one "please solve again" prompt per renewal cycle, which is
@@ -390,7 +390,7 @@ Prometheus comfort.
 **OTel span attribute:** `bot_protection.challenge` on the root
 `http_request` span, populated with `mode`, `outcome`, and
 `bypass_reason` (category name, when applicable). No separate
-child span — the challenge is evaluated inside request_filter
+child span - the challenge is evaluated inside request_filter
 which is already inside the root span.
 
 ## 10. Threat model
@@ -401,7 +401,7 @@ which is already inside the root span.
   HTTP probes, headless scanners that don't run JS or handle
   cookies, and low-resource credential-stuffing scripts.
 - **Raises cost for:** mid-tier bot operators who run on rented
-  VPS pools — each IP must now solve the challenge once per 24 h
+  VPS pools - each IP must now solve the challenge once per 24 h
   per route, which breaks fire-and-forget abuse economics.
 
 ### 10.2 Out of scope
@@ -409,14 +409,14 @@ which is already inside the root span.
 - **Headless Chrome / Playwright farms.** Solve JS PoW natively.
   Mitigation: escalate to captcha, accept the UX cost.
 - **CAPTCHA-solving services.** Solve image captchas at ~$1 /
-  1000. Mitigation: none inside Lorica — the operator's recourse
+  1000. Mitigation: none inside Lorica - the operator's recourse
   is to pair with an external reputation feed (not part of this
   epic).
 - **Sophisticated cookie theft.** An attacker with XSS or a
   network-level MITM can capture the verdict cookie. The IP
   prefix binding limits replay to the same NAT gateway but does
   not prevent the attack outright. Mitigations exist elsewhere
-  in the stack (CSP, HSTS, secure-cookie flag — all emitted by
+  in the stack (CSP, HSTS, secure-cookie flag - all emitted by
   Lorica's default security headers).
 - **Same-NAT adversarial neighbours.** A hostile client on the
   same `/24` (v4) or `/64` (v6) can replay the victim's cookie.
@@ -431,7 +431,7 @@ which is already inside the root span.
 
 Each bypass category is a potential vector:
 
-- **`ip_cidrs`:** trivially correct — the client IP either is or
+- **`ip_cidrs`:** trivially correct - the client IP either is or
   is not in the CIDR. Risk is operator misconfiguration
   (bypassing `0.0.0.0/0`).
 - **`asns`:** depends on the ASN database freshness. Using a
@@ -439,7 +439,7 @@ Each bypass category is a potential vector:
   block is mis-attributed. Kept low-severity because ASN
   transfers are rare (~weekly at the RIR level).
 - **`countries`:** relies on GeoIP. Same assumptions as GeoIP
-  filtering — see the GeoIP doc for DB freshness tradeoffs.
+  filtering - see the GeoIP doc for DB freshness tradeoffs.
 - **`user_agents`:** trivially spoofable by a bad actor. Only
   useful with forward-confirm rDNS pairing, which is why the
   dashboard UI surfaces the two as "pair for safety".
@@ -451,7 +451,7 @@ Each bypass category is a potential vector:
 ## 11. Implementation checklist
 
 The stories below map one-to-one to the ROADMAP entries for
-v1.4.0 Epic 3. This section is the definition-of-done contract —
+v1.4.0 Epic 3. This section is the definition-of-done contract -
 an implementation is not complete until every checkbox below is
 ticked.
 
@@ -501,7 +501,7 @@ ticked.
 - **Stale-while-revalidate on rDNS cache.** A stale PTR match
   could serve one request after its real TTL expired. Current
   design fail-closes on cache miss (shows the challenge). The
-  alternative — stale-while-revalidate with a 5 min grace — is
+  alternative - stale-while-revalidate with a 5 min grace - is
   deferred pending real-world data on rDNS lookup latency.
 - **JS PoW worker threads.** A naive in-page solver blocks the
   main thread for large N. Using a Web Worker would let the page
