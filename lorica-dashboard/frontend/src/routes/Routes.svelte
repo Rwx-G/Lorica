@@ -42,13 +42,26 @@
   // Delete state
   let deletingRoute: RouteResponse | null = $state(null);
 
+  // Confirmation gate for enabling maintenance (503 for every client).
+  // Disabling maintenance restores service, so no gate there.
+  let maintenanceEnableTarget: RouteResponse | null = $state(null);
+
   // Prevents a double-click from firing two PUTs before the list reloads.
   let togglingRouteId: string | null = $state(null);
 
-  async function toggleMaintenance(route: RouteResponse) {
+  function requestMaintenanceToggle(route: RouteResponse) {
     if (togglingRouteId === route.id) return;
+    if (route.maintenance_mode) {
+      // Turning OFF: safe, restores normal service, fire immediately.
+      void applyMaintenance(route, false);
+    } else {
+      // Turning ON: 503 to every subsequent client, confirm first.
+      maintenanceEnableTarget = route;
+    }
+  }
+
+  async function applyMaintenance(route: RouteResponse, next: boolean) {
     togglingRouteId = route.id;
-    const next = !route.maintenance_mode;
     const res = await api.updateRoute(route.id, { maintenance_mode: next });
     if (res.error) {
       showToast(`Failed to toggle maintenance: ${res.error.message}`, 'error');
@@ -62,6 +75,12 @@
     }
     togglingRouteId = null;
     await loadData();
+  }
+
+  async function confirmEnableMaintenance() {
+    const t = maintenanceEnableTarget;
+    maintenanceEnableTarget = null;
+    if (t) await applyMaintenance(t, true);
   }
 
   async function loadData() {
@@ -258,7 +277,7 @@
                   aria-label={route.maintenance_mode ? 'Disable maintenance' : 'Enable maintenance'}
                   aria-pressed={route.maintenance_mode}
                   disabled={togglingRouteId === route.id}
-                  onclick={() => toggleMaintenance(route)}
+                  onclick={() => requestMaintenanceToggle(route)}
                 >
                   <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                   {@html wrenchIcon}
@@ -297,6 +316,17 @@
     message="Are you sure you want to delete the route for {deletingRoute.hostname}{deletingRoute.path_prefix}? This action cannot be undone."
     onconfirm={handleDelete}
     oncancel={() => { deletingRoute = null; }}
+  />
+{/if}
+
+{#if maintenanceEnableTarget}
+  <ConfirmDialog
+    title="Enable Maintenance Mode"
+    message="All requests to {maintenanceEnableTarget.hostname}{maintenanceEnableTarget.path_prefix} will immediately return 503 Service Unavailable with Retry-After. Existing in-flight responses are not affected. Continue?"
+    confirmLabel="Enable maintenance"
+    confirmStyle="warning"
+    onconfirm={confirmEnableMaintenance}
+    oncancel={() => { maintenanceEnableTarget = null; }}
   />
 {/if}
 
