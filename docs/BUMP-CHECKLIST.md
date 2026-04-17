@@ -10,9 +10,12 @@ When bumping the version, update ALL of these files:
 - [ ] `lorica-bench/Cargo.toml` - `version`
 - [ ] `lorica-worker/Cargo.toml` - `version`
 - [ ] `lorica-command/Cargo.toml` - `version`
+- [ ] `lorica-shmem/Cargo.toml` - `version`
+- [ ] `lorica-geoip/Cargo.toml` - `version` (follows product since v1.4.0)
+- [ ] `lorica-challenge/Cargo.toml` - `version` (follows product since v1.4.0)
 
 ## Internal dependency references (cross-crate deps)
-- [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-bench, lorica-worker, lorica-command versions
+- [ ] `lorica/Cargo.toml` - lorica-config, lorica-api, lorica-bench, lorica-worker, lorica-command, lorica-shmem, lorica-geoip, lorica-challenge versions
 - [ ] `lorica-api/Cargo.toml` - lorica-config, lorica-dashboard, lorica-bench versions
 - [ ] `lorica-bench/Cargo.toml` - lorica-config version
 
