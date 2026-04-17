@@ -13,10 +13,7 @@
     sla_purge_enabled: boolean;
     sla_purge_retention_days: number;
     sla_purge_schedule: string;
-    trusted_proxies: string;
     waf_whitelist_ips: string;
-    connection_deny_cidrs: string;
-    connection_allow_cidrs: string;
   }
 
   interface Props {
@@ -95,24 +92,9 @@
         <span class="hint">How long to ban (default 3600 = 1 hour, max 7 days).</span>
       </div>
       <div class="settings-form-row">
-        <label for="trusted-proxies">Trusted Proxies (CIDR)</label>
-        <textarea id="trusted-proxies" rows="4" bind:value={settingsForm.trusted_proxies} placeholder="192.168.0.0/16&#10;10.0.0.0/8&#10;172.16.0.0/12"></textarea>
-        <span class="hint">One CIDR range or IP per line. X-Forwarded-For is only trusted from these addresses. Empty = trust no XFF (direct client IP always used).</span>
-      </div>
-      <div class="settings-form-row">
         <label for="waf-whitelist">WAF Whitelist IPs</label>
         <textarea id="waf-whitelist" rows="3" bind:value={settingsForm.waf_whitelist_ips} placeholder="203.0.113.50&#10;10.0.0.0/8"></textarea>
         <span class="hint">One IP or CIDR per line. These IPs bypass WAF, rate limiting, IP blocklist, and auto-ban entirely. Use for admin/operator IPs.</span>
-      </div>
-      <div class="settings-form-row">
-        <label for="conn-deny">Connection Deny CIDRs</label>
-        <textarea id="conn-deny" rows="3" bind:value={settingsForm.connection_deny_cidrs} placeholder="198.51.100.0/24&#10;2001:db8::/32"></textarea>
-        <span class="hint">One IP or CIDR per line. Matching connections are dropped at TCP accept, before TLS handshake. Evaluated after the allow list; deny always wins.</span>
-      </div>
-      <div class="settings-form-row">
-        <label for="conn-allow">Connection Allow CIDRs</label>
-        <textarea id="conn-allow" rows="3" bind:value={settingsForm.connection_allow_cidrs} placeholder="10.0.0.0/8&#10;192.168.0.0/16"></textarea>
-        <span class="hint">One IP or CIDR per line. Leave empty for default-allow. When non-empty, switches the pre-filter to default-deny: only listed IPs are accepted.</span>
       </div>
       <div class="settings-form-row">
         <label for="s-log-retention">Access Log Retention (entries)</label>
@@ -150,9 +132,6 @@
 
       {#if settingsError}
         <div class="settings-form-error">{settingsError}</div>
-      {/if}
-      {#if settingsMsg}
-        <div class="form-success">{settingsMsg}</div>
       {/if}
       <div class="settings-dialog-actions">
         <button class="btn btn-primary" onclick={onSave} disabled={settingsSaving}>
