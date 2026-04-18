@@ -94,6 +94,16 @@
       }
       const svgText = await resp.text();
       if (svgContainer) {
+        // We intentionally bypass the Svelte DOM reconciler here: the
+        // Wikimedia SVG is fetched at runtime (not known at compile
+        // time), has ~250 country <path> elements that we then
+        // attribute-tweak and click-delegate against, and we need
+        // post-insertion DOM access for applyHighlights(). `{@html}`
+        // would insert but not let us mutate viewBox / listen for
+        // clicks on path elements. The container is a leaf component -
+        // Svelte never writes to it from its own template - so there
+        // is no reconciler state to diverge from.
+        // eslint-disable-next-line svelte/no-dom-manipulating
         svgContainer.innerHTML = svgText;
         // Make the SVG fill its container; strip fixed
         // width/height that Wikimedia hardcodes.

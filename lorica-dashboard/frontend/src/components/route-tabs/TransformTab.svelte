@@ -14,6 +14,13 @@
 
   let { form = $bindable(), importedFields }: Props = $props();
 
+  // Multi-line placeholders: HTML attributes render escape sequences
+  // literally, so the newline must come from a JS string at interpolation
+  // time. Hoisted to consts so eslint-svelte's `no-useless-mustaches`
+  // does not flag them as trivially replaceable by an attribute string.
+  const PROXY_HEADERS_PLACEHOLDER = 'X-Forwarded-For=$remote_addr\nX-Custom=value';
+  const RESPONSE_HEADERS_PLACEHOLDER = 'X-Frame-Options=DENY\nCache-Control=no-store';
+
   let activeHelp = $state<
     | null
     | 'section:request_headers'
@@ -74,7 +81,7 @@
         <label for="proxy-headers">Custom proxy headers</label>
         {#if isImported('proxy_headers')}<span class="imported-badge">imported</span>{/if}
         <textarea id="proxy-headers" rows="4" bind:value={form.proxy_headers}
-          placeholder={'X-Forwarded-For=$remote_addr\nX-Custom=value'}></textarea>
+          placeholder={PROXY_HEADERS_PLACEHOLDER}></textarea>
         <span class="hint">Format: <code>key=value</code>, one per line. Nginx: <code>proxy_set_header</code>.</span>
       </div>
       <div class="form-group" class:modified={isModified('proxy_headers_remove')}>
@@ -109,7 +116,7 @@
         <label for="response-headers">Custom response headers</label>
         {#if isImported('response_headers')}<span class="imported-badge">imported</span>{/if}
         <textarea id="response-headers" rows="4" bind:value={form.response_headers}
-          placeholder={'X-Frame-Options=DENY\nCache-Control=no-store'}></textarea>
+          placeholder={RESPONSE_HEADERS_PLACEHOLDER}></textarea>
         <span class="hint">
           Format: <code>key=value</code>, one per line. Avoid <code>Access-Control-*</code> here - set them via the CORS subsection below.
         </span>

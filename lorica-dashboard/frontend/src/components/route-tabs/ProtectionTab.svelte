@@ -15,6 +15,12 @@
 
   let { form = $bindable(), importedFields }: Props = $props();
 
+  // Multi-line placeholder: HTML attributes render `\n` as two chars,
+  // so the newline has to come from a JS string at interpolation time.
+  // Hoisted to a const so eslint-svelte's `no-useless-mustaches` does
+  // not flag the mustache expression as trivially replaceable.
+  const UA_BYPASS_PLACEHOLDER = '(?i)^Mozilla/5\\.0 .* Firefox/\n(?i)googlebot';
+
   let activeHelp = $state<
     | null
     | 'section:rate_limit'
@@ -303,7 +309,7 @@
           <label for="bot-bypass-ua">Bypass - User-Agent regexes</label>
           {#if isImported('bot_bypass_user_agents')}<span class="imported-badge">imported</span>{/if}
           <textarea id="bot-bypass-ua" rows="4" bind:value={form.bot_bypass_user_agents}
-            placeholder={'(?i)^Mozilla/5\\.0 .* Firefox/\n(?i)googlebot'}
+            placeholder={UA_BYPASS_PLACEHOLDER}
             autocomplete="off" spellcheck="false"></textarea>
           <span class="hint">
             Rust <code>regex</code> crate syntax (no lookahead, no backreference). One per line. Trivially spoofable alone - pair with IP CIDRs or rDNS.

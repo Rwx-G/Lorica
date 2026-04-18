@@ -105,7 +105,7 @@ export function validateDnsSuffix(input: string): string | null {
   if (s.length === 0) return null;
   if (s.startsWith('.')) return 'must not start with a dot';
   if (!s.includes('.')) return 'bare TLD rejected; use e.g. googlebot.com';
-  if (!/^[a-zA-Z0-9.\-]+$/.test(s)) return 'only letters, digits, dashes and dots allowed';
+  if (!/^[a-zA-Z0-9.-]+$/.test(s)) return 'only letters, digits, dashes and dots allowed';
   return null;
 }
 
