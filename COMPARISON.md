@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-04-17 | Lorica v1.4.0
+> Last updated: 2026-04-18 | Lorica v1.4.0
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin/Module (not built-in)
 >
@@ -19,7 +19,7 @@
 | WebSocket proxying | Y | Y | P | Y | Y | Y | Y | Y |
 | gRPC proxying | Y | Y | N | Y | Y | Plug | Y | Y |
 | HTTP/2 upstream (h2c) | Y | Y | N | Y | Y | P | Y | Y |
-| HTTP/3 (QUIC) | N | N | N | N | Y | N | P | Y |
+| HTTP/3 (QUIC) | N | N | N | Y | Y | N | Y | Y |
 | TLS termination (rustls) | Y | Y | Y | Y | Y | Y | Y | Y |
 | SNI-based cert selection | Y | P | Y | Y | Y | Y | Y | Y |
 | Wildcard cert support | Y | P | Y | Y | Y | Y | Y | Y |
@@ -38,7 +38,7 @@
 ### Gaps for Lorica
 
 - **TCP/L4 proxying** - Supported by most competitors. Enables database, MQTT, SSH proxying.
-- **HTTP/3 (QUIC)** - Traefik and HAProxy have production support. Pingora has an upstream PR pending. Long-term gap.
+- **HTTP/3 (QUIC)** - Nginx (stable since 1.28, 2025-04), Caddy (since 2.6), Traefik v3, and HAProxy 3.2+ all have production support. Pingora has an upstream PR pending. Long-term gap.
 
 ---
 
@@ -53,11 +53,11 @@
 | Random | Y | Y | Y | Y | N | N | Y | Y |
 | IP Hash | N | N | N | Y | N | N | Y | Y |
 | Health-aware filtering | Y | Y | Y | Paid | Y | Paid | Y | Y |
-| Traffic mirroring | Y | N | N | N | Y | N | N | N |
+| Traffic mirroring | Y | N | N | Y | Y | N | N | N |
 
 ### Lorica Strengths
 
-- **Traffic mirroring** - Only Traefik and Lorica ship this natively. Lorica's implementation adds request-body mirroring up to a configurable cap, deterministic per-request-id sampling, and a 256-slot concurrency semaphore so a slow shadow can't starve the primary.
+- **Traffic mirroring** - Nginx (`ngx_http_mirror_module`, core since 1.13.4), Traefik, and Lorica ship this natively. Lorica's implementation adds request-body mirroring up to a configurable cap, deterministic per-request-id sampling, and a 256-slot concurrency semaphore so a slow shadow can't starve the primary - guardrails that the Nginx directive leaves to the operator.
 
 ### Gaps for Lorica
 
@@ -132,10 +132,10 @@
 
 | Feature | Lorica | Pingora | Sozu | Nginx | Traefik | BunkerWeb | Caddy | HAProxy |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| ACME HTTP-01 | Y | N | Y | Plug | Y | Y | Y | Y |
+| ACME HTTP-01 | Y | N | Y | Y | Y | Y | Y | Y |
 | ACME DNS-01 | Y | N | N | N | Y | Y | Y | Y |
 | ACME TLS-ALPN-01 | N | N | N | Plug | Y | N | Y | N |
-| Auto-renewal | Y | N | P | N | Y | Y | Y | Y |
+| Auto-renewal | Y | N | P | Y | Y | Y | Y | Y |
 | Multi-domain SAN | Y | N | N | N | Y | N | Y | N |
 | Wildcard via DNS-01 | Y | N | N | N | Y | Y | Y | Y |
 | SNI hot-swap | Y | P | Y | N | Y | N | Y | N |
@@ -145,7 +145,7 @@
 
 ### Lorica Strengths
 
-- **ACME DNS-01 with 3 providers** (Cloudflare, Route53, OVH) + manual mode - competitive with Traefik and Caddy.
+- **ACME DNS-01 with 3 providers** (Cloudflare, Route53, OVH) + manual mode. Traefik and Caddy ship many more DNS providers; Lorica's spread covers the common European-centric set. Route 53 is an opt-in Cargo feature (not in the default `.deb` / `.rpm` build) to keep the AWS SDK dep graph out of the default binary.
 - **SNI hot-swap** via arc-swap - zero-downtime cert rotation.
 - **CRL support** - Rare feature, only Nginx and HAProxy match.
 - **Per-route mTLS policy** - chain verification at the TLS listener plus per-route enforcement knobs (`required`, org allowlist) that hot-reload without restart. Most competitors only expose a single listener-wide client-cert setting.
@@ -167,7 +167,7 @@
 | Real-time access logs (WS) | Y | N | N | N | N | N | N | N |
 | Built-in load testing | Y | N | N | N | N | N | N | N |
 | SLA breach alerts | Y | N | N | N | N | N | N | N |
-| OpenTelemetry tracing (OTLP) | Y | P | Y | N | Y | N | P | Y |
+| OpenTelemetry tracing (OTLP) | Y | P | Y | Y | Y | N | P | Y |
 | Structured JSON logs | Y | P | Y | Y | Y | Y | Y | Y |
 
 ### Lorica Strengths
@@ -223,7 +223,7 @@
 | Circuit breaker | Y | P | N | N | Y | N | P | P |
 | Graceful drain | Y | Y | Y | Paid | Y | Y | Y | Y |
 | Encrypted storage (AES) | Y | N | N | N | N | N | N | N |
-| Retry with backoff | Y | N | N | N | Y | N | Y | Y |
+| Retry with backoff | Y | Y | N | N | Y | N | Y | Y |
 | **Hot binary upgrade** | **N** | Y | Y | Y | N | Y | N | Y |
 
 ### Lorica Strengths
