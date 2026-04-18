@@ -191,18 +191,24 @@ fi
 # service is kept as a regression guard for the previous
 # (broken) behaviour.
 log "waiting for span export to Jaeger..."
+# BatchSpanProcessor default schedule_delay = 5 s. A worker-forked
+# runtime needs at least one tick to flush. Plus Jaeger's ingest
+# pipeline adds a second or two. 30 s was too tight under multi-
+# worker fan-out; 90 s covers 18 BatchSpanProcessor ticks and still
+# short-circuits as soon as the span lands.
 TRACE_JSON=""
-for i in $(seq 1 30); do
+for i in $(seq 1 90); do
     BYID=$(curl -sf "${JAEGER}/api/traces/${CLIENT_TRACE_ID}" 2>/dev/null || echo '{}')
     if echo "$BYID" | jq -e '.data[0].spans | length > 0' >/dev/null 2>&1; then
         TRACE_JSON="$BYID"
+        log "span landed in Jaeger after ${i}s"
         break
     fi
     sleep 1
 done
 
 if [ -z "$TRACE_JSON" ]; then
-    fail "no trace with id ${CLIENT_TRACE_ID} in Jaeger after 30 s"
+    fail "no trace with id ${CLIENT_TRACE_ID} in Jaeger after 90 s"
     LIST=$(curl -sf "${JAEGER}/api/traces?service=lorica&limit=5" 2>/dev/null || echo '{}')
     echo "Fallback: traces for service=lorica follow (for debug):"
     echo "$LIST" | jq -r '.data[].traceID' | head -5

@@ -181,38 +181,51 @@ sleep 2
 
 # --- Mode: Cookie --------------------------------------------------------
 log "=== bot smoke: mode=cookie ==="
-# Use --cookie-jar so curl captures Set-Cookie and replays on the
-# follow-up request.
-JAR=$(mktemp)
-CODE=$(curl -s -o /dev/null -w '%{http_code}' -c "$JAR" \
+# NOTE: Lorica stamps `Secure` on the verdict cookie by design
+# (bot.rs::build_set_cookie_header - verdict cookies are security
+# tokens and must never transit over plaintext). The smoke harness
+# speaks plain HTTP, so curl correctly drops Secure cookies from its
+# jar per RFC 6265. We therefore parse the Set-Cookie header
+# directly from the response and replay by constructing the Cookie
+# header ourselves. The challenge-page body vs backend-response body
+# are distinguishable by the `X-Backend-Id` header the fixture stamps
+# on every backend response, so the passthrough assertion is now
+# strict (backend header must be present on replay).
+HDRS=$(mktemp)
+BODY=$(mktemp)
+curl -s -o "$BODY" -D "$HDRS" \
     -H "Host: bot-test.local" \
     -H "X-Forwarded-For: $IP_UNKNOWN" \
     -H "Accept: text/html" \
-    "${PROXY}/")
+    "${PROXY}/" > /dev/null
+CODE=$(awk 'NR==1 {print $2}' "$HDRS")
 if [ "$CODE" = "200" ]; then
     ok "cookie mode: challenge page served (HTTP 200)"
 else
     fail "cookie mode: expected 200 on challenge render, got $CODE"
 fi
-# Verdict cookie must be present in the jar.
-if grep -q lorica_bot_verdict "$JAR"; then
-    ok "cookie mode: Set-Cookie issued in challenge response"
+VERDICT=$(grep -i "^Set-Cookie:" "$HDRS" | grep -o 'lorica_bot_verdict=[^;]*' | head -1)
+if [ -n "$VERDICT" ]; then
+    ok "cookie mode: Set-Cookie issued in challenge response ($(echo "$VERDICT" | head -c 48)...)"
 else
-    fail "cookie mode: Set-Cookie missing from jar"
+    fail "cookie mode: Set-Cookie missing from response headers"
 fi
-# Replay with the cookie jar → backend responds (not the refresh
-# page).
-CODE=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" \
+# Replay with the reconstructed cookie -> Lorica should proxy to the
+# backend. Strict assertion: response must carry X-Backend-Id (only
+# the backend fixture emits this, not the challenge HTML).
+REPLAY_HDRS=$(mktemp)
+curl -s -o /dev/null -D "$REPLAY_HDRS" \
     -H "Host: bot-test.local" \
     -H "X-Forwarded-For: $IP_UNKNOWN" \
     -H "Accept: text/html" \
-    "${PROXY}/")
-if [ "$CODE" = "200" ]; then
-    ok "cookie mode: verdict cookie grants passthrough"
+    -H "Cookie: $VERDICT" \
+    "${PROXY}/" > /dev/null
+if grep -qi '^X-Backend-Id:' "$REPLAY_HDRS"; then
+    ok "cookie mode: verdict cookie grants passthrough (backend header present)"
 else
-    fail "cookie mode: passthrough expected 200, got $CODE"
+    fail "cookie mode: passthrough did not reach backend (no X-Backend-Id on replay)"
 fi
-rm -f "$JAR"
+rm -f "$HDRS" "$BODY" "$REPLAY_HDRS"
 
 # --- Mode: JavaScript PoW -------------------------------------------------
 log "=== bot smoke: switch to mode=javascript (difficulty=14) ==="
@@ -280,12 +293,12 @@ else
     exit 1
 fi
 
-# Submit the solution. Expect 302 + Set-Cookie. -L follows the
-# redirect; the redirect target + cookie should now get us
-# through the backend.
-JAR=$(mktemp)
+# Submit the solution. Expect 302 + Set-Cookie. Parse the Set-Cookie
+# straight from the response headers (see comment in the cookie-mode
+# section: Secure cookies over plain HTTP are dropped by curl's jar
+# by design).
 POST_HEAD=$(mktemp)
-HTTP=$(curl -s -o /dev/null -D "$POST_HEAD" -w '%{http_code}' -c "$JAR" \
+HTTP=$(curl -s -o /dev/null -D "$POST_HEAD" -w '%{http_code}' \
     -H "Host: bot-test.local" \
     -H "X-Forwarded-For: $IP_UNKNOWN" \
     -X POST \
@@ -297,24 +310,29 @@ if [ "$HTTP" = "302" ]; then
 else
     fail "pow solve: expected 302, got $HTTP"
 fi
-if grep -q lorica_bot_verdict "$JAR"; then
+POW_VERDICT=$(grep -i "^Set-Cookie:" "$POST_HEAD" | grep -o 'lorica_bot_verdict=[^;]*' | head -1)
+if [ -n "$POW_VERDICT" ]; then
     ok "pow solve: verdict cookie issued"
 else
-    fail "pow solve: verdict cookie missing"
+    fail "pow solve: verdict cookie missing from response headers"
 fi
 rm -f "$POST_HEAD"
 
-# Replay with the cookie — should now passthrough to backend.
-CODE=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" \
+# Replay with the reconstructed cookie — must reach the backend
+# (strict: X-Backend-Id is only emitted by the backend fixture).
+POW_REPLAY_HDRS=$(mktemp)
+curl -s -o /dev/null -D "$POW_REPLAY_HDRS" \
     -H "Host: bot-test.local" \
     -H "X-Forwarded-For: $IP_UNKNOWN" \
     -H "Accept: text/html" \
-    "${PROXY}/")
-if [ "$CODE" = "200" ]; then
-    ok "pow mode: verdict cookie grants passthrough"
+    -H "Cookie: $POW_VERDICT" \
+    "${PROXY}/" > /dev/null
+if grep -qi '^X-Backend-Id:' "$POW_REPLAY_HDRS"; then
+    ok "pow mode: verdict cookie grants passthrough (backend header present)"
 else
-    fail "pow passthrough: expected 200, got $CODE"
+    fail "pow passthrough: no X-Backend-Id on replay"
 fi
+rm -f "$POW_REPLAY_HDRS"
 
 # Wrong counter must be rejected with 403.
 BAD_HTTP=$(curl -s -o /dev/null -w '%{http_code}' \
@@ -332,7 +350,6 @@ if [ "$BAD_HTTP" = "403" ]; then
 else
     fail "pow solve: replay expected 403, got $BAD_HTTP"
 fi
-rm -f "$JAR"
 
 # --- Mode: Captcha (render-only, no human to type the answer) --------------
 log "=== bot smoke: switch to mode=captcha ==="
