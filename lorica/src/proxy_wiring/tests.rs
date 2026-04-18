@@ -66,6 +66,8 @@ fn make_route(id: &str, hostname: &str, path: &str, enabled: bool) -> Route {
         response_rewrite: None,
         mtls: None,
         rate_limit: None,
+        geoip: None,
+        bot_protection: None,
         created_at: now,
         updated_at: now,
     }

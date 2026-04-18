@@ -1,7 +1,6 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Working docs
 FIXLIST.md
@@ -51,3 +50,4 @@ audit-v*/
 
 # Local-only error page demo HTML (preview file, not shipped)
 error-page-demo.html
+TESTING-GUIDE.md

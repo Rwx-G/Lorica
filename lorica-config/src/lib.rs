@@ -21,4 +21,5 @@ mod tests;
 
 pub use crypto::EncryptionKey;
 pub use error::{ConfigError, Result};
+pub use store::bot_stash::BotStashEntry;
 pub use store::ConfigStore;

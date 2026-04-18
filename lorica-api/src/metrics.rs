@@ -335,6 +335,279 @@ pub fn inc_forward_auth_cache(route_id: &str, outcome: &str) {
         .inc();
 }
 
+/// Counter: GeoIP-filter rejections per route. Labels:
+/// - `route_id`: bounded by number of configured routes.
+/// - `country`: ISO 3166-1 alpha-2 (bounded ~240).
+/// - `mode`: "allowlist" | "denylist".
+///
+/// Cardinality bound: routes * countries * 2, well within Prometheus
+/// comfort envelope on any sensible deployment. A route with no
+/// GeoIP config never increments this counter.
+static GEOIP_BLOCK_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "geoip_block_total",
+            "GeoIP-filter blocks (country=ISO3166 alpha-2, mode=allowlist|denylist)"
+        )
+        .namespace("lorica"),
+        &["route_id", "country", "mode"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record a GeoIP filter rejection. Called from the proxy request
+/// filter when a country mismatches the per-route
+/// `Allowlist` / `Denylist` rule and Lorica returns 403.
+pub fn inc_geoip_block(route_id: &str, country: &str, mode: &str) {
+    GEOIP_BLOCK_TOTAL
+        .with_label_values(&[route_id, country, mode])
+        .inc();
+}
+
+/// Counter: bot-protection challenge outcomes per route (v1.4.0
+/// Epic 3 story 3.7). Labels:
+/// - `route_id`: bounded by the number of configured routes.
+/// - `mode`: `"cookie"` / `"javascript"` / `"captcha"` (the mode
+///   the route was configured with at the time of the event).
+/// - `outcome`: `"shown"` (challenge page served), `"passed"`
+///   (verdict cookie verified OR solve succeeded), `"failed"`
+///   (wrong PoW / captcha answer, or cookie scope mismatch), or
+///   `"bypassed"` (one of the five bypass categories matched —
+///   detail carried on the OTel span, not the metric).
+///
+/// Cardinality bound: routes × 3 modes × 4 outcomes, well inside
+/// Prometheus comfort on any plausible deployment. Routes without
+/// `bot_protection` configured never touch this counter.
+static BOT_CHALLENGE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "bot_challenge_total",
+            "Bot-protection challenge outcomes (outcome=shown|passed|failed|bypassed)"
+        )
+        .namespace("lorica"),
+        &["route_id", "mode", "outcome"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one bot-protection challenge outcome. Called from the
+/// proxy request filter on every bot-protection decision that
+/// reaches a terminal state: pass, challenge render, or verify
+/// result.
+pub fn inc_bot_challenge(route_id: &str, mode: &str, outcome: &str) {
+    BOT_CHALLENGE_TOTAL
+        .with_label_values(&[route_id, mode, outcome])
+        .inc();
+}
+
+// ---------------------------------------------------------------------------
+// Cross-worker counter aggregation (v1.4.0 follow-up).
+//
+// In worker mode, each of the `IntCounterVec` statics above lives
+// in the worker process that incremented it. The supervisor's
+// `/metrics` handler scrapes the supervisor's own registry — which
+// does NOT see worker-side increments for these counters because
+// the existing `MetricsReport` wire format only carries the typed
+// fields (cache_hits, active_connections, per-route request counts,
+// WAF counts).
+//
+// The helpers below let a worker serialise a snapshot of the
+// per-worker counters into `Vec<GenericCounterEntry>` (cheap: iter
+// the `IntCounterVec::get_metric_with_label_values`-style family
+// readback via `prometheus::core::Collector::collect()`), and let
+// the supervisor apply that snapshot to its OWN registry — keyed
+// per-worker so successive scrapes replace instead of double-count.
+//
+// The supervisor's apply path does not just `inc_by` — that would
+// double-count on the second scrape. Instead it tracks per-worker
+// snapshots (worker_id -> metric_name -> label_tuple -> value) and
+// on every apply it computes the delta to reach the new value; if
+// a worker resets or drops out, the delta goes negative and the
+// counter stays where it is (prometheus counters cannot decrement).
+// ---------------------------------------------------------------------------
+
+/// Names of the per-worker counter vecs whose deltas ship on the
+/// wire. Kept as a const array so worker snapshot and supervisor
+/// apply look at the same list — a counter added here without
+/// being added to both snapshot + apply logic will simply not
+/// aggregate.
+pub const PER_WORKER_COUNTERS: &[&str] = &[
+    "lorica_cache_predictor_bypass_total",
+    "lorica_header_rule_match_total",
+    "lorica_canary_split_selected_total",
+    "lorica_mirror_outcome_total",
+    "lorica_forward_auth_cache_total",
+    "lorica_geoip_block_total",
+    "lorica_bot_challenge_total",
+];
+
+/// One generic counter entry at the lorica-api boundary.
+/// `(metric_name, label_NAME_value_pairs, value)`. The lorica
+/// binary translates between this tuple and the
+/// `lorica_command::GenericCounterEntry` wire type — this crate
+/// stays free of the lorica-command dep.
+///
+/// Labels are name=value pairs (not positional values) because
+/// `prometheus::Metric::get_label()` returns them in ALPHABETICAL
+/// order, not registration order. At apply time the supervisor
+/// looks up each metric's registered label-name list and builds
+/// the positional `with_label_values` slice from there.
+pub type GenericCounterTuple = (String, Vec<(String, String)>, u64);
+
+/// Snapshot every per-worker counter. Called on every
+/// metrics-report tick by the worker. Returns an empty vec when no
+/// counter has ever incremented on this worker (all vecs are lazy
+/// — they only allocate label sets on first `inc`).
+pub fn snapshot_per_worker_counters() -> Vec<GenericCounterTuple> {
+    use prometheus::core::Collector;
+
+    let vecs: [(&str, &IntCounterVec); 7] = [
+        (
+            "lorica_cache_predictor_bypass_total",
+            &CACHE_PREDICTOR_BYPASS_TOTAL,
+        ),
+        ("lorica_header_rule_match_total", &HEADER_RULE_MATCH_TOTAL),
+        (
+            "lorica_canary_split_selected_total",
+            &CANARY_SPLIT_SELECTED_TOTAL,
+        ),
+        ("lorica_mirror_outcome_total", &MIRROR_OUTCOME_TOTAL),
+        ("lorica_forward_auth_cache_total", &FORWARD_AUTH_CACHE_TOTAL),
+        ("lorica_geoip_block_total", &GEOIP_BLOCK_TOTAL),
+        ("lorica_bot_challenge_total", &BOT_CHALLENGE_TOTAL),
+    ];
+
+    let mut out = Vec::new();
+    for (name, vec) in vecs {
+        let families = vec.collect();
+        for mf in families {
+            for m in mf.get_metric() {
+                // Carry label name=value pairs on the wire so the
+                // supervisor can rebuild positional ordering using
+                // the target vec's registered label names.
+                // `get_label` returns pairs in alphabetical order,
+                // which is NOT the registration order.
+                let labels: Vec<(String, String)> = m
+                    .get_label()
+                    .iter()
+                    .map(|l| (l.name().to_string(), l.value().to_string()))
+                    .collect();
+                let value = m.get_counter().value() as u64;
+                if value > 0 {
+                    out.push((name.to_string(), labels, value));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Supervisor-side snapshot: worker_id -> metric_name ->
+/// label_key -> last-known-value. Stored alongside the typed
+/// per-worker fields in `AggregatedMetrics`.
+type PerWorkerCounterSnapshot =
+    std::collections::HashMap<String, std::collections::HashMap<String, u64>>;
+
+static SUPERVISOR_GENERIC_SNAPSHOT: Lazy<
+    parking_lot::RwLock<std::collections::HashMap<u32, PerWorkerCounterSnapshot>>,
+> = Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+
+/// Apply a worker's generic-counter snapshot to the supervisor's
+/// own metrics registry. Called from the supervisor's
+/// `MetricsReport` ingress. The supervisor's vec (same
+/// `IntCounterVec` statics declared above — the `lorica-api`
+/// crate is linked into both worker and supervisor binaries)
+/// receives a POSITIVE delta only: a dropped worker's state stays
+/// in the last scrape until another `MetricsReport` arrives or a
+/// `forget_worker` call removes it.
+pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTuple]) {
+    // Registered label order for each per-worker counter vec.
+    // MUST match the `&[...]` passed to `IntCounterVec::new` at
+    // the corresponding `Lazy::new` above. The apply path walks
+    // this list to reorder name=value pairs from the wire into
+    // positional arguments for `with_label_values`.
+    fn label_names(metric: &str) -> Option<&'static [&'static str]> {
+        match metric {
+            "lorica_cache_predictor_bypass_total" => Some(&["route_id"]),
+            "lorica_header_rule_match_total" => Some(&["route_id", "rule_index"]),
+            "lorica_canary_split_selected_total" => Some(&["route_id", "split_name"]),
+            "lorica_mirror_outcome_total" => Some(&["route_id", "outcome"]),
+            "lorica_forward_auth_cache_total" => Some(&["route_id", "outcome"]),
+            "lorica_geoip_block_total" => Some(&["route_id", "country", "mode"]),
+            "lorica_bot_challenge_total" => Some(&["route_id", "mode", "outcome"]),
+            _ => None,
+        }
+    }
+
+    fn key_from_positional(values: &[String]) -> String {
+        values.join("\0")
+    }
+
+    let mut map = SUPERVISOR_GENERIC_SNAPSHOT.write();
+    let worker_state = map.entry(worker_id).or_default();
+
+    for (name, label_pairs, value) in entries {
+        let Some(order) = label_names(name) else {
+            continue;
+        };
+        // Reorder name=value pairs into positional values matching
+        // the registered order. Missing names get an empty string
+        // (the registered vec never accepts empty labels, so this
+        // will fail the `get_metric_with_label_values` check and
+        // be skipped — safe default).
+        let mut positional: Vec<String> = Vec::with_capacity(order.len());
+        for expected in order {
+            let v = label_pairs
+                .iter()
+                .find(|(n, _)| n.as_str() == *expected)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            positional.push(v);
+        }
+
+        let lbl_key = key_from_positional(&positional);
+        let metric_state = worker_state.entry(name.clone()).or_default();
+        let prev = metric_state.get(&lbl_key).copied().unwrap_or(0);
+        if *value <= prev {
+            continue;
+        }
+        let delta = *value - prev;
+        metric_state.insert(lbl_key, *value);
+
+        let label_refs: Vec<&str> = positional.iter().map(|s| s.as_str()).collect();
+        let vec: &IntCounterVec = match name.as_str() {
+            "lorica_cache_predictor_bypass_total" => &CACHE_PREDICTOR_BYPASS_TOTAL,
+            "lorica_header_rule_match_total" => &HEADER_RULE_MATCH_TOTAL,
+            "lorica_canary_split_selected_total" => &CANARY_SPLIT_SELECTED_TOTAL,
+            "lorica_mirror_outcome_total" => &MIRROR_OUTCOME_TOTAL,
+            "lorica_forward_auth_cache_total" => &FORWARD_AUTH_CACHE_TOTAL,
+            "lorica_geoip_block_total" => &GEOIP_BLOCK_TOTAL,
+            "lorica_bot_challenge_total" => &BOT_CHALLENGE_TOTAL,
+            _ => continue,
+        };
+        if vec.get_metric_with_label_values(&label_refs).is_ok() {
+            vec.with_label_values(&label_refs).inc_by(delta);
+        }
+    }
+}
+
+/// Drop a worker's snapshot on the supervisor side. Called when
+/// the supervisor detects a dead worker (RPC channel gone, crash
+/// signalled). Without this, the supervisor would keep the last-
+/// known counter values forever, skewing the aggregate.
+pub fn forget_worker_generic_counters(worker_id: u32) {
+    SUPERVISOR_GENERIC_SNAPSHOT.write().remove(&worker_id);
+}
+
+#[cfg(test)]
+pub fn reset_generic_counter_snapshot_for_test() {
+    SUPERVISOR_GENERIC_SNAPSHOT.write().clear();
+}
+
 /// Counter: notification events dropped by the bounded broadcast
 /// channel, labeled by drop reason (`lag` = subscriber fell behind,
 /// `closed` = channel closed). Bounded-cardinality: only two labels.
@@ -602,6 +875,193 @@ mod tests {
         let text = String::from_utf8(buf).expect("test setup: metrics output is UTF-8");
         assert!(text.contains("lorica_http_requests_total"));
         assert!(text.contains("test-encode"));
+    }
+
+    #[test]
+    fn test_inc_geoip_block_increments_counter() {
+        // Story 2.5 coverage: exercise the counter through its public
+        // entry point and scrape the Prometheus text format to prove
+        // the (route_id, country, mode) triple actually shows up.
+        // Use unique-per-test label values so this case does not race
+        // with other tests reading from the shared REGISTRY.
+        inc_geoip_block("metrics-test-rt", "ZZ", "denylist");
+        inc_geoip_block("metrics-test-rt", "ZZ", "denylist");
+        inc_geoip_block("metrics-test-rt", "ZZ", "allowlist");
+
+        let encoder = TextEncoder::new();
+        let families = REGISTRY.gather();
+        let mut buf = Vec::new();
+        encoder
+            .encode(&families, &mut buf)
+            .expect("test setup: encode metrics");
+        let text = String::from_utf8(buf).expect("test setup: metrics output is UTF-8");
+
+        // Both label combos must be present, and the denylist count
+        // must be 2 (two inc calls above).
+        let deny_line = text
+            .lines()
+            .find(|l| {
+                l.starts_with("lorica_geoip_block_total{")
+                    && l.contains("route_id=\"metrics-test-rt\"")
+                    && l.contains("country=\"ZZ\"")
+                    && l.contains("mode=\"denylist\"")
+            })
+            .unwrap_or_else(|| panic!("denylist counter missing. text=\n{text}"));
+        let allow_line = text
+            .lines()
+            .find(|l| {
+                l.starts_with("lorica_geoip_block_total{")
+                    && l.contains("route_id=\"metrics-test-rt\"")
+                    && l.contains("country=\"ZZ\"")
+                    && l.contains("mode=\"allowlist\"")
+            })
+            .unwrap_or_else(|| panic!("allowlist counter missing. text=\n{text}"));
+
+        let deny_val: u64 = deny_line
+            .split_whitespace()
+            .next_back()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("denylist value unparseable: {deny_line}"));
+        let allow_val: u64 = allow_line
+            .split_whitespace()
+            .next_back()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("allowlist value unparseable: {allow_line}"));
+        assert_eq!(deny_val, 2, "expected 2 denylist increments");
+        assert_eq!(allow_val, 1, "expected 1 allowlist increment");
+    }
+
+    #[test]
+    fn test_snapshot_then_apply_aggregates_across_workers() {
+        // Two workers both increment the same counter. The
+        // supervisor's apply_worker_generic_counters should
+        // eventually produce `a + b` at the supervisor label
+        // combo. Uses unique-per-test label values so we do not
+        // race other tests on the shared REGISTRY.
+        reset_generic_counter_snapshot_for_test();
+
+        // Worker 1 pretends to have incremented 3 times.
+        apply_worker_generic_counters(
+            1,
+            &[(
+                "lorica_bot_challenge_total".to_string(),
+                vec![
+                    ("route_id".to_string(), "agg-test-rt".to_string()),
+                    ("mode".to_string(), "cookie".to_string()),
+                    ("outcome".to_string(), "shown".to_string()),
+                ],
+                3,
+            )],
+        );
+        // Worker 2 pretends to have incremented 5 times.
+        apply_worker_generic_counters(
+            2,
+            &[(
+                "lorica_bot_challenge_total".to_string(),
+                vec![
+                    ("route_id".to_string(), "agg-test-rt".to_string()),
+                    ("mode".to_string(), "cookie".to_string()),
+                    ("outcome".to_string(), "shown".to_string()),
+                ],
+                5,
+            )],
+        );
+
+        // Supervisor's vec must now show 3 + 5 = 8 at that label.
+        let v = BOT_CHALLENGE_TOTAL
+            .with_label_values(&["agg-test-rt", "cookie", "shown"])
+            .get();
+        assert_eq!(v, 8, "supervisor should see aggregated count");
+
+        // Worker 1 sends a new snapshot with a bigger value (4).
+        // Only the DELTA (4 - 3 = 1) is applied, not the full 4.
+        apply_worker_generic_counters(
+            1,
+            &[(
+                "lorica_bot_challenge_total".to_string(),
+                vec![
+                    ("route_id".to_string(), "agg-test-rt".to_string()),
+                    ("mode".to_string(), "cookie".to_string()),
+                    ("outcome".to_string(), "shown".to_string()),
+                ],
+                4,
+            )],
+        );
+        let v = BOT_CHALLENGE_TOTAL
+            .with_label_values(&["agg-test-rt", "cookie", "shown"])
+            .get();
+        assert_eq!(v, 9, "apply should be delta-based, not replace");
+
+        // A regressed worker snapshot (worker crashes + restarts
+        // at 0) must NOT decrement the counter. Prometheus
+        // counters can't go down; we just skip the delta.
+        apply_worker_generic_counters(
+            1,
+            &[(
+                "lorica_bot_challenge_total".to_string(),
+                vec![
+                    ("route_id".to_string(), "agg-test-rt".to_string()),
+                    ("mode".to_string(), "cookie".to_string()),
+                    ("outcome".to_string(), "shown".to_string()),
+                ],
+                0,
+            )],
+        );
+        let v = BOT_CHALLENGE_TOTAL
+            .with_label_values(&["agg-test-rt", "cookie", "shown"])
+            .get();
+        assert_eq!(
+            v, 9,
+            "regressed snapshot must not decrement supervisor counter"
+        );
+
+        // Forgetting worker 2 clears its snapshot — but the
+        // supervisor counter stays where it is (Prometheus
+        // counters can't decrement). A later worker 2 snapshot
+        // will therefore push full value again as new delta.
+        forget_worker_generic_counters(2);
+        apply_worker_generic_counters(
+            2,
+            &[(
+                "lorica_bot_challenge_total".to_string(),
+                vec![
+                    ("route_id".to_string(), "agg-test-rt".to_string()),
+                    ("mode".to_string(), "cookie".to_string()),
+                    ("outcome".to_string(), "shown".to_string()),
+                ],
+                7,
+            )],
+        );
+        let v = BOT_CHALLENGE_TOTAL
+            .with_label_values(&["agg-test-rt", "cookie", "shown"])
+            .get();
+        // Before forget: 4 (w1) + 5 (w2) = 9.
+        // After forget + w2 resend 7: 4 + 5 + 7 = 16 (the
+        // forget wiped w2's prev=5 so the full 7 reappears as
+        // delta). This is the correct semantics — a crashed
+        // worker's counts are NOT lost at the supervisor.
+        assert_eq!(v, 16);
+    }
+
+    #[test]
+    fn test_snapshot_emits_only_non_zero() {
+        // Snapshot should skip counter entries that have never
+        // been incremented — that keeps the RPC payload small
+        // under steady state.
+        inc_bot_challenge("snapshot-test", "javascript", "passed");
+        let snap = snapshot_per_worker_counters();
+        let hit = snap.iter().find(|(n, pairs, _)| {
+            n == "lorica_bot_challenge_total" && pairs.iter().any(|(_, v)| v == "snapshot-test")
+        });
+        assert!(
+            hit.is_some(),
+            "incremented counter should appear in snapshot"
+        );
+        // None of the entries should have value 0 — that's the
+        // skip-zero-entries guard.
+        for (_, _, v) in &snap {
+            assert!(*v > 0, "snapshot must not emit zero entries");
+        }
     }
 
     #[test]

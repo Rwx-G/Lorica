@@ -1384,10 +1384,11 @@ describe('validateRouteFormWithTab', () => {
     expect(r.tab).toBeNull();
   });
 
-  it('attributes timeout errors to the timeouts tab', () => {
+  it('attributes timeout errors to the upstream tab', () => {
     const r = validateRouteFormWithTab(base({ connect_timeout_s: 9999 }));
     expect(r.message).toMatch(/Connect timeout/);
-    expect(r.tab).toBe('timeouts');
+    // Timeouts tab renamed to Upstream in the v1.4.0 UX refactor.
+    expect(r.tab).toBe('upstream');
   });
 
   it('attributes traffic split errors to the traffic_splits tab', () => {
@@ -1397,7 +1398,8 @@ describe('validateRouteFormWithTab', () => {
       }),
     );
     expect(r.message).toMatch(/weight/);
-    expect(r.tab).toBe('traffic_splits');
+    // Traffic splits got absorbed into the Routing tab in the v1.4.0 UX refactor.
+    expect(r.tab).toBe('routing');
   });
 
   it('attributes forward auth errors to the security tab', () => {
@@ -1407,7 +1409,7 @@ describe('validateRouteFormWithTab', () => {
     expect(r.tab).toBe('security');
   });
 
-  it('attributes response rewrite errors to the response_rewrite tab', () => {
+  it('attributes response rewrite errors to the transform tab', () => {
     const r = validateRouteFormWithTab(
       base({
         response_rewrite_rules: [
@@ -1416,7 +1418,8 @@ describe('validateRouteFormWithTab', () => {
       }),
     );
     expect(r.message).toMatch(/invalid regex/);
-    expect(r.tab).toBe('response_rewrite');
+    // Rewrite tab absorbed into Transform in the v1.4.0 UX refactor.
+    expect(r.tab).toBe('transform');
   });
 
   it('attributes hostname errors to the general tab', () => {

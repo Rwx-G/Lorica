@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.3.0-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.4.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Lorica%20Tests-985-brightgreen.svg" alt="Lorica Tests">
@@ -178,7 +178,7 @@ The dashboard ships inside the binary and is served on the management port (defa
 
 <p align="center">
   <img src="docs/screenshots/routesDrawer.png" alt="Route Configuration Drawer" width="100%">
-  <br><em>Route editor with 50+ settings across 11 tabs (General, Timeouts, Security, Headers, CORS, Caching, Protection, Path Rules, Header Rules, Canary, Rewrite)</em>
+  <br><em>Route editor with 50+ settings across 7 tabs (General, Routing, Transform, Protection, Security, Cache, Upstream)</em>
 </p>
 
 <p align="center">
@@ -488,6 +488,39 @@ cd lorica-dashboard/frontend && npx vitest run
 | Frontend (vitest / svelte-check) | 178 | Form validation, type safety, component wiring |
 | **Total shipping tests** | **1553** | |
 
+#### Docker end-to-end suites
+
+`tests-e2e-docker/` spins Lorica up against real backend containers
+and drives 400+ assertions through the actual network stack:
+
+```bash
+cd tests-e2e-docker
+./run.sh                                    # single-process (315 asserts) + workers mode (86)
+docker compose --profile bot run --rm bot-smoke                   # 33 asserts - graded bot challenge
+docker compose --profile geoip run --rm geoip-smoke               # 16 asserts - country allow/deny
+docker compose --profile rdns run --rm rdns-smoke                 # 8  asserts - forward-confirmed rDNS bypass
+docker compose --profile otel run --rm otel-smoke                 # 15 asserts - OTLP + W3C + log/trace correlation
+docker compose --profile otel-workers run --rm otel-smoke-workers # 15 asserts - same under --workers 2
+```
+
+The two intentional gaps in the Docker harness are:
+
+- **mTLS client-cert handshake** (495 / 496 / 200 based on the
+  presented cert). The e2e container starts without any TLS certs
+  pre-loaded so the HTTPS listener on port 8443 is never built -
+  driving `curl --cert` needs a staged environment. The config
+  surface (CA PEM validation, `required` + `allowed_organizations`
+  hot-reload) is covered.
+- **Connection pre-filter TCP drop** (scanner IP refused at
+  `accept()` before TLS). The test-runner sits on the same Docker
+  network as Lorica, so any CIDR that would cover a real scanner
+  also covers the runner - asserting the drop from inside would be
+  self-blocking. The config round-trip (valid CIDR accepted, garbage
+  rejected 400) is covered.
+
+Validate both manually on staging when touching the surrounding
+code paths.
+
 ## systemd Service
 
 The `.deb` and `.rpm` packages install a hardened systemd unit with:
@@ -530,7 +563,13 @@ gpg --verify lorica.deb.asc lorica.deb
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for planned features across upcoming releases (v1.3.0 - v2.0.0).
+| Version | Features | Status |
+|---------|----------|--------|
+| **v1.4.0** | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Current |
+| v1.5.0 | Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) | Planned |
+| v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 See [COMPARISON.md](COMPARISON.md) for a detailed feature comparison with Nginx, Traefik, HAProxy, Caddy, BunkerWeb, Sozu, and Pingora.
 

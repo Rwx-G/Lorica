@@ -3,12 +3,18 @@
     title: string;
     message: string;
     confirmLabel?: string;
-    confirmStyle?: 'danger' | 'primary';
+    confirmStyle?: 'danger' | 'primary' | 'warning';
     onconfirm: () => void;
     oncancel: () => void;
   }
 
   let { title, message, confirmLabel = 'Delete', confirmStyle = 'danger', onconfirm, oncancel }: Props = $props();
+
+  function confirmClass(s: 'danger' | 'primary' | 'warning'): string {
+    if (s === 'primary') return 'btn-primary';
+    if (s === 'warning') return 'btn-warning';
+    return 'btn-danger';
+  }
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
@@ -26,7 +32,7 @@
     <p>{message}</p>
     <div class="actions">
       <button class="btn btn-cancel" onclick={oncancel}>Cancel</button>
-      <button class="btn {confirmStyle === 'primary' ? 'btn-primary' : 'btn-danger'}" onclick={onconfirm}>{confirmLabel}</button>
+      <button class="btn {confirmClass(confirmStyle)}" onclick={onconfirm}>{confirmLabel}</button>
     </div>
   </div>
 </div>
@@ -101,5 +107,14 @@
 
   .btn-primary:hover {
     background: var(--color-primary-hover, #2563eb);
+  }
+
+  .btn-warning {
+    background: var(--color-orange, #f59e0b);
+    color: white;
+  }
+
+  .btn-warning:hover {
+    background: #d97706;
   }
 </style>

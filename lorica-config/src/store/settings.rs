@@ -114,6 +114,31 @@ impl ConfigStore {
                             ))
                         })?;
                 }
+                "otlp_endpoint" => {
+                    settings.otlp_endpoint = if value.is_empty() { None } else { Some(value) };
+                }
+                "otlp_protocol" => settings.otlp_protocol = value,
+                "otlp_service_name" => settings.otlp_service_name = value,
+                "otlp_sampling_ratio" => {
+                    settings.otlp_sampling_ratio = value.parse().map_err(|_| {
+                        ConfigError::Validation("invalid otlp_sampling_ratio".into())
+                    })?;
+                }
+                "geoip_db_path" => {
+                    settings.geoip_db_path = if value.is_empty() { None } else { Some(value) };
+                }
+                "geoip_auto_update_enabled" => {
+                    settings.geoip_auto_update_enabled = value == "true" || value == "1";
+                }
+                "bot_hmac_secret_hex" => {
+                    settings.bot_hmac_secret_hex = value;
+                }
+                "asn_db_path" => {
+                    settings.asn_db_path = if value.is_empty() { None } else { Some(value) };
+                }
+                "asn_auto_update_enabled" => {
+                    settings.asn_auto_update_enabled = value == "true" || value == "1";
+                }
                 _ => {}
             }
         }
@@ -217,6 +242,49 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('connection_allow_cidrs', ?1)",
             params![connection_allow_json],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_endpoint', ?1)",
+            params![settings.otlp_endpoint.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_protocol', ?1)",
+            params![settings.otlp_protocol],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_service_name', ?1)",
+            params![settings.otlp_service_name],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('otlp_sampling_ratio', ?1)",
+            // `f64::to_string` renders `1.0` as `"1"` which round-trips
+            // through `parse::<f64>` just fine but confuses downstream
+            // consumers (the API JSON encoder emits `1.0`, so the
+            // stored string and the API echo diverge). `{:?}` goes via
+            // Debug's Grisu3 formatter which always keeps the decimal
+            // point (`1.0` stays `"1.0"`, `0.1` stays `"0.1"`), giving
+            // a canonical round-trippable form.
+            params![format!("{:?}", settings.otlp_sampling_ratio)],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('geoip_db_path', ?1)",
+            params![settings.geoip_db_path.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('geoip_auto_update_enabled', ?1)",
+            params![settings.geoip_auto_update_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('bot_hmac_secret_hex', ?1)",
+            params![settings.bot_hmac_secret_hex],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('asn_db_path', ?1)",
+            params![settings.asn_db_path.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('asn_auto_update_enabled', ?1)",
+            params![settings.asn_auto_update_enabled.to_string()],
         )?;
         Ok(())
     }

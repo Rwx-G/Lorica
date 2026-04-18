@@ -40,7 +40,7 @@ use lorica_http::ResponseHeader;
 use lorica_proxy::{FailToProxy, ProxyHttp, Session};
 use lorica_waf::WafEngine;
 use once_cell::sync::Lazy;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Smooth weighted round-robin state (Nginx algorithm).
 /// Each backend address has a `current_weight` that increases by `effective_weight`
@@ -129,6 +129,9 @@ impl SmoothWrrState {
 }
 
 /// In-memory snapshot of a route and its backends for fast lookup.
+/// Some fields are only read via the `Debug` derive (diagnostic
+/// serialisation) or by conditional code paths; `dead_code` is
+/// suppressed to keep the struct complete.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct RouteEntry {
@@ -174,6 +177,11 @@ pub struct RouteEntry {
     /// this route require a cert, did it present one, does the
     /// organization match) happen in `request_filter`.
     pub mtls_enforcer: Option<MtlsEnforcer>,
+    /// Pre-compiled regex set for bot-protection `bypass.user_agents`.
+    /// Built once at config-reload time so the per-request evaluate()
+    /// path does not re-compile patterns on every hit. `None` when
+    /// bot-protection is disabled or the UA bypass list is empty.
+    pub bot_ua_regex_set: Option<Arc<regex::RegexSet>>,
 }
 
 /// Runtime-side view of a route's mTLS policy: the bits we check at
@@ -443,6 +451,25 @@ impl ProxyConfig {
                 allowed_organizations: m.allowed_organizations.clone(),
             });
 
+            let bot_ua_regex_set = route.bot_protection.as_ref().and_then(|bp| {
+                let pats = &bp.bypass.user_agents;
+                if pats.is_empty() {
+                    return None;
+                }
+                match regex::RegexSet::new(pats) {
+                    Ok(set) => Some(Arc::new(set)),
+                    Err(e) => {
+                        warn!(
+                            route_id = %route.id,
+                            error = %e,
+                            "bot bypass UA regex set failed to compile; \
+                             UA bypass disabled for this route"
+                        );
+                        None
+                    }
+                }
+            });
+
             let entry = Arc::new(RouteEntry {
                 route: Arc::new(route.clone()),
                 backends: route_backends,
@@ -456,6 +483,7 @@ impl ProxyConfig {
                 mirror_backends,
                 response_rewrite_compiled,
                 mtls_enforcer,
+                bot_ua_regex_set,
             });
 
             routes_by_host
@@ -983,6 +1011,36 @@ pub struct RequestCtx {
     /// bounce back to Open on failure). `None` for requests that went
     /// out on a Closed breaker.
     pub breaker_probe_backend: Option<String>,
+    /// W3C `traceparent` to emit toward the upstream. `Some` once the
+    /// request_filter pipeline has either preserved the client's
+    /// header (with a new parent-span id rolled for Lorica) or
+    /// synthesised a fresh trace from the request_id. `None` only
+    /// during early startup between `new_ctx` and the first line of
+    /// `request_filter`. See `lorica::otel`.
+    pub outgoing_traceparent: Option<crate::otel::TraceParent>,
+    /// Parsed incoming `traceparent` from the client, retained so the
+    /// OTel span created in `request_filter` can link to the client's
+    /// span as its parent. `None` when the client did not send a
+    /// header or sent a malformed one.
+    pub incoming_traceparent: Option<crate::otel::TraceParent>,
+    /// Whether the outgoing traceparent was preserved from the
+    /// client (true) or synthesised by Lorica (false). Used by later
+    /// stories (span attributes, metrics) to distinguish trace origin.
+    pub traceparent_from_client: bool,
+    /// Root `tracing::Span` for this request. Created by the
+    /// `#[instrument(name = "http_request")]` on `request_filter` and
+    /// captured via `Span::current()` at the top of that hook so the
+    /// downstream hooks (`upstream_request_filter`, `response_filter`,
+    /// `logging`, `fail_to_proxy`) can parent their own `#[instrument]`
+    /// spans under it — producing a clean nested tree in Jaeger /
+    /// Tempo when the `otel` feature is on (the
+    /// `tracing_opentelemetry` bridge installed in `init_logging`
+    /// mirrors every tracing span to an OTel span, inheriting the
+    /// parent link). Without the feature, the tracing span still
+    /// exists but only feeds the fmt layer for log correlation. The
+    /// field starts as `tracing::Span::none()` in `new_ctx` and is
+    /// replaced at the top of `request_filter`.
+    pub root_tracing_span: tracing::Span,
 }
 
 /// The Lorica ProxyHttp implementation that routes traffic based on database configuration.
@@ -1075,6 +1133,30 @@ pub struct LoricaProxy {
     /// collapsing the divergence window from ~10-50 ms down to the
     /// UDS RTT between workers (microseconds). See design § 7 WPAR-8.
     pub pending_proxy_config: Arc<parking_lot::Mutex<Option<PendingProxyConfig>>>,
+    /// GeoIP country-code resolver (v1.4.0 Epic 2). Loaded from
+    /// `GlobalSettings.geoip_db_path` at startup and refreshed by
+    /// the supervisor's auto-update task when enabled. Every
+    /// request may consult the resolver but the check is a no-op
+    /// when no DB is loaded (resolver returns None, the GeoIP
+    /// guard falls through) so installations without a DB pay
+    /// nothing on the hot path besides the per-route-config
+    /// presence check.
+    pub geoip_resolver: Arc<lorica_geoip::GeoIpResolver>,
+    /// ASN resolver (v1.4.0 Epic 3 follow-up closing the
+    /// `bot_protection.bypass.asns` deferred item). Same shape as
+    /// `geoip_resolver`: loaded from `GlobalSettings.asn_db_path`
+    /// at startup, hot-swappable. `AsnResolver::empty()` at
+    /// construction so installations without an ASN DB pay
+    /// nothing on the hot path.
+    pub asn_resolver: Arc<lorica_geoip::AsnResolver>,
+    /// Bot-protection challenge engine (v1.4.0 Epic 3). Holds the
+    /// in-process pending-challenge stash (keyed by server-side
+    /// nonce) that the submit handler consumes on verify. Cookie /
+    /// JS PoW / Captcha modes all share the same stash; a request
+    /// that never reaches the challenge stage pays nothing (the
+    /// evaluator short-circuits when `route.bot_protection` is
+    /// `None`).
+    pub bot_engine: Arc<crate::bot::BotEngine>,
 }
 
 /// Prepared-but-not-yet-committed proxy config. Held by workers
@@ -1092,6 +1174,7 @@ pub struct PendingProxyConfig {
 // RateLimitEngine moved to proxy_wiring/engines.rs to keep this
 // file below the refactor threshold. Re-exported here so
 // `lorica::proxy_wiring::BreakerEngine` (etc.) still resolves.
+pub mod bot_handlers;
 pub mod forward_auth;
 #[cfg(test)]
 pub(crate) use forward_auth::{
@@ -1161,6 +1244,9 @@ impl LoricaProxy {
             rate_limit_buckets: RateLimitEngine::authoritative(),
             verdict_cache: VerdictCacheEngine::local(),
             pending_proxy_config: Arc::new(parking_lot::Mutex::new(None)),
+            geoip_resolver: Arc::new(lorica_geoip::GeoIpResolver::empty()),
+            asn_resolver: Arc::new(lorica_geoip::AsnResolver::empty()),
+            bot_engine: Arc::new(crate::bot::BotEngine::new()),
         }
     }
 
@@ -1184,6 +1270,32 @@ impl LoricaProxy {
             loop {
                 ticker.tick().await;
                 cache.retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
+            }
+        })
+    }
+
+    /// Spawn a background prune task for the bot-protection pending
+    /// stash. Without this, expired challenges only get cleaned up
+    /// when a new challenge happens to render (opportunistic prune
+    /// in bot_handlers). Under low traffic or JavaScript-only routes,
+    /// expired rows could accumulate until the 10K row cap evicts
+    /// them. This task runs every 60 s and is cheap: a single
+    /// `DELETE WHERE expires_at <= ?` on the SQLite table.
+    pub fn spawn_bot_stash_prune(
+        &self,
+        tracker: &tokio_util::task::TaskTracker,
+    ) -> tokio::task::JoinHandle<()> {
+        let engine = Arc::clone(&self.bot_engine);
+        tracker.spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.tick().await; // skip the immediate tick
+            loop {
+                ticker.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                engine.prune_expired(now).await;
             }
         })
     }
@@ -1391,6 +1503,7 @@ impl LoricaProxy {
                             connection_filter.as_ref(),
                             &gate,
                             worker_id,
+                            &store,
                         )
                         .await;
                     }
@@ -1525,6 +1638,33 @@ async fn handle_metrics_request(
     report.backend_conn_entries = backend_conn_entries;
     report.request_entries = request_entries;
     report.waf_entries = waf_entries;
+    // Cross-worker counter aggregation (v1.4.0 follow-up). Ships
+    // every non-typed per-worker counter (bot_challenge,
+    // geoip_block, forward_auth_cache, ...) to the supervisor so
+    // `/metrics` at the supervisor sees the union across workers.
+    // lorica-api exposes the snapshot as `(name, labels, value)`
+    // tuples; translate into the lorica-command wire shape here —
+    // keeps lorica-api free of the lorica-command dep.
+    report.generic_counters = lorica_api::metrics::snapshot_per_worker_counters()
+        .into_iter()
+        .map(|(name, label_pairs, value)| {
+            // Flatten name=value pairs into alternating strings on
+            // the wire (`["route_id", "uuid", "mode", "cookie", ...]`).
+            // The supervisor re-pairs them at apply time. This keeps
+            // the wire format flat while preserving the label-name
+            // metadata needed for positional reorder.
+            let mut labels: Vec<String> = Vec::with_capacity(label_pairs.len() * 2);
+            for (k, v) in label_pairs {
+                labels.push(k);
+                labels.push(v);
+            }
+            lorica_command::GenericCounterEntry {
+                name,
+                labels,
+                value,
+            }
+        })
+        .collect();
 
     let _ = inc
         .reply(lorica_command::Response::ok_with(
@@ -1645,6 +1785,7 @@ async fn handle_config_reload_commit(
     connection_filter: Option<&Arc<crate::connection_filter::GlobalConnectionFilter>>,
     gate: &Arc<lorica_command::GenerationGate>,
     worker_id: u32,
+    store: &Arc<tokio::sync::Mutex<lorica_config::ConfigStore>>,
 ) {
     let commit = match inc.command().payload.clone() {
         Some(lorica_command::command::Payload::ConfigReloadCommit(c)) => c,
@@ -1698,6 +1839,18 @@ async fn handle_config_reload_commit(
                 generation = commit.generation,
                 "ConfigReloadCommit: pending config swapped in"
             );
+            // Apply the per-process resolver hooks so the worker's
+            // GeoIP / ASN / OTel / bot-HMAC state stays in sync with
+            // the supervisor on every commit. Without these calls,
+            // the pipelined RPC reload would only swap the proxy
+            // config, leaving stale resolver state until a process
+            // restart - which is the issue that caused
+            // freshly-downloaded `.mmdb` files to never become
+            // visible to worker lookups.
+            crate::reload::apply_otel_settings_from_store(store).await;
+            crate::reload::apply_geoip_settings_from_store(store).await;
+            crate::reload::apply_asn_settings_from_store(store).await;
+            crate::reload::apply_bot_secret_from_store(store).await;
             let _ = inc.reply(lorica_command::Response::ok(0)).await;
         }
         None => {
@@ -1801,6 +1954,10 @@ impl ProxyHttp for LoricaProxy {
             breaker_probe_backend: None,
             response_rewrite_state: None,
             response_rewrite_rules: None,
+            outgoing_traceparent: None,
+            incoming_traceparent: None,
+            traceparent_from_client: false,
+            root_tracing_span: tracing::Span::none(),
         }
     }
 
@@ -1808,1007 +1965,441 @@ impl ProxyHttp for LoricaProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // ACME HTTP-01 challenge intercept (must respond before any other check)
-        if let Some(ref challenge_store) = self.acme_challenge_store {
-            let path = session.req_header().uri.path();
-            if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-                info!(
-                    token = token,
-                    "ACME challenge request intercepted, looking up token"
-                );
-                if let Some(key_auth) = challenge_store.get(token).await {
-                    let mut header = ResponseHeader::build(200, None)?;
-                    header.insert_header("Content-Type", "text/plain")?;
-                    header.insert_header("Content-Length", key_auth.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(key_auth)), true)
-                        .await?;
-                    return Ok(true);
-                }
-            }
-        }
-
-        // Global flood tracking (before any other processing)
-        self.global_rate.observe(&"global", 1);
-
-        // Global connection limit (before any other processing)
-        let config = self.config.load();
-        if config.max_global_connections > 0 {
-            let current = self.active_connections.load(Ordering::Relaxed);
-            if current >= config.max_global_connections as u64 {
-                ctx.block_reason = Some("global connection limit".to_string());
-                // No route matched yet at this stage, so no per-route
-                // override is consultable: always render the default page.
-                let host_header = extract_host(session.req_header()).to_string();
-                let body = render_error_body(
-                    503,
-                    &ctx.request_id,
-                    &host_header,
-                    None,
-                    "Global connection limit exceeded",
-                );
-                let mut header = lorica_http::ResponseHeader::build(503, None)?;
-                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                header.insert_header("Content-Length", body.len().to_string())?;
-                session
-                    .write_response_header(Box::new(header), false)
-                    .await?;
-                session
-                    .write_response_body(Some(bytes::Bytes::from(body)), true)
-                    .await?;
-                return Ok(true);
-            }
-        }
-
-        // IP blocklist check (before any other processing)
-        let client_ip = session
-            .as_downstream()
-            .client_addr()
-            .and_then(|addr| addr.as_inet())
-            .map(|addr| addr.ip().to_string());
-
-        // Only trust X-Forwarded-For when the direct TCP client is a trusted proxy.
-        // When trusted_proxies is empty, XFF is never used (secure default).
-        let req = session.req_header();
-        let has_xff = req.headers.get("x-forwarded-for").is_some();
-        let direct_ip = client_ip.clone();
-
-        let direct_is_trusted = direct_ip.as_ref().is_some_and(|ip| {
-            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                config.trusted_proxies.iter().any(|net| net.contains(&addr))
-            } else {
-                false
-            }
-        });
-
-        let xff_used = direct_is_trusted && has_xff;
-        let check_ip = if xff_used {
-            // Trusted proxy: extract real client IP from XFF (leftmost entry)
-            req.headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .map(|xff| xff.split(',').next().unwrap_or(xff).trim().to_string())
-                .or(client_ip)
-        } else {
-            // Not trusted or no XFF: use direct TCP client IP
-            client_ip
-        };
-
-        // Store client IP and source in context for access logging
-        ctx.client_ip = check_ip.clone();
-        ctx.is_xff = xff_used && check_ip.is_some();
-        ctx.xff_proxy_ip = if ctx.is_xff { direct_ip } else { None };
-        ctx.source = req
+        // W3C trace context capture. Runs before everything else so
+        // even ACME challenges carry a traceparent forward. If the
+        // client sent a well-formed header we keep the trace_id and
+        // roll a new parent_id (Lorica sits between client and
+        // origin); otherwise we synthesise a fresh trace seeded on
+        // the request_id so backend sidecars can still correlate.
+        // Parsing is ~50 ns and runs regardless of the `otel` feature
+        // so header pass-through is always available.
+        let incoming = session
+            .req_header()
             .headers
-            .get("x-lorica-source")
+            .get("traceparent")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+            .and_then(crate::otel::TraceParent::parse);
+        if let Some(ref parent) = incoming {
+            ctx.outgoing_traceparent = Some(parent.child(&ctx.request_id));
+            ctx.traceparent_from_client = true;
+        } else {
+            ctx.outgoing_traceparent =
+                Some(crate::otel::traceparent_from_request_id(&ctx.request_id));
+            ctx.traceparent_from_client = false;
+        }
+        ctx.incoming_traceparent = incoming;
 
-        // Global WAF whitelist: IPs in this list bypass ban checks, IP blocklist,
-        // rate limiting, and WAF evaluation entirely.
-        let is_whitelisted = check_ip.as_ref().is_some_and(|ip| {
-            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                config.waf_whitelist.iter().any(|net| net.contains(&addr))
-            } else {
-                false
-            }
+        // Build the per-request tracing span. With the `otel` feature
+        // on, the tracing_opentelemetry bridge mirrors this into an
+        // OTel span via `on_new_span` *at span creation time* — and
+        // the bridge latches `trace_id` right then from the currently-
+        // attached OTel Context. Calling `OpenTelemetrySpanExt::set_parent`
+        // AFTER creation only updates `OtelData.parent_cx`, not the
+        // already-frozen builder trace_id, so the OTel span ends up
+        // with an SDK-generated trace_id that does not match the
+        // client's W3C header.
+        //
+        // Fix: attach the W3C remote span context as the current
+        // OTel context BEFORE `info_span!` expansion, via
+        // `Context::attach()`. The guard lives just long enough for
+        // the macro to evaluate — `on_new_span` reads
+        // `Context::current()`, picks up our remote parent, and
+        // bakes the client's trace_id into the builder. We drop the
+        // guard as the `info_span!` expression returns, so nothing
+        // downstream inherits the attached context by accident.
+        // The resulting `tracing::Span` carries the right trace_id
+        // and can still be `set_parent`-ed later for edge cases.
+        #[cfg(feature = "otel")]
+        let _otel_cx_guard = ctx.incoming_traceparent.as_ref().and_then(|p| {
+            use opentelemetry::trace::{
+                SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState,
+            };
+            use opentelemetry::Context;
+            let tid = TraceId::from_hex(&p.trace_id).ok()?;
+            let sid = SpanId::from_hex(&p.parent_id).ok()?;
+            let sc = SpanContext::new(
+                tid,
+                sid,
+                TraceFlags::new(p.flags),
+                true, // remote
+                TraceState::default(),
+            );
+            Some(Context::new().with_remote_span_context(sc).attach())
         });
 
-        // Ban list + IP blocklist checks (skipped for whitelisted IPs)
-        if !is_whitelisted {
-            if let Some(ref ip) = check_ip {
-                let banned = if let Some(entry) = self.ban_list.get(ip) {
-                    let (banned_at, duration_s) = entry.value();
-                    if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
-                        drop(entry);
-                        // Ban expired - lazy cleanup
-                        self.ban_list.remove(ip);
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    false
-                };
-                if banned {
-                    ctx.block_reason = Some("IP banned".to_string());
-                    // Pre-route stage: no route override consultable.
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body =
-                        render_error_body(403, &ctx.request_id, &host_header, None, "IP banned");
-                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
-                }
+        let span = tracing::info_span!(
+            "http_request",
+            otel.kind = "server",
+            http.request.method = %session.req_header().method.as_str(),
+            url.path = %session.req_header().uri.path(),
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            request_id = %ctx.request_id,
+            lorica.route_id = tracing::field::Empty,
+            http.response.status_code = tracing::field::Empty,
+            client.geo.country_iso_code = tracing::field::Empty,
+            server.address = tracing::field::Empty,
+            network.peer.address = tracing::field::Empty,
+            lorica.latency_ms = tracing::field::Empty,
+            lorica.trace.origin = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            error.message = tracing::field::Empty,
+            bot_protection.challenge.outcome = tracing::field::Empty,
+            bot_protection.challenge.mode = tracing::field::Empty,
+            bot_protection.challenge.reason = tracing::field::Empty,
+        );
 
-                if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
-                    warn!(
-                        ip = %ip,
-                        "request blocked by IP blocklist"
+        // Drop the context guard now that the span has latched its
+        // trace_id. Any subsequent code that inherits from
+        // `Context::current()` (e.g. a manually-created OTel span
+        // inside a child helper) will see the surrounding context,
+        // not the W3C remote parent we briefly attached.
+        #[cfg(feature = "otel")]
+        drop(_otel_cx_guard);
+
+        // Stamp the log-correlation fields now so the first events
+        // inside the body (ACME challenge log, flood log) see them.
+        if let Some(ref tp) = ctx.outgoing_traceparent {
+            span.record("trace_id", tp.trace_id.as_str());
+            span.record("span_id", tp.parent_id.as_str());
+        }
+        ctx.root_tracing_span = span.clone();
+
+        // Run the body instrumented with the span. `.instrument`
+        // re-enters the span on every poll so log records + nested
+        // `#[instrument]` child hooks (upstream_request_filter,
+        // response_filter, logging, fail_to_proxy) inherit it as
+        // their parent without the body having to thread the span
+        // manually. Kept as an inline `async move` rather than a
+        // separate method because `impl ProxyHttp for LoricaProxy`
+        // only accepts trait methods.
+        use tracing::Instrument as _;
+        async move {
+            // ACME HTTP-01 challenge intercept (must respond before any other check)
+            if let Some(ref challenge_store) = self.acme_challenge_store {
+                let path = session.req_header().uri.path();
+                if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+                    info!(
+                        token = token,
+                        "ACME challenge request intercepted, looking up token"
                     );
-                    ctx.waf_blocked = true;
-                    // Record as WAF event + Prometheus metric + persist
-                    let path = req.uri.path();
-                    let host_val = extract_host(req);
-                    self.waf_engine.record_blocklist_event(ip, host_val, path);
-                    lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
-                    self.waf_counts
-                        .entry(("ip_blocklist".to_string(), "blocked".to_string()))
-                        .or_insert_with(|| AtomicU64::new(0))
-                        .fetch_add(1, Ordering::Relaxed);
-                    if let Some(ref store) = self.log_store {
-                        let ev = lorica_waf::WafEvent {
-                            rule_id: 0,
-                            description: format!("IP {ip} blocked by IP blocklist"),
-                            category: lorica_waf::RuleCategory::IpBlocklist,
-                            severity: 5,
-                            matched_field: "client_ip".to_string(),
-                            matched_value: ip.to_string(),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                            client_ip: ip.to_string(),
-                            route_hostname: {
-                                let h = extract_host(req);
-                                if h.is_empty() {
-                                    "-"
-                                } else {
-                                    h
-                                }
-                            }
-                            .to_string(),
-                            action: "blocked".to_string(),
-                        };
-                        let _ = store.insert_waf_event(&ev);
-                    }
-                    // Pre-route stage: no route override consultable.
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body =
-                        render_error_body(403, &ctx.request_id, &host_header, None, "IP blocked");
-                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
-                }
-            }
-        } // end if !is_whitelisted (ban + blocklist)
-
-        let host_raw = extract_host(req);
-        let host = host_raw.split(':').next().unwrap_or(host_raw);
-
-        let path = req.uri.path();
-        let query = req.uri.query();
-
-        // Find matching route (exact hostname first, then wildcard).
-        // Cache the matched entry in ctx so upstream_peer does not
-        // re-run find_route on the same request.
-        let entry = match config.find_route(host, path) {
-            Some(e) => e,
-            None => return Ok(false), // No route = let upstream_peer handle 404
-        };
-        ctx.matched_route_entry = Some(Arc::clone(entry));
-
-        // Store route snapshot, precompiled regex, and access log setting for later pipeline stages
-        ctx.route_snapshot = Some(Arc::clone(&entry.route));
-        ctx.path_rewrite_regex = entry.path_rewrite_regex.clone(); // Arc::clone, cheap
-        ctx.access_log_enabled = entry.route.access_log_enabled;
-
-        // Block WebSocket upgrades if disabled on this route
-        if !entry.route.websocket_enabled {
-            if let Some(upgrade) = req.headers.get("upgrade") {
-                if upgrade
-                    .to_str()
-                    .unwrap_or("")
-                    .eq_ignore_ascii_case("websocket")
-                {
-                    ctx.block_reason = Some("WebSocket disabled".to_string());
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        403,
-                        &ctx.request_id,
-                        &host_header,
-                        entry.route.error_page_html.as_deref(),
-                        "WebSocket upgrades disabled on this route",
-                    );
-                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
-                }
-            }
-        }
-
-        // Force HTTPS redirect (skip for ACME challenges - must stay HTTP)
-        if entry.route.force_https && !path.starts_with("/.well-known/acme-challenge/") {
-            let is_tls = session
-                .digest()
-                .and_then(|d| d.ssl_digest.as_ref())
-                .is_some();
-            let scheme = if is_tls {
-                "https"
-            } else {
-                req.headers
-                    .get("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("http")
-            };
-            if scheme != "https" {
-                let redir_host = extract_host(req);
-                let redir_path = req.uri.path();
-                let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-                let location = format!("https://{redir_host}{redir_path}{redir_query}");
-                let mut header = lorica_http::ResponseHeader::build(301, None)?;
-                header.insert_header("Location", &location)?;
-                session
-                    .write_response_header(Box::new(header), true)
-                    .await?;
-                return Ok(true);
-            }
-        }
-
-        // Hostname redirect
-        if let Some(ref target) = entry.route.redirect_hostname {
-            if host != target.as_str() {
-                let redir_path = req.uri.path();
-                let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-                let scheme = req
-                    .headers
-                    .get("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("https");
-                let location = format!("{scheme}://{target}{redir_path}{redir_query}");
-                let mut header = lorica_http::ResponseHeader::build(301, None)?;
-                header.insert_header("Location", &location)?;
-                session
-                    .write_response_header(Box::new(header), true)
-                    .await?;
-                return Ok(true);
-            }
-        }
-
-        // Per-route token-bucket rate limit. Runs after ban/blocklist
-        // and redirects so that an abusive client is rejected before
-        // we touch WAF / mtls / forward_auth. See design § 6 and
-        // `lorica_limits::token_bucket::AuthoritativeBucket`.
-        //
-        // Whitelisted IPs bypass the limiter (same policy as WAF ban
-        // checks — an operator who added an IP to the whitelist has
-        // made a deliberate trust decision).
-        if let Some(ref rl) = entry.route.rate_limit {
-            if !is_whitelisted {
-                let scope_key = match rl.scope {
-                    lorica_config::models::RateLimitScope::PerIp => {
-                        ctx.client_ip.as_deref().unwrap_or("unknown").to_string()
-                    }
-                    lorica_config::models::RateLimitScope::PerRoute => "__route__".to_string(),
-                };
-                let key = format!("{}|{}", entry.route.id, scope_key);
-                let admitted =
-                    self.rate_limit_buckets
-                        .try_consume(&key, rl, 1, lorica_shmem::now_ns());
-                if !admitted {
-                    ctx.block_reason = Some("rate limited".to_string());
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        429,
-                        &ctx.request_id,
-                        &host_header,
-                        entry.route.error_page_html.as_deref(),
-                        "Rate limit exceeded",
-                    );
-                    let mut header = lorica_http::ResponseHeader::build(429, None)?;
-                    // Retry-After in seconds. For any configured refill
-                    // rate >= 1 tok/s, 1 second is the right advice
-                    // (one token refills in <= 1 s). A zero refill means
-                    // a one-shot bucket that never refills - advise a
-                    // generous 60 s backoff instead of a tight loop.
-                    let retry_after: u64 = if rl.refill_per_sec >= 1 { 1 } else { 60 };
-                    header.insert_header("Retry-After", retry_after.to_string())?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
-                }
-            }
-        }
-
-        // mTLS client verification: runs before forward_auth so a
-        // request that failed to present a valid client cert is
-        // rejected cheaply (no auth sub-request spawned). The listener
-        // has already validated the cert chain against the union CA
-        // bundle; we just check presence and the per-route org
-        // allowlist.
-        //
-        // 495 / 496 are the semi-standard "SSL cert error" / "SSL cert
-        // required" codes used by Nginx; reqwest and common clients
-        // surface them as meaningful errors and they don't collide
-        // with our other rejection paths.
-        if let Some(ref enforcer) = entry.mtls_enforcer {
-            let verdict = evaluate_mtls(enforcer, downstream_ssl_digest(session).as_deref());
-            if let Some(status) = verdict {
-                ctx.block_reason = Some(format!("mtls rejected ({status})"));
-                let message = match status {
-                    496 => "SSL certificate required",
-                    495 => "SSL certificate error",
-                    _ => "Forbidden",
-                };
-                let host_header = extract_host(session.req_header()).to_string();
-                let body = render_error_body(
-                    status,
-                    &ctx.request_id,
-                    &host_header,
-                    entry.route.error_page_html.as_deref(),
-                    message,
-                );
-                let mut resp_header = ResponseHeader::build(status, None)?;
-                resp_header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                resp_header.insert_header("Content-Length", body.len().to_string())?;
-                session
-                    .write_response_header(Box::new(resp_header), false)
-                    .await?;
-                session
-                    .write_response_body(Some(bytes::Bytes::from(body)), true)
-                    .await?;
-                return Ok(true);
-            }
-        }
-
-        // Forward authentication: gate the request on an external auth
-        // service (Authelia / Authentik / Keycloak / oauth2-proxy). Runs
-        // after route match but before header/canary/path rules so a
-        // denied request never leaks into the backend-selection phase.
-        if let Some(ref fa_cfg) = entry.route.forward_auth {
-            // Detect TLS from the downstream socket, not HTTP version:
-            // h2c (HTTP/2 over plaintext) would otherwise be reported
-            // as https to the auth service, which is misleading and
-            // may trigger redirect loops.
-            let is_tls = session
-                .digest()
-                .and_then(|d| d.ssl_digest.as_ref())
-                .is_some();
-            let scheme = if is_tls { "https" } else { "http" };
-            let outcome = run_forward_auth_keyed(
-                fa_cfg,
-                req,
-                ctx.client_ip.as_deref(),
-                scheme,
-                &entry.route.id,
-                &self.verdict_cache,
-            )
-            .await;
-            match outcome {
-                ForwardAuthOutcome::Allow { response_headers } => {
-                    ctx.forward_auth_inject = response_headers;
-                }
-                ForwardAuthOutcome::Deny {
-                    status,
-                    headers,
-                    body,
-                } => {
-                    ctx.block_reason = Some(format!("forward auth denied ({status})"));
-                    let mut resp_header = ResponseHeader::build(status, None)?;
-                    for (name, value) in &headers {
-                        let _ = resp_header.insert_header(name.clone(), value);
-                    }
-                    let _ = resp_header.insert_header("Content-Length", body.len().to_string());
-                    session
-                        .write_response_header(Box::new(resp_header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
-                }
-                ForwardAuthOutcome::FailClosed { reason } => {
-                    tracing::warn!(
-                        route_id = %entry.route.id,
-                        reason = %reason,
-                        "forward auth fail-closed"
-                    );
-                    ctx.block_reason = Some(format!("forward auth error: {reason}"));
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        503,
-                        &ctx.request_id,
-                        &host_header,
-                        entry.route.error_page_html.as_deref(),
-                        "Authentication service unavailable",
-                    );
-                    let mut resp_header = ResponseHeader::build(503, None)?;
-                    resp_header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    resp_header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(resp_header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
-                }
-            }
-        }
-
-        // Header rule matching (first match wins; sets backend override
-        // before path rules so a later path rule with its own backend_ids
-        // can still take precedence - "more specific wins"). Also
-        // emits a Prometheus counter so operators can see rule-match
-        // activity in metrics, not just logs. `rule_index = "default"`
-        // means no rule matched.
-        if !entry.route.header_rules.is_empty() {
-            let mut matched_idx: Option<usize> = None;
-            for (i, rule) in entry.route.header_rules.iter().enumerate() {
-                let value = req
-                    .headers
-                    .get(rule.header_name.as_str())
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                let regex: Option<&regex::Regex> = entry
-                    .header_rule_regexes
-                    .get(i)
-                    .and_then(|opt| opt.as_deref());
-                if rule.matches(value, |v| regex.is_some_and(|re| re.is_match(v))) {
-                    matched_idx = Some(i);
-                    if let Some(b) = entry.header_rule_backends.get(i).and_then(|b| b.as_ref()) {
-                        ctx.matched_backends = Some(b.clone());
-                    }
-                    break;
-                }
-            }
-            match matched_idx {
-                Some(i) => {
-                    // Stack-allocated itoa buffer avoids the per-request
-                    // String allocation that the old `i.to_string()`
-                    // performed on every header-rule match. ~1-2% CPU
-                    // saved at high QPS on routes with many rules.
-                    let mut buf = itoa::Buffer::new();
-                    lorica_api::metrics::inc_header_rule_match(&entry.route.id, buf.format(i));
-                }
-                None => lorica_api::metrics::inc_header_rule_match(&entry.route.id, "default"),
-            }
-        }
-
-        // Canary traffic split: runs AFTER header rules (operator opt-in
-        // always wins) and BEFORE path rules (URL-specific overrides
-        // still win). The split is applied only when no earlier phase
-        // already set `matched_backends`, so a user with X-Version: beta
-        // is never accidentally rebalanced into the canary bucket for
-        // the default version. Requests without a client IP (Unix-socket
-        // listeners in tests, rare IPv6 edge cases) keep route defaults
-        // rather than being bucketed deterministically on an empty
-        // string.
-        if ctx.matched_backends.is_none() && !entry.route.traffic_splits.is_empty() {
-            if let Some(ref ip) = ctx.client_ip {
-                let bucket = canary_bucket(&entry.route.id, ip);
-                // Inline walk so we know which split matched (for the
-                // split_name metric label). Mirrors
-                // `pick_traffic_split_backends` logic; the helper stays
-                // as-is for its unit-test callers.
-                let mut cumulative: u32 = 0;
-                let mut matched_split_name: Option<&str> = None;
-                for (i, split) in entry.route.traffic_splits.iter().enumerate() {
-                    let w = split.weight_percent.min(100) as u32;
-                    if w == 0 {
-                        continue;
-                    }
-                    cumulative = cumulative.saturating_add(w).min(100);
-                    if (bucket as u32) < cumulative {
-                        if let Some(backends) =
-                            entry.traffic_split_backends.get(i).and_then(|b| b.as_ref())
-                        {
-                            ctx.matched_backends = Some(backends.clone());
-                            matched_split_name = Some(if split.name.is_empty() {
-                                "unnamed"
-                            } else {
-                                split.name.as_str()
-                            });
-                        }
-                        break;
-                    }
-                }
-                match matched_split_name {
-                    Some(name) => {
-                        lorica_api::metrics::inc_canary_split_selected(&entry.route.id, name)
-                    }
-                    None => {
-                        lorica_api::metrics::inc_canary_split_selected(&entry.route.id, "default")
-                    }
-                }
-            }
-        }
-
-        // Path rule matching (first match wins, overrides route config)
-        for (i, rule) in entry.route.path_rules.iter().enumerate() {
-            if rule.matches(path) {
-                let effective = entry.route.with_path_rule_overrides(rule);
-                ctx.route_snapshot = Some(Arc::new(effective));
-                if rule.backend_ids.is_some() {
-                    if let Some(ref backends) = entry.path_rule_backends[i] {
-                        ctx.matched_backends = Some(backends.clone());
-                    }
-                }
-                break;
-            }
-        }
-
-        // Request mirroring: fire-and-forget shadow copies. For body-
-        // less requests (GET/HEAD/DELETE, or any request without
-        // Content-Length / Transfer-Encoding) we spawn immediately.
-        // For body-bearing requests we stash the metadata in
-        // `ctx.mirror_pending` and fire in `request_body_filter` once
-        // the body is buffered - so shadow backends see the same
-        // request body as the primary, up to the configured
-        // max_body_bytes cap.
-        if let Some(ref mirror_cfg) = entry.route.mirror {
-            if !entry.mirror_backends.is_empty()
-                && mirror_sample_hit(&ctx.request_id, mirror_cfg.sample_percent)
-            {
-                let headers = build_mirror_forward_headers(req, &ctx.request_id);
-                let path = req
-                    .uri
-                    .path_and_query()
-                    .map(|pq| pq.as_str().to_string())
-                    .unwrap_or_else(|| "/".to_string());
-                let method = req.method.clone();
-                let max_body = mirror_cfg.max_body_bytes as usize;
-                let body_expected = max_body > 0 && request_has_body(req);
-
-                if body_expected {
-                    // Defer mirror firing until request_body_filter has
-                    // buffered the full body.
-                    ctx.mirror_pending = Some(MirrorPending {
-                        cfg: mirror_cfg.clone(),
-                        backends: entry.mirror_backends.clone(),
-                        method,
-                        path_and_query: path,
-                        headers,
-                        request_id: ctx.request_id.clone(),
-                        max_body_bytes: max_body,
-                        route_id: entry.route.id.clone(),
-                    });
-                    ctx.mirror_body_state = Some(MirrorBodyState::Active(Vec::new()));
-                } else {
-                    // No body to buffer (or operator opted into
-                    // headers-only via max_body_bytes = 0): fire now.
-                    spawn_mirrors(
-                        mirror_cfg,
-                        &entry.mirror_backends,
-                        method,
-                        path,
-                        headers,
-                        None,
-                        ctx.request_id.clone(),
-                        entry.route.id.clone(),
-                    );
-                }
-            }
-        }
-
-        // Maintenance mode - return 503 with optional custom HTML
-        if let Some(ref route) = ctx.route_snapshot {
-            if route.maintenance_mode {
-                let host_header = extract_host(session.req_header()).to_string();
-                let body_html = render_error_body(
-                    503,
-                    &ctx.request_id,
-                    &host_header,
-                    route.error_page_html.as_deref(),
-                    "Service under maintenance",
-                );
-                let mut header = ResponseHeader::build(503, None)?;
-                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                header.insert_header("Content-Length", body_html.len().to_string())?;
-                header.insert_header("Retry-After", "300")?;
-                session
-                    .write_response_header(Box::new(header), false)
-                    .await?;
-                session
-                    .write_response_body(Some(bytes::Bytes::from(body_html)), true)
-                    .await?;
-                return Ok(true);
-            }
-        }
-
-        // HTTP Basic Auth (per-route) with credential verification cache.
-        // The cache avoids running Argon2 (~100ms) on every request by caching
-        // the hash of verified credentials for 60 seconds.
-        if let Some(ref route) = ctx.route_snapshot {
-            if let (Some(ref expected_user), Some(ref expected_hash)) =
-                (&route.basic_auth_username, &route.basic_auth_password_hash)
-            {
-                let authorized = session
-                    .req_header()
-                    .headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Basic "))
-                    .and_then(|b64| {
-                        use base64::Engine;
-                        base64::engine::general_purpose::STANDARD.decode(b64).ok()
-                    })
-                    .and_then(|decoded| String::from_utf8(decoded).ok())
-                    .map(|cred| {
-                        let mut parts = cred.splitn(2, ':');
-                        let user = parts.next().unwrap_or("");
-                        let pass = parts.next().unwrap_or("");
-                        if user != expected_user {
-                            return false;
-                        }
-
-                        // Check credential cache before running Argon2.
-                        // Key is the NUL-joined literal "{cred}\0{hash}"
-                        // so two distinct credentials cannot collide on
-                        // a truncated 64-bit digest (which, at a small
-                        // cache size, is not worth the bypass risk).
-                        let mut cache_key =
-                            String::with_capacity(cred.len() + 1 + expected_hash.len());
-                        cache_key.push_str(&cred);
-                        cache_key.push('\0');
-                        cache_key.push_str(expected_hash.as_str());
-
-                        const AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
-                        if let Some(verified_at) = self.basic_auth_cache.get(&cache_key) {
-                            if verified_at.elapsed() < AUTH_CACHE_TTL {
-                                return true; // cache hit - skip Argon2
-                            }
-                        }
-
-                        // Cache miss or expired - run full Argon2 verification.
-                        // Parse the hash first; if it's corrupt, deny immediately
-                        // without paying the cost of block_in_place.
-                        if argon2::PasswordHash::new(expected_hash).is_err() {
-                            return false;
-                        }
-                        // Offload CPU-intensive Argon2 to the blocking thread
-                        // pool to avoid stalling the async proxy runtime.
-                        let pass_bytes = pass.as_bytes().to_vec();
-                        let hash_str = expected_hash.to_string();
-                        let ok = tokio::task::block_in_place(|| {
-                            use argon2::PasswordVerifier;
-                            match argon2::PasswordHash::new(&hash_str) {
-                                Ok(h) => argon2::Argon2::default()
-                                    .verify_password(&pass_bytes, &h)
-                                    .is_ok(),
-                                Err(_) => false,
-                            }
-                        });
-                        if ok {
-                            self.basic_auth_cache.insert(cache_key, Instant::now());
-                            // Evict expired entries to prevent unbounded growth
-                            self.basic_auth_cache
-                                .retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
-                        }
-                        ok
-                    })
-                    .unwrap_or(false);
-
-                if !authorized {
-                    let mut header = ResponseHeader::build(401, None)?;
-                    header.insert_header("WWW-Authenticate", "Basic realm=\"Lorica\"")?;
-                    header.insert_header("Content-Length", "0")?;
-                    session
-                        .write_response_header(Box::new(header), true)
-                        .await?;
-                    return Ok(true);
-                }
-            }
-        }
-
-        // Direct status response (return_status)
-        if let Some(status) = ctx.route_snapshot.as_ref().and_then(|r| r.return_status) {
-            ctx.block_reason = Some(format!("return_status {status}"));
-            if let Some(ref target) = ctx
-                .route_snapshot
-                .as_ref()
-                .and_then(|r| r.redirect_to.clone())
-            {
-                // return_status + redirect_to = redirect with specific status code
-                let redir_path = req.uri.path();
-                let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-                let base = target.trim_end_matches('/');
-                let location = format!("{base}{redir_path}{redir_query}");
-                let mut header = lorica_http::ResponseHeader::build(status, None)?;
-                header.insert_header("Location", &location)?;
-                session
-                    .write_response_header(Box::new(header), true)
-                    .await?;
-            } else {
-                // return_status alone = direct response with empty body
-                let header = lorica_http::ResponseHeader::build(status, None)?;
-                session
-                    .write_response_header(Box::new(header), true)
-                    .await?;
-            }
-            return Ok(true);
-        }
-
-        // Redirect to external URL (read from snapshot, path rules may have overridden it)
-        if let Some(ref target) = ctx
-            .route_snapshot
-            .as_ref()
-            .and_then(|r| r.redirect_to.clone())
-        {
-            let redir_path = req.uri.path();
-            let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-            let base = target.trim_end_matches('/');
-            let location = format!("{base}{redir_path}{redir_query}");
-            let mut header = lorica_http::ResponseHeader::build(301, None)?;
-            header.insert_header("Location", &location)?;
-            session
-                .write_response_header(Box::new(header), true)
-                .await?;
-            return Ok(true);
-        }
-
-        // Per-route IP allowlist/denylist
-        if let Some(ref ip) = check_ip {
-            if !entry.route.ip_allowlist.is_empty()
-                && !entry.route.ip_allowlist.iter().any(|a| ip_matches(ip, a))
-            {
-                ctx.block_reason = Some("IP not in allowlist".to_string());
-                let host_header = extract_host(session.req_header()).to_string();
-                let body = render_error_body(
-                    403,
-                    &ctx.request_id,
-                    &host_header,
-                    entry.route.error_page_html.as_deref(),
-                    "IP not in allowlist",
-                );
-                let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                header.insert_header("Content-Length", body.len().to_string())?;
-                session
-                    .write_response_header(Box::new(header), false)
-                    .await?;
-                session
-                    .write_response_body(Some(bytes::Bytes::from(body)), true)
-                    .await?;
-                return Ok(true);
-            }
-            if entry.route.ip_denylist.iter().any(|d| ip_matches(ip, d)) {
-                ctx.block_reason = Some("IP in denylist".to_string());
-                let host_header = extract_host(session.req_header()).to_string();
-                let body = render_error_body(
-                    403,
-                    &ctx.request_id,
-                    &host_header,
-                    entry.route.error_page_html.as_deref(),
-                    "IP in denylist",
-                );
-                let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                header.insert_header("Content-Length", body.len().to_string())?;
-                session
-                    .write_response_header(Box::new(header), false)
-                    .await?;
-                session
-                    .write_response_body(Some(bytes::Bytes::from(body)), true)
-                    .await?;
-                return Ok(true);
-            }
-        }
-
-        // Slowloris detection: reject requests where headers took too long to arrive.
-        // If the time from connection start to request_filter exceeds the threshold,
-        // the client is likely performing a slowloris attack (sending headers very slowly).
-        let slowloris_ms = entry.route.slowloris_threshold_ms;
-        if slowloris_ms > 0 {
-            let elapsed_ms = ctx.start_time.elapsed().as_millis() as i32;
-            if elapsed_ms > slowloris_ms {
-                let client_ip_str = check_ip.as_deref().unwrap_or("-");
-                warn!(
-                    ip = %client_ip_str,
-                    elapsed_ms = elapsed_ms,
-                    threshold_ms = slowloris_ms,
-                    route_id = %entry.route.id,
-                    "slowloris detected - slow request headers"
-                );
-                ctx.block_reason = Some("slowloris detected".to_string());
-                let host_header = extract_host(session.req_header()).to_string();
-                let body = render_error_body(
-                    408,
-                    &ctx.request_id,
-                    &host_header,
-                    entry.route.error_page_html.as_deref(),
-                    "Request headers took too long",
-                );
-                let mut header = lorica_http::ResponseHeader::build(408, None)?;
-                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                header.insert_header("Content-Length", body.len().to_string())?;
-                session
-                    .write_response_header(Box::new(header), false)
-                    .await?;
-                session
-                    .write_response_body(Some(bytes::Bytes::from(body)), true)
-                    .await?;
-                return Ok(true);
-            }
-        }
-
-        // Per-route max connections enforcement.
-        // Tracks active connections per route using atomic counters.
-        // Returns 503 when a route exceeds its configured connection limit.
-        if let Some(max_conn) = entry.route.max_connections {
-            let counter = self
-                .route_connections
-                .entry(entry.route.id.clone())
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-                .value()
-                .clone();
-            let current = counter.fetch_add(1, Ordering::Relaxed);
-            if current >= max_conn as u64 {
-                counter.fetch_sub(1, Ordering::Relaxed);
-                warn!(
-                    route_id = %entry.route.id,
-                    current_connections = current + 1,
-                    max_connections = max_conn,
-                    "max connections exceeded for route (503)"
-                );
-                ctx.block_reason = Some("route connection limit".to_string());
-                let host_header = extract_host(session.req_header()).to_string();
-                let body = render_error_body(
-                    503,
-                    &ctx.request_id,
-                    &host_header,
-                    ctx.route_snapshot
-                        .as_ref()
-                        .and_then(|r| r.error_page_html.as_deref()),
-                    "Route connection limit exceeded",
-                );
-                let mut header = lorica_http::ResponseHeader::build(503, None)?;
-                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                header.insert_header("Content-Length", body.len().to_string())?;
-                session
-                    .write_response_header(Box::new(header), false)
-                    .await?;
-                session
-                    .write_response_body(Some(bytes::Bytes::from(body)), true)
-                    .await?;
-                return Ok(true);
-            }
-            ctx.route_conn_counter = Some(counter);
-        }
-
-        // Request body size limit
-        if let Some(max_bytes) = entry.route.max_request_body_bytes {
-            if let Some(cl) = req.headers.get("content-length") {
-                if let Ok(len) = cl.to_str().unwrap_or("0").parse::<u64>() {
-                    if len > max_bytes {
-                        let header = lorica_http::ResponseHeader::build(413, None)?;
+                    if let Some(key_auth) = challenge_store.get(token).await {
+                        let mut header = ResponseHeader::build(200, None)?;
+                        header.insert_header("Content-Type", "text/plain")?;
+                        header.insert_header("Content-Length", key_auth.len().to_string())?;
                         session
-                            .write_response_header(Box::new(header), true)
+                            .write_response_header(Box::new(header), false)
+                            .await?;
+                        session
+                            .write_response_body(Some(bytes::Bytes::from(key_auth)), true)
                             .await?;
                         return Ok(true);
                     }
                 }
             }
-        }
 
-        // Per-route rate limiting (skipped for whitelisted IPs)
-        if !is_whitelisted {
-            if let Some(rps) = entry.route.rate_limit_rps {
-                if let Some(ref ip) = check_ip {
-                    let key = format!("{}:{}", entry.route.id, ip);
-                    self.rate_limiter.observe(&key, 1);
-                    let current_rate = self.rate_limiter.rate(&key);
-                    let mut effective_limit = match entry.route.rate_limit_burst {
-                        Some(burst) => (rps + burst) as f64,
-                        None => rps as f64,
+            // Bot-protection cross-cutting endpoints (v1.4.0 Epic 3
+            // story 3.5). Two Lorica-handled paths below the `/lorica/bot/`
+            // namespace: POST `/lorica/bot/solve` (verify a submitted
+            // PoW / captcha, issue verdict cookie) and GET
+            // `/lorica/bot/captcha/{nonce}` (serve the captcha PNG).
+            // Both are handled here because they are route-independent:
+            // the stashed entry carries the route_id the cookie gets
+            // bound to, and the captcha nonce is self-scoped. Client IP
+            // extraction + cookie-bound scope validation happen inside
+            // the handlers.
+            {
+                let path: String = session.req_header().uri.path().to_owned();
+                if crate::bot::is_bot_solve_path(&path) {
+                    // Client IP must go through the SAME XFF unwrap that
+                    // the challenge-render path used; otherwise the
+                    // stashed entry's IP prefix (XFF-unwrapped) won't
+                    // match the current TCP client's prefix and the
+                    // handler rejects with 403 "client network changed".
+                    // Duplicates the xff_used logic from the main
+                    // request_filter block below, because that block is
+                    // skipped entirely when we take this early return.
+                    let config = self.config.load();
+                    let tcp_ip = session
+                        .client_addr()
+                        .and_then(|addr| addr.as_inet())
+                        .map(|a| a.ip());
+                    let xff_header = session
+                        .req_header()
+                        .headers
+                        .get("x-forwarded-for")
+                        .and_then(|v| v.to_str().ok());
+                    let direct_is_trusted = tcp_ip.is_some_and(|ip| {
+                        config.trusted_proxies.iter().any(|net| net.contains(&ip))
+                    });
+                    let client_ip = if direct_is_trusted {
+                        xff_header
+                            .and_then(|xff| {
+                                xff.split(',').next().unwrap_or(xff).trim().parse().ok()
+                            })
+                            .or(tcp_ip)
+                    } else {
+                        tcp_ip
                     };
-
-                    // Adaptive flood defense: when global RPS exceeds the
-                    // configured threshold, halve per-IP rate limits.
-                    let threshold = config.flood_threshold_rps;
-                    if threshold > 0 {
-                        let global_rps = self.global_rate.rate(&"global");
-                        if global_rps > threshold as f64 {
-                            effective_limit *= 0.5;
-                        }
+                    let now_secs = chrono::Utc::now().timestamp();
+                    let secret = lorica_challenge::secret::handle();
+                    let secret_ref = secret.as_deref();
+                    if let Some(ip) = client_ip {
+                        return bot_handlers::handle_solve(
+                            session,
+                            &self.bot_engine,
+                            secret_ref,
+                            ip,
+                            now_secs,
+                        )
+                        .await;
                     }
-                    // Store rate info for response headers (even if not throttled)
-                    ctx.rate_limit_info = Some((rps, current_rate));
+                    // No client address is exotic but real (tests,
+                    // non-TCP transports). Fail closed so we never
+                    // issue a cookie to a request we cannot attribute.
+                    let msg = "client address unavailable";
+                    let mut header = ResponseHeader::build(503, None)?;
+                    header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    header.insert_header("Content-Length", msg.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from_static(msg.as_bytes())), true)
+                        .await?;
+                    return Ok(true);
+                }
+                if let Some(nonce) = crate::bot::parse_bot_captcha_path(&path) {
+                    return bot_handlers::handle_captcha_image(session, &self.bot_engine, nonce)
+                        .await;
+                }
+            }
 
-                    if current_rate > effective_limit {
-                        warn!(
-                            route_id = %entry.route.id,
-                            client_ip = %ip,
-                            current_rate = %current_rate,
-                            limit_rps = %rps,
-                            "request rate-limited (429)"
-                        );
+            // Global flood tracking (before any other processing)
+            self.global_rate.observe(&"global", 1);
 
-                        // Track rate limit violations for auto-ban
-                        if let Some(ban_threshold) = entry.route.auto_ban_threshold {
-                            let violation_key = format!("violation:{}", ip);
-                            self.rate_violations.observe(&violation_key, 1);
-                            let violations = self.rate_violations.rate(&violation_key);
-                            if violations > ban_threshold as f64 {
-                                let ban_duration = entry.route.auto_ban_duration_s;
-                                self.ban_list
-                                    .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
-                                warn!(
-                                    ip = %ip,
-                                    violations = %violations,
-                                    ban_duration_s = %ban_duration,
-                                    "IP auto-banned for rate limit abuse"
-                                );
-                                // Dispatch ip_banned notification
-                                if let Some(ref sender) = self.alert_sender {
-                                    sender.send(
-                                        lorica_notify::AlertEvent::new(
-                                            lorica_notify::events::AlertType::IpBanned,
-                                            format!("IP {} auto-banned for rate limit abuse", ip),
-                                        )
-                                        .with_detail("ip", ip.to_string())
-                                        .with_detail("violations", violations.to_string())
-                                        .with_detail("ban_duration_s", ban_duration.to_string()),
-                                    );
-                                }
-                            }
+            // Global connection limit (before any other processing)
+            let config = self.config.load();
+            if config.max_global_connections > 0 {
+                let current = self.active_connections.load(Ordering::Relaxed);
+                if current >= config.max_global_connections as u64 {
+                    ctx.block_reason = Some("global connection limit".to_string());
+                    // No route matched yet at this stage, so no per-route
+                    // override is consultable: always render the default page.
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body = render_error_body(
+                        503,
+                        &ctx.request_id,
+                        &host_header,
+                        None,
+                        "Global connection limit exceeded",
+                    );
+                    let mut header = lorica_http::ResponseHeader::build(503, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+
+            // IP blocklist check (before any other processing)
+            let client_ip = session
+                .as_downstream()
+                .client_addr()
+                .and_then(|addr| addr.as_inet())
+                .map(|addr| addr.ip().to_string());
+
+            // Only trust X-Forwarded-For when the direct TCP client is a trusted proxy.
+            // When trusted_proxies is empty, XFF is never used (secure default).
+            let req = session.req_header();
+            let has_xff = req.headers.get("x-forwarded-for").is_some();
+            let direct_ip = client_ip.clone();
+
+            let direct_is_trusted = direct_ip.as_ref().is_some_and(|ip| {
+                if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                    config.trusted_proxies.iter().any(|net| net.contains(&addr))
+                } else {
+                    false
+                }
+            });
+
+            let xff_used = direct_is_trusted && has_xff;
+            let check_ip = if xff_used {
+                // Trusted proxy: extract real client IP from XFF (leftmost entry)
+                req.headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|xff| xff.split(',').next().unwrap_or(xff).trim().to_string())
+                    .or(client_ip)
+            } else {
+                // Not trusted or no XFF: use direct TCP client IP
+                client_ip
+            };
+
+            // Store client IP and source in context for access logging
+            ctx.client_ip = check_ip.clone();
+            ctx.is_xff = xff_used && check_ip.is_some();
+            ctx.xff_proxy_ip = if ctx.is_xff { direct_ip } else { None };
+            ctx.source = req
+                .headers
+                .get("x-lorica-source")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            // Global WAF whitelist: IPs in this list bypass ban checks, IP blocklist,
+            // rate limiting, and WAF evaluation entirely.
+            let is_whitelisted = check_ip.as_ref().is_some_and(|ip| {
+                if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                    config.waf_whitelist.iter().any(|net| net.contains(&addr))
+                } else {
+                    false
+                }
+            });
+
+            // Ban list + IP blocklist checks (skipped for whitelisted IPs)
+            if !is_whitelisted {
+                if let Some(ref ip) = check_ip {
+                    let banned = if let Some(entry) = self.ban_list.get(ip) {
+                        let (banned_at, duration_s) = entry.value();
+                        if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
+                            drop(entry);
+                            // Ban expired - lazy cleanup
+                            self.ban_list.remove(ip);
+                            false
+                        } else {
+                            true
                         }
-
-                        let reset_ts = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                            + 1;
-                        ctx.block_reason = Some("rate limited".to_string());
+                    } else {
+                        false
+                    };
+                    if banned {
+                        ctx.block_reason = Some("IP banned".to_string());
+                        // Pre-route stage: no route override consultable.
                         let host_header = extract_host(session.req_header()).to_string();
                         let body = render_error_body(
-                            429,
+                            403,
+                            &ctx.request_id,
+                            &host_header,
+                            None,
+                            "IP banned",
+                        );
+                        let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                        header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                        header.insert_header("Content-Length", body.len().to_string())?;
+                        session
+                            .write_response_header(Box::new(header), false)
+                            .await?;
+                        session
+                            .write_response_body(Some(bytes::Bytes::from(body)), true)
+                            .await?;
+                        return Ok(true);
+                    }
+
+                    if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
+                        warn!(
+                            ip = %ip,
+                            "request blocked by IP blocklist"
+                        );
+                        ctx.waf_blocked = true;
+                        // Record as WAF event + Prometheus metric + persist
+                        let path = req.uri.path();
+                        let host_val = extract_host(req);
+                        self.waf_engine.record_blocklist_event(ip, host_val, path);
+                        lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
+                        self.waf_counts
+                            .entry(("ip_blocklist".to_string(), "blocked".to_string()))
+                            .or_insert_with(|| AtomicU64::new(0))
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Some(ref store) = self.log_store {
+                            let ev = lorica_waf::WafEvent {
+                                rule_id: 0,
+                                description: format!("IP {ip} blocked by IP blocklist"),
+                                category: lorica_waf::RuleCategory::IpBlocklist,
+                                severity: 5,
+                                matched_field: "client_ip".to_string(),
+                                matched_value: ip.to_string(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                client_ip: ip.to_string(),
+                                route_hostname: {
+                                    let h = extract_host(req);
+                                    if h.is_empty() {
+                                        "-"
+                                    } else {
+                                        h
+                                    }
+                                }
+                                .to_string(),
+                                action: "blocked".to_string(),
+                            };
+                            let _ = store.insert_waf_event(&ev);
+                        }
+                        // Pre-route stage: no route override consultable.
+                        let host_header = extract_host(session.req_header()).to_string();
+                        let body = render_error_body(
+                            403,
+                            &ctx.request_id,
+                            &host_header,
+                            None,
+                            "IP blocked",
+                        );
+                        let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                        header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                        header.insert_header("Content-Length", body.len().to_string())?;
+                        session
+                            .write_response_header(Box::new(header), false)
+                            .await?;
+                        session
+                            .write_response_body(Some(bytes::Bytes::from(body)), true)
+                            .await?;
+                        return Ok(true);
+                    }
+                }
+            } // end if !is_whitelisted (ban + blocklist)
+
+            let host_raw = extract_host(req);
+            let host = host_raw.split(':').next().unwrap_or(host_raw);
+
+            let path = req.uri.path();
+            let query = req.uri.query();
+
+            // Find matching route (exact hostname first, then wildcard).
+            // Cache the matched entry in ctx so upstream_peer does not
+            // re-run find_route on the same request.
+            let entry = match config.find_route(host, path) {
+                Some(e) => e,
+                None => return Ok(false), // No route = let upstream_peer handle 404
+            };
+            ctx.matched_route_entry = Some(Arc::clone(entry));
+
+            // Store route snapshot, precompiled regex, and access log setting for later pipeline stages
+            ctx.route_snapshot = Some(Arc::clone(&entry.route));
+            ctx.path_rewrite_regex = entry.path_rewrite_regex.clone(); // Arc::clone, cheap
+            ctx.access_log_enabled = entry.route.access_log_enabled;
+
+            // Block WebSocket upgrades if disabled on this route
+            if !entry.route.websocket_enabled {
+                if let Some(upgrade) = req.headers.get("upgrade") {
+                    if upgrade
+                        .to_str()
+                        .unwrap_or("")
+                        .eq_ignore_ascii_case("websocket")
+                    {
+                        ctx.block_reason = Some("WebSocket disabled".to_string());
+                        let host_header = extract_host(session.req_header()).to_string();
+                        let body = render_error_body(
+                            403,
                             &ctx.request_id,
                             &host_header,
                             entry.route.error_page_html.as_deref(),
-                            "Rate limit exceeded",
+                            "WebSocket upgrades disabled on this route",
                         );
-                        let mut header = lorica_http::ResponseHeader::build(429, None)?;
-                        header.insert_header("Retry-After", "1")?;
-                        header.insert_header("X-RateLimit-Reset", reset_ts.to_string())?;
+                        let mut header = lorica_http::ResponseHeader::build(403, None)?;
                         header.insert_header("Content-Type", "text/html; charset=utf-8")?;
                         header.insert_header("Content-Length", body.len().to_string())?;
                         session
@@ -2821,16 +2412,1118 @@ impl ProxyHttp for LoricaProxy {
                     }
                 }
             }
-        } // end if !is_whitelisted (rate limiting)
 
-        // Skip WAF evaluation entirely if not enabled or IP is whitelisted (zero overhead)
-        if is_whitelisted || !entry.route.waf_enabled {
-            return Ok(false);
-        }
+            // Force HTTPS redirect (skip for ACME challenges - must stay HTTP)
+            if entry.route.force_https && !path.starts_with("/.well-known/acme-challenge/") {
+                let is_tls = session
+                    .digest()
+                    .and_then(|d| d.ssl_digest.as_ref())
+                    .is_some();
+                let scheme = if is_tls {
+                    "https"
+                } else {
+                    req.headers
+                        .get("x-forwarded-proto")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("http")
+                };
+                if scheme != "https" {
+                    let redir_host = extract_host(req);
+                    let redir_path = req.uri.path();
+                    let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                    let location = format!("https://{redir_host}{redir_path}{redir_query}");
+                    let mut header = lorica_http::ResponseHeader::build(301, None)?;
+                    header.insert_header("Location", &location)?;
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
 
-        // Collect headers for inspection
-        let headers: Vec<(&str, &str)> =
-            req.headers
+            // Hostname redirect
+            if let Some(ref target) = entry.route.redirect_hostname {
+                if host != target.as_str() {
+                    let redir_path = req.uri.path();
+                    let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                    let scheme = req
+                        .headers
+                        .get("x-forwarded-proto")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("https");
+                    let location = format!("{scheme}://{target}{redir_path}{redir_query}");
+                    let mut header = lorica_http::ResponseHeader::build(301, None)?;
+                    header.insert_header("Location", &location)?;
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+
+            // Per-route token-bucket rate limit. Runs after ban/blocklist
+            // and redirects so that an abusive client is rejected before
+            // we touch WAF / mtls / forward_auth. See design § 6 and
+            // `lorica_limits::token_bucket::AuthoritativeBucket`.
+            //
+            // Whitelisted IPs bypass the limiter (same policy as WAF ban
+            // checks — an operator who added an IP to the whitelist has
+            // made a deliberate trust decision).
+            if let Some(ref rl) = entry.route.rate_limit {
+                if !is_whitelisted {
+                    let scope_key = match rl.scope {
+                        lorica_config::models::RateLimitScope::PerIp => {
+                            ctx.client_ip.as_deref().unwrap_or("unknown").to_string()
+                        }
+                        lorica_config::models::RateLimitScope::PerRoute => "__route__".to_string(),
+                    };
+                    let key = format!("{}|{}", entry.route.id, scope_key);
+                    let admitted =
+                        self.rate_limit_buckets
+                            .try_consume(&key, rl, 1, lorica_shmem::now_ns());
+                    if !admitted {
+                        ctx.block_reason = Some("rate limited".to_string());
+                        let host_header = extract_host(session.req_header()).to_string();
+                        let body = render_error_body(
+                            429,
+                            &ctx.request_id,
+                            &host_header,
+                            entry.route.error_page_html.as_deref(),
+                            "Rate limit exceeded",
+                        );
+                        let mut header = lorica_http::ResponseHeader::build(429, None)?;
+                        // Retry-After in seconds. For any configured refill
+                        // rate >= 1 tok/s, 1 second is the right advice
+                        // (one token refills in <= 1 s). A zero refill means
+                        // a one-shot bucket that never refills - advise a
+                        // generous 60 s backoff instead of a tight loop.
+                        let retry_after: u64 = if rl.refill_per_sec >= 1 { 1 } else { 60 };
+                        header.insert_header("Retry-After", retry_after.to_string())?;
+                        header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                        header.insert_header("Content-Length", body.len().to_string())?;
+                        session
+                            .write_response_header(Box::new(header), false)
+                            .await?;
+                        session
+                            .write_response_body(Some(bytes::Bytes::from(body)), true)
+                            .await?;
+                        return Ok(true);
+                    }
+                }
+            }
+
+            // mTLS client verification: runs before forward_auth so a
+            // request that failed to present a valid client cert is
+            // rejected cheaply (no auth sub-request spawned). The listener
+            // has already validated the cert chain against the union CA
+            // bundle; we just check presence and the per-route org
+            // allowlist.
+            //
+            // 495 / 496 are the semi-standard "SSL cert error" / "SSL cert
+            // required" codes used by Nginx; reqwest and common clients
+            // surface them as meaningful errors and they don't collide
+            // with our other rejection paths.
+            if let Some(ref enforcer) = entry.mtls_enforcer {
+                let verdict = evaluate_mtls(enforcer, downstream_ssl_digest(session).as_deref());
+                if let Some(status) = verdict {
+                    ctx.block_reason = Some(format!("mtls rejected ({status})"));
+                    let message = match status {
+                        496 => "SSL certificate required",
+                        495 => "SSL certificate error",
+                        _ => "Forbidden",
+                    };
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body = render_error_body(
+                        status,
+                        &ctx.request_id,
+                        &host_header,
+                        entry.route.error_page_html.as_deref(),
+                        message,
+                    );
+                    let mut resp_header = ResponseHeader::build(status, None)?;
+                    resp_header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    resp_header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(resp_header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+
+            // Forward authentication: gate the request on an external auth
+            // service (Authelia / Authentik / Keycloak / oauth2-proxy). Runs
+            // after route match but before header/canary/path rules so a
+            // denied request never leaks into the backend-selection phase.
+            if let Some(ref fa_cfg) = entry.route.forward_auth {
+                // Detect TLS from the downstream socket, not HTTP version:
+                // h2c (HTTP/2 over plaintext) would otherwise be reported
+                // as https to the auth service, which is misleading and
+                // may trigger redirect loops.
+                let is_tls = session
+                    .digest()
+                    .and_then(|d| d.ssl_digest.as_ref())
+                    .is_some();
+                let scheme = if is_tls { "https" } else { "http" };
+                let outcome = run_forward_auth_keyed(
+                    fa_cfg,
+                    req,
+                    ctx.client_ip.as_deref(),
+                    scheme,
+                    &entry.route.id,
+                    &self.verdict_cache,
+                )
+                .await;
+                match outcome {
+                    ForwardAuthOutcome::Allow { response_headers } => {
+                        ctx.forward_auth_inject = response_headers;
+                    }
+                    ForwardAuthOutcome::Deny {
+                        status,
+                        headers,
+                        body,
+                    } => {
+                        ctx.block_reason = Some(format!("forward auth denied ({status})"));
+                        let mut resp_header = ResponseHeader::build(status, None)?;
+                        for (name, value) in &headers {
+                            let _ = resp_header.insert_header(name.clone(), value);
+                        }
+                        let _ = resp_header.insert_header("Content-Length", body.len().to_string());
+                        session
+                            .write_response_header(Box::new(resp_header), false)
+                            .await?;
+                        session
+                            .write_response_body(Some(bytes::Bytes::from(body)), true)
+                            .await?;
+                        return Ok(true);
+                    }
+                    ForwardAuthOutcome::FailClosed { reason } => {
+                        tracing::warn!(
+                            route_id = %entry.route.id,
+                            reason = %reason,
+                            "forward auth fail-closed"
+                        );
+                        ctx.block_reason = Some(format!("forward auth error: {reason}"));
+                        let host_header = extract_host(session.req_header()).to_string();
+                        let body = render_error_body(
+                            503,
+                            &ctx.request_id,
+                            &host_header,
+                            entry.route.error_page_html.as_deref(),
+                            "Authentication service unavailable",
+                        );
+                        let mut resp_header = ResponseHeader::build(503, None)?;
+                        resp_header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                        resp_header.insert_header("Content-Length", body.len().to_string())?;
+                        session
+                            .write_response_header(Box::new(resp_header), false)
+                            .await?;
+                        session
+                            .write_response_body(Some(bytes::Bytes::from(body)), true)
+                            .await?;
+                        return Ok(true);
+                    }
+                }
+            }
+
+            // Header rule matching (first match wins; sets backend override
+            // before path rules so a later path rule with its own backend_ids
+            // can still take precedence - "more specific wins"). Also
+            // emits a Prometheus counter so operators can see rule-match
+            // activity in metrics, not just logs. `rule_index = "default"`
+            // means no rule matched.
+            if !entry.route.header_rules.is_empty() {
+                let mut matched_idx: Option<usize> = None;
+                for (i, rule) in entry.route.header_rules.iter().enumerate() {
+                    let value = req
+                        .headers
+                        .get(rule.header_name.as_str())
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let regex: Option<&regex::Regex> = entry
+                        .header_rule_regexes
+                        .get(i)
+                        .and_then(|opt| opt.as_deref());
+                    if rule.matches(value, |v| regex.is_some_and(|re| re.is_match(v))) {
+                        matched_idx = Some(i);
+                        if let Some(b) = entry.header_rule_backends.get(i).and_then(|b| b.as_ref())
+                        {
+                            ctx.matched_backends = Some(b.clone());
+                        }
+                        break;
+                    }
+                }
+                match matched_idx {
+                    Some(i) => {
+                        // Stack-allocated itoa buffer avoids the per-request
+                        // String allocation that the old `i.to_string()`
+                        // performed on every header-rule match. ~1-2% CPU
+                        // saved at high QPS on routes with many rules.
+                        let mut buf = itoa::Buffer::new();
+                        lorica_api::metrics::inc_header_rule_match(&entry.route.id, buf.format(i));
+                    }
+                    None => lorica_api::metrics::inc_header_rule_match(&entry.route.id, "default"),
+                }
+            }
+
+            // Canary traffic split: runs AFTER header rules (operator opt-in
+            // always wins) and BEFORE path rules (URL-specific overrides
+            // still win). The split is applied only when no earlier phase
+            // already set `matched_backends`, so a user with X-Version: beta
+            // is never accidentally rebalanced into the canary bucket for
+            // the default version. Requests without a client IP (Unix-socket
+            // listeners in tests, rare IPv6 edge cases) keep route defaults
+            // rather than being bucketed deterministically on an empty
+            // string.
+            if ctx.matched_backends.is_none() && !entry.route.traffic_splits.is_empty() {
+                if let Some(ref ip) = ctx.client_ip {
+                    let bucket = canary_bucket(&entry.route.id, ip);
+                    // Inline walk so we know which split matched (for the
+                    // split_name metric label). Mirrors
+                    // `pick_traffic_split_backends` logic; the helper stays
+                    // as-is for its unit-test callers.
+                    let mut cumulative: u32 = 0;
+                    let mut matched_split_name: Option<&str> = None;
+                    for (i, split) in entry.route.traffic_splits.iter().enumerate() {
+                        let w = split.weight_percent.min(100) as u32;
+                        if w == 0 {
+                            continue;
+                        }
+                        cumulative = cumulative.saturating_add(w).min(100);
+                        if (bucket as u32) < cumulative {
+                            if let Some(backends) =
+                                entry.traffic_split_backends.get(i).and_then(|b| b.as_ref())
+                            {
+                                ctx.matched_backends = Some(backends.clone());
+                                matched_split_name = Some(if split.name.is_empty() {
+                                    "unnamed"
+                                } else {
+                                    split.name.as_str()
+                                });
+                            }
+                            break;
+                        }
+                    }
+                    match matched_split_name {
+                        Some(name) => {
+                            lorica_api::metrics::inc_canary_split_selected(&entry.route.id, name)
+                        }
+                        None => lorica_api::metrics::inc_canary_split_selected(
+                            &entry.route.id,
+                            "default",
+                        ),
+                    }
+                }
+            }
+
+            // Path rule matching (first match wins, overrides route config)
+            for (i, rule) in entry.route.path_rules.iter().enumerate() {
+                if rule.matches(path) {
+                    let effective = entry.route.with_path_rule_overrides(rule);
+                    ctx.route_snapshot = Some(Arc::new(effective));
+                    if rule.backend_ids.is_some() {
+                        if let Some(ref backends) = entry.path_rule_backends[i] {
+                            ctx.matched_backends = Some(backends.clone());
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // Request mirroring: fire-and-forget shadow copies. For body-
+            // less requests (GET/HEAD/DELETE, or any request without
+            // Content-Length / Transfer-Encoding) we spawn immediately.
+            // For body-bearing requests we stash the metadata in
+            // `ctx.mirror_pending` and fire in `request_body_filter` once
+            // the body is buffered - so shadow backends see the same
+            // request body as the primary, up to the configured
+            // max_body_bytes cap.
+            if let Some(ref mirror_cfg) = entry.route.mirror {
+                if !entry.mirror_backends.is_empty()
+                    && mirror_sample_hit(&ctx.request_id, mirror_cfg.sample_percent)
+                {
+                    let headers = build_mirror_forward_headers(req, &ctx.request_id);
+                    let path = req
+                        .uri
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_string())
+                        .unwrap_or_else(|| "/".to_string());
+                    let method = req.method.clone();
+                    let max_body = mirror_cfg.max_body_bytes as usize;
+                    let body_expected = max_body > 0 && request_has_body(req);
+
+                    if body_expected {
+                        // Defer mirror firing until request_body_filter has
+                        // buffered the full body.
+                        ctx.mirror_pending = Some(MirrorPending {
+                            cfg: mirror_cfg.clone(),
+                            backends: entry.mirror_backends.clone(),
+                            method,
+                            path_and_query: path,
+                            headers,
+                            request_id: ctx.request_id.clone(),
+                            max_body_bytes: max_body,
+                            route_id: entry.route.id.clone(),
+                        });
+                        ctx.mirror_body_state = Some(MirrorBodyState::Active(Vec::new()));
+                    } else {
+                        // No body to buffer (or operator opted into
+                        // headers-only via max_body_bytes = 0): fire now.
+                        spawn_mirrors(
+                            mirror_cfg,
+                            &entry.mirror_backends,
+                            method,
+                            path,
+                            headers,
+                            None,
+                            ctx.request_id.clone(),
+                            entry.route.id.clone(),
+                        );
+                    }
+                }
+            }
+
+            // Maintenance mode - return 503 with optional custom HTML
+            if let Some(ref route) = ctx.route_snapshot {
+                if route.maintenance_mode {
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body_html = render_error_body(
+                        503,
+                        &ctx.request_id,
+                        &host_header,
+                        route.error_page_html.as_deref(),
+                        "Service under maintenance",
+                    );
+                    let mut header = ResponseHeader::build(503, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body_html.len().to_string())?;
+                    header.insert_header("Retry-After", "300")?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body_html)), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+
+            // HTTP Basic Auth (per-route) with credential verification cache.
+            // The cache avoids running Argon2 (~100ms) on every request by caching
+            // the hash of verified credentials for 60 seconds.
+            if let Some(ref route) = ctx.route_snapshot {
+                if let (Some(ref expected_user), Some(ref expected_hash)) =
+                    (&route.basic_auth_username, &route.basic_auth_password_hash)
+                {
+                    let authorized = session
+                        .req_header()
+                        .headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Basic "))
+                        .and_then(|b64| {
+                            use base64::Engine;
+                            base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                        })
+                        .and_then(|decoded| String::from_utf8(decoded).ok())
+                        .map(|cred| {
+                            let mut parts = cred.splitn(2, ':');
+                            let user = parts.next().unwrap_or("");
+                            let pass = parts.next().unwrap_or("");
+                            if user != expected_user {
+                                return false;
+                            }
+
+                            // Check credential cache before running Argon2.
+                            // Key is the NUL-joined literal "{cred}\0{hash}"
+                            // so two distinct credentials cannot collide on
+                            // a truncated 64-bit digest (which, at a small
+                            // cache size, is not worth the bypass risk).
+                            let mut cache_key =
+                                String::with_capacity(cred.len() + 1 + expected_hash.len());
+                            cache_key.push_str(&cred);
+                            cache_key.push('\0');
+                            cache_key.push_str(expected_hash.as_str());
+
+                            const AUTH_CACHE_TTL: Duration = Duration::from_secs(60);
+                            if let Some(verified_at) = self.basic_auth_cache.get(&cache_key) {
+                                if verified_at.elapsed() < AUTH_CACHE_TTL {
+                                    return true; // cache hit - skip Argon2
+                                }
+                            }
+
+                            // Cache miss or expired - run full Argon2 verification.
+                            // Parse the hash first; if it's corrupt, deny immediately
+                            // without paying the cost of block_in_place.
+                            if argon2::PasswordHash::new(expected_hash).is_err() {
+                                return false;
+                            }
+                            // Offload CPU-intensive Argon2 to the blocking thread
+                            // pool to avoid stalling the async proxy runtime.
+                            let pass_bytes = pass.as_bytes().to_vec();
+                            let hash_str = expected_hash.to_string();
+                            let ok = tokio::task::block_in_place(|| {
+                                use argon2::PasswordVerifier;
+                                match argon2::PasswordHash::new(&hash_str) {
+                                    Ok(h) => argon2::Argon2::default()
+                                        .verify_password(&pass_bytes, &h)
+                                        .is_ok(),
+                                    Err(_) => false,
+                                }
+                            });
+                            if ok {
+                                self.basic_auth_cache.insert(cache_key, Instant::now());
+                                // Evict expired entries to prevent unbounded growth
+                                self.basic_auth_cache
+                                    .retain(|_, t| t.elapsed() < AUTH_CACHE_TTL);
+                            }
+                            ok
+                        })
+                        .unwrap_or(false);
+
+                    if !authorized {
+                        let mut header = ResponseHeader::build(401, None)?;
+                        header.insert_header("WWW-Authenticate", "Basic realm=\"Lorica\"")?;
+                        header.insert_header("Content-Length", "0")?;
+                        session
+                            .write_response_header(Box::new(header), true)
+                            .await?;
+                        return Ok(true);
+                    }
+                }
+            }
+
+            // Direct status response (return_status)
+            if let Some(status) = ctx.route_snapshot.as_ref().and_then(|r| r.return_status) {
+                ctx.block_reason = Some(format!("return_status {status}"));
+                if let Some(ref target) = ctx
+                    .route_snapshot
+                    .as_ref()
+                    .and_then(|r| r.redirect_to.clone())
+                {
+                    // return_status + redirect_to = redirect with specific status code
+                    let redir_path = req.uri.path();
+                    let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                    let base = target.trim_end_matches('/');
+                    let location = format!("{base}{redir_path}{redir_query}");
+                    let mut header = lorica_http::ResponseHeader::build(status, None)?;
+                    header.insert_header("Location", &location)?;
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                } else {
+                    // return_status alone = direct response. Route the body
+                    // through render_error_body() so operators get Lorica's
+                    // branded error page (or their own error_page_html when
+                    // configured), consistent with every other terminal
+                    // branch (403 IP / WAF / GeoIP, 429 rate limit,
+                    // 502 / 504 upstream). Previously this path wrote empty
+                    // headers only, which produced a blank page for
+                    // return_status routes.
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let error_page_html = ctx
+                        .route_snapshot
+                        .as_ref()
+                        .and_then(|r| r.error_page_html.as_deref())
+                        .map(|s| s.to_string());
+                    let body = render_error_body(
+                        status,
+                        &ctx.request_id,
+                        &host_header,
+                        error_page_html.as_deref(),
+                        &format!("return_status {status}"),
+                    );
+                    let mut header = lorica_http::ResponseHeader::build(status, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                }
+                return Ok(true);
+            }
+
+            // Redirect to external URL (read from snapshot, path rules may have overridden it)
+            if let Some(ref target) = ctx
+                .route_snapshot
+                .as_ref()
+                .and_then(|r| r.redirect_to.clone())
+            {
+                let redir_path = req.uri.path();
+                let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                let base = target.trim_end_matches('/');
+                let location = format!("{base}{redir_path}{redir_query}");
+                let mut header = lorica_http::ResponseHeader::build(301, None)?;
+                header.insert_header("Location", &location)?;
+                session
+                    .write_response_header(Box::new(header), true)
+                    .await?;
+                return Ok(true);
+            }
+
+            // Per-route IP allowlist/denylist
+            if let Some(ref ip) = check_ip {
+                if !entry.route.ip_allowlist.is_empty()
+                    && !entry.route.ip_allowlist.iter().any(|a| ip_matches(ip, a))
+                {
+                    ctx.block_reason = Some("IP not in allowlist".to_string());
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body = render_error_body(
+                        403,
+                        &ctx.request_id,
+                        &host_header,
+                        entry.route.error_page_html.as_deref(),
+                        "IP not in allowlist",
+                    );
+                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
+                if entry.route.ip_denylist.iter().any(|d| ip_matches(ip, d)) {
+                    ctx.block_reason = Some("IP in denylist".to_string());
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body = render_error_body(
+                        403,
+                        &ctx.request_id,
+                        &host_header,
+                        entry.route.error_page_html.as_deref(),
+                        "IP in denylist",
+                    );
+                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+
+            // Per-route GeoIP country filter (v1.4.0 Epic 2 story 2.4).
+            // Evaluated after IP allow/denylist so a specific IP always
+            // wins over a country rule, and before WAF so cheap
+            // geographic rejection happens before expensive regex
+            // matching. Unknown country (reserved / private ranges, DB
+            // miss) falls through without blocking so a legitimate
+            // client behind a corporate NAT is never accidentally denied
+            // — the operator can layer an explicit `ip_allowlist` on top
+            // when they want fail-close semantics.
+            // GeoIP country resolved once and cached for both the geoip
+            // block check and the bot-protection bypass evaluator,
+            // avoiding a redundant mmdb decode_path call on the hot path.
+            let mut cached_country: Option<String> = None;
+            if let Some(ref ip_str) = check_ip {
+                if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
+                    if let Some(country) = self.geoip_resolver.lookup_country(ip_addr) {
+                        cached_country = Some(country.as_str().to_string());
+                        // Always stamp the country on the root tracing
+                        // span — the attribute is useful even on requests
+                        // that are not blocked (traffic analytics per
+                        // country, anomaly detection). The bridge
+                        // mirrors this onto the exported OTel span when
+                        // the `otel` feature is on; without the feature
+                        // it just shows up as a span field in JSON logs.
+                        ctx.root_tracing_span
+                            .record("client.geo.country_iso_code", country.as_str());
+
+                        if let Some(ref geoip_cfg) = entry.route.geoip {
+                            use lorica_config::models::GeoIpMode;
+                            if geoip_cfg.blocks(country.as_str()) {
+                                let mode_str = match geoip_cfg.mode {
+                                    GeoIpMode::Allowlist => "allowlist",
+                                    GeoIpMode::Denylist => "denylist",
+                                };
+                                // Prometheus counter: bounded cardinality
+                                // (routes * ~240 countries * 2 modes).
+                                // Use `entry.route.id` directly — the
+                                // per-request `ctx.route_id` is only
+                                // assigned further down the filter (after
+                                // response_headers + auth checks) and
+                                // would show up as "_unknown" here.
+                                lorica_api::metrics::inc_geoip_block(
+                                    entry.route.id.as_str(),
+                                    country.as_str(),
+                                    mode_str,
+                                );
+
+                                let reason = format!("GeoIP blocked ({country} via {mode_str})");
+                                ctx.block_reason = Some(reason.clone());
+                                let host_header = extract_host(session.req_header()).to_string();
+                                let body = render_error_body(
+                                    403,
+                                    &ctx.request_id,
+                                    &host_header,
+                                    entry.route.error_page_html.as_deref(),
+                                    &reason,
+                                );
+                                let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                                header.insert_header("Content-Length", body.len().to_string())?;
+                                session
+                                    .write_response_header(Box::new(header), false)
+                                    .await?;
+                                session
+                                    .write_response_body(Some(bytes::Bytes::from(body)), true)
+                                    .await?;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    // `country` is None = DB miss / unknown range;
+                    // fall through without blocking. Operators that
+                    // want fail-close behaviour can layer
+                    // ip_allowlist on top. No OTel attribute when
+                    // country is unknown — omitting is semantically
+                    // clearer than setting an empty string.
+                }
+            }
+
+            // Per-route bot-protection evaluation (v1.4.0 Epic 3
+            // story 3.5). Runs after GeoIP (so the `bypass.countries`
+            // and `only_country` checks can use the resolved country)
+            // and before forward_auth (so we do not pay an IdP RTT on
+            // a request we are about to block anyway). Only the
+            // request-path enters this block; `POST /lorica/bot/solve`
+            // and the captcha image GET are intercepted earlier.
+            if let Some(ref bot_cfg) = entry.route.bot_protection {
+                if let Some(ref ip_str) = check_ip {
+                    if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
+                        // Reuse the country resolved in the GeoIP block
+                        // above (cached_country) to avoid a redundant
+                        // mmdb decode_path call on every request.
+                        let country = cached_country.clone();
+                        // ASN lookup via the hot-swappable resolver.
+                        // Returns None when no DB is loaded — the
+                        // evaluator treats that as "asn bypass
+                        // disabled for this request" and falls through
+                        // to the remaining categories. Zero-cost when
+                        // the operator has no ASN DB configured.
+                        let asn = self.asn_resolver.lookup_asn(ip_addr);
+                        // Forward-confirmed rDNS from the per-process
+                        // cache. Cache miss on the hot path is
+                        // intentional: the rDNS lookup is O(~network
+                        // RTT) and must not block request_filter. We
+                        // spawn a populate task so the NEXT request
+                        // from the same IP gets a hit, then proceed
+                        // with rdns_name = None for this request (the
+                        // evaluator treats that as "rdns bypass does
+                        // not fire").
+                        let rdns_name: Option<String> = if bot_cfg.bypass.rdns.is_empty() {
+                            // Zero-cost when the operator has no rDNS
+                            // bypass configured — do not even probe the
+                            // cache.
+                            None
+                        } else if let Some(resolver) = crate::bot_rdns::handle() {
+                            let now_i = chrono::Utc::now().timestamp();
+                            match resolver.cache_check(ip_addr, now_i) {
+                                Some(cached) => cached,
+                                None => {
+                                    // Fire-and-forget populate. Bounded
+                                    // by hickory's timeout + attempts
+                                    // config (≤ 6 s). Dropped on
+                                    // runtime shutdown.
+                                    let resolver = resolver.clone();
+                                    tokio::spawn(async move {
+                                        let _ = resolver.resolve_and_cache(ip_addr).await;
+                                    });
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let ua = session
+                            .req_header()
+                            .headers
+                            .get(http::header::USER_AGENT)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let cookie_header = session
+                            .req_header()
+                            .headers
+                            .get(http::header::COOKIE)
+                            .and_then(|v| v.to_str().ok());
+                        let verdict_cookie =
+                            cookie_header.and_then(crate::bot::extract_verdict_cookie);
+                        let now_secs = chrono::Utc::now().timestamp();
+                        let secret = lorica_challenge::secret::handle();
+                        let secret_ref = secret.as_deref();
+                        // Cross-worker verdict cache (story 3.6 closure):
+                        // in worker mode, consult the supervisor-owned
+                        // cache BEFORE running HMAC verify so a cookie
+                        // issued on a sibling worker is honoured without
+                        // a fresh verify on this worker. Local-mode
+                        // evaluator handles the in-process cache
+                        // internally; Rpc-mode hits this path.
+                        let ip_prefix = lorica_challenge::IpPrefix::from_ip(ip_addr);
+                        let cached_cookie_hit =
+                            if matches!(self.verdict_cache, VerdictCacheEngine::Rpc { .. }) {
+                                if let Some(cookie) = verdict_cookie {
+                                    crate::bot::rpc_cache_check(
+                                        &self.verdict_cache,
+                                        &entry.route.id,
+                                        &ip_prefix,
+                                        cookie,
+                                        now_secs,
+                                    )
+                                    .await
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                        let inputs = crate::bot::EvalInputs {
+                            client_ip: ip_addr,
+                            country,
+                            asn,
+                            rdns_name,
+                            user_agent: ua,
+                            verdict_cookie,
+                            now: now_secs,
+                            hmac_secret: secret_ref,
+                            route_id: &entry.route.id,
+                            config: bot_cfg,
+                            cached_cookie_hit,
+                            ua_regex_set: entry.bot_ua_regex_set.as_deref(),
+                        };
+                        match crate::bot::evaluate(&inputs) {
+                            crate::bot::Decision::Pass { reason } => {
+                                debug!(
+                                    route_id = %entry.route.id,
+                                    reason = reason.as_str(),
+                                    "bot-protection: pass"
+                                );
+                                // In Rpc mode AND on a fresh HMAC-verify
+                                // hit (not a cache short-circuit), push
+                                // the verdict to the supervisor cache so
+                                // the next request on any worker skips
+                                // the verify. Fire-and-forget — a failed
+                                // push just means the next request
+                                // re-verifies, which is the same as a
+                                // cache miss. Skips pushes when the hit
+                                // already came from the cache (to avoid
+                                // refreshing TTL on every request, which
+                                // would extend the cookie's effective
+                                // life past its `expires_at`).
+                                if reason == crate::bot::PassReason::ValidCookie
+                                    && cached_cookie_hit.is_none()
+                                    && matches!(self.verdict_cache, VerdictCacheEngine::Rpc { .. })
+                                {
+                                    if let (Some(cookie), Some(secret)) =
+                                        (verdict_cookie, secret_ref)
+                                    {
+                                        if let Ok(payload) = lorica_challenge::cookie::verify(
+                                            cookie, secret, now_secs,
+                                        ) {
+                                            let engine = self.verdict_cache.clone();
+                                            let route_id = entry.route.id.clone();
+                                            let ip_prefix_c = ip_prefix.clone();
+                                            let cookie_c = cookie.to_string();
+                                            let exp = payload.expires_at;
+                                            tokio::spawn(async move {
+                                                crate::bot::rpc_cache_push(
+                                                    &engine,
+                                                    &route_id,
+                                                    &ip_prefix_c,
+                                                    &cookie_c,
+                                                    exp,
+                                                    now_secs,
+                                                )
+                                                .await;
+                                            });
+                                        }
+                                    }
+                                }
+                                // Metric + OTel span attribute. A valid
+                                // cookie yields outcome=passed; any of
+                                // the bypass reasons yields
+                                // outcome=bypassed. The detailed bypass
+                                // category lives on the OTel span
+                                // attribute so Prometheus cardinality
+                                // stays bounded.
+                                let outcome = match reason {
+                                    crate::bot::PassReason::ValidCookie => "passed",
+                                    crate::bot::PassReason::Disabled => "passed",
+                                    crate::bot::PassReason::OnlyCountryGateMiss => "bypassed",
+                                    crate::bot::PassReason::BypassIpCidr
+                                    | crate::bot::PassReason::BypassAsn
+                                    | crate::bot::PassReason::BypassRdns
+                                    | crate::bot::PassReason::BypassCountry
+                                    | crate::bot::PassReason::BypassUserAgent => "bypassed",
+                                };
+                                let mode_str = match bot_cfg.mode {
+                                    lorica_config::models::BotProtectionMode::Cookie => "cookie",
+                                    lorica_config::models::BotProtectionMode::Javascript => {
+                                        "javascript"
+                                    }
+                                    lorica_config::models::BotProtectionMode::Captcha => "captcha",
+                                };
+                                lorica_api::metrics::inc_bot_challenge(
+                                    entry.route.id.as_str(),
+                                    mode_str,
+                                    outcome,
+                                );
+                                ctx.root_tracing_span
+                                    .record("bot_protection.challenge.outcome", outcome);
+                                ctx.root_tracing_span
+                                    .record("bot_protection.challenge.mode", mode_str);
+                                ctx.root_tracing_span
+                                    .record("bot_protection.challenge.reason", reason.as_str());
+                            }
+                            crate::bot::Decision::Challenge => {
+                                // Render the original request URI so a
+                                // successful solve bounces the user back
+                                // to where they came from (path + query).
+                                let req = session.req_header();
+                                let path_and_q = req
+                                    .uri
+                                    .path_and_query()
+                                    .map(|pq| pq.as_str().to_string())
+                                    .unwrap_or_else(|| "/".to_string());
+                                let accept_html = bot_handlers::accept_prefers_html(
+                                    req.headers
+                                        .get(http::header::ACCEPT)
+                                        .and_then(|v| v.to_str().ok()),
+                                );
+                                return bot_handlers::serve_challenge(
+                                    session,
+                                    &self.bot_engine,
+                                    bot_cfg,
+                                    &entry.route.id,
+                                    ip_addr,
+                                    &path_and_q,
+                                    accept_html,
+                                    now_secs,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Slowloris detection: reject requests where headers took too long to arrive.
+            // If the time from connection start to request_filter exceeds the threshold,
+            // the client is likely performing a slowloris attack (sending headers very slowly).
+            let slowloris_ms = entry.route.slowloris_threshold_ms;
+            if slowloris_ms > 0 {
+                let elapsed_ms = ctx.start_time.elapsed().as_millis() as i32;
+                if elapsed_ms > slowloris_ms {
+                    let client_ip_str = check_ip.as_deref().unwrap_or("-");
+                    warn!(
+                        ip = %client_ip_str,
+                        elapsed_ms = elapsed_ms,
+                        threshold_ms = slowloris_ms,
+                        route_id = %entry.route.id,
+                        "slowloris detected - slow request headers"
+                    );
+                    ctx.block_reason = Some("slowloris detected".to_string());
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body = render_error_body(
+                        408,
+                        &ctx.request_id,
+                        &host_header,
+                        entry.route.error_page_html.as_deref(),
+                        "Request headers took too long",
+                    );
+                    let mut header = lorica_http::ResponseHeader::build(408, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+
+            // Per-route max connections enforcement.
+            // Tracks active connections per route using atomic counters.
+            // Returns 503 when a route exceeds its configured connection limit.
+            if let Some(max_conn) = entry.route.max_connections {
+                let counter = self
+                    .route_connections
+                    .entry(entry.route.id.clone())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                    .value()
+                    .clone();
+                let current = counter.fetch_add(1, Ordering::Relaxed);
+                if current >= max_conn as u64 {
+                    counter.fetch_sub(1, Ordering::Relaxed);
+                    warn!(
+                        route_id = %entry.route.id,
+                        current_connections = current + 1,
+                        max_connections = max_conn,
+                        "max connections exceeded for route (503)"
+                    );
+                    ctx.block_reason = Some("route connection limit".to_string());
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body = render_error_body(
+                        503,
+                        &ctx.request_id,
+                        &host_header,
+                        ctx.route_snapshot
+                            .as_ref()
+                            .and_then(|r| r.error_page_html.as_deref()),
+                        "Route connection limit exceeded",
+                    );
+                    let mut header = lorica_http::ResponseHeader::build(503, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    return Ok(true);
+                }
+                ctx.route_conn_counter = Some(counter);
+            }
+
+            // Request body size limit
+            if let Some(max_bytes) = entry.route.max_request_body_bytes {
+                if let Some(cl) = req.headers.get("content-length") {
+                    if let Ok(len) = cl.to_str().unwrap_or("0").parse::<u64>() {
+                        if len > max_bytes {
+                            let header = lorica_http::ResponseHeader::build(413, None)?;
+                            session
+                                .write_response_header(Box::new(header), true)
+                                .await?;
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+
+            // Per-route rate limiting (skipped for whitelisted IPs)
+            if !is_whitelisted {
+                if let Some(rps) = entry.route.rate_limit_rps {
+                    if let Some(ref ip) = check_ip {
+                        let key = format!("{}:{}", entry.route.id, ip);
+                        self.rate_limiter.observe(&key, 1);
+                        let current_rate = self.rate_limiter.rate(&key);
+                        let mut effective_limit = match entry.route.rate_limit_burst {
+                            Some(burst) => (rps + burst) as f64,
+                            None => rps as f64,
+                        };
+
+                        // Adaptive flood defense: when global RPS exceeds the
+                        // configured threshold, halve per-IP rate limits.
+                        let threshold = config.flood_threshold_rps;
+                        if threshold > 0 {
+                            let global_rps = self.global_rate.rate(&"global");
+                            if global_rps > threshold as f64 {
+                                effective_limit *= 0.5;
+                            }
+                        }
+                        // Store rate info for response headers (even if not throttled)
+                        ctx.rate_limit_info = Some((rps, current_rate));
+
+                        if current_rate > effective_limit {
+                            warn!(
+                                route_id = %entry.route.id,
+                                client_ip = %ip,
+                                current_rate = %current_rate,
+                                limit_rps = %rps,
+                                "request rate-limited (429)"
+                            );
+
+                            // Track rate limit violations for auto-ban
+                            if let Some(ban_threshold) = entry.route.auto_ban_threshold {
+                                let violation_key = format!("violation:{}", ip);
+                                self.rate_violations.observe(&violation_key, 1);
+                                let violations = self.rate_violations.rate(&violation_key);
+                                if violations > ban_threshold as f64 {
+                                    let ban_duration = entry.route.auto_ban_duration_s;
+                                    self.ban_list.insert(
+                                        ip.to_string(),
+                                        (Instant::now(), ban_duration as u64),
+                                    );
+                                    warn!(
+                                        ip = %ip,
+                                        violations = %violations,
+                                        ban_duration_s = %ban_duration,
+                                        "IP auto-banned for rate limit abuse"
+                                    );
+                                    // Dispatch ip_banned notification
+                                    if let Some(ref sender) = self.alert_sender {
+                                        sender.send(
+                                            lorica_notify::AlertEvent::new(
+                                                lorica_notify::events::AlertType::IpBanned,
+                                                format!(
+                                                    "IP {} auto-banned for rate limit abuse",
+                                                    ip
+                                                ),
+                                            )
+                                            .with_detail("ip", ip.to_string())
+                                            .with_detail("violations", violations.to_string())
+                                            .with_detail(
+                                                "ban_duration_s",
+                                                ban_duration.to_string(),
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+
+                            let reset_ts = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                                + 1;
+                            ctx.block_reason = Some("rate limited".to_string());
+                            let host_header = extract_host(session.req_header()).to_string();
+                            let body = render_error_body(
+                                429,
+                                &ctx.request_id,
+                                &host_header,
+                                entry.route.error_page_html.as_deref(),
+                                "Rate limit exceeded",
+                            );
+                            let mut header = lorica_http::ResponseHeader::build(429, None)?;
+                            header.insert_header("Retry-After", "1")?;
+                            header.insert_header("X-RateLimit-Reset", reset_ts.to_string())?;
+                            header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                            header.insert_header("Content-Length", body.len().to_string())?;
+                            session
+                                .write_response_header(Box::new(header), false)
+                                .await?;
+                            session
+                                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                                .await?;
+                            return Ok(true);
+                        }
+                    }
+                }
+            } // end if !is_whitelisted (rate limiting)
+
+            // Skip WAF evaluation entirely if not enabled or IP is whitelisted (zero overhead)
+            if is_whitelisted || !entry.route.waf_enabled {
+                return Ok(false);
+            }
+
+            // Collect headers for inspection
+            let headers: Vec<(&str, &str)> = req
+                .headers
                 .iter()
                 .filter_map(|(name, value)| {
                     let name_str = name.as_str();
@@ -2845,151 +3538,163 @@ impl ProxyHttp for LoricaProxy {
                 })
                 .collect();
 
-        let waf_mode = match entry.route.waf_mode {
-            WafMode::Detection => lorica_waf::WafMode::Detection,
-            WafMode::Blocking => lorica_waf::WafMode::Blocking,
-        };
+            let waf_mode = match entry.route.waf_mode {
+                WafMode::Detection => lorica_waf::WafMode::Detection,
+                WafMode::Blocking => lorica_waf::WafMode::Blocking,
+            };
 
-        let mut verdict = self.waf_engine.evaluate(
-            waf_mode,
-            path,
-            query,
-            &headers,
-            host,
-            check_ip.as_deref().unwrap_or("-"),
-        );
+            let mut verdict = self.waf_engine.evaluate(
+                waf_mode,
+                path,
+                query,
+                &headers,
+                host,
+                check_ip.as_deref().unwrap_or("-"),
+            );
 
-        match verdict {
-            lorica_waf::WafVerdict::Blocked(ref mut events) => {
-                for ev in events.iter_mut() {
-                    ev.route_hostname = host.to_string();
-                    ev.action = "blocked".to_string();
-                    lorica_api::metrics::record_waf_event(ev.category.as_str(), "blocked");
-                    self.waf_counts
-                        .entry((ev.category.as_str().to_string(), "blocked".to_string()))
-                        .or_insert_with(|| AtomicU64::new(0))
-                        .fetch_add(1, Ordering::Relaxed);
-                    if let Some(ref store) = self.log_store {
-                        let _ = store.insert_waf_event(ev);
+            match verdict {
+                lorica_waf::WafVerdict::Blocked(ref mut events) => {
+                    for ev in events.iter_mut() {
+                        ev.route_hostname = host.to_string();
+                        ev.action = "blocked".to_string();
+                        lorica_api::metrics::record_waf_event(ev.category.as_str(), "blocked");
+                        self.waf_counts
+                            .entry((ev.category.as_str().to_string(), "blocked".to_string()))
+                            .or_insert_with(|| AtomicU64::new(0))
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Some(ref store) = self.log_store {
+                            let _ = store.insert_waf_event(ev);
+                        }
                     }
-                }
-                // Dispatch waf_alert notification
-                if let (Some(ref sender), Some(ev)) = (&self.alert_sender, events.first()) {
-                    sender.send(
-                        lorica_notify::AlertEvent::new(
-                            lorica_notify::events::AlertType::WafAlert,
-                            format!("WAF blocked {} on {}{}", ev.category.as_str(), host, path),
-                        )
-                        .with_detail("rule_id", ev.rule_id.to_string())
-                        .with_detail("category", ev.category.as_str().to_string())
-                        .with_detail("host", host.to_string())
-                        .with_detail("path", path.to_string())
-                        .with_detail("client_ip", check_ip.as_deref().unwrap_or("-").to_string()),
-                    );
-                }
-                ctx.waf_blocked = true;
-                ctx.matched_host = Some(host.to_string());
-                ctx.matched_path = Some(path.to_string());
+                    // Dispatch waf_alert notification
+                    if let (Some(ref sender), Some(ev)) = (&self.alert_sender, events.first()) {
+                        sender.send(
+                            lorica_notify::AlertEvent::new(
+                                lorica_notify::events::AlertType::WafAlert,
+                                format!("WAF blocked {} on {}{}", ev.category.as_str(), host, path),
+                            )
+                            .with_detail("rule_id", ev.rule_id.to_string())
+                            .with_detail("category", ev.category.as_str().to_string())
+                            .with_detail("host", host.to_string())
+                            .with_detail("path", path.to_string())
+                            .with_detail(
+                                "client_ip",
+                                check_ip.as_deref().unwrap_or("-").to_string(),
+                            ),
+                        );
+                    }
+                    ctx.waf_blocked = true;
+                    ctx.matched_host = Some(host.to_string());
+                    ctx.matched_path = Some(path.to_string());
 
-                // WAF auto-ban counter. Two modes:
-                //
-                // - Multi-worker (`self.shmem.is_some()`): increment the
-                //   cross-worker `waf_auto_ban` atomic counter. The
-                //   supervisor reads the counter on each UDS WAF event,
-                //   decides when the threshold is crossed, broadcasts
-                //   `BanIp` to all workers, and resets the slot. Workers
-                //   never issue bans directly — the supervisor is the
-                //   sole authority so the ban is consistent across the
-                //   pool.
-                //
-                // - Single-process (`self.shmem.is_none()`): fall back to
-                //   the per-process `waf_violations` DashMap + local
-                //   `ban_list` insertion, as before.
-                if let Some(ref ip) = check_ip {
-                    let config = self.config.load();
-                    let threshold = config.waf_ban_threshold;
-                    if threshold > 0 {
-                        if let Some(region) = self.shmem {
-                            // Multi-worker: just bump the shmem counter.
-                            let tagged = region.tagged(ip_to_shmem_key(ip.as_str()));
-                            let _ =
-                                region
-                                    .waf_auto_ban
-                                    .increment(tagged, 1, lorica_shmem::now_ns());
-                        } else {
-                            let violations = self
-                                .waf_violations
-                                .entry(ip.to_string())
-                                .or_insert_with(|| AtomicU64::new(0))
-                                .fetch_add(1, Ordering::Relaxed)
-                                + 1;
-                            if violations >= threshold as u64 {
-                                let ban_duration = config.waf_ban_duration_s;
-                                self.ban_list
-                                    .insert(ip.to_string(), (Instant::now(), ban_duration as u64));
-                                self.waf_violations.remove(ip.as_str());
-                                warn!(
-                                    ip = %ip,
-                                    violations = %violations,
-                                    ban_duration_s = %ban_duration,
-                                    "IP auto-banned for repeated WAF violations (local counter)"
+                    // WAF auto-ban counter. Two modes:
+                    //
+                    // - Multi-worker (`self.shmem.is_some()`): increment the
+                    //   cross-worker `waf_auto_ban` atomic counter. The
+                    //   supervisor reads the counter on each UDS WAF event,
+                    //   decides when the threshold is crossed, broadcasts
+                    //   `BanIp` to all workers, and resets the slot. Workers
+                    //   never issue bans directly — the supervisor is the
+                    //   sole authority so the ban is consistent across the
+                    //   pool.
+                    //
+                    // - Single-process (`self.shmem.is_none()`): fall back to
+                    //   the per-process `waf_violations` DashMap + local
+                    //   `ban_list` insertion, as before.
+                    if let Some(ref ip) = check_ip {
+                        let config = self.config.load();
+                        let threshold = config.waf_ban_threshold;
+                        if threshold > 0 {
+                            if let Some(region) = self.shmem {
+                                // Multi-worker: just bump the shmem counter.
+                                let tagged = region.tagged(ip_to_shmem_key(ip.as_str()));
+                                let _ = region.waf_auto_ban.increment(
+                                    tagged,
+                                    1,
+                                    lorica_shmem::now_ns(),
                                 );
-                                if let Some(ref sender) = self.alert_sender {
-                                    sender.send(
-                                        lorica_notify::AlertEvent::new(
-                                            lorica_notify::events::AlertType::IpBanned,
-                                            format!(
-                                                "IP {} auto-banned for repeated WAF violations",
-                                                ip
-                                            ),
-                                        )
-                                        .with_detail("ip", ip.to_string())
-                                        .with_detail("violations", violations.to_string())
-                                        .with_detail("ban_duration_s", ban_duration.to_string()),
+                            } else {
+                                let violations = self
+                                    .waf_violations
+                                    .entry(ip.to_string())
+                                    .or_insert_with(|| AtomicU64::new(0))
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    + 1;
+                                if violations >= threshold as u64 {
+                                    let ban_duration = config.waf_ban_duration_s;
+                                    self.ban_list.insert(
+                                        ip.to_string(),
+                                        (Instant::now(), ban_duration as u64),
                                     );
+                                    self.waf_violations.remove(ip.as_str());
+                                    warn!(
+                                        ip = %ip,
+                                        violations = %violations,
+                                        ban_duration_s = %ban_duration,
+                                        "IP auto-banned for repeated WAF violations (local counter)"
+                                    );
+                                    if let Some(ref sender) = self.alert_sender {
+                                        sender.send(
+                                            lorica_notify::AlertEvent::new(
+                                                lorica_notify::events::AlertType::IpBanned,
+                                                format!(
+                                                    "IP {} auto-banned for repeated WAF violations",
+                                                    ip
+                                                ),
+                                            )
+                                            .with_detail("ip", ip.to_string())
+                                            .with_detail("violations", violations.to_string())
+                                            .with_detail(
+                                                "ban_duration_s",
+                                                ban_duration.to_string(),
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                let host_header = extract_host(session.req_header()).to_string();
-                let body = render_error_body(
-                    403,
-                    &ctx.request_id,
-                    &host_header,
-                    entry.route.error_page_html.as_deref(),
-                    "Request blocked by WAF",
-                );
-                let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                header.insert_header("Content-Length", body.len().to_string())?;
-                session
-                    .write_response_header(Box::new(header), false)
-                    .await?;
-                session
-                    .write_response_body(Some(bytes::Bytes::from(body)), true)
-                    .await?;
-                Ok(true)
-            }
-            lorica_waf::WafVerdict::Detected(ref mut events) => {
-                for ev in events.iter_mut() {
-                    ev.route_hostname = host.to_string();
-                    ev.action = "detected".to_string();
-                    lorica_api::metrics::record_waf_event(ev.category.as_str(), "detected");
-                    self.waf_counts
-                        .entry((ev.category.as_str().to_string(), "detected".to_string()))
-                        .or_insert_with(|| AtomicU64::new(0))
-                        .fetch_add(1, Ordering::Relaxed);
-                    if let Some(ref store) = self.log_store {
-                        let _ = store.insert_waf_event(ev);
-                    }
+                    let host_header = extract_host(session.req_header()).to_string();
+                    let body = render_error_body(
+                        403,
+                        &ctx.request_id,
+                        &host_header,
+                        entry.route.error_page_html.as_deref(),
+                        "Request blocked by WAF",
+                    );
+                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
+                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    header.insert_header("Content-Length", body.len().to_string())?;
+                    session
+                        .write_response_header(Box::new(header), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(body)), true)
+                        .await?;
+                    Ok(true)
                 }
-                ctx.waf_detected = true;
-                Ok(false)
+                lorica_waf::WafVerdict::Detected(ref mut events) => {
+                    for ev in events.iter_mut() {
+                        ev.route_hostname = host.to_string();
+                        ev.action = "detected".to_string();
+                        lorica_api::metrics::record_waf_event(ev.category.as_str(), "detected");
+                        self.waf_counts
+                            .entry((ev.category.as_str().to_string(), "detected".to_string()))
+                            .or_insert_with(|| AtomicU64::new(0))
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Some(ref store) = self.log_store {
+                            let _ = store.insert_waf_event(ev);
+                        }
+                    }
+                    ctx.waf_detected = true;
+                    Ok(false)
+                }
+                lorica_waf::WafVerdict::Pass => Ok(false),
             }
-            lorica_waf::WafVerdict::Pass => Ok(false),
         }
+        .instrument(span)
+        .await
     }
 
     /// Handle incoming request body chunks.
@@ -3444,6 +4149,16 @@ impl ProxyHttp for LoricaProxy {
     /// If the route has an `error_page_html` configured, render it with the
     /// error status code. Otherwise fall back to the default Pingora error
     /// response (plain-text status line).
+    #[tracing::instrument(
+        name = "fail_to_proxy",
+        parent = &ctx.root_tracing_span,
+        skip_all,
+        fields(
+            trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
+            span_id = ctx.outgoing_traceparent.as_ref().map(|t| t.parent_id.as_str()).unwrap_or(""),
+            request_id = %ctx.request_id,
+        )
+    )]
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
@@ -3678,19 +4393,19 @@ impl ProxyHttp for LoricaProxy {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
         self.backend_connections.increment(&backend.address);
 
-        let mut peer = Box::new(HttpPeer::new(
+        let sni = if backend.tls_upstream {
+            backend
+                .tls_sni
+                .clone()
+                .unwrap_or_else(|| entry.route.hostname.clone())
+        } else {
+            String::new()
+        };
+        let mut peer = Box::new(HttpPeer::try_new(
             &*backend.address,
             backend.tls_upstream,
-            if backend.tls_upstream {
-                // SNI priority: backend tls_sni override > route hostname
-                backend
-                    .tls_sni
-                    .clone()
-                    .unwrap_or_else(|| entry.route.hostname.clone())
-            } else {
-                String::new()
-            },
-        ));
+            sni,
+        )?);
 
         // Force HTTP/2 upstream if configured on the backend
         if backend.h2_upstream {
@@ -3724,6 +4439,16 @@ impl ProxyHttp for LoricaProxy {
         Ok(peer)
     }
 
+    #[tracing::instrument(
+        name = "upstream_request_filter",
+        parent = &ctx.root_tracing_span,
+        skip_all,
+        fields(
+            trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
+            span_id = ctx.outgoing_traceparent.as_ref().map(|t| t.parent_id.as_str()).unwrap_or(""),
+            request_id = %ctx.request_id,
+        )
+    )]
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
@@ -3740,6 +4465,19 @@ impl ProxyHttp for LoricaProxy {
 
         // Inject X-Request-Id for end-to-end tracing
         let _ = upstream_request.insert_header("X-Request-Id", &ctx.request_id);
+
+        // W3C trace context propagation. Always overwrite whatever the
+        // client sent: the value stored on `ctx.outgoing_traceparent`
+        // either preserves the client's trace_id with Lorica as the
+        // new parent (client traceparent was well-formed) or is a
+        // fresh deterministic trace from the request_id. The backend
+        // thus always sees a valid traceparent and the trace tree
+        // stays continuous across the hop. Tracestate passes through
+        // unchanged when present (vendor-opaque); we do not touch it
+        // here so a backend can still rely on any vendor baggage.
+        if let Some(ref tp) = ctx.outgoing_traceparent {
+            let _ = upstream_request.insert_header("traceparent", tp.to_header_value());
+        }
 
         // Path rewriting: strip prefix then add prefix
         let original_path = upstream_request.uri.path().to_string();
@@ -3868,6 +4606,16 @@ impl ProxyHttp for LoricaProxy {
         Ok(())
     }
 
+    #[tracing::instrument(
+        name = "response_filter",
+        parent = &ctx.root_tracing_span,
+        skip_all,
+        fields(
+            trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
+            span_id = ctx.outgoing_traceparent.as_ref().map(|t| t.parent_id.as_str()).unwrap_or(""),
+            request_id = %ctx.request_id,
+        )
+    )]
     async fn response_filter(
         &self,
         session: &mut Session,
@@ -3974,7 +4722,7 @@ impl ProxyHttp for LoricaProxy {
 
         // Inject sticky session cookie
         if let Some(ref backend_id) = ctx.sticky_backend_id {
-            let cookie = format!("LORICA_SRV={backend_id}; Path=/; HttpOnly; SameSite=Lax");
+            let cookie = format!("LORICA_SRV={backend_id}; Path=/; Secure; HttpOnly; SameSite=Lax");
             let _ = upstream_response.append_header("Set-Cookie", &cookie);
         }
 
@@ -4175,6 +4923,16 @@ impl ProxyHttp for LoricaProxy {
         })
     }
 
+    #[tracing::instrument(
+        name = "logging",
+        parent = &ctx.root_tracing_span,
+        skip_all,
+        fields(
+            trace_id = ctx.outgoing_traceparent.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
+            span_id = ctx.outgoing_traceparent.as_ref().map(|t| t.parent_id.as_str()).unwrap_or(""),
+            request_id = %ctx.request_id,
+        )
+    )]
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX)
     where
         Self::CTX: Send + Sync,
@@ -4237,6 +4995,53 @@ impl ProxyHttp for LoricaProxy {
                 backend = backend_addr,
                 "request completed"
             );
+        }
+
+        // Finalise the root `http_request` tracing span by recording
+        // the response-time HTTP semconv attributes. Each `record`
+        // call updates a field that was declared as
+        // `field::Empty` on the `#[instrument]` attribute, so the
+        // bridge picks them up on span close and exports the OTel
+        // span with the full attribute set. The span itself is
+        // closed automatically when `request_filter` returns and the
+        // implicit `#[instrument]` guard drops — no explicit `end()`
+        // call needed (the bridge runs on the layer's `on_close`).
+        {
+            let span = &ctx.root_tracing_span;
+            span.record("http.response.status_code", status as i64);
+            span.record("lorica.latency_ms", latency_ms as i64);
+            if host != "-" {
+                span.record("server.address", host);
+            }
+            if backend_addr != "-" {
+                span.record("network.peer.address", backend_addr);
+            }
+            if let Some(ref rid) = ctx.route_id {
+                span.record("lorica.route_id", rid.as_str());
+            }
+            span.record(
+                "lorica.trace.origin",
+                if ctx.traceparent_from_client {
+                    "client"
+                } else {
+                    "lorica"
+                },
+            );
+            // `otel.status_code` is the well-known field the
+            // tracing-opentelemetry bridge reads to set the OTel
+            // span status: "OK" / "ERROR" / "UNSET". Map 5xx -> ERROR,
+            // everything else -> OK to match OTel semconv.
+            span.record(
+                "otel.status_code",
+                if (500..600).contains(&status) {
+                    "ERROR"
+                } else {
+                    "OK"
+                },
+            );
+            if let Some(ref err) = error_str {
+                span.record("error.message", err.as_str());
+            }
         }
 
         // Decrement per-route connection counter (max_connections enforcement)

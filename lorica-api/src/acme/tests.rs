@@ -482,6 +482,7 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         system_cache: Arc::new(Mutex::new(crate::system::SystemCache::new())),
         active_connections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         started_at: Instant::now(),
+        data_dir: std::path::PathBuf::from("/var/lib/lorica"),
         http_port: 8080,
         https_port: 8443,
         config_reload_tx: None,

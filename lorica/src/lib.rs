@@ -36,8 +36,12 @@
 //!
 //! If looking to build a (reverse) proxy, see [`lorica-proxy`](https://docs.rs/lorica-proxy) crate.
 
+pub mod bot;
+pub mod bot_rdns;
 pub mod connection_filter;
+pub mod geoip;
 pub mod mtls;
+pub mod otel;
 pub mod proxy_wiring;
 pub mod reload;
 

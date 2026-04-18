@@ -17,6 +17,8 @@ services:
       - backend1
       - backend2
       - backend-tls
+      - backend-h2
+      - auth-svc
     networks:
       - e2e
 
@@ -31,6 +33,7 @@ services:
     depends_on:
       - backend1
       - backend2
+      - auth-svc
     networks:
       - e2e
 
@@ -71,6 +74,21 @@ services:
     networks:
       - e2e
 
+  # Mock forward-auth service. Reuses the shared Python backend but
+  # with FORWARD_AUTH_MODE=1 so every request is gated by a Bearer
+  # token check. Used by the forward_auth e2e test (TESTING-GUIDE #4)
+  # and the cross-worker verdict cache test (#11).
+  auth-svc:
+    build:
+      context: ./backend
+    environment:
+      - BACKEND_ID=auth-svc
+      - LISTEN_PORT=80
+      - FORWARD_AUTH_MODE=1
+      - AUTH_TOKEN=good-token
+    networks:
+      - e2e
+
   test-runner:
     build:
       context: ./test-runner
@@ -86,6 +104,7 @@ services:
       - BACKEND2_ADDR=backend2:80
       - BACKEND_TLS_ADDR=backend-tls:443
       - BACKEND_H2_ADDR=backend-h2:80
+      - AUTH_SVC_ADDR=auth-svc:80
     networks:
       - e2e
 
@@ -95,6 +114,7 @@ services:
     entrypoint: ["bash", "run-tests-workers.sh"]
     depends_on:
       - lorica-workers
+      - auth-svc
     volumes:
       - shared-workers:/shared:ro
     environment:
@@ -102,14 +122,347 @@ services:
       - LORICA_PROXY=http://lorica-workers:8080
       - BACKEND1_ADDR=backend1:80
       - BACKEND2_ADDR=backend2:80
+      - AUTH_SVC_ADDR=auth-svc:80
+    networks:
+      - e2e
+
+  # ---- OpenTelemetry E2E (v1.4.0 Epic 1, story 1.8) --------------------
+  # Optional profile that wires Lorica built with `--features otel`
+  # against a Jaeger all-in-one collector so the `otel-smoke` test can
+  # drive a request through the proxy and assert the resulting span
+  # tree is visible via Jaeger's HTTP query API.
+  #
+  # Run with: docker compose --profile otel up --build
+  #   docker compose --profile otel run --rm otel-smoke
+  #
+  # Jaeger exposes:
+  #   4317 (OTLP/gRPC)    - not used by Lorica in the default config
+  #   4318 (OTLP/HTTP)    - used when protocol=http-proto or http-json
+  #   16686 (Query UI)    - http://localhost:16686 after `up`
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    profiles: ["otel"]
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"
+    networks:
+      - e2e
+
+  lorica-otel:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+      args:
+        LORICA_FEATURES: "otel"
+    entrypoint: ["/entrypoint-otel.sh"]
+    profiles: ["otel"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-otel-data:/var/lib/lorica
+      - shared-otel:/shared
+    depends_on:
+      - backend1
+      - jaeger
+    networks:
+      - e2e
+
+  otel-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["otel"]
+    entrypoint: ["bash", "run-otel-smoke.sh"]
+    depends_on:
+      - lorica-otel
+      - jaeger
+    volumes:
+      - shared-otel:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-otel:9443
+      - LORICA_PROXY=http://lorica-otel:8080
+      - JAEGER_QUERY=http://jaeger:16686
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
+  # ---- OTel E2E in WORKER MODE (v1.4.0 story 1.6) ---------------------
+  # Variant of the OTel profile that runs Lorica with `--workers 2` so
+  # the same smoke assertions exercise the forked-worker OTel init
+  # path. The separate `shared-otel-workers` volume keeps the
+  # admin_password + log.sock isolated from the single-process OTel
+  # container (they cannot share SQLite on the same data volume
+  # without cross-boot mutation; a second named volume is the
+  # cheapest safe split).
+  #
+  # Run with:
+  #   docker compose --profile otel-workers up --build
+  #   docker compose --profile otel-workers run --rm otel-smoke-workers
+  lorica-otel-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+      args:
+        LORICA_FEATURES: "otel"
+    entrypoint: ["/entrypoint-otel-workers.sh"]
+    profiles: ["otel-workers"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-otel-workers-data:/var/lib/lorica
+      - shared-otel-workers:/shared
+    depends_on:
+      - backend1
+      - jaeger-workers
+    networks:
+      - e2e
+
+  # A second Jaeger is required because the single-process `jaeger`
+  # service lives under the `otel` profile and Compose V2 does not
+  # cross-activate profiles. Sharing a Jaeger is possible with
+  # `profiles: ["otel", "otel-workers"]` but duplicating for clarity.
+  jaeger-workers:
+    image: jaegertracing/all-in-one:1.60
+    profiles: ["otel-workers"]
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - e2e
+
+  otel-smoke-workers:
+    build:
+      context: ./test-runner
+    profiles: ["otel-workers"]
+    entrypoint: ["bash", "run-otel-smoke.sh"]
+    depends_on:
+      - lorica-otel-workers
+      - jaeger-workers
+    volumes:
+      - shared-otel-workers:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-otel-workers:9443
+      - LORICA_PROXY=http://lorica-otel-workers:8080
+      - JAEGER_QUERY=http://jaeger-workers:16686
+      - OTLP_ENDPOINT=http://jaeger-workers:4318
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
+  # ---- GeoIP E2E (v1.4.0 Epic 2, story 2.7) ---------------------------
+  # Optional profile that boots Lorica with a test `.mmdb` fixture
+  # mounted from the host (MaxMind's open `GeoIP2-Country-Test.mmdb`,
+  # Apache-2.0). The `geoip-smoke` runner drives requests with
+  # X-Forwarded-For headers pointing at known test IPs and asserts
+  # allowlist / denylist / fallthrough behavior plus the
+  # `lorica_geoip_block_total` Prometheus counter.
+  #
+  # Run with: docker compose --profile geoip up --build
+  #   docker compose --profile geoip run --rm geoip-smoke
+  lorica-geoip:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-geoip.sh"]
+    profiles: ["geoip"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-geoip-data:/var/lib/lorica
+      - shared-geoip:/shared
+      # Mount the test fixture read-only into the path the entrypoint
+      # pre-seeds into `global_settings.geoip_db_path`.
+      - ./fixtures/GeoIP2-Country-Test.mmdb:/var/lib/lorica/geoip-test.mmdb:ro
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  geoip-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["geoip"]
+    entrypoint: ["bash", "run-geoip-smoke.sh"]
+    depends_on:
+      - lorica-geoip
+    volumes:
+      - shared-geoip:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-geoip:9443
+      - LORICA_PROXY=http://lorica-geoip:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
+  # ---- Bot-protection E2E (v1.4.0 Epic 3 story 3.9) -------------------
+  # Runs the default Lorica image; the smoke drives everything over
+  # the management API (trusted_proxies + geoip_db_path + route
+  # creation). The geoip test fixture is mounted so the
+  # country-based bypass match resolves for the known-US IP the
+  # smoke uses.
+  lorica-bot:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["bot"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-bot-data:/var/lib/lorica
+      - shared-bot:/shared
+      - ./fixtures/GeoIP2-Country-Test.mmdb:/var/lib/lorica/geoip-test.mmdb:ro
+      - ./fixtures/GeoLite2-ASN-Test.mmdb:/var/lib/lorica/asn-test.mmdb:ro
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  bot-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["bot"]
+    entrypoint: ["bash", "run-bot-smoke.sh"]
+    depends_on:
+      - lorica-bot
+    volumes:
+      - shared-bot:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-bot:9443
+      - LORICA_PROXY=http://lorica-bot:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
+  # Bot-protection E2E in WORKER MODE. Same smoke as above, but
+  # Lorica runs with `--workers 2` so the SQLite-backed pending
+  # stash is exercised across workers. A challenge stashed on one
+  # worker must be consumable on the other — the smoke PoW-solves
+  # after re-configuring the route, which inherently alternates
+  # which worker handles each call via the default round-robin
+  # connection distribution.
+  lorica-bot-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["bot-workers"]
+    entrypoint: ["/entrypoint-workers.sh"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-bot-workers-data:/var/lib/lorica
+      - shared-bot-workers:/shared
+      - ./fixtures/GeoIP2-Country-Test.mmdb:/var/lib/lorica/geoip-test.mmdb:ro
+      - ./fixtures/GeoLite2-ASN-Test.mmdb:/var/lib/lorica/asn-test.mmdb:ro
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  bot-smoke-workers:
+    build:
+      context: ./test-runner
+    profiles: ["bot-workers"]
+    entrypoint: ["bash", "run-bot-smoke.sh"]
+    depends_on:
+      - lorica-bot-workers
+    volumes:
+      - shared-bot-workers:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-bot-workers:9443
+      - LORICA_PROXY=http://lorica-bot-workers:8080
+      - BACKEND1_ADDR=backend1:80
+      # Counter aggregation now lands (v1.4.0 follow-up):
+      # per-worker counters ship on `MetricsReport.generic_counters`
+      # and the supervisor applies them to its own registry on
+      # every scrape. The smoke's counter-delta checks therefore
+      # run under workers mode too; the skip flag would mask any
+      # aggregation regression.
+    networks:
+      - e2e
+
+  # ---- rDNS bypass E2E (v1.4.0 Epic 3 follow-up) ---------------------
+  # Exercises the bot-protection `bypass.rdns` category with
+  # forward-confirmed PTR matching. Lorica's hickory-resolver is
+  # re-pointed at the `dnsmasq` sidecar at entrypoint time so the
+  # test zone from fixtures/dnsmasq-rdns.conf resolves. The smoke
+  # asserts:
+  #   - PTR-matched + forward-confirmed client bypasses the challenge.
+  #   - PTR-matched but forward-spoofed client DOES NOT bypass (the
+  #     forward-confirm step protects against hostile resolvers).
+  #
+  # Run with:
+  #   docker compose --profile rdns up --build
+  #   docker compose --profile rdns run --rm rdns-smoke
+  dnsmasq:
+    image: strm/dnsmasq:latest
+    profiles: ["rdns"]
+    # dnsmasq needs NET_ADMIN to bind UDP/53 in some container
+    # runtimes. NET_BIND_SERVICE is the narrower cap when available.
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./fixtures/dnsmasq-rdns.conf:/etc/dnsmasq.conf:ro
+    command: ["-k", "--log-facility=-", "--conf-file=/etc/dnsmasq.conf"]
+    networks:
+      - e2e
+
+  lorica-rdns:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-rdns.sh"]
+    profiles: ["rdns"]
+    # entrypoint writes /etc/resolv.conf before lorica starts; that
+    # requires root for this profile only. The bot-protection
+    # process itself is still unprivileged — the entrypoint sets
+    # resolv.conf and then `lorica` runs as root in the test image
+    # (fine for E2E; production .deb installs still drop privs).
+    user: "0:0"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-rdns-data:/var/lib/lorica
+      - shared-rdns:/shared
+    depends_on:
+      - backend1
+      - dnsmasq
+    networks:
+      - e2e
+
+  rdns-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["rdns"]
+    entrypoint: ["bash", "run-rdns-smoke.sh"]
+    depends_on:
+      - lorica-rdns
+      - dnsmasq
+    volumes:
+      - shared-rdns:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-rdns:9443
+      - LORICA_PROXY=http://lorica-rdns:8080
+      - BACKEND1_ADDR=backend1:80
+      - DNSMASQ_ADDR=dnsmasq:53
     networks:
       - e2e
 
 volumes:
   lorica-data:
   lorica-workers-data:
+  lorica-otel-data:
+  lorica-otel-workers-data:
+  lorica-geoip-data:
+  lorica-bot-data:
+  lorica-bot-workers-data:
+  lorica-rdns-data:
   shared:
   shared-workers:
+  shared-bot-workers:
+  shared-otel:
+  shared-otel-workers:
+  shared-geoip:
+  shared-bot:
+  shared-rdns:
 
 networks:
   e2e:

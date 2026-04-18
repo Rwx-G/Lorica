@@ -39,6 +39,10 @@ const DEFAULT_MANAGEMENT_PORT: u16 = 9443;
 const DEFAULT_HTTP_PORT: u16 = 8080;
 const DEFAULT_HTTPS_PORT: u16 = 8443;
 
+/// Wire shape a worker sends for each generic counter slot:
+/// `(counter_name, [(label_key, label_value), ...], value)`.
+type GenericCounterRow = (String, Vec<(String, String)>, u64);
+
 #[derive(Parser, Debug)]
 #[command(
     name = "lorica",
@@ -153,36 +157,21 @@ static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuar
     std::sync::OnceLock::new();
 
 fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
-    // Build the writer: file (non-blocking, thread-safe) or stdout.
-    macro_rules! build_subscriber {
-        ($writer:expr, $ansi:expr) => {
-            if log_format == "text" {
-                tracing_subscriber::fmt()
-                    .with_env_filter(filter)
-                    .with_target(true)
-                    .with_thread_ids(true)
-                    .with_timer(tracing_subscriber::fmt::time::SystemTime)
-                    .with_ansi($ansi)
-                    .with_writer($writer)
-                    .init();
-            } else {
-                tracing_subscriber::fmt()
-                    .json()
-                    .with_env_filter(filter)
-                    .with_target(true)
-                    .with_thread_ids(true)
-                    .with_timer(tracing_subscriber::fmt::time::SystemTime)
-                    .with_writer($writer)
-                    .init();
-            }
-        };
-    }
-
-    if let Some(path) = log_file {
+    // Resolve the writer + ANSI combo once here so the subscriber
+    // composition below has a single source of truth. The non-blocking
+    // file path keeps its `WorkerGuard` alive in a process-wide
+    // static so flushes continue until shutdown; the stdout path
+    // uses ANSI colours. Daily rotation with 14-file retention
+    // bounds disk usage on unattended installs.
+    let (writer, ansi): (tracing_subscriber::fmt::writer::BoxMakeWriter, bool) = if let Some(path) =
+        log_file
+    {
         let dir = std::path::Path::new(path)
             .parent()
             .unwrap_or(std::path::Path::new("."));
@@ -190,36 +179,101 @@ fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("lorica.log");
-        // Daily rotation with 14-day retention so an unattended install
-        // can't fill the disk. The current day's file is the canonical
-        // path the operator configured (e.g. /var/log/lorica.log);
-        // rotated files are suffixed with the date (lorica.log.2026-04-13).
-        // Falls back to non-rotating append if the builder rejects the
-        // path (read-only mount, missing dir) so a misconfigured log path
-        // never blocks startup.
         let appender = tracing_appender::rolling::RollingFileAppender::builder()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix(filename)
             .max_log_files(14)
             .build(dir);
-        match appender {
-            Ok(file_appender) => {
-                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-                let _ = LOG_GUARD.set(guard);
-                build_subscriber!(non_blocking, false);
-            }
+        let appender = match appender {
+            Ok(a) => a,
             Err(e) => {
                 eprintln!(
-                    "warning: rolling log appender failed for {path}: {e}; falling back to non-rotating append"
-                );
-                let file_appender = tracing_appender::rolling::never(dir, filename);
-                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-                let _ = LOG_GUARD.set(guard);
-                build_subscriber!(non_blocking, false);
+                        "warning: rolling log appender failed for {path}: {e}; falling back to non-rotating append"
+                    );
+                tracing_appender::rolling::never(dir, filename)
             }
-        }
+        };
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let _ = LOG_GUARD.set(guard);
+        (
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(non_blocking),
+            false,
+        )
     } else {
-        build_subscriber!(std::io::stdout, true);
+        (
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout),
+            true,
+        )
+    };
+
+    // JSON and text fmt layers have different concrete types, so
+    // the whole subscriber must be built separately in each branch
+    // (`Box<dyn Layer<S>>` does not satisfy the
+    // `Layer<Layered<_, S>>` bound needed when the boxed layer is
+    // then layered on top of another, which is the shape we would
+    // need to lift the OTel bridge out of both branches). The
+    // duplication is the price we pay for leaning on concrete
+    // monomorphic types; each branch composes cleanly and
+    // `init()` accepts the resulting `Layered` stack.
+    //
+    // Inside each branch, when the `otel` feature is on, we add a
+    // `tracing_opentelemetry::layer` wrapped in a `reload::Layer`
+    // so `otel::init` can swap the embedded `BoxedTracer` from its
+    // startup-noop placeholder to a real tracer bound to the
+    // freshly-installed global provider. The reload callback is
+    // stored in `OTEL_RELOAD_HOOK` with its subscriber-chain type
+    // parameters erased behind a `Box<dyn Fn(...)>` so the public
+    // OTel API stays free of subscriber-generic plumbing.
+    if log_format == "text" {
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_timer(tracing_subscriber::fmt::time::SystemTime)
+            .with_ansi(ansi)
+            .with_writer(writer);
+        let subscriber = tracing_subscriber::Registry::default()
+            .with(filter)
+            .with(fmt_layer);
+        #[cfg(feature = "otel")]
+        {
+            let noop_tracer = opentelemetry::global::tracer("lorica");
+            let initial = tracing_opentelemetry::layer().with_tracer(noop_tracer);
+            let (otel_bridge, handle) = tracing_subscriber::reload::Layer::new(initial);
+            let hook: Box<dyn Fn(opentelemetry::global::BoxedTracer) + Send + Sync> =
+                Box::new(move |tracer| {
+                    let _ =
+                        handle.modify(|l| *l = tracing_opentelemetry::layer().with_tracer(tracer));
+                });
+            let _ = lorica::otel::OTEL_RELOAD_HOOK.set(hook);
+            subscriber.with(otel_bridge).init();
+        }
+        #[cfg(not(feature = "otel"))]
+        subscriber.init();
+    } else {
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_timer(tracing_subscriber::fmt::time::SystemTime)
+            .with_writer(writer);
+        let subscriber = tracing_subscriber::Registry::default()
+            .with(filter)
+            .with(fmt_layer);
+        #[cfg(feature = "otel")]
+        {
+            let noop_tracer = opentelemetry::global::tracer("lorica");
+            let initial = tracing_opentelemetry::layer().with_tracer(noop_tracer);
+            let (otel_bridge, handle) = tracing_subscriber::reload::Layer::new(initial);
+            let hook: Box<dyn Fn(opentelemetry::global::BoxedTracer) + Send + Sync> =
+                Box::new(move |tracer| {
+                    let _ =
+                        handle.modify(|l| *l = tracing_opentelemetry::layer().with_tracer(tracer));
+                });
+            let _ = lorica::otel::OTEL_RELOAD_HOOK.set(hook);
+            subscriber.with(otel_bridge).init();
+        }
+        #[cfg(not(feature = "otel"))]
+        subscriber.init();
     }
 }
 
@@ -534,6 +588,31 @@ fn run_supervisor(cli: Cli) {
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let worker_metrics = Arc::new(lorica_api::workers::WorkerMetrics::new());
 
+        try_init_otel_from_settings(&store, "supervisor").await;
+
+        // Supervisor-side GeoIP / ASN state. Workers load the `.mmdb`
+        // files from disk at fork and keep their own copy (see the
+        // corresponding block in `run_worker`), so the supervisor's
+        // job here is to keep the on-disk files fresh via the auto-
+        // update task AND to expose a registered resolver handle so
+        // the config-reload hook can spawn / abort the updater on
+        // `*_auto_update_enabled` toggles from the dashboard.
+        //
+        // The actual spawn happens inside `apply_geoip_settings_from_store`
+        // / `apply_asn_settings_from_store` (called from the first
+        // `reload_proxy_config` below), which reads the persisted
+        // flag and starts the updater when it is true. This unifies
+        // the boot-time path with the runtime hot-reload path so the
+        // two can never drift.
+        let supervisor_geoip = std::sync::Arc::new(lorica_geoip::GeoIpResolver::empty());
+        let supervisor_asn = std::sync::Arc::new(lorica_geoip::AsnResolver::empty());
+        lorica::geoip::set_handle(std::sync::Arc::clone(&supervisor_geoip));
+        lorica::geoip::set_asn_handle(std::sync::Arc::clone(&supervisor_asn));
+        // `apply_supervisor_settings_from_store` boot call happens
+        // below, AFTER `register_supervisor_reload_trigger`, so the
+        // "is_supervisor" guard in `apply_auto_update_flip` sees the
+        // trigger in place and allows the spawn.
+
         // UDS log stream: workers send access logs in real-time to the supervisor
         let log_sock_path = data_dir.join("log.sock");
         let _ = std::fs::remove_file(&log_sock_path); // clean stale socket
@@ -616,6 +695,20 @@ fn run_supervisor(cli: Cli) {
         let reload_bc_tx_clone = reload_bc_tx.clone();
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
 
+        // Register the watch sender with the reload module so the
+        // GeoIP / ASN auto-update task can bump it after every
+        // successful download. That triggers the worker reload
+        // coordinator below, which makes the freshly-downloaded
+        // .mmdb visible to the data plane without a manual save.
+        lorica::reload::register_supervisor_reload_trigger(config_reload_tx.clone());
+
+        // Fire the hot-reload path once at boot so the updater
+        // tasks spawn if `*_auto_update_enabled` is persisted true.
+        // Must run AFTER `register_supervisor_reload_trigger` above
+        // so the supervisor-guard in `apply_auto_update_flip` lets
+        // the spawn through.
+        lorica::reload::apply_supervisor_settings_from_store(&store).await;
+
         // Per-worker RPC endpoint table. Used by the config-reload
         // coordinator (§ 7 WPAR-8) to fan out `ConfigReloadPrepare`
         // and `ConfigReloadCommit` in two phases. Each worker's spawn
@@ -654,8 +747,20 @@ fn run_supervisor(cli: Cli) {
         let endpoints_for_reload = Arc::clone(&worker_rpc_endpoints);
         let reload_generation_clone = Arc::clone(&reload_generation);
         let rl_policy_for_reload = Arc::clone(&rl_policy_cache);
+        let supervisor_reload_store = Arc::clone(&store);
         tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
+                // Apply the per-process hot-reload hooks (GeoIP / ASN
+                // updater task lifecycle, OTel exporter, bot HMAC
+                // secret) on the SUPERVISOR side. Worker reload runs
+                // independently via the RPC two-phase coordinator
+                // below. Without this call, supervisor-side state
+                // (auto-update task spawn / abort, OTel exporter)
+                // would only refresh at boot time.
+                lorica::reload::apply_supervisor_settings_from_store(
+                    &supervisor_reload_store,
+                )
+                .await;
                 let seq = bridge_seq.fetch_add(1, Ordering::Relaxed);
                 // Two-phase RPC reload (WPAR-8) when any worker has a
                 // registered endpoint.
@@ -969,6 +1074,32 @@ fn run_supervisor(cli: Cli) {
                                                 waf_counts,
                                             )
                                             .await;
+                                        // Cross-worker generic-counter
+                                        // aggregation (v1.4.0
+                                        // follow-up).
+                                        // Pair up the flat ["k","v","k","v",...]
+                                        // list back into (String, String) label
+                                        // pairs. Odd trailing entries are
+                                        // silently dropped — safe default
+                                        // since a truncated wire payload
+                                        // just skips the affected metric.
+                                        let gc: Vec<GenericCounterRow> =
+                                            report
+                                                .generic_counters
+                                                .iter()
+                                                .map(|e| {
+                                                    let pairs: Vec<(String, String)> = e
+                                                        .labels
+                                                        .chunks_exact(2)
+                                                        .map(|c| (c[0].clone(), c[1].clone()))
+                                                        .collect();
+                                                    (e.name.clone(), pairs, e.value)
+                                                })
+                                                .collect();
+                                        lorica_api::metrics::apply_worker_generic_counters(
+                                            worker_id,
+                                            &gc,
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -1295,6 +1426,7 @@ fn run_supervisor(cli: Cli) {
                 system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
                 active_connections: api_active_connections,
                 started_at: Instant::now(),
+                data_dir: PathBuf::from(&cli.data_dir),
                 http_port: cli.http_port,
                 https_port: cli.https_port,
                 config_reload_tx: Some(config_reload_tx),
@@ -1518,6 +1650,23 @@ fn run_supervisor(cli: Cli) {
                                                                 agg_metrics
                                                                     .update_worker(id, report.cache_hits, report.cache_misses, report.active_connections, bans, ewma, backend_conns, req_counts, waf_counts)
                                                                     .await;
+                                                                let gc: Vec<GenericCounterRow> =
+                                                                    report
+                                                                        .generic_counters
+                                                                        .iter()
+                                                                        .map(|e| {
+                                                                            let pairs: Vec<(String, String)> = e
+                                                                                .labels
+                                                                                .chunks_exact(2)
+                                                                                .map(|c| (c[0].clone(), c[1].clone()))
+                                                                                .collect();
+                                                                            (e.name.clone(), pairs, e.value)
+                                                                        })
+                                                                        .collect();
+                                                                lorica_api::metrics::apply_worker_generic_counters(
+                                                                    id,
+                                                                    &gc,
+                                                                );
                                                             }
                                                         }
                                                         Err(e) => warn!(worker_id = id, error = %e, "restarted worker heartbeat recv failed"),
@@ -1585,6 +1734,12 @@ fn run_supervisor(cli: Cli) {
         }
         api_handle.abort();
         health_handle.abort();
+
+        // Flush the OTel batch exporter before the runtime drops so
+        // supervisor-side spans (API requests, health checks) reach
+        // the collector on clean shutdown. No-op when the `otel`
+        // feature is off or the endpoint was never configured.
+        lorica::otel::shutdown();
     });
 }
 
@@ -2361,6 +2516,27 @@ async fn pull_all_metrics_via_rpc(
                             waf_counts,
                         )
                         .await;
+                    // Cross-worker counter aggregation (v1.4.0
+                    // follow-up). Apply the per-worker snapshot
+                    // to the supervisor's own prometheus registry
+                    // so the supervisor's `/metrics` sees the
+                    // union of every worker's counters for
+                    // bot_challenge / geoip_block / forward_auth
+                    // cache / header rule match / canary split /
+                    // mirror outcome / cache predictor bypass.
+                    let gc: Vec<GenericCounterRow> = report
+                        .generic_counters
+                        .iter()
+                        .map(|e| {
+                            let pairs: Vec<(String, String)> = e
+                                .labels
+                                .chunks_exact(2)
+                                .map(|c| (c[0].clone(), c[1].clone()))
+                                .collect();
+                            (e.name.clone(), pairs, e.value)
+                        })
+                        .collect();
+                    lorica_api::metrics::apply_worker_generic_counters(wid, &gc);
                 }
                 _ => {
                     lorica_api::metrics::inc_supervisor_rpc_outcome("metrics_pull", "error");
@@ -2496,6 +2672,14 @@ fn run_worker(
             std::process::exit(1);
         }
     });
+
+    // Initialise the OTel exporter in this worker's runtime. Must run
+    // *after* fork and *inside* the worker's runtime so the batch
+    // processor's background task lives on the right reactor. Each
+    // worker thus maintains its own independent exporter; spans emitted
+    // on one worker do not block another worker's flush queue. The
+    // supervisor has its own init (for API / health spans).
+    rt.block_on(try_init_otel_from_settings(&store, "worker"));
 
     // Build CertResolver for TLS termination in worker
     let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
@@ -2959,11 +3143,73 @@ fn run_worker(
     lorica_proxy.request_counts = worker_request_counts;
     lorica_proxy.waf_counts = worker_waf_counts;
     lorica_proxy.waf_engine = waf_engine;
+    // Worker mode needs the SQLite-backed bot-protection stash so
+    // a challenge stashed here is visible to the POST handler on
+    // a sibling worker. The in-memory default would stash only
+    // locally and a worker-B POST would always fail-closed with
+    // 403 "challenge expired or unknown".
+    lorica_proxy.bot_engine = Arc::new(lorica::bot::BotEngine::with_sqlite(Arc::clone(&store)));
     lorica_proxy.shmem = shmem_region;
     // Worker mode: rate-limit engine runs as a local cache synced with
     // the supervisor via the pipelined RPC channel every 100 ms. See
     // `spawn_rate_limit_sync` below and design doc § 6.
     lorica_proxy.rate_limit_buckets = lorica::proxy_wiring::RateLimitEngine::local();
+    // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so worker
+    // lookups can resolve client IPs to country codes. Each worker
+    // keeps its own copy (the DB is small — ~3 MiB for DB-IP Lite
+    // Country). The resolver handle is stashed in the per-worker
+    // `lorica::geoip` static so the config-reload path can hot-swap
+    // the DB on setting change, and a periodic 24-hour reload task
+    // below picks up updater-written files on disk. Silent no-op
+    // when the path is unset.
+    lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
+    lorica::geoip::set_asn_handle(Arc::clone(&lorica_proxy.asn_resolver));
+    // rDNS resolver (v1.4.0 follow-up). Must be built inside the
+    // worker's tokio runtime because hickory-resolver's
+    // TokioAsyncResolver latches onto the current runtime at
+    // construction. `rt.enter()` gives us that context.
+    {
+        let _rt_guard = rt.enter();
+        match lorica::bot_rdns::RdnsResolver::from_system_conf() {
+            Ok(r) => {
+                lorica::bot_rdns::set_handle(Arc::new(r));
+                info!("worker: rDNS resolver initialised from system resolv.conf");
+            }
+            Err(e) => warn!(
+                error = %e,
+                "worker: rDNS resolver init failed; bot_protection.bypass.rdns will be a silent no-op"
+            ),
+        }
+    }
+    {
+        let s = store.blocking_lock();
+        if let Ok(settings) = s.get_global_settings() {
+            if let Some(ref path) = settings.geoip_db_path {
+                if !path.trim().is_empty() {
+                    match lorica_proxy.geoip_resolver.load_from_path(path) {
+                        Ok(()) => info!(path = %path, "worker: GeoIP database loaded"),
+                        Err(e) => warn!(
+                            path = %path,
+                            error = %e,
+                            "worker: GeoIP database load failed; lookups will return None"
+                        ),
+                    }
+                }
+            }
+            if let Some(ref path) = settings.asn_db_path {
+                if !path.trim().is_empty() {
+                    match lorica_proxy.asn_resolver.load_from_path(path) {
+                        Ok(()) => info!(path = %path, "worker: ASN database loaded"),
+                        Err(e) => warn!(
+                            path = %path,
+                            error = %e,
+                            "worker: ASN database load failed; lookups will return None"
+                        ),
+                    }
+                }
+            }
+        }
+    }
     // Periodic basic-auth cache prune (PERF-8). Worker mode has no
     // supervisor TaskTracker available here; a local tracker is fine
     // because worker shutdown is orchestrated by the supervisor via
@@ -2987,6 +3233,7 @@ fn run_worker(
         Duration::from_secs(60),
         Duration::from_secs(5 * 60),
     );
+    let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&worker_auth_prune_tracker);
     // Spawn the cross-worker sync task when the supervisor provided
     // an RPC socketpair (production worker mode). The task drains
     // `LocalBucket::take_delta` every 100 ms, pushes the batch via
@@ -3126,10 +3373,23 @@ fn run_worker(
 
     info!(worker_id = id, "starting proxy engine");
 
+    // OTel graceful shutdown in workers (v1.4.0 story 1.6
+    // completion): `Server::run_forever()` is `run() + exit(0)`
+    // which drops the post-serve flush entirely. We inline the
+    // equivalent — `server.run(RunArgs::default())` drives the
+    // graceful-drain loop exactly like `run_forever` would, then
+    // we call `otel::shutdown()` before `std::process::exit(0)`.
+    // Result: the BatchSpanProcessor drains any in-flight spans
+    // AFTER the worker finishes serving and BEFORE the process
+    // exits, so a SIGTERM mid-export does not lose the last N
+    // seconds of spans.
     let mut server = lorica_core::server::Server::new(None).expect("failed to create proxy server");
     server.set_listen_fds(fds);
     server.add_service(proxy_service);
-    server.run_forever();
+    server.run(lorica_core::server::RunArgs::default());
+    info!(worker_id = id, "proxy engine drained; flushing OTel spans");
+    lorica::otel::shutdown();
+    std::process::exit(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3206,6 +3466,8 @@ fn run_single_process(cli: Cli) {
             error!(error = %e, "failed to load initial proxy configuration");
             std::process::exit(1);
         }
+
+        try_init_otel_from_settings(&store, "single-process").await;
 
         // Build the CertResolver for SNI-based certificate selection
         let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
@@ -3341,6 +3603,39 @@ fn run_single_process(cli: Cli) {
         lorica_proxy.acme_challenge_store = Some(acme_challenge_store.clone());
         lorica_proxy.alert_sender = Some(alert_sender.clone());
         lorica_proxy.log_store = log_store.clone();
+
+        // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so
+        // the request_filter can resolve client IPs. If auto-update is
+        // enabled, also spawn the periodic refresh task inside the
+        // current tokio runtime. Silent no-op when the path is unset
+        // (installations without GeoIP pay nothing). The resolver
+        // handle is also stashed in the process-wide `lorica::geoip`
+        // static so `reload::apply_geoip_settings_from_store` can
+        // hot-swap the DB when the dashboard changes the path,
+        // without forcing a restart.
+        lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
+        lorica::geoip::set_asn_handle(Arc::clone(&lorica_proxy.asn_resolver));
+        // rDNS resolver for bot-protection's rdns bypass (v1.4.0
+        // follow-up). Built from the system resolv.conf — a
+        // missing / broken file is not fatal, it just disables
+        // the rDNS bypass category for this process (other
+        // bot-protection categories keep working).
+        match lorica::bot_rdns::RdnsResolver::from_system_conf() {
+            Ok(r) => {
+                lorica::bot_rdns::set_handle(Arc::new(r));
+                info!("rDNS resolver initialised from system resolv.conf");
+            }
+            Err(e) => warn!(
+                error = %e,
+                "rDNS resolver init failed; bot_protection.bypass.rdns will be a silent no-op"
+            ),
+        }
+        // Load + auto-update spawn are handled by
+        // `apply_supervisor_settings_from_store` further down, after
+        // `register_supervisor_reload_trigger`. That call does the
+        // initial load via the same hot-reload path that fires on
+        // every dashboard save, so boot and runtime behave identically.
+
         // Periodic prune of expired basic-auth cache entries so a
         // password-spray with no successful logins cannot grow the
         // cache unboundedly until next restart (PERF-8).
@@ -3353,6 +3648,7 @@ fn run_single_process(cli: Cli) {
             Duration::from_secs(60),
             Duration::from_secs(5 * 60),
         );
+        let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&single_task_tracker);
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);
@@ -3430,6 +3726,21 @@ fn run_single_process(cli: Cli) {
         // Create config reload channel so API mutations can trigger proxy reload
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::watch::channel(0u64);
 
+        // Register with the reload module so the GeoIP / ASN auto-
+        // update task can bump the watch after every successful
+        // download. Same rationale as the supervisor path: the
+        // updater must be spawned in THIS process (we own the
+        // resolver that serves requests), and the flag doubles as
+        // a "this process owns the updater" marker for
+        // `apply_auto_update_flip`.
+        lorica::reload::register_supervisor_reload_trigger(config_reload_tx.clone());
+
+        // Fire the hot-reload path once at boot so the resolvers
+        // load from disk AND the updater tasks spawn if
+        // `*_auto_update_enabled` is persisted true. Must run AFTER
+        // `register_supervisor_reload_trigger` above.
+        lorica::reload::apply_supervisor_settings_from_store(&store).await;
+
         // Clone sla_collector before the async move closure captures it
         let reload_sla_collector = Arc::clone(&sla_collector);
 
@@ -3454,6 +3765,7 @@ fn run_single_process(cli: Cli) {
                 system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
                 active_connections: api_active_connections,
                 started_at: Instant::now(),
+                data_dir: PathBuf::from(&cli.data_dir),
                 http_port: cli.http_port,
                 https_port: cli.https_port,
                 config_reload_tx: Some(config_reload_tx),
@@ -3618,7 +3930,63 @@ fn run_single_process(cli: Cli) {
         }
         api_handle.abort();
         health_handle.abort();
+
+        // Flush the OTel batch exporter before the runtime drops so
+        // in-flight spans reach the collector on clean shutdown. No-op
+        // when the `otel` feature is off or when the endpoint was
+        // never configured, so it's always safe to call.
+        lorica::otel::shutdown();
     });
+}
+
+/// Try to initialise the OpenTelemetry exporter from persisted
+/// `GlobalSettings`. No-op when the `otel` Cargo feature is off, the
+/// settings row cannot be read, or `otlp_endpoint` is unset / blank.
+///
+/// Must be called from inside a Tokio runtime — the OTLP batch
+/// exporter spawns a background flush task. `role` is a free-form
+/// label (`"supervisor"`, `"worker"`, `"single-process"`) included in
+/// the startup log line so multi-process installs can tell which
+/// component finished tracing init.
+///
+/// Errors are logged at `warn!` and swallowed: observability is not
+/// a critical path, so a misconfigured endpoint never blocks startup.
+async fn try_init_otel_from_settings(store: &Arc<Mutex<lorica_config::ConfigStore>>, role: &str) {
+    let s = store.lock().await;
+    let gs = match s.get_global_settings() {
+        Ok(gs) => gs,
+        Err(e) => {
+            warn!(error = %e, "failed to read global settings for OTel init");
+            return;
+        }
+    };
+    drop(s);
+
+    let Some(endpoint) = gs.otlp_endpoint.as_ref().filter(|e| !e.trim().is_empty()) else {
+        return;
+    };
+
+    let otel_cfg = lorica::otel::OtelConfig {
+        endpoint: endpoint.clone(),
+        protocol: lorica::otel::OtlpProtocol::from_settings(&gs.otlp_protocol),
+        service_name: gs.otlp_service_name.clone(),
+        sampling_ratio: gs.otlp_sampling_ratio,
+    };
+    match lorica::otel::init(&otel_cfg) {
+        Ok(()) => info!(
+            role = role,
+            endpoint = %otel_cfg.endpoint,
+            protocol = otel_cfg.protocol.as_str(),
+            service_name = %otel_cfg.service_name,
+            sampling_ratio = otel_cfg.sampling_ratio,
+            "OpenTelemetry tracing enabled"
+        ),
+        Err(e) => warn!(
+            role = role,
+            error = %e,
+            "OpenTelemetry init failed; tracing disabled (startup continues)"
+        ),
+    }
 }
 
 /// Build a NotifyDispatcher from database notification configs.

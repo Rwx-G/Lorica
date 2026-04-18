@@ -13,17 +13,20 @@
     validateRouteFormWithTab,
   } from '../lib/route-form';
   import { showToast } from '../lib/toast';
+  import ConfirmDialog from './ConfirmDialog.svelte';
   import GeneralTab from './route-tabs/GeneralTab.svelte';
-  import TimeoutsTab from './route-tabs/TimeoutsTab.svelte';
-  import SecurityTab from './route-tabs/SecurityTab.svelte';
-  import HeadersTab from './route-tabs/HeadersTab.svelte';
-  import CorsTab from './route-tabs/CorsTab.svelte';
+  import RoutingTab from './route-tabs/RoutingTab.svelte';
+  import TransformTab from './route-tabs/TransformTab.svelte';
   import CachingTab from './route-tabs/CachingTab.svelte';
+  import SecurityTab from './route-tabs/SecurityTab.svelte';
   import ProtectionTab from './route-tabs/ProtectionTab.svelte';
-  import PathRulesTab from './route-tabs/PathRulesTab.svelte';
-  import HeaderRulesTab from './route-tabs/HeaderRulesTab.svelte';
-  import CanaryTab from './route-tabs/CanaryTab.svelte';
-  import ResponseRewriteTab from './route-tabs/ResponseRewriteTab.svelte';
+  import UpstreamTab from './route-tabs/UpstreamTab.svelte';
+  // Former standalone tabs (HeadersTab, CorsTab, TimeoutsTab) have
+  // been absorbed as inline subsections and their files deleted.
+  // Still-alive tab components that live as embedded panels inside
+  // RoutingTab / TransformTab: CanaryTab, HeaderRulesTab, PathRulesTab,
+  // ResponseRewriteTab. They are imported by their parent tab, not
+  // registered here.
 
   interface Props {
     open: boolean;
@@ -46,16 +49,12 @@
 
   const TABS = [
     { id: 'general', label: 'General' },
-    { id: 'timeouts', label: 'Timeouts' },
+    { id: 'routing', label: 'Routing' },
+    { id: 'transform', label: 'Transform' },
+    { id: 'cache', label: 'Cache' },
     { id: 'security', label: 'Security' },
-    { id: 'headers', label: 'Headers' },
-    { id: 'cors', label: 'CORS' },
-    { id: 'caching', label: 'Caching' },
     { id: 'protection', label: 'Protection' },
-    { id: 'path_rules', label: 'Path Rules' },
-    { id: 'header_rules', label: 'Header Rules' },
-    { id: 'traffic_splits', label: 'Canary' },
-    { id: 'response_rewrite', label: 'Rewrite' },
+    { id: 'upstream', label: 'Upstream' },
   ];
 
   // Reset form when drawer opens - untrack body so form/editing changes
@@ -87,17 +86,170 @@
 
   let modifiedFields: Set<string> = $derived(getModifiedFields(form));
 
+  /**
+   * Flag changes that have a large blast radius if saved by mistake.
+   * Displayed as a warn banner above the footer's Save button so the
+   * operator reads "you are about to do X to a live route" before
+   * clicking. Empty list (or create mode) = no banner.
+   *
+   * Resolves UXUI.md finding #18.
+   */
+  let riskyChanges: string[] = $derived.by(() => {
+    if (!editing) return [];
+    const warnings: string[] = [];
+
+    if (form.load_balancing !== editing.load_balancing) {
+      warnings.push(
+        `Load balancing algorithm: ${editing.load_balancing} -> ${form.load_balancing}. Breaks sticky affinity for existing sessions.`,
+      );
+    }
+    if ((form.certificate_id || '') !== (editing.certificate_id || '')) {
+      const before = editing.certificate_id ? 'a TLS cert' : 'HTTP only';
+      const after = form.certificate_id ? 'a different TLS cert' : 'HTTP only';
+      warnings.push(
+        `TLS certificate: ${before} -> ${after}. Clients may see a handshake error during rollout.`,
+      );
+    }
+    if (editing.waf_enabled && !form.waf_enabled) {
+      warnings.push(
+        'WAF disabled: auto-ban will stop firing and incoming traffic is no longer inspected against the rule set.',
+      );
+    }
+    const initialMtlsRequired = Boolean(editing.mtls?.required);
+    if (!initialMtlsRequired && form.mtls_required && form.mtls_ca_cert_pem.trim()) {
+      warnings.push(
+        'mTLS required just turned on: clients without a valid client certificate will be rejected with 496.',
+      );
+    }
+    return warnings;
+  });
+
+  /**
+   * Summary chips rendered in the drawer header, right under the
+   * hostname preview. Each chip is one derived fact about the route
+   * so an operator can tell at a glance which features are armed
+   * without clicking into the tabs. Resolves finding #14.
+   *
+   * Tones map to the palette used for subsection accents elsewhere
+   * in the drawer (blue / cyan / purple / red / orange / slate /
+   * teal / pink) so the header picks up the same colour language.
+   */
+  type Chip = { label: string; tone: 'blue' | 'cyan' | 'purple' | 'red' | 'orange' | 'slate' | 'teal' | 'pink' | 'green' };
+  let summaryChips: Chip[] = $derived.by(() => {
+    const chips: Chip[] = [];
+
+    // TLS
+    if (form.certificate_id) {
+      chips.push({ label: form.force_https ? 'TLS (forced)' : 'TLS', tone: 'green' });
+    }
+
+    // Terminal responses (short-circuit proxy)
+    if (form.redirect_to || form.redirect_hostname) {
+      chips.push({ label: 'Redirect', tone: 'pink' });
+    }
+    if (form.return_status) {
+      chips.push({ label: `Returns ${form.return_status}`, tone: 'pink' });
+    }
+
+    // Routing decorations
+    if (form.sticky_session) {
+      chips.push({ label: 'Sticky', tone: 'cyan' });
+    }
+    if (form.traffic_splits.length > 0) {
+      const total = form.traffic_splits.reduce((s, t) => s + (t.weight_percent || 0), 0);
+      chips.push({ label: `Split ${total}%`, tone: 'cyan' });
+    }
+    if (form.header_rules.length > 0) {
+      chips.push({ label: `${form.header_rules.length} header rule${form.header_rules.length > 1 ? 's' : ''}`, tone: 'purple' });
+    }
+    if (form.path_rules.length > 0) {
+      chips.push({ label: `${form.path_rules.length} path rule${form.path_rules.length > 1 ? 's' : ''}`, tone: 'orange' });
+    }
+    if (form.mirror_backend_ids.length > 0) {
+      chips.push({ label: `Mirror ${form.mirror_sample_percent}%`, tone: 'slate' });
+    }
+
+    // Security
+    if (form.waf_enabled) {
+      chips.push({
+        label: form.waf_mode === 'blocking' ? 'WAF blocking' : 'WAF detect',
+        tone: 'red',
+      });
+    }
+    if (form.basic_auth_username) {
+      chips.push({ label: 'Basic auth', tone: 'cyan' });
+    }
+    if (form.forward_auth_address) {
+      chips.push({ label: 'Forward auth', tone: 'teal' });
+    }
+    if (form.mtls_ca_cert_pem.trim()) {
+      chips.push({
+        label: form.mtls_required ? 'mTLS required' : 'mTLS optional',
+        tone: 'slate',
+      });
+    }
+
+    // Protection
+    if (form.rate_limit_capacity && Number(form.rate_limit_capacity) > 0) {
+      chips.push({
+        label: `Rate ${form.rate_limit_refill_per_sec}/s`,
+        tone: 'blue',
+      });
+    }
+    if (form.geoip_mode && form.geoip_countries.trim()) {
+      const countries = form.geoip_countries
+        .split(/[,\s]+/)
+        .filter((c) => c.length > 0);
+      const preview = countries.slice(0, 2).join(',');
+      const more = countries.length > 2 ? `+${countries.length - 2}` : '';
+      chips.push({
+        label: `GeoIP ${form.geoip_mode === 'denylist' ? 'deny' : 'allow'} ${preview}${more}`,
+        tone: 'orange',
+      });
+    }
+    if (form.bot_enabled) {
+      const mode =
+        form.bot_mode === 'javascript'
+          ? `JS(${form.bot_pow_difficulty})`
+          : form.bot_mode === 'captcha'
+            ? 'Captcha'
+            : 'Cookie';
+      chips.push({ label: `Bot ${mode}`, tone: 'pink' });
+    }
+
+    // Cache
+    if (form.cache_enabled) {
+      chips.push({ label: `Cache ${form.cache_ttl_s}s`, tone: 'cyan' });
+    }
+
+    // Transform (compression is the smallest flag worth surfacing)
+    if (form.compression_enabled) {
+      chips.push({ label: 'gzip', tone: 'teal' });
+    }
+
+    return chips;
+  });
+
   function tabHasModifiedFields(tabId: string): boolean {
     const fields = TAB_FIELDS[tabId];
     if (!fields) return false;
     return fields.some((f) => modifiedFields.has(f));
   }
 
+  // Confirmation modal for discarding unsaved changes. Replaces the
+  // previous `window.confirm` which broke theming and A11y.
+  let showUnsavedConfirm = $state(false);
+
   function handleClose() {
     if (hasUnsavedChanges) {
-      const confirmed = window.confirm('You have unsaved changes. Discard them?');
-      if (!confirmed) return;
+      showUnsavedConfirm = true;
+      return;
     }
+    onclose();
+  }
+
+  function confirmDiscardAndClose() {
+    showUnsavedConfirm = false;
     onclose();
   }
 
@@ -162,9 +314,18 @@
       <!-- Header -->
       <div class="drawer-header">
         <div class="drawer-header-left">
-          <h2>{editing ? 'Edit Route' : 'New Route'}</h2>
-          {#if form.hostname}
-            <span class="hostname-preview">{form.hostname}{form.path_prefix !== '/' ? form.path_prefix : ''}</span>
+          <div class="drawer-title-row">
+            <h2>{editing ? 'Edit Route' : 'New Route'}</h2>
+            {#if form.hostname}
+              <span class="hostname-preview">{form.hostname}{form.path_prefix !== '/' ? form.path_prefix : ''}</span>
+            {/if}
+          </div>
+          {#if summaryChips.length > 0}
+            <div class="summary-chips" aria-label="Effective configuration summary">
+              {#each summaryChips as chip, i (i)}
+                <span class="chip" data-tone={chip.tone}>{chip.label}</span>
+              {/each}
+            </div>
           {/if}
         </div>
         <div class="drawer-header-right">
@@ -185,11 +346,17 @@
           <button
             class="tab-btn"
             class:active={activeTab === tab.id}
+            aria-label={tabHasModifiedFields(tab.id) ? `${tab.label} (modified)` : tab.label}
             onclick={() => { activeTab = tab.id; }}
           >
             {tab.label}
             {#if tabHasModifiedFields(tab.id)}
-              <span class="tab-dot" title="This tab has non-default values"></span>
+              <span
+                class="tab-dot"
+                role="img"
+                aria-label="has non-default values"
+                title="This tab has non-default values"
+              ></span>
             {/if}
           </button>
         {/each}
@@ -198,39 +365,54 @@
       <!-- Tab content -->
       <div class="drawer-body">
         {#if activeTab === 'general'}
-          <GeneralTab bind:form={form} {backends} {certificates} editing={!!editing} {importedFields} />
-        {:else if activeTab === 'timeouts'}
-          <TimeoutsTab bind:form={form} {importedFields} />
+          <GeneralTab bind:form={form} editing={!!editing} {importedFields} />
+        {:else if activeTab === 'routing'}
+          <RoutingTab bind:form={form} {backends} {certificates} {importedFields} />
+        {:else if activeTab === 'transform'}
+          <TransformTab bind:form={form} {importedFields} />
+        {:else if activeTab === 'cache'}
+          <CachingTab bind:form={form} {importedFields} />
         {:else if activeTab === 'security'}
           <SecurityTab bind:form={form} {importedFields} {customPresets} {backends} initialMtlsCaCertPem={editing?.mtls?.ca_cert_pem ?? ''} />
-        {:else if activeTab === 'headers'}
-          <HeadersTab bind:form={form} {importedFields} />
-        {:else if activeTab === 'cors'}
-          <CorsTab bind:form={form} {importedFields} />
-        {:else if activeTab === 'caching'}
-          <CachingTab bind:form={form} {importedFields} />
         {:else if activeTab === 'protection'}
           <ProtectionTab bind:form={form} {importedFields} />
-        {:else if activeTab === 'path_rules'}
-          <PathRulesTab bind:form={form} {backends} {importedFields} />
-        {:else if activeTab === 'header_rules'}
-          <HeaderRulesTab bind:form={form} {backends} {importedFields} />
-        {:else if activeTab === 'traffic_splits'}
-          <CanaryTab bind:form={form} {backends} {importedFields} />
-        {:else if activeTab === 'response_rewrite'}
-          <ResponseRewriteTab bind:form={form} {importedFields} />
+        {:else if activeTab === 'upstream'}
+          <UpstreamTab bind:form={form} {importedFields} />
         {/if}
       </div>
 
       <!-- Footer -->
       <div class="drawer-footer">
-        <button class="btn btn-cancel" onclick={handleClose}>Cancel</button>
-        <button class="btn btn-primary" disabled={formSubmitting} onclick={handleSubmit}>
-          {formSubmitting ? 'Saving...' : editing ? 'Update' : 'Create'}
-        </button>
+        {#if riskyChanges.length > 0}
+          <div class="risky-banner" role="note">
+            <strong>Risky change{riskyChanges.length > 1 ? 's' : ''} before save:</strong>
+            <ul>
+              {#each riskyChanges as w, i (i)}
+                <li>{w}</li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+        <div class="drawer-footer-actions">
+          <button class="btn btn-cancel" onclick={handleClose}>Cancel</button>
+          <button class="btn btn-primary" disabled={formSubmitting} onclick={handleSubmit}>
+            {formSubmitting ? 'Saving...' : editing ? 'Update' : 'Create'}
+          </button>
+        </div>
       </div>
     </div>
   </div>
+{/if}
+
+{#if showUnsavedConfirm}
+  <ConfirmDialog
+    title="Discard unsaved changes?"
+    message="You have unsaved edits in this drawer. Closing now will lose them."
+    confirmLabel="Discard"
+    confirmStyle="danger"
+    onconfirm={confirmDiscardAndClose}
+    oncancel={() => { showUnsavedConfirm = false; }}
+  />
 {/if}
 
 <script lang="ts" module>
@@ -255,7 +437,11 @@
   .drawer {
     position: relative;
     z-index: 1;
-    width: 900px;
+    /* clamp(min, preferred, max): 900px minimum on narrow screens,
+       55 % of viewport for comfortable editing on full-HD and above,
+       1280px hard cap so 4K screens do not drown the form in
+       whitespace. */
+    width: clamp(900px, 55vw, 1280px);
     max-width: 100vw;
     height: 100vh;
     background: var(--color-bg-card);
@@ -281,6 +467,14 @@
 
   .drawer-header-left {
     display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .drawer-title-row {
+    display: flex;
     align-items: baseline;
     gap: 1rem;
     min-width: 0;
@@ -299,6 +493,39 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+
+  /* Summary chips: a compact, colour-coded read-out of the route's
+     effective configuration. Stays visible regardless of the active
+     tab so an operator can tell at a glance "this route has WAF
+     blocking, GeoIP deny FR, and a 301 redirect" without clicking
+     through each tab. */
+  .summary-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3125rem;
+    max-width: 100%;
+  }
+
+  .chip {
+    display: inline-block;
+    padding: 0.125rem 0.5rem;
+    border-radius: 9999px;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    line-height: 1.4;
+    white-space: nowrap;
+    border: 1px solid transparent;
+  }
+
+  .chip[data-tone='blue']   { color: #3b82f6; background: rgba(59,  130, 246, 0.12); border-color: rgba(59,  130, 246, 0.25); }
+  .chip[data-tone='green']  { color: #10b981; background: rgba(16,  185, 129, 0.12); border-color: rgba(16,  185, 129, 0.25); }
+  .chip[data-tone='purple'] { color: #8b5cf6; background: rgba(139, 92,  246, 0.12); border-color: rgba(139, 92,  246, 0.25); }
+  .chip[data-tone='cyan']   { color: #06b6d4; background: rgba(6,   182, 212, 0.12); border-color: rgba(6,   182, 212, 0.25); }
+  .chip[data-tone='red']    { color: #ef4444; background: rgba(239, 68,  68,  0.12); border-color: rgba(239, 68,  68,  0.25); }
+  .chip[data-tone='orange'] { color: #f59e0b; background: rgba(245, 158, 11,  0.12); border-color: rgba(245, 158, 11,  0.25); }
+  .chip[data-tone='slate']  { color: #64748b; background: rgba(100, 116, 139, 0.12); border-color: rgba(100, 116, 139, 0.25); }
+  .chip[data-tone='teal']   { color: #14b8a6; background: rgba(20,  184, 166, 0.12); border-color: rgba(20,  184, 166, 0.25); }
+  .chip[data-tone='pink']   { color: #ec4899; background: rgba(236, 72,  153, 0.12); border-color: rgba(236, 72,  153, 0.25); }
 
   .drawer-header-right {
     display: flex;
@@ -386,14 +613,22 @@
     border-bottom-color: var(--color-primary);
   }
 
+  /* Tab-dot visual. The primary-colour fill signals "modified" to
+     sighted users; the 1px outer ring keeps the dot visible when
+     color perception alone is not enough (contrast + forced-colors
+     modes, WCAG 1.4.1). Screen readers read the paired aria-label
+     on both the button and the dot itself. */
   .tab-dot {
     position: absolute;
     top: 0.5rem;
     right: 0.25rem;
-    width: 6px;
-    height: 6px;
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
     background: var(--color-primary);
+    box-shadow: 0 0 0 1px var(--color-bg-card);
+    outline: 1px solid var(--color-primary);
+    outline-offset: 0;
   }
 
   .drawer-body {
@@ -404,12 +639,36 @@
 
   .drawer-footer {
     display: flex;
-    justify-content: flex-end;
+    flex-direction: column;
     gap: 0.75rem;
     padding: 1rem 1.5rem;
     border-top: 1px solid var(--color-border);
     flex-shrink: 0;
   }
+
+  .drawer-footer-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.75rem;
+  }
+
+  /* Risky-change warn banner. Shown above the Save button so an
+     operator reads the warning before clicking Update. Lists each
+     risky change (LB algo change, TLS cert swap, WAF disabled, mTLS
+     required turned on) as a bullet so the blast radius is explicit. */
+  .risky-banner {
+    padding: 0.625rem 0.875rem;
+    background: rgba(245, 158, 11, 0.08);
+    border-left: 3px solid var(--color-orange, #f59e0b);
+    border-radius: 0 0.25rem 0.25rem 0;
+    font-size: 0.8125rem;
+    color: var(--color-text);
+    line-height: 1.45;
+  }
+  .risky-banner strong { display: block; color: var(--color-text-heading); margin-bottom: 0.25rem; }
+  .risky-banner ul { margin: 0; padding-left: 1.125rem; }
+  .risky-banner li { margin-bottom: 0.25rem; }
+  .risky-banner li:last-child { margin-bottom: 0; }
 
   @media (max-width: 960px) {
     .drawer {

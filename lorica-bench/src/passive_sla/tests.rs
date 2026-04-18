@@ -208,6 +208,8 @@ fn test_store_sla_bucket_insert_and_query() {
         response_rewrite: None,
         mtls: None,
         rate_limit: None,
+        geoip: None,
+        bot_protection: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -317,6 +319,8 @@ fn test_store_sla_summary() {
         response_rewrite: None,
         mtls: None,
         rate_limit: None,
+        geoip: None,
+        bot_protection: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -441,6 +445,8 @@ fn test_store_prune_buckets() {
         response_rewrite: None,
         mtls: None,
         rate_limit: None,
+        geoip: None,
+        bot_protection: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -552,6 +558,8 @@ fn test_store_sla_config_upsert_and_get() {
         response_rewrite: None,
         mtls: None,
         rate_limit: None,
+        geoip: None,
+        bot_protection: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -648,6 +656,8 @@ fn test_store_export_sla_data() {
         response_rewrite: None,
         mtls: None,
         rate_limit: None,
+        geoip: None,
+        bot_protection: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };

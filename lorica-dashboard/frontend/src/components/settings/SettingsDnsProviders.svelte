@@ -179,7 +179,7 @@
           </table>
         </div>
       {/if}
-      <div class="settings-actions-left">
+      <div class="settings-dialog-actions">
         <button class="btn btn-primary" onclick={openDnsProviderCreate}>Add Provider</button>
       </div>
     </div>

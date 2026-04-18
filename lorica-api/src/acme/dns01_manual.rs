@@ -506,6 +506,7 @@ pub async fn provision_dns_manual_confirm(
         .create_certificate(&cert)
         .map_err(|e| ApiError::Internal(format!("failed to store certificate: {e}")))?;
     drop(store);
+    state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
     // Only remove the pending challenge after successful provisioning

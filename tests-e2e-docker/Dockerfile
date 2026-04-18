@@ -1,10 +1,15 @@
 # Stage 1: Build frontend
+# Lorica's canonical package manager is pnpm (see CLAUDE.md); the
+# npm package-lock.json drifts because dep bumps only refresh
+# pnpm-lock.yaml. Using pnpm here keeps the e2e image in sync with
+# the local dev build and the .deb build flow.
 FROM node:22-slim AS frontend
+RUN npm install -g pnpm@10
 WORKDIR /app/lorica-dashboard/frontend
-COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/package-lock.json* ./
-RUN npm ci
+COPY lorica-dashboard/frontend/package.json lorica-dashboard/frontend/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 COPY lorica-dashboard/frontend/ ./
-RUN npm run build
+RUN pnpm run build
 
 # Stage 2: Build Rust binary
 FROM rust:1-bookworm AS builder
@@ -36,25 +41,39 @@ COPY lorica-shmem/ lorica-shmem/
 COPY lorica-waf/ lorica-waf/
 COPY lorica-worker/ lorica-worker/
 COPY lorica-bench/ lorica-bench/
+COPY lorica-geoip/ lorica-geoip/
+COPY lorica-challenge/ lorica-challenge/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend into the dashboard crate
 COPY --from=frontend /app/lorica-dashboard/frontend/dist/ lorica-dashboard/frontend/dist/
 
-# Build with SKIP_FRONTEND_BUILD since we already built it
+# Build with SKIP_FRONTEND_BUILD since we already built it. Cargo
+# features can be toggled at build time via the `LORICA_FEATURES`
+# build arg (e.g. `--build-arg LORICA_FEATURES=otel`); defaults to
+# the crate's default feature set.
+ARG LORICA_FEATURES=""
 ENV SKIP_FRONTEND_BUILD=1
-RUN cargo build --release -p lorica
+RUN if [ -n "$LORICA_FEATURES" ]; then \
+        cargo build --release -p lorica --features "$LORICA_FEATURES"; \
+    else \
+        cargo build --release -p lorica; \
+    fi
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates socat curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates socat curl sqlite3 && rm -rf /var/lib/apt/lists/*
 RUN useradd -r -s /bin/false lorica
 RUN mkdir -p /var/lib/lorica && chown lorica:lorica /var/lib/lorica
 
 COPY --from=builder /app/target/release/lorica /usr/local/bin/lorica
 COPY tests-e2e-docker/entrypoint.sh /entrypoint.sh
 COPY tests-e2e-docker/entrypoint-workers.sh /entrypoint-workers.sh
-RUN chmod +x /entrypoint.sh /entrypoint-workers.sh
+COPY tests-e2e-docker/entrypoint-geoip.sh /entrypoint-geoip.sh
+COPY tests-e2e-docker/entrypoint-otel.sh /entrypoint-otel.sh
+COPY tests-e2e-docker/entrypoint-otel-workers.sh /entrypoint-otel-workers.sh
+COPY tests-e2e-docker/entrypoint-rdns.sh /entrypoint-rdns.sh
+RUN chmod +x /entrypoint.sh /entrypoint-workers.sh /entrypoint-geoip.sh /entrypoint-otel.sh /entrypoint-otel-workers.sh /entrypoint-rdns.sh
 
 # Pre-create the `/shared` mount point owned by the non-root lorica
 # user so the entrypoint can write `/shared/admin_password` after the

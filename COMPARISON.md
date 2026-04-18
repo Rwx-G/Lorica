@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-04-12 | Lorica v1.3.0
+> Last updated: 2026-04-18 | Lorica v1.4.0
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin/Module (not built-in)
 >
@@ -19,7 +19,7 @@
 | WebSocket proxying | Y | Y | P | Y | Y | Y | Y | Y |
 | gRPC proxying | Y | Y | N | Y | Y | Plug | Y | Y |
 | HTTP/2 upstream (h2c) | Y | Y | N | Y | Y | P | Y | Y |
-| HTTP/3 (QUIC) | N | N | N | N | Y | N | P | Y |
+| HTTP/3 (QUIC) | N | N | N | Y | Y | N | Y | Y |
 | TLS termination (rustls) | Y | Y | Y | Y | Y | Y | Y | Y |
 | SNI-based cert selection | Y | P | Y | Y | Y | Y | Y | Y |
 | Wildcard cert support | Y | P | Y | Y | Y | Y | Y | Y |
@@ -38,7 +38,7 @@
 ### Gaps for Lorica
 
 - **TCP/L4 proxying** - Supported by most competitors. Enables database, MQTT, SSH proxying.
-- **HTTP/3 (QUIC)** - Traefik and HAProxy have production support. Pingora has an upstream PR pending. Long-term gap.
+- **HTTP/3 (QUIC)** - Nginx (stable since 1.28, 2025-04), Caddy (since 2.6), Traefik v3, and HAProxy 3.2+ all have production support. Pingora has an upstream PR pending. Long-term gap.
 
 ---
 
@@ -53,11 +53,11 @@
 | Random | Y | Y | Y | Y | N | N | Y | Y |
 | IP Hash | N | N | N | Y | N | N | Y | Y |
 | Health-aware filtering | Y | Y | Y | Paid | Y | Paid | Y | Y |
-| Traffic mirroring | Y | N | N | N | Y | N | N | N |
+| Traffic mirroring | Y | N | N | Y | Y | N | N | N |
 
 ### Lorica Strengths
 
-- **Traffic mirroring** - Only Traefik and Lorica ship this natively. Lorica's implementation adds request-body mirroring up to a configurable cap, deterministic per-request-id sampling, and a 256-slot concurrency semaphore so a slow shadow can't starve the primary.
+- **Traffic mirroring** - Nginx (`ngx_http_mirror_module`, core since 1.13.4), Traefik, and Lorica ship this natively. Lorica's implementation adds request-body mirroring up to a configurable cap, deterministic per-request-id sampling, and a 256-slot concurrency semaphore so a slow shadow can't starve the primary - guardrails that the Nginx directive leaves to the operator.
 
 ### Gaps for Lorica
 
@@ -81,8 +81,9 @@
 | IP allowlist/denylist | Y | N | N | Y | Y | Y | Y | Y |
 | CORS per route | Y | N | N | P | Y | Y | P | P |
 | Basic auth per route | Y | N | N | Y | Y | Y | Y | Y |
-| **Bot detection (captcha)** | **N** | N | N | N | N | Y | N | N |
-| **Country blocking (GeoIP)** | **N** | N | N | Plug | N | Y | N | N |
+| Bot detection (PoW / captcha / cookie) | Y | N | N | N | N | Y | N | N |
+| Country blocking (GeoIP) | Y | N | N | Plug | N | Y | N | N |
+| ASN-based bypass / filter | Y | N | N | N | N | N | N | N |
 | Request body scanning | Y | N | N | Plug | Plug | Y | N | N |
 | mTLS client verification | Y | Y | N | Y | Y | Y | Y | Y |
 | Connection pre-filter (pre-TLS CIDR) | Y | P | P | P | N | N | N | Y |
@@ -99,8 +100,8 @@
 
 - ~~Basic auth per route~~ - Implemented in v1.2.0.
 - ~~mTLS client verification~~ - Implemented in v1.3.0.
-- **Bot detection** - BunkerWeb's major differentiator (JS challenge, captcha, hCaptcha, Turnstile).
-- **Country blocking** - BunkerWeb has it. Useful for compliance and attack surface reduction.
+- ~~Bot detection~~ - Implemented in v1.4.0 (three modes: cookie, JavaScript PoW, image captcha). Five-category bypass matrix (IP CIDR, ASN, country, User-Agent regex, rDNS with forward confirmation).
+- ~~Country blocking~~ - Implemented in v1.4.0 (GeoIP via DB-IP Lite Country, weekly auto-update, per-route allowlist / denylist).
 
 ---
 
@@ -131,10 +132,10 @@
 
 | Feature | Lorica | Pingora | Sozu | Nginx | Traefik | BunkerWeb | Caddy | HAProxy |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| ACME HTTP-01 | Y | N | Y | Plug | Y | Y | Y | Y |
+| ACME HTTP-01 | Y | N | Y | Y | Y | Y | Y | Y |
 | ACME DNS-01 | Y | N | N | N | Y | Y | Y | Y |
 | ACME TLS-ALPN-01 | N | N | N | Plug | Y | N | Y | N |
-| Auto-renewal | Y | N | P | N | Y | Y | Y | Y |
+| Auto-renewal | Y | N | P | Y | Y | Y | Y | Y |
 | Multi-domain SAN | Y | N | N | N | Y | N | Y | N |
 | Wildcard via DNS-01 | Y | N | N | N | Y | Y | Y | Y |
 | SNI hot-swap | Y | P | Y | N | Y | N | Y | N |
@@ -144,7 +145,7 @@
 
 ### Lorica Strengths
 
-- **ACME DNS-01 with 3 providers** (Cloudflare, Route53, OVH) + manual mode - competitive with Traefik and Caddy.
+- **ACME DNS-01 with 3 providers** (Cloudflare, Route53, OVH) + manual mode. Traefik and Caddy ship many more DNS providers; Lorica's spread covers the common European-centric set. Route 53 is an opt-in Cargo feature (not in the default `.deb` / `.rpm` build) to keep the AWS SDK dep graph out of the default binary.
 - **SNI hot-swap** via arc-swap - zero-downtime cert rotation.
 - **CRL support** - Rare feature, only Nginx and HAProxy match.
 - **Per-route mTLS policy** - chain verification at the TLS listener plus per-route enforcement knobs (`required`, org allowlist) that hot-reload without restart. Most competitors only expose a single listener-wide client-cert setting.
@@ -166,7 +167,7 @@
 | Real-time access logs (WS) | Y | N | N | N | N | N | N | N |
 | Built-in load testing | Y | N | N | N | N | N | N | N |
 | SLA breach alerts | Y | N | N | N | N | N | N | N |
-| **OpenTelemetry tracing** | **N** | P | Y | N | Y | N | P | Y |
+| OpenTelemetry tracing (OTLP) | Y | P | Y | Y | Y | N | P | Y |
 | Structured JSON logs | Y | P | Y | Y | Y | Y | Y | Y |
 
 ### Lorica Strengths
@@ -179,7 +180,7 @@
 
 ### Gaps for Lorica
 
-- **OpenTelemetry tracing** - Traefik (native OTLP), HAProxy (OpenTracing filter), Sozu support it. Important for distributed tracing.
+- ~~OpenTelemetry tracing~~ - Implemented in v1.4.0 as an off-by-default Cargo feature (`otel`). W3C trace context propagation, per-request spans with OTel HTTP semconv, log/trace correlation. Non-OTel users do not pay the dep-graph cost.
 - ~~Structured JSON logs to file/syslog~~ - Implemented in v1.2.0.
 
 ---
@@ -206,10 +207,9 @@
 - **Notification channels** (SMTP, Slack, Webhook) - Unique. No competitor has built-in alerting.
 - **Config export/import with diff preview** - Unique.
 
-### Gaps for Lorica
+### Out of Scope by Design
 
-- **Service discovery** (Docker, Kubernetes) - Traefik's main differentiator. Important for cloud-native deployments.
-- **Config providers** - Traefik supports 10+ providers (Docker, K8s, Consul, etcd, etc.).
+- **Service discovery** (Docker labels, Kubernetes Ingress) and **config providers** (etcd, Consul, etc.) are deliberately out of scope. Lorica targets the **standalone edge / bastion** use case (runs in front of clusters, not inside them). Operators that need in-cluster service discovery are better served by Traefik. Lorica's positioning is "the bastion-class reverse proxy with a dashboard": cert auto-renewal, WAF, bot protection, GeoIP, SLA, auto-ban, audit trail, all in one binary that an SRE drops on a VM.
 
 ---
 
@@ -223,7 +223,7 @@
 | Circuit breaker | Y | P | N | N | Y | N | P | P |
 | Graceful drain | Y | Y | Y | Paid | Y | Y | Y | Y |
 | Encrypted storage (AES) | Y | N | N | N | N | N | N | N |
-| **Retry with backoff** | **P** | N | N | N | Y | N | Y | Y |
+| Retry with backoff | Y | Y | N | N | Y | N | Y | Y |
 | **Hot binary upgrade** | **N** | Y | Y | Y | N | Y | N | Y |
 
 ### Lorica Strengths
@@ -234,7 +234,8 @@
 
 ### Gaps for Lorica
 
-- **Retry with backoff** - Already in backlog. Traefik, Caddy, HAProxy support configurable retry policies.
+- ~~Retry with backoff~~ - Implemented in v1.2.0 (`retry_on_methods`, `retry_attempts`, exponential backoff via the `fail_to_connect` hook).
+- **Hot binary upgrade** - Planned for v1.5.0. Pingora ships the infrastructure (SIGUSR2 fd passing); wiring is ~3-4 days.
 
 ---
 
@@ -280,43 +281,20 @@ These features are either unique to Lorica or extremely rare among competitors:
 
 ---
 
-## Summary: Priority Gaps to Address
+## Summary: Remaining Gaps
 
-### Table-Stakes (most competitors have these)
+All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.4.0 are shipped. Remaining gaps are by design or planned for future versions.
 
-| Feature | Backlog? | Competitors With It |
-|---|---|---|
-| ~~Forward auth (external auth)~~ | ~~Yes (#1)~~ | Implemented in v1.3.0 |
-| ~~Basic auth per route~~ | ~~Yes (#4)~~ | Implemented in v1.2.0 |
-| ~~Custom error pages + maintenance mode~~ | ~~Yes (#3)~~ | Implemented in v1.2.0 |
-| ~~mTLS client verification~~ | ~~Yes (#10)~~ | Implemented in v1.3.0 |
-| ~~Retry with backoff~~ | ~~Yes (#7)~~ | Implemented in v1.2.0 (retry_on_methods) |
-
-### Differentiators (competitive advantage opportunities)
-
-| Feature | Backlog? | Competitors With It |
-|---|---|---|
-| ~~Canary / traffic split~~ | ~~Yes (#5)~~ | Implemented in v1.3.0 |
-| ~~Header-based routing~~ | ~~Yes (#6)~~ | Implemented in v1.3.0 |
-| ~~Structured JSON logs (file/syslog)~~ | ~~Yes (#8)~~ | Implemented in v1.2.0 |
-| ~~Request mirroring~~ | ~~Yes (#9)~~ | Implemented in v1.3.0 |
-| TCP/L4 proxying | Yes (#12) | All except Pingora framework |
-
-### Not Yet in Backlog (consider adding)
-
-| Feature | Priority | Rationale |
-|---|---|---|
-| ~~OCSP stapling~~ | ~~Medium~~ | Implemented in v1.2.0 |
-| OpenTelemetry tracing | Medium | Traefik, HAProxy, Sozu support it. Key for distributed systems |
-| ~~Least Connections LB~~ | ~~Low~~ | Implemented in v1.2.0 |
-| ~~Docker image~~ | ~~Medium~~ | Implemented in v1.2.0 |
-| Bot detection (JS challenge/captcha) | Low | Only BunkerWeb has it. Niche but impressive |
-| Country blocking (GeoIP) | Low | Only BunkerWeb has it. Useful for compliance |
-| ~~Response body rewriting~~ | ~~Low~~ | Implemented in v1.3.0 |
-| ~~Cache Vary partitioning~~ | ~~-~~ | Implemented in v1.3.0 |
-| ~~Cache predictor~~ | ~~-~~ | Implemented in v1.3.0 |
-| ~~Stale-while-revalidate (background refresh)~~ | ~~-~~ | Implemented in v1.3.0 |
-| ~~Connection pre-filter (pre-TLS CIDR)~~ | ~~-~~ | Implemented in v1.3.0 |
+| Gap | Plan |
+|---|---|
+| Hot binary upgrade | Planned for v1.5.0. Pingora ships the infrastructure (SIGUSR2 fd passing); wiring is ~3-4 days |
+| Team settings (users & RBAC) | Planned for v1.5.0. Single-admin model today; multi-user with roles is needed for org-wide adoption |
+| HTTP/3 (QUIC) | Planned for v2.0.0. Blocked on [Pingora PR #524](https://github.com/cloudflare/pingora/pull/524) (tokio-quiche integration) |
+| TCP/L4 proxying | Planned for v2.0.0. Enables database, MQTT, SSH stream proxying |
+| Service discovery (Docker labels, K8s Ingress) | Out of scope by design. Lorica targets standalone edge / bastion, not in-cluster deployment |
+| Config providers (etcd, Consul) | Out of scope by design. Same rationale as service discovery |
+| ACME TLS-ALPN-01 | Low priority. HTTP-01 and DNS-01 cover all real-world scenarios |
+| Helm chart | Low priority. Out of the primary positioning; may ship on community demand |
 
 ---
 
@@ -328,7 +306,7 @@ Lorica is a fork of Cloudflare Pingora. The forked crates already contain signif
 
 The `ProxyHttp` trait in `lorica-proxy/src/proxy_trait.rs` defines 41 methods. v1.3.0 pushed the used count from 12 to 20+. The remaining unused hooks still unlock features with minimal effort.
 
-#### Tapped in v1.2.0 / v1.3.0
+#### Tapped in v1.2.0 / v1.3.0 / v1.4.0
 
 | Hook | Shipped As | Version |
 |---|---|---|
@@ -340,6 +318,7 @@ The `ProxyHttp` trait in `lorica-proxy/src/proxy_trait.rs` defines 41 methods. v
 | `response_body_filter()` | Response body rewriting | v1.3.0 |
 | `allow_spawning_subrequest()` + subrequest pipe | Forward auth + SWR background refresh | v1.3.0 |
 | `cache_vary_filter()` | Cache Vary partitioning | v1.3.0 |
+| `#[instrument]` on all hooks + W3C traceparent | OpenTelemetry tracing (OTLP) | v1.4.0 |
 
 #### Still Untapped (remaining opportunities)
 

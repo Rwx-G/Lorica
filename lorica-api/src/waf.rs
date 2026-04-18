@@ -112,7 +112,7 @@ pub async fn get_waf_stats(
                     .into_iter()
                     .map(|(category, count)| CategoryCount { category, count })
                     .collect();
-                by_cat.sort_by(|a, b| b.count.cmp(&a.count));
+                by_cat.sort_by_key(|c| std::cmp::Reverse(c.count));
                 (total, by_cat)
             }
             Err(_) => (0, vec![]),
@@ -130,7 +130,7 @@ pub async fn get_waf_stats(
             .into_iter()
             .map(|(category, count)| CategoryCount { category, count })
             .collect();
-        by_cat.sort_by(|a, b| b.count.cmp(&a.count));
+        by_cat.sort_by_key(|c| std::cmp::Reverse(c.count));
         (total, by_cat)
     } else {
         (0, vec![])

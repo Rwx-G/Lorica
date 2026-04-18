@@ -171,19 +171,44 @@
         <span class="gauge-detail">{formatBytes(system.host.memory_used_bytes)} / {formatBytes(system.host.memory_total_bytes)}</span>
       </div>
 
+      {#if system.host.disk_root}
       <div class="gauge-card">
-        <span class="gauge-label">Disk</span>
+        <span class="gauge-label">Disk - Root</span>
+        <span class="gauge-sublabel">{system.host.disk_root.mount_point}</span>
         <div class="gauge-bar-bg">
           <div
             class="gauge-bar-fill"
-            style="width: {system.host.disk_usage_percent}%; background: {gaugeColor(system.host.disk_usage_percent)}"
+            style="width: {system.host.disk_root.usage_percent}%; background: {gaugeColor(system.host.disk_root.usage_percent)}"
           ></div>
         </div>
-        <span class="gauge-value" style="color: {gaugeColor(system.host.disk_usage_percent)}">
-          {system.host.disk_usage_percent.toFixed(1)}%
+        <span class="gauge-value" style="color: {gaugeColor(system.host.disk_root.usage_percent)}">
+          {system.host.disk_root.usage_percent.toFixed(1)}%
         </span>
-        <span class="gauge-detail">{formatBytes(system.host.disk_used_bytes)} / {formatBytes(system.host.disk_total_bytes)}</span>
+        <span class="gauge-detail">{formatBytes(system.host.disk_root.used_bytes)} / {formatBytes(system.host.disk_root.total_bytes)}</span>
       </div>
+      {/if}
+
+      {#if system.host.disk_data}
+      <div class="gauge-card">
+        <span class="gauge-label">
+          Disk - Lorica data
+          {#if system.host.disk_root && system.host.disk_data.total_bytes === system.host.disk_root.total_bytes && system.host.disk_data.used_bytes === system.host.disk_root.used_bytes}
+            <span class="same-mount-tag">same as root</span>
+          {/if}
+        </span>
+        <span class="gauge-sublabel">{system.host.disk_data.mount_point}</span>
+        <div class="gauge-bar-bg">
+          <div
+            class="gauge-bar-fill"
+            style="width: {system.host.disk_data.usage_percent}%; background: {gaugeColor(system.host.disk_data.usage_percent)}"
+          ></div>
+        </div>
+        <span class="gauge-value" style="color: {gaugeColor(system.host.disk_data.usage_percent)}">
+          {system.host.disk_data.usage_percent.toFixed(1)}%
+        </span>
+        <span class="gauge-detail">{formatBytes(system.host.disk_data.used_bytes)} / {formatBytes(system.host.disk_data.total_bytes)}</span>
+      </div>
+      {/if}
     </div>
 
     <h2>Lorica Process</h2>
@@ -254,6 +279,14 @@
     letter-spacing: 0.05em;
   }
 
+  .gauge-sublabel {
+    font-size: 0.75rem;
+    color: var(--color-text-muted);
+    opacity: 0.75;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    margin-top: -0.25rem;
+  }
+
   .gauge-bar-bg {
     width: 100%;
     height: 0.5rem;
@@ -276,6 +309,18 @@
   .gauge-detail {
     font-size: 0.8125rem;
     color: var(--color-text-muted);
+  }
+
+  .same-mount-tag {
+    display: inline-block;
+    margin-left: 0.5rem;
+    padding: 0 0.5rem;
+    font-size: 0.6875rem;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--color-text-muted);
+    background: var(--color-bg-input);
+    border-radius: 9999px;
   }
 
   .workers-table {

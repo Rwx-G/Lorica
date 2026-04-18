@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { RouteFormState, PathRuleFormState } from '../../lib/route-form';
   import type { BackendResponse } from '../../lib/api';
+  import BackendCheckboxList from '../BackendCheckboxList.svelte';
 
   interface Props {
     form: RouteFormState;
@@ -31,6 +32,31 @@
   function addRule() {
     form.path_rules = [...form.path_rules, newRule()];
     expandedIndex = form.path_rules.length - 1;
+  }
+
+  // Two-click confirm for delete: the first click arms the button
+  // for 3 s, the second within that window commits. Matches the
+  // pattern used by Canary / HeaderRules / Response rewrite so every
+  // rule list in the drawer behaves the same way - no more "one
+  // click silently drops a path rule that was routing 404s into the
+  // void". (Resolves UXUI.md finding #6.)
+  let pendingRemoveIndex: number | null = $state(null);
+  let pendingRemoveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function requestRemove(index: number) {
+    if (pendingRemoveIndex === index) {
+      if (pendingRemoveTimer) clearTimeout(pendingRemoveTimer);
+      pendingRemoveTimer = null;
+      pendingRemoveIndex = null;
+      removeRule(index);
+      return;
+    }
+    pendingRemoveIndex = index;
+    if (pendingRemoveTimer) clearTimeout(pendingRemoveTimer);
+    pendingRemoveTimer = setTimeout(() => {
+      pendingRemoveIndex = null;
+      pendingRemoveTimer = null;
+    }, 3000);
   }
 
   function removeRule(index: number) {
@@ -127,10 +153,19 @@
               <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               {@html expandedIndex === index ? collapseIcon : expandIcon}
             </button>
-            <button class="btn-icon btn-delete" title="Remove" aria-label="Remove" onclick={() => removeRule(index)}>
-              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-              {@html deleteIcon}
-            </button>
+            {#if pendingRemoveIndex === index}
+              <button
+                class="btn-icon btn-delete btn-delete-confirm"
+                title="Click again within 3 s to remove"
+                aria-label="Confirm remove"
+                onclick={() => requestRemove(index)}
+              >Confirm?</button>
+            {:else}
+              <button class="btn-icon btn-delete" title="Remove" aria-label="Remove" onclick={() => requestRemove(index)}>
+                <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                {@html deleteIcon}
+              </button>
+            {/if}
           </div>
         </div>
 
@@ -139,18 +174,12 @@
             <!-- Backend override -->
             <div class="override-section">
               <span class="override-title">Backend override</span>
-              {#if backends.length === 0}
-                <p class="text-muted small">No backends available</p>
-              {:else}
-                <div class="checkbox-list">
-                  {#each backends as b (b.id)}
-                    <label class="checkbox-item">
-                      <input type="checkbox" checked={rule.backend_ids.includes(b.id)} onchange={() => toggleBackend(rule, b.id)} />
-                      <span>{b.name ? `${b.name} (${b.address})` : b.address}</span>
-                    </label>
-                  {/each}
-                </div>
-              {/if}
+              <BackendCheckboxList
+                {backends}
+                selected={rule.backend_ids}
+                onToggle={(id) => toggleBackend(rule, id)}
+                showHealth={false}
+              />
             </div>
 
             <!-- Cache override -->
@@ -409,6 +438,20 @@
 
   .btn-delete:hover:not(:disabled) {
     color: var(--color-red);
+  }
+  .btn-delete-confirm {
+    width: auto;
+    padding: 0 0.5rem;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    color: white;
+    background: var(--color-danger, var(--color-red, #dc2626));
+    border-radius: 0.25rem;
+    animation: pulse-arm 1s ease-in-out infinite;
+  }
+  @keyframes pulse-arm {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
   }
 
   .rule-body {

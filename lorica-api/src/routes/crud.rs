@@ -32,6 +32,301 @@ use super::traffic_splits::{build_traffic_split, validate_traffic_splits, Traffi
 /// arithmetic in the token-bucket refill path.
 const RATE_LIMIT_MAX: u32 = 1_000_000;
 
+/// Validate a per-route `GeoIpConfig` for API acceptance. Country
+/// codes must be ISO 3166-1 alpha-2 (two ASCII letters, normalised to
+/// upper). Duplicates are collapsed. Allowlist mode rejects empty
+/// lists so an operator cannot accidentally block everything by
+/// leaving the country list blank after switching modes.
+fn validate_geoip(
+    cfg: &lorica_config::models::GeoIpConfig,
+) -> Result<lorica_config::models::GeoIpConfig, ApiError> {
+    use lorica_config::models::GeoIpMode;
+
+    let mut normalised: Vec<String> = Vec::with_capacity(cfg.countries.len());
+    for raw in &cfg.countries {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.len() != 2 || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Err(ApiError::BadRequest(format!(
+                "geoip.countries: '{trimmed}' is not a valid ISO 3166-1 alpha-2 code"
+            )));
+        }
+        let upper = trimmed.to_ascii_uppercase();
+        if !normalised.contains(&upper) {
+            normalised.push(upper);
+        }
+    }
+
+    if cfg.mode == GeoIpMode::Allowlist && normalised.is_empty() {
+        return Err(ApiError::BadRequest(
+            "geoip.countries: allowlist mode with empty country list would block every request. \
+             Use denylist mode or add at least one country"
+                .into(),
+        ));
+    }
+
+    // Upper bound on the country list so an operator cannot paste a
+    // huge blob. 300 covers every ISO code twice over.
+    const MAX_COUNTRIES: usize = 300;
+    if normalised.len() > MAX_COUNTRIES {
+        return Err(ApiError::BadRequest(format!(
+            "geoip.countries: at most {MAX_COUNTRIES} entries allowed"
+        )));
+    }
+
+    Ok(lorica_config::models::GeoIpConfig {
+        mode: cfg.mode,
+        countries: normalised,
+    })
+}
+
+/// Validate a `BotProtectionConfig` for API acceptance (v1.4.0 Epic
+/// 3 story 3.3). Normalises country codes to uppercase, compiles
+/// user-agent regexes to surface parse errors at write time rather
+/// than on the first request, and bounds every numeric knob so a
+/// hand-crafted JSON blob cannot stash an out-of-spec config that
+/// the request-filter would then have to defend against.
+///
+/// Error messages are plain-English and include the offending
+/// value so the dashboard can surface them directly to the operator.
+fn validate_bot_protection(
+    cfg: &lorica_config::models::BotProtectionConfig,
+) -> Result<lorica_config::models::BotProtectionConfig, ApiError> {
+    use lorica_config::models::{BotBypassRules, BotProtectionConfig};
+
+    // Hard caps matching `lorica_challenge::pow` constants (the
+    // crate constants are not re-exported here to avoid forcing
+    // lorica-api to depend on lorica-challenge at compile time —
+    // the values are tiny and duplicated as named constants below).
+    const COOKIE_TTL_MAX: u32 = 604_800; // 7 days
+    const POW_DIFFICULTY_MIN: u8 = 14;
+    const POW_DIFFICULTY_MAX: u8 = 22;
+    const CAPTCHA_ALPHABET_MIN: usize = 10;
+    const CAPTCHA_ALPHABET_MAX: usize = 128;
+    const MAX_BYPASS_ENTRIES_PER_CATEGORY: usize = 500;
+
+    if cfg.cookie_ttl_s == 0 {
+        return Err(ApiError::BadRequest(
+            "bot_protection.cookie_ttl_s must be > 0".into(),
+        ));
+    }
+    if cfg.cookie_ttl_s > COOKIE_TTL_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "bot_protection.cookie_ttl_s must be <= {COOKIE_TTL_MAX} (7 days)"
+        )));
+    }
+
+    if !(POW_DIFFICULTY_MIN..=POW_DIFFICULTY_MAX).contains(&cfg.pow_difficulty) {
+        return Err(ApiError::BadRequest(format!(
+            "bot_protection.pow_difficulty must be in {POW_DIFFICULTY_MIN}..={POW_DIFFICULTY_MAX}"
+        )));
+    }
+
+    // Captcha alphabet: length bounds, ASCII-printable only, no
+    // duplicates. Same rules as `lorica_challenge::captcha::validate_alphabet`
+    // so the API + crate agree on the contract.
+    let alpha_chars: Vec<char> = cfg.captcha_alphabet.chars().collect();
+    if alpha_chars.len() < CAPTCHA_ALPHABET_MIN {
+        return Err(ApiError::BadRequest(format!(
+            "bot_protection.captcha_alphabet shorter than minimum of \
+             {CAPTCHA_ALPHABET_MIN} characters"
+        )));
+    }
+    if alpha_chars.len() > CAPTCHA_ALPHABET_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "bot_protection.captcha_alphabet longer than maximum of \
+             {CAPTCHA_ALPHABET_MAX} characters"
+        )));
+    }
+    {
+        let mut seen = Vec::<char>::with_capacity(alpha_chars.len());
+        for c in &alpha_chars {
+            if !c.is_ascii_graphic() {
+                return Err(ApiError::BadRequest(
+                    "bot_protection.captcha_alphabet contains non-ASCII-printable \
+                     character (must be ASCII 0x21..=0x7e)"
+                        .into(),
+                ));
+            }
+            if seen.contains(c) {
+                return Err(ApiError::BadRequest(format!(
+                    "bot_protection.captcha_alphabet contains duplicate '{c}'"
+                )));
+            }
+            seen.push(*c);
+        }
+    }
+
+    // Bypass matrix: validate each category independently. All of
+    // these are upper-bounded by a per-category cap so an operator
+    // cannot paste a multi-megabyte blob. Validation is inlined per
+    // category (rather than a shared generic) because each field
+    // carries a different element type (String / u32) and
+    // trimming / normalisation rules.
+    fn check_cap(label: &str, len: usize) -> Result<(), ApiError> {
+        if len > MAX_BYPASS_ENTRIES_PER_CATEGORY {
+            return Err(ApiError::BadRequest(format!(
+                "bot_protection.bypass.{label}: at most \
+                 {MAX_BYPASS_ENTRIES_PER_CATEGORY} entries allowed"
+            )));
+        }
+        Ok(())
+    }
+
+    check_cap("ip_cidrs", cfg.bypass.ip_cidrs.len())?;
+    let mut ip_cidrs: Vec<String> = Vec::with_capacity(cfg.bypass.ip_cidrs.len());
+    for raw in &cfg.bypass.ip_cidrs {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError::BadRequest(
+                "bot_protection.bypass.ip_cidrs: empty entry".into(),
+            ));
+        }
+        if trimmed.parse::<ipnet::IpNet>().is_err() && trimmed.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(ApiError::BadRequest(format!(
+                "bot_protection.bypass.ip_cidrs: '{trimmed}' is not a valid IP or CIDR"
+            )));
+        }
+        ip_cidrs.push(trimmed.to_string());
+    }
+
+    // ASN-based bypass (v1.4.0 Epic 3). Resolver is
+    // `lorica_geoip::AsnResolver` loaded from
+    // `GlobalSettings.asn_db_path`. When the DB is missing at
+    // request time, `asn_handle().lookup_asn()` returns `None` and
+    // the request falls through to the remaining bypass categories
+    // — the config is accepted, it just does not fire until the
+    // operator points `asn_db_path` at an ASN `.mmdb`.
+    check_cap("asns", cfg.bypass.asns.len())?;
+    for n in &cfg.bypass.asns {
+        if *n == 0 {
+            return Err(ApiError::BadRequest(
+                "bot_protection.bypass.asns: 0 is not a valid ASN (IANA reserves 0)".into(),
+            ));
+        }
+    }
+    let asns = cfg.bypass.asns.clone();
+
+    check_cap("countries", cfg.bypass.countries.len())?;
+    let mut countries: Vec<String> = Vec::with_capacity(cfg.bypass.countries.len());
+    for raw in &cfg.bypass.countries {
+        let trimmed = raw.trim();
+        if trimmed.len() != 2 || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Err(ApiError::BadRequest(format!(
+                "bot_protection.bypass.countries: '{trimmed}' is not a valid ISO 3166-1 alpha-2 code"
+            )));
+        }
+        countries.push(trimmed.to_ascii_uppercase());
+    }
+
+    check_cap("user_agents", cfg.bypass.user_agents.len())?;
+    let mut user_agents: Vec<String> = Vec::with_capacity(cfg.bypass.user_agents.len());
+    for raw in &cfg.bypass.user_agents {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError::BadRequest(
+                "bot_protection.bypass.user_agents: empty pattern".into(),
+            ));
+        }
+        regex::Regex::new(trimmed).map_err(|e| {
+            ApiError::BadRequest(format!(
+                "bot_protection.bypass.user_agents: '{trimmed}' is not a valid regex: {e}"
+            ))
+        })?;
+        user_agents.push(trimmed.to_string());
+    }
+
+    // rDNS-based bypass (v1.4.0 Epic 3). Forward-
+    // confirmation is enforced in-process by
+    // `lorica::bot_rdns::RdnsResolver` (resolve PTR then confirm
+    // one of the resulting names forward-resolves back to the
+    // client IP — without this a hostile resolver could trivially
+    // spoof any PTR and bypass).
+    //
+    // Shape rules: printable ASCII, no leading dot, contains at
+    // least one dot (a bare TLD like `com` would match every
+    // `.com` host and is almost always an operator mistake).
+    // Lowercase the suffix for case-insensitive matching against
+    // the resolved host.
+    check_cap("rdns", cfg.bypass.rdns.len())?;
+    let mut rdns: Vec<String> = Vec::with_capacity(cfg.bypass.rdns.len());
+    for raw in &cfg.bypass.rdns {
+        let trimmed = raw.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return Err(ApiError::BadRequest(
+                "bot_protection.bypass.rdns: empty entry".into(),
+            ));
+        }
+        if !trimmed.chars().all(|c| c.is_ascii_graphic()) {
+            return Err(ApiError::BadRequest(format!(
+                "bot_protection.bypass.rdns: '{trimmed}' contains non-ASCII-printable character"
+            )));
+        }
+        if trimmed.starts_with('.') {
+            return Err(ApiError::BadRequest(format!(
+                "bot_protection.bypass.rdns: '{trimmed}' must not start with a dot"
+            )));
+        }
+        // Allow a trailing dot (canonical DNS form) but require at
+        // least two labels. `com` = 0 internal dots → reject.
+        // `com.` = trailing dot only → reject.
+        let no_trail = trimmed.trim_end_matches('.');
+        if !no_trail.contains('.') {
+            return Err(ApiError::BadRequest(format!(
+                "bot_protection.bypass.rdns: '{trimmed}' must contain at least one \
+                 dot (a bare TLD like 'com' would match every `.com` host and \
+                 is almost always a mistake)"
+            )));
+        }
+        rdns.push(trimmed);
+    }
+
+    // only_country: same shape rules as bypass.countries.
+    let only_country = match cfg.only_country.as_ref() {
+        Some(list) => {
+            if list.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "bot_protection.only_country: empty list; use null instead to \
+                     signal 'challenge applies to all traffic'"
+                        .into(),
+                ));
+            }
+            check_cap("only_country", list.len())?;
+            let mut normalised: Vec<String> = Vec::with_capacity(list.len());
+            for raw in list {
+                let trimmed = raw.trim();
+                if trimmed.len() != 2 || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+                    return Err(ApiError::BadRequest(format!(
+                        "bot_protection.only_country: '{trimmed}' is not a valid ISO \
+                         3166-1 alpha-2 code"
+                    )));
+                }
+                normalised.push(trimmed.to_ascii_uppercase());
+            }
+            Some(normalised)
+        }
+        None => None,
+    };
+
+    Ok(BotProtectionConfig {
+        mode: cfg.mode,
+        cookie_ttl_s: cfg.cookie_ttl_s,
+        pow_difficulty: cfg.pow_difficulty,
+        captcha_alphabet: cfg.captcha_alphabet.clone(),
+        bypass: BotBypassRules {
+            ip_cidrs,
+            asns,
+            countries,
+            user_agents,
+            rdns,
+        },
+        only_country,
+    })
+}
+
 /// Validate a `RateLimit` config for API acceptance. Returns the
 /// config unchanged on success, `ApiError::BadRequest` with a clear
 /// message on validation failure.
@@ -135,6 +430,388 @@ mod rate_limit_tests {
     }
 }
 
+#[cfg(test)]
+mod geoip_validation_tests {
+    use super::*;
+    use lorica_config::models::{GeoIpConfig, GeoIpMode};
+
+    fn cfg(mode: GeoIpMode, countries: &[&str]) -> GeoIpConfig {
+        GeoIpConfig {
+            mode,
+            countries: countries.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn normalises_country_case() {
+        let out = validate_geoip(&cfg(GeoIpMode::Denylist, &["us", "Fr", "DE"])).unwrap();
+        assert_eq!(out.countries, vec!["US", "FR", "DE"]);
+    }
+
+    #[test]
+    fn trims_and_dedupes() {
+        // Whitespace padding + duplicate after case-folding.
+        let out = validate_geoip(&cfg(GeoIpMode::Denylist, &[" us ", "US", "fr"])).unwrap();
+        assert_eq!(out.countries, vec!["US", "FR"]);
+    }
+
+    #[test]
+    fn skips_empty_entries() {
+        let out = validate_geoip(&cfg(GeoIpMode::Denylist, &["", "US", "   "])).unwrap();
+        assert_eq!(out.countries, vec!["US"]);
+    }
+
+    #[test]
+    fn rejects_non_alpha2() {
+        match validate_geoip(&cfg(GeoIpMode::Denylist, &["USA"])) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("USA"), "msg={msg}");
+                assert!(msg.contains("alpha-2"), "msg={msg}");
+            }
+            other => panic!("expected BadRequest on 3-letter code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_digits() {
+        assert!(matches!(
+            validate_geoip(&cfg(GeoIpMode::Denylist, &["U1"])),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_allowlist_with_empty_list() {
+        // Allowlist with no countries = block everyone; must be rejected
+        // so the operator sees the mistake at API time instead of at
+        // traffic time.
+        match validate_geoip(&cfg(GeoIpMode::Allowlist, &[])) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("allowlist"), "msg={msg}");
+                assert!(msg.contains("empty"), "msg={msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_denylist_with_empty_list() {
+        // Denylist + empty = "block nobody", legal no-op (equivalent
+        // to `geoip: null`, useful when keeping the row around for
+        // quick re-enable).
+        let out = validate_geoip(&cfg(GeoIpMode::Denylist, &[])).unwrap();
+        assert_eq!(out.mode, GeoIpMode::Denylist);
+        assert!(out.countries.is_empty());
+    }
+
+    #[test]
+    fn rejects_oversize_list() {
+        // 301 distinct ASCII alpha-2 combos would exceed MAX_COUNTRIES.
+        // We cheat by generating synthetic duplicates - dedup kicks
+        // first though, so pad with distinct codes.
+        let mut long: Vec<String> = Vec::with_capacity(301);
+        for a in b'A'..=b'Z' {
+            for b in b'A'..=b'Z' {
+                if long.len() >= 301 {
+                    break;
+                }
+                long.push(format!("{}{}", a as char, b as char));
+            }
+        }
+        assert!(long.len() > 300);
+        let cfg = GeoIpConfig {
+            mode: GeoIpMode::Denylist,
+            countries: long,
+        };
+        match validate_geoip(&cfg) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("at most 300"), "msg={msg}");
+            }
+            other => panic!("expected BadRequest on oversize list, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod bot_protection_validation_tests {
+    use super::*;
+    use lorica_config::models::{BotBypassRules, BotProtectionConfig, BotProtectionMode};
+
+    fn baseline() -> BotProtectionConfig {
+        BotProtectionConfig {
+            mode: BotProtectionMode::Javascript,
+            cookie_ttl_s: 86_400,
+            pow_difficulty: 18,
+            captcha_alphabet: "23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ".to_string(),
+            bypass: BotBypassRules::default(),
+            only_country: None,
+        }
+    }
+
+    #[test]
+    fn accepts_baseline() {
+        validate_bot_protection(&baseline()).expect("defaults must validate");
+    }
+
+    #[test]
+    fn rejects_cookie_ttl_zero() {
+        let mut c = baseline();
+        c.cookie_ttl_s = 0;
+        assert!(matches!(
+            validate_bot_protection(&c),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_cookie_ttl_above_cap() {
+        let mut c = baseline();
+        c.cookie_ttl_s = 604_801;
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("604800"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_difficulty_below_floor() {
+        let mut c = baseline();
+        c.pow_difficulty = 13;
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("14..=22"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_difficulty_above_ceiling() {
+        let mut c = baseline();
+        c.pow_difficulty = 23;
+        assert!(matches!(
+            validate_bot_protection(&c),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_short_alphabet() {
+        let mut c = baseline();
+        c.captcha_alphabet = "abc".to_string();
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("shorter than minimum"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_alphabet_with_duplicates() {
+        let mut c = baseline();
+        c.captcha_alphabet = "aabcdefghij".to_string();
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("duplicate"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_alphabet_with_non_printable() {
+        let mut c = baseline();
+        c.captcha_alphabet = "abcdefghij\t".to_string();
+        assert!(matches!(
+            validate_bot_protection(&c),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_valid_ip_cidr_bypass() {
+        let mut c = baseline();
+        c.bypass.ip_cidrs = vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
+        validate_bot_protection(&c).unwrap();
+    }
+
+    #[test]
+    fn accepts_bare_ip_in_bypass() {
+        // Matches the existing trusted_proxies convention: a bare IP
+        // is a /32 or /128 CIDR.
+        let mut c = baseline();
+        c.bypass.ip_cidrs = vec!["203.0.113.42".to_string()];
+        validate_bot_protection(&c).unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_cidr() {
+        let mut c = baseline();
+        c.bypass.ip_cidrs = vec!["not-a-cidr".to_string()];
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("not a valid IP or CIDR"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_country_code() {
+        let mut c = baseline();
+        c.bypass.countries = vec!["USA".to_string()];
+        assert!(matches!(
+            validate_bot_protection(&c),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn normalises_country_code_to_upper() {
+        let mut c = baseline();
+        c.bypass.countries = vec!["us".to_string(), "Fr".to_string()];
+        let out = validate_bot_protection(&c).unwrap();
+        assert_eq!(out.bypass.countries, vec!["US", "FR"]);
+    }
+
+    #[test]
+    fn rejects_uncompilable_regex() {
+        let mut c = baseline();
+        c.bypass.user_agents = vec!["[unterminated".to_string()];
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("not a valid regex"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_non_empty_rdns_list() {
+        let mut c = baseline();
+        c.bypass.rdns = vec!["GoogleBot.com".to_string(), "search.msn.com".to_string()];
+        let out = validate_bot_protection(&c).expect("non-empty rdns must pass");
+        assert_eq!(out.bypass.rdns, vec!["googlebot.com", "search.msn.com"]);
+    }
+
+    #[test]
+    fn rejects_bare_tld_in_rdns() {
+        let mut c = baseline();
+        c.bypass.rdns = vec!["com".to_string()];
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("bare TLD"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_leading_dot_in_rdns() {
+        let mut c = baseline();
+        c.bypass.rdns = vec![".googlebot.com".to_string()];
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("must not start with a dot"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bare_trailing_dot_tld_in_rdns() {
+        // `com.` is a TLD with canonical trailing dot — still a
+        // bare TLD that would match every .com host.
+        let mut c = baseline();
+        c.bypass.rdns = vec!["com.".to_string()];
+        assert!(matches!(
+            validate_bot_protection(&c),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_empty_rdns_list() {
+        let mut c = baseline();
+        c.bypass.rdns = vec![];
+        validate_bot_protection(&c).expect("empty rdns must pass");
+    }
+
+    #[test]
+    fn rejects_empty_only_country_list() {
+        // Empty Some(vec![]) is a nonsensical shape. None = disabled,
+        // non-empty = scope. The API enforces one of the two to avoid
+        // silent UI states.
+        let mut c = baseline();
+        c.only_country = Some(vec![]);
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("empty list"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalises_only_country_codes() {
+        let mut c = baseline();
+        c.only_country = Some(vec!["fr".to_string(), "DE".to_string()]);
+        let out = validate_bot_protection(&c).unwrap();
+        assert_eq!(
+            out.only_country,
+            Some(vec!["FR".to_string(), "DE".to_string()])
+        );
+    }
+
+    #[test]
+    fn caps_bypass_categories_at_500_entries() {
+        let mut c = baseline();
+        c.bypass.ip_cidrs = (0..501).map(|i| format!("10.0.{i}.0/24")).collect();
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("at most 500"), "msg={msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_non_empty_asn_list() {
+        // Now that the ASN resolver shipped, non-empty lists are
+        // a legal config. The resolver runs lookups at request time;
+        // an absent ASN DB makes the bypass a silent no-op.
+        let mut c = baseline();
+        c.bypass.asns = vec![15169, 8075];
+        let out = validate_bot_protection(&c).expect("non-empty asns must pass");
+        assert_eq!(out.bypass.asns, vec![15169, 8075]);
+    }
+
+    #[test]
+    fn rejects_zero_asn() {
+        // ASN 0 is IANA-reserved; allowing it in a bypass list would
+        // be a misconfiguration that silently never matches (the DB
+        // never returns 0 for a real IP).
+        let mut c = baseline();
+        c.bypass.asns = vec![0];
+        match validate_bot_protection(&c) {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("IANA reserves 0"), "msg={msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_empty_asn_list() {
+        let mut c = baseline();
+        c.bypass.asns = vec![];
+        validate_bot_protection(&c).expect("empty asns must pass");
+    }
+}
+
 /// Full JSON view of a route returned by list / get / create / update endpoints.
 #[derive(Serialize)]
 pub struct RouteResponse {
@@ -207,6 +884,10 @@ pub struct RouteResponse {
     pub mtls: Option<MtlsConfigRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<lorica_config::models::RateLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geoip: Option<lorica_config::models::GeoIpConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -277,6 +958,8 @@ pub struct CreateRouteRequest {
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
     pub mtls: Option<MtlsConfigRequest>,
     pub rate_limit: Option<lorica_config::models::RateLimit>,
+    pub geoip: Option<lorica_config::models::GeoIpConfig>,
+    pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
 }
 
 /// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are mutated.
@@ -357,6 +1040,25 @@ pub struct UpdateRouteRequest {
     /// `capacity = 0` = clear; present with `capacity > 0` =
     /// validate + install/replace.
     pub rate_limit: Option<lorica_config::models::RateLimit>,
+    /// Update semantics: missing = leave alone; present with empty
+    /// `countries` list = clear; present with non-empty = validate
+    /// (ISO 3166-1 alpha-2 codes only) + install / replace. When
+    /// `mode = Allowlist` an empty list is rejected at validation
+    /// time so the operator cannot accidentally block everything.
+    pub geoip: Option<lorica_config::models::GeoIpConfig>,
+    /// Update semantics: missing = leave alone; present = validate +
+    /// install/replace. See story 3.3 for the validation rules.
+    /// To CLEAR an existing config (toggle bot-protection off on
+    /// a route that already had it configured), set
+    /// `bot_protection_disable: true`. Without this boolean the
+    /// axum JSON layer cannot distinguish "absent field" from
+    /// "field explicitly set to null", so a clear-by-null scheme
+    /// would be brittle. The boolean + config-struct pair keeps
+    /// the three cases orthogonal: neither sent = no-op, config
+    /// sent = install, disable=true = clear.
+    pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
+    #[serde(default)]
+    pub bot_protection_disable: Option<bool>,
 }
 
 fn route_to_response(
@@ -505,6 +1207,8 @@ fn route_to_response(
             allowed_organizations: m.allowed_organizations.clone(),
         }),
         rate_limit: route.rate_limit.clone(),
+        geoip: route.geoip.clone(),
+        bot_protection: route.bot_protection.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
@@ -654,6 +1358,17 @@ pub async fn create_route(
         },
         rate_limit: match body.rate_limit.as_ref() {
             Some(rl) => Some(validate_rate_limit(rl)?),
+            None => None,
+        },
+        geoip: match body.geoip.as_ref() {
+            // Empty country list in denylist mode is legal (means "no
+            // countries blocked"), but allowlist with empty list is
+            // rejected by `validate_geoip`.
+            Some(g) => Some(validate_geoip(g)?),
+            None => None,
+        },
+        bot_protection: match body.bot_protection.as_ref() {
+            Some(b) => Some(validate_bot_protection(b)?),
             None => None,
         },
         created_at: now,
@@ -1005,6 +1720,29 @@ pub async fn update_route(
         } else {
             route.rate_limit = Some(validate_rate_limit(rl)?);
         }
+    }
+    if let Some(ref g) = body.geoip {
+        // Empty country list in allowlist mode is rejected by
+        // `validate_geoip`; empty list in denylist mode is legal and
+        // means "filter disabled for this route". Empty list in
+        // denylist mode also clears the `geoip` column on disk.
+        use lorica_config::models::GeoIpMode;
+        if g.mode == GeoIpMode::Denylist && g.countries.is_empty() {
+            route.geoip = None;
+        } else {
+            route.geoip = Some(validate_geoip(g)?);
+        }
+    }
+    if body.bot_protection_disable == Some(true) {
+        // Explicit clear signal from the dashboard when the
+        // operator toggles bot-protection OFF on a route that
+        // previously had a config. Mutually exclusive with
+        // sending a new `bot_protection` body (would be a
+        // contradiction — `disable` wins so the API contract
+        // stays predictable).
+        route.bot_protection = None;
+    } else if let Some(ref b) = body.bot_protection {
+        route.bot_protection = Some(validate_bot_protection(b)?);
     }
     route.updated_at = Utc::now();
 

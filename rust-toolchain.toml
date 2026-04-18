@@ -1,0 +1,22 @@
+# Single source of truth for the Rust toolchain used by BOTH local
+# development and GitHub Actions CI. Pinning a specific version
+# (rather than `stable`) avoids the local-vs-CI drift we hit when
+# the stable channel bumped to 1.95 and a new `clippy::unnecessary_
+# sort_by` lint fired in CI while the local rust:1-bookworm image
+# still shipped the older stable.
+#
+# Bump on our own schedule:
+#   1. update `channel` below
+#   2. run `cargo clippy --workspace -- -D warnings` + test suite
+#      in the same Docker image
+#   3. commit
+#
+# rustup honours this file automatically, so `cargo clippy` / `cargo
+# test` inside `rust:1-bookworm` will auto-install the pinned
+# version on first use. CI uses `actions-rust-lang/setup-rust-
+# toolchain@v1` which reads the same file.
+
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

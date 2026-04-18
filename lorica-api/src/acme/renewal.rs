@@ -122,6 +122,7 @@ pub fn spawn_renewal_task(
                             warn!(old_id = %cert.id, error = %e, "failed to delete old certificate after renewal");
                         }
                         drop(store);
+                        state.rotate_bot_hmac_on_cert_event().await;
                         state.notify_config_changed();
                         info!(
                             domain = %cert.domain,
@@ -193,6 +194,7 @@ pub async fn renew_certificate(
             tracing::warn!(old_id = %cert.id, error = %e, "failed to delete old certificate after renewal");
         }
     }
+    state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
     tracing::info!(

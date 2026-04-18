@@ -40,6 +40,14 @@ pub struct UpdateSettingsRequest {
     pub waf_whitelist_ips: Option<Vec<String>>,
     pub connection_deny_cidrs: Option<Vec<String>>,
     pub connection_allow_cidrs: Option<Vec<String>>,
+    pub otlp_endpoint: Option<String>,
+    pub otlp_protocol: Option<String>,
+    pub otlp_service_name: Option<String>,
+    pub otlp_sampling_ratio: Option<f64>,
+    pub geoip_db_path: Option<String>,
+    pub geoip_auto_update_enabled: Option<bool>,
+    pub asn_db_path: Option<String>,
+    pub asn_auto_update_enabled: Option<bool>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -193,11 +201,241 @@ pub async fn update_settings(
         validate_cidr_list(cidrs, "connection_allow_cidrs")?;
         settings.connection_allow_cidrs = cidrs.clone();
     }
+    if let Some(ref endpoint) = body.otlp_endpoint {
+        let trimmed = endpoint.trim();
+        if trimmed.is_empty() {
+            settings.otlp_endpoint = None;
+        } else {
+            // Validate scheme + host to reject malformed input.
+            // RFC-1918 / loopback targets are NOT blocked because
+            // internal collectors (docker-compose, k8s sidecar) are
+            // the primary deployment pattern and the API is auth-gated.
+            let is_https = trimmed.starts_with("https://");
+            let is_http = trimmed.starts_with("http://");
+            if !is_http && !is_https {
+                return Err(ApiError::BadRequest(
+                    "otlp_endpoint must start with http:// or https://".into(),
+                ));
+            }
+            let after_scheme = if is_https {
+                &trimmed[8..]
+            } else {
+                &trimmed[7..]
+            };
+            if after_scheme.is_empty()
+                || after_scheme.starts_with('/')
+                || after_scheme.starts_with(':')
+            {
+                return Err(ApiError::BadRequest(
+                    "otlp_endpoint must contain a hostname after the scheme".into(),
+                ));
+            }
+            if trimmed.len() > 2048 {
+                return Err(ApiError::BadRequest(
+                    "otlp_endpoint too long (> 2048 chars)".into(),
+                ));
+            }
+            if is_http {
+                tracing::warn!(
+                    endpoint = %trimmed,
+                    "OTLP endpoint uses plaintext HTTP; trace data \
+                     (URLs, IPs, error messages) will transit in cleartext. \
+                     Use https:// in production."
+                );
+            }
+            settings.otlp_endpoint = Some(trimmed.to_string());
+        }
+    }
+    if let Some(ref protocol) = body.otlp_protocol {
+        let valid = ["grpc", "http-proto", "http-json"];
+        if !valid.contains(&protocol.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "invalid otlp_protocol: {protocol}. Must be one of: {valid:?}"
+            )));
+        }
+        settings.otlp_protocol = protocol.clone();
+    }
+    if let Some(ref name) = body.otlp_service_name {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.len() > 256 {
+            return Err(ApiError::BadRequest(
+                "otlp_service_name must be 1-256 characters".into(),
+            ));
+        }
+        settings.otlp_service_name = trimmed.to_string();
+    }
+    if let Some(ratio) = body.otlp_sampling_ratio {
+        if !(0.0..=1.0).contains(&ratio) || !ratio.is_finite() {
+            return Err(ApiError::BadRequest(
+                "otlp_sampling_ratio must be a finite number in 0.0..=1.0".into(),
+            ));
+        }
+        settings.otlp_sampling_ratio = ratio;
+    }
+    if let Some(ref path) = body.geoip_db_path {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            settings.geoip_db_path = None;
+        } else {
+            if !trimmed.starts_with('/') {
+                return Err(ApiError::BadRequest(
+                    "geoip_db_path must be an absolute path (starting with '/')".into(),
+                ));
+            }
+            if trimmed.len() > 4096 {
+                return Err(ApiError::BadRequest(
+                    "geoip_db_path too long (> 4096 chars)".into(),
+                ));
+            }
+            // Reject path traversal components. The path is operator-
+            // supplied via the authenticated API, but defence-in-depth
+            // prevents accidentally writing outside /var/lib/lorica.
+            if trimmed.contains("/../") || trimmed.ends_with("/..") {
+                return Err(ApiError::BadRequest(
+                    "geoip_db_path must not contain path traversal (../)".into(),
+                ));
+            }
+            settings.geoip_db_path = Some(trimmed.to_string());
+        }
+    }
+    if let Some(auto_update) = body.geoip_auto_update_enabled {
+        settings.geoip_auto_update_enabled = auto_update;
+    }
+    if let Some(ref path) = body.asn_db_path {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            settings.asn_db_path = None;
+        } else {
+            if !trimmed.starts_with('/') {
+                return Err(ApiError::BadRequest(
+                    "asn_db_path must be an absolute path (starting with '/')".into(),
+                ));
+            }
+            if trimmed.len() > 4096 {
+                return Err(ApiError::BadRequest(
+                    "asn_db_path too long (> 4096 chars)".into(),
+                ));
+            }
+            if trimmed.contains("/../") || trimmed.ends_with("/..") {
+                return Err(ApiError::BadRequest(
+                    "asn_db_path must not contain path traversal (../)".into(),
+                ));
+            }
+            settings.asn_db_path = Some(trimmed.to_string());
+        }
+    }
+    if let Some(auto_update) = body.asn_auto_update_enabled {
+        settings.asn_auto_update_enabled = auto_update;
+    }
 
     store.update_global_settings(&settings)?;
     drop(store);
     state.notify_config_changed();
     Ok(json_data(settings))
+}
+
+/// POST /api/v1/settings/otel/test - probe the currently-persisted
+/// OTLP endpoint for reachability. Used by the dashboard's
+/// "Test connection" button. Does NOT mutate state; does NOT
+/// re-init the OTel provider. Just opens a plain HTTP(S)
+/// connection to the endpoint's `/v1/traces` path (for http-proto
+/// / http-json) or to the base URL (grpc — we cannot speak the
+/// HTTP/2 gRPC preamble from reqwest so "TCP open" is all we
+/// assert) and reports status + round-trip latency.
+///
+/// Any HTTP status code (including 4xx and 5xx) counts as
+/// "reachable" — the collector is answering, even if it does not
+/// like our empty request. Connection refused, DNS failure or
+/// timeout count as "unreachable".
+pub async fn test_otel_connection(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use std::time::{Duration, Instant};
+
+    let store = state.store.lock().await;
+    let settings = store.get_global_settings()?;
+    drop(store);
+
+    let endpoint = settings
+        .otlp_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(endpoint) = endpoint else {
+        return Ok(json_data(serde_json::json!({
+            "ok": false,
+            "message": "otlp_endpoint is not set; save a collector URL first.",
+        })));
+    };
+
+    // Compose the probe URL: for HTTP transports collectors
+    // canonically expose `/v1/traces`. For gRPC we just hit the
+    // base URL — the plain HTTP client will get a protocol error
+    // from the gRPC listener, which still means "TCP is open".
+    let protocol = settings.otlp_protocol.as_str();
+    let probe_url = match protocol {
+        "http-proto" | "http-json" => {
+            let trimmed = endpoint.trim_end_matches('/');
+            if trimmed.ends_with("/v1/traces") {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/v1/traces")
+            }
+        }
+        _ => endpoint.to_string(),
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(json_data(serde_json::json!({
+                "ok": false,
+                "message": format!("reqwest client build failed: {e}"),
+            })));
+        }
+    };
+
+    let start = Instant::now();
+    // A minimal empty POST is the most representative probe: real
+    // traffic is also POST. Collectors reject it with 400 / 415
+    // (wrong content type) which still proves reachability.
+    let result = client
+        .post(&probe_url)
+        .header("Content-Type", "application/x-protobuf")
+        .body(Vec::<u8>::new())
+        .send()
+        .await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    let payload = match result {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let detail = if status >= 400 {
+                format!(
+                    "collector responded (HTTP {status}); \
+                     endpoint is reachable but rejected the probe - \
+                     check authentication or content-type settings"
+                )
+            } else {
+                format!("reachable (HTTP {status})")
+            };
+            serde_json::json!({
+                "ok": true,
+                "message": detail,
+                "latency_ms": latency_ms,
+            })
+        }
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "message": format!("unreachable: {e}"),
+            "latency_ms": latency_ms,
+        }),
+    };
+
+    Ok(json_data(payload))
 }
 
 fn validate_cidr_list(entries: &[String], field: &str) -> Result<(), ApiError> {

@@ -48,7 +48,10 @@ async function request<T>(
   }
 
   if (!res.ok) {
-    return { error: (json.error as ApiError) ?? { code: 'unknown', message: res.statusText } };
+    const err = json.error && typeof json.error === 'object' && 'code' in json.error
+      ? (json.error as ApiError)
+      : { code: 'unknown', message: res.statusText };
+    return { error: err };
   }
   return { data: json.data as T };
 }
@@ -163,6 +166,8 @@ export interface RouteResponse {
   response_rewrite?: ResponseRewriteConfigResponse | null;
   mtls?: MtlsConfigResponse | null;
   rate_limit?: RateLimitConfig | null;
+  geoip?: GeoIpConfig | null;
+  bot_protection?: BotProtectionConfig | null;
   created_at: string;
   updated_at: string;
 }
@@ -173,6 +178,32 @@ export interface RateLimitConfig {
   capacity: number;
   refill_per_sec: number;
   scope: RateLimitScope;
+}
+
+export type GeoIpMode = 'allowlist' | 'denylist';
+
+export interface GeoIpConfig {
+  mode: GeoIpMode;
+  countries: string[];
+}
+
+export type BotProtectionMode = 'cookie' | 'javascript' | 'captcha';
+
+export interface BotBypassRules {
+  ip_cidrs?: string[];
+  asns?: number[];
+  countries?: string[];
+  user_agents?: string[];
+  rdns?: string[];
+}
+
+export interface BotProtectionConfig {
+  mode: BotProtectionMode;
+  cookie_ttl_s: number;
+  pow_difficulty: number;
+  captcha_alphabet: string;
+  bypass: BotBypassRules;
+  only_country?: string[] | null;
 }
 
 export interface HeaderRuleResponse {
@@ -331,6 +362,8 @@ export interface CreateRouteRequest {
   response_rewrite?: ResponseRewriteConfigRequest;
   mtls?: MtlsConfigRequest;
   rate_limit?: RateLimitConfig;
+  geoip?: GeoIpConfig;
+  bot_protection?: BotProtectionConfig;
 }
 
 
@@ -396,6 +429,13 @@ export interface UpdateRouteRequest {
   response_rewrite?: ResponseRewriteConfigRequest;
   mtls?: MtlsConfigRequest;
   rate_limit?: RateLimitConfig;
+  geoip?: GeoIpConfig;
+  bot_protection?: BotProtectionConfig;
+  /// Explicit "clear" flag on update PUT: wipes the existing
+  /// `bot_protection` column. Omitting the flag AND omitting
+  /// `bot_protection` leaves the stored value alone - the
+  /// "missing = no-op" contract preserved for every other field.
+  bot_protection_disable?: boolean;
 }
 
 export interface BackendResponse {
@@ -493,15 +533,24 @@ export interface LogsQuery {
   after_id?: number;
 }
 
+export interface DiskUsage {
+  mount_point: string;
+  total_bytes: number;
+  used_bytes: number;
+  usage_percent: number;
+}
+
 export interface HostMetrics {
   cpu_usage_percent: number;
   cpu_count: number;
   memory_total_bytes: number;
   memory_used_bytes: number;
   memory_usage_percent: number;
-  disk_total_bytes: number;
-  disk_used_bytes: number;
-  disk_usage_percent: number;
+  /// Root filesystem (`/`). `null` when sysinfo cannot read it.
+  disk_root: DiskUsage | null;
+  /// Filesystem holding the Lorica data-dir (typically `/var/lib/lorica`).
+  /// Same mount as `disk_root` on a single-disk host.
+  disk_data: DiskUsage | null;
 }
 
 export interface ProcessMetrics {
@@ -547,6 +596,16 @@ export interface GlobalSettingsResponse {
   waf_whitelist_ips: string[];
   connection_deny_cidrs: string[];
   connection_allow_cidrs: string[];
+  // Observability (v1.4.0 OTel). Empty endpoint = exporter off.
+  otlp_endpoint?: string | null;
+  otlp_protocol?: string;
+  otlp_service_name?: string;
+  otlp_sampling_ratio?: number;
+  // GeoIP + ASN DBs. Empty path = feature off.
+  geoip_db_path?: string | null;
+  geoip_auto_update_enabled?: boolean;
+  asn_db_path?: string | null;
+  asn_auto_update_enabled?: boolean;
 }
 
 export interface UpdateSettingsRequest {
@@ -568,6 +627,24 @@ export interface UpdateSettingsRequest {
   waf_whitelist_ips?: string[];
   connection_deny_cidrs?: string[];
   connection_allow_cidrs?: string[];
+  otlp_endpoint?: string | null;
+  otlp_protocol?: string;
+  otlp_service_name?: string;
+  otlp_sampling_ratio?: number;
+  geoip_db_path?: string | null;
+  geoip_auto_update_enabled?: boolean;
+  asn_db_path?: string | null;
+  asn_auto_update_enabled?: boolean;
+}
+
+/// Result of the "Test connection" probe on the OTel settings
+/// section. The backend mints a canary span with the
+/// currently-configured endpoint + protocol and reports whether
+/// the collector accepted it.
+export interface OtelTestResponse {
+  ok: boolean;
+  message: string;
+  latency_ms?: number;
 }
 
 export interface NotificationConfigResponse {
@@ -745,6 +822,14 @@ export const api = {
 
   updateSettings: (body: UpdateSettingsRequest) =>
     request<GlobalSettingsResponse>('PUT', '/settings', body),
+
+  // Mint a single canary OTel span via the CURRENTLY persisted
+  // `otlp_endpoint` + `otlp_protocol`. Used by the "Test
+  // connection" button on the Observability settings section so
+  // the operator sees "collector reachable" before saving a
+  // change. Does not mutate state.
+  testOtel: () =>
+    request<OtelTestResponse>('POST', '/settings/otel/test', {}),
 
   // Notifications
   listNotifications: () =>

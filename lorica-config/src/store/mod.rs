@@ -25,6 +25,7 @@ use crate::crypto::EncryptionKey;
 use crate::error::{ConfigError, Result};
 
 mod backends;
+pub mod bot_stash;
 mod certs;
 mod dns_providers;
 mod loadtest;
@@ -559,6 +560,74 @@ impl ConfigStore {
         let _ = self.conn.execute(
             "ALTER TABLE routes ADD COLUMN rate_limit TEXT DEFAULT NULL",
             [],
+        );
+
+        // V34: per-route GeoIP country filter (v1.4.0 Epic 2 story 2.2).
+        // JSON blob or NULL (feature off by default). Schema:
+        //   { "mode": "allowlist" | "denylist",
+        //     "countries": ["FR", "DE", ...] }
+        // The supervisor's shared-memory `.mmdb` reader (loaded from
+        // `GlobalSettings.geoip_db_path`) is the lookup source; a NULL
+        // column skips the GeoIP check entirely for that route.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE routes ADD COLUMN geoip TEXT DEFAULT NULL", []);
+
+        // V35: per-route bot-protection challenge (v1.4.0 Epic 3
+        // story 3.3). JSON blob or NULL (feature off by default).
+        // Schema: serde-serialised `BotProtectionConfig` with mode,
+        // cookie_ttl_s, pow_difficulty, captcha_alphabet, bypass
+        // (ip_cidrs / asns / countries / user_agents / rdns), and
+        // only_country. NULL column = request_filter skips the
+        // bot-protection stage for this route.
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN bot_protection TEXT DEFAULT NULL",
+            [],
+        );
+
+        // V36: cross-worker bot-protection pending-challenge stash
+        // (v1.4.0 Epic 3 follow-up closing the per-worker-stash
+        // deferred item). Each row = one pending PoW or captcha
+        // challenge waiting for the client to solve. SQLite-backed
+        // so a client solving on worker A can submit on worker B;
+        // the DELETE RETURNING on take() gives atomic "first solver
+        // wins" semantics across workers without any RPC.
+        //   - nonce (hex): primary key, 32 chars for PoW / 32 for
+        //     captcha. Generated with `OsRng`, unpredictable.
+        //   - kind: "pow" or "captcha" — deserialise dispatch key.
+        //   - payload: JSON blob of the mode-specific fields.
+        //     PoW: { nonce_hex, difficulty }; captcha:
+        //     { expected_text } (PNG bytes are stored in the
+        //     separate `png_bytes` column for binary efficiency).
+        //   - mode: numeric value of `lorica_challenge::Mode`
+        //     (1 = Cookie, 2 = Javascript, 3 = Captcha) so the
+        //     verdict cookie payload can be rebuilt.
+        //   - route_id: the route_id the cookie will be bound to.
+        //   - ip_prefix_disc + ip_prefix_bytes: client IP prefix
+        //     (/24 or /64) so the solve handler rejects a network
+        //     change mid-challenge.
+        //   - return_url: where the client bounces to on success.
+        //   - cookie_ttl_s: u32, copied from the route config at
+        //     stash time so a route edit between stash+solve does
+        //     not re-sign cookies with an unexpected TTL.
+        //   - expires_at: UNIX seconds, stash-time + 5 min.
+        //   - png_bytes: captcha image BLOB. NULL for PoW entries.
+        let _ = self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bot_pending_challenges (
+                nonce TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                mode INTEGER NOT NULL,
+                route_id TEXT NOT NULL,
+                ip_prefix_disc INTEGER NOT NULL,
+                ip_prefix_bytes BLOB NOT NULL,
+                return_url TEXT NOT NULL,
+                cookie_ttl_s INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                png_bytes BLOB
+            );
+             CREATE INDEX IF NOT EXISTS idx_bot_pending_expires_at
+                ON bot_pending_challenges(expires_at);",
         );
 
         Ok(())

@@ -34,10 +34,10 @@ pub use channel::CommandChannel;
 pub use messages::{
     command, envelope, response, BackendConnEntry, BanReportEntry, BreakerDecision, BreakerQuery,
     BreakerReport, BreakerResult, Command, CommandType, ConfigReloadAbort, ConfigReloadCommit,
-    ConfigReloadPrepare, Envelope, EwmaReportEntry, ForwardAuthHeader, MetricsReport,
-    RateLimitDelta, RateLimitDeltaResult, RateLimitEntry, RateLimitQuery, RateLimitResult,
-    RateLimitSnapshot, RequestCountEntry, Response, ResponseStatus, Verdict, VerdictLookup,
-    VerdictPush, VerdictResult, WafCountEntry,
+    ConfigReloadPrepare, Envelope, EwmaReportEntry, ForwardAuthHeader, GenericCounterEntry,
+    MetricsReport, RateLimitDelta, RateLimitDeltaResult, RateLimitEntry, RateLimitQuery,
+    RateLimitResult, RateLimitSnapshot, RequestCountEntry, Response, ResponseStatus, Verdict,
+    VerdictLookup, VerdictPush, VerdictResult, WafCountEntry,
 };
 pub use rpc::{IncomingCommand, IncomingCommands, RpcEndpoint, DEFAULT_REQUEST_TIMEOUT};
 
