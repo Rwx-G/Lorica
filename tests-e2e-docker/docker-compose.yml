@@ -243,6 +243,7 @@ services:
       - LORICA_API=http://lorica-otel-workers:9443
       - LORICA_PROXY=http://lorica-otel-workers:8080
       - JAEGER_QUERY=http://jaeger-workers:16686
+      - OTLP_ENDPOINT=http://jaeger-workers:4318
       - BACKEND1_ADDR=backend1:80
     networks:
       - e2e

@@ -31,6 +31,11 @@ source "$SCRIPT_DIR/helpers.sh"
 API="${LORICA_API}"
 PROXY="${LORICA_PROXY}"
 JAEGER="${JAEGER_QUERY:-http://jaeger:16686}"
+# OTLP ingest endpoint Lorica exports to. Must match the Jaeger
+# instance the smoke queries (JAEGER_QUERY). The two OTel profiles
+# use DIFFERENT Jaeger service names (`jaeger` vs `jaeger-workers`)
+# so the compose file overrides this for the workers profile.
+OTLP_ENDPOINT="${OTLP_ENDPOINT:-http://jaeger:4318}"
 BACKEND1="${BACKEND1_ADDR}"
 
 # Fixed W3C trace id so the Jaeger query has a deterministic target.
@@ -114,13 +119,13 @@ ok "session ready"
 
 # --- Configure OTel settings ---
 log "=== OTel smoke: configure OTLP endpoint ==="
-OTEL_UPDATE=$(api_put /api/v1/settings '{
-    "otlp_endpoint": "http://jaeger:4318",
-    "otlp_protocol": "http-proto",
-    "otlp_service_name": "lorica",
-    "otlp_sampling_ratio": 1.0
-}')
-assert_json "$OTEL_UPDATE" '.data.otlp_endpoint' 'http://jaeger:4318' 'otlp_endpoint persisted'
+OTEL_UPDATE=$(api_put /api/v1/settings "{
+    \"otlp_endpoint\": \"${OTLP_ENDPOINT}\",
+    \"otlp_protocol\": \"http-proto\",
+    \"otlp_service_name\": \"lorica\",
+    \"otlp_sampling_ratio\": 1.0
+}")
+assert_json "$OTEL_UPDATE" '.data.otlp_endpoint' "${OTLP_ENDPOINT}" 'otlp_endpoint persisted'
 # API encoder emits f64 1.0 as JSON `1.0` (serde_json + ryu), the DB
 # now uses `{:?}` format so the stored string is `"1.0"` too. jq's
 # `-r` on a JSON integer-valued float will strip the decimal down
@@ -191,13 +196,12 @@ fi
 # service is kept as a regression guard for the previous
 # (broken) behaviour.
 log "waiting for span export to Jaeger..."
-# BatchSpanProcessor default schedule_delay = 5 s. A worker-forked
-# runtime needs at least one tick to flush. Plus Jaeger's ingest
-# pipeline adds a second or two. 30 s was too tight under multi-
-# worker fan-out; 90 s covers 18 BatchSpanProcessor ticks and still
-# short-circuits as soon as the span lands.
+# BatchSpanProcessor default schedule_delay = 5 s. Single-process
+# usually lands the span in ~2 s, worker mode in ~5 s. 30 s is a
+# comfortable ceiling; the loop short-circuits as soon as the span
+# shows up.
 TRACE_JSON=""
-for i in $(seq 1 90); do
+for i in $(seq 1 30); do
     BYID=$(curl -sf "${JAEGER}/api/traces/${CLIENT_TRACE_ID}" 2>/dev/null || echo '{}')
     if echo "$BYID" | jq -e '.data[0].spans | length > 0' >/dev/null 2>&1; then
         TRACE_JSON="$BYID"
@@ -208,7 +212,7 @@ for i in $(seq 1 90); do
 done
 
 if [ -z "$TRACE_JSON" ]; then
-    fail "no trace with id ${CLIENT_TRACE_ID} in Jaeger after 90 s"
+    fail "no trace with id ${CLIENT_TRACE_ID} in Jaeger after 30 s"
     LIST=$(curl -sf "${JAEGER}/api/traces?service=lorica&limit=5" 2>/dev/null || echo '{}')
     echo "Fallback: traces for service=lorica follow (for debug):"
     echo "$LIST" | jq -r '.data[].traceID' | head -5
