@@ -1,0 +1,42 @@
+# cargo-audit configuration. Read automatically by `cargo audit` when
+# run from the workspace root (no CLI flag needed - the same call the
+# GitHub Actions CI job runs).
+
+[advisories]
+# Two advisories in rustls-webpki 0.101.7 that only affect the
+# OPTIONAL `route53` feature (ACME DNS-01 via Amazon Route 53).
+# Default builds do not pull this chain.
+#
+# - RUSTSEC-2026-0098 "Name constraints for URI names were
+#   incorrectly accepted"
+# - RUSTSEC-2026-0099 "Name constraints were accepted for
+#   certificates asserting a wildcard name"
+#
+# Dependency path: rustls-webpki 0.101.7 <- rustls 0.21.12 <-
+# tokio-rustls 0.24.1 <- hyper-rustls 0.24.2 <- aws-smithy-http-
+# client 1.1.12 <- aws-sdk-route53 1.110.0 / aws-sdk-sts 1.101.0
+# <- aws-config 1.8.15 <- lorica-api (only when the `route53`
+# feature is enabled).
+#
+# Upstream status (checked 2026-04-18): aws-smithy-http-client
+# 1.1.12 is the current stable and still pins rustls 0.21. There
+# is no published aws-sdk-* release that uses rustls 0.23 yet.
+#
+# Runtime exposure:
+# - Lorica uses the AWS SDK exclusively to drive Route 53 Change-
+#   Batch API calls for ACME DNS-01 solving. The only peer whose
+#   certificate we validate is `route53.amazonaws.com`, which
+#   presents a well-known certificate chain with no wildcard or
+#   URI-name constraints that the two advisories could mis-classify.
+# - No user-controlled hostname or user-controlled certificate is
+#   ever validated by this chain.
+# - The vulnerability requires a specially-crafted CA that the
+#   Route 53 endpoint does not ship and cannot be induced to ship.
+#
+# Revisit on every `cargo update` touching the AWS SDK: when
+# aws-smithy-http-client switches to rustls 0.23 (tracked upstream
+# in awslabs/smithy-rs), remove both entries.
+ignore = [
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+]
