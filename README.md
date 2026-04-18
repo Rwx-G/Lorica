@@ -488,6 +488,39 @@ cd lorica-dashboard/frontend && npx vitest run
 | Frontend (vitest / svelte-check) | 178 | Form validation, type safety, component wiring |
 | **Total shipping tests** | **1553** | |
 
+#### Docker end-to-end suites
+
+`tests-e2e-docker/` spins Lorica up against real backend containers
+and drives 400+ assertions through the actual network stack:
+
+```bash
+cd tests-e2e-docker
+./run.sh                                    # single-process (315 asserts) + workers mode (86)
+docker compose --profile bot run --rm bot-smoke                   # 33 asserts - graded bot challenge
+docker compose --profile geoip run --rm geoip-smoke               # 16 asserts - country allow/deny
+docker compose --profile rdns run --rm rdns-smoke                 # 8  asserts - forward-confirmed rDNS bypass
+docker compose --profile otel run --rm otel-smoke                 # 15 asserts - OTLP + W3C + log/trace correlation
+docker compose --profile otel-workers run --rm otel-smoke-workers # 15 asserts - same under --workers 2
+```
+
+The two intentional gaps in the Docker harness are:
+
+- **mTLS client-cert handshake** (495 / 496 / 200 based on the
+  presented cert). The e2e container starts without any TLS certs
+  pre-loaded so the HTTPS listener on port 8443 is never built -
+  driving `curl --cert` needs a staged environment. The config
+  surface (CA PEM validation, `required` + `allowed_organizations`
+  hot-reload) is covered.
+- **Connection pre-filter TCP drop** (scanner IP refused at
+  `accept()` before TLS). The test-runner sits on the same Docker
+  network as Lorica, so any CIDR that would cover a real scanner
+  also covers the runner - asserting the drop from inside would be
+  self-blocking. The config round-trip (valid CIDR accepted, garbage
+  rejected 400) is covered.
+
+Validate both manually on staging when touching the surrounding
+code paths.
+
 ## systemd Service
 
 The `.deb` and `.rpm` packages install a hardened systemd unit with:
