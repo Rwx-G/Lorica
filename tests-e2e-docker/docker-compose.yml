@@ -18,6 +18,7 @@ services:
       - backend2
       - backend-tls
       - backend-h2
+      - auth-svc
     networks:
       - e2e
 
@@ -32,6 +33,7 @@ services:
     depends_on:
       - backend1
       - backend2
+      - auth-svc
     networks:
       - e2e
 
@@ -72,6 +74,21 @@ services:
     networks:
       - e2e
 
+  # Mock forward-auth service. Reuses the shared Python backend but
+  # with FORWARD_AUTH_MODE=1 so every request is gated by a Bearer
+  # token check. Used by the forward_auth e2e test (TESTING-GUIDE #4)
+  # and the cross-worker verdict cache test (#11).
+  auth-svc:
+    build:
+      context: ./backend
+    environment:
+      - BACKEND_ID=auth-svc
+      - LISTEN_PORT=80
+      - FORWARD_AUTH_MODE=1
+      - AUTH_TOKEN=good-token
+    networks:
+      - e2e
+
   test-runner:
     build:
       context: ./test-runner
@@ -87,6 +104,7 @@ services:
       - BACKEND2_ADDR=backend2:80
       - BACKEND_TLS_ADDR=backend-tls:443
       - BACKEND_H2_ADDR=backend-h2:80
+      - AUTH_SVC_ADDR=auth-svc:80
     networks:
       - e2e
 
@@ -96,6 +114,7 @@ services:
     entrypoint: ["bash", "run-tests-workers.sh"]
     depends_on:
       - lorica-workers
+      - auth-svc
     volumes:
       - shared-workers:/shared:ro
     environment:
@@ -103,6 +122,7 @@ services:
       - LORICA_PROXY=http://lorica-workers:8080
       - BACKEND1_ADDR=backend1:80
       - BACKEND2_ADDR=backend2:80
+      - AUTH_SVC_ADDR=auth-svc:80
     networks:
       - e2e
 

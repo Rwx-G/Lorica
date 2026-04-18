@@ -16,14 +16,49 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 BACKEND_ID = os.environ.get("BACKEND_ID", "unknown")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "80"))
 TLS_ENABLED = os.environ.get("TLS_ENABLED", "") == "1"
+# When set, the backend acts as a forward-auth gate: every GET returns
+# 200 iff the request carries `Authorization: Bearer good-token`, else
+# 401. Used by the Lorica e2e forward_auth test (TESTING-GUIDE #4).
+FORWARD_AUTH_MODE = os.environ.get("FORWARD_AUTH_MODE", "") == "1"
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "good-token")
 
 request_count = 0
+mirror_count = 0
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global request_count
+        global request_count, mirror_count
         request_count += 1
+        # Track requests carrying the Lorica mirror marker so the
+        # mirroring e2e test can confirm the shadow backend actually
+        # saw a cloned request vs. never being hit.
+        if self.headers.get("X-Lorica-Mirror", "") == "1":
+            mirror_count += 1
+
+        # Forward-auth gate mode: 200 if Bearer token matches, else 401.
+        # Placed at the top of do_GET so `/healthz` still works for
+        # compose healthchecks (it falls through the branch below).
+        if FORWARD_AUTH_MODE and self.path != "/healthz":
+            auth = self.headers.get("Authorization", "")
+            if auth == f"Bearer {AUTH_TOKEN}":
+                # Echo the user identity as Remote-User so Lorica's
+                # forward-auth filter can relay it to the upstream.
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Remote-User", "testuser")
+                self.send_header("Remote-Groups", "admins")
+                self.send_header("Content-Length", "17")
+                self.end_headers()
+                self.wfile.write(b'{"auth":"granted"}'[:17])
+                return
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("WWW-Authenticate", "Bearer")
+            self.send_header("Content-Length", "16")
+            self.end_headers()
+            self.wfile.write(b'{"auth":"denied"}'[:16])
+            return
 
         if self.path == "/healthz":
             self._json_response(200, {
@@ -38,6 +73,19 @@ class Handler(BaseHTTPRequestHandler):
                 "requests": request_count,
                 "tls": TLS_ENABLED,
             })
+        elif self.path == "/count":
+            # Introspection endpoint for mirror tests: exposes the
+            # per-process counters so the test-runner can assert the
+            # shadow actually received the cloned request.
+            self._json_response(200, {
+                "backend": BACKEND_ID,
+                "requests": request_count,
+                "mirror_requests": mirror_count,
+            })
+        elif self.path == "/reset":
+            request_count = 0
+            mirror_count = 0
+            self._json_response(200, {"reset": True})
         elif self.path == "/slow":
             time.sleep(3)
             self._json_response(200, {"backend": BACKEND_ID, "slow": True})
