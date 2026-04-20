@@ -54,6 +54,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Security headers** - presets (strict/moderate/none) with HSTS, CSP, X-Frame-Options, X-Content-Type-Options
 - **HTTP Basic Auth** - per-route username/password authentication (Argon2id-hashed) with cached verification
 - **IP allowlist/denylist** and **CORS configuration** per route
+- **Certificate export** (v1.4.1, disabled by default) - mirror issued certificates as PEM files under `/var/lib/lorica/exported-certs/<hostname>/{cert,chain,fullchain,privkey}.pem` every time a cert is issued or renewed. Lets Ansible / HAProxy sidecar / backup jobs read the live bundle straight off disk without hitting the HTTP API. Atomic writes (`.tmp` stage + `fsync` + `rename`, cross-mount `EXDEV` fallback), per-file `chmod` + `chown` with configurable owner UID / group GID / octal modes (defaults 0o640 files / 0o750 dirs), fail-soft (export error never blocks the ACME renewal). Per-pattern ACL table narrows which hostnames are exported and with which UID / GID (exact match, leading `*.` wildcard, or bare `*`). Audit-logged + rate-limited `GET /api/v1/certificates/:id/download` complements on-disk export for one-off downloads. Threat model: `docs/security/cert-export-threat-model.md`
 
 ### :bar_chart: Monitoring & Observability
 
@@ -334,8 +335,13 @@ All endpoints are served on the management port (default `9443`) over HTTPS. Pro
 | `POST` | `/api/v1/certificates` | Upload PEM certificate |
 | `POST` | `/api/v1/certificates/self-signed` | Generate self-signed certificate |
 | `GET` | `/api/v1/certificates/:id` | Get certificate |
+| `GET` | `/api/v1/certificates/:id/download?part={cert\|key\|chain\|bundle}` | Download PEM material (rate-limited, audit-logged) |
 | `PUT` | `/api/v1/certificates/:id` | Update certificate |
 | `DELETE` | `/api/v1/certificates/:id` | Delete certificate |
+| `GET` | `/api/v1/cert-export/acls` | List per-pattern cert-export ACLs |
+| `POST` | `/api/v1/cert-export/acls` | Create a cert-export ACL rule |
+| `DELETE` | `/api/v1/cert-export/acls/:id` | Delete a cert-export ACL rule |
+| `POST` | `/api/v1/cert-export/reapply` | Re-export every certificate to disk |
 
 ### ACME
 
