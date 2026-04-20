@@ -66,7 +66,12 @@ hickory-resolver = { version = "0.24", default-features = false, features = ["to
 lru = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "cookies", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rustls-pemfile = "2"
+# PEM parsing via the official rustls pki-types crate. Replaces
+# rustls-pemfile (v1.5.0 audit HIGH-2: RUSTSEC-2025-0134, unmaintained).
+# pki-types is maintained by the rustls team and its `pem_slice_iter`
+# API is a 1:1 replacement for the old iterator. Advisory remains
+# transitive via the forked lorica-tls crate; tracked upstream.
+rustls-pki-types = { version = "1", features = ["alloc"] }
 futures-util = "0.3"
 arc-swap = "1"
 dashmap = "6"

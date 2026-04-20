@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use lorica_config::models::Route;
 use lorica_tls::{ClientCertVerifier, RootCertStore, WebPkiClientVerifier};
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 
 /// Aggregate all mTLS CA PEMs found across `routes` into a single
 /// rustls `RootCertStore`. Returns `None` when no route has mTLS
@@ -48,14 +49,23 @@ pub fn build_union_root_store(routes: &[Route]) -> Option<RootCertStore> {
     let mut store = RootCertStore::empty();
     let mut added = 0usize;
     for pem_text in pems {
-        // rustls_pemfile returns items one-by-one; keep only X.509
-        // CERTIFICATE blocks. A single PEM bundle can carry an
-        // intermediate + root, and we want both in the store.
-        let mut reader = std::io::Cursor::new(pem_text.as_bytes());
-        let items: Vec<_> = rustls_pemfile::certs(&mut reader)
-            .filter_map(|r| r.ok())
-            .collect();
-        for der in items {
+        // `CertificateDer::pem_slice_iter` walks every `-----BEGIN
+        // CERTIFICATE-----` / `-----END CERTIFICATE-----` block in the
+        // PEM bundle and returns the DER payload. A single PEM bundle
+        // can carry an intermediate + root, and we want both in the
+        // store. Non-certificate blocks (PRIVATE KEY, etc.) are
+        // silently skipped by the iterator.
+        for der_result in CertificateDer::pem_slice_iter(pem_text.as_bytes()) {
+            let der = match der_result {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "mtls: skipping CA cert block that failed PEM parse"
+                    );
+                    continue;
+                }
+            };
             match store.add(der) {
                 Ok(()) => added += 1,
                 Err(e) => tracing::warn!(

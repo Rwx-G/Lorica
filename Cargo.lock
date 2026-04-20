@@ -2682,7 +2682,6 @@ dependencies = [
  "regex",
  "reqwest",
  "rustls 0.23.37",
- "rustls-pemfile",
  "rustls-pki-types",
  "serde",
  "serde_json",
