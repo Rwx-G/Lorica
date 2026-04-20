@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/version-1.5.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-985-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-1280%2B-brightgreen.svg" alt="Lorica Tests">
   <img src="https://img.shields.io/badge/Pingora%20Tests-568-blue.svg" alt="Inherited Tests">
 </p>
 
@@ -54,7 +54,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Security headers** - presets (strict/moderate/none) with HSTS, CSP, X-Frame-Options, X-Content-Type-Options
 - **HTTP Basic Auth** - per-route username/password authentication (Argon2id-hashed) with cached verification
 - **IP allowlist/denylist** and **CORS configuration** per route
-- **Certificate export** (v1.4.1, disabled by default) - mirror issued certificates as PEM files under `/var/lib/lorica/exported-certs/<hostname>/{cert,chain,fullchain,privkey}.pem` every time a cert is issued or renewed. Lets Ansible / HAProxy sidecar / backup jobs read the live bundle straight off disk without hitting the HTTP API. Atomic writes (`.tmp` stage + `fsync` + `rename`, cross-mount `EXDEV` fallback), per-file `chmod` + `chown` with configurable owner UID / group GID / octal modes (defaults 0o640 files / 0o750 dirs), fail-soft (export error never blocks the ACME renewal). Per-pattern ACL table narrows which hostnames are exported and with which UID / GID (exact match, leading `*.` wildcard, or bare `*`). Audit-logged + rate-limited `GET /api/v1/certificates/:id/download` complements on-disk export for one-off downloads. Threat model: `docs/security/cert-export-threat-model.md`
+- **Certificate export** (v1.5.0, disabled by default) - mirror issued certificates as PEM files under `/var/lib/lorica/exported-certs/<hostname>/{cert,chain,fullchain,privkey}.pem` every time a cert is issued or renewed. Lets Ansible / HAProxy sidecar / backup jobs read the live bundle straight off disk without hitting the HTTP API. Atomic writes (`.tmp` stage + `fsync` + `rename`, cross-mount `EXDEV` fallback), per-file `chmod` + `chown` with configurable owner UID / group GID / octal modes (defaults 0o640 files / 0o750 dirs), fail-soft (export error never blocks the ACME renewal). Per-pattern ACL table narrows which hostnames are exported and with which UID / GID (exact match, leading `*.` wildcard, or bare `*`). Audit-logged + rate-limited `GET /api/v1/certificates/:id/download` complements on-disk export for one-off downloads. Threat model: `docs/security/cert-export-threat-model.md`
 
 ### :bar_chart: Monitoring & Observability
 
@@ -205,12 +205,12 @@ The dashboard ships inside the binary and is served on the management port (defa
 - **Active Probes** - CRUD for synthetic health probes with route selection, HTTP method/path/status/interval/timeout
 - **Access Logs** - scrollable real-time log stream via WebSocket with green pulsing indicator
 - **System** - worker table with PID, health, heartbeat latency; CPU/memory/disk gauges
-- **Settings** - notification channels, security header presets, config export/import with diff preview
+- **Settings** - notification channels, security header presets, DNS providers (Cloudflare / Route53 / OVH), ban rules, OpenTelemetry exporter, GeoIP / ASN databases, certificate filesystem export zone + ACL editor, config export / import with diff preview
 - **Theme** - light/dark mode toggle
 
 ## Architecture
 
-Lorica is a Rust workspace with 25 crates: 15 forked from Cloudflare Pingora and 10 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
+Lorica is a Rust workspace with 28 crates: 16 forked from Cloudflare Pingora and 12 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
 
 | Crate | Purpose |
 |-------|---------|
@@ -455,13 +455,17 @@ cargo build --release
 ### Running tests
 
 ```bash
-# All Rust unit tests (1553 tests across 19 crates)
+# All Rust unit tests (~1850 tests across 22 crates)
 cargo test --workspace
 
-# Product crate tests only (739 tests)
+# Product crate tests only (~1100 tests - lorica-native, include
+# the new v1.5.0 hardening coverage : rate-limit buckets, body-size
+# layers, session rotation, public_version masking, ammonia bypass
+# corpus, map_err context preservation)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
-           -p lorica-command -p lorica-limits -p lorica-shmem
+           -p lorica-command -p lorica-limits -p lorica-shmem \
+           -p lorica-challenge -p lorica-geoip
 
 # Pingora-forked crate tests (568 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
@@ -469,7 +473,7 @@ cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
            --features ring -p lorica-lb
 
-# End-to-end tests driving a real Pingora Server (68 tests, 10 binaries)
+# End-to-end tests driving a real Pingora Server (70+ tests, 10 binaries)
 cargo test -p lorica --test mtls_e2e_test \
                      --test response_rewrite_e2e_test \
                      --test mirror_e2e_test \
@@ -481,7 +485,7 @@ cargo test -p lorica --test mtls_e2e_test \
                      --test proxy_config_test \
                      --test proxy_routing_test
 
-# Frontend tests (178 Vitest tests across 6 files)
+# Frontend tests (287 Vitest tests across 8 files)
 cd lorica-dashboard/frontend && npx vitest run
 ```
 
@@ -489,25 +493,26 @@ cd lorica-dashboard/frontend && npx vitest run
 
 | Layer | Count | Notes |
 |---|---|---|
-| Product unit (config, api, lib, waf, notify, bench, worker, command, limits) | 739 | Lorica-specific code |
-| Product e2e (real Pingora `Server` + mock backends) | 68 | 10 binaries: mTLS, response rewriting, mirroring, forward auth, SWR, connection filter, canary, header routing, config, routing |
+| Product unit (config, api, lib, waf, notify, bench, worker, command, limits, challenge, shmem, geoip) | ~1100 | Lorica-specific code, including v1.5.0 hardening coverage (ammonia bypass corpus, named rate-limit buckets with Retry-After, per-route body-size 413 path, session rotation integration test, `public_version` masking, map_err context preservation). Tests currently require `--test-threads=1` on a full-suite run due to the existing verdict-cache global-state race tracked as backlog #16. |
+| Product e2e (real Pingora `Server` + mock backends) | 70+ | 10 binaries: mTLS, response rewriting, mirroring, forward auth, SWR, connection filter, canary, header routing, config, routing |
 | Pingora-forked crates (core, proxy, http, error, tls, cache, pool, runtime, timeout, lb) | 568 | Inherited upstream coverage kept passing on every change |
-| Frontend (vitest / svelte-check) | 178 | Form validation, type safety, component wiring |
-| **Total shipping tests** | **1553** | |
+| Frontend (vitest / svelte-check) | 287 | Form validation, type safety, component wiring |
+| **Total shipping tests** | **~1850** | |
 
 #### Docker end-to-end suites
 
 `tests-e2e-docker/` spins Lorica up against real backend containers
-and drives 400+ assertions through the actual network stack:
+and drives 460+ assertions through the actual network stack:
 
 ```bash
 cd tests-e2e-docker
-./run.sh                                    # single-process (315 asserts) + workers mode (86)
+./run.sh                                    # single-process (336 asserts) + workers mode (86) + cert-export (38)
 docker compose --profile bot run --rm bot-smoke                   # 33 asserts - graded bot challenge
 docker compose --profile geoip run --rm geoip-smoke               # 16 asserts - country allow/deny
 docker compose --profile rdns run --rm rdns-smoke                 # 8  asserts - forward-confirmed rDNS bypass
 docker compose --profile otel run --rm otel-smoke                 # 15 asserts - OTLP + W3C + log/trace correlation
 docker compose --profile otel-workers run --rm otel-smoke-workers # 15 asserts - same under --workers 2
+docker compose --profile cert-export run --rm cert-export-smoke   # 38 asserts - PEM disk export + ACL + reapply
 ```
 
 The two intentional gaps in the Docker harness are:
