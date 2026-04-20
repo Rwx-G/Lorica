@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api } from '../../lib/api';
+  import { validateUrl } from '../../lib/validators';
 
   interface ObservabilityFormShape {
     otlp_endpoint: string;
@@ -27,6 +28,25 @@
     settingsMsg,
     settingsError,
   }: Props = $props();
+
+  // --- Blur-time field validators ---
+  let endpointError = $state<string | null>(null);
+  let serviceNameError = $state<string | null>(null);
+  function checkEndpoint() {
+    endpointError = validateUrl(settingsForm.otlp_endpoint);
+  }
+  function checkServiceName() {
+    const s = settingsForm.otlp_service_name.trim();
+    if (s.length === 0) {
+      serviceNameError = 'service name must not be empty';
+    } else if (s.length > 256) {
+      serviceNameError = 'service name must be <= 256 characters';
+    } else if (/[\u0000-\u001f\u007f]/.test(s)) {
+      serviceNameError = 'service name must not contain control characters';
+    } else {
+      serviceNameError = null;
+    }
+  }
 
   // --- Test connection state ---
   let testing = $state(false);
@@ -87,7 +107,9 @@
           bind:value={settingsForm.otlp_endpoint}
           placeholder="e.g. http://jaeger:4318 or https://tempo.example.com:4317"
           autocomplete="off"
+          onblur={checkEndpoint} oninput={checkEndpoint}
         />
+        {#if endpointError}<span class="field-error" role="alert">{endpointError}</span>{/if}
         <span class="hint">
           Full base URL. For <code>http-proto</code> / <code>http-json</code>
           Lorica appends <code>/v1/traces</code> automatically if missing.
@@ -112,7 +134,9 @@
           bind:value={settingsForm.otlp_service_name}
           placeholder="lorica"
           autocomplete="off"
+          onblur={checkServiceName} oninput={checkServiceName}
         />
+        {#if serviceNameError}<span class="field-error" role="alert">{serviceNameError}</span>{/if}
         <span class="hint">
           Exposed as <code>service.name</code> on every exported span.
           Defaults to <code>lorica</code>.
@@ -216,4 +240,5 @@
     color: var(--color-danger, #b32);
     background: var(--color-danger-subtle, rgba(187, 51, 51, 0.1));
   }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 </style>
