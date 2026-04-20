@@ -158,15 +158,28 @@ KEY_MODE=$(stat -c '%a' "$HOST_DIR/privkey.pem" 2>/dev/null || echo "?")
 [ "$KEY_MODE" = "640" ] && ok "privkey.pem mode is 0o640" \
     || fail "privkey.pem mode expected 640, got $KEY_MODE"
 
-# Content check: every PEM file begins with `-----BEGIN`. A wrong
-# byte order (gzip bytes, TOML bytes) would fail this trivially.
-for f in cert.pem chain.pem fullchain.pem privkey.pem; do
+# Content check: cert.pem / fullchain.pem / privkey.pem must start
+# with a PEM header. chain.pem is allowed to be empty because a
+# self-signed certificate has no intermediate CA to capture - it
+# is documented to contain the chain-minus-leaf and will be empty
+# for self-signed fullchains of length 1. Any wrong byte order
+# (gzip bytes, TOML bytes) would still fail the header check.
+for f in cert.pem fullchain.pem privkey.pem; do
     if head -1 "$HOST_DIR/$f" 2>/dev/null | grep -q '^-----BEGIN '; then
         ok "$f starts with a PEM header"
     else
         fail "$f does not start with -----BEGIN"
     fi
 done
+
+CHAIN_SIZE=$(stat -c '%s' "$HOST_DIR/chain.pem" 2>/dev/null || echo "-1")
+if [ "$CHAIN_SIZE" = "0" ]; then
+    ok "chain.pem is empty (self-signed has no intermediate CA)"
+elif head -1 "$HOST_DIR/chain.pem" 2>/dev/null | grep -q '^-----BEGIN '; then
+    ok "chain.pem starts with a PEM header"
+else
+    fail "chain.pem is non-empty but does not start with -----BEGIN (size=$CHAIN_SIZE)"
+fi
 
 # fullchain.pem is cert + chain concatenation: the number of
 # -----BEGIN CERTIFICATE----- markers must be >= the count in
