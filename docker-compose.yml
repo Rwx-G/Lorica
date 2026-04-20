@@ -4,7 +4,7 @@ services:
       context: .
     container_name: lorica
     volumes:
-      - lorica-data:/var/lib/lorica'
+      - lorica-data:/var/lib/lorica
     ports:
       - '9443:9443'
       - '8443:8443'
