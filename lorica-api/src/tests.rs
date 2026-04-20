@@ -1820,14 +1820,17 @@ async fn test_update_settings_cert_export_clears_dir_on_empty_string() {
 
 #[tokio::test]
 async fn test_rate_limit_settings_bucket_returns_429_after_limit() {
-    // PUT /api/v1/settings is capped at 10/60s per IP (v1.5.0 A.3).
-    // Drive 11 PUTs from the same (simulated) client and assert the
-    // 11th returns 429 with a Retry-After header.
+    // PUT /api/v1/settings is capped at 30/60s per IP (v1.5.0 A.3
+    // — relaxed from the initial 10/60s after the e2e smoke flagged
+    // realistic operator activity on the /settings endpoint under
+    // test-isolation). Drive 31 PUTs from the same (simulated)
+    // client and assert the 31st returns 429 with a Retry-After
+    // header.
     let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
     let body = serde_json::json!({ "log_level": "info" });
-    for i in 0..10 {
+    for i in 0..30 {
         let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
         let req = Request::builder()
             .method("PUT")
@@ -1874,15 +1877,15 @@ async fn test_rate_limit_settings_bucket_returns_429_after_limit() {
 #[tokio::test]
 async fn test_rate_limit_buckets_are_isolated() {
     // Exhausting the settings bucket (10/60s) must NOT affect the
-    // routes CRUD bucket (30/60s). Each state-mutating endpoint
+    // routes CRUD bucket (100/60s). Each state-mutating endpoint
     // carries its own bucket so a flood on one does not block the
     // operator from fixing the config elsewhere.
     let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
 
-    // Exhaust the settings bucket.
+    // Exhaust the settings bucket (30/60s).
     let body = serde_json::json!({ "log_level": "info" });
-    for _ in 0..=10 {
+    for _ in 0..=30 {
         let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
         let req = Request::builder()
             .method("PUT")

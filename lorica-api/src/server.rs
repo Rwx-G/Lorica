@@ -229,18 +229,18 @@ pub fn build_router(
             "/api/v1/routes",
             post(crate::routes::create_route)
                 .layer(bl(128 * 1024))
-                .layer(rl("routes_cud", 30, 60)),
+                .layer(rl("routes_cud", 100, 60)),
         )
         .route("/api/v1/routes/:id", get(crate::routes::get_route))
         .route(
             "/api/v1/routes/:id",
             put(crate::routes::update_route)
                 .layer(bl(128 * 1024))
-                .layer(rl("routes_cud", 30, 60)),
+                .layer(rl("routes_cud", 100, 60)),
         )
         .route(
             "/api/v1/routes/:id",
-            delete(crate::routes::delete_route).layer(rl("routes_cud", 30, 60)),
+            delete(crate::routes::delete_route).layer(rl("routes_cud", 100, 60)),
         )
         .route(
             "/api/v1/validate/mtls-pem",
@@ -273,11 +273,11 @@ pub fn build_router(
             "/api/v1/certificates",
             post(crate::certificates::create_certificate)
                 .layer(bl(512 * 1024))
-                .layer(rl("cert_create", 5, 60)),
+                .layer(rl("cert_create", 20, 60)),
         )
         .route(
             "/api/v1/certificates/self-signed",
-            post(crate::certificates::generate_self_signed).layer(rl("cert_create", 5, 60)),
+            post(crate::certificates::generate_self_signed).layer(rl("cert_create", 20, 60)),
         )
         .route(
             "/api/v1/certificates/:id",
@@ -301,11 +301,11 @@ pub fn build_router(
         )
         .route(
             "/api/v1/cert-export/acls",
-            post(crate::routes::cert_export::create_acl).layer(rl("cert_export_acls", 30, 60)),
+            post(crate::routes::cert_export::create_acl).layer(rl("cert_export_acls", 100, 60)),
         )
         .route(
             "/api/v1/cert-export/acls/:id",
-            delete(crate::routes::cert_export::delete_acl).layer(rl("cert_export_acls", 30, 60)),
+            delete(crate::routes::cert_export::delete_acl).layer(rl("cert_export_acls", 100, 60)),
         )
         .route(
             "/api/v1/cert-export/reapply",
@@ -338,7 +338,7 @@ pub fn build_router(
             "/api/v1/settings",
             put(crate::settings::update_settings)
                 .layer(bl(64 * 1024))
-                .layer(rl("settings", 10, 60)),
+                .layer(rl("settings", 30, 60)),
         )
         .route(
             "/api/v1/settings/otel/test",
