@@ -433,3 +433,110 @@ export function validateRewriteReplacement(replacement: string, pattern: string)
   }
   return null;
 }
+
+/**
+ * Validate an absolute POSIX directory path. Empty => null
+ * ("feature off"). Used by `geoip_db_path`, `asn_db_path`, and
+ * `cert_export_dir` inputs. Mirrors the checks applied server-side
+ * by `lorica-api::settings::update_settings`: must start with `/`,
+ * fit in 4096 chars, and not contain `/../` or a trailing `/..`.
+ */
+export function validateAbsolutePath(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return null;
+  if (!s.startsWith('/')) return "must be an absolute path (starting with '/')";
+  if (s.length > 4096) return 'path too long (> 4096 chars)';
+  if (s.includes('/../') || s.endsWith('/..')) {
+    return 'must not contain path traversal (../)';
+  }
+  for (const c of s) {
+    const code = c.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) return 'contains a control character';
+  }
+  return null;
+}
+
+/**
+ * Validate an octal permission mode string. Accepts `0o640`,
+ * `0640`, or `640` (all parsed as octal). Empty => null. Range
+ * 0..=0o777. Used by `cert_export_file_mode` and
+ * `cert_export_dir_mode`. Returns `null` when valid, an error
+ * string otherwise.
+ */
+export function validateOctalMode(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return null;
+  const raw = s.startsWith('0o') || s.startsWith('0O') ? s.slice(2) : s;
+  if (!/^[0-7]+$/.test(raw)) {
+    return 'mode must be octal digits (0-7) only, e.g. 640 or 0o640';
+  }
+  const n = parseInt(raw, 8);
+  if (!Number.isFinite(n) || n < 0 || n > 0o777) {
+    return 'mode must fit in 9 permission bits (0-777 octal)';
+  }
+  return null;
+}
+
+/**
+ * Parse an octal mode string (same accepted forms as
+ * `validateOctalMode`) into a decimal number. Returns `null` when
+ * the input is empty or invalid; callers should run the validator
+ * first for user-facing errors.
+ */
+export function parseOctalMode(input: string): number | null {
+  const s = input.trim();
+  if (s === '') return null;
+  const raw = s.startsWith('0o') || s.startsWith('0O') ? s.slice(2) : s;
+  if (!/^[0-7]+$/.test(raw)) return null;
+  const n = parseInt(raw, 8);
+  if (!Number.isFinite(n) || n < 0 || n > 0o777) return null;
+  return n;
+}
+
+/**
+ * Validate a non-negative POSIX numeric id (uid or gid). Empty =>
+ * null ("unset"). Non-empty must parse as a decimal integer in
+ * 0..=0xFFFFFFFF (`u32` on the backend).
+ */
+export function validatePosixId(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return null;
+  if (!/^\d+$/.test(s)) return 'must be a non-negative integer';
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0 || n > 0xFFFFFFFF) {
+    return 'must fit in a u32 (0..=4294967295)';
+  }
+  return null;
+}
+
+/**
+ * Validate a cert-export ACL hostname pattern. Accepts a bare `*`
+ * (match everything), a leading wildcard `*.suffix` (match any
+ * hostname under `suffix`), or an exact DNS-ish hostname. Mirrors
+ * `validate_pattern` in `lorica-api::routes::cert_export`.
+ */
+export function validateCertExportPattern(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return 'pattern must not be empty';
+  if (s.length > 253) return 'pattern must be <= 253 characters';
+  if (s === '*') return null;
+  let body: string;
+  if (s.startsWith('*.')) {
+    body = s.slice(2);
+  } else if (s.includes('*')) {
+    return 'pattern may only use `*` as a leading `*.` wildcard or a bare `*`';
+  } else {
+    body = s;
+  }
+  if (body === '' || body.startsWith('.') || body.endsWith('.')) {
+    return 'pattern body must not start or end with a dot';
+  }
+  for (const label of body.split('.')) {
+    if (label === '') return 'pattern contains an empty DNS label';
+    if (label.length > 63) return 'pattern has a label longer than 63 characters';
+    if (!/^[A-Za-z0-9-]+$/.test(label)) {
+      return 'pattern may only contain ASCII letters, digits, `-`, `.`, and a leading `*.`';
+    }
+  }
+  return null;
+}

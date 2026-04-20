@@ -48,6 +48,12 @@ pub struct UpdateSettingsRequest {
     pub geoip_auto_update_enabled: Option<bool>,
     pub asn_db_path: Option<String>,
     pub asn_auto_update_enabled: Option<bool>,
+    pub cert_export_enabled: Option<bool>,
+    pub cert_export_dir: Option<String>,
+    pub cert_export_owner_uid: Option<u32>,
+    pub cert_export_group_gid: Option<u32>,
+    pub cert_export_file_mode: Option<u32>,
+    pub cert_export_dir_mode: Option<u32>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -331,6 +337,54 @@ pub async fn update_settings(
     }
     if let Some(auto_update) = body.asn_auto_update_enabled {
         settings.asn_auto_update_enabled = auto_update;
+    }
+    if let Some(enabled) = body.cert_export_enabled {
+        settings.cert_export_enabled = enabled;
+    }
+    if let Some(ref dir) = body.cert_export_dir {
+        let trimmed = dir.trim();
+        if trimmed.is_empty() {
+            settings.cert_export_dir = None;
+        } else {
+            if !trimmed.starts_with('/') {
+                return Err(ApiError::BadRequest(
+                    "cert_export_dir must be an absolute path (starting with '/')".into(),
+                ));
+            }
+            if trimmed.len() > 4096 {
+                return Err(ApiError::BadRequest(
+                    "cert_export_dir too long (> 4096 chars)".into(),
+                ));
+            }
+            if trimmed.contains("/../") || trimmed.ends_with("/..") {
+                return Err(ApiError::BadRequest(
+                    "cert_export_dir must not contain path traversal (../)".into(),
+                ));
+            }
+            settings.cert_export_dir = Some(trimmed.to_string());
+        }
+    }
+    if let Some(uid) = body.cert_export_owner_uid {
+        settings.cert_export_owner_uid = Some(uid);
+    }
+    if let Some(gid) = body.cert_export_group_gid {
+        settings.cert_export_group_gid = Some(gid);
+    }
+    if let Some(mode) = body.cert_export_file_mode {
+        if mode > 0o777 {
+            return Err(ApiError::BadRequest(
+                "cert_export_file_mode must fit in 9 permission bits (<= 0o777)".into(),
+            ));
+        }
+        settings.cert_export_file_mode = mode;
+    }
+    if let Some(mode) = body.cert_export_dir_mode {
+        if mode > 0o777 {
+            return Err(ApiError::BadRequest(
+                "cert_export_dir_mode must fit in 9 permission bits (<= 0o777)".into(),
+            ));
+        }
+        settings.cert_export_dir_mode = mode;
     }
 
     store.update_global_settings(&settings)?;

@@ -1548,6 +1548,184 @@ async fn test_update_settings_sla_purge_retention_cap() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn test_update_settings_cert_export_roundtrip() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "cert_export_enabled": true,
+        "cert_export_dir": "/var/lib/lorica/exported-certs",
+        "cert_export_owner_uid": 1001,
+        "cert_export_group_gid": 2001,
+        "cert_export_file_mode": 0o640,
+        "cert_export_dir_mode": 0o750,
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&payload).expect("test setup");
+    // Handler returns the full GlobalSettings doc under the
+    // standard "data" envelope. Assert each cert_export field
+    // round-tripped with the posted value.
+    assert_eq!(json["data"]["cert_export_enabled"], true);
+    assert_eq!(
+        json["data"]["cert_export_dir"].as_str(),
+        Some("/var/lib/lorica/exported-certs")
+    );
+    assert_eq!(json["data"]["cert_export_owner_uid"], 1001);
+    assert_eq!(json["data"]["cert_export_group_gid"], 2001);
+    assert_eq!(json["data"]["cert_export_file_mode"], 0o640);
+    assert_eq!(json["data"]["cert_export_dir_mode"], 0o750);
+}
+
+#[tokio::test]
+async fn test_update_settings_cert_export_rejects_relative_dir() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "cert_export_dir": "var/lib/lorica" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("absolute path"));
+}
+
+#[tokio::test]
+async fn test_update_settings_cert_export_rejects_traversal_dir() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "cert_export_dir": "/var/lib/../etc/shadow" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("traversal"));
+}
+
+#[tokio::test]
+async fn test_update_settings_cert_export_rejects_mode_out_of_range() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    // 0o1000 = 512 = one bit past the 9 permission bits.
+    let body = serde_json::json!({ "cert_export_file_mode": 0o1000 });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("9 permission bits"));
+}
+
+#[tokio::test]
+async fn test_update_settings_cert_export_clears_dir_on_empty_string() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // First set a dir so we can observe the clear.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "cert_export_dir": "/tmp/lorica-export" });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Now clear it with an empty string - the field should flip
+    // back to null (None on the backend) instead of "unchanged".
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "cert_export_dir": "" });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&payload).expect("test setup");
+    assert!(json["data"]["cert_export_dir"].is_null());
+}
+
 // ---- Notification Endpoint Tests ----
 
 #[tokio::test]

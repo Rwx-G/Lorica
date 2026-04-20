@@ -615,6 +615,13 @@ export interface GlobalSettingsResponse {
   geoip_auto_update_enabled?: boolean;
   asn_db_path?: string | null;
   asn_auto_update_enabled?: boolean;
+  // Filesystem certificate export (v1.4.1).
+  cert_export_enabled?: boolean;
+  cert_export_dir?: string | null;
+  cert_export_owner_uid?: number | null;
+  cert_export_group_gid?: number | null;
+  cert_export_file_mode?: number;
+  cert_export_dir_mode?: number;
 }
 
 export interface UpdateSettingsRequest {
@@ -644,6 +651,32 @@ export interface UpdateSettingsRequest {
   geoip_auto_update_enabled?: boolean;
   asn_db_path?: string | null;
   asn_auto_update_enabled?: boolean;
+  cert_export_enabled?: boolean;
+  cert_export_dir?: string | null;
+  cert_export_owner_uid?: number | null;
+  cert_export_group_gid?: number | null;
+  cert_export_file_mode?: number;
+  cert_export_dir_mode?: number;
+}
+
+export interface CertExportAclResponse {
+  id: string;
+  hostname_pattern: string;
+  allowed_uid?: number | null;
+  allowed_gid?: number | null;
+  created_at: string;
+}
+
+export interface CreateCertExportAclRequest {
+  hostname_pattern: string;
+  allowed_uid?: number | null;
+  allowed_gid?: number | null;
+}
+
+export interface CertExportReapplyResponse {
+  enabled: boolean;
+  exported: number;
+  failed: number;
 }
 
 /// Result of the "Test connection" probe on the OTel settings
@@ -915,6 +948,19 @@ export const api = {
 
   testDnsProvider: (id: string) =>
     request<{ message: string; provider_type: string }>('POST', `/dns-providers/${id}/test`),
+
+  // Cert export ACLs (v1.4.1)
+  listCertExportAcls: () =>
+    request<{ acls: CertExportAclResponse[] }>('GET', '/cert-export/acls'),
+
+  createCertExportAcl: (body: CreateCertExportAclRequest) =>
+    request<CertExportAclResponse>('POST', '/cert-export/acls', body),
+
+  deleteCertExportAcl: (id: string) =>
+    request<{ deleted: string }>('DELETE', `/cert-export/acls/${id}`),
+
+  reapplyCertExport: () =>
+    request<CertExportReapplyResponse>('POST', '/cert-export/reapply', {}),
 
   // Preferences
   listPreferences: () =>

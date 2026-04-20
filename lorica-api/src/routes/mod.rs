@@ -29,6 +29,7 @@
 //! - [`mtls`] - per-route mTLS config type, validator, and the
 //!   `POST /api/v1/validate/mtls-pem` endpoint.
 
+pub mod cert_export;
 pub mod crud;
 pub mod forward_auth;
 pub mod header_rules;

@@ -610,6 +610,45 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/v1/certificates/{id}/download:
+    get:
+      tags: [Certificates]
+      summary: Download one certificate's PEM material
+      description: |
+        Returns a PEM file with the requested part(s) of a stored
+        certificate. Audit-logged (tracing::warn with client IP +
+        cert id) and rate-limited at 5 downloads per 60s per IP.
+      security:
+        - sessionCookie: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: part
+          required: false
+          schema:
+            type: string
+            enum: [cert, key, chain, bundle]
+            default: bundle
+          description: |
+            Which material to return. `cert` = leaf only,
+            `chain` = leaf + intermediates,
+            `key` = private key only,
+            `bundle` (default) = leaf + chain + key in a single PEM.
+      responses:
+        "200":
+          description: PEM file stream
+          content:
+            application/x-pem-file:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          description: Rate limit exceeded (5 downloads per 60s per IP)
+
   /api/v1/certificates/self-signed:
     post:
       tags: [Certificates]
@@ -2051,6 +2090,104 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Certificate filesystem export (v1.4.1)
+  # ---------------------------------------------------------------------------
+  /api/v1/cert-export/acls:
+    get:
+      tags: [Certificates]
+      summary: List per-pattern cert-export ACLs
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: ACL list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  acls:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        hostname_pattern: { type: string }
+                        allowed_uid: { type: integer, nullable: true }
+                        allowed_gid: { type: integer, nullable: true }
+                        created_at: { type: string, format: date-time }
+    post:
+      tags: [Certificates]
+      summary: Create a cert-export ACL rule
+      description: |
+        Adds a hostname pattern (`*`, `*.suffix`, or exact hostname)
+        and optional UID / GID override. On export, Lorica picks
+        the most-specific matching pattern and applies its UID /
+        GID. If no pattern matches, the cert is not exported.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hostname_pattern]
+              properties:
+                hostname_pattern:
+                  type: string
+                  example: "*.prod.mibu.fr"
+                allowed_uid:
+                  type: integer
+                  nullable: true
+                allowed_gid:
+                  type: integer
+                  nullable: true
+      responses:
+        "201":
+          description: ACL created
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/cert-export/acls/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    delete:
+      tags: [Certificates]
+      summary: Delete a cert-export ACL rule (idempotent)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: ACL deleted
+
+  /api/v1/cert-export/reapply:
+    post:
+      tags: [Certificates]
+      summary: Re-export every certificate to the configured directory
+      description: |
+        Forces a full re-export of every cert on disk. Honours the
+        currently-persisted settings + ACL rules. Useful after
+        changing ACLs or modes without waiting for the next ACME
+        renewal.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Re-export summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  exported:
+                    type: integer
+                  failed:
+                    type: integer
 
   # ---------------------------------------------------------------------------
   # Preferences

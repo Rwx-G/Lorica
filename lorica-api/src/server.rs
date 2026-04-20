@@ -251,6 +251,22 @@ pub fn build_router(
             "/api/v1/certificates/:id/download",
             get(crate::certificates::download_certificate),
         )
+        .route(
+            "/api/v1/cert-export/acls",
+            get(crate::routes::cert_export::list_acls),
+        )
+        .route(
+            "/api/v1/cert-export/acls",
+            post(crate::routes::cert_export::create_acl),
+        )
+        .route(
+            "/api/v1/cert-export/acls/:id",
+            delete(crate::routes::cert_export::delete_acl),
+        )
+        .route(
+            "/api/v1/cert-export/reapply",
+            post(crate::routes::cert_export::reapply),
+        )
         .route("/api/v1/status", get(crate::status::get_status))
         .route("/api/v1/logs", get(crate::logs::get_logs))
         .route("/api/v1/logs", delete(crate::logs::clear_logs))
