@@ -1910,7 +1910,12 @@ fn generate_request_id() -> String {
 /// trimmed. This is the documented migration-friendly behavior:
 /// pointing `old.example.com` at `https://new.example.com/` preserves
 /// every subpath.
-fn build_redirect_location(target: &str, req_path: &str, req_query: Option<&str>, literal: bool) -> String {
+fn build_redirect_location(
+    target: &str,
+    req_path: &str,
+    req_query: Option<&str>,
+    literal: bool,
+) -> String {
     if literal {
         return target.to_string();
     }

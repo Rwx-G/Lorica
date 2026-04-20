@@ -3131,11 +3131,6 @@ fn redirect_location_path_rule_is_literal() {
 fn redirect_location_path_rule_literal_ignores_query_too() {
     // Literal redirects must also ignore the client's query string:
     // the operator's target is authoritative.
-    let loc = build_redirect_location(
-        "https://example.com/final",
-        "/src",
-        Some("utm=x"),
-        true,
-    );
+    let loc = build_redirect_location("https://example.com/final", "/src", Some("utm=x"), true);
     assert_eq!(loc, "https://example.com/final");
 }
