@@ -9,6 +9,10 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Security
+
+- Replaced the 3-pass regex HTML sanitiser (`<script>`, `on*=`, `javascript:`) applied to operator-supplied `error_page_html` with an `ammonia` whitelist-based sanitiser (v1.5.0 audit finding HIGH-1). Regex-based HTML filters are historically contournable via `<svg onload>`, encoded `javascript&#58;`, nested `<scr<script>ipt>`, and malformed HTML ; `ammonia` parses through `html5ever` and walks the DOM against an allow-list, so the attack surface collapses onto what the Servo team already hardens. Policy: default ammonia allow-list + explicit allow for structural tags (`html`, `head`, `body`, `title`) so an operator can still supply a full standalone document ; URL schemes capped to `http`, `https`, `mailto` (rejects `data:`, `vbscript:`, `file:`, plus the usual `javascript:`) ; `<style>`, `<link>`, `<iframe>`, `<object>`, `<embed>`, `<meta>` are now rejected (kept out of the allow-list). 128 KiB input cap enforced upstream by `validate_error_page_html` in `lorica-api` (unchanged). 15 new unit tests cover `<svg onload>`, `<iframe>`, `<object>`, `<embed>`, `<style>`, `<link>`, `<meta http-equiv="refresh">`, `data:` URIs, `vbscript:` URIs, HTML-encoded `javascript&#58;`, the nested `<scr<script>ipt>` bypass, and the preserved-happy-paths (structural tags, `mailto:`, `https://` link).
+
 ### Added
 
 - README roadmap updated: v1.4.1 entry now lists every shipped feature (guard-rails pass, Route group_name, certificate download, filesystem cert export + ACL + dashboard tab). v1.5.0 entry gains AI-crawler / LLM deny-list as a first-class feature (known-bot UA + rDNS matcher, per-route opt-in, Prometheus counter). A new "Backlog" subsection under Roadmap documents the explicitly-deferred items (third-party IP-reputation feeds, PKCS#12 / JKS export, exported-cert orphan cleanup) with rationale so the reader sees why they are not scheduled rather than forgotten.

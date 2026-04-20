@@ -48,6 +48,13 @@ lorica-challenge = { version = "1.4.1", path = "../lorica-challenge" }
 once_cell = { workspace = true }
 lorica-bench = { version = "1.4.1", path = "../lorica-bench" }
 regex = "1"
+# HTML sanitization for operator-supplied error_page_html (v1.5.0
+# audit finding HIGH-1). Whitelist-based parser replaces the
+# previous 3-pass regex - those are historically contournables
+# via `<svg onload>`, HTML malformé, encoded bypasses. ammonia
+# parses through html5ever, so the attack surface collapses onto
+# what the Servo team already hardens.
+ammonia = "4"
 sha2 = "0.10"
 bytes = "1"
 # Async DNS resolver for the bot-protection rDNS bypass

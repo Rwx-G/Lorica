@@ -33,28 +33,91 @@ use lorica_cache::{CacheMeta, VarianceBuilder};
 use lorica_config::models::Route;
 use lorica_proxy::Session;
 use once_cell::sync::Lazy;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 use super::Backend;
 use super::MtlsEnforcer;
 
-static RE_SCRIPT: Lazy<regex::Regex> = Lazy::new(|| {
-    regex::Regex::new(r"(?is)<script[\s>].*?</script>").expect("sanitize: script regex")
-});
-static RE_EVENTS: Lazy<regex::Regex> = Lazy::new(|| {
-    regex::Regex::new(r#"(?i)\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)"#)
-        .expect("sanitize: event handler regex")
-});
-static RE_JS_URI: Lazy<regex::Regex> = Lazy::new(|| {
-    regex::Regex::new(r#"(?i)(href|src|action)\s*=\s*["']?\s*javascript:"#)
-        .expect("sanitize: javascript URI regex")
+/// Singleton `ammonia::Builder` configured for the operator-supplied
+/// `error_page_html` use case. Built once at first access (Lazy) so the
+/// `HashMap` allocations happen outside the hot path.
+///
+/// Replaces the regex-based sanitizer that used to live in this module
+/// (3-pass strip of `<script>`, `on*=`, `javascript:`). Regex HTML
+/// filters are historically contournable via `<svg onload>`, HTML
+/// malformé, encoded bypasses. ammonia parses the input through
+/// `html5ever` and walks the DOM against an allow-list, so the attack
+/// surface collapses onto what the Servo team already hardens (v1.5.0
+/// audit finding HIGH-1).
+///
+/// Policy:
+/// - Default ammonia allow-list covers the structural + inline tags
+///   operators need for readable error pages (h1..h6, p, div, span,
+///   strong, em, code, pre, ul, ol, li, br, hr, a, blockquote, etc).
+/// - Explicitly allows the document-level tags (`html`, `head`, `body`,
+///   `title`) so an operator can supply a full standalone document.
+///   These carry no scripting semantics on their own.
+/// - `<style>`, `<link>`, `<script>`, `<iframe>`, `<object>`, `<embed>`,
+///   `<meta>`, `<base>`, `<form>`, `<input>` are rejected (kept out of
+///   the default allow-list and not re-added here).
+/// - URL schemes on `href` / `src` restricted to `http`, `https`,
+///   `mailto`. `javascript:`, `data:`, `file:`, `vbscript:` are
+///   rejected. (Ammonia defaults already reject `javascript:`; we
+///   tighten to an explicit allow-list.)
+/// - Event handler attributes (`on*=`) never survive parsing.
+/// - `<a>` gets `rel="noopener noreferrer"` forced + target-restricted
+///   (ammonia default for external links).
+static SANITIZER: Lazy<ammonia::Builder<'static>> = Lazy::new(|| {
+    let mut b = ammonia::Builder::default();
+
+    // Structural document tags. ammonia's default strips these because
+    // in a CMS-comment / wiki-edit context they are noise; here we
+    // serve the sanitized HTML as the FULL response body, so an
+    // operator who supplies `<html><body>...` should see it preserved.
+    let mut extra_tags: HashSet<&'static str> = HashSet::new();
+    extra_tags.insert("html");
+    extra_tags.insert("head");
+    extra_tags.insert("body");
+    extra_tags.insert("title");
+    b.add_tags(extra_tags);
+
+    // Tighten URL schemes: ammonia default is fairly permissive
+    // (http, https, mailto, tel, ...). For an error page served from
+    // a reverse proxy, `tel:` and friends have no business use, so we
+    // cap to the minimum set.
+    let mut schemes: HashSet<&'static str> = HashSet::new();
+    schemes.insert("http");
+    schemes.insert("https");
+    schemes.insert("mailto");
+    b.url_schemes(schemes);
+
+    // Lock down `href` / `src` to the scheme allow-list above and
+    // keep relative URLs disabled - the error page is served from
+    // an arbitrary origin and a relative link would chase that.
+    b.url_relative(ammonia::UrlRelative::Deny);
+
+    // Per-tag attribute allow-list stays on the default. We do NOT
+    // re-add `style` on any tag - inline CSS is a known XSS vector
+    // via `background-image: url(javascript:...)` on some old
+    // browsers and `expression()` on IE. Operators who need styling
+    // should ship the CSS externally in a dedicated hosted page.
+    let _ = HashMap::<&str, HashSet<&str>>::new();
+
+    b
 });
 
+/// Sanitize operator-supplied HTML before rendering it as an error
+/// page body. Whitelist-based via ammonia; rejects scripts, event
+/// handlers, `javascript:` / `data:` URIs, `<style>`, `<link>`,
+/// `<iframe>`, etc.
+///
+/// Input size is capped upstream by `validate_error_page_html`
+/// (128 KiB, see `lorica-api`). We do NOT re-check the size here;
+/// the API has already rejected oversize payloads before they are
+/// persisted.
 pub(crate) fn sanitize_html(html: &str) -> String {
-    let out = RE_SCRIPT.replace_all(html, "");
-    let out = RE_EVENTS.replace_all(&out, "");
-    let out = RE_JS_URI.replace_all(&out, r#"$1=""#);
-    out.into_owned()
+    SANITIZER.clean(html).to_string()
 }
 
 pub(crate) fn extract_host(req: &lorica_http::RequestHeader) -> &str {
