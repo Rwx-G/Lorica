@@ -515,10 +515,10 @@ impl ProxyConfig {
 
         // Sort each host's routes by path_prefix length descending (longest prefix match first)
         for entries in routes_by_host.values_mut() {
-            entries.sort_by(|a, b| b.route.path_prefix.len().cmp(&a.route.path_prefix.len()));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.route.path_prefix.len()));
         }
         for (_, entries) in &mut wildcard_routes {
-            entries.sort_by(|a, b| b.route.path_prefix.len().cmp(&a.route.path_prefix.len()));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.route.path_prefix.len()));
         }
 
         // Merge security presets: start with builtins, let custom override by name
