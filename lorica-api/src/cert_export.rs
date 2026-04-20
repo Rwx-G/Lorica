@@ -31,7 +31,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use lorica_config::models::{Certificate, GlobalSettings};
+use lorica_config::models::{resolve_cert_export_acl, CertExportAcl, Certificate, GlobalSettings};
 
 #[cfg(unix)]
 use nix::unistd::{chown, Gid, Uid};
@@ -183,9 +183,12 @@ fn write_atomic(target: &Path, content: &[u8]) -> Result<(), ExportError> {
 /// Main entry point. Export a certificate's PEM bytes to the disk
 /// zone configured in `settings`. Returns `Ok(Disabled)` when the
 /// feature is off so the ACME renewal callers can unconditionally
-/// call this and let the exporter decide.
+/// call this and let the exporter decide. `acls` carries the
+/// per-hostname-pattern overrides; pass an empty slice to fall back
+/// entirely on the global uid / gid.
 pub fn export_certificate(
     settings: &GlobalSettings,
+    acls: &[CertExportAcl],
     cert: &Certificate,
 ) -> Result<ExportOutcome, ExportError> {
     if !settings.cert_export_enabled {
@@ -204,6 +207,26 @@ pub fn export_certificate(
         sanitize_hostname(&cert.domain).unwrap_or_else(|| format!("cert-{}", cert.id));
     let host_dir = root.join(&subdir_name);
 
+    // Resolve per-pattern ACL for this hostname. Each `None` side on
+    // the matched ACL inherits the global default, so an operator can
+    // override just the group without touching the owner.
+    let matched = resolve_cert_export_acl(acls, &cert.domain);
+    let effective_uid = matched
+        .and_then(|a| a.allowed_uid)
+        .or(settings.cert_export_owner_uid);
+    let effective_gid = matched
+        .and_then(|a| a.allowed_gid)
+        .or(settings.cert_export_group_gid);
+    if let Some(a) = matched {
+        tracing::debug!(
+            hostname = %cert.domain,
+            pattern = %a.hostname_pattern,
+            uid = ?effective_uid,
+            gid = ?effective_gid,
+            "cert export: ACL matched"
+        );
+    }
+
     // Ensure both the root and the per-host directory exist with the
     // configured dir mode. `create_dir_all` is idempotent.
     fs::create_dir_all(&host_dir)?;
@@ -213,8 +236,8 @@ pub fn export_certificate(
     for d in [&root, &host_dir] {
         match apply_permissions(
             d,
-            settings.cert_export_owner_uid,
-            settings.cert_export_group_gid,
+            effective_uid,
+            effective_gid,
             settings.cert_export_dir_mode,
         ) {
             Ok(true) => {}
@@ -245,8 +268,8 @@ pub fn export_certificate(
         write_atomic(&target, content.as_bytes())?;
         match apply_permissions(
             &target,
-            settings.cert_export_owner_uid,
-            settings.cert_export_group_gid,
+            effective_uid,
+            effective_gid,
             settings.cert_export_file_mode,
         ) {
             Ok(true) => {}
@@ -311,10 +334,10 @@ fn chain_pem_from(pem: &str) -> String {
 
 /// Convenience wrapper called by every cert-creation path
 /// (`create_certificate`, `generate_self_signed`, the ACME HTTP-01 /
-/// DNS-01 success handlers). Reads `GlobalSettings` from the store,
-/// invokes `export_certificate`, logs the outcome. Never returns
-/// an error - the cert is already persisted in the DB, a missing
-/// disk copy never blocks the request.
+/// DNS-01 success handlers). Reads `GlobalSettings` + ACLs from the
+/// store, invokes `export_certificate`, logs the outcome. Never
+/// returns an error - the cert is already persisted in the DB, a
+/// missing disk copy never blocks the request.
 pub fn export_from_store(store: &lorica_config::ConfigStore, cert: &Certificate) {
     let settings = match store.get_global_settings() {
         Ok(s) => s,
@@ -323,7 +346,8 @@ pub fn export_from_store(store: &lorica_config::ConfigStore, cert: &Certificate)
             return;
         }
     };
-    match export_certificate(&settings, cert) {
+    let acls = store.list_cert_export_acls().unwrap_or_default();
+    match export_certificate(&settings, &acls, cert) {
         Ok(ExportOutcome::Ok) => {
             tracing::info!(cert_id = %cert.id, domain = %cert.domain, "cert export: ok");
         }
@@ -351,14 +375,18 @@ pub fn export_from_store(store: &lorica_config::ConfigStore, cert: &Certificate)
 /// mounted, or an operator-changed mode/ACL, immediately reaches
 /// a coherent on-disk state instead of waiting for the next
 /// renewal cycle.
-pub async fn reexport_all(settings: &GlobalSettings, certs: &[Certificate]) -> (usize, usize) {
+pub async fn reexport_all(
+    settings: &GlobalSettings,
+    acls: &[CertExportAcl],
+    certs: &[Certificate],
+) -> (usize, usize) {
     if !settings.cert_export_enabled {
         return (0, 0);
     }
     let mut ok = 0usize;
     let mut err = 0usize;
     for cert in certs {
-        match export_certificate(settings, cert) {
+        match export_certificate(settings, acls, cert) {
             Ok(ExportOutcome::Ok) | Ok(ExportOutcome::PermissionsSkipped) => ok += 1,
             Ok(ExportOutcome::Disabled) => {}
             Err(e) => {
@@ -459,7 +487,7 @@ mod tests {
         };
         // Feature flag off -> Disabled
         let cert = dummy_cert("test.example.com", "CERT", "KEY");
-        let outcome = export_certificate(&settings, &cert).expect("test setup");
+        let outcome = export_certificate(&settings, &[], &cert).expect("test setup");
         assert!(matches!(outcome, ExportOutcome::Disabled));
         // Nothing should have been written.
         assert!(tmp
@@ -480,7 +508,7 @@ mod tests {
         };
         let pem = "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nchain\n-----END CERTIFICATE-----\n";
         let cert = dummy_cert("grafana.mibu.fr", pem, "privkey-bytes");
-        let outcome = export_certificate(&settings, &cert).expect("test setup");
+        let outcome = export_certificate(&settings, &[], &cert).expect("test setup");
         // Either Ok or PermissionsSkipped depending on test user capabilities.
         assert!(matches!(
             outcome,
@@ -503,6 +531,38 @@ mod tests {
     }
 
     #[test]
+    fn export_acl_overrides_uid_and_gid_for_matching_hostname() {
+        // With no CAP_CHOWN in the test harness the chown step will
+        // skip, so we assert on the outcome enum rather than on the
+        // actual on-disk owner. The intent here is that the exporter
+        // reads the ACL at all and does not silently ignore it.
+        let tmp = tempfile::tempdir().expect("test setup");
+        let settings = GlobalSettings {
+            cert_export_enabled: true,
+            cert_export_dir: Some(tmp.path().to_string_lossy().into_owned()),
+            cert_export_owner_uid: Some(500),
+            cert_export_group_gid: Some(500),
+            ..GlobalSettings::default()
+        };
+        let acls = vec![CertExportAcl {
+            id: "acl-prod".into(),
+            hostname_pattern: "*.mibu.fr".into(),
+            allowed_uid: None,
+            allowed_gid: Some(9999),
+            created_at: Utc::now(),
+        }];
+        let pem = "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n";
+        let cert = dummy_cert("grafana.mibu.fr", pem, "k");
+        let outcome = export_certificate(&settings, &acls, &cert).expect("test setup");
+        assert!(matches!(
+            outcome,
+            ExportOutcome::Ok | ExportOutcome::PermissionsSkipped
+        ));
+        // Matching the ACL wildcard yields a host subdir under the root.
+        assert!(tmp.path().join("grafana.mibu.fr").exists());
+    }
+
+    #[test]
     fn export_falls_back_to_cert_id_when_hostname_unsafe() {
         let tmp = tempfile::tempdir().expect("test setup");
         let settings = GlobalSettings {
@@ -515,7 +575,7 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n",
             "key",
         );
-        let _ = export_certificate(&settings, &cert).expect("test setup");
+        let _ = export_certificate(&settings, &[], &cert).expect("test setup");
         assert!(tmp.path().join("cert-dummy-id").exists());
     }
 }

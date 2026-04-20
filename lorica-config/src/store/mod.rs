@@ -26,6 +26,7 @@ use crate::error::{ConfigError, Result};
 
 mod backends;
 pub mod bot_stash;
+mod cert_export_acls;
 mod certs;
 mod dns_providers;
 mod loadtest;
@@ -640,6 +641,22 @@ impl ConfigStore {
         let _ = self.conn.execute(
             "ALTER TABLE routes ADD COLUMN group_name TEXT NOT NULL DEFAULT ''",
             [],
+        );
+
+        // V38: per-pattern ACL for the certificate export zone
+        // (v1.4.1). One row = one rule. Exporter walks ACLs in
+        // longest-pattern-first order and applies the first match's
+        // uid / gid instead of the global default. `allowed_uid` and
+        // `allowed_gid` are NULLable so an ACL can override only the
+        // group without touching the owner, or vice versa.
+        let _ = self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cert_export_acls (
+                id TEXT PRIMARY KEY,
+                hostname_pattern TEXT NOT NULL,
+                allowed_uid INTEGER,
+                allowed_gid INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
         );
 
         Ok(())
