@@ -1,6 +1,6 @@
 [package]
 name = "lorica-challenge"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Bot-protection challenges (cookie + PoW + captcha) for Lorica"

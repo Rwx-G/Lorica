@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.4.1-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.5.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Lorica%20Tests-985-brightgreen.svg" alt="Lorica Tests">
@@ -573,15 +573,16 @@ gpg --verify lorica.deb.asc lorica.deb
 | Version | Features | Status |
 |---------|----------|--------|
 | v1.4.0 | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Shipped |
-| **v1.4.1** | Path-rule redirect fix + operator-input guard-rails on every field (URL, regex, headers, CORS, mTLS, numeric bounds, paths, hostname aliases) with live blur + input inline-error feedback in the dashboard; Route `group_name` classification label + filter dropdown + colored pill; Certificate download API + dashboard split-menu (cert / chain / key / bundle) with private-key confirm dialog; Filesystem certificate export zone (writes PEM bundles per hostname on issue / renewal, atomic writes, operator-configurable UID / GID / mode) with per-pattern ACL, dashboard Settings tab, and operator re-export endpoint | Current |
-| v1.5.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) | Planned |
+| **v1.5.0** | Operator-input guard-rails on every field with blur + input inline errors; Route `group_name` + filter + colored pill; Certificate download API + dashboard split-menu with private-key confirm; Filesystem certificate export zone with per-pattern ACL, Settings tab, operator re-export endpoint; Path-rule redirect fix ; Security hardening wave: `ammonia` HTML sanitiser, per-endpoint rate limits on management plane, per-route body-size limits with 1 MiB global default, session cookie rotation on password change, `/system` response filter, `rustls-pemfile → rustls-pki-types` migration, `rand 0.9` bump, source-error preservation on `.map_err` chains, WebSocket log-stream backpressure with close-on-slow-client | Current |
+| v1.6.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) ; `proxy_wiring.rs` + `main.rs` module split ; ACME module unit tests with mocked DNS providers | Planned |
 | v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
 
 ### Backlog (no planned version yet)
 
 - **Third-party IP-reputation feeds.** Beyond the built-in Data-Shield blocklist: pluggable feed sources (FireHOL, Spamhaus DROP, abuse.ch, custom HTTP endpoints) with per-feed allow / deny policy. Deferred: the stability of the feeds we reviewed (SLA for URL stability, license compatibility with Apache-2.0) is mixed, and the current `connection_deny_cidrs` + Data-Shield combo already covers 95 % of what operators ask for without a third-party trust boundary.
 - **PKCS#12 / JKS bundle export.** Complement the PEM export zone with `.p12` / `.jks` for Java keystore consumers. Deferred: `openssl pkcs12 -export` on the already-written PEM files is one line and keeps the Lorica code path free of OpenSSL-versus-rustls format-serialization.
-- **Exported-cert orphan cleanup.** When the operator deletes a certificate in the dashboard, the on-disk export directory is NOT removed (by design, v1.4.1 leaves it to the operator). A dashboard "sweep orphans" button is the likely v1.5.x follow-up.
+- **Exported-cert orphan cleanup.** When the operator deletes a certificate in the dashboard, the on-disk export directory is NOT removed (by design, v1.5.0 leaves it to the operator). A dashboard "sweep orphans" button is the likely v1.6.x follow-up.
+- **Public-API doc coverage pass (`missing_docs`).** Enable `#![warn(missing_docs)]` on `lorica-api` / `lorica-config` / `lorica-challenge` + fill remaining gaps in request / response type fields, settings keys, model fields. Enumerated but deferred from the v1.5.0 hardening wave — it is grind, not mechanical, and would create ~100+ new warnings to triage.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 

@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-04-20
+
 ### Security
 
 - WebSocket log-stream backpressure with drop metric (v1.5.0 audit finding LOW-12). A slow consumer on `GET /api/v1/logs/ws` used to silently drop messages on the inner `broadcast::Receiver` (`RecvError::Lagged(n)`) with only a `debug!` log. The handler now counts every dropped entry against a new Prometheus counter `lorica_logs_ws_dropped_total{reason="slow_client"}`, raises the log level to `warn!` with the running per-connection total, and terminates the connection with a WebSocket close code 1008 (Policy Violation) + reason text `"log stream too slow"` once the cumulative drops exceed 1000 — protecting Lorica from stuck-client backpressure amplification. Threshold is deliberately high so a brief network hiccup does not evict a live operator session ; a genuinely stuck client racks up drops fast enough to hit the cap within seconds.

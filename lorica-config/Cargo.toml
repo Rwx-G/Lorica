@@ -1,6 +1,6 @@
 [package]
 name = "lorica-config"
-version = "1.4.1"
+version = "1.5.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
