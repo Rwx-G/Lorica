@@ -3085,3 +3085,56 @@ fn breaker_unknown_route_is_available_by_default() {
     let breaker = CircuitBreaker::new(5, 10);
     assert!(breaker.is_available("never-seen", "10.0.0.1:3080"));
 }
+
+// ---- Redirect URL construction ----
+
+#[test]
+fn redirect_location_route_level_appends_path_and_query() {
+    // Route-level redirect_to: migration use case. The target is a
+    // base URL; the request path + query are appended so every
+    // subpath of the old host maps to the new host.
+    let loc = build_redirect_location(
+        "https://new.example.com/",
+        "/docs/v2",
+        Some("ref=changelog"),
+        false,
+    );
+    assert_eq!(loc, "https://new.example.com/docs/v2?ref=changelog");
+}
+
+#[test]
+fn redirect_location_route_level_trims_trailing_slash_once() {
+    let loc = build_redirect_location("https://new.example.com/", "/a", None, false);
+    assert_eq!(loc, "https://new.example.com/a");
+}
+
+#[test]
+fn redirect_location_path_rule_is_literal() {
+    // Path rule redirect_to: operator set the exact destination for
+    // this matched path. The request path must not be appended,
+    // otherwise a target like ".../?q=https://host/" would receive
+    // the matched path concatenated after it (the Plex /tesla bug).
+    let loc = build_redirect_location(
+        "https://www.youtube.com/redirect?q=https://plex.rwx-g.fr/",
+        "/tesla",
+        None,
+        true,
+    );
+    assert_eq!(
+        loc,
+        "https://www.youtube.com/redirect?q=https://plex.rwx-g.fr/"
+    );
+}
+
+#[test]
+fn redirect_location_path_rule_literal_ignores_query_too() {
+    // Literal redirects must also ignore the client's query string:
+    // the operator's target is authoritative.
+    let loc = build_redirect_location(
+        "https://example.com/final",
+        "/src",
+        Some("utm=x"),
+        true,
+    );
+    assert_eq!(loc, "https://example.com/final");
+}
