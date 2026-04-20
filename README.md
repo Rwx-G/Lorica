@@ -573,9 +573,15 @@ gpg --verify lorica.deb.asc lorica.deb
 | Version | Features | Status |
 |---------|----------|--------|
 | v1.4.0 | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Shipped |
-| **v1.4.1** | Path-rule redirect fix + operator-input guard-rails on every field (URL, regex, headers, CORS, mTLS, numeric bounds, paths, hostname aliases) with live blur + input inline-error feedback in the dashboard | Current |
-| v1.5.0 | Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) | Planned |
+| **v1.4.1** | Path-rule redirect fix + operator-input guard-rails on every field (URL, regex, headers, CORS, mTLS, numeric bounds, paths, hostname aliases) with live blur + input inline-error feedback in the dashboard; Route `group_name` classification label + filter dropdown + colored pill; Certificate download API + dashboard split-menu (cert / chain / key / bundle) with private-key confirm dialog; Filesystem certificate export zone (writes PEM bundles per hostname on issue / renewal, atomic writes, operator-configurable UID / GID / mode) with per-pattern ACL, dashboard Settings tab, and operator re-export endpoint | Current |
+| v1.5.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) | Planned |
 | v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
+
+### Backlog (no planned version yet)
+
+- **Third-party IP-reputation feeds.** Beyond the built-in Data-Shield blocklist: pluggable feed sources (FireHOL, Spamhaus DROP, abuse.ch, custom HTTP endpoints) with per-feed allow / deny policy. Deferred: the stability of the feeds we reviewed (SLA for URL stability, license compatibility with Apache-2.0) is mixed, and the current `connection_deny_cidrs` + Data-Shield combo already covers 95 % of what operators ask for without a third-party trust boundary.
+- **PKCS#12 / JKS bundle export.** Complement the PEM export zone with `.p12` / `.jks` for Java keystore consumers. Deferred: `openssl pkcs12 -export` on the already-written PEM files is one line and keeps the Lorica code path free of OpenSSL-versus-rustls format-serialization.
+- **Exported-cert orphan cleanup.** When the operator deletes a certificate in the dashboard, the on-disk export directory is NOT removed (by design, v1.4.1 leaves it to the operator). A dashboard "sweep orphans" button is the likely v1.5.x follow-up.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
