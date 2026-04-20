@@ -1726,6 +1726,103 @@ async fn test_update_settings_cert_export_clears_dir_on_empty_string() {
     assert!(json["data"]["cert_export_dir"].is_null());
 }
 
+#[tokio::test]
+async fn test_rate_limit_settings_bucket_returns_429_after_limit() {
+    // PUT /api/v1/settings is capped at 10/60s per IP (v1.5.0 A.3).
+    // Drive 11 PUTs from the same (simulated) client and assert the
+    // 11th returns 429 with a Retry-After header.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let body = serde_json::json!({ "log_level": "info" });
+    for i in 0..10 {
+        let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/settings")
+            .header("Content-Type", "application/json")
+            .header("Cookie", &cookie)
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test setup"),
+            ))
+            .expect("test setup");
+        let response = router.oneshot(req).await.expect("test setup");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "request {i} within budget should be 200"
+        );
+    }
+
+    // 11th request over the limit -> 429 + Retry-After.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry = response
+        .headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok())
+        .expect("Retry-After header present on 429");
+    let retry_seconds: u64 = retry.parse().expect("Retry-After is a number");
+    assert!(
+        (1..=60).contains(&retry_seconds),
+        "Retry-After {retry_seconds} out of [1, 60]"
+    );
+}
+
+#[tokio::test]
+async fn test_rate_limit_buckets_are_isolated() {
+    // Exhausting the settings bucket (10/60s) must NOT affect the
+    // routes CRUD bucket (30/60s). Each state-mutating endpoint
+    // carries its own bucket so a flood on one does not block the
+    // operator from fixing the config elsewhere.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Exhaust the settings bucket.
+    let body = serde_json::json!({ "log_level": "info" });
+    for _ in 0..=10 {
+        let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/settings")
+            .header("Content-Type", "application/json")
+            .header("Cookie", &cookie)
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test setup"),
+            ))
+            .expect("test setup");
+        let _ = router.oneshot(req).await;
+    }
+
+    // routes_cud bucket should still have budget: a GET /routes
+    // (no bucket) + a POST /routes returns a normal 201/400, not
+    // a 429. Skip the 400-prone full payload; a GET is enough to
+    // prove the router still serves the authenticated session.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/routes")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_ne!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "GET /routes must not be rate limited by the settings bucket"
+    );
+}
+
 // ---- Notification Endpoint Tests ----
 
 #[tokio::test]

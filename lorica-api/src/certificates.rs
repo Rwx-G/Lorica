@@ -482,13 +482,17 @@ pub async fn download_certificate(
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
-    // Rate-limit per client IP. Same bucket shape as the login flow
+    // Rate-limit per client IP in a dedicated `cert_download` bucket
     // (5 attempts / 60 s window) so a runaway script cannot exfiltrate
-    // every cert in a tight loop; legitimate "backup all certs" use
-    // cases pace themselves trivially.
-    let rate_key = format!("cert_download:{client_ip}");
-    if !rate_limiter.check(&rate_key).await {
-        return Err(ApiError::RateLimited);
+    // every cert in a tight loop. Legitimate "backup all certs" use
+    // cases pace themselves trivially. The bucket is independent of
+    // the login bucket so a cert-download flood does not block the
+    // operator from logging in.
+    if let Err(retry_after) = rate_limiter
+        .check_bucket("cert_download", &client_ip, 5, 60)
+        .await
+    {
+        return Err(ApiError::RateLimited(retry_after));
     }
 
     let store = state.store.lock().await;

@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::logs::LogBuffer;
 use crate::middleware::auth::{require_auth, SessionStore};
-use crate::middleware::rate_limit::RateLimiter;
+use crate::middleware::rate_limit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
 use crate::system::SystemCache;
 use crate::workers::WorkerMetrics;
 
@@ -179,6 +179,23 @@ pub fn build_router(
     session_store: SessionStore,
     rate_limiter: RateLimiter,
 ) -> Router {
+    // Helper: build a rate-limit middleware layer for a specific
+    // bucket. Attached per-route on state-mutating management
+    // endpoints (v1.5.0 audit A.3). Defense-in-depth for when the
+    // dashboard is exposed behind a reverse proxy : a compromised
+    // session cookie cannot flood ACME quotas, overwrite the whole
+    // config, or password-spray.
+    let rl = |bucket: &'static str, limit: u32, window_seconds: u64| {
+        middleware::from_fn_with_state(
+            RateLimitConfig {
+                bucket,
+                limit,
+                window_seconds,
+            },
+            rate_limit_middleware,
+        )
+    };
+
     // Public routes (no auth required)
     let auth_routes = Router::new()
         .route("/api/v1/auth/login", post(crate::auth::login))
@@ -194,12 +211,24 @@ pub fn build_router(
 
     // Protected routes (auth required)
     let protected_routes = Router::new()
-        .route("/api/v1/auth/password", put(crate::auth::change_password))
+        .route(
+            "/api/v1/auth/password",
+            put(crate::auth::change_password).layer(rl("password_change", 3, 60)),
+        )
         .route("/api/v1/routes", get(crate::routes::list_routes))
-        .route("/api/v1/routes", post(crate::routes::create_route))
+        .route(
+            "/api/v1/routes",
+            post(crate::routes::create_route).layer(rl("routes_cud", 30, 60)),
+        )
         .route("/api/v1/routes/:id", get(crate::routes::get_route))
-        .route("/api/v1/routes/:id", put(crate::routes::update_route))
-        .route("/api/v1/routes/:id", delete(crate::routes::delete_route))
+        .route(
+            "/api/v1/routes/:id",
+            put(crate::routes::update_route).layer(rl("routes_cud", 30, 60)),
+        )
+        .route(
+            "/api/v1/routes/:id",
+            delete(crate::routes::delete_route).layer(rl("routes_cud", 30, 60)),
+        )
         .route(
             "/api/v1/validate/mtls-pem",
             post(crate::routes::validate_mtls_pem),
@@ -229,11 +258,11 @@ pub fn build_router(
         )
         .route(
             "/api/v1/certificates",
-            post(crate::certificates::create_certificate),
+            post(crate::certificates::create_certificate).layer(rl("cert_create", 5, 60)),
         )
         .route(
             "/api/v1/certificates/self-signed",
-            post(crate::certificates::generate_self_signed),
+            post(crate::certificates::generate_self_signed).layer(rl("cert_create", 5, 60)),
         )
         .route(
             "/api/v1/certificates/:id",
@@ -257,15 +286,15 @@ pub fn build_router(
         )
         .route(
             "/api/v1/cert-export/acls",
-            post(crate::routes::cert_export::create_acl),
+            post(crate::routes::cert_export::create_acl).layer(rl("cert_export_acls", 30, 60)),
         )
         .route(
             "/api/v1/cert-export/acls/:id",
-            delete(crate::routes::cert_export::delete_acl),
+            delete(crate::routes::cert_export::delete_acl).layer(rl("cert_export_acls", 30, 60)),
         )
         .route(
             "/api/v1/cert-export/reapply",
-            post(crate::routes::cert_export::reapply),
+            post(crate::routes::cert_export::reapply).layer(rl("cert_export_reapply", 5, 60)),
         )
         .route("/api/v1/status", get(crate::status::get_status))
         .route("/api/v1/logs", get(crate::logs::get_logs))
@@ -275,13 +304,19 @@ pub fn build_router(
         .route("/api/v1/system", get(crate::system::get_system))
         .route("/api/v1/workers", get(crate::workers::get_workers))
         .route("/api/v1/config/export", post(crate::config::export_config))
-        .route("/api/v1/config/import", post(crate::config::import_config))
+        .route(
+            "/api/v1/config/import",
+            post(crate::config::import_config).layer(rl("config_import", 3, 60)),
+        )
         .route(
             "/api/v1/config/import/preview",
-            post(crate::config::import_preview),
+            post(crate::config::import_preview).layer(rl("config_import", 3, 60)),
         )
         .route("/api/v1/settings", get(crate::settings::get_settings))
-        .route("/api/v1/settings", put(crate::settings::update_settings))
+        .route(
+            "/api/v1/settings",
+            put(crate::settings::update_settings).layer(rl("settings", 10, 60)),
+        )
         .route(
             "/api/v1/settings/otel/test",
             post(crate::settings::test_otel_connection),
@@ -356,27 +391,27 @@ pub fn build_router(
         )
         .route(
             "/api/v1/acme/provision",
-            post(crate::acme::provision_certificate),
+            post(crate::acme::provision_certificate).layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns",
-            post(crate::acme::provision_certificate_dns),
+            post(crate::acme::provision_certificate_dns).layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual",
-            post(crate::acme::provision_dns_manual),
+            post(crate::acme::provision_dns_manual).layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual/check",
-            post(crate::acme::check_dns_manual),
+            post(crate::acme::check_dns_manual).layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual/confirm",
-            post(crate::acme::provision_dns_manual_confirm),
+            post(crate::acme::provision_dns_manual_confirm).layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/certificates/:id/renew",
-            post(crate::acme::renew_certificate),
+            post(crate::acme::renew_certificate).layer(rl("acme_provision", 3, 60)),
         )
         .route("/api/v1/waf/rules", get(crate::waf::get_waf_rules))
         .route(

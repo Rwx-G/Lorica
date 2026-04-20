@@ -70,9 +70,16 @@ pub async fn login(
     let client_ip = connect_info
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    let rate_key = format!("login:{client_ip}");
-    if !rate_limiter.check(&rate_key).await {
-        return Err(ApiError::RateLimited);
+    // Legacy fixed 5/60 s login bucket. Retained via
+    // `RateLimiter::check` (wrapper around the new
+    // `check_bucket("login", ...)`). The Retry-After on the 429
+    // response is computed from the same fixed window so clients
+    // polite enough to honour it back off correctly.
+    if !rate_limiter.check(client_ip.as_str()).await {
+        // 60 s fixed window ceiling is good enough for the legacy
+        // path ; the named-bucket version computes the exact
+        // remaining time.
+        return Err(ApiError::RateLimited(60));
     }
 
     let store = state.store.lock().await;
