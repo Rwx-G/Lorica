@@ -800,6 +800,47 @@ export const api = {
   renewCertificate: (id: string) =>
     request<{ renewed: boolean; old_cert_id: string; new_cert_id: string; domain: string }>('POST', `/certificates/${id}/renew`),
 
+  /**
+   * Trigger a browser download of the PEM payload for one certificate.
+   * Bypasses the `request()` wrapper (which expects a JSON envelope) and
+   * talks directly to the endpoint via fetch + Blob so the browser's
+   * native download flow picks up the `Content-Disposition` filename.
+   * `part` selects `cert` / `key` / `chain` / `bundle` (default).
+   * Returns `{ ok }` on success, or `{ ok: false, message }` on error;
+   * callers surface a toast and never auto-retry (rate-limit is 5 per
+   * 60 s).
+   */
+  downloadCertificate: async (id: string, part: 'cert' | 'key' | 'chain' | 'bundle' = 'bundle'): Promise<{ ok: true } | { ok: false; message: string }> => {
+    const qs = new URLSearchParams({ part }).toString();
+    const res = await fetch(`/api/v1/certificates/${id}/download?${qs}`, {
+      method: 'GET',
+      credentials: 'same-origin',
+    });
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`;
+      try {
+        const j = await res.json();
+        if (j?.error?.message) message = j.error.message;
+      } catch { /* ignore */ }
+      return { ok: false, message };
+    }
+    const blob = await res.blob();
+    // Prefer the server-supplied filename from Content-Disposition; fall
+    // back to `{id}-{part}.pem` if the header is missing or malformed.
+    const cd = res.headers.get('Content-Disposition') ?? '';
+    const match = /filename="([^"]+)"/.exec(cd);
+    const filename = match?.[1] ?? `${id}-${part}.pem`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    return { ok: true };
+  },
+
   generateSelfSigned: (body: GenerateSelfSignedRequest) =>
     request<CertificateResponse>('POST', '/certificates/self-signed', body),
 
