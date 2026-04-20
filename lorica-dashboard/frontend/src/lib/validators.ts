@@ -222,6 +222,24 @@ export function validateErrorPageHtml(input: string): string | null {
 }
 
 /**
+ * Validate a `group_name` for a Route or a Backend. Empty string
+ * (after trim) is accepted as "ungrouped". Non-empty must match the
+ * RFC-1035-inspired identifier alphabet `^[a-z0-9_-]{1,64}$`:
+ * lowercase ASCII letters, digits, dash and underscore. Mirrors the
+ * server-side `validate_group_name` in lorica-api so the UI can fail
+ * fast with the same contract.
+ */
+export function validateGroupName(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return null;
+  if (s.length > 64) return 'group name must be <= 64 characters';
+  if (!/^[a-z0-9_-]+$/.test(s)) {
+    return 'group name may only contain ASCII lowercase letters, digits, `-` and `_`';
+  }
+  return null;
+}
+
+/**
  * Validate a path-prefix-style field (route `path_prefix`,
  * `strip_path_prefix`, `add_path_prefix`, path-rule paths). Empty
  * => null ("clear the field"). Non-empty value must start with

@@ -168,6 +168,9 @@ export interface RouteResponse {
   rate_limit?: RateLimitConfig | null;
   geoip?: GeoIpConfig | null;
   bot_protection?: BotProtectionConfig | null;
+  /// Free-form classification label (prod / staging / homelab / ...).
+  /// Empty string = ungrouped. Mirrors `Backend.group_name`.
+  group_name?: string;
   created_at: string;
   updated_at: string;
 }
@@ -364,6 +367,7 @@ export interface CreateRouteRequest {
   rate_limit?: RateLimitConfig;
   geoip?: GeoIpConfig;
   bot_protection?: BotProtectionConfig;
+  group_name?: string;
 }
 
 
@@ -436,6 +440,11 @@ export interface UpdateRouteRequest {
   /// `bot_protection` leaves the stored value alone - the
   /// "missing = no-op" contract preserved for every other field.
   bot_protection_disable?: boolean;
+  /// Free-form operator classification (prod / staging / homelab / ...).
+  /// Empty string clears the grouping. `undefined` leaves the field
+  /// unchanged (follows the same missing-= no-op rule as every other
+  /// UpdateRouteRequest field).
+  group_name?: string;
 }
 
 export interface BackendResponse {

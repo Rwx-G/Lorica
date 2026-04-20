@@ -12,6 +12,7 @@ import {
   validateRoutePath,
   validateHostnameAliasList,
   validateErrorPageHtml,
+  validateGroupName,
 } from './validators';
 
 export interface PathRuleFormState {
@@ -65,6 +66,7 @@ export interface RouteFormState {
   redirect_hostname: string;
   redirect_to: string;
   hostname_aliases: string;
+  group_name: string;
   websocket_enabled: boolean;
   access_log_enabled: boolean;
   compression_enabled: boolean;
@@ -166,6 +168,7 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   redirect_hostname: '',
   redirect_to: '',
   hostname_aliases: '',
+  group_name: '',
   websocket_enabled: true,
   access_log_enabled: true,
   compression_enabled: false,
@@ -379,6 +382,7 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     redirect_hostname: route.redirect_hostname ?? '',
     redirect_to: route.redirect_to ?? '',
     hostname_aliases: route.hostname_aliases.join(', '),
+    group_name: route.group_name ?? '',
     websocket_enabled: route.websocket_enabled,
     access_log_enabled: route.access_log_enabled,
     compression_enabled: route.compression_enabled,
@@ -616,6 +620,7 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     redirect_hostname: form.redirect_hostname || (isUpdate ? '' : undefined),
     redirect_to: form.redirect_to || (isUpdate ? '' : undefined),
     hostname_aliases: tokenListToArray(form.hostname_aliases).length > 0 ? tokenListToArray(form.hostname_aliases) : empty([]),
+    group_name: form.group_name || (isUpdate ? '' : undefined),
     websocket_enabled: form.websocket_enabled,
     access_log_enabled: form.access_log_enabled,
     connect_timeout_s: form.connect_timeout_s,
@@ -999,6 +1004,8 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
   }
   const aliasErr = validateHostnameAliasList(form.hostname_aliases);
   if (aliasErr !== null) return r(`Hostname aliases: ${aliasErr}`, 'general');
+  const groupErr = validateGroupName(form.group_name);
+  if (groupErr !== null) return r(`Group: ${groupErr}`, 'general');
   const retryErr = validateHttpMethodList(form.retry_on_methods);
   if (retryErr !== null) return r(`Retry on methods: ${retryErr}`, 'upstream');
   const errorPageErr = validateErrorPageHtml(form.error_page_html);
@@ -1183,6 +1190,8 @@ export function validateRouteForm(form: RouteFormState): string {
   }
   const aliasErr = validateHostnameAliasList(form.hostname_aliases);
   if (aliasErr !== null) return `Hostname aliases: ${aliasErr}`;
+  const groupErr = validateGroupName(form.group_name);
+  if (groupErr !== null) return `Group: ${groupErr}`;
   const retryErr = validateHttpMethodList(form.retry_on_methods);
   if (retryErr !== null) return `Retry on methods: ${retryErr}`;
   const errorPageErr = validateErrorPageHtml(form.error_page_html);

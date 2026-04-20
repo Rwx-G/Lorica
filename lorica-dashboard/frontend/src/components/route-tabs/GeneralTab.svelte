@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { RouteFormState } from '../../lib/route-form';
   import { ROUTE_DEFAULTS, validateHostname, validateRedirectHostname } from '../../lib/route-form';
-  import { validateUrl, validateRoutePath, validateHostnameAliasList, validateErrorPageHtml } from '../../lib/validators';
+  import { validateUrl, validateRoutePath, validateHostnameAliasList, validateErrorPageHtml, validateGroupName } from '../../lib/validators';
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
@@ -19,6 +19,7 @@
   let redirectToError = $state<string | null>(null);
   let pathPrefixError = $state<string | null>(null);
   let hostnameAliasesError = $state<string | null>(null);
+  let groupNameError = $state<string | null>(null);
   let returnStatusError = $state<string | null>(null);
   let errorPageHtmlError = $state<string | null>(null);
   let activeHelp = $state<null | 'section:identity' | 'section:response_override' | 'hostname' | 'path_prefix' | 'hostname_aliases' | 'enabled' | 'websocket_enabled' | 'access_log_enabled' | 'redirect_to' | 'redirect_hostname' | 'return_status' | 'error_page_html'>(null);
@@ -41,6 +42,10 @@
 
   function handleHostnameAliasesBlur() {
     hostnameAliasesError = validateHostnameAliasList(form.hostname_aliases);
+  }
+
+  function handleGroupNameBlur() {
+    groupNameError = validateGroupName(form.group_name);
   }
 
   function handleReturnStatusBlur() {
@@ -115,6 +120,18 @@
         <input id="hostname-aliases" type="text" bind:value={form.hostname_aliases} placeholder="alias1.com, alias2.com" onblur={handleHostnameAliasesBlur} oninput={handleHostnameAliasesBlur} />
         {#if hostnameAliasesError}<span class="field-error" role="alert">{hostnameAliasesError}</span>{/if}
         <span class="hint">Additional hostnames routed to this same configuration. Comma-separated.</span>
+      </div>
+
+      <div class="form-group" class:modified={isModified('group_name')}>
+        <label for="route-group">Group</label>
+        {#if isImported('group_name')}<span class="imported-badge">imported</span>{/if}
+        <input id="route-group" type="text" bind:value={form.group_name} placeholder="e.g. prod, staging, homelab" onblur={handleGroupNameBlur} oninput={handleGroupNameBlur} />
+        {#if groupNameError}<span class="field-error" role="alert">{groupNameError}</span>{/if}
+        <span class="hint">
+          Free-form classification for filtering in the routes list.
+          Lowercase letters, digits, <code>-</code> and <code>_</code>,
+          up to 64 chars. Empty = ungrouped.
+        </span>
       </div>
 
       {#if editing}

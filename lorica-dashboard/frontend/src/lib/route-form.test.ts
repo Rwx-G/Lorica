@@ -29,6 +29,7 @@ import {
   validateRoutePath,
   validateHostnameAliasList,
   validateErrorPageHtml,
+  validateGroupName,
 } from './validators';
 
 // ---------------------------------------------------------------------------
@@ -439,6 +440,35 @@ describe('validateHostnameAliasList', () => {
 // ---------------------------------------------------------------------------
 // validateErrorPageHtml
 // ---------------------------------------------------------------------------
+
+describe('validateGroupName', () => {
+  it('accepts empty / whitespace as ungrouped', () => {
+    expect(validateGroupName('')).toBeNull();
+    expect(validateGroupName('   ')).toBeNull();
+  });
+
+  it('accepts lowercase identifier alphabet', () => {
+    expect(validateGroupName('prod')).toBeNull();
+    expect(validateGroupName('homelab-staging')).toBeNull();
+    expect(validateGroupName('my_group_42')).toBeNull();
+    expect(validateGroupName('a')).toBeNull();
+  });
+
+  it('rejects uppercase', () => {
+    expect(validateGroupName('PROD')).toMatch(/lowercase/);
+    expect(validateGroupName('Prod')).toMatch(/lowercase/);
+  });
+
+  it('rejects whitespace and special chars', () => {
+    expect(validateGroupName('my group')).toMatch(/lowercase/);
+    expect(validateGroupName('my.group')).toMatch(/lowercase/);
+    expect(validateGroupName('my/group')).toMatch(/lowercase/);
+  });
+
+  it('rejects oversize', () => {
+    expect(validateGroupName('a'.repeat(100))).toMatch(/64/);
+  });
+});
 
 describe('validateErrorPageHtml', () => {
   it('accepts empty and small pages', () => {
