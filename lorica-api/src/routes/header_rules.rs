@@ -36,6 +36,25 @@ pub(super) fn build_header_rule(
             "header_rules: header_name must not be empty".into(),
         ));
     }
+    if header_name.len() > 256 {
+        return Err(ApiError::BadRequest(
+            "header_rules: header_name must be <= 256 characters".into(),
+        ));
+    }
+    for c in header_name.chars() {
+        let is_token = c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' |
+                '.' | '^' | '_' | '`' | '|' | '~'
+            );
+        if !is_token {
+            return Err(ApiError::BadRequest(format!(
+                "header_rules: header_name {header_name:?} contains `{c}` which is not a \
+                 valid HTTP field-name character (RFC 7230 token)"
+            )));
+        }
+    }
     let match_type: lorica_config::models::HeaderMatchType = body
         .match_type
         .as_deref()

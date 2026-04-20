@@ -33,8 +33,19 @@ pub(super) fn build_traffic_split(
             "traffic_splits: a split with weight > 0 must list at least one backend".into(),
         ));
     }
+    let name = body.name.trim();
+    if name.len() > 128 {
+        return Err(ApiError::BadRequest(
+            "traffic_splits: name must be <= 128 characters".into(),
+        ));
+    }
+    if name.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
+        return Err(ApiError::BadRequest(
+            "traffic_splits: name contains a control character".into(),
+        ));
+    }
     Ok(lorica_config::models::TrafficSplit {
-        name: body.name.trim().to_string(),
+        name: name.to_string(),
         weight_percent: body.weight_percent,
         backend_ids: body.backend_ids.clone(),
     })
@@ -121,5 +132,20 @@ mod tests {
     #[test]
     fn validate_traffic_splits_empty_is_ok() {
         assert!(validate_traffic_splits(&[]).is_ok());
+    }
+
+    #[test]
+    fn build_traffic_split_rejects_name_too_long() {
+        let name: String = "a".repeat(200);
+        let req = split(&name, 5, &["b"]);
+        let err = build_traffic_split(&req).expect_err("should reject");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("128")));
+    }
+
+    #[test]
+    fn build_traffic_split_rejects_control_char_in_name() {
+        let req = split("bad\nname", 5, &["b"]);
+        let err = build_traffic_split(&req).expect_err("should reject");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("control character")));
     }
 }

@@ -138,9 +138,9 @@ pub async fn update_settings(
         settings.sla_purge_enabled = enabled;
     }
     if let Some(days) = body.sla_purge_retention_days {
-        if days < 1 {
+        if !(1..=3650).contains(&days) {
             return Err(ApiError::BadRequest(
-                "sla_purge_retention_days must be >= 1".into(),
+                "sla_purge_retention_days must be in 1..=3650 (10 years)".into(),
             ));
         }
         settings.sla_purge_retention_days = days;
@@ -260,6 +260,11 @@ pub async fn update_settings(
         if trimmed.is_empty() || trimmed.len() > 256 {
             return Err(ApiError::BadRequest(
                 "otlp_service_name must be 1-256 characters".into(),
+            ));
+        }
+        if trimmed.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
+            return Err(ApiError::BadRequest(
+                "otlp_service_name must not contain control characters".into(),
             ));
         }
         settings.otlp_service_name = trimmed.to_string();
