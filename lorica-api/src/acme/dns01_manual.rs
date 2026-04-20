@@ -505,6 +505,7 @@ pub async fn provision_dns_manual_confirm(
     store
         .create_certificate(&cert)
         .map_err(|e| ApiError::Internal(format!("failed to store certificate: {e}")))?;
+    crate::cert_export::export_from_store(&store, &cert);
     drop(store);
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();

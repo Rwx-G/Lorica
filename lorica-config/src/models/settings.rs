@@ -218,6 +218,44 @@ pub struct GlobalSettings {
     /// CC-BY 4.0 attribution note.
     #[serde(default)]
     pub asn_auto_update_enabled: bool,
+    /// Enable the filesystem certificate export (v1.4.1). When true,
+    /// every time an ACME cert is issued or renewed (and at startup
+    /// for already-issued certs) Lorica writes the PEM + key under
+    /// `cert_export_dir/<hostname>/` so external tools (Ansible, a
+    /// HAProxy sidecar, a backup job) can read the live bundle
+    /// directly from disk. Requires `cert_export_dir` to be set; the
+    /// dashboard surfaces a warning banner before the operator turns
+    /// this on because the key is written in plain text.
+    #[serde(default)]
+    pub cert_export_enabled: bool,
+    /// Absolute path of the directory that receives exported certs.
+    /// Each cert lands under `<dir>/<sanitised-hostname>/{cert,chain,
+    /// fullchain,privkey}.pem`. `None` = feature off.
+    #[serde(default)]
+    pub cert_export_dir: Option<String>,
+    /// Numeric UID set on every exported file / directory (ownership).
+    /// `None` = keep the default (same as the Lorica process user).
+    /// Required when Ansible or another external process needs to
+    /// read the bundle.
+    #[serde(default)]
+    pub cert_export_owner_uid: Option<u32>,
+    /// Numeric GID set on every exported file / directory. Same
+    /// semantics as `cert_export_owner_uid`. Typical setup is a
+    /// dedicated Unix group (`lorica-certs`) that the external
+    /// process's user is a member of.
+    #[serde(default)]
+    pub cert_export_group_gid: Option<u32>,
+    /// Octal mode (file permission bits) applied to each `.pem`
+    /// file. Default `0o640` (owner rw, group r, world nothing).
+    /// Stored as decimal so the existing key-value `global_settings`
+    /// table does not need a special type - the dashboard input
+    /// surfaces octal notation.
+    #[serde(default = "default_cert_export_file_mode")]
+    pub cert_export_file_mode: u32,
+    /// Octal mode (directory permission bits) applied to the export
+    /// dir and its per-hostname subdirectories. Default `0o750`.
+    #[serde(default = "default_cert_export_dir_mode")]
+    pub cert_export_dir_mode: u32,
     /// HMAC secret used to sign the bot-protection verdict cookie
     /// (v1.4.0 Epic 3). 32 raw bytes, stored as a hex string so the
     /// existing key-value `global_settings` table does not need a
@@ -293,6 +331,14 @@ fn default_otlp_sampling_ratio() -> f64 {
     0.1
 }
 
+fn default_cert_export_file_mode() -> u32 {
+    0o640
+}
+
+fn default_cert_export_dir_mode() -> u32 {
+    0o750
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
@@ -328,6 +374,12 @@ impl Default for GlobalSettings {
             asn_db_path: None,
             asn_auto_update_enabled: false,
             bot_hmac_secret_hex: String::new(),
+            cert_export_enabled: false,
+            cert_export_dir: None,
+            cert_export_owner_uid: None,
+            cert_export_group_gid: None,
+            cert_export_file_mode: default_cert_export_file_mode(),
+            cert_export_dir_mode: default_cert_export_dir_mode(),
         }
     }
 }

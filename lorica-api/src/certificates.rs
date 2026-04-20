@@ -262,6 +262,7 @@ pub async fn create_certificate(
 
     let store = state.store.lock().await;
     store.create_certificate(&cert)?;
+    crate::cert_export::export_from_store(&store, &cert);
     drop(store);
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
@@ -436,6 +437,7 @@ pub async fn generate_self_signed(
 
     let store = state.store.lock().await;
     store.create_certificate(&certificate)?;
+    crate::cert_export::export_from_store(&store, &certificate);
     drop(store);
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();

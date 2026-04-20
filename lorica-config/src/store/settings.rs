@@ -139,6 +139,32 @@ impl ConfigStore {
                 "asn_auto_update_enabled" => {
                     settings.asn_auto_update_enabled = value == "true" || value == "1";
                 }
+                "cert_export_enabled" => {
+                    settings.cert_export_enabled = value == "true" || value == "1";
+                }
+                "cert_export_dir" => {
+                    settings.cert_export_dir = if value.is_empty() { None } else { Some(value) };
+                }
+                "cert_export_owner_uid" => {
+                    settings.cert_export_owner_uid = if value.is_empty() {
+                        None
+                    } else {
+                        value.parse().ok()
+                    };
+                }
+                "cert_export_group_gid" => {
+                    settings.cert_export_group_gid = if value.is_empty() {
+                        None
+                    } else {
+                        value.parse().ok()
+                    };
+                }
+                "cert_export_file_mode" => {
+                    settings.cert_export_file_mode = value.parse().unwrap_or(0o640);
+                }
+                "cert_export_dir_mode" => {
+                    settings.cert_export_dir_mode = value.parse().unwrap_or(0o750);
+                }
                 _ => {}
             }
         }
@@ -285,6 +311,40 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('asn_auto_update_enabled', ?1)",
             params![settings.asn_auto_update_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_export_enabled', ?1)",
+            params![settings.cert_export_enabled.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_export_dir', ?1)",
+            params![settings.cert_export_dir.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_export_owner_uid', ?1)",
+            params![
+                settings
+                    .cert_export_owner_uid
+                    .map(|n| n.to_string())
+                    .unwrap_or_default()
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_export_group_gid', ?1)",
+            params![
+                settings
+                    .cert_export_group_gid
+                    .map(|n| n.to_string())
+                    .unwrap_or_default()
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_export_file_mode', ?1)",
+            params![settings.cert_export_file_mode.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_export_dir_mode', ?1)",
+            params![settings.cert_export_dir_mode.to_string()],
         )?;
         Ok(())
     }
