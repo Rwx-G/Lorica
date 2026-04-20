@@ -128,6 +128,7 @@ sudo systemctl restart lorica
 ### Run with Docker
 
 ```bash
+docker build -t lorica .
 docker run -p 8080:8080 -p 8443:8443 -p 9443:9443 \
   -v lorica-data:/var/lib/lorica lorica
 ```

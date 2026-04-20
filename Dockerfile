@@ -51,6 +51,9 @@ COPY lorica-command/ lorica-command/
 COPY lorica-bench/ lorica-bench/
 COPY lorica-notify/ lorica-notify/
 COPY lorica-waf/ lorica-waf/
+COPY lorica-challenge/ lorica-challenge/
+COPY lorica-geoip/ lorica-geoip/
+COPY lorica-shmem/ lorica-shmem/
 COPY tinyufo/ tinyufo/
 
 # Copy pre-built frontend

@@ -1,0 +1,14 @@
+services:
+  lorica:
+    build:
+      context: .
+    container_name: lorica
+    volumes:
+      - lorica-data:/var/lib/lorica
+    ports:
+      - '9443:9443'
+      - '8443:8443'
+      - '8080:8080'
+
+volumes:
+  lorica-data:
