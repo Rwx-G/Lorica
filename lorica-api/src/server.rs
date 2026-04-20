@@ -247,6 +247,10 @@ pub fn build_router(
             "/api/v1/certificates/:id",
             delete(crate::certificates::delete_certificate),
         )
+        .route(
+            "/api/v1/certificates/:id/download",
+            get(crate::certificates::download_certificate),
+        )
         .route("/api/v1/status", get(crate::status::get_status))
         .route("/api/v1/logs", get(crate::logs::get_logs))
         .route("/api/v1/logs", delete(crate::logs::clear_logs))
