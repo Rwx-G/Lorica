@@ -466,6 +466,7 @@ fn test_route_with_path_rule_overrides_applies_some_fields() {
         rate_limit: None,
         geoip: None,
         bot_protection: None,
+        group_name: String::new(),
         created_at: now,
         updated_at: now,
     };
@@ -610,6 +611,7 @@ fn example_route_for_serde() -> Route {
         rate_limit: None,
         geoip: None,
         bot_protection: None,
+        group_name: String::new(),
         created_at: now,
         updated_at: now,
     }

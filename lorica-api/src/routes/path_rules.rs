@@ -79,11 +79,13 @@ pub(super) fn build_path_rules(
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         let redirect_to = match pr.redirect_to.as_deref() {
             Some(r) => {
-                let v = super::crud::validate_redirect_to(
-                    r,
-                    &format!("path_rules[{i}].redirect_to"),
-                )?;
-                if v.is_empty() { None } else { Some(v) }
+                let v =
+                    super::crud::validate_redirect_to(r, &format!("path_rules[{i}].redirect_to"))?;
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v)
+                }
             }
             None => None,
         };
@@ -167,7 +169,9 @@ mod tests {
         let mut rule = pr("/tesla");
         rule.redirect_to = Some("example.com".into());
         let err = build_path_rules(&[rule]).expect_err("test setup");
-        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("path_rules[0].redirect_to") && m.contains("http")));
+        assert!(
+            matches!(err, ApiError::BadRequest(ref m) if m.contains("path_rules[0].redirect_to") && m.contains("http"))
+        );
     }
 
     #[test]

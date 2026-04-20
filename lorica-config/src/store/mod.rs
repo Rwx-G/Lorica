@@ -630,6 +630,18 @@ impl ConfigStore {
                 ON bot_pending_challenges(expires_at);",
         );
 
+        // V37: per-route group_name (v1.4.1 dashboard UX). Free-form
+        // classification label mirroring `Backend.group_name` so
+        // operators can filter / group routes in the dashboard
+        // (prod / staging / homelab / legacy, etc.). Pure metadata -
+        // never read on the proxy hot path, never exposed as a
+        // Prometheus label (bounded-cardinality concern). Empty
+        // string = ungrouped.
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN group_name TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+
         Ok(())
     }
 

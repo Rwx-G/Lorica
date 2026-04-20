@@ -216,6 +216,13 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             let raw: Option<String> = row.get::<_, Option<String>>(64).unwrap_or(None);
             raw.and_then(|s| serde_json::from_str(&s).ok())
         },
+        group_name: {
+            // Column index 65 (v1.4.1 migration V37). Free-form
+            // operator-supplied classification string, empty = ungrouped.
+            // `unwrap_or_default` covers rows that pre-date the V37
+            // migration on a bisect build.
+            row.get::<_, String>(65).unwrap_or_default()
+        },
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

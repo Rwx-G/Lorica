@@ -122,12 +122,13 @@ impl ConfigStore {
              mtls,
              rate_limit,
              geoip,
-             bot_protection)
+             bot_protection,
+             group_name)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                      ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
                      ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45,
-                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65)",
+                     ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65, ?66)",
             params![
                 route.id,
                 route.hostname,
@@ -194,6 +195,7 @@ impl ConfigStore {
                 rate_limit_json,
                 geoip_json,
                 bot_protection_json,
+                route.group_name,
             ],
         )?;
         Ok(())
@@ -234,7 +236,9 @@ impl ConfigStore {
                  response_rewrite,
                  mtls,
                  rate_limit,
-                 geoip
+                 geoip,
+                 bot_protection,
+                 group_name
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
@@ -278,7 +282,8 @@ impl ConfigStore {
              mtls,
              rate_limit,
              geoip,
-             bot_protection
+             bot_protection,
+             group_name
              FROM routes ORDER BY hostname, path_prefix",
         )?;
         let rows = stmt.query_map([], |row| Ok(row_to_route(row)))?;
@@ -355,7 +360,8 @@ impl ConfigStore {
              mtls=?61,
              rate_limit=?62,
              geoip=?63,
-             bot_protection=?64 WHERE id=?1",
+             bot_protection=?64,
+             group_name=?65 WHERE id=?1",
             params![
                 route.id,
                 route.hostname,
@@ -421,6 +427,7 @@ impl ConfigStore {
                 rate_limit_json,
                 geoip_json,
                 bot_protection_json,
+                route.group_name,
             ],
         )?;
         if changed == 0 {

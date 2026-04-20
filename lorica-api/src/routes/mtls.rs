@@ -288,8 +288,8 @@ mod tests {
     #[test]
     fn build_mtls_rejects_organization_with_control_char() {
         let pem = gen_ca_pem();
-        let err = build_mtls_config(&mtls_req(&pem, false, vec!["Acme\nInc"]))
-            .expect_err("test setup");
+        let err =
+            build_mtls_config(&mtls_req(&pem, false, vec!["Acme\nInc"])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("control character")));
     }
 

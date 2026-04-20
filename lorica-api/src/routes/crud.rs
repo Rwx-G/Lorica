@@ -353,8 +353,8 @@ fn validate_rate_limit(
 
 /// Validate a `redirect_hostname` input for API acceptance.
 ///
-/// The proxy emits redirects as `{scheme}://{redirect_hostname}{path}{?query}`
-/// - the field is a bare DNS hostname, NOT a full URL. Operators who
+/// The proxy emits redirects as `{scheme}://{redirect_hostname}{path}{?query}`;
+/// the field is a bare DNS hostname, NOT a full URL. Operators who
 /// paste `https://example.com/foo` end up with a malformed Location
 /// header (`https://https://example.com/foo/...`). We reject those at
 /// the API boundary with a clear error so the mistake surfaces on save
@@ -364,6 +364,35 @@ fn validate_rate_limit(
 /// labels 1..=63 chars and total length <= 253. The input is returned
 /// trimmed of surrounding whitespace. An empty string (after trim) is
 /// caller-policy: the two callers below treat it as "clear the field".
+/// Validate a `group_name` input for a Route or a Backend. Empty
+/// string (after trim) is accepted as "ungrouped". Non-empty must
+/// match the RFC-1035-inspired identifier alphabet
+/// `^[a-z0-9_-]{1,64}$`: lowercase ASCII letters, digits, dash and
+/// underscore. The `Backend.group_name` column has been in production
+/// since v1.2 without validation; this helper applies the new rule
+/// to both routes and backends going forward. Returns the trimmed
+/// value.
+fn validate_group_name(raw: &str) -> Result<String, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > 64 {
+        return Err(ApiError::BadRequest(
+            "group_name must be <= 64 characters".into(),
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(ApiError::BadRequest(
+            "group_name may only contain ASCII lowercase letters, digits, `-` and `_`".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 fn validate_redirect_hostname(raw: &str) -> Result<String, ApiError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -416,10 +445,7 @@ fn validate_redirect_hostname(raw: &str) -> Result<String, ApiError> {
                 "redirect_hostname contains a DNS label that starts or ends with `-`".into(),
             ));
         }
-        if !label
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return Err(ApiError::BadRequest(
                 "redirect_hostname may only contain ASCII letters, digits, `-` and `.`".into(),
             ));
@@ -463,9 +489,7 @@ pub(super) fn validate_redirect_to(raw: &str, field_label: &str) -> Result<Strin
         )));
     };
     // Host ends at the first `/`, `?`, or `#`; must be non-empty.
-    let host_end = rest
-        .find(|c: char| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     if host_end == 0 {
         return Err(ApiError::BadRequest(format!(
             "{field_label} must include a host after the scheme"
@@ -519,8 +543,20 @@ fn validate_http_header_name(name: &str, field_label: &str) -> Result<(), ApiErr
         let is_token = c.is_ascii_alphanumeric()
             || matches!(
                 c,
-                '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' |
-                '.' | '^' | '_' | '`' | '|' | '~'
+                '!' | '#'
+                    | '$'
+                    | '%'
+                    | '&'
+                    | '\''
+                    | '*'
+                    | '+'
+                    | '-'
+                    | '.'
+                    | '^'
+                    | '_'
+                    | '`'
+                    | '|'
+                    | '~'
             );
         if !is_token {
             return Err(ApiError::BadRequest(format!(
@@ -571,7 +607,10 @@ pub(super) fn validate_http_headers_map(
 
 /// Validate a list of header names (e.g. `proxy_headers_remove`,
 /// `response_headers_remove`, `cache_vary_headers`).
-pub(super) fn validate_http_header_name_list(names: &[String], field_label: &str) -> Result<(), ApiError> {
+pub(super) fn validate_http_header_name_list(
+    names: &[String],
+    field_label: &str,
+) -> Result<(), ApiError> {
     for name in names {
         let trimmed = name.trim();
         validate_http_header_name(trimmed, field_label)?;
@@ -658,10 +697,7 @@ fn validate_hostname_alias(raw: &str, field_label: &str) -> Result<String, ApiEr
                 "{field_label} contains a DNS label that starts or ends with `-`"
             )));
         }
-        if !label
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return Err(ApiError::BadRequest(format!(
                 "{field_label} may only contain ASCII letters, digits, `-` and `.`"
             )));
@@ -738,6 +774,7 @@ fn check_range<T: PartialOrd + std::fmt::Display>(
 /// missing ones are skipped (update semantics: don't touch what the
 /// operator did not send). Centralising avoids the bug where `POST`
 /// and `PUT` drift apart on validity rules.
+#[allow(clippy::too_many_arguments)] // intentional single-site fan-in of route numeric fields
 fn validate_route_numeric_bounds(
     connect_timeout_s: Option<i32>,
     read_timeout_s: Option<i32>,
@@ -863,9 +900,7 @@ fn validate_path_rewrite_replacement(
         )));
     }
     if let Some(p) = pattern.filter(|p| !p.is_empty()) {
-        let captures = regex::Regex::new(p)
-            .map(|r| r.captures_len())
-            .unwrap_or(1);
+        let captures = regex::Regex::new(p).map(|r| r.captures_len()).unwrap_or(1);
         // captures_len() counts the implicit group-0 (the whole match)
         // plus each `(...)`. A pattern with N explicit groups allows
         // references `$0..$N`.
@@ -969,6 +1004,61 @@ mod rate_limit_tests {
 }
 
 #[cfg(test)]
+mod group_name_validation_tests {
+    use super::*;
+
+    fn expect_err(input: &str) -> String {
+        match validate_group_name(input) {
+            Ok(v) => panic!("expected validation error for {input:?}, got Ok({v:?})"),
+            Err(ApiError::BadRequest(m)) => m,
+            Err(e) => panic!("expected BadRequest, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_empty() {
+        assert_eq!(validate_group_name("").unwrap(), "");
+        assert_eq!(validate_group_name("   ").unwrap(), "");
+    }
+
+    #[test]
+    fn accepts_valid_identifiers() {
+        assert_eq!(validate_group_name("prod").unwrap(), "prod");
+        assert_eq!(
+            validate_group_name("homelab-staging").unwrap(),
+            "homelab-staging"
+        );
+        assert_eq!(validate_group_name("my_group_42").unwrap(), "my_group_42");
+        assert_eq!(validate_group_name("a").unwrap(), "a");
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        assert_eq!(validate_group_name("  prod  ").unwrap(), "prod");
+    }
+
+    #[test]
+    fn rejects_uppercase() {
+        assert!(expect_err("PROD").contains("lowercase"));
+        assert!(expect_err("Prod").contains("lowercase"));
+    }
+
+    #[test]
+    fn rejects_whitespace_and_special_chars() {
+        assert!(expect_err("my group").contains("lowercase"));
+        assert!(expect_err("my.group").contains("lowercase"));
+        assert!(expect_err("my/group").contains("lowercase"));
+        assert!(expect_err("accent-é").contains("lowercase"));
+    }
+
+    #[test]
+    fn rejects_too_long() {
+        let long = "a".repeat(100);
+        assert!(expect_err(&long).contains("64"));
+    }
+}
+
+#[cfg(test)]
 mod redirect_hostname_validation_tests {
     use super::*;
 
@@ -1007,7 +1097,10 @@ mod redirect_hostname_validation_tests {
     fn accepts_single_label_hostname() {
         // "localhost" and similar single-label internal names are common
         // in home-lab Lorica setups; we must not reject them.
-        assert_eq!(validate_redirect_hostname("localhost").unwrap(), "localhost");
+        assert_eq!(
+            validate_redirect_hostname("localhost").unwrap(),
+            "localhost"
+        );
         assert_eq!(validate_redirect_hostname("plex").unwrap(), "plex");
     }
 
@@ -1066,10 +1159,7 @@ mod redirect_hostname_validation_tests {
     #[test]
     fn rejects_total_too_long() {
         // 64 labels of 3 chars + 63 dots = 255 chars, exceeds the 253 cap.
-        let input = (0..64)
-            .map(|_| "abc")
-            .collect::<Vec<_>>()
-            .join(".");
+        let input = (0..64).map(|_| "abc").collect::<Vec<_>>().join(".");
         assert!(expect_err(&input).contains("253"));
     }
 
@@ -1156,15 +1246,15 @@ mod route_path_validation_tests {
     fn accepts_paths_with_leading_slash() {
         assert_eq!(validate_route_path("/", "f").unwrap(), "/");
         assert_eq!(validate_route_path("/api", "f").unwrap(), "/api");
-        assert_eq!(validate_route_path("/api/v1/users", "f").unwrap(), "/api/v1/users");
+        assert_eq!(
+            validate_route_path("/api/v1/users", "f").unwrap(),
+            "/api/v1/users"
+        );
     }
 
     #[test]
     fn trims_surrounding_whitespace() {
-        assert_eq!(
-            validate_route_path("  /api  ", "f").unwrap(),
-            "/api"
-        );
+        assert_eq!(validate_route_path("  /api  ", "f").unwrap(), "/api");
     }
 
     #[test]
@@ -1235,15 +1325,69 @@ mod route_numeric_bounds_tests {
     #[test]
     fn timeouts_bounds() {
         err_matches(
-            || validate_route_numeric_bounds(Some(0), None, None, None, None, None, None, None, None, None, None, None, None, None, None),
+            || {
+                validate_route_numeric_bounds(
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
             "connect_timeout_s",
         );
         err_matches(
-            || validate_route_numeric_bounds(None, Some(3601), None, None, None, None, None, None, None, None, None, None, None, None, None),
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    Some(3601),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
             "read_timeout_s",
         );
         err_matches(
-            || validate_route_numeric_bounds(None, None, Some(-1), None, None, None, None, None, None, None, None, None, None, None, None),
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    Some(-1),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
             "send_timeout_s",
         );
     }
@@ -1251,24 +1395,114 @@ mod route_numeric_bounds_tests {
     #[test]
     fn return_status_must_be_in_http_range() {
         err_matches(
-            || validate_route_numeric_bounds(None, None, None, None, None, None, None, None, None, Some(42), None, None, None, None, None),
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(42),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
             "return_status",
         );
         err_matches(
-            || validate_route_numeric_bounds(None, None, None, None, None, None, None, None, None, Some(600), None, None, None, None, None),
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(600),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
             "return_status",
         );
-        ok(|| validate_route_numeric_bounds(None, None, None, None, None, None, None, None, None, Some(418), None, None, None, None, None));
+        ok(|| {
+            validate_route_numeric_bounds(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(418),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        });
     }
 
     #[test]
     fn cors_max_age_rejects_negative_and_huge() {
         err_matches(
-            || validate_route_numeric_bounds(None, None, None, None, None, None, None, None, None, None, None, None, None, Some(-1), None),
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(-1),
+                    None,
+                )
+            },
             "cors_max_age_s",
         );
         err_matches(
-            || validate_route_numeric_bounds(None, None, None, None, None, None, None, None, None, None, None, None, None, Some(100_000), None),
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(100_000),
+                    None,
+                )
+            },
             "cors_max_age_s",
         );
     }
@@ -1276,20 +1510,92 @@ mod route_numeric_bounds_tests {
     #[test]
     fn retry_attempts_cap() {
         err_matches(
-            || validate_route_numeric_bounds(None, None, None, None, None, None, None, None, None, None, Some(11), None, None, None, None),
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(11),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
             "retry_attempts",
         );
-        ok(|| validate_route_numeric_bounds(None, None, None, None, None, None, None, None, None, None, Some(3), None, None, None, None));
+        ok(|| {
+            validate_route_numeric_bounds(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(3),
+                None,
+                None,
+                None,
+                None,
+            )
+        });
     }
 
     #[test]
     fn max_connections_and_auto_ban_thresholds() {
         err_matches(
-            || validate_route_numeric_bounds(None, None, None, None, None, Some(0), None, None, None, None, None, None, None, None, None),
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
             "max_connections",
         );
         err_matches(
-            || validate_route_numeric_bounds(None, None, None, None, None, None, None, Some(0), None, None, None, None, None, None, None),
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
             "auto_ban_threshold",
         );
     }
@@ -1323,7 +1629,10 @@ mod http_header_validation_tests {
     #[test]
     fn header_name_rejects_whitespace_and_special_chars() {
         for name in &["X Forwarded", "Content Type", "X:Bad", "X\tBad", "X@bad"] {
-            assert!(validate_http_header_name(name, "h").is_err(), "name {name:?}");
+            assert!(
+                validate_http_header_name(name, "h").is_err(),
+                "name {name:?}"
+            );
         }
     }
 
@@ -1372,7 +1681,9 @@ mod http_header_validation_tests {
 
     #[test]
     fn method_accepts_standard_verbs() {
-        for m in &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "MKCOL"] {
+        for m in &[
+            "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "MKCOL",
+        ] {
             validate_http_method(m, "methods")
                 .unwrap_or_else(|e| panic!("expected {m:?} to pass: {e:?}"));
         }
@@ -2061,6 +2372,10 @@ pub struct RouteResponse {
     pub geoip: Option<lorica_config::models::GeoIpConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
+    /// Free-form classification label (prod / staging / homelab / ...).
+    /// Empty string = ungrouped. Mirrors `Backend.group_name`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group_name: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2133,6 +2448,10 @@ pub struct CreateRouteRequest {
     pub rate_limit: Option<lorica_config::models::RateLimit>,
     pub geoip: Option<lorica_config::models::GeoIpConfig>,
     pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
+    /// Free-form operator classification (prod / staging / homelab / ...).
+    /// Omit or send empty string for ungrouped. Validated against a
+    /// lowercase ASCII + digits + `-` + `_` alphabet, 1..=64 chars.
+    pub group_name: Option<String>,
 }
 
 /// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are mutated.
@@ -2232,6 +2551,9 @@ pub struct UpdateRouteRequest {
     pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
     #[serde(default)]
     pub bot_protection_disable: Option<bool>,
+    /// Free-form operator classification (prod / staging / homelab / ...).
+    /// Empty string clears the grouping. `None` leaves the field unchanged.
+    pub group_name: Option<String>,
 }
 
 fn route_to_response(
@@ -2382,19 +2704,48 @@ fn route_to_response(
         rate_limit: route.rate_limit.clone(),
         geoip: route.geoip.clone(),
         bot_protection: route.bot_protection.clone(),
+        group_name: route.group_name.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
 }
 
+/// Query string for `GET /api/v1/routes`. Optional `group` filter lets
+/// the dashboard narrow the list to a single operator classification
+/// (prod / staging / etc.) without fetching everything first.
+#[derive(Deserialize, Default)]
+pub struct ListRoutesQuery {
+    pub group: Option<String>,
+}
+
 /// GET /api/v1/routes - list every configured route with its linked backend ids.
 pub async fn list_routes(
     Extension(state): Extension<AppState>,
+    axum::extract::Query(query): axum::extract::Query<ListRoutesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     let routes = store.list_routes()?;
+    // Optional `?group=...` filter: trimmed, exact match on
+    // `Route.group_name`. Invalid shapes (non-alphabet chars) return
+    // 400 early rather than silently matching nothing.
+    let group_filter = match query.group.as_deref() {
+        Some(raw) => {
+            let v = validate_group_name(raw)?;
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        None => None,
+    };
     let mut responses = Vec::with_capacity(routes.len());
     for route in &routes {
+        if let Some(ref g) = group_filter {
+            if &route.group_name != g {
+                continue;
+            }
+        }
         let backend_ids = store.list_backends_for_route(&route.id)?;
         responses.push(route_to_response(route, backend_ids));
     }
@@ -2416,7 +2767,11 @@ pub async fn create_route(
     let redirect_hostname = match body.redirect_hostname.as_deref() {
         Some(h) => {
             let v = validate_redirect_hostname(h)?;
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         }
         None => None,
     };
@@ -2424,24 +2779,33 @@ pub async fn create_route(
     let redirect_to = match body.redirect_to.as_deref() {
         Some(r) => {
             let v = validate_redirect_to(r, "redirect_to")?;
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         }
         None => None,
     };
 
     let path_prefix = {
-        let raw = body
-            .path_prefix
-            .clone()
-            .unwrap_or_else(|| "/".to_string());
+        let raw = body.path_prefix.clone().unwrap_or_else(|| "/".to_string());
         let v = validate_route_path(&raw, "path_prefix")?;
-        if v.is_empty() { "/".to_string() } else { v }
+        if v.is_empty() {
+            "/".to_string()
+        } else {
+            v
+        }
     };
 
     let strip_path_prefix = match body.strip_path_prefix.as_deref() {
         Some(p) => {
             let v = validate_route_path(p, "strip_path_prefix")?;
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         }
         None => None,
     };
@@ -2449,7 +2813,11 @@ pub async fn create_route(
     let add_path_prefix = match body.add_path_prefix.as_deref() {
         Some(p) => {
             let v = validate_route_path(p, "add_path_prefix")?;
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         }
         None => None,
     };
@@ -2457,7 +2825,11 @@ pub async fn create_route(
     let path_rewrite_pattern = match body.path_rewrite_pattern.as_deref() {
         Some(p) => {
             let v = validate_path_rewrite_pattern(p)?;
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         }
         None => None,
     };
@@ -2550,7 +2922,10 @@ pub async fn create_route(
             let raw = body.hostname_aliases.clone().unwrap_or_default();
             let mut out = Vec::with_capacity(raw.len());
             for (i, a) in raw.iter().enumerate() {
-                out.push(validate_hostname_alias(a, &format!("hostname_aliases[{i}]"))?);
+                out.push(validate_hostname_alias(
+                    a,
+                    &format!("hostname_aliases[{i}]"),
+                )?);
             }
             out
         },
@@ -2662,6 +3037,10 @@ pub async fn create_route(
             Some(b) => Some(validate_bot_protection(b)?),
             None => None,
         },
+        group_name: match body.group_name.as_deref() {
+            Some(g) => validate_group_name(g)?,
+            None => String::new(),
+        },
         created_at: now,
         updated_at: now,
     };
@@ -2766,7 +3145,10 @@ pub async fn update_route(
     if let Some(hostname_aliases) = body.hostname_aliases {
         let mut out = Vec::with_capacity(hostname_aliases.len());
         for (i, a) in hostname_aliases.iter().enumerate() {
-            out.push(validate_hostname_alias(a, &format!("hostname_aliases[{i}]"))?);
+            out.push(validate_hostname_alias(
+                a,
+                &format!("hostname_aliases[{i}]"),
+            )?);
         }
         route.hostname_aliases = out;
     }
@@ -2808,10 +3190,8 @@ pub async fn update_route(
         }
     }
     if let Some(replacement) = body.path_rewrite_replacement {
-        let v = validate_path_rewrite_replacement(
-            &replacement,
-            route.path_rewrite_pattern.as_deref(),
-        )?;
+        let v =
+            validate_path_rewrite_replacement(&replacement, route.path_rewrite_pattern.as_deref())?;
         route.path_rewrite_replacement = if v.is_empty() && route.path_rewrite_pattern.is_none() {
             None
         } else {
@@ -3059,6 +3439,9 @@ pub async fn update_route(
         route.bot_protection = None;
     } else if let Some(ref b) = body.bot_protection {
         route.bot_protection = Some(validate_bot_protection(b)?);
+    }
+    if let Some(ref raw) = body.group_name {
+        route.group_name = validate_group_name(raw)?;
     }
     route.updated_at = Utc::now();
 

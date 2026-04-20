@@ -62,6 +62,10 @@ pub(super) fn build_response_rewrite(
     }
     const PATTERN_MAX_LEN: usize = 4096;
     const REPLACEMENT_MAX_LEN: usize = 4096;
+    // `$N` capture-group references in the replacement - compiled
+    // once outside the per-rule loop.
+    static REF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let ref_re = REF_RE.get_or_init(|| regex::Regex::new(r"\$(\d+)").expect("static regex"));
     let mut rules = Vec::with_capacity(body.rules.len());
     for (i, rule) in body.rules.iter().enumerate() {
         if rule.pattern.is_empty() {
@@ -90,7 +94,6 @@ pub(super) fn build_response_rewrite(
             // operator only notices once a user hits the page).
             let max_ref = compiled.captures_len().saturating_sub(1);
             let scan = rule.replacement.replace("$$", "");
-            let ref_re = regex::Regex::new(r"\$(\d+)").expect("static regex");
             for cap in ref_re.captures_iter(&scan) {
                 let n: usize = cap[1].parse().unwrap_or(0);
                 if n > max_ref {
@@ -226,7 +229,9 @@ mod tests {
         // the operator wanted.
         let cfg = rr_cfg(vec![rr_rule(r"\d+", "value: $1", true)]);
         let err = build_response_rewrite(&cfg).expect_err("test setup");
-        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("`$1`") && m.contains("only 0")));
+        assert!(
+            matches!(err, ApiError::BadRequest(ref m) if m.contains("`$1`") && m.contains("only 0"))
+        );
     }
 
     #[test]

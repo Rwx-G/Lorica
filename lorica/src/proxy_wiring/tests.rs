@@ -68,6 +68,7 @@ fn make_route(id: &str, hostname: &str, path: &str, enabled: bool) -> Route {
         rate_limit: None,
         geoip: None,
         bot_protection: None,
+        group_name: String::new(),
         created_at: now,
         updated_at: now,
     }

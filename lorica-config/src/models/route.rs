@@ -614,6 +614,16 @@ pub struct Route {
     /// `None` = filter disabled for this route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_protection: Option<BotProtectionConfig>,
+    /// Free-form classification label so an operator can filter /
+    /// group routes in the dashboard (e.g. `prod`, `staging`,
+    /// `homelab`, `legacy`). Mirrors the `group_name` convention on
+    /// Backend. Pure metadata: the proxy hot path never reads it, it
+    /// is not in Prometheus labels (bounded-cardinality concern), it
+    /// is not in the trace tags. Empty string = ungrouped. Same
+    /// character rule as `Backend.group_name`: ASCII lowercase +
+    /// digits + `-` / `_`, 1..=64 chars.
+    #[serde(default)]
+    pub group_name: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

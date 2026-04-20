@@ -163,6 +163,7 @@ fn test_route(id: &str, hostname: &str, header_rules: Vec<HeaderRule>) -> Route 
         rate_limit: None,
         geoip: None,
         bot_protection: None,
+        group_name: String::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

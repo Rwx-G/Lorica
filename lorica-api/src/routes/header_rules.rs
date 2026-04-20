@@ -45,8 +45,20 @@ pub(super) fn build_header_rule(
         let is_token = c.is_ascii_alphanumeric()
             || matches!(
                 c,
-                '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' |
-                '.' | '^' | '_' | '`' | '|' | '~'
+                '!' | '#'
+                    | '$'
+                    | '%'
+                    | '&'
+                    | '\''
+                    | '*'
+                    | '+'
+                    | '-'
+                    | '.'
+                    | '^'
+                    | '_'
+                    | '`'
+                    | '|'
+                    | '~'
             );
         if !is_token {
             return Err(ApiError::BadRequest(format!(
