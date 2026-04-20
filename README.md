@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.4.0-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.4.1-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Lorica%20Tests-985-brightgreen.svg" alt="Lorica Tests">
@@ -566,7 +566,8 @@ gpg --verify lorica.deb.asc lorica.deb
 
 | Version | Features | Status |
 |---------|----------|--------|
-| **v1.4.0** | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Current |
+| v1.4.0 | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Shipped |
+| **v1.4.1** | Path-rule redirect fix + operator-input guard-rails on every field (URL, regex, headers, CORS, mTLS, numeric bounds, paths, hostname aliases) with live blur + input inline-error feedback in the dashboard | Current |
 | v1.5.0 | Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) | Planned |
 | v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
 

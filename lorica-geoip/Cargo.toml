@@ -1,6 +1,6 @@
 [package]
 name = "lorica-geoip"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "GeoIP country-code lookup for Lorica, wrapping maxminddb"
