@@ -446,6 +446,68 @@ services:
     networks:
       - e2e
 
+  # ---- Cert export E2E (v1.4.1) -------------------------------------
+  # Filesystem certificate export zone: every issued cert lands as
+  # PEM files under `cert_export_dir/<hostname>/{cert,chain,
+  # fullchain,privkey}.pem`. The smoke drives the full operator
+  # path over the management API:
+  #   - PUT /settings to enable + set dir + modes
+  #   - POST /certificates/self-signed to mint a cert
+  #   - mount the shared export volume read-only into the runner
+  #     so the four PEM files can be stat'd + their modes checked
+  #   - add / delete a cert-export ACL and hit /reapply
+  #
+  # The `lorica-cert-export-data` named volume is shared with the
+  # test-runner via a read-only mount at /exported-certs so the
+  # smoke can observe the files without a docker exec hop.
+  #
+  # Run with:
+  #   docker compose --profile cert-export up --build
+  #   docker compose --profile cert-export run --rm cert-export-smoke
+  lorica-cert-export:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["cert-export"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-cert-export-data:/var/lib/lorica
+      - shared-cert-export:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  cert-export-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["cert-export"]
+    entrypoint: ["bash", "run-cert-export-smoke.sh"]
+    # Run as root so the smoke can stat + read PEM files written
+    # under the lorica service user with mode 0o640 on a dir with
+    # mode 0o750 - the test-runner's default `testuser` is not in
+    # the writer's group and would get EACCES on the directory
+    # traversal. Running as root for a read-only verify container
+    # is safe; the feature itself still ships with the restrictive
+    # modes configured via the API.
+    user: "0:0"
+    depends_on:
+      - lorica-cert-export
+    volumes:
+      - shared-cert-export:/shared:ro
+      # Same named volume the lorica container writes to, mounted
+      # read-only so the smoke can observe the exported PEM files
+      # without a docker exec hop.
+      - lorica-cert-export-data:/lorica-data:ro
+    environment:
+      - LORICA_API=http://lorica-cert-export:9443
+      - LORICA_PROXY=http://lorica-cert-export:8080
+      - BACKEND1_ADDR=backend1:80
+      - EXPORT_ROOT=/lorica-data/exported-certs
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
@@ -455,6 +517,7 @@ volumes:
   lorica-bot-data:
   lorica-bot-workers-data:
   lorica-rdns-data:
+  lorica-cert-export-data:
   shared:
   shared-workers:
   shared-bot-workers:
@@ -463,6 +526,7 @@ volumes:
   shared-geoip:
   shared-bot:
   shared-rdns:
+  shared-cert-export:
 
 networks:
   e2e:
