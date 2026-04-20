@@ -57,6 +57,44 @@
     { id: 'upstream', label: 'Upstream' },
   ];
 
+  // Live validation: re-runs every time `form` changes. `message` is
+  // the error (empty when the form is clean), `tab` is the offending
+  // tab id so the pre-save banner can name the section the user
+  // needs to jump to. Used for both the Save-button disabled state
+  // and the inline banner above the footer actions.
+  let liveValidation = $derived(validateRouteFormWithTab(form));
+  function tabLabel(id: string | null): string {
+    if (!id) return '';
+    const t = TABS.find((x) => x.id === id);
+    return t?.label ?? id;
+  }
+
+  /**
+   * Jump from the validation banner to the offending tab, wait one
+   * animation frame for the new tab's DOM to mount, then scroll the
+   * first `.field-error` (or the `.invalid` input fallback) into
+   * view and focus it. Covers both blur-time inline errors added in
+   * the guard-rails pass and the per-row `.invalid` class used by
+   * PathRules / HeaderRules / Canary.
+   */
+  function jumpToErrorTab(targetTab: string) {
+    activeTab = targetTab;
+    requestAnimationFrame(() => {
+      const drawer = document.querySelector('.drawer');
+      if (!drawer) return;
+      const target = drawer.querySelector<HTMLElement>('.field-error, .invalid');
+      if (!target) return;
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // Focus the related input when the error is a sibling of one.
+      const input = target.classList.contains('invalid')
+        ? target
+        : (target.previousElementSibling as HTMLElement | null);
+      if (input && typeof (input as HTMLInputElement).focus === 'function') {
+        (input as HTMLInputElement).focus({ preventScroll: true });
+      }
+    });
+  }
+
   // Reset form when drawer opens - untrack body so form/editing changes
   // don't re-trigger this effect (would reset activeTab on every keystroke)
   $effect(() => {
@@ -393,9 +431,27 @@
             </ul>
           </div>
         {/if}
+        {#if liveValidation.message}
+          <div class="validation-banner" role="alert">
+            <strong>Fix before saving:</strong>
+            <span>{liveValidation.message}</span>
+            {#if liveValidation.tab}
+              <button
+                type="button"
+                class="validation-banner-jump"
+                onclick={() => { if (liveValidation.tab) jumpToErrorTab(liveValidation.tab); }}
+              >{liveValidation.tab !== activeTab ? `Go to ${tabLabel(liveValidation.tab)}` : 'Show'}</button>
+            {/if}
+          </div>
+        {/if}
         <div class="drawer-footer-actions">
           <button class="btn btn-cancel" onclick={handleClose}>Cancel</button>
-          <button class="btn btn-primary" disabled={formSubmitting} onclick={handleSubmit}>
+          <button
+            class="btn btn-primary"
+            disabled={formSubmitting || liveValidation.message !== ''}
+            title={liveValidation.message ? liveValidation.message : ''}
+            onclick={handleSubmit}
+          >
             {formSubmitting ? 'Saving...' : editing ? 'Update' : 'Create'}
           </button>
         </div>
@@ -669,6 +725,34 @@
   .risky-banner ul { margin: 0; padding-left: 1.125rem; }
   .risky-banner li { margin-bottom: 0.25rem; }
   .risky-banner li:last-child { margin-bottom: 0; }
+
+  .validation-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.5rem;
+    background: var(--color-red-subtle, rgba(220, 38, 38, 0.08));
+    border-left: 3px solid var(--color-red);
+    border-radius: 0 0.25rem 0.25rem 0;
+    font-size: 0.8125rem;
+    color: var(--color-text);
+    line-height: 1.4;
+  }
+  .validation-banner strong { color: var(--color-red); }
+  .validation-banner span { flex: 1; min-width: 0; }
+  .validation-banner-jump {
+    flex-shrink: 0;
+    padding: 0.25rem 0.625rem;
+    border: 1px solid var(--color-red);
+    background: transparent;
+    color: var(--color-red);
+    border-radius: 0.25rem;
+    cursor: pointer;
+    font-size: 0.75rem;
+    font-weight: 500;
+  }
+  .validation-banner-jump:hover { background: var(--color-red); color: var(--color-bg); }
 
   @media (max-width: 960px) {
     .drawer {

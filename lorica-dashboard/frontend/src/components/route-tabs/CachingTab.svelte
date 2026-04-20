@@ -4,6 +4,7 @@
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
+  import { validateHttpHeaderNameList } from '../../lib/validators';
 
   interface Props {
     form: RouteFormState;
@@ -11,6 +12,26 @@
   }
 
   let { form = $bindable(), importedFields }: Props = $props();
+
+  function numErr(raw: number | string, min: number, max: number, label: string): string | null {
+    const str = String(raw).trim();
+    if (str === '') return null;
+    const n = Number(str);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      return `${label} must be an integer in ${min}..${max}`;
+    }
+    return null;
+  }
+  let ttlError = $state<string | null>(null);
+  let maxMbError = $state<string | null>(null);
+  let staleRevalError = $state<string | null>(null);
+  let staleErrorError = $state<string | null>(null);
+  let varyError = $state<string | null>(null);
+  function checkTtl() { ttlError = numErr(form.cache_ttl_s, 1, 31_536_000, 'value'); }
+  function checkMaxMb() { maxMbError = numErr(form.cache_max_mb, 1, 131_072, 'value'); }
+  function checkStaleReval() { staleRevalError = numErr(form.stale_while_revalidate_s, 0, 86_400, 'value'); }
+  function checkStaleError() { staleErrorError = numErr(form.stale_if_error_s, 0, 86_400, 'value'); }
+  function checkVary() { varyError = validateHttpHeaderNameList(form.cache_vary_headers); }
 
   let activeHelp = $state<
     | null
@@ -76,7 +97,8 @@
             <FieldHelpButton fieldLabel="Cache TTL" onhelp={() => { activeHelp = 'cache_ttl_s'; }} />
           </label>
           {#if isImported('cache_ttl_s')}<span class="imported-badge">imported</span>{/if}
-          <input id="cache-ttl" type="number" min="1" bind:value={form.cache_ttl_s} placeholder="300" />
+          <input id="cache-ttl" type="number" min="1" max="31536000" bind:value={form.cache_ttl_s} placeholder="300" onblur={checkTtl} oninput={checkTtl} />
+          {#if ttlError}<span class="field-error" role="alert">{ttlError}</span>{/if}
           <span class="hint">How long a response stays fresh before re-fetching.</span>
         </div>
         <div class="form-group" class:modified={isModified('cache_max_mb')}>
@@ -85,7 +107,8 @@
             <FieldHelpButton fieldLabel="Cache max size" onhelp={() => { activeHelp = 'cache_max_mb'; }} />
           </label>
           {#if isImported('cache_max_mb')}<span class="imported-badge">imported</span>{/if}
-          <input id="cache-max-mb" type="number" min="1" bind:value={form.cache_max_mb} placeholder="50" />
+          <input id="cache-max-mb" type="number" min="1" max="131072" bind:value={form.cache_max_mb} placeholder="50" onblur={checkMaxMb} oninput={checkMaxMb} />
+          {#if maxMbError}<span class="field-error" role="alert">{maxMbError}</span>{/if}
           <span class="hint">Hard cap on total cache footprint for this route.</span>
         </div>
       </div>
@@ -96,7 +119,8 @@
             Stale-while-revalidate (s)
             <FieldHelpButton fieldLabel="Stale-while-revalidate" onhelp={() => { activeHelp = 'stale_while_revalidate_s'; }} />
           </label>
-          <input id="stale-revalidate" type="number" min="0" bind:value={form.stale_while_revalidate_s} placeholder="10" />
+          <input id="stale-revalidate" type="number" min="0" max="86400" bind:value={form.stale_while_revalidate_s} placeholder="10" onblur={checkStaleReval} oninput={checkStaleReval} />
+          {#if staleRevalError}<span class="field-error" role="alert">{staleRevalError}</span>{/if}
           <span class="hint">Serve stale content while refreshing in the background. 0 = off.</span>
         </div>
         <div class="form-group" class:modified={isModified('stale_if_error_s')}>
@@ -104,7 +128,8 @@
             Stale-if-error (s)
             <FieldHelpButton fieldLabel="Stale-if-error" onhelp={() => { activeHelp = 'stale_if_error_s'; }} />
           </label>
-          <input id="stale-error" type="number" min="0" bind:value={form.stale_if_error_s} placeholder="60" />
+          <input id="stale-error" type="number" min="0" max="86400" bind:value={form.stale_if_error_s} placeholder="60" onblur={checkStaleError} oninput={checkStaleError} />
+          {#if staleErrorError}<span class="field-error" role="alert">{staleErrorError}</span>{/if}
           <span class="hint">Serve stale content when the upstream returns an error. 0 = off.</span>
         </div>
       </div>
@@ -125,7 +150,8 @@
           Vary headers
           <FieldHelpButton fieldLabel="Vary headers" onhelp={() => { activeHelp = 'cache_vary_headers'; }} />
         </label>
-        <input id="cache-vary" type="text" bind:value={form.cache_vary_headers} placeholder="Accept-Encoding, Accept-Language" />
+        <input id="cache-vary" type="text" bind:value={form.cache_vary_headers} placeholder="Accept-Encoding, Accept-Language" onblur={checkVary} oninput={checkVary} />
+        {#if varyError}<span class="field-error" role="alert">{varyError}</span>{/if}
         <span class="hint">Comma-separated request header names. Merged with the origin's <code>Vary</code> response header.</span>
       </div>
     </div>
@@ -364,6 +390,7 @@
   .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 
   .hint { display: block; font-weight: 400; color: var(--color-text-muted); font-size: 0.75rem; margin-top: 0.25rem; }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 
   .imported-badge {
     display: inline-block;

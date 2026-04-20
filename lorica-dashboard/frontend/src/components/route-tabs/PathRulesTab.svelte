@@ -2,6 +2,49 @@
   import type { RouteFormState, PathRuleFormState } from '../../lib/route-form';
   import type { BackendResponse } from '../../lib/api';
   import BackendCheckboxList from '../BackendCheckboxList.svelte';
+  import {
+    validateRoutePath,
+    validateUrl,
+    validateHeadersMapText,
+    validateHttpHeaderNameList,
+  } from '../../lib/validators';
+
+  /**
+   * Compute per-field errors for a given path rule. Returns `null`
+   * for an OK field so template `{#if ...}` blocks collapse. Empty
+   * strings are treated as "field not set yet" and never flag.
+   */
+  function ruleErrors(rule: PathRuleFormState) {
+    return {
+      path: rule.path.trim() === '' ? null : validateRoutePath(rule.path),
+      redirect: validateUrl(rule.redirect_to),
+      returnStatus: (() => {
+        const raw = rule.return_status.trim();
+        if (raw === '') return null;
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 100 || n > 599) {
+          return 'must be an HTTP code in 100..599';
+        }
+        return null;
+      })(),
+      respHeaders: validateHeadersMapText(rule.response_headers),
+      respHeadersRemove: validateHttpHeaderNameList(rule.response_headers_remove),
+      rps: (() => {
+        const raw = rule.rate_limit_rps.trim();
+        if (raw === '') return null;
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 1) return 'must be a positive integer';
+        return null;
+      })(),
+      burst: (() => {
+        const raw = rule.rate_limit_burst.trim();
+        if (raw === '') return null;
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 1) return 'must be a positive integer';
+        return null;
+      })(),
+    };
+  }
 
   interface Props {
     form: RouteFormState;
@@ -113,12 +156,14 @@
     </div>
   {:else}
     {#each form.path_rules as rule, index (index)}
+      {@const errs = ruleErrors(rule)}
       <div class="rule-card">
         <div class="rule-header">
           <div class="rule-header-left">
             <input
               type="text"
               class="path-input"
+              class:invalid={errs.path !== null}
               bind:value={rule.path}
               placeholder="/api/v1"
               onchange={() => { form.path_rules = [...form.path_rules]; }}
@@ -132,6 +177,7 @@
               <option value="exact">Exact</option>
             </select>
           </div>
+          {#if errs.path}<span class="field-error" role="alert">Path: {errs.path}</span>{/if}
           <div class="rule-overrides-summary">
             {#if rule.backend_ids.length > 0}<span class="override-pill">backends</span>{/if}
             {#if rule.cache_enabled != null}<span class="override-pill">cache</span>{/if}
@@ -223,6 +269,7 @@
                 placeholder="X-Custom=value&#10;X-Other=value"
                 onchange={() => { form.path_rules = [...form.path_rules]; }}
               ></textarea>
+              {#if errs.respHeaders}<span class="field-error" role="alert">{errs.respHeaders}</span>{/if}
               <div class="inline-field" style="margin-top: 0.5rem;">
                 <label for="pr-hdr-rm-{index}">Remove headers (comma-separated)</label>
                 <input
@@ -232,6 +279,7 @@
                   placeholder="X-Powered-By, Server"
                   onchange={() => { form.path_rules = [...form.path_rules]; }}
                 />
+                {#if errs.respHeadersRemove}<span class="field-error" role="alert">{errs.respHeadersRemove}</span>{/if}
               </div>
             </div>
 
@@ -249,6 +297,7 @@
                     placeholder="Inherit"
                     onchange={() => { form.path_rules = [...form.path_rules]; }}
                   />
+                  {#if errs.rps}<span class="field-error" role="alert">{errs.rps}</span>{/if}
                 </div>
                 <div class="inline-field">
                   <label for="pr-burst-{index}">Burst</label>
@@ -260,6 +309,7 @@
                     placeholder="Inherit"
                     onchange={() => { form.path_rules = [...form.path_rules]; }}
                   />
+                  {#if errs.burst}<span class="field-error" role="alert">{errs.burst}</span>{/if}
                 </div>
               </div>
             </div>
@@ -273,6 +323,11 @@
                 placeholder="https://example.com/new-path"
                 onchange={() => { form.path_rules = [...form.path_rules]; }}
               />
+              {#if errs.redirect}<span class="field-error" role="alert">{errs.redirect}</span>{/if}
+              <span class="hint">
+                Emitted as-is (literal 301 target). Unlike the route-level
+                Redirect, the matched path is <strong>not</strong> appended.
+              </span>
             </div>
 
             <!-- Return status -->
@@ -286,6 +341,7 @@
                 placeholder="e.g. 403, 404"
                 onchange={() => { form.path_rules = [...form.path_rules]; }}
               />
+              {#if errs.returnStatus}<span class="field-error" role="alert">{errs.returnStatus}</span>{/if}
               <span class="hint">If set, responds with this HTTP status instead of proxying.</span>
             </div>
           </div>
@@ -550,6 +606,8 @@
   .text-muted { color: var(--color-text-muted); }
   .small { font-size: 0.8125rem; }
   .hint { font-weight: 400; color: var(--color-text-muted); font-size: 0.75rem; }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
+  .invalid { border-color: var(--color-red) !important; }
 
   .imported-badge {
     display: inline-block;

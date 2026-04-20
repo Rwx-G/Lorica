@@ -47,6 +47,44 @@
     !form.waf_enabled &&
       (Number(form.auto_ban_threshold) > 0 || form.auto_ban_duration_s !== ROUTE_DEFAULTS.auto_ban_duration_s),
   );
+
+  // Numeric-range blur validators. The API enforces the same bounds
+  // via `validate_route_numeric_bounds`; these catch the mistake
+  // before the operator hits Save.
+  function rangeErr(raw: string | number, min: number, max: number, label: string): string | null {
+    const str = String(raw).trim();
+    if (str === '') return null;
+    const n = Number(str);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      return `${label} must be an integer in ${min}..${max}`;
+    }
+    return null;
+  }
+  let rateLimitCapacityError = $state<string | null>(null);
+  let rateLimitRefillError = $state<string | null>(null);
+  function checkRateLimitCapacity() { rateLimitCapacityError = rangeErr(form.rate_limit_capacity, 0, 1_000_000, 'value'); }
+  function checkRateLimitRefill() { rateLimitRefillError = rangeErr(form.rate_limit_refill_per_sec, 0, 1_000_000, 'value'); }
+  let maxConnError = $state<string | null>(null);
+  let slowlorisError = $state<string | null>(null);
+  let maxBodyError = $state<string | null>(null);
+  let autoBanThresholdError = $state<string | null>(null);
+  let autoBanDurationError = $state<string | null>(null);
+  let botCookieTtlError = $state<string | null>(null);
+  function checkMaxConn() { maxConnError = rangeErr(form.max_connections, 1, 1_000_000, 'value'); }
+  function checkSlowloris() { slowlorisError = rangeErr(form.slowloris_threshold_ms, 100, 600_000, 'value'); }
+  function checkMaxBody() {
+    const raw = String(form.max_body_mb).trim();
+    if (raw === '') { maxBodyError = null; return; }
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0 || n > 131_072) {
+      maxBodyError = 'value must be an integer in 0..131072 (0 = no limit)';
+    } else {
+      maxBodyError = null;
+    }
+  }
+  function checkAutoBanThreshold() { autoBanThresholdError = rangeErr(form.auto_ban_threshold, 1, 10_000, 'value'); }
+  function checkAutoBanDuration() { autoBanDurationError = rangeErr(form.auto_ban_duration_s, 1, 31_536_000, 'value'); }
+  function checkBotCookieTtl() { botCookieTtlError = rangeErr(form.bot_cookie_ttl_s, 1, 604_800, 'value'); }
 </script>
 
 <div class="tab-content">
@@ -63,13 +101,15 @@
         <div class="form-group" class:modified={isModified('rate_limit_capacity')}>
           <label for="rate-limit-capacity">Capacity (burst tokens)</label>
           {#if isImported('rate_limit_capacity')}<span class="imported-badge">imported</span>{/if}
-          <input id="rate-limit-capacity" type="number" min="0" max="1000000" bind:value={form.rate_limit_capacity} placeholder="Disabled" />
+          <input id="rate-limit-capacity" type="number" min="0" max="1000000" bind:value={form.rate_limit_capacity} placeholder="Disabled" onblur={checkRateLimitCapacity} oninput={checkRateLimitCapacity} />
+          {#if rateLimitCapacityError}<span class="field-error" role="alert">{rateLimitCapacityError}</span>{/if}
           <span class="hint">Burst size. 0 disables the rate limit entirely.</span>
         </div>
         <div class="form-group" class:modified={isModified('rate_limit_refill_per_sec')}>
           <label for="rate-limit-refill">Refill (tokens/s)</label>
           {#if isImported('rate_limit_refill_per_sec')}<span class="imported-badge">imported</span>{/if}
-          <input id="rate-limit-refill" type="number" min="0" max="1000000" bind:value={form.rate_limit_refill_per_sec} placeholder="0 = one-shot" />
+          <input id="rate-limit-refill" type="number" min="0" max="1000000" bind:value={form.rate_limit_refill_per_sec} placeholder="0 = one-shot" onblur={checkRateLimitRefill} oninput={checkRateLimitRefill} />
+          {#if rateLimitRefillError}<span class="field-error" role="alert">{rateLimitRefillError}</span>{/if}
           <span class="hint">Steady-state rate. 0 = bucket drains and does not refill.</span>
         </div>
       </div>
@@ -98,13 +138,15 @@
         <div class="form-group" class:modified={isModified('max_connections')}>
           <label for="max-connections">Max connections</label>
           {#if isImported('max_connections')}<span class="imported-badge">imported</span>{/if}
-          <input id="max-connections" type="number" min="1" bind:value={form.max_connections} placeholder="No limit" />
+          <input id="max-connections" type="number" min="1" max="1000000" bind:value={form.max_connections} placeholder="No limit" onblur={checkMaxConn} oninput={checkMaxConn} />
+          {#if maxConnError}<span class="field-error" role="alert">{maxConnError}</span>{/if}
           <span class="hint">Max concurrent connections for this route. Nginx: <code>limit_conn</code>.</span>
         </div>
         <div class="form-group" class:modified={isModified('slowloris_threshold_ms')}>
           <label for="slowloris-threshold">Slowloris threshold (ms)</label>
           {#if isImported('slowloris_threshold_ms')}<span class="imported-badge">imported</span>{/if}
-          <input id="slowloris-threshold" type="number" min="100" bind:value={form.slowloris_threshold_ms} placeholder="5000" />
+          <input id="slowloris-threshold" type="number" min="100" max="600000" bind:value={form.slowloris_threshold_ms} placeholder="5000" onblur={checkSlowloris} oninput={checkSlowloris} />
+          {#if slowlorisError}<span class="field-error" role="alert">{slowlorisError}</span>{/if}
           <span class="hint">Abort a client that has not finished sending headers within this window.</span>
         </div>
       </div>
@@ -123,7 +165,8 @@
       <div class="form-group" class:modified={isModified('max_body_mb')}>
         <label for="max-body">Max body (MB)</label>
         {#if isImported('max_body_mb')}<span class="imported-badge">imported</span>{/if}
-        <input id="max-body" type="number" min="0" step="1" bind:value={form.max_body_mb} placeholder="No limit" />
+        <input id="max-body" type="number" min="0" max="131072" step="1" bind:value={form.max_body_mb} placeholder="No limit" onblur={checkMaxBody} oninput={checkMaxBody} />
+        {#if maxBodyError}<span class="field-error" role="alert">{maxBodyError}</span>{/if}
         <span class="hint">0 or empty = no limit. Nginx equivalent: <code>client_max_body_size</code>.</span>
       </div>
     </div>
@@ -151,13 +194,15 @@
         <div class="form-group" class:modified={isModified('auto_ban_threshold')}>
           <label for="auto-ban-threshold">Threshold (violations before ban)</label>
           {#if isImported('auto_ban_threshold')}<span class="imported-badge">imported</span>{/if}
-          <input id="auto-ban-threshold" type="number" min="1" bind:value={form.auto_ban_threshold} placeholder="Disabled" />
+          <input id="auto-ban-threshold" type="number" min="1" max="10000" bind:value={form.auto_ban_threshold} placeholder="Disabled" onblur={checkAutoBanThreshold} oninput={checkAutoBanThreshold} />
+          {#if autoBanThresholdError}<span class="field-error" role="alert">{autoBanThresholdError}</span>{/if}
           <span class="hint">Empty or 0 = auto-ban disabled.</span>
         </div>
         <div class="form-group" class:modified={isModified('auto_ban_duration_s')}>
           <label for="auto-ban-duration">Duration (s)</label>
           {#if isImported('auto_ban_duration_s')}<span class="imported-badge">imported</span>{/if}
-          <input id="auto-ban-duration" type="number" min="1" bind:value={form.auto_ban_duration_s} placeholder="3600" />
+          <input id="auto-ban-duration" type="number" min="1" max="31536000" bind:value={form.auto_ban_duration_s} placeholder="3600" onblur={checkAutoBanDuration} oninput={checkAutoBanDuration} />
+          {#if autoBanDurationError}<span class="field-error" role="alert">{autoBanDurationError}</span>{/if}
           <span class="hint">Ban duration after the threshold is hit.</span>
         </div>
       </div>
@@ -225,7 +270,8 @@
           <div class="form-group" class:modified={isModified('bot_cookie_ttl_s')}>
             <label for="bot-cookie-ttl">Cookie TTL (seconds, 1..604800)</label>
             {#if isImported('bot_cookie_ttl_s')}<span class="imported-badge">imported</span>{/if}
-            <input id="bot-cookie-ttl" type="number" min="1" max="604800" bind:value={form.bot_cookie_ttl_s} />
+            <input id="bot-cookie-ttl" type="number" min="1" max="604800" bind:value={form.bot_cookie_ttl_s} onblur={checkBotCookieTtl} oninput={checkBotCookieTtl} />
+            {#if botCookieTtlError}<span class="field-error" role="alert">{botCookieTtlError}</span>{/if}
             <span class="hint">Default 86400 (24 h). API caps at 604800 = 7 days.</span>
           </div>
         </div>
@@ -598,6 +644,7 @@
   .checkbox-item input[type="checkbox"] { accent-color: var(--color-primary); }
 
   .hint { display: block; font-weight: 400; color: var(--color-text-muted); font-size: 0.75rem; margin-top: 0.25rem; }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 
   .imported-badge {
     display: inline-block;

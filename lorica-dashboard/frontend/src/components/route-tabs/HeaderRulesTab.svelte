@@ -2,6 +2,23 @@
   import type { RouteFormState, HeaderRuleFormState } from '../../lib/route-form';
   import type { BackendResponse } from '../../lib/api';
   import BackendCheckboxList from '../BackendCheckboxList.svelte';
+  import { validateHttpHeaderName, validateRegex } from '../../lib/validators';
+
+  /**
+   * Compute per-field errors for a given header rule. Returns `null`
+   * for an OK field. Empty fields are treated as "not set yet" and
+   * never flag - the submit-time validator catches those.
+   */
+  function ruleErrors(rule: HeaderRuleFormState) {
+    return {
+      name: rule.header_name.trim() === '' ? null : validateHttpHeaderName(rule.header_name.trim()),
+      value: (() => {
+        if (rule.match_type !== 'regex') return null;
+        if (rule.value.trim() === '') return null;
+        return validateRegex(rule.value);
+      })(),
+    };
+  }
 
   interface Props {
     form: RouteFormState;
@@ -110,12 +127,14 @@
     </div>
   {:else}
     {#each form.header_rules as rule, index (index)}
+      {@const errs = ruleErrors(rule)}
       <div class="rule-card">
         <div class="rule-header">
           <div class="rule-header-left">
             <input
               type="text"
               class="name-input"
+              class:invalid={errs.name !== null}
               bind:value={rule.header_name}
               placeholder="X-Tenant"
               onchange={() => { form.header_rules = [...form.header_rules]; }}
@@ -132,6 +151,7 @@
             <input
               type="text"
               class="value-input"
+              class:invalid={errs.value !== null}
               bind:value={rule.value}
               placeholder="acme"
               onchange={() => { form.header_rules = [...form.header_rules]; }}
@@ -151,6 +171,8 @@
               >disabled</span>
             {/if}
           </div>
+          {#if errs.name}<span class="field-error" role="alert">Header name: {errs.name}</span>{/if}
+          {#if errs.value}<span class="field-error" role="alert">Regex value: {errs.value}</span>{/if}
           <div class="rule-header-right">
             <button class="btn-icon" title="Move up" aria-label="Move up" disabled={index === 0} onclick={() => moveUp(index)}>
               <!-- eslint-disable-next-line svelte/no-at-html-tags -->
@@ -430,4 +452,6 @@
     color: var(--color-primary);
     vertical-align: middle;
   }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
+  .invalid { border-color: var(--color-red) !important; }
 </style>

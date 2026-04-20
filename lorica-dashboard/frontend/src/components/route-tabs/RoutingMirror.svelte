@@ -17,6 +17,22 @@
       form.mirror_backend_ids = [...form.mirror_backend_ids, id];
     }
   }
+
+  function numErr(raw: number | string, min: number, max: number): string | null {
+    const str = String(raw).trim();
+    if (str === '') return null;
+    const n = Number(str);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      return `value must be an integer in ${min}..${max}`;
+    }
+    return null;
+  }
+  let sampleErr = $state<string | null>(null);
+  let timeoutErr = $state<string | null>(null);
+  let maxBodyErr = $state<string | null>(null);
+  function checkSample() { sampleErr = numErr(form.mirror_sample_percent, 0, 100); }
+  function checkTimeout() { timeoutErr = numErr(form.mirror_timeout_ms, 1, 60_000); }
+  function checkMaxBody() { maxBodyErr = numErr(form.mirror_max_body_bytes, 0, 128 * 1_048_576); }
 </script>
 
 <div class="mirror-panel">
@@ -56,7 +72,9 @@
         bind:value={form.mirror_sample_percent}
         disabled={form.mirror_backend_ids.length === 0}
         title={form.mirror_backend_ids.length === 0 ? 'Select at least one shadow backend to enable this option' : ''}
+        onblur={checkSample} oninput={checkSample}
       />
+      {#if sampleErr}<span class="field-error" role="alert">{sampleErr}</span>{/if}
       <span class="hint">0..100. Sticky per X-Request-Id so retries of the same request stay in or out.</span>
     </div>
     <div class="form-group" class:modified={form.mirror_timeout_ms !== 5000}>
@@ -69,7 +87,9 @@
         bind:value={form.mirror_timeout_ms}
         disabled={form.mirror_backend_ids.length === 0}
         title={form.mirror_backend_ids.length === 0 ? 'Select at least one shadow backend to enable this option' : ''}
+        onblur={checkTimeout} oninput={checkTimeout}
       />
+      {#if timeoutErr}<span class="field-error" role="alert">{timeoutErr}</span>{/if}
       <span class="hint">Slow mirrors are dropped silently; never impacts the primary request.</span>
     </div>
   </div>
@@ -84,7 +104,9 @@
       bind:value={form.mirror_max_body_bytes}
       disabled={form.mirror_backend_ids.length === 0}
       title={form.mirror_backend_ids.length === 0 ? 'Select at least one shadow backend to enable this option' : ''}
+      onblur={checkMaxBody} oninput={checkMaxBody}
     />
+    {#if maxBodyErr}<span class="field-error" role="alert">{maxBodyErr}</span>{/if}
     <span class="hint">
       Max body size buffered for mirror sub-requests. Requests with a body
       larger than this are sent to the primary normally but NOT mirrored
@@ -149,6 +171,7 @@
   .text-muted { color: var(--color-text-muted); }
   .small { font-size: 0.8125rem; }
   .hint { display: block; font-weight: 400; color: var(--color-text-muted); font-size: 0.75rem; margin-top: 0.25rem; }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 
   .mirror-summary {
     margin-top: 0.5rem;

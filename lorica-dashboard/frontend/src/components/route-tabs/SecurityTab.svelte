@@ -3,7 +3,12 @@
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import ChipListInput from '../ChipListInput.svelte';
-  import { validateCidr, validateUrl } from '../../lib/validators';
+  import {
+    validateCidr,
+    validateUrl,
+    validateMtlsPemShape,
+    validateMtlsOrganizationList,
+  } from '../../lib/validators';
 
   import { api, type SecurityHeaderPreset, type BackendResponse } from '../../lib/api';
 
@@ -63,8 +68,25 @@
   // sees an "must start with http:// or https://" hint the moment
   // they leave the field instead of at save time.
   let forwardAuthUrlError = $state<string | null>(null);
+  let forwardAuthTimeoutError = $state<string | null>(null);
+  let mtlsPemError = $state<string | null>(null);
+  let mtlsOrgsError = $state<string | null>(null);
   function checkForwardAuthUrl() {
     forwardAuthUrlError = validateUrl(form.forward_auth_address);
+  }
+  function checkForwardAuthTimeout() {
+    const n = Number(form.forward_auth_timeout_ms);
+    if (!Number.isInteger(n) || n < 1 || n > 60000) {
+      forwardAuthTimeoutError = 'must be an integer in 1..60000 (ms)';
+    } else {
+      forwardAuthTimeoutError = null;
+    }
+  }
+  function checkMtlsPem() {
+    mtlsPemError = validateMtlsPemShape(form.mtls_ca_cert_pem);
+  }
+  function checkMtlsOrgs() {
+    mtlsOrgsError = validateMtlsOrganizationList(form.mtls_allowed_organizations);
   }
 
   async function runMtlsValidate() {
@@ -242,7 +264,7 @@
       type="text"
       bind:value={form.forward_auth_address}
       placeholder="http://authelia.internal:9091/api/verify"
-      onblur={checkForwardAuthUrl}
+      onblur={checkForwardAuthUrl} oninput={checkForwardAuthUrl}
       class:invalid={forwardAuthUrlError !== null}
     />
     <span class="hint">Empty = feature disabled. Must be an absolute http(s):// URL.</span>
@@ -277,7 +299,9 @@
         bind:value={form.forward_auth_timeout_ms}
         disabled={!form.forward_auth_address}
         title={!form.forward_auth_address ? 'Set an auth service URL above to enable this option' : ''}
+        onblur={checkForwardAuthTimeout} oninput={checkForwardAuthTimeout}
       />
+      {#if forwardAuthTimeoutError}<span class="field-error" role="alert">{forwardAuthTimeoutError}</span>{/if}
       <span class="hint">Per-request total timeout. 1..60000 ms. Default 5000.</span>
     </div>
     <div class="form-group" class:modified={form.forward_auth_response_headers !== ''}>
@@ -312,7 +336,9 @@
       rows="6"
       bind:value={form.mtls_ca_cert_pem}
       placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+      onblur={checkMtlsPem} oninput={checkMtlsPem}
     ></textarea>
+    {#if mtlsPemError}<span class="field-error" role="alert">{mtlsPemError}</span>{/if}
     <span class="hint">
       One or more <code>-----BEGIN CERTIFICATE-----</code> blocks. Empty = feature
       disabled. Max 1 MiB.
@@ -378,7 +404,9 @@
         placeholder="Acme Corp, Beta Inc"
         disabled={form.mtls_ca_cert_pem.trim() === ''}
         title={form.mtls_ca_cert_pem.trim() === '' ? 'Paste a client CA bundle above to enable this option' : ''}
+        onblur={checkMtlsOrgs} oninput={checkMtlsOrgs}
       />
+      {#if mtlsOrgsError}<span class="field-error" role="alert">{mtlsOrgsError}</span>{/if}
       <span class="hint">
         Comma or newline-separated exact matches against the cert
         subject's <code>O=</code> field. Empty = accept any cert that
