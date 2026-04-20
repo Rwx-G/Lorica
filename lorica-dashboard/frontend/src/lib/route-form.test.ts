@@ -4,12 +4,32 @@ import {
   validateRouteForm,
   validateRouteFormWithTab,
   validateHostname,
+  validateRedirectHostname,
   routeToFormState,
   formStateToCreateRequest,
   getModifiedFields,
   ROUTE_DEFAULTS,
   type RouteFormState,
 } from './route-form';
+import {
+  validateUrl,
+  validateRegex,
+  validateRewriteReplacement,
+  validateHttpHeaderName,
+  validateHttpHeaderValue,
+  validateHttpMethod,
+  validateCorsOrigin,
+  validateHeadersMapText,
+  validateHttpHeaderNameList,
+  validateHttpMethodList,
+  validateCorsOriginList,
+  validateMtlsPemShape,
+  validateMtlsOrganization,
+  validateMtlsOrganizationList,
+  validateRoutePath,
+  validateHostnameAliasList,
+  validateErrorPageHtml,
+} from './validators';
 
 // ---------------------------------------------------------------------------
 // validateHostname
@@ -45,6 +65,393 @@ describe('validateHostname', () => {
 });
 
 // ---------------------------------------------------------------------------
+// validateRedirectHostname
+// ---------------------------------------------------------------------------
+
+describe('validateRedirectHostname', () => {
+  it('accepts empty as "clear the field"', () => {
+    expect(validateRedirectHostname('')).toBe('');
+    expect(validateRedirectHostname('   ')).toBe('');
+  });
+
+  it('accepts bare hostnames', () => {
+    expect(validateRedirectHostname('example.com')).toBe('');
+    expect(validateRedirectHostname('www.example.com')).toBe('');
+    expect(validateRedirectHostname('a-b.example.co.uk')).toBe('');
+    expect(validateRedirectHostname('localhost')).toBe('');
+  });
+
+  it('trims surrounding whitespace before validating', () => {
+    expect(validateRedirectHostname('  example.com  ')).toBe('');
+  });
+
+  it('rejects URL schemes with a scheme-specific message', () => {
+    expect(validateRedirectHostname('https://example.com')).toMatch(/http/);
+    expect(validateRedirectHostname('http://example.com')).toMatch(/http/);
+  });
+
+  it('rejects paths and trailing slashes with a path-specific message', () => {
+    expect(validateRedirectHostname('example.com/')).toMatch(/path/);
+    expect(validateRedirectHostname('example.com/foo')).toMatch(/path/);
+  });
+
+  it('rejects port / query / fragment / user', () => {
+    expect(validateRedirectHostname('example.com:8080')).toMatch(/invalid/);
+    expect(validateRedirectHostname('example.com?x=1')).toMatch(/invalid/);
+    expect(validateRedirectHostname('example.com#frag')).toMatch(/invalid/);
+    expect(validateRedirectHostname('user@example.com')).toMatch(/invalid/);
+  });
+
+  it('rejects leading or trailing dot', () => {
+    expect(validateRedirectHostname('.example.com')).toMatch(/dot/);
+    expect(validateRedirectHostname('example.com.')).toMatch(/dot/);
+  });
+
+  it('rejects consecutive dots', () => {
+    expect(validateRedirectHostname('example..com')).toMatch(/empty DNS label/);
+  });
+
+  it('rejects non-ASCII or underscore', () => {
+    expect(validateRedirectHostname('exämple.com')).toMatch(/ASCII/);
+    expect(validateRedirectHostname('example_underscore.com')).toMatch(/ASCII/);
+  });
+
+  it('rejects label leading or trailing dash', () => {
+    expect(validateRedirectHostname('-example.com')).toMatch(/`-`/);
+    expect(validateRedirectHostname('example-.com')).toMatch(/`-`/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateUrl
+// ---------------------------------------------------------------------------
+
+describe('validateUrl (shared validator)', () => {
+  it('accepts empty as "clear the field"', () => {
+    expect(validateUrl('')).toBeNull();
+    expect(validateUrl('   ')).toBeNull();
+  });
+
+  it('accepts http and https URLs with hosts', () => {
+    expect(validateUrl('https://example.com')).toBeNull();
+    expect(validateUrl('http://example.com/legacy')).toBeNull();
+    expect(validateUrl('https://www.youtube.com/redirect?q=https://plex.rwx-g.fr/')).toBeNull();
+  });
+
+  it('rejects missing or wrong scheme', () => {
+    expect(validateUrl('example.com')).toMatch(/http/);
+    expect(validateUrl('//example.com')).toMatch(/http/);
+    expect(validateUrl('ftp://example.com')).toMatch(/http/);
+  });
+
+  it('rejects scheme without host', () => {
+    // The shared `validateUrl` uses `new URL(...)` which throws for a
+    // bare scheme; accept either "missing hostname" (URL parsed but
+    // hostname was empty) or "not a valid URL" (URL constructor threw)
+    // as long as it's not null.
+    expect(validateUrl('https://')).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateRegex + validateRewriteReplacement (shared validators)
+// ---------------------------------------------------------------------------
+
+describe('validateRegex (shared validator)', () => {
+  it('accepts empty', () => {
+    expect(validateRegex('')).toBeNull();
+  });
+
+  it('accepts valid regex', () => {
+    expect(validateRegex(String.raw`^/api/v1/(.*)$`)).toBeNull();
+  });
+
+  it('rejects invalid regex', () => {
+    expect(validateRegex('(unclosed')).not.toBeNull();
+  });
+});
+
+describe('validateRewriteReplacement', () => {
+  it('accepts empty replacement', () => {
+    expect(validateRewriteReplacement('', '')).toBeNull();
+    expect(validateRewriteReplacement('', '(.*)')).toBeNull();
+  });
+
+  it('accepts in-range capture group refs', () => {
+    expect(validateRewriteReplacement('/v2/$1', String.raw`^/api/v1/(.*)$`)).toBeNull();
+    expect(validateRewriteReplacement('/$1/$2/$3', '^/(a)/(b)/(c)$')).toBeNull();
+  });
+
+  it('accepts $0 whole-match reference', () => {
+    expect(validateRewriteReplacement('/static/$0', '^/api/')).toBeNull();
+  });
+
+  it('rejects out-of-range capture references', () => {
+    expect(validateRewriteReplacement('/v2/$3', String.raw`^/api/v1/(.*)$`)).toMatch(/\$3/);
+  });
+
+  it('respects $$ escape (literal dollar)', () => {
+    expect(validateRewriteReplacement('price: $$5', '^/x$')).toBeNull();
+  });
+
+  it('skips the check when no pattern is given', () => {
+    expect(validateRewriteReplacement('/v2/$99', '')).toBeNull();
+  });
+
+  it('enforces 2048-char replacement cap', () => {
+    expect(validateRewriteReplacement('a'.repeat(3000), '')).toMatch(/2048/);
+  });
+
+  it('handles named groups without double-counting', () => {
+    // `(?<name>...)` is a capturing group; `(?:...)` is not.
+    expect(validateRewriteReplacement('/$1', String.raw`(?<id>\d+)`)).toBeNull();
+    expect(validateRewriteReplacement('/$1', String.raw`(?:\d+)`)).toMatch(/\$1/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HTTP header / method / CORS validators
+// ---------------------------------------------------------------------------
+
+describe('validateHttpHeaderName', () => {
+  it('accepts RFC 7230 token chars', () => {
+    expect(validateHttpHeaderName('X-Forwarded-For')).toBeNull();
+    expect(validateHttpHeaderName('Content-Type')).toBeNull();
+    expect(validateHttpHeaderName('X_My_Header')).toBeNull();
+    expect(validateHttpHeaderName('!#$%&\'*+-.^_`|~')).toBeNull();
+  });
+
+  it('rejects whitespace and special chars', () => {
+    expect(validateHttpHeaderName('X Forwarded')).not.toBeNull();
+    expect(validateHttpHeaderName('X:Colon')).not.toBeNull();
+    expect(validateHttpHeaderName('X\tTab')).not.toBeNull();
+    expect(validateHttpHeaderName('')).not.toBeNull();
+  });
+
+  it('rejects names longer than 256 chars', () => {
+    expect(validateHttpHeaderName('a'.repeat(300))).toMatch(/256/);
+  });
+});
+
+describe('validateHttpHeaderValue', () => {
+  it('accepts printable ASCII, tabs, and UTF-8', () => {
+    expect(validateHttpHeaderValue('foo')).toBeNull();
+    expect(validateHttpHeaderValue('no-cache, no-store')).toBeNull();
+    expect(validateHttpHeaderValue('café')).toBeNull();
+    expect(validateHttpHeaderValue('')).toBeNull();
+  });
+
+  it('rejects CR, LF, and NUL', () => {
+    expect(validateHttpHeaderValue('foo\r')).not.toBeNull();
+    expect(validateHttpHeaderValue('foo\n')).not.toBeNull();
+    expect(validateHttpHeaderValue('foo\r\nX-Admin: yes')).not.toBeNull();
+    expect(validateHttpHeaderValue('foo\0')).not.toBeNull();
+  });
+
+  it('rejects values longer than 4096 chars', () => {
+    expect(validateHttpHeaderValue('a'.repeat(5000))).toMatch(/4096/);
+  });
+});
+
+describe('validateHttpMethod', () => {
+  it('accepts uppercase letter tokens', () => {
+    expect(validateHttpMethod('GET')).toBeNull();
+    expect(validateHttpMethod('POST')).toBeNull();
+    expect(validateHttpMethod('MKCOL')).toBeNull();
+  });
+
+  it('rejects lowercase, digits, and punctuation', () => {
+    expect(validateHttpMethod('get')).not.toBeNull();
+    expect(validateHttpMethod('GET1')).not.toBeNull();
+    expect(validateHttpMethod('GET,POST')).not.toBeNull();
+    expect(validateHttpMethod('')).not.toBeNull();
+  });
+});
+
+describe('validateCorsOrigin', () => {
+  it('accepts wildcard, null, and scheme://host[:port]', () => {
+    expect(validateCorsOrigin('*')).toBeNull();
+    expect(validateCorsOrigin('null')).toBeNull();
+    expect(validateCorsOrigin('https://example.com')).toBeNull();
+    expect(validateCorsOrigin('http://example.com:8080')).toBeNull();
+  });
+
+  it('rejects path, query, fragment', () => {
+    expect(validateCorsOrigin('https://example.com/')).not.toBeNull();
+    expect(validateCorsOrigin('https://example.com/foo')).not.toBeNull();
+    expect(validateCorsOrigin('https://example.com?x=1')).not.toBeNull();
+  });
+
+  it('rejects bare host and bad scheme', () => {
+    expect(validateCorsOrigin('example.com')).not.toBeNull();
+    expect(validateCorsOrigin('ftp://example.com')).not.toBeNull();
+  });
+});
+
+describe('headers + CORS list validators', () => {
+  it('validateHeadersMapText catches bad name and bad value', () => {
+    expect(validateHeadersMapText('X-Good=ok\nBad Name=ok')).toMatch(/Bad Name|header name/);
+    // An embedded CR inside one value byte-sequence on a single line.
+    // The outer newlines are the textarea record separator, but a lone
+    // CR inside the value would still enable response-splitting.
+    expect(validateHeadersMapText('X-Admin=foo\rbar')).toMatch(/CR|LF|NUL/);
+    expect(validateHeadersMapText('X-No-Equals')).toMatch(/key=value/);
+  });
+
+  it('validateHeadersMapText accepts valid text and empty', () => {
+    expect(validateHeadersMapText('')).toBeNull();
+    expect(validateHeadersMapText('X-Forwarded-For=$remote_addr\nX-Custom=value')).toBeNull();
+  });
+
+  it('validateHttpHeaderNameList flags the first bad entry', () => {
+    expect(validateHttpHeaderNameList('')).toBeNull();
+    expect(validateHttpHeaderNameList('X-Good, Content-Type')).toBeNull();
+    expect(validateHttpHeaderNameList('X-Good, Bad Name')).toMatch(/Bad Name/);
+  });
+
+  it('validateHttpMethodList accepts uppercase verbs', () => {
+    expect(validateHttpMethodList('')).toBeNull();
+    expect(validateHttpMethodList('GET, POST, DELETE')).toBeNull();
+    expect(validateHttpMethodList('GET, post')).toMatch(/post/);
+  });
+
+  it('validateCorsOriginList handles wildcards and full URLs', () => {
+    expect(validateCorsOriginList('')).toBeNull();
+    expect(validateCorsOriginList('*')).toBeNull();
+    expect(validateCorsOriginList('https://a.com, https://b.com')).toBeNull();
+    expect(validateCorsOriginList('https://a.com, example.com')).toMatch(/example.com/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mTLS validators
+// ---------------------------------------------------------------------------
+
+describe('validateMtlsPemShape', () => {
+  const minimalPem = '-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n';
+
+  it('accepts empty as "feature off"', () => {
+    expect(validateMtlsPemShape('')).toBeNull();
+    expect(validateMtlsPemShape('   ')).toBeNull();
+  });
+
+  it('accepts a shape-valid PEM', () => {
+    expect(validateMtlsPemShape(minimalPem)).toBeNull();
+  });
+
+  it('rejects missing BEGIN marker', () => {
+    expect(validateMtlsPemShape('hello world')).toMatch(/BEGIN/);
+  });
+
+  it('rejects missing END marker', () => {
+    expect(validateMtlsPemShape('-----BEGIN CERTIFICATE-----\nAAAA\n')).toMatch(/END/);
+  });
+
+  it('rejects oversize bundle', () => {
+    const big = '-----BEGIN CERTIFICATE-----\n' + 'A'.repeat(1_048_600) + '\n-----END CERTIFICATE-----\n';
+    expect(validateMtlsPemShape(big)).toMatch(/1 MiB/);
+  });
+});
+
+describe('validateMtlsOrganization(List)', () => {
+  it('accepts valid orgs and flags empty / oversize / control char', () => {
+    expect(validateMtlsOrganization('Acme')).toBeNull();
+    expect(validateMtlsOrganization('')).toMatch(/empty/);
+    expect(validateMtlsOrganization('a'.repeat(300))).toMatch(/256/);
+    expect(validateMtlsOrganization('Acme\nInc')).toMatch(/control/);
+  });
+
+  it('list validator caps at 100 entries', () => {
+    const many = Array.from({ length: 101 }, (_, i) => `Org${i}`).join(',');
+    expect(validateMtlsOrganizationList(many)).toMatch(/100/);
+    const ok = Array.from({ length: 50 }, (_, i) => `Org${i}`).join(',');
+    expect(validateMtlsOrganizationList(ok)).toBeNull();
+  });
+
+  it('list validator tolerates trailing commas and blank lines', () => {
+    expect(validateMtlsOrganizationList('Acme, Beta,')).toBeNull();
+    expect(validateMtlsOrganizationList('\nAcme\nBeta\n')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateRoutePath
+// ---------------------------------------------------------------------------
+
+describe('validateRoutePath', () => {
+  it('accepts empty and well-formed paths', () => {
+    expect(validateRoutePath('')).toBeNull();
+    expect(validateRoutePath('   ')).toBeNull();
+    expect(validateRoutePath('/')).toBeNull();
+    expect(validateRoutePath('/api/v1/users')).toBeNull();
+  });
+
+  it('rejects missing leading slash', () => {
+    expect(validateRoutePath('api')).toMatch(/\//);
+    expect(validateRoutePath('foo/bar')).toMatch(/\//);
+  });
+
+  it('rejects whitespace and control characters', () => {
+    expect(validateRoutePath('/foo bar')).toMatch(/whitespace/);
+    expect(validateRoutePath('/foo\tbar')).toMatch(/whitespace/);
+    expect(validateRoutePath('/foo\x01bar')).toMatch(/control/);
+  });
+
+  it('rejects paths longer than 1024', () => {
+    expect(validateRoutePath('/' + 'a'.repeat(1100))).toMatch(/1024/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateHostnameAliasList
+// ---------------------------------------------------------------------------
+
+describe('validateHostnameAliasList', () => {
+  it('accepts empty and valid lists', () => {
+    expect(validateHostnameAliasList('')).toBeNull();
+    expect(validateHostnameAliasList('example.com, api.example.com')).toBeNull();
+  });
+
+  it('accepts leading-wildcard aliases', () => {
+    expect(validateHostnameAliasList('*.example.com, *.api.example.com')).toBeNull();
+  });
+
+  it('flags the offending alias with its index', () => {
+    expect(validateHostnameAliasList('example.com, https://bad.com')).toMatch(/alias #2/);
+    expect(validateHostnameAliasList('example.com, bad hostname')).toMatch(/alias #2/);
+  });
+
+  it('rejects leading/trailing dot', () => {
+    expect(validateHostnameAliasList('.bad.com')).toMatch(/dot/);
+    expect(validateHostnameAliasList('bad.com.')).toMatch(/dot/);
+  });
+
+  it('rejects label dash boundaries', () => {
+    expect(validateHostnameAliasList('-bad.com')).toMatch(/`-`/);
+    expect(validateHostnameAliasList('bad-.com')).toMatch(/`-`/);
+  });
+
+  it('rejects too-long label', () => {
+    expect(validateHostnameAliasList('a'.repeat(64) + '.com')).toMatch(/63/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateErrorPageHtml
+// ---------------------------------------------------------------------------
+
+describe('validateErrorPageHtml', () => {
+  it('accepts empty and small pages', () => {
+    expect(validateErrorPageHtml('')).toBeNull();
+    expect(validateErrorPageHtml('<h1>oops</h1>')).toBeNull();
+  });
+
+  it('rejects pages over 128 KiB', () => {
+    expect(validateErrorPageHtml('a'.repeat(128 * 1024 + 1))).toMatch(/128 KiB/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // validateRouteForm
 // ---------------------------------------------------------------------------
 
@@ -62,7 +469,7 @@ describe('validateRouteForm', () => {
   });
 
   it('returns error for invalid path prefix', () => {
-    expect(validateRouteForm(makeForm({ path_prefix: 'no-slash' }))).toBe('Path prefix must start with /');
+    expect(validateRouteForm(makeForm({ path_prefix: 'no-slash' }))).toMatch(/Path prefix.*\//);
   });
 
   it('returns error for connect timeout out of range', () => {
@@ -1170,7 +1577,11 @@ describe('mtls', () => {
     ).toMatch(/1 MiB/);
   });
 
-  it('validateRouteForm rejects empty organization entry between commas', () => {
+  it('validateRouteForm tolerates empty slots in the comma-separated org list', () => {
+    // Trailing, leading, and doubled commas are a common accidental
+    // keystroke. The backend validator already filters empties via
+    // `tokenListToArray` before calling the API, so the server never
+    // sees them - mirror that here instead of failing save on typos.
     expect(
       validateRouteForm(
         mt({
@@ -1178,14 +1589,23 @@ describe('mtls', () => {
           mtls_allowed_organizations: 'Acme,,Beta',
         }),
       ),
-    ).toMatch(/must not be empty/);
-  });
-
-  it('validateRouteForm rejects a single whitespace-only entry', () => {
-    // An operator leaving "   " in the field is asking to send an
-    // empty org to the API; fail at the dashboard layer so the error
-    // is inline instead of a server roundtrip. Aligns with the API
-    // validator's per-entry check.
+    ).toBe('');
+    expect(
+      validateRouteForm(
+        mt({
+          mtls_ca_cert_pem: DUMMY_PEM,
+          mtls_allowed_organizations: 'Acme,',
+        }),
+      ),
+    ).toBe('');
+    expect(
+      validateRouteForm(
+        mt({
+          mtls_ca_cert_pem: DUMMY_PEM,
+          mtls_allowed_organizations: ',Acme',
+        }),
+      ),
+    ).toBe('');
     expect(
       validateRouteForm(
         mt({
@@ -1194,37 +1614,6 @@ describe('mtls', () => {
         }),
       ),
     ).toBe('');
-    // But an explicit comma + whitespace fails:
-    expect(
-      validateRouteForm(
-        mt({
-          mtls_ca_cert_pem: DUMMY_PEM,
-          mtls_allowed_organizations: 'Acme,   ',
-        }),
-      ),
-    ).toMatch(/must not be empty/);
-  });
-
-  it('validateRouteForm rejects trailing-comma entry', () => {
-    expect(
-      validateRouteForm(
-        mt({
-          mtls_ca_cert_pem: DUMMY_PEM,
-          mtls_allowed_organizations: 'Acme,',
-        }),
-      ),
-    ).toMatch(/must not be empty/);
-  });
-
-  it('validateRouteForm rejects leading-comma entry', () => {
-    expect(
-      validateRouteForm(
-        mt({
-          mtls_ca_cert_pem: DUMMY_PEM,
-          mtls_allowed_organizations: ',Acme',
-        }),
-      ),
-    ).toMatch(/must not be empty/);
   });
 
   it('validateRouteForm accepts valid config', () => {

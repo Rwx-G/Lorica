@@ -1,4 +1,18 @@
 import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest, MirrorConfigRequest, ResponseRewriteConfigRequest, MtlsConfigRequest } from './api';
+import {
+  validateUrl,
+  validateRegex,
+  validateRewriteReplacement,
+  validateHeadersMapText,
+  validateHttpHeaderNameList,
+  validateHttpMethodList,
+  validateCorsOriginList,
+  validateMtlsPemShape,
+  validateMtlsOrganizationList,
+  validateRoutePath,
+  validateHostnameAliasList,
+  validateErrorPageHtml,
+} from './validators';
 
 export interface PathRuleFormState {
   path: string;
@@ -897,6 +911,38 @@ export function validateHostname(value: string): string {
 }
 
 /**
+ * Validate a `redirect_hostname` input. Empty = "clear the field" and
+ * is accepted. The proxy emits redirects as
+ * `{scheme}://{redirect_hostname}{path}{?query}` so the field must be
+ * a bare DNS hostname - pasting a full URL results in a malformed
+ * Location header on the next client request. Mirrors the server-side
+ * `validate_redirect_hostname` in lorica-api so the UI can fail fast
+ * with a clear, field-specific message.
+ */
+export function validateRedirectHostname(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === '') return '';
+  if (trimmed.includes('://')) {
+    return 'Drop the `http://` / `https://` - this field is a bare hostname, not a URL';
+  }
+  if (trimmed.includes('/')) {
+    return 'Drop the path / trailing slash - this field is a bare hostname';
+  }
+  if (/[\s?#:@]/.test(trimmed)) {
+    return 'Hostname contains an invalid character (whitespace, `?`, `#`, `:`, `@`)';
+  }
+  if (trimmed.length > 253) return 'Hostname is longer than 253 characters (DNS limit)';
+  if (trimmed.startsWith('.') || trimmed.endsWith('.')) return 'Hostname must not start or end with a dot';
+  for (const label of trimmed.split('.')) {
+    if (label === '') return 'Hostname contains an empty DNS label (consecutive dots)';
+    if (label.length > 63) return 'Hostname contains a DNS label longer than 63 characters';
+    if (label.startsWith('-') || label.endsWith('-')) return 'Hostname contains a DNS label that starts or ends with `-`';
+    if (!/^[A-Za-z0-9-]+$/.test(label)) return 'Hostname may only contain ASCII letters, digits, `-` and `.`';
+  }
+  return '';
+}
+
+/**
  * Result shape for `validateRouteFormWithTab`. `tab` names the drawer
  * tab that owns the offending field so the caller can auto-switch
  * the view and put the user in front of the problem; `null` means
@@ -922,18 +968,95 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
 
   const hostErr = validateHostname(form.hostname);
   if (hostErr) return r(hostErr, 'general');
-  if (form.path_prefix && !form.path_prefix.startsWith('/')) return r('Path prefix must start with /', 'general');
+  const redirHostErr = validateRedirectHostname(form.redirect_hostname);
+  if (redirHostErr) return r(`Redirect to another host: ${redirHostErr}`, 'general');
+  const redirToErr = validateUrl(form.redirect_to);
+  if (redirToErr !== null) return r(`Redirect to (full URL): ${redirToErr}`, 'general');
+  const prePatternErr = validateRegex(form.path_rewrite_pattern);
+  if (prePatternErr !== null) return r(`Path rewrite pattern: ${prePatternErr}`, 'transform');
+  const preReplErr = validateRewriteReplacement(form.path_rewrite_replacement, form.path_rewrite_pattern);
+  if (preReplErr !== null) return r(`Path rewrite replacement: ${preReplErr}`, 'transform');
+  for (let i = 0; i < form.path_rules.length; i++) {
+    const pr = form.path_rules[i];
+    const prRedirErr = validateUrl(pr.redirect_to);
+    if (prRedirErr !== null) return r(`Path rule #${i + 1} redirect: ${prRedirErr}`, 'path_rules');
+    if (pr.return_status) {
+      const s = Number(pr.return_status);
+      if (!Number.isInteger(s) || s < 100 || s > 599) {
+        return r(`Path rule #${i + 1} return status must be in 100..599`, 'path_rules');
+      }
+    }
+  }
+  const pathPrefixErr = validateRoutePath(form.path_prefix);
+  if (pathPrefixErr !== null) return r(`Path prefix: ${pathPrefixErr}`, 'general');
+  const stripErr = validateRoutePath(form.strip_path_prefix);
+  if (stripErr !== null) return r(`Strip path prefix: ${stripErr}`, 'transform');
+  const addErr = validateRoutePath(form.add_path_prefix);
+  if (addErr !== null) return r(`Add path prefix: ${addErr}`, 'transform');
+  for (let i = 0; i < form.path_rules.length; i++) {
+    const prPathErr = validateRoutePath(form.path_rules[i].path);
+    if (prPathErr !== null) return r(`Path rule #${i + 1} path: ${prPathErr}`, 'path_rules');
+  }
+  const aliasErr = validateHostnameAliasList(form.hostname_aliases);
+  if (aliasErr !== null) return r(`Hostname aliases: ${aliasErr}`, 'general');
+  const retryErr = validateHttpMethodList(form.retry_on_methods);
+  if (retryErr !== null) return r(`Retry on methods: ${retryErr}`, 'upstream');
+  const errorPageErr = validateErrorPageHtml(form.error_page_html);
+  if (errorPageErr !== null) return r(`Error page HTML: ${errorPageErr}`, 'general');
+  const proxyHeadersErr = validateHeadersMapText(form.proxy_headers);
+  if (proxyHeadersErr) return r(`Proxy headers: ${proxyHeadersErr}`, 'transform');
+  const respHeadersErr = validateHeadersMapText(form.response_headers);
+  if (respHeadersErr) return r(`Response headers: ${respHeadersErr}`, 'transform');
+  const proxyHeadersRemoveErr = validateHttpHeaderNameList(form.proxy_headers_remove);
+  if (proxyHeadersRemoveErr) return r(`Remove proxy headers: ${proxyHeadersRemoveErr}`, 'transform');
+  const respHeadersRemoveErr = validateHttpHeaderNameList(form.response_headers_remove);
+  if (respHeadersRemoveErr) return r(`Remove response headers: ${respHeadersRemoveErr}`, 'transform');
+  const cacheVaryErr = validateHttpHeaderNameList(form.cache_vary_headers);
+  if (cacheVaryErr) return r(`Cache vary headers: ${cacheVaryErr}`, 'cache');
+  const corsOriginsErr = validateCorsOriginList(form.cors_allowed_origins);
+  if (corsOriginsErr) return r(`CORS allowed origins: ${corsOriginsErr}`, 'transform');
+  const corsMethodsErr = validateHttpMethodList(form.cors_allowed_methods);
+  if (corsMethodsErr) return r(`CORS allowed methods: ${corsMethodsErr}`, 'transform');
   if (form.connect_timeout_s < 1 || form.connect_timeout_s > 3600) return r('Connect timeout must be between 1 and 3600', 'upstream');
   if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return r('Read timeout must be between 1 and 3600', 'upstream');
   if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return r('Send timeout must be between 1 and 3600', 'upstream');
   if (form.max_body_mb && Number(form.max_body_mb) <= 0) return r('Max body size must be greater than 0', 'protection');
+  if (form.cache_ttl_s < 1 || form.cache_ttl_s > 31_536_000) return r('Cache TTL must be between 1 and 31536000 (1 year)', 'cache');
+  if (form.cache_max_mb < 1 || form.cache_max_mb > 131_072) return r('Cache max size must be between 1 and 131072 MiB (128 GiB)', 'cache');
+  if (form.stale_while_revalidate_s < 0 || form.stale_while_revalidate_s > 86_400) return r('Stale-while-revalidate must be between 0 and 86400 (1 day)', 'cache');
+  if (form.stale_if_error_s < 0 || form.stale_if_error_s > 86_400) return r('Stale-if-error must be between 0 and 86400 (1 day)', 'cache');
+  if (form.max_connections) {
+    const n = Number(form.max_connections);
+    if (!Number.isInteger(n) || n < 1 || n > 1_000_000) return r('Max connections must be between 1 and 1000000', 'protection');
+  }
+  if (form.slowloris_threshold_ms < 100 || form.slowloris_threshold_ms > 600_000) {
+    return r('Slowloris threshold must be between 100 and 600000 ms', 'protection');
+  }
+  if (form.auto_ban_threshold) {
+    const n = Number(form.auto_ban_threshold);
+    if (!Number.isInteger(n) || n < 1 || n > 10_000) return r('Auto-ban threshold must be between 1 and 10000', 'protection');
+  }
+  if (form.auto_ban_duration_s < 1 || form.auto_ban_duration_s > 31_536_000) {
+    return r('Auto-ban duration must be between 1 and 31536000 (1 year)', 'protection');
+  }
+  if (form.retry_attempts) {
+    const n = Number(form.retry_attempts);
+    if (!Number.isInteger(n) || n < 0 || n > 10) return r('Retry attempts must be between 0 and 10', 'upstream');
+  }
+  if (form.return_status) {
+    const n = Number(form.return_status);
+    if (!Number.isInteger(n) || n < 100 || n > 599) return r('Return status must be an HTTP code in 100..599', 'general');
+  }
   // Legacy rate_limit_rps / rate_limit_burst UI removed in pass 4; these branches are dead weight but kept in case imported data carries stale values - route them at Protection since that is where the modern rate limit lives now.
   if (form.rate_limit_rps && Number(form.rate_limit_rps) <= 0) return r('Rate limit RPS must be greater than 0', 'protection');
   if (form.rate_limit_burst && Number(form.rate_limit_burst) <= 0) return r('Rate limit burst must be greater than 0', 'protection');
   if (form.rate_limit_rps && form.rate_limit_burst && Number(form.rate_limit_burst) < Number(form.rate_limit_rps)) {
     return r('Rate limit burst must be >= RPS', 'protection');
   }
-  if (form.cors_max_age_s && Number(form.cors_max_age_s) <= 0) return r('CORS max age must be greater than 0', 'transform');
+  if (form.cors_max_age_s) {
+    const n = Number(form.cors_max_age_s);
+    if (!Number.isInteger(n) || n < 0) return r('CORS max age must be a non-negative integer', 'transform');
+  }
   const allowErr = validateIpList(form.ip_allowlist);
   if (allowErr) return r(`IP allowlist: ${allowErr}`, 'security');
   const denyErr = validateIpList(form.ip_denylist);
@@ -989,12 +1112,22 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
       if (!rule.pattern.trim()) {
         return r(`Response rewrite rule ${i + 1}: pattern must not be empty`, 'transform');
       }
+      if (rule.pattern.length > 4096) {
+        return r(`Response rewrite rule ${i + 1}: pattern must be <= 4096 characters`, 'transform');
+      }
+      if (rule.replacement.length > 4096) {
+        return r(`Response rewrite rule ${i + 1}: replacement must be <= 4096 characters`, 'transform');
+      }
       if (rule.is_regex) {
         try {
-           
+
           new RegExp(rule.pattern);
         } catch (e) {
           return r(`Response rewrite rule ${i + 1}: invalid regex (${(e as Error).message})`, 'transform');
+        }
+        const replErr = validateRewriteReplacement(rule.replacement, rule.pattern);
+        if (replErr) {
+          return r(`Response rewrite rule ${i + 1}: ${replErr}`, 'transform');
         }
       }
       const maxStr = rule.max_replacements.trim();
@@ -1007,23 +1140,11 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
     }
   }
   // mTLS
-  const mtlsPem = form.mtls_ca_cert_pem.trim();
-  if (mtlsPem !== '') {
-    if (!/-----BEGIN CERTIFICATE-----/.test(mtlsPem)) {
-      return r('mTLS CA PEM must contain at least one "-----BEGIN CERTIFICATE-----" block', 'security');
-    }
-    if (mtlsPem.length > 1048576) {
-      return r('mTLS CA PEM must be 1 MiB or smaller; trim the bundle to issuing CAs only', 'security');
-    }
-    const raw = form.mtls_allowed_organizations;
-    if (raw.trim() !== '') {
-      const parts = raw.split(/[,\n]/);
-      for (let i = 0; i < parts.length; i++) {
-        if (parts[i].trim() === '') {
-          return r(`mTLS allowed organization #${i + 1} must not be empty`, 'security');
-        }
-      }
-    }
+  const mtlsPemErr = validateMtlsPemShape(form.mtls_ca_cert_pem);
+  if (mtlsPemErr) return r(`mTLS CA PEM: ${mtlsPemErr}`, 'security');
+  if (form.mtls_ca_cert_pem.trim() !== '') {
+    const orgErr = validateMtlsOrganizationList(form.mtls_allowed_organizations);
+    if (orgErr) return r(`mTLS allowed organizations: ${orgErr}`, 'security');
   }
   return r('', null);
 }
@@ -1031,17 +1152,94 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
 export function validateRouteForm(form: RouteFormState): string {
   const hostErr = validateHostname(form.hostname);
   if (hostErr) return hostErr;
-  if (form.path_prefix && !form.path_prefix.startsWith('/')) return 'Path prefix must start with /';
+  const redirHostErr = validateRedirectHostname(form.redirect_hostname);
+  if (redirHostErr) return `Redirect to another host: ${redirHostErr}`;
+  const redirToErr = validateUrl(form.redirect_to);
+  if (redirToErr !== null) return `Redirect to (full URL): ${redirToErr}`;
+  const prePatternErr = validateRegex(form.path_rewrite_pattern);
+  if (prePatternErr !== null) return `Path rewrite pattern: ${prePatternErr}`;
+  const preReplErr = validateRewriteReplacement(form.path_rewrite_replacement, form.path_rewrite_pattern);
+  if (preReplErr !== null) return `Path rewrite replacement: ${preReplErr}`;
+  for (let i = 0; i < form.path_rules.length; i++) {
+    const pr = form.path_rules[i];
+    const prRedirErr = validateUrl(pr.redirect_to);
+    if (prRedirErr !== null) return `Path rule #${i + 1} redirect: ${prRedirErr}`;
+    if (pr.return_status) {
+      const s = Number(pr.return_status);
+      if (!Number.isInteger(s) || s < 100 || s > 599) {
+        return `Path rule #${i + 1} return status must be in 100..599`;
+      }
+    }
+  }
+  const pathPrefixErr = validateRoutePath(form.path_prefix);
+  if (pathPrefixErr !== null) return `Path prefix: ${pathPrefixErr}`;
+  const stripErr = validateRoutePath(form.strip_path_prefix);
+  if (stripErr !== null) return `Strip path prefix: ${stripErr}`;
+  const addErr = validateRoutePath(form.add_path_prefix);
+  if (addErr !== null) return `Add path prefix: ${addErr}`;
+  for (let i = 0; i < form.path_rules.length; i++) {
+    const prPathErr = validateRoutePath(form.path_rules[i].path);
+    if (prPathErr !== null) return `Path rule #${i + 1} path: ${prPathErr}`;
+  }
+  const aliasErr = validateHostnameAliasList(form.hostname_aliases);
+  if (aliasErr !== null) return `Hostname aliases: ${aliasErr}`;
+  const retryErr = validateHttpMethodList(form.retry_on_methods);
+  if (retryErr !== null) return `Retry on methods: ${retryErr}`;
+  const errorPageErr = validateErrorPageHtml(form.error_page_html);
+  if (errorPageErr !== null) return `Error page HTML: ${errorPageErr}`;
+  const proxyHeadersErr = validateHeadersMapText(form.proxy_headers);
+  if (proxyHeadersErr) return `Proxy headers: ${proxyHeadersErr}`;
+  const respHeadersErr = validateHeadersMapText(form.response_headers);
+  if (respHeadersErr) return `Response headers: ${respHeadersErr}`;
+  const proxyHeadersRemoveErr = validateHttpHeaderNameList(form.proxy_headers_remove);
+  if (proxyHeadersRemoveErr) return `Remove proxy headers: ${proxyHeadersRemoveErr}`;
+  const respHeadersRemoveErr = validateHttpHeaderNameList(form.response_headers_remove);
+  if (respHeadersRemoveErr) return `Remove response headers: ${respHeadersRemoveErr}`;
+  const cacheVaryErr = validateHttpHeaderNameList(form.cache_vary_headers);
+  if (cacheVaryErr) return `Cache vary headers: ${cacheVaryErr}`;
+  const corsOriginsErr = validateCorsOriginList(form.cors_allowed_origins);
+  if (corsOriginsErr) return `CORS allowed origins: ${corsOriginsErr}`;
+  const corsMethodsErr = validateHttpMethodList(form.cors_allowed_methods);
+  if (corsMethodsErr) return `CORS allowed methods: ${corsMethodsErr}`;
+  if (form.cors_max_age_s) {
+    const n = Number(form.cors_max_age_s);
+    if (!Number.isInteger(n) || n < 0) return 'CORS max age must be a non-negative integer';
+  }
   if (form.connect_timeout_s < 1 || form.connect_timeout_s > 3600) return 'Connect timeout must be between 1 and 3600';
   if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return 'Read timeout must be between 1 and 3600';
   if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return 'Send timeout must be between 1 and 3600';
   if (form.max_body_mb && Number(form.max_body_mb) <= 0) return 'Max body size must be greater than 0';
+  if (form.cache_ttl_s < 1 || form.cache_ttl_s > 31_536_000) return 'Cache TTL must be between 1 and 31536000 (1 year)';
+  if (form.cache_max_mb < 1 || form.cache_max_mb > 131_072) return 'Cache max size must be between 1 and 131072 MiB (128 GiB)';
+  if (form.stale_while_revalidate_s < 0 || form.stale_while_revalidate_s > 86_400) return 'Stale-while-revalidate must be between 0 and 86400 (1 day)';
+  if (form.stale_if_error_s < 0 || form.stale_if_error_s > 86_400) return 'Stale-if-error must be between 0 and 86400 (1 day)';
+  if (form.max_connections) {
+    const n = Number(form.max_connections);
+    if (!Number.isInteger(n) || n < 1 || n > 1_000_000) return 'Max connections must be between 1 and 1000000';
+  }
+  if (form.slowloris_threshold_ms < 100 || form.slowloris_threshold_ms > 600_000) {
+    return 'Slowloris threshold must be between 100 and 600000 ms';
+  }
+  if (form.auto_ban_threshold) {
+    const n = Number(form.auto_ban_threshold);
+    if (!Number.isInteger(n) || n < 1 || n > 10_000) return 'Auto-ban threshold must be between 1 and 10000';
+  }
+  if (form.auto_ban_duration_s < 1 || form.auto_ban_duration_s > 31_536_000) {
+    return 'Auto-ban duration must be between 1 and 31536000 (1 year)';
+  }
+  if (form.retry_attempts) {
+    const n = Number(form.retry_attempts);
+    if (!Number.isInteger(n) || n < 0 || n > 10) return 'Retry attempts must be between 0 and 10';
+  }
+  if (form.return_status) {
+    const n = Number(form.return_status);
+    if (!Number.isInteger(n) || n < 100 || n > 599) return 'Return status must be an HTTP code in 100..599';
+  }
   if (form.rate_limit_rps && Number(form.rate_limit_rps) <= 0) return 'Rate limit RPS must be greater than 0';
   if (form.rate_limit_burst && Number(form.rate_limit_burst) <= 0) return 'Rate limit burst must be greater than 0';
   if (form.rate_limit_rps && form.rate_limit_burst && Number(form.rate_limit_burst) < Number(form.rate_limit_rps)) {
     return 'Rate limit burst must be >= RPS';
   }
-  if (form.cors_max_age_s && Number(form.cors_max_age_s) <= 0) return 'CORS max age must be greater than 0';
   const allowErr = validateIpList(form.ip_allowlist);
   if (allowErr) return `IP allowlist: ${allowErr}`;
   const denyErr = validateIpList(form.ip_denylist);
@@ -1098,12 +1296,22 @@ export function validateRouteForm(form: RouteFormState): string {
       if (!r.pattern.trim()) {
         return `Response rewrite rule ${i + 1}: pattern must not be empty`;
       }
+      if (r.pattern.length > 4096) {
+        return `Response rewrite rule ${i + 1}: pattern must be <= 4096 characters`;
+      }
+      if (r.replacement.length > 4096) {
+        return `Response rewrite rule ${i + 1}: replacement must be <= 4096 characters`;
+      }
       if (r.is_regex) {
         try {
-           
+
           new RegExp(r.pattern);
         } catch (e) {
           return `Response rewrite rule ${i + 1}: invalid regex (${(e as Error).message})`;
+        }
+        const replErr = validateRewriteReplacement(r.replacement, r.pattern);
+        if (replErr) {
+          return `Response rewrite rule ${i + 1}: ${replErr}`;
         }
       }
       const maxStr = r.max_replacements.trim();
@@ -1116,27 +1324,11 @@ export function validateRouteForm(form: RouteFormState): string {
     }
   }
   // mTLS sanity. Empty ca_cert_pem = feature off.
-  const mtlsPem = form.mtls_ca_cert_pem.trim();
-  if (mtlsPem !== '') {
-    if (!/-----BEGIN CERTIFICATE-----/.test(mtlsPem)) {
-      return 'mTLS CA PEM must contain at least one "-----BEGIN CERTIFICATE-----" block';
-    }
-    if (mtlsPem.length > 1048576) {
-      return 'mTLS CA PEM must be 1 MiB or smaller; trim the bundle to issuing CAs only';
-    }
-    // Match API behavior: any trimmed-empty entry is a hard reject,
-    // including the single-element " " case and the leading/trailing
-    // comma cases. An empty field (no commas, no text) is fine - it
-    // means "no allowlist".
-    const raw = form.mtls_allowed_organizations;
-    if (raw.trim() !== '') {
-      const parts = raw.split(',');
-      for (let i = 0; i < parts.length; i++) {
-        if (parts[i].trim() === '') {
-          return `mTLS allowed organization #${i + 1} must not be empty`;
-        }
-      }
-    }
+  const mtlsPemErr = validateMtlsPemShape(form.mtls_ca_cert_pem);
+  if (mtlsPemErr) return `mTLS CA PEM: ${mtlsPemErr}`;
+  if (form.mtls_ca_cert_pem.trim() !== '') {
+    const orgErr = validateMtlsOrganizationList(form.mtls_allowed_organizations);
+    if (orgErr) return `mTLS allowed organizations: ${orgErr}`;
   }
   return '';
 }
