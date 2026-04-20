@@ -632,6 +632,35 @@ pub fn inc_notifier_events_dropped(reason: &str, count: u64) {
         .inc_by(count);
 }
 
+/// Counter: log-stream WebSocket entries dropped because a
+/// subscriber lagged the bounded broadcast channel (v1.5.0 audit
+/// LOW-12 backpressure). Non-zero values signal a slow client (or
+/// a client blocked at the kernel send buffer). The WebSocket
+/// handler also closes the connection with WS close code 1008
+/// (Policy Violation) once the per-connection drop count exceeds
+/// `LOG_WS_CLOSE_ON_DROPS`, protecting Lorica from stuck-client
+/// backpressure amplification.
+static LOGS_WS_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "logs_ws_dropped_total",
+            "Log entries dropped by a WebSocket subscriber (reason=slow_client|closed)"
+        )
+        .namespace("lorica"),
+        &["reason"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one or more dropped log-stream WebSocket entries.
+pub fn inc_logs_ws_dropped(reason: &str, count: u64) {
+    LOGS_WS_DROPPED_TOTAL
+        .with_label_values(&[reason])
+        .inc_by(count);
+}
+
 /// Counter: BanIp commands dropped by the supervisor -> worker
 /// broadcast channel when a worker subscriber falls behind the
 /// bounded queue. Non-zero values signal that the ban channel

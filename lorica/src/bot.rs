@@ -51,7 +51,7 @@ use lorica_challenge::{IpPrefix, Mode};
 use lorica_config::ConfigStore;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use rand::RngCore;
+use rand::TryRngCore;
 
 /// Path prefix for all Lorica-handled bot-protection endpoints.
 /// Chosen to be improbable-to-collide with real routes; the `lorica`
@@ -175,7 +175,9 @@ impl BotEngine {
     pub fn fresh_nonce(&self) -> String {
         use std::fmt::Write;
         let mut raw = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut raw)
+            .expect("OS RNG must produce entropy for bot-protection nonce");
         let mut out = String::with_capacity(32);
         for b in raw.iter() {
             let _ = write!(out, "{b:02x}");

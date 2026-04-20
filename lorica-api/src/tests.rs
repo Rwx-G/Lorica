@@ -259,6 +259,98 @@ async fn test_change_password() {
 }
 
 #[tokio::test]
+async fn test_change_password_rotates_session_cookie() {
+    // Password change must rotate the session cookie (v1.5.0 A.5).
+    // The old cookie becomes invalid immediately ; the response
+    // carries a new Set-Cookie that the browser picks up. A
+    // stolen-cookie attacker holding the old value gets a 401 on
+    // the next call.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let known_password = "test_password_123";
+    {
+        let store = state.store.lock().await;
+        let mut user = store
+            .get_admin_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup");
+        user.password_hash = hash_password(known_password).expect("test setup");
+        store.update_admin_user(&user).expect("test setup");
+    }
+
+    // Login, capture cookie_A.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let login_body = serde_json::json!({
+        "username": "admin",
+        "password": known_password,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&login_body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    let cookie_a_value = extract_session_cookie(&response).expect("test setup");
+    let cookie_a = format!("lorica_session={cookie_a_value}");
+
+    // Change password — the response carries a fresh Set-Cookie
+    // whose session id differs from cookie_A.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "current_password": known_password,
+        "new_password": "new_secure_password_456",
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/auth/password")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie_a)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie_b_value = extract_session_cookie(&response)
+        .expect("password change response must carry a Set-Cookie for the new session");
+    let cookie_b = format!("lorica_session={cookie_b_value}");
+    assert_ne!(
+        cookie_a_value, cookie_b_value,
+        "new session id must differ from old"
+    );
+
+    // cookie_A must now be rejected by any protected endpoint.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/status")
+        .header("Cookie", &cookie_a)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "old session cookie must no longer authenticate after password rotation"
+    );
+
+    // cookie_B authenticates normally.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/status")
+        .header("Cookie", &cookie_b)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_rate_limiting() {
     let (state, session_store, rate_limiter) = test_state().await;
 

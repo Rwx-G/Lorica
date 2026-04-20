@@ -174,7 +174,7 @@
       {#if system.host.disk_root}
       <div class="gauge-card">
         <span class="gauge-label">Disk - Root</span>
-        <span class="gauge-sublabel">{system.host.disk_root.mount_point}</span>
+        <span class="gauge-sublabel">{system.host.disk_root.mount_label}</span>
         <div class="gauge-bar-bg">
           <div
             class="gauge-bar-fill"
@@ -196,7 +196,7 @@
             <span class="same-mount-tag">same as root</span>
           {/if}
         </span>
-        <span class="gauge-sublabel">{system.host.disk_data.mount_point}</span>
+        <span class="gauge-sublabel">{system.host.disk_data.mount_label}</span>
         <div class="gauge-bar-bg">
           <div
             class="gauge-bar-fill"

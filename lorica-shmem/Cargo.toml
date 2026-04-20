@@ -9,7 +9,7 @@ description = "Cross-worker shared-memory primitives for Lorica (anonymous memfd
 
 [dependencies]
 nix = { version = "~0.29", features = ["mman", "fs", "socket", "time"] }
-rand = "0.8"
+rand = "0.9"
 tracing = "0.1"
 thiserror = "2"
 

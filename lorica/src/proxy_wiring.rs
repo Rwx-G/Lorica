@@ -1890,9 +1890,11 @@ fn extract_sticky_backend(cookie_header: &str) -> Option<&str> {
 /// deterministic output given `(now, thread_id)` inputs, so an
 /// attacker observing a few IDs could predict future ones.
 fn generate_request_id() -> String {
-    use rand::RngCore;
+    use rand::TryRngCore;
     let mut bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG must produce entropy for request id");
     let hi = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
     let lo = u64::from_le_bytes(bytes[8..].try_into().expect("8 bytes"));
     format!("{hi:016x}{lo:016x}")

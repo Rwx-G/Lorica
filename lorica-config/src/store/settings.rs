@@ -24,47 +24,57 @@ impl ConfigStore {
             let (key, value) = r?;
             match key.as_str() {
                 "management_port" => {
-                    settings.management_port = value
-                        .parse()
-                        .map_err(|_| ConfigError::Validation("invalid management_port".into()))?;
+                    settings.management_port = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!("invalid management_port {value:?}: {e}"))
+                    })?;
                 }
                 "log_level" => settings.log_level = value,
                 "default_health_check_interval_s" => {
-                    settings.default_health_check_interval_s = value.parse().map_err(|_| {
-                        ConfigError::Validation("invalid default_health_check_interval_s".into())
+                    settings.default_health_check_interval_s = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!(
+                            "invalid default_health_check_interval_s {value:?}: {e}"
+                        ))
                     })?;
                 }
                 "cert_warning_days" => {
-                    settings.cert_warning_days = value
-                        .parse()
-                        .map_err(|_| ConfigError::Validation("invalid cert_warning_days".into()))?;
+                    settings.cert_warning_days = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!("invalid cert_warning_days {value:?}: {e}"))
+                    })?;
                 }
                 "cert_critical_days" => {
-                    settings.cert_critical_days = value.parse().map_err(|_| {
-                        ConfigError::Validation("invalid cert_critical_days".into())
+                    settings.cert_critical_days = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!(
+                            "invalid cert_critical_days {value:?}: {e}"
+                        ))
                     })?;
                 }
                 "ip_blocklist_enabled" => {
                     settings.ip_blocklist_enabled = value == "true" || value == "1";
                 }
                 "max_global_connections" => {
-                    settings.max_global_connections = value.parse().map_err(|_| {
-                        ConfigError::Validation("invalid max_global_connections".into())
+                    settings.max_global_connections = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!(
+                            "invalid max_global_connections {value:?}: {e}"
+                        ))
                     })?;
                 }
                 "flood_threshold_rps" => {
-                    settings.flood_threshold_rps = value.parse().map_err(|_| {
-                        ConfigError::Validation("invalid flood_threshold_rps".into())
+                    settings.flood_threshold_rps = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!(
+                            "invalid flood_threshold_rps {value:?}: {e}"
+                        ))
                     })?;
                 }
                 "waf_ban_threshold" => {
-                    settings.waf_ban_threshold = value
-                        .parse()
-                        .map_err(|_| ConfigError::Validation("invalid waf_ban_threshold".into()))?;
+                    settings.waf_ban_threshold = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!("invalid waf_ban_threshold {value:?}: {e}"))
+                    })?;
                 }
                 "waf_ban_duration_s" => {
-                    settings.waf_ban_duration_s = value.parse().map_err(|_| {
-                        ConfigError::Validation("invalid waf_ban_duration_s".into())
+                    settings.waf_ban_duration_s = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!(
+                            "invalid waf_ban_duration_s {value:?}: {e}"
+                        ))
                     })?;
                 }
                 "custom_security_presets" => {
@@ -76,16 +86,20 @@ impl ConfigStore {
                         })?;
                 }
                 "access_log_retention" => {
-                    settings.access_log_retention = value.parse().map_err(|_| {
-                        ConfigError::Validation("invalid access_log_retention".into())
+                    settings.access_log_retention = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!(
+                            "invalid access_log_retention {value:?}: {e}"
+                        ))
                     })?;
                 }
                 "sla_purge_enabled" => {
                     settings.sla_purge_enabled = value == "true" || value == "1";
                 }
                 "sla_purge_retention_days" => {
-                    settings.sla_purge_retention_days = value.parse().map_err(|_| {
-                        ConfigError::Validation("invalid sla_purge_retention_days".into())
+                    settings.sla_purge_retention_days = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!(
+                            "invalid sla_purge_retention_days {value:?}: {e}"
+                        ))
                     })?;
                 }
                 "sla_purge_schedule" => {
@@ -120,8 +134,10 @@ impl ConfigStore {
                 "otlp_protocol" => settings.otlp_protocol = value,
                 "otlp_service_name" => settings.otlp_service_name = value,
                 "otlp_sampling_ratio" => {
-                    settings.otlp_sampling_ratio = value.parse().map_err(|_| {
-                        ConfigError::Validation("invalid otlp_sampling_ratio".into())
+                    settings.otlp_sampling_ratio = value.parse().map_err(|e| {
+                        ConfigError::Validation(format!(
+                            "invalid otlp_sampling_ratio {value:?}: {e}"
+                        ))
                     })?;
                 }
                 "geoip_db_path" => {

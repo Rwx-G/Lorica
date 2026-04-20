@@ -137,9 +137,11 @@ impl AppState {
     /// higher-priority operation).
     pub async fn rotate_bot_hmac_on_cert_event(&self) {
         let new_bytes: [u8; 32] = {
-            use rand::RngCore;
+            use rand::TryRngCore;
             let mut out = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut out);
+            rand::rngs::OsRng
+                .try_fill_bytes(&mut out)
+                .expect("OS RNG must produce entropy for HMAC rotation");
             out
         };
         let mut hex_buf = String::with_capacity(64);

@@ -21,8 +21,12 @@ subtle = "2"
 # the workspace on 0.22.
 base64 = "0.22"
 # CSPRNG for the HMAC secret, the PoW challenge nonce, and the
-# captcha solution text. Already on 0.8 across the workspace.
-rand = "0.8"
+# captcha solution text. Bumped to 0.9 in v1.5.0 (RUSTSEC-2026-0097
+# unsoundness when a custom logger + `rand::rng()` combine ; fixed
+# in rand >= 0.9). 0.10 would also work but the surrounding
+# ecosystem (argon2, rand_chacha) lags behind, so 0.9 is the path
+# of least friction.
+rand = "0.9"
 # PNG generation for the image captcha. The `captcha` crate is pure
 # Rust (no C dep) and ships its own font + mild distortion so we
 # do not need to ship a font file. ~2 KiB per rendered image.
@@ -46,4 +50,4 @@ once_cell = "1"
 [dev-dependencies]
 # Deterministic RNG for reproducing challenge / solve cycles in
 # tests without flakiness from timing-sensitive captchas.
-rand_chacha = "0.3"
+rand_chacha = "0.9"

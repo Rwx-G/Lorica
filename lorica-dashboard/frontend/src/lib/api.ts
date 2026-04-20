@@ -543,7 +543,9 @@ export interface LogsQuery {
 }
 
 export interface DiskUsage {
-  mount_point: string;
+  /// Short role label for the mount: `"root"` or `"data"`. The
+  /// absolute path is intentionally not exposed (v1.5.0 hardening).
+  mount_label: string;
   total_bytes: number;
   used_bytes: number;
   usage_percent: number;

@@ -75,7 +75,7 @@ rustls-pki-types = { version = "1", features = ["alloc"] }
 futures-util = "0.3"
 arc-swap = "1"
 dashmap = "6"
-rand = "0.8"
+rand = "0.9"
 parking_lot = "0.12"
 argon2 = "0.5"
 base64 = "0.22"

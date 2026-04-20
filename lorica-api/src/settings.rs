@@ -701,10 +701,10 @@ pub async fn update_notification(
                     )
                 })?;
                 let existing_val: serde_json::Value = serde_json::from_str(&existing.config)
-                    .map_err(|_| {
-                        ApiError::BadRequest(
-                            "existing email config is corrupt; cannot restore smtp_password".into(),
-                        )
+                    .map_err(|e| {
+                        ApiError::BadRequest(format!(
+                            "existing email config is corrupt; cannot restore smtp_password: {e}"
+                        ))
                     })?;
                 let pwd = existing_val.get("smtp_password").ok_or_else(|| {
                     ApiError::BadRequest(
@@ -712,8 +712,8 @@ pub async fn update_notification(
                     )
                 })?;
                 new_val["smtp_password"] = pwd.clone();
-                config = serde_json::to_string(&new_val).map_err(|_| {
-                    ApiError::BadRequest("failed to re-serialize notification config".into())
+                config = serde_json::to_string(&new_val).map_err(|e| {
+                    ApiError::BadRequest(format!("failed to re-serialize notification config: {e}"))
                 })?;
                 drop(store);
             }

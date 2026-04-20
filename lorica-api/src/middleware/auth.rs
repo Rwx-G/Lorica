@@ -239,6 +239,32 @@ impl SessionStore {
         });
     }
 
+    /// Remove every session belonging to a user, including the
+    /// currently-active one. Used by the password-change flow so
+    /// a stolen cookie cannot survive a rotation (v1.5.0 audit
+    /// finding LOW-13). Caller is expected to follow up with
+    /// `create(...)` to mint a fresh session + `Set-Cookie` on
+    /// the response so the legitimate user stays logged in.
+    ///
+    /// The DB purge runs **synchronously** here, not spawned, so
+    /// an immediate follow-up `get(old_session_id)` call cannot
+    /// re-hydrate the deleted row from the DB fallback path.
+    /// Latency impact: one SQLite DELETE (~1 ms on a warm page
+    /// cache), negligible in the password-change flow.
+    pub async fn remove_all_for_user(&self, user_id: &str) {
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|_sid, session| session.user_id != user_id);
+        }
+        let store = self.db.lock().await;
+        // Delete-all is implemented on top of the existing
+        // delete-all-except helper with a sentinel that can
+        // never match an issued session id (a session id is a
+        // UUID v4; the literal `__rotate_all__` does not match
+        // that shape).
+        let _ = store.delete_sessions_for_user_except(user_id, "__rotate_all__");
+    }
+
     /// Remove all expired sessions from memory and database.
     pub async fn purge_expired(&self) -> usize {
         let now = Utc::now();
