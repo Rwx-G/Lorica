@@ -1823,6 +1823,67 @@ async fn test_rate_limit_buckets_are_isolated() {
     );
 }
 
+#[tokio::test]
+async fn test_per_route_body_limit_rejects_oversize_payload() {
+    // Global default is 1 MiB (v1.5.0 A.4). `POST /api/v1/waf/rules/
+    // custom` has a per-route override at 8 KiB because a
+    // ModSecurity rule is never legitimately that large. A payload
+    // just above that override must land as 413 Payload Too Large
+    // without reaching the handler.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Build a JSON body > 8 KiB. The handler would normally need
+    // real WAF-rule fields ; the body here is padded garbage that
+    // axum rejects BEFORE entering the handler (413 from the body
+    // limit, not 400 from validation).
+    let padding = "A".repeat(9 * 1024);
+    let body = format!("{{\"description\":\"{padding}\"}}");
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/waf/rules/custom")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(body))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "body over 8 KiB should be rejected with 413"
+    );
+}
+
+#[tokio::test]
+async fn test_global_body_limit_applied_to_unbounded_routes() {
+    // Routes without a per-route body-limit override fall back on
+    // the global 1 MiB ceiling. Drive a 1.5 MiB payload at
+    // `POST /api/v1/backends` (no specific override) and assert
+    // 413 bubbles up.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let padding = "A".repeat(1_500_000);
+    let body = format!("{{\"name\":\"{padding}\"}}");
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/backends")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(body))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "body over 1 MiB on an unbounded route should be rejected with 413"
+    );
+}
+
 // ---- Notification Endpoint Tests ----
 
 #[tokio::test]

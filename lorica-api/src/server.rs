@@ -196,6 +196,13 @@ pub fn build_router(
         )
     };
 
+    // Helper : build a per-route body-size limit layer (v1.5.0
+    // audit A.4). Global default is 1 MiB ; this helper raises it
+    // for specific endpoints that legitimately carry larger
+    // payloads (cert PEM upload, TOML import, route configs with
+    // many path rules).
+    let bl = axum::extract::DefaultBodyLimit::max;
+
     // Public routes (no auth required)
     let auth_routes = Router::new()
         .route("/api/v1/auth/login", post(crate::auth::login))
@@ -218,12 +225,16 @@ pub fn build_router(
         .route("/api/v1/routes", get(crate::routes::list_routes))
         .route(
             "/api/v1/routes",
-            post(crate::routes::create_route).layer(rl("routes_cud", 30, 60)),
+            post(crate::routes::create_route)
+                .layer(bl(128 * 1024))
+                .layer(rl("routes_cud", 30, 60)),
         )
         .route("/api/v1/routes/:id", get(crate::routes::get_route))
         .route(
             "/api/v1/routes/:id",
-            put(crate::routes::update_route).layer(rl("routes_cud", 30, 60)),
+            put(crate::routes::update_route)
+                .layer(bl(128 * 1024))
+                .layer(rl("routes_cud", 30, 60)),
         )
         .route(
             "/api/v1/routes/:id",
@@ -258,7 +269,9 @@ pub fn build_router(
         )
         .route(
             "/api/v1/certificates",
-            post(crate::certificates::create_certificate).layer(rl("cert_create", 5, 60)),
+            post(crate::certificates::create_certificate)
+                .layer(bl(512 * 1024))
+                .layer(rl("cert_create", 5, 60)),
         )
         .route(
             "/api/v1/certificates/self-signed",
@@ -294,7 +307,9 @@ pub fn build_router(
         )
         .route(
             "/api/v1/cert-export/reapply",
-            post(crate::routes::cert_export::reapply).layer(rl("cert_export_reapply", 5, 60)),
+            post(crate::routes::cert_export::reapply)
+                .layer(bl(4 * 1024))
+                .layer(rl("cert_export_reapply", 5, 60)),
         )
         .route("/api/v1/status", get(crate::status::get_status))
         .route("/api/v1/logs", get(crate::logs::get_logs))
@@ -306,16 +321,22 @@ pub fn build_router(
         .route("/api/v1/config/export", post(crate::config::export_config))
         .route(
             "/api/v1/config/import",
-            post(crate::config::import_config).layer(rl("config_import", 3, 60)),
+            post(crate::config::import_config)
+                .layer(bl(2 * 1024 * 1024))
+                .layer(rl("config_import", 3, 60)),
         )
         .route(
             "/api/v1/config/import/preview",
-            post(crate::config::import_preview).layer(rl("config_import", 3, 60)),
+            post(crate::config::import_preview)
+                .layer(bl(2 * 1024 * 1024))
+                .layer(rl("config_import", 3, 60)),
         )
         .route("/api/v1/settings", get(crate::settings::get_settings))
         .route(
             "/api/v1/settings",
-            put(crate::settings::update_settings).layer(rl("settings", 10, 60)),
+            put(crate::settings::update_settings)
+                .layer(bl(64 * 1024))
+                .layer(rl("settings", 10, 60)),
         )
         .route(
             "/api/v1/settings/otel/test",
@@ -391,27 +412,39 @@ pub fn build_router(
         )
         .route(
             "/api/v1/acme/provision",
-            post(crate::acme::provision_certificate).layer(rl("acme_provision", 3, 60)),
+            post(crate::acme::provision_certificate)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns",
-            post(crate::acme::provision_certificate_dns).layer(rl("acme_provision", 3, 60)),
+            post(crate::acme::provision_certificate_dns)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual",
-            post(crate::acme::provision_dns_manual).layer(rl("acme_provision", 3, 60)),
+            post(crate::acme::provision_dns_manual)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual/check",
-            post(crate::acme::check_dns_manual).layer(rl("acme_provision", 3, 60)),
+            post(crate::acme::check_dns_manual)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual/confirm",
-            post(crate::acme::provision_dns_manual_confirm).layer(rl("acme_provision", 3, 60)),
+            post(crate::acme::provision_dns_manual_confirm)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/certificates/:id/renew",
-            post(crate::acme::renew_certificate).layer(rl("acme_provision", 3, 60)),
+            post(crate::acme::renew_certificate)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route("/api/v1/waf/rules", get(crate::waf::get_waf_rules))
         .route(
@@ -420,7 +453,7 @@ pub fn build_router(
         )
         .route(
             "/api/v1/waf/rules/custom",
-            post(crate::waf::create_custom_rule),
+            post(crate::waf::create_custom_rule).layer(bl(8 * 1024)),
         )
         .route(
             "/api/v1/waf/rules/custom/:id",
@@ -528,7 +561,14 @@ pub fn build_router(
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
                 .allow_headers(Any),
         )
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        // Global body-size ceiling : 1 MiB (v1.5.0 audit finding
+        // MEDIUM, tightened from the previous 10 MiB). Endpoints that
+        // legitimately need more (config import, cert PEM upload, route
+        // CRUD with many path rules) declare their own limit via
+        // `.layer(DefaultBodyLimit::max(N))` on the specific route ;
+        // anything larger than this global default and without a per-
+        // route override is rejected with 413 Payload Too Large.
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MiB
         .layer(axum::Extension(state))
         .layer(axum::Extension(session_store))
         .layer(axum::Extension(rate_limiter))
