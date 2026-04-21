@@ -44,6 +44,24 @@ const LOGIN_BUCKET: &str = "login";
 const LOGIN_MAX: u32 = 5;
 const LOGIN_WINDOW_SECONDS: i64 = 60;
 
+/// When the `HashMap` holding `(bucket, key)` entries grows past
+/// this threshold, `check_bucket` sweeps every entry whose window
+/// is older than [`EVICT_AFTER_SECONDS`]. The threshold is chosen
+/// so the sweep runs rarely enough to stay O(1) amortised in
+/// steady-state (management API is typically localhost-only so
+/// the map stays small), but still bounded enough to defeat a
+/// runaway "one entry per ever-rotating client IP" growth if
+/// Lorica is ever exposed behind an aggressive forwarder.
+const SWEEP_THRESHOLD: usize = 1024;
+
+/// Entries whose `window_start` is older than this get swept. 300 s
+/// is a safe upper bound above every window we currently use
+/// (max: 60 s for named buckets, 60 s for login), so an evicted
+/// entry cannot carry any useful rate-limit state by the time we
+/// drop it : the next request from the same key simply starts a
+/// fresh counter at zero.
+const EVICT_AFTER_SECONDS: i64 = 300;
+
 #[derive(Debug, Clone)]
 struct RateBucket {
     attempts: u32,
@@ -103,6 +121,19 @@ impl RateLimiter {
         let mut buckets = self.buckets.lock().await;
         let now = Utc::now();
         let composite = format!("{bucket}:{key}");
+
+        // Bound the map size : if we are past the sweep threshold,
+        // drop every entry whose window has been inactive for long
+        // enough that an evicted entry cannot carry any useful
+        // state. Cost is O(map_size) but only when the map grows
+        // past SWEEP_THRESHOLD, so the amortised cost stays O(1)
+        // for the common path. Runs BEFORE the current key is
+        // touched so an incoming request never gets swept by its
+        // own call.
+        if buckets.len() > SWEEP_THRESHOLD {
+            let cutoff = now - Duration::seconds(EVICT_AFTER_SECONDS);
+            buckets.retain(|_, v| v.window_start > cutoff);
+        }
 
         let entry = buckets.entry(composite).or_insert(RateBucket {
             attempts: 0,
@@ -288,5 +319,86 @@ mod tests {
     fn default_impl() {
         let limiter = RateLimiter::default();
         assert!(limiter.buckets.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn expired_entries_are_swept_when_map_grows_past_threshold() {
+        let limiter = RateLimiter::new();
+        // Seed the map just past SWEEP_THRESHOLD with stale
+        // entries whose window_start is well beyond EVICT_AFTER.
+        {
+            let mut buckets = limiter.buckets.lock().await;
+            let stale = Utc::now() - Duration::seconds(EVICT_AFTER_SECONDS + 10);
+            for i in 0..(SWEEP_THRESHOLD + 1) {
+                buckets.insert(
+                    format!("login:192.0.2.{i}"),
+                    RateBucket {
+                        attempts: 1,
+                        window_start: stale,
+                    },
+                );
+            }
+            assert!(buckets.len() > SWEEP_THRESHOLD);
+        }
+        // Trigger the sweep via a regular call ; the fresh entry
+        // survives, all the stale ones are evicted.
+        assert!(limiter
+            .check_bucket("login", "203.0.113.42", 5, 60)
+            .await
+            .is_ok());
+        let buckets = limiter.buckets.lock().await;
+        // After sweep + insert of the new key, exactly one entry
+        // remains (the caller just created above).
+        assert_eq!(
+            buckets.len(),
+            1,
+            "expired entries should have been swept, got: {}",
+            buckets.len()
+        );
+        assert!(buckets.contains_key("login:203.0.113.42"));
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_live_entries() {
+        let limiter = RateLimiter::new();
+        // Seed the map just past SWEEP_THRESHOLD with a mix of
+        // stale and fresh entries. Fresh ones must survive.
+        {
+            let mut buckets = limiter.buckets.lock().await;
+            let stale = Utc::now() - Duration::seconds(EVICT_AFTER_SECONDS + 10);
+            let fresh = Utc::now() - Duration::seconds(5);
+            for i in 0..SWEEP_THRESHOLD {
+                buckets.insert(
+                    format!("login:stale-{i}"),
+                    RateBucket {
+                        attempts: 1,
+                        window_start: stale,
+                    },
+                );
+            }
+            for i in 0..5 {
+                buckets.insert(
+                    format!("login:fresh-{i}"),
+                    RateBucket {
+                        attempts: 1,
+                        window_start: fresh,
+                    },
+                );
+            }
+            assert!(buckets.len() > SWEEP_THRESHOLD);
+        }
+        // Trigger the sweep.
+        let _ = limiter.check_bucket("login", "203.0.113.99", 5, 60).await;
+        let buckets = limiter.buckets.lock().await;
+        // 5 fresh entries + the new caller = 6 survivors.
+        assert_eq!(
+            buckets.len(),
+            6,
+            "expected 6 survivors (5 fresh + 1 new), got: {}",
+            buckets.len()
+        );
+        for i in 0..5 {
+            assert!(buckets.contains_key(&format!("login:fresh-{i}")));
+        }
     }
 }

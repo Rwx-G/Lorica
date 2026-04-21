@@ -574,19 +574,61 @@ pub fn delete_orphan(
         )));
     }
 
-    // 3. Build the target path and re-check its parent. Once the
-    //    sanitiser has cleared the name this is more a sanity
-    //    assertion than an additional barrier, but it catches a
-    //    pathological settings edit (relative `cert_export_dir`).
-    let target = root.join(&sanitised);
+    // 3. Canonicalise the export root, then rebuild target on top.
+    //    Canonicalising both sides defangs two edge cases the pure
+    //    string / parent check above misses :
+    //      - `cert_export_dir` itself containing a symlink (e.g.
+    //        `/var/lib/lorica -> /mnt/secrets/lorica`) ;
+    //      - `<root>/<name>` being a symlink to a path outside the
+    //        export zone. `fs::remove_dir_all` on a modern Rust
+    //        stdlib does not follow symlinks for removal, but the
+    //        defense-in-depth check makes the invariant explicit
+    //        and portable across stdlib versions.
+    let canon_root = fs::canonicalize(&root).map_err(ExportError::from)?;
+    let target = canon_root.join(&sanitised);
     match target.parent() {
-        Some(p) if p == root => {}
+        Some(p) if p == canon_root => {}
         _ => {
             return Err(ExportError::InvalidHostname(sanitised));
         }
     }
 
-    // 4. Actually remove. `remove_dir_all` walks + deletes ; it is
+    // 4. Use `symlink_metadata` so we observe the link itself, not
+    //    its target. A symlink at `<root>/<name>` is refused
+    //    outright : even if the link points inside `canon_root`,
+    //    removing it would produce a dangling entry and give
+    //    operators a wrong "orphan deleted" signal.
+    match fs::symlink_metadata(&target) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(ExportError::InvalidHostname(format!(
+                "{sanitised}: refusing to delete a symlink"
+            )));
+        }
+        Ok(md) if !md.file_type().is_dir() => {
+            return Err(ExportError::InvalidHostname(format!(
+                "{sanitised}: refusing to delete a non-directory entry"
+            )));
+        }
+        Ok(_) => {}
+        // Idempotent : nothing to delete is success.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+
+    // 5. If `target` canonicalises (it exists), double-check it
+    //    still resolves inside `canon_root`. This catches the
+    //    pathological case where an operator manually mv'd the
+    //    per-hostname directory to a symlink tree that bypasses
+    //    step 4's one-level check.
+    if let Ok(canon_target) = fs::canonicalize(&target) {
+        if !canon_target.starts_with(&canon_root) {
+            return Err(ExportError::InvalidHostname(format!(
+                "{sanitised}: resolved path escapes the export directory"
+            )));
+        }
+    }
+
+    // 6. Actually remove. `remove_dir_all` walks + deletes ; it is
     //    idempotent when the dir already vanished (ENOENT).
     match fs::remove_dir_all(&target) {
         Ok(()) => Ok(true),
@@ -600,6 +642,13 @@ pub fn delete_orphan(
 /// mounted, or an operator-changed mode/ACL, immediately reaches
 /// a coherent on-disk state instead of waiting for the next
 /// renewal cycle.
+///
+/// The whole loop runs inside `tokio::task::spawn_blocking` so the
+/// synchronous `fs::write` + `fs::rename` + `chown` syscalls on every
+/// cert do not block the Tokio runtime. On a store with hundreds of
+/// certs the sync path was stalling the executor for tens of
+/// milliseconds at a time, which degraded the response time of every
+/// concurrent HTTP handler.
 pub async fn reexport_all(
     settings: &GlobalSettings,
     acls: &[CertExportAcl],
@@ -608,24 +657,38 @@ pub async fn reexport_all(
     if !settings.cert_export_enabled {
         return (0, 0);
     }
-    let mut ok = 0usize;
-    let mut err = 0usize;
-    for cert in certs {
-        match export_certificate(settings, acls, cert) {
-            Ok(ExportOutcome::Ok) | Ok(ExportOutcome::PermissionsSkipped) => ok += 1,
-            Ok(ExportOutcome::Disabled) => {}
-            Err(e) => {
-                err += 1;
-                tracing::warn!(cert_id = %cert.id, domain = %cert.domain, error = %e, "cert export failed on startup");
+    let settings = settings.clone();
+    let acls = acls.to_vec();
+    let certs = certs.to_vec();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut ok = 0usize;
+        let mut err = 0usize;
+        for cert in &certs {
+            match export_certificate(&settings, &acls, cert) {
+                Ok(ExportOutcome::Ok) | Ok(ExportOutcome::PermissionsSkipped) => ok += 1,
+                Ok(ExportOutcome::Disabled) => {}
+                Err(e) => {
+                    err += 1;
+                    tracing::warn!(cert_id = %cert.id, domain = %cert.domain, error = %e, "cert export failed on startup");
+                }
             }
         }
-    }
+        (ok, err)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        // spawn_blocking only fails when the task panics. Surface
+        // it as a zero-export run so the caller's status JSON stays
+        // shape-stable.
+        tracing::error!(error = %e, "cert export: re-export task panicked");
+        (0, 0)
+    });
     tracing::info!(
-        exported = ok,
-        failed = err,
+        exported = result.0,
+        failed = result.1,
         "cert export: startup re-export complete"
     );
-    (ok, err)
+    result
 }
 
 #[cfg(test)]
@@ -952,5 +1015,46 @@ mod tests {
         let err =
             delete_orphan(&settings, &[], "stale.example.com").expect_err("must reject disabled");
         assert!(matches!(err, ExportError::BadConfig(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_orphan_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("test setup");
+        let outside = tempfile::tempdir().expect("test setup");
+        // Place a symlink at `<root>/evil.example.com -> <outside>`
+        // so following it would escape the export zone.
+        let link = tmp.path().join("evil.example.com");
+        symlink(outside.path(), &link).expect("symlink create failed");
+        let settings = settings_with_dir(tmp.path());
+        let err = delete_orphan(&settings, &[], "evil.example.com")
+            .expect_err("must reject a symlink entry");
+        match err {
+            ExportError::InvalidHostname(m) => {
+                assert!(m.contains("symlink"), "unexpected message: {m}");
+            }
+            other => panic!("expected InvalidHostname, got {other:?}"),
+        }
+        // The link must still be there : we refused, not silently
+        // followed through.
+        assert!(link.symlink_metadata().is_ok());
+        // And the outside tempdir must NOT have been touched.
+        assert!(outside.path().exists());
+    }
+
+    #[test]
+    fn delete_orphan_refuses_regular_file() {
+        // An operator-created README or stray `.pem` file at the
+        // root is not a directory and must not be removed by the
+        // orphan sweep even if its name survives the sanitiser.
+        let tmp = tempfile::tempdir().expect("test setup");
+        let file_path = tmp.path().join("notes.txt");
+        fs::write(&file_path, b"hand-written notes").expect("write failed");
+        let settings = settings_with_dir(tmp.path());
+        let err = delete_orphan(&settings, &[], "notes.txt")
+            .expect_err("must reject non-directory entry");
+        assert!(matches!(err, ExportError::InvalidHostname(_)));
+        assert!(file_path.exists(), "file must not have been removed");
     }
 }
