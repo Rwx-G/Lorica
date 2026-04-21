@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { api, type CertExportAclResponse } from '../../lib/api';
+  import { api, type CertExportAclResponse, type CertExportOrphan } from '../../lib/api';
   import {
     parseOctalMode,
     validateAbsolutePath,
@@ -88,6 +88,13 @@
   let reapplyMsg = $state('');
   let reapplyOk = $state(false);
 
+  // --- Orphan sweep state ---
+  let orphans: CertExportOrphan[] = $state([]);
+  let orphansLoading = $state(false);
+  let orphansError = $state('');
+  let orphansEnabled = $state(true);
+  let deletingOrphan: CertExportOrphan | null = $state(null);
+
   async function loadAcls() {
     aclsLoading = true;
     aclsError = '';
@@ -141,6 +148,45 @@
     }
   }
 
+  async function loadOrphans() {
+    orphansLoading = true;
+    orphansError = '';
+    const res = await api.listCertExportOrphans();
+    if (res.error) {
+      orphansError = res.error.message;
+    } else if (res.data) {
+      orphans = res.data.orphans;
+      orphansEnabled = res.data.enabled;
+    }
+    orphansLoading = false;
+  }
+
+  async function confirmDeleteOrphan() {
+    if (!deletingOrphan) return;
+    const name = deletingOrphan.name;
+    deletingOrphan = null;
+    const res = await api.deleteCertExportOrphan(name);
+    if (res.error) {
+      showToast(`Failed to delete ${name}: ${res.error.message}`, 'error');
+    } else {
+      showToast(`Orphan ${name} removed.`, 'success');
+      await loadOrphans();
+    }
+  }
+
+  function formatBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+    return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
+  }
+
+  function formatTimestamp(ts: string): string {
+    if (!ts) return '-';
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return ts;
+    return d.toLocaleString();
+  }
+
   async function reapply() {
     reapplying = true;
     reapplyMsg = '';
@@ -173,6 +219,7 @@
   let aclsRefreshTimer: ReturnType<typeof setInterval> | null = null;
   onMount(() => {
     loadAcls();
+    loadOrphans();
     // Refresh the ACL list every 30s so two admins editing the
     // same settings page do not drift. Cheap call, authenticated,
     // no state mutation.
@@ -461,9 +508,78 @@
           settings - save first if you just changed them.
         </span>
       </div>
+
+      <h3>Orphan directories</h3>
+      <p class="section-hint">
+        Per-hostname subdirectories found under the export root that
+        no longer correspond to any live certificate. These are the
+        residual bytes of a cert you deleted in the dashboard: the
+        exporter leaves them in place by design (consumers that
+        cached the path keep working on the stale bundle until they
+        flip) so you control the removal explicitly here.
+      </p>
+
+      {#if !orphansEnabled}
+        <p class="acl-empty">Export is disabled ; there is nothing to scan.</p>
+      {:else if orphansLoading}
+        <p class="loading">Scanning export directory...</p>
+      {:else if orphansError}
+        <div class="settings-form-error">{orphansError}</div>
+      {:else if orphans.length === 0}
+        <p class="acl-empty">No orphan directory found. 🎉</p>
+      {:else}
+        <table class="acl-table">
+          <thead>
+            <tr>
+              <th>Hostname</th>
+              <th>Size</th>
+              <th>Last modified</th>
+              <th aria-label="Actions"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each orphans as o (o.name)}
+              <tr>
+                <td><code>{o.name}</code></td>
+                <td>{formatBytes(o.size_bytes)}</td>
+                <td>{formatTimestamp(o.modified_at)}</td>
+                <td class="acl-row-actions">
+                  <button
+                    type="button"
+                    class="btn btn-secondary btn-small"
+                    onclick={() => (deletingOrphan = o)}
+                  >
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+
+      <div class="settings-form-row orphans-actions">
+        <button
+          type="button"
+          class="btn btn-secondary"
+          onclick={loadOrphans}
+          disabled={orphansLoading}
+        >
+          {orphansLoading ? 'Scanning...' : 'Rescan now'}
+        </button>
+      </div>
     </div>
   {/if}
 </section>
+
+{#if deletingOrphan}
+  <ConfirmDialog
+    title="Delete orphan directory"
+    message={`Permanently delete ${deletingOrphan.name}/ from the export directory? The four PEM files (including privkey.pem) will be removed. Any consumer still reading from this path will start failing.`}
+    onconfirm={confirmDeleteOrphan}
+    oncancel={() => (deletingOrphan = null)}
+  />
+{/if}
 
 {#if deletingAcl}
   <ConfirmDialog
@@ -560,6 +676,9 @@
     border-top: 1px solid var(--color-border);
     padding-top: var(--space-4);
     margin-top: var(--space-4);
+  }
+  .orphans-actions {
+    margin-top: 0.5rem;
   }
   .reapply-inner {
     display: flex;

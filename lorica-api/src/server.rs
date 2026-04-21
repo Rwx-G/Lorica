@@ -320,6 +320,18 @@ pub fn build_router(
                 .layer(bl(4 * 1024))
                 .layer(rl("cert_export_reapply", 5, 60)),
         )
+        .route(
+            "/api/v1/cert-export/orphans",
+            get(crate::routes::cert_export::list_orphans),
+        )
+        .route(
+            "/api/v1/cert-export/orphans/:name",
+            delete(crate::routes::cert_export::delete_orphan).layer(rl(
+                "cert_export_acls",
+                100,
+                60,
+            )),
+        )
         .route("/api/v1/status", get(crate::status::get_status))
         .route("/api/v1/logs", get(crate::logs::get_logs))
         .route("/api/v1/logs", delete(crate::logs::clear_logs))

@@ -166,7 +166,14 @@ service user (and root) can write into the export dir.
   deletes a cert in the dashboard, the on-disk directory is NOT
   removed. This is deliberate: a consumer that cached the path
   must see a stable filesystem layout. Removal is an explicit
-  operator action (`rm -rf /var/lib/lorica/exported-certs/<host>`).
+  operator action, surfaced via the dashboard Settings → Cert
+  export tab ("Orphan directories" section in v1.5.0) or via
+  `rm -rf /var/lib/lorica/exported-certs/<host>` on the shell.
+  The API endpoints `GET /api/v1/cert-export/orphans` and
+  `DELETE /api/v1/cert-export/orphans/{name}` re-validate the name
+  through the hostname sanitiser + the live-cert set before any
+  filesystem write, so a stale or racy click cannot blow away a
+  directory that still corresponds to an issued cert.
 - **No mirror to remote storage.** v1.4.1 writes locally. S3 /
   remote-sync flavours are out of scope.
 

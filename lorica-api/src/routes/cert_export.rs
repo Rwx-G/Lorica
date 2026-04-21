@@ -179,6 +179,75 @@ pub async fn reapply(
     })))
 }
 
+/// JSON projection of an orphan subdirectory on disk.
+#[derive(Serialize)]
+pub struct OrphanResponse {
+    /// Subdirectory name (already sanitised, safe to display).
+    pub name: String,
+    /// RFC 3339 modification timestamp (empty when stat failed).
+    pub modified_at: String,
+    /// Total bytes summed across the four expected PEM files.
+    pub size_bytes: u64,
+}
+
+/// GET /api/v1/cert-export/orphans - list per-hostname subdirectories
+/// under the export root that no longer correspond to any live
+/// certificate. The dashboard uses this to surface a "sweep" flow
+/// without the operator having to SSH into the box.
+pub async fn list_orphans(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.store.lock().await;
+    let settings = store.get_global_settings()?;
+    let certs = store.list_certificates()?;
+    drop(store);
+    let orphans = crate::cert_export::scan_orphans(&settings, &certs)
+        .map_err(|e| ApiError::Internal(format!("cert-export orphan scan failed: {e}")))?;
+    let items: Vec<OrphanResponse> = orphans
+        .into_iter()
+        .map(|o| OrphanResponse {
+            name: o.name,
+            modified_at: o.modified_at,
+            size_bytes: o.size_bytes,
+        })
+        .collect();
+    Ok(json_data(serde_json::json!({
+        "enabled": settings.cert_export_enabled,
+        "orphans": items,
+    })))
+}
+
+/// DELETE /api/v1/cert-export/orphans/:name - remove a single orphan
+/// subdirectory. The name is re-validated server-side (sanitiser +
+/// live-cert re-check) before any filesystem write, so a stale or
+/// racy dashboard click cannot blow away a legitimate directory.
+pub async fn delete_orphan(
+    Extension(state): Extension<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state.store.lock().await;
+    let settings = store.get_global_settings()?;
+    let certs = store.list_certificates()?;
+    drop(store);
+    let removed =
+        crate::cert_export::delete_orphan(&settings, &certs, &name).map_err(|e| match e {
+            crate::cert_export::ExportError::InvalidHostname(_) => {
+                ApiError::BadRequest(format!("invalid orphan name: {name:?}"))
+            }
+            crate::cert_export::ExportError::BadConfig(m) => ApiError::BadRequest(m),
+            other => ApiError::Internal(format!("cert-export orphan delete failed: {other}")),
+        })?;
+    tracing::warn!(
+        target = %name,
+        removed,
+        "cert export: orphan deletion requested"
+    );
+    Ok(json_data(serde_json::json!({
+        "name": name,
+        "removed": removed,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -681,6 +681,17 @@ export interface CertExportReapplyResponse {
   failed: number;
 }
 
+export interface CertExportOrphan {
+  name: string;
+  modified_at: string;
+  size_bytes: number;
+}
+
+export interface CertExportOrphansResponse {
+  enabled: boolean;
+  orphans: CertExportOrphan[];
+}
+
 /// Result of the "Test connection" probe on the OTel settings
 /// section. The backend mints a canary span with the
 /// currently-configured endpoint + protocol and reports whether
@@ -963,6 +974,15 @@ export const api = {
 
   reapplyCertExport: () =>
     request<CertExportReapplyResponse>('POST', '/cert-export/reapply', {}),
+
+  listCertExportOrphans: () =>
+    request<CertExportOrphansResponse>('GET', '/cert-export/orphans'),
+
+  deleteCertExportOrphan: (name: string) =>
+    request<{ name: string; removed: boolean }>(
+      'DELETE',
+      `/cert-export/orphans/${encodeURIComponent(name)}`,
+    ),
 
   // Preferences
   listPreferences: () =>

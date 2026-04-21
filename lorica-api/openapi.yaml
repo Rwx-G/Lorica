@@ -2189,6 +2189,76 @@ paths:
                   failed:
                     type: integer
 
+  /api/v1/cert-export/orphans:
+    get:
+      tags: [Certificates]
+      summary: List per-hostname subdirectories left behind by deleted certs
+      description: |
+        Scans `cert_export_dir` and returns every subdirectory whose
+        name does not correspond to a live certificate (either by
+        sanitised hostname or the `cert-{id}` fallback). Each entry
+        carries its modification timestamp and the summed size of
+        the four expected PEM files so the dashboard can surface
+        the stale bytes before offering deletion.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Orphan list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  orphans:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        modified_at:
+                          type: string
+                          format: date-time
+                        size_bytes:
+                          type: integer
+
+  /api/v1/cert-export/orphans/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Subdirectory name (sanitised hostname).
+    delete:
+      tags: [Certificates]
+      summary: Delete one orphan cert-export subdirectory
+      description: |
+        Removes a per-hostname subdirectory that has no corresponding
+        live certificate. The server re-runs the hostname sanitiser
+        and re-checks the live-cert set before touching the disk, so
+        a stale dashboard click or a racy delete cannot blow away a
+        legitimate directory.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Deletion outcome
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  removed:
+                    type: boolean
+        "400":
+          description: Invalid name or live cert still maps to the directory
+
   # ---------------------------------------------------------------------------
   # Preferences
   # ---------------------------------------------------------------------------
