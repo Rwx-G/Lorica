@@ -890,6 +890,28 @@ fn validate_route_numeric_bounds(
     Ok(())
 }
 
+/// Rate-limit bounds kept in a dedicated helper so the main
+/// numeric-bounds validator does not grow past `#[allow(clippy::
+/// too_many_arguments)]`. `rate_limit_rps` and `rate_limit_burst`
+/// use the same "0 = clear" convention as `max_connections` (the
+/// handler normalises `Some(0) => None` before persisting), so the
+/// lower bound is 0. The 1_000_000 ceiling mirrors `max_connections`
+/// and keeps `rps + burst` well inside u32 at the proxy level
+/// (`proxy_wiring::rate_limit` adds them as a `u32` to derive
+/// `effective_limit`).
+fn validate_rate_limit_bounds(
+    rate_limit_rps: Option<u32>,
+    rate_limit_burst: Option<u32>,
+) -> Result<(), ApiError> {
+    if let Some(v) = rate_limit_rps {
+        check_range(v, 0, 1_000_000, "rate_limit_rps")?;
+    }
+    if let Some(v) = rate_limit_burst {
+        check_range(v, 0, 1_000_000, "rate_limit_burst")?;
+    }
+    Ok(())
+}
+
 /// Validate a CORS origin entry. Accepts `*`, `null`, or a full
 /// `scheme://host[:port]` URL without path / query / fragment. The
 /// CORS spec only attaches meaning to origin-equality, so an origin
@@ -1789,6 +1811,68 @@ mod route_numeric_bounds_tests {
             },
             "cache_ttl_s",
         );
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_bounds_tests {
+    use super::*;
+
+    fn err_matches<F: FnOnce() -> Result<(), ApiError>>(f: F, needle: &str) {
+        let err = f().expect_err("test setup");
+        match err {
+            ApiError::BadRequest(m) => {
+                assert!(
+                    m.contains(needle),
+                    "expected error message to contain {needle:?} : {m}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// `rate_limit_rps == 0` and `rate_limit_burst == 0` are
+    /// valid clear sentinels : `create_route` and `update_route`
+    /// both normalise `Some(0) => None` before writing, so the
+    /// validator has to let 0 through.
+    #[test]
+    fn zero_is_accepted_as_clear() {
+        validate_rate_limit_bounds(Some(0), Some(0)).expect("zero must be accepted");
+    }
+
+    #[test]
+    fn none_is_accepted() {
+        validate_rate_limit_bounds(None, None).expect("None must be accepted");
+    }
+
+    #[test]
+    fn in_range_values_are_accepted() {
+        validate_rate_limit_bounds(Some(1_000), Some(500)).expect("typical values must pass");
+    }
+
+    #[test]
+    fn rps_past_the_cap_is_rejected() {
+        err_matches(
+            || validate_rate_limit_bounds(Some(10_000_000), None),
+            "rate_limit_rps",
+        );
+    }
+
+    #[test]
+    fn burst_past_the_cap_is_rejected() {
+        err_matches(
+            || validate_rate_limit_bounds(None, Some(10_000_000)),
+            "rate_limit_burst",
+        );
+    }
+
+    /// The documented ceiling is 1_000_000 on both fields, which
+    /// mirrors `max_connections` and keeps `rps + burst` well
+    /// inside u32 on the proxy hot path.
+    #[test]
+    fn exactly_one_million_is_accepted() {
+        validate_rate_limit_bounds(Some(1_000_000), Some(1_000_000))
+            .expect("the 1M ceiling itself must pass");
     }
 }
 
@@ -3283,6 +3367,7 @@ pub async fn create_route(
         body.cors_max_age_s,
         body.max_request_body_bytes,
     )?;
+    validate_rate_limit_bounds(body.rate_limit_rps, body.rate_limit_burst)?;
 
     let path_rules = if let Some(ref prs) = body.path_rules {
         build_path_rules(prs)?
@@ -3495,6 +3580,7 @@ pub async fn update_route(
         body.cors_max_age_s,
         body.max_request_body_bytes,
     )?;
+    validate_rate_limit_bounds(body.rate_limit_rps, body.rate_limit_burst)?;
 
     if let Some(hostname) = body.hostname {
         route.hostname = hostname;
