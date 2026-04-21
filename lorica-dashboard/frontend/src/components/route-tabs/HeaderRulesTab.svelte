@@ -419,25 +419,6 @@
     letter-spacing: 0.05em;
   }
 
-  .checkbox-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    max-height: 12rem;
-    overflow-y: auto;
-  }
-
-  .checkbox-item {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.8125rem;
-    cursor: pointer;
-    padding: 0.25rem 0;
-  }
-
-  .checkbox-item input[type="checkbox"] { accent-color: var(--color-primary); }
-
   .text-muted { color: var(--color-text-muted); }
   .small { font-size: 0.75rem; }
 

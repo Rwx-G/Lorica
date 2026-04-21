@@ -506,8 +506,7 @@
   .form-group:last-child { margin-bottom: 0.5rem; }
   .form-group.modified { border-left: 3px solid var(--color-primary); padding-left: 0.75rem; }
 
-  .form-group label,
-  .form-group .field-label {
+  .form-group label {
     display: block;
     font-size: 0.8125rem;
     font-weight: 500;
@@ -520,7 +519,6 @@
 
   .form-group input[type="text"],
   .form-group input[type="number"],
-  .form-group select,
   .form-group textarea {
     width: 100%;
     padding: 0.5rem 0.75rem;
@@ -534,7 +532,6 @@
 
   .form-group input[type="text"]:focus,
   .form-group input[type="number"]:focus,
-  .form-group select:focus,
   .form-group textarea:focus {
     outline: none;
     border-color: var(--color-primary);

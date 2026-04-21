@@ -521,8 +521,7 @@
   .form-group:last-child { margin-bottom: 0.5rem; }
   .form-group.modified { border-left: 3px solid var(--color-primary); padding-left: 0.75rem; }
 
-  .form-group label,
-  .form-group .field-label {
+  .form-group label {
     display: block;
     font-size: 0.8125rem;
     font-weight: 500;
@@ -545,18 +544,6 @@
     border-color: var(--color-primary);
   }
 
-  .checkbox-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.375rem;
-    max-height: 150px;
-    overflow-y: auto;
-    padding: 0.5rem;
-    border: 1px solid var(--color-border);
-    border-radius: 0.375rem;
-    background: var(--color-bg-input);
-  }
-
   .checkbox-item {
     display: flex;
     align-items: center;
@@ -567,8 +554,6 @@
 
   .checkbox-item input[type="checkbox"] { accent-color: var(--color-primary); }
 
-  .text-muted { color: var(--color-text-muted); }
-  .small { font-size: 0.8125rem; }
   .hint { display: block; font-weight: 400; color: var(--color-text-muted); font-size: 0.75rem; margin-top: 0.25rem; }
 
   .imported-badge {

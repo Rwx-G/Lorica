@@ -212,11 +212,6 @@
     color: var(--color-text-muted);
     margin-top: 0.25rem;
   }
-  .form-success {
-    color: var(--color-green);
-    font-size: 0.8125rem;
-    margin: 0.5rem 0;
-  }
   h3 {
     margin: var(--space-4) 0 var(--space-2);
     font-size: var(--text-md);

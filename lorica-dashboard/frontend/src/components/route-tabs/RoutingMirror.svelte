@@ -37,6 +37,10 @@
 
 <div class="mirror-panel">
   <div class="form-group" class:modified={form.mirror_backend_ids.length > 0}>
+    <!-- The label is linked to the BackendCheckboxList group via
+         aria-labelledby below ; svelte-check cannot see through
+         the component boundary. -->
+    <!-- svelte-ignore a11y_label_has_associated_control -->
     <label id="mirror-backends-label">Shadow backends</label>
     <BackendCheckboxList
       {backends}
@@ -146,30 +150,6 @@
     gap: 1rem;
   }
 
-  .checkbox-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.375rem;
-    max-height: 150px;
-    overflow-y: auto;
-    padding: 0.5rem;
-    border: 1px solid var(--color-border);
-    border-radius: 0.375rem;
-    background: var(--color-bg-input);
-  }
-
-  .checkbox-item {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.8125rem;
-    cursor: pointer;
-  }
-
-  .checkbox-item input[type="checkbox"] { accent-color: var(--color-primary); }
-
-  .text-muted { color: var(--color-text-muted); }
-  .small { font-size: 0.8125rem; }
   .hint { display: block; font-weight: 400; color: var(--color-text-muted); font-size: 0.75rem; margin-top: 0.25rem; }
   .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 

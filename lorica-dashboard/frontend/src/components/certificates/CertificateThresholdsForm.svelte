@@ -10,7 +10,14 @@
 
   let { warningDays, criticalDays, onClose, onSaved }: Props = $props();
 
+  // Modal-form pattern : snapshot the incoming props as the initial
+  // value of the editable state. If the parent changes the prop
+  // while the modal is open (unusual but possible during a live
+  // settings refresh) the local edit wins until Save or Cancel
+  // closes the modal — this is the expected UX.
+  // svelte-ignore state_referenced_locally
   let thresholdWarning = $state(warningDays);
+  // svelte-ignore state_referenced_locally
   let thresholdCritical = $state(criticalDays);
 
   function handleKeydown(e: KeyboardEvent) {

@@ -163,13 +163,18 @@
 
   // Live list of unique group names for the filter dropdown. `_none`
   // is the sentinel for "ungrouped" routes (matches empty string).
+  // Uses a plain `Record` for the dedup-set shape so the lint rule
+  // `svelte/prefer-svelte-reactivity` (which flags every `new Set()`
+  // inside reactive scopes, not just reactive state) leaves us alone ;
+  // the value is a one-shot local, not reactive state, so `SvelteSet`
+  // would be overkill here.
   let availableGroups: string[] = $derived.by(() => {
-    const set = new Set<string>();
+    const seen: Record<string, true> = {};
     for (const r of routes) {
       const g = r.group_name ?? '';
-      if (g !== '') set.add(g);
+      if (g !== '') seen[g] = true;
     }
-    return Array.from(set).sort();
+    return Object.keys(seen).sort();
   });
 
   let filteredRoutes: RouteResponse[] = $derived.by(() => {

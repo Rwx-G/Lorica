@@ -271,12 +271,6 @@
   .override-section { padding: 0.5rem; background: var(--color-bg); border-radius: 0.25rem; }
   .override-title { display: block; font-size: 0.75rem; font-weight: 600; color: var(--color-text-muted); margin-bottom: 0.375rem; text-transform: uppercase; letter-spacing: 0.05em; }
 
-  .checkbox-list { display: flex; flex-direction: column; gap: 0.25rem; max-height: 12rem; overflow-y: auto; }
-  .checkbox-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8125rem; cursor: pointer; padding: 0.25rem 0; }
-  .checkbox-item input[type="checkbox"] { accent-color: var(--color-primary); }
-
-  .text-muted { color: var(--color-text-muted); }
-  .small { font-size: 0.75rem; }
   .imported-badge { display: inline-block; padding: 0.0625rem 0.375rem; border-radius: 9999px; font-size: 0.625rem; font-weight: 600; text-transform: uppercase; background: rgba(59, 130, 246, 0.15); color: var(--color-primary); vertical-align: middle; }
   .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
   .invalid { border-color: var(--color-red) !important; }

@@ -550,8 +550,7 @@
   }
 
   .override-section input[type="text"],
-  .override-section input[type="number"],
-  .override-section select {
+  .override-section input[type="number"] {
     width: 100%;
     padding: 0.375rem 0.5rem;
     border: 1px solid var(--color-border);
@@ -561,8 +560,7 @@
     font-size: 0.8125rem;
   }
 
-  .override-section input:focus,
-  .override-section select:focus {
+  .override-section input:focus {
     outline: none;
     border-color: var(--color-primary);
   }
@@ -581,18 +579,6 @@
 
   .override-section textarea:focus { outline: none; border-color: var(--color-primary); }
 
-  .checkbox-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    max-height: 120px;
-    overflow-y: auto;
-    padding: 0.375rem;
-    border: 1px solid var(--color-border);
-    border-radius: 0.25rem;
-    background: var(--color-bg-card);
-  }
-
   .checkbox-item {
     display: flex;
     align-items: center;
@@ -603,8 +589,6 @@
 
   .checkbox-item input[type="checkbox"] { accent-color: var(--color-primary); }
 
-  .text-muted { color: var(--color-text-muted); }
-  .small { font-size: 0.8125rem; }
   .hint { font-weight: 400; color: var(--color-text-muted); font-size: 0.75rem; }
   .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
   .invalid { border-color: var(--color-red) !important; }

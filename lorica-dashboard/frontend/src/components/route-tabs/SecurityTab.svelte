@@ -465,11 +465,8 @@
      parent feature is off; the label text is still readable. */
   .form-group input[type="checkbox"]:disabled + span { color: var(--color-text-muted); }
 
-  .checkbox-list { display: flex; flex-direction: column; gap: 0.25rem; max-height: 10rem; overflow-y: auto; }
   .checkbox-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8125rem; cursor: pointer; padding: 0.25rem 0; }
   .checkbox-item input[type="checkbox"] { accent-color: var(--color-primary); }
-  .text-muted { color: var(--color-text-muted); }
-  .small { font-size: 0.75rem; }
   code { font-family: ui-monospace, monospace; font-size: 0.75rem; background: var(--color-bg-input); padding: 0.05rem 0.25rem; border-radius: 0.25rem; }
 
   .form-group select,
@@ -515,21 +512,8 @@
   .form-group textarea:focus { outline: none; border-color: var(--color-primary); }
 
   .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-  .form-row-3 { grid-template-columns: 1fr 1fr 1fr; }
 
   .hint { font-weight: 400; color: var(--color-text-muted); font-size: 0.75rem; }
-
-  .mirror-summary {
-    margin-top: 0.5rem;
-    padding: 0.5rem 0.75rem;
-    background: rgba(59, 130, 246, 0.08);
-    border: 1px solid rgba(59, 130, 246, 0.25);
-    border-radius: 4px;
-    font-size: 0.75rem;
-    color: var(--color-text);
-  }
-  .mirror-summary strong { color: var(--color-primary); }
-  .mirror-summary .sep { margin: 0 0.375rem; opacity: 0.5; }
 
   /* Inline action row: small button + trailing result badge, used
      by the Test connection / Validate PEM affordances. Kept low-key

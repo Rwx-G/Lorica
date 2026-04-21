@@ -41,6 +41,7 @@
       serviceNameError = 'service name must not be empty';
     } else if (s.length > 256) {
       serviceNameError = 'service name must be <= 256 characters';
+      // eslint-disable-next-line no-control-regex -- intentional control-char rejection, mirror of the backend validator
     } else if (/[\u0000-\u001f\u007f]/.test(s)) {
       serviceNameError = 'service name must not contain control characters';
     } else {
@@ -210,11 +211,6 @@
     font-size: 0.75rem;
     color: var(--color-text-muted);
     margin-top: 0.25rem;
-  }
-  .form-success {
-    color: var(--color-green);
-    font-size: 0.8125rem;
-    margin: 0.5rem 0;
   }
   .test-connection-row {
     border-top: 1px solid var(--color-border);

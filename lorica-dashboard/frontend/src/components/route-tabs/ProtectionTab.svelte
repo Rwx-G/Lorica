@@ -297,6 +297,10 @@
                operator scrolling Cookie / Captcha mode does not think
                it is missing. -->
           <div class="form-group ghost-hint" aria-hidden="true">
+            <!-- Cosmetic label for a mode-gated control that is not
+                 rendered here ; parent is aria-hidden so the label
+                 is skipped by assistive tech. -->
+            <!-- svelte-ignore a11y_label_has_associated_control -->
             <label>PoW difficulty</label>
             <span class="hint">Available after selecting JavaScript mode above.</span>
           </div>
@@ -311,6 +315,10 @@
           </div>
         {:else}
           <div class="form-group ghost-hint" aria-hidden="true">
+            <!-- Cosmetic label for a mode-gated control that is not
+                 rendered here ; parent is aria-hidden so the label
+                 is skipped by assistive tech. -->
+            <!-- svelte-ignore a11y_label_has_associated_control -->
             <label>Captcha alphabet</label>
             <span class="hint">Available after selecting Captcha mode above.</span>
           </div>
