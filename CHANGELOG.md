@@ -11,6 +11,10 @@ Author: Rwx-G
 
 ## [1.5.0] - 2026-04-21
 
+### Changed
+
+- Test reliability + ACME coverage tightening (v1.5.0 backlog items #16 + #9). The `verdict_cache_*` tests in `lorica::bot` mutate process-global state (`VERDICT_CACHE: Lazy<DashMap>` + `VERDICT_CACHE_ORDER: Lazy<Mutex<VecDeque>>`) and used to race under `cargo test`'s parallel scheduler; `verdict_cache_fifo_evicts_oldest_when_full` was the first to surface a flake. Added `serial_test = "3"` as a dev-dependency and annotated the three cache-mutating tests with `#[serial(verdict_cache)]` so cargo test runs them sequentially without having to drop the whole process to `--test-threads=1`. ACME unit coverage expanded from 28 → 43 tests: `is_valid_dns_server` (the shell-injection filter on the `@server` argument passed to `dig`) gets 8 tests covering IPv4, IPv6-with-brackets, hostname accept paths + empty / too-long / shell-metacharacter / whitespace / quote-and-slash reject paths, and the renewal filter logic is extracted behind a pure `should_auto_renew` predicate with 7 tests covering non-ACME rejection, opt-out rejection, `dns01-manual` skip, inside-window acceptance for http01 + dns01-cloudflare, exactly-at-threshold edge, outside-window rejection, and the already-expired case.
+
 ### Security
 
 - WebSocket log-stream backpressure with drop metric (v1.5.0 audit finding LOW-12). A slow consumer on `GET /api/v1/logs/ws` used to silently drop messages on the inner `broadcast::Receiver` (`RecvError::Lagged(n)`) with only a `debug!` log. The handler now counts every dropped entry against a new Prometheus counter `lorica_logs_ws_dropped_total{reason="slow_client"}`, raises the log level to `warn!` with the running per-connection total, and terminates the connection with a WebSocket close code 1008 (Policy Violation) + reason text `"log stream too slow"` once the cumulative drops exceed 1000 — protecting Lorica from stuck-client backpressure amplification. Threshold is deliberately high so a brief network hiccup does not evict a live operator session ; a genuinely stuck client racks up drops fast enough to hit the cap within seconds.
