@@ -99,6 +99,12 @@ tracing-opentelemetry = { version = "0.32", optional = true, default-features = 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+# Serial-test barrier for the global VERDICT_CACHE state in
+# `lorica::bot` (v1.5.0 backlog #16). The three tests that mutate
+# the process-wide `DashMap` + `Mutex<VecDeque>` carry
+# `#[serial(verdict_cache)]` so cargo test's parallel scheduler
+# does not interleave them and produce a FIFO-ordering flake.
+serial_test = "3"
 async-trait = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }

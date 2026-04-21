@@ -933,6 +933,7 @@ pub fn extract_verdict_cookie(cookie_header: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use lorica_config::models::{BotBypassRules, BotProtectionConfig, BotProtectionMode};
+    use serial_test::serial;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn cfg() -> BotProtectionConfig {
@@ -1413,6 +1414,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(verdict_cache)]
     fn verdict_cache_hit_skips_hmac_verify() {
         cache_reset_for_test();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
@@ -1494,6 +1496,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(verdict_cache)]
     fn verdict_cache_expired_entry_is_miss() {
         cache_reset_for_test();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
@@ -1523,6 +1526,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(verdict_cache)]
     fn verdict_cache_fifo_evicts_oldest_when_full() {
         cache_reset_for_test();
         // Insert one more than the cap; the first entry must be
