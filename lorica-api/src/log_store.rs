@@ -497,6 +497,36 @@ impl LogStore {
         Ok(events)
     }
 
+    /// Summarise WAF events via SQL aggregation : total count and
+    /// per-category counts (sorted high-to-low). Used by
+    /// `/api/v1/waf/stats` so the stats are accurate regardless
+    /// of table size. The previous implementation loaded up to
+    /// 10 000 rows into memory to `.len()` them, which capped
+    /// the dashboard counter at 10 000 once the retention window
+    /// (100 000 rows) was in use.
+    pub fn waf_event_stats(&self) -> Result<(u64, Vec<(String, u64)>), String> {
+        let conn = self.conn.lock();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM waf_events", [], |row| row.get(0))
+            .map_err(|e| format!("failed to count WAF events: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT category, COUNT(*) FROM waf_events
+                 GROUP BY category ORDER BY 2 DESC",
+            )
+            .map_err(|e| format!("failed to prepare WAF stats query: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(|e| format!("failed to query WAF stats: {e}"))?;
+        let mut by_category = Vec::new();
+        for r in rows {
+            by_category.push(r.map_err(|e| format!("failed to read WAF stats row: {e}"))?);
+        }
+        Ok((total as u64, by_category))
+    }
+
     /// Clear all WAF events.
     /// Remove every persisted WAF event row.
     pub fn clear_waf_events(&self) -> Result<(), String> {
@@ -636,5 +666,86 @@ fn copy_to_sql(val: &dyn rusqlite::types::ToSql) -> Box<dyn rusqlite::types::ToS
         }
         ToSqlOutput::Borrowed(rusqlite::types::ValueRef::Integer(i)) => Box::new(i),
         _ => Box::new(String::new()),
+    }
+}
+
+#[cfg(test)]
+mod waf_stats_tests {
+    use super::*;
+
+    fn tmp_store() -> (LogStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LogStore::open(dir.path()).expect("open store");
+        (store, dir)
+    }
+
+    fn mk_event(rule_id: u32, category: lorica_waf::RuleCategory) -> lorica_waf::WafEvent {
+        lorica_waf::WafEvent {
+            rule_id,
+            description: "test".into(),
+            category,
+            severity: 1,
+            matched_field: "uri".into(),
+            matched_value: "x".into(),
+            timestamp: "2026-04-21T12:00:00Z".into(),
+            client_ip: "127.0.0.1".into(),
+            route_hostname: "example.com".into(),
+            action: "block".into(),
+        }
+    }
+
+    /// The v1.5.1 fix : `waf_event_stats` must return the real
+    /// table size (via `COUNT(*)`), not the length of a
+    /// load-and-count page. Insert more rows than the old 10 000
+    /// cap and confirm the counter does not plateau.
+    #[test]
+    fn waf_event_stats_is_not_capped_at_ten_thousand() {
+        let (store, _dir) = tmp_store();
+        let n = 10_050u32;
+        for i in 0..n {
+            let cat = if i % 3 == 0 {
+                lorica_waf::RuleCategory::Xss
+            } else if i % 3 == 1 {
+                lorica_waf::RuleCategory::SqlInjection
+            } else {
+                lorica_waf::RuleCategory::PathTraversal
+            };
+            store.insert_waf_event(&mk_event(i, cat)).expect("insert");
+        }
+        let (total, by_cat) = store.waf_event_stats().expect("stats");
+        assert_eq!(total, n as u64, "total must reflect the full table");
+        let sum: u64 = by_cat.iter().map(|(_, c)| c).sum();
+        assert_eq!(sum, n as u64, "per-category counts must sum to total");
+        // Ordering is high-to-low.
+        for pair in by_cat.windows(2) {
+            assert!(pair[0].1 >= pair[1].1);
+        }
+    }
+
+    #[test]
+    fn waf_event_stats_groups_by_category() {
+        let (store, _dir) = tmp_store();
+        for _ in 0..3 {
+            store
+                .insert_waf_event(&mk_event(1, lorica_waf::RuleCategory::Xss))
+                .expect("insert");
+        }
+        store
+            .insert_waf_event(&mk_event(2, lorica_waf::RuleCategory::SqlInjection))
+            .expect("insert");
+        let (total, by_cat) = store.waf_event_stats().expect("stats");
+        assert_eq!(total, 4);
+        assert_eq!(by_cat.len(), 2);
+        // XSS first (3 > 1).
+        assert_eq!(by_cat[0].1, 3);
+        assert_eq!(by_cat[1].1, 1);
+    }
+
+    #[test]
+    fn waf_event_stats_on_empty_table() {
+        let (store, _dir) = tmp_store();
+        let (total, by_cat) = store.waf_event_stats().expect("stats");
+        assert_eq!(total, 0);
+        assert!(by_cat.is_empty());
     }
 }
