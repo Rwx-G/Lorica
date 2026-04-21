@@ -201,6 +201,7 @@
         reapplyOk = false;
       } else {
         const parts: string[] = [`${res.data.exported} exported`];
+        if (res.data.skipped > 0) parts.push(`${res.data.skipped} skipped (no ACL)`);
         if (res.data.failed > 0) parts.push(`${res.data.failed} failed`);
         reapplyMsg = parts.join(', ');
         reapplyOk = res.data.failed === 0;
@@ -376,6 +377,8 @@
         </button>
       </div>
 
+      <hr class="section-separator" />
+
       <h3>Access control (per-pattern ACL)</h3>
       <p class="section-hint">
         ACLs narrow which hostnames are exported and under which
@@ -483,29 +486,32 @@
         </table>
       {/if}
 
+      <hr class="section-separator" />
+
       <h3>Operator actions</h3>
       <div class="settings-form-row reapply-row">
         <div class="reapply-inner">
+          {#if reapplyMsg}
+            <span class="test-msg {reapplyOk ? 'test-ok' : 'test-err'}" role="status">
+              {reapplyMsg}
+            </span>
+          {/if}
           <button
             type="button"
             class="btn btn-secondary"
             onclick={reapply}
             disabled={reapplying}
           >
-            {reapplying ? 'Re-exporting...' : 'Re-export all certificates now'}
+            {reapplying ? 'Re-exporting...' : 'Re-export matching certificates now'}
           </button>
-          {#if reapplyMsg}
-            <span class="test-msg {reapplyOk ? 'test-ok' : 'test-err'}" role="status">
-              {reapplyMsg}
-            </span>
-          {/if}
         </div>
         <span class="hint">
-          Forces a full re-export of every certificate on disk.
-          Useful after changing ACLs or default file modes, when
-          you do not want to wait for the next ACME renewal to
-          realign on-disk files. Honours the currently-persisted
-          settings - save first if you just changed them.
+          Forces a re-export of every certificate whose hostname
+          matches a configured ACL pattern. Useful after changing
+          ACLs or default file modes, when you do not want to wait
+          for the next ACME renewal to realign on-disk files.
+          Honours the currently-persisted settings - save first if
+          you just changed them.
         </span>
       </div>
 
@@ -629,9 +635,11 @@
     gap: 0.75rem 1rem;
     margin-bottom: 1rem;
   }
+  /* No border-top here : the `Access control` h3 + its hint
+     already open the section. A separator between the hint and
+     the add form would mis-read as "new section" inside what is
+     one coherent ACL block (add form + list). */
   .acl-add-form {
-    border-top: 1px solid var(--color-border);
-    padding-top: 0.75rem;
     margin-top: 0.5rem;
   }
   .acl-add-grid {
@@ -672,19 +680,52 @@
     color: var(--color-text-muted);
     margin: 0.75rem 0 0;
   }
-  .reapply-row {
-    border-top: 1px solid var(--color-border);
-    padding-top: var(--space-4);
-    margin-top: var(--space-4);
+  /* Plain h3 typography. Cross-section separators are explicit
+     `<hr class="section-separator">` elements below, placed only
+     where a category boundary exists (after `Save Export
+     Settings` and at the end of the ACL block). Permissions is
+     a sub-section of the main export config, so no separator
+     above its h3. */
+  h3 {
+    margin: var(--space-4) 0 var(--space-2);
+    font-size: var(--text-md);
+    color: var(--color-text-heading);
   }
-  .orphans-actions {
+  /* Separator between two full sub-sections. Deliberately
+     distinct from the ACL / orphan table bottom borders that
+     share the same `--color-border` : extra vertical breathing
+     room above AND below so the reader does not read the hr as
+     "last row of the table". */
+  .section-separator {
+    border: 0;
+    border-top: 1px solid var(--color-border-strong, var(--color-text-muted));
+    margin: var(--space-6) 0 var(--space-4);
+  }
+  /* The h3 above now carries the section separator, so this row
+     only needs internal spacing for the inner flex. */
+  .reapply-row {
     margin-top: 0.5rem;
   }
+  /* Right-align the action row so the button matches the
+     `Save Export Settings` position (both read as per-section
+     primary actions). Status msg sits to the left of the button
+     so the reading order is "result, action" - natural after a
+     click where the operator glances back to confirm the
+     outcome. */
   .reapply-inner {
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 0.75rem;
     margin-bottom: 0.25rem;
+  }
+  /* Right-align the rescan button so it reads as a deliberate
+     action row, matching the `settings-dialog-actions` pattern
+     used for `Save Export Settings` above. */
+  .orphans-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 0.75rem;
   }
   .test-msg {
     font-size: 0.8125rem;

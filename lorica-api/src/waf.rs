@@ -41,7 +41,7 @@ struct WafEventsResponse {
 
 #[derive(Debug, Serialize)]
 struct WafStatsResponse {
-    total_events: usize,
+    total_events: u64,
     rule_count: usize,
     by_category: Vec<CategoryCount>,
 }
@@ -49,7 +49,7 @@ struct WafStatsResponse {
 #[derive(Debug, Serialize)]
 struct CategoryCount {
     category: String,
-    count: usize,
+    count: u64,
 }
 
 /// GET /api/v1/waf/events - list recent WAF events
@@ -91,7 +91,14 @@ pub async fn get_waf_events(
     }))
 }
 
-/// GET /api/v1/waf/stats - WAF statistics summary
+/// GET /api/v1/waf/stats - WAF statistics summary.
+///
+/// Aggregated at the SQL level via `COUNT(*)` + `GROUP BY category`
+/// so the dashboard counter reflects the actual table size (up to
+/// the configured `enforce_waf_retention` budget). The previous
+/// implementation loaded up to 10 000 rows into memory and returned
+/// `events.len()`, capping the counter at 10 000 once the retention
+/// window exceeded that.
 pub async fn get_waf_stats(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -99,32 +106,24 @@ pub async fn get_waf_stats(
 
     // Read from persistent store if available, fall back to in-memory buffer
     let (total_events, by_category) = if let Some(ref store) = state.log_store {
-        match store.list_waf_events(10000, None) {
-            Ok(events) => {
-                let total = events.len();
-                let mut counts = std::collections::HashMap::new();
-                for event in &events {
-                    *counts
-                        .entry(event.category.as_str().to_string())
-                        .or_insert(0usize) += 1;
-                }
-                let mut by_cat: Vec<CategoryCount> = counts
+        match store.waf_event_stats() {
+            Ok((total, cats)) => {
+                let by_cat = cats
                     .into_iter()
                     .map(|(category, count)| CategoryCount { category, count })
                     .collect();
-                by_cat.sort_by_key(|c| std::cmp::Reverse(c.count));
                 (total, by_cat)
             }
-            Err(_) => (0, vec![]),
+            Err(_) => (0u64, vec![]),
         }
     } else if let Some(ref waf_buffer) = state.waf_event_buffer {
         let buf = waf_buffer.lock();
-        let total = buf.len();
+        let total = buf.len() as u64;
         let mut counts = std::collections::HashMap::new();
         for event in buf.iter() {
             *counts
                 .entry(event.category.as_str().to_string())
-                .or_insert(0usize) += 1;
+                .or_insert(0u64) += 1;
         }
         let mut by_cat: Vec<CategoryCount> = counts
             .into_iter()
@@ -133,7 +132,7 @@ pub async fn get_waf_stats(
         by_cat.sort_by_key(|c| std::cmp::Reverse(c.count));
         (total, by_cat)
     } else {
-        (0, vec![])
+        (0u64, vec![])
     };
 
     Ok(json_data(WafStatsResponse {

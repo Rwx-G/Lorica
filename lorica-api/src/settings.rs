@@ -650,6 +650,13 @@ pub async fn test_notification(
 }
 
 /// GET /api/v1/notifications/history - return the recent notification dispatch history.
+///
+/// `events` is a page (most recent 200 rows) ; `total` is the
+/// real row count from a `SELECT COUNT(*)` so it is not capped
+/// at the page size. Same class of fix as `get_waf_stats` - the
+/// previous implementation returned `events.len()` as the total
+/// and would have silently plateaued at 200 once the history
+/// table filled up.
 pub async fn notification_history(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -658,13 +665,16 @@ pub async fn notification_history(
         let events = log_store
             .list_notification_history(200)
             .map_err(ApiError::Internal)?;
-        let total = events.len();
+        let total = log_store
+            .notification_history_count()
+            .map_err(ApiError::Internal)?;
         return Ok(json_data(serde_json::json!({
             "events": events,
             "total": total,
         })));
     }
-    // Fallback to in-memory history
+    // Fallback to in-memory history. The in-memory ring buffer
+    // is bounded so `events.len()` IS the real total here.
     let events = if let Some(ref history) = state.notification_history {
         let h = history.lock();
         h.iter().rev().cloned().collect::<Vec<_>>()

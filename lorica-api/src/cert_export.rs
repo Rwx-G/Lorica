@@ -42,7 +42,7 @@ use nix::unistd::{chown, Gid, Uid};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-/// Outcome of a single export attempt. All three arms are non-fatal;
+/// Outcome of a single export attempt. All arms are non-fatal;
 /// the caller logs and moves on.
 #[derive(Debug)]
 pub enum ExportOutcome {
@@ -56,6 +56,13 @@ pub enum ExportOutcome {
     /// in the log; the file is still on disk with the process
     /// default permissions.
     PermissionsSkipped,
+    /// No ACL pattern matches this cert's hostname. The dashboard
+    /// documents ACLs as the allowlist ("If no pattern matches, the
+    /// cert is not exported"), so an empty-or-non-matching ACL set
+    /// means "skip this cert". Distinct from `Disabled` so the
+    /// caller can log it as an intentional per-cert skip rather
+    /// than a global no-op.
+    NoAclMatch,
 }
 
 /// Errors the exporter surfaces to the caller. `DiskFull` is the only
@@ -219,25 +226,33 @@ pub fn export_certificate(
         sanitize_hostname(&cert.domain).unwrap_or_else(|| format!("cert-{}", cert.id));
     let host_dir = root.join(&subdir_name);
 
-    // Resolve per-pattern ACL for this hostname. Each `None` side on
-    // the matched ACL inherits the global default, so an operator can
-    // override just the group without touching the owner.
-    let matched = resolve_cert_export_acl(acls, &cert.domain);
-    let effective_uid = matched
-        .and_then(|a| a.allowed_uid)
-        .or(settings.cert_export_owner_uid);
-    let effective_gid = matched
-        .and_then(|a| a.allowed_gid)
-        .or(settings.cert_export_group_gid);
-    if let Some(a) = matched {
+    // ACLs are the allowlist (UI text : "If no pattern matches, the
+    // cert is not exported. [...] Patterns accept `*` (all), ..."),
+    // so a cert whose hostname does not match any configured pattern
+    // is skipped rather than exported under global defaults. An
+    // operator who wants "export everything" declares a `*` pattern
+    // explicitly - that is the documented way to opt in to the
+    // blanket behavior.
+    let Some(matched) = resolve_cert_export_acl(acls, &cert.domain) else {
         tracing::debug!(
             hostname = %cert.domain,
-            pattern = %a.hostname_pattern,
-            uid = ?effective_uid,
-            gid = ?effective_gid,
-            "cert export: ACL matched"
+            acl_count = acls.len(),
+            "cert export: no ACL pattern matches, skipping"
         );
-    }
+        return Ok(ExportOutcome::NoAclMatch);
+    };
+    // Matched ACL : pick its uid / gid overrides, falling back to
+    // the global default on `None`. Lets an operator override just
+    // the group without touching the owner.
+    let effective_uid = matched.allowed_uid.or(settings.cert_export_owner_uid);
+    let effective_gid = matched.allowed_gid.or(settings.cert_export_group_gid);
+    tracing::debug!(
+        hostname = %cert.domain,
+        pattern = %matched.hostname_pattern,
+        uid = ?effective_uid,
+        gid = ?effective_gid,
+        "cert export: ACL matched"
+    );
 
     // Ensure both the root and the per-host directory exist with the
     // configured dir mode. `create_dir_all` is idempotent.
@@ -364,6 +379,13 @@ pub fn export_from_store(store: &lorica_config::ConfigStore, cert: &Certificate)
             tracing::info!(cert_id = %cert.id, domain = %cert.domain, "cert export: ok");
         }
         Ok(ExportOutcome::Disabled) => {}
+        Ok(ExportOutcome::NoAclMatch) => {
+            tracing::info!(
+                cert_id = %cert.id,
+                domain = %cert.domain,
+                "cert export: skipped (no ACL pattern matches the hostname)"
+            );
+        }
         Ok(ExportOutcome::PermissionsSkipped) => {
             tracing::warn!(
                 cert_id = %cert.id,
@@ -653,9 +675,9 @@ pub async fn reexport_all(
     settings: &GlobalSettings,
     acls: &[CertExportAcl],
     certs: &[Certificate],
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
     if !settings.cert_export_enabled {
-        return (0, 0);
+        return (0, 0, 0);
     }
     let settings = settings.clone();
     let acls = acls.to_vec();
@@ -663,17 +685,19 @@ pub async fn reexport_all(
     let result = tokio::task::spawn_blocking(move || {
         let mut ok = 0usize;
         let mut err = 0usize;
+        let mut skipped = 0usize;
         for cert in &certs {
             match export_certificate(&settings, &acls, cert) {
                 Ok(ExportOutcome::Ok) | Ok(ExportOutcome::PermissionsSkipped) => ok += 1,
                 Ok(ExportOutcome::Disabled) => {}
+                Ok(ExportOutcome::NoAclMatch) => skipped += 1,
                 Err(e) => {
                     err += 1;
                     tracing::warn!(cert_id = %cert.id, domain = %cert.domain, error = %e, "cert export failed on startup");
                 }
             }
         }
-        (ok, err)
+        (ok, err, skipped)
     })
     .await
     .unwrap_or_else(|e| {
@@ -681,11 +705,12 @@ pub async fn reexport_all(
         // it as a zero-export run so the caller's status JSON stays
         // shape-stable.
         tracing::error!(error = %e, "cert export: re-export task panicked");
-        (0, 0)
+        (0, 0, 0)
     });
     tracing::info!(
         exported = result.0,
         failed = result.1,
+        skipped_no_acl = result.2,
         "cert export: startup re-export complete"
     );
     result
@@ -794,9 +819,12 @@ mod tests {
             cert_export_dir: Some(tmp.path().to_string_lossy().into_owned()),
             ..GlobalSettings::default()
         };
+        // Catchall ACL so the export is not skipped by the
+        // no-ACL-match filter (v1.5.1 fix).
+        let acls = vec![catchall_acl("acl-all")];
         let pem = "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nchain\n-----END CERTIFICATE-----\n";
         let cert = dummy_cert("grafana.mibu.fr", pem, "privkey-bytes");
-        let outcome = export_certificate(&settings, &[], &cert).expect("test setup");
+        let outcome = export_certificate(&settings, &acls, &cert).expect("test setup");
         // Either Ok or PermissionsSkipped depending on test user capabilities.
         assert!(matches!(
             outcome,
@@ -858,13 +886,110 @@ mod tests {
             cert_export_dir: Some(tmp.path().to_string_lossy().into_owned()),
             ..GlobalSettings::default()
         };
+        // Catchall ACL so the no-ACL-match skip does not short
+        // circuit before we reach the sanitise-hostname fallback
+        // path we want to exercise here.
+        let acls = vec![catchall_acl("acl-all")];
         let cert = dummy_cert(
             "*.example.com",
             "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n",
             "key",
         );
-        let _ = export_certificate(&settings, &[], &cert).expect("test setup");
+        let _ = export_certificate(&settings, &acls, &cert).expect("test setup");
         assert!(tmp.path().join("cert-dummy-id").exists());
+    }
+
+    fn catchall_acl(id: &str) -> CertExportAcl {
+        CertExportAcl {
+            id: id.into(),
+            hostname_pattern: "*".into(),
+            allowed_uid: None,
+            allowed_gid: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// v1.5.1 regression pin : when the ACL table has entries but
+    /// none of them matches the cert's hostname, the exporter must
+    /// skip the cert rather than falling back to the global
+    /// defaults. Before the fix, the exporter treated "no ACL
+    /// match" as "use global uid/gid" and wrote every cert to disk
+    /// regardless of the operator's allowlist.
+    #[test]
+    fn export_skipped_when_no_acl_pattern_matches() {
+        let tmp = tempfile::tempdir().expect("test setup");
+        let settings = GlobalSettings {
+            cert_export_enabled: true,
+            cert_export_dir: Some(tmp.path().to_string_lossy().into_owned()),
+            ..GlobalSettings::default()
+        };
+        // Narrow allowlist : only `*.mail.example.org` is exportable.
+        let acls = vec![CertExportAcl {
+            id: "acl-mail".into(),
+            hostname_pattern: "*.mail.example.org".into(),
+            allowed_uid: None,
+            allowed_gid: None,
+            created_at: Utc::now(),
+        }];
+        let pem = "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n";
+        // Hostname does NOT match any configured pattern.
+        let cert = dummy_cert("analytics.example.com", pem, "k");
+        let outcome = export_certificate(&settings, &acls, &cert).expect("test setup");
+        assert!(matches!(outcome, ExportOutcome::NoAclMatch));
+        // No subdirectory, no files written.
+        assert!(!tmp.path().join("analytics.example.com").exists());
+    }
+
+    /// Empty ACL table means "no pattern matches anything", so
+    /// every cert is skipped. The dashboard UI documents this
+    /// explicitly (`Without at least one pattern, no certificate
+    /// is exported`).
+    #[test]
+    fn export_skipped_when_acls_empty() {
+        let tmp = tempfile::tempdir().expect("test setup");
+        let settings = GlobalSettings {
+            cert_export_enabled: true,
+            cert_export_dir: Some(tmp.path().to_string_lossy().into_owned()),
+            ..GlobalSettings::default()
+        };
+        let cert = dummy_cert("whatever.example.com", "PEM", "k");
+        let outcome = export_certificate(&settings, &[], &cert).expect("test setup");
+        assert!(matches!(outcome, ExportOutcome::NoAclMatch));
+        assert!(!tmp.path().join("whatever.example.com").exists());
+    }
+
+    /// `reexport_all` counts the three arms independently so the
+    /// operator sees `N exported, M skipped, 0 failed` in the
+    /// dashboard. Regression pin for the UI message that relies
+    /// on the shape.
+    #[tokio::test]
+    async fn reexport_all_counts_skipped_certs() {
+        let tmp = tempfile::tempdir().expect("test setup");
+        let settings = GlobalSettings {
+            cert_export_enabled: true,
+            cert_export_dir: Some(tmp.path().to_string_lossy().into_owned()),
+            ..GlobalSettings::default()
+        };
+        let acls = vec![CertExportAcl {
+            id: "acl-mail".into(),
+            hostname_pattern: "*.mail.example.org".into(),
+            allowed_uid: None,
+            allowed_gid: None,
+            created_at: Utc::now(),
+        }];
+        let pem = "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n";
+        let certs = vec![
+            dummy_cert("alpha.mail.example.org", pem, "k"),
+            dummy_cert("beta.mail.example.org", pem, "k"),
+            dummy_cert("outside.example.com", pem, "k"),
+        ];
+        let (ok, err, skipped) = reexport_all(&settings, &acls, &certs).await;
+        // The two matching certs pass (or PermissionsSkipped on
+        // hosts without CAP_CHOWN - both counted as `ok`), the
+        // outside.example.com cert is skipped by the ACL filter.
+        assert_eq!(ok, 2, "two matching certs must count as exported");
+        assert_eq!(skipped, 1, "one non-matching cert must count as skipped");
+        assert_eq!(err, 0);
     }
 
     fn cert_with_id(id: &str, domain: &str) -> Certificate {

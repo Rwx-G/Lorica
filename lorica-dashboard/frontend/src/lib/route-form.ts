@@ -322,6 +322,62 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   // timeouts split: path rewrite -> transform, everything else -> upstream.
 };
 
+/**
+ * Extract a field name from a backend 400 error message and map it to
+ * the tab that owns the field, so the route drawer can auto-switch +
+ * focus the offending input when the server rejects a save the
+ * client-side validator let through.
+ *
+ * Backend messages consistently start with the field name, in one of
+ * these shapes :
+ *   - `"max_connections must be in 0..=1000000"`          -> flat
+ *   - `"bot_protection.cookie_ttl_s must be > 0"`        -> dotted
+ *   - `"path_rules[3].redirect_to must be a valid URL"`  -> indexed
+ *   - `"rate_limit.capacity must be > 0 ..."`            -> dotted
+ *
+ * The first token is extracted ; if it contains a `[i]` or `.`, we
+ * also try its root ("path_rules", "bot_protection", ...) which maps
+ * to a tab via a small explicit prefix table covering the nested
+ * route-config shapes that are not individual form fields.
+ *
+ * Returns `null` when no match — callers stay on the current tab.
+ */
+export function inferTabFromBackendError(message: string): string | null {
+  const match = message.trim().match(/^([A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?(?:\.[A-Za-z_][A-Za-z0-9_]*)*)/);
+  if (!match) return null;
+  const raw = match[1];
+
+  // Try the most-specific name first, then walk down the prefix tree
+  // so `path_rules[3].redirect_to` falls back to `path_rules[3]`, then
+  // `path_rules`, then `path` etc. TAB_FIELDS only carries flat
+  // form-state keys so we strip brackets + trailing `.x` to compare.
+  const flat = raw.replace(/\[\d+\]/g, '').split('.')[0];
+  for (const [tab, fields] of Object.entries(TAB_FIELDS)) {
+    if ((fields as string[]).includes(flat)) return tab;
+  }
+
+  // Fallback : nested config shapes that don't map 1:1 onto form
+  // state but always live in the same tab. Ordered most-specific
+  // prefix first so `bot_protection.pow_difficulty` matches
+  // `bot_protection` before falling through to the default branch.
+  const prefixToTab: Array<[string, string]> = [
+    ['bot_protection', 'protection'],
+    ['rate_limit', 'protection'],
+    ['geoip', 'protection'],
+    ['forward_auth', 'security'],
+    ['mtls', 'security'],
+    ['mirror', 'routing'],
+    ['response_rewrite', 'transform'],
+    ['path_rules', 'routing'],
+    ['header_rules', 'routing'],
+    ['traffic_splits', 'routing'],
+  ];
+  for (const [prefix, tab] of prefixToTab) {
+    if (flat === prefix || flat.startsWith(`${prefix}_`)) return tab;
+  }
+  return null;
+}
+
 function recordToText(rec: Record<string, string>): string {
   return Object.entries(rec).map(([k, v]) => `${k}=${v}`).join('\n');
 }
@@ -1028,8 +1084,11 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
   if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return r('Read timeout must be between 1 and 3600', 'upstream');
   if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return r('Send timeout must be between 1 and 3600', 'upstream');
   if (form.max_body_mb && Number(form.max_body_mb) <= 0) return r('Max body size must be greater than 0', 'protection');
-  if (form.cache_ttl_s < 1 || form.cache_ttl_s > 31_536_000) return r('Cache TTL must be between 1 and 31536000 (1 year)', 'cache');
-  if (form.cache_max_mb < 1 || form.cache_max_mb > 131_072) return r('Cache max size must be between 1 and 131072 MiB (128 GiB)', 'cache');
+  // Cache TTL / max size : 0 is a valid sentinel (always-
+  // revalidate for TTL, no size cap for max_size). See the
+  // matching backend comment in `validate_route_numeric_bounds`.
+  if (form.cache_ttl_s < 0 || form.cache_ttl_s > 31_536_000) return r('Cache TTL must be between 0 and 31536000 (1 year)', 'cache');
+  if (form.cache_max_mb < 0 || form.cache_max_mb > 131_072) return r('Cache max size must be between 0 and 131072 MiB (128 GiB)', 'cache');
   if (form.stale_while_revalidate_s < 0 || form.stale_while_revalidate_s > 86_400) return r('Stale-while-revalidate must be between 0 and 86400 (1 day)', 'cache');
   if (form.stale_if_error_s < 0 || form.stale_if_error_s > 86_400) return r('Stale-if-error must be between 0 and 86400 (1 day)', 'cache');
   if (form.max_connections) {
@@ -1218,8 +1277,8 @@ export function validateRouteForm(form: RouteFormState): string {
   if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return 'Read timeout must be between 1 and 3600';
   if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return 'Send timeout must be between 1 and 3600';
   if (form.max_body_mb && Number(form.max_body_mb) <= 0) return 'Max body size must be greater than 0';
-  if (form.cache_ttl_s < 1 || form.cache_ttl_s > 31_536_000) return 'Cache TTL must be between 1 and 31536000 (1 year)';
-  if (form.cache_max_mb < 1 || form.cache_max_mb > 131_072) return 'Cache max size must be between 1 and 131072 MiB (128 GiB)';
+  if (form.cache_ttl_s < 0 || form.cache_ttl_s > 31_536_000) return 'Cache TTL must be between 0 and 31536000 (1 year)';
+  if (form.cache_max_mb < 0 || form.cache_max_mb > 131_072) return 'Cache max size must be between 0 and 131072 MiB (128 GiB)';
   if (form.stale_while_revalidate_s < 0 || form.stale_while_revalidate_s > 86_400) return 'Stale-while-revalidate must be between 0 and 86400 (1 day)';
   if (form.stale_if_error_s < 0 || form.stale_if_error_s > 86_400) return 'Stale-if-error must be between 0 and 86400 (1 day)';
   if (form.max_connections) {

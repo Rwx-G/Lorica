@@ -27,8 +27,8 @@
   let staleRevalError = $state<string | null>(null);
   let staleErrorError = $state<string | null>(null);
   let varyError = $state<string | null>(null);
-  function checkTtl() { ttlError = numErr(form.cache_ttl_s, 1, 31_536_000, 'value'); }
-  function checkMaxMb() { maxMbError = numErr(form.cache_max_mb, 1, 131_072, 'value'); }
+  function checkTtl() { ttlError = numErr(form.cache_ttl_s, 0, 31_536_000, 'value'); }
+  function checkMaxMb() { maxMbError = numErr(form.cache_max_mb, 0, 131_072, 'value'); }
   function checkStaleReval() { staleRevalError = numErr(form.stale_while_revalidate_s, 0, 86_400, 'value'); }
   function checkStaleError() { staleErrorError = numErr(form.stale_if_error_s, 0, 86_400, 'value'); }
   function checkVary() { varyError = validateHttpHeaderNameList(form.cache_vary_headers); }
@@ -97,7 +97,7 @@
             <FieldHelpButton fieldLabel="Cache TTL" onhelp={() => { activeHelp = 'cache_ttl_s'; }} />
           </label>
           {#if isImported('cache_ttl_s')}<span class="imported-badge">imported</span>{/if}
-          <input id="cache-ttl" type="number" min="1" max="31536000" bind:value={form.cache_ttl_s} placeholder="300" onblur={checkTtl} oninput={checkTtl} />
+          <input id="cache-ttl" type="number" min="0" max="31536000" bind:value={form.cache_ttl_s} placeholder="300" onblur={checkTtl} oninput={checkTtl} />
           {#if ttlError}<span class="field-error" role="alert">{ttlError}</span>{/if}
           <span class="hint">How long a response stays fresh before re-fetching.</span>
         </div>
@@ -107,7 +107,7 @@
             <FieldHelpButton fieldLabel="Cache max size" onhelp={() => { activeHelp = 'cache_max_mb'; }} />
           </label>
           {#if isImported('cache_max_mb')}<span class="imported-badge">imported</span>{/if}
-          <input id="cache-max-mb" type="number" min="1" max="131072" bind:value={form.cache_max_mb} placeholder="50" onblur={checkMaxMb} oninput={checkMaxMb} />
+          <input id="cache-max-mb" type="number" min="0" max="131072" bind:value={form.cache_max_mb} placeholder="50" onblur={checkMaxMb} oninput={checkMaxMb} />
           {#if maxMbError}<span class="field-error" role="alert">{maxMbError}</span>{/if}
           <span class="hint">Hard cap on total cache footprint for this route.</span>
         </div>
@@ -244,7 +244,12 @@
     <p>
       Typical values: 60 s for hot data you can tolerate being a
       minute stale, 3600 s for daily reports, 86400 s for fully
-      static content.
+      static content. Setting <code>0</code> caches the entry but
+      marks it already expired on every request, forcing
+      revalidation — equivalent to the backend sending
+      <code>Cache-Control: max-age=0</code>, useful paired with
+      stale-while-revalidate so the stale copy is served while
+      the revalidation happens in the background.
     </p>
   </HelpModal>
 {:else if activeHelp === 'cache_max_mb'}
@@ -259,6 +264,9 @@
       (every request pushes out another useful entry); too large
       means memory pressure. 10-100 MB per route is typical for
       text-heavy responses; 500-1000 MB for asset-heavy routes.
+      Setting <code>0</code> disables the per-entry size cap
+      entirely — the global in-memory LRU still bounds the whole
+      cache, but individual responses of any size are admitted.
     </p>
   </HelpModal>
 {:else if activeHelp === 'stale_while_revalidate_s'}

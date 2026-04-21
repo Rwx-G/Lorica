@@ -8,6 +8,7 @@ import {
   routeToFormState,
   formStateToCreateRequest,
   getModifiedFields,
+  inferTabFromBackendError,
   ROUTE_DEFAULTS,
   type RouteFormState,
 } from './route-form';
@@ -1803,6 +1804,21 @@ describe('validateRouteFormWithTab', () => {
     expect(r.tab).toBeNull();
   });
 
+  it('accepts cache_ttl_s=0 (always-revalidate) and cache_max_mb=0 (no cap)', () => {
+    // v1.5.1 follow-up : 0 is a valid runtime sentinel on both
+    // fields. See the matching backend test
+    // `cache_ttl_and_max_bytes_accept_zero`.
+    const r = validateRouteFormWithTab(base({ cache_ttl_s: 0, cache_max_mb: 0 }));
+    expect(r.message).toBe('');
+    expect(r.tab).toBeNull();
+  });
+
+  it('still rejects cache_ttl_s past the 1-year cap', () => {
+    const r = validateRouteFormWithTab(base({ cache_ttl_s: 40_000_000 }));
+    expect(r.message).toMatch(/Cache TTL/);
+    expect(r.tab).toBe('cache');
+  });
+
   it('attributes timeout errors to the upstream tab', () => {
     const r = validateRouteFormWithTab(base({ connect_timeout_s: 9999 }));
     expect(r.message).toMatch(/Connect timeout/);
@@ -1844,5 +1860,98 @@ describe('validateRouteFormWithTab', () => {
   it('attributes hostname errors to the general tab', () => {
     const r = validateRouteFormWithTab(base({ hostname: '' }));
     expect(r.tab).toBe('general');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// inferTabFromBackendError
+//
+// The route drawer now uses this helper to auto-switch to the offending
+// tab when a server-side 400 lands (the pre-submit validator already
+// handles the client-side case via validateRouteFormWithTab). Coverage
+// spans every backend message shape we documented :
+//   - flat field name: "max_connections must be in 0..=1000000"
+//   - dotted config:   "bot_protection.cookie_ttl_s must be > 0"
+//   - indexed path:    "path_rules[3].redirect_to must ..."
+//   - label-prefixed:  "forward_auth_response_headers[0]: ..."
+// Plus the "no match" fallback so an unknown message keeps the drawer
+// on its current tab instead of jumping arbitrarily.
+// ---------------------------------------------------------------------------
+
+describe('inferTabFromBackendError', () => {
+  it('maps max_connections to protection', () => {
+    expect(inferTabFromBackendError('max_connections must be in 0..=1000000')).toBe('protection');
+  });
+
+  it('maps auto_ban_threshold to protection', () => {
+    expect(inferTabFromBackendError('auto_ban_threshold must be in 0..=10000')).toBe('protection');
+  });
+
+  it('maps return_status to general', () => {
+    expect(inferTabFromBackendError('return_status must be in 100..=599')).toBe('general');
+  });
+
+  it('maps connect_timeout_s to upstream', () => {
+    expect(inferTabFromBackendError('connect_timeout_s must be in 1..=3600')).toBe('upstream');
+  });
+
+  it('maps cache_ttl_s to cache', () => {
+    expect(inferTabFromBackendError('cache_ttl_s must be in 1..=31536000')).toBe('cache');
+  });
+
+  it('maps hostname to general', () => {
+    expect(inferTabFromBackendError('hostname must not be empty')).toBe('general');
+  });
+
+  it('maps dotted bot_protection.* to protection', () => {
+    expect(inferTabFromBackendError('bot_protection.cookie_ttl_s must be > 0')).toBe('protection');
+    expect(inferTabFromBackendError('bot_protection.pow_difficulty must be in 14..=22')).toBe(
+      'protection',
+    );
+  });
+
+  it('maps dotted rate_limit.* to protection', () => {
+    expect(inferTabFromBackendError('rate_limit.capacity must be > 0')).toBe('protection');
+  });
+
+  it('maps dotted mtls.* / forward_auth.* to security', () => {
+    expect(inferTabFromBackendError('mtls.ca_cert_pem must contain at least one CERTIFICATE')).toBe(
+      'security',
+    );
+    expect(inferTabFromBackendError('forward_auth.address must be an absolute URL')).toBe(
+      'security',
+    );
+  });
+
+  it('maps dotted response_rewrite.* to transform', () => {
+    expect(
+      inferTabFromBackendError('response_rewrite.rules must not be empty'),
+    ).toBe('transform');
+  });
+
+  it('maps indexed path_rules[i].x to routing', () => {
+    expect(inferTabFromBackendError('path_rules[3].redirect_to must be a valid URL')).toBe(
+      'routing',
+    );
+    expect(inferTabFromBackendError('path_rules[0].path must start with /')).toBe('routing');
+  });
+
+  it('maps indexed header_rules[i] / traffic_splits[i] to routing', () => {
+    expect(inferTabFromBackendError('header_rules[1].header_name must not be empty')).toBe(
+      'routing',
+    );
+    expect(inferTabFromBackendError('traffic_splits[0]: weight_percent must be 0..=100')).toBe(
+      'routing',
+    );
+  });
+
+  it('returns null when the message has no recognisable field name', () => {
+    expect(inferTabFromBackendError('internal server error')).toBeNull();
+    expect(inferTabFromBackendError('')).toBeNull();
+    expect(inferTabFromBackendError('unknown_new_field_xyz is invalid')).toBeNull();
+  });
+
+  it('trims leading whitespace before parsing', () => {
+    expect(inferTabFromBackendError('   return_status must be in 100..=599')).toBe('general');
   });
 });
