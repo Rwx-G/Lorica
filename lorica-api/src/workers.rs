@@ -28,10 +28,15 @@ use crate::server::AppState;
 /// Per-worker health metrics, updated by the supervisor heartbeat loop.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerStatus {
+    /// Worker index assigned by the supervisor (0..N).
     pub worker_id: u32,
+    /// PID of the worker process.
     pub pid: i32,
+    /// Latency of the last heartbeat round-trip (ms).
     pub last_heartbeat_ms: u64,
+    /// Seconds since the last heartbeat was observed.
     pub last_heartbeat_ago_s: u64,
+    /// `true` when the supervisor still considers this worker live.
     pub healthy: bool,
 }
 

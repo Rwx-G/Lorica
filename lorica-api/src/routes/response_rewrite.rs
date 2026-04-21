@@ -7,10 +7,17 @@ use crate::error::ApiError;
 /// One literal-or-regex find/replace rule applied to response bodies.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ResponseRewriteRuleRequest {
+    /// Literal string or regex source searched against the response
+    /// body.
     pub pattern: String,
+    /// Replacement string (`$N` capture groups allowed when
+    /// `is_regex`).
     pub replacement: String,
+    /// Whether `pattern` compiles as a regex (default literal).
     #[serde(default)]
     pub is_regex: bool,
+    /// Cap on the number of matches replaced per response. `None` =
+    /// unlimited.
     #[serde(default)]
     pub max_replacements: Option<u32>,
 }
@@ -18,10 +25,14 @@ pub struct ResponseRewriteRuleRequest {
 /// Response body rewrite configuration: ordered rules, body size cap, content-type filter.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ResponseRewriteConfigRequest {
+    /// Ordered list of rewrite rules (applied sequentially).
     #[serde(default)]
     pub rules: Vec<ResponseRewriteRuleRequest>,
+    /// Maximum buffered body size (bytes) ; larger responses pass
+    /// through unchanged.
     #[serde(default = "default_rewrite_max_body_bytes")]
     pub max_body_bytes: u32,
+    /// Response Content-Type prefixes that enable rewriting.
     #[serde(default)]
     pub content_type_prefixes: Vec<String>,
 }

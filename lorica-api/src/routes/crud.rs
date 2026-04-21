@@ -2296,157 +2296,289 @@ mod bot_protection_validation_tests {
     }
 }
 
-/// Full JSON view of a route returned by list / get / create / update endpoints.
+/// Full JSON view of a route returned by list / get / create / update
+/// endpoints. Fields mirror `lorica_config::models::Route` one-for-one
+/// unless noted otherwise ; see that type for the full semantics.
 #[derive(Serialize)]
 pub struct RouteResponse {
+    /// Mirror of `Route.id`.
     pub id: String,
+    /// Mirror of `Route.hostname`.
     pub hostname: String,
+    /// Mirror of `Route.path_prefix`.
     pub path_prefix: String,
+    /// IDs of the backends linked via `route_backends`.
     pub backends: Vec<String>,
+    /// Mirror of `Route.certificate_id`.
     pub certificate_id: Option<String>,
+    /// Load-balancing policy (rendered as the lowercase string form).
     pub load_balancing: String,
+    /// Mirror of `Route.waf_enabled`.
     pub waf_enabled: bool,
+    /// WAF mode (rendered as the lowercase string form).
     pub waf_mode: String,
+    /// Mirror of `Route.enabled`.
     pub enabled: bool,
+    /// Mirror of `Route.force_https`.
     pub force_https: bool,
+    /// Mirror of `Route.redirect_hostname`.
     pub redirect_hostname: Option<String>,
+    /// Mirror of `Route.redirect_to`.
     pub redirect_to: Option<String>,
+    /// Mirror of `Route.hostname_aliases`.
     pub hostname_aliases: Vec<String>,
+    /// Mirror of `Route.proxy_headers`.
     pub proxy_headers: HashMap<String, String>,
+    /// Mirror of `Route.response_headers`.
     pub response_headers: HashMap<String, String>,
+    /// Mirror of `Route.security_headers`.
     pub security_headers: String,
+    /// Mirror of `Route.connect_timeout_s`.
     pub connect_timeout_s: i32,
+    /// Mirror of `Route.read_timeout_s`.
     pub read_timeout_s: i32,
+    /// Mirror of `Route.send_timeout_s`.
     pub send_timeout_s: i32,
+    /// Mirror of `Route.strip_path_prefix`.
     pub strip_path_prefix: Option<String>,
+    /// Mirror of `Route.add_path_prefix`.
     pub add_path_prefix: Option<String>,
+    /// Mirror of `Route.path_rewrite_pattern`.
     pub path_rewrite_pattern: Option<String>,
+    /// Mirror of `Route.path_rewrite_replacement`.
     pub path_rewrite_replacement: Option<String>,
+    /// Mirror of `Route.access_log_enabled`.
     pub access_log_enabled: bool,
+    /// Mirror of `Route.proxy_headers_remove`.
     pub proxy_headers_remove: Vec<String>,
+    /// Mirror of `Route.response_headers_remove`.
     pub response_headers_remove: Vec<String>,
+    /// Mirror of `Route.max_request_body_bytes`.
     pub max_request_body_bytes: Option<u64>,
+    /// Mirror of `Route.websocket_enabled`.
     pub websocket_enabled: bool,
+    /// Mirror of `Route.rate_limit_rps`.
     pub rate_limit_rps: Option<u32>,
+    /// Mirror of `Route.rate_limit_burst`.
     pub rate_limit_burst: Option<u32>,
+    /// Mirror of `Route.ip_allowlist`.
     pub ip_allowlist: Vec<String>,
+    /// Mirror of `Route.ip_denylist`.
     pub ip_denylist: Vec<String>,
+    /// Mirror of `Route.cors_allowed_origins`.
     pub cors_allowed_origins: Vec<String>,
+    /// Mirror of `Route.cors_allowed_methods`.
     pub cors_allowed_methods: Vec<String>,
+    /// Mirror of `Route.cors_max_age_s`.
     pub cors_max_age_s: Option<i32>,
+    /// Mirror of `Route.compression_enabled`.
     pub compression_enabled: bool,
+    /// Mirror of `Route.retry_attempts`.
     pub retry_attempts: Option<u32>,
+    /// Mirror of `Route.cache_enabled`.
     pub cache_enabled: bool,
+    /// Mirror of `Route.cache_ttl_s`.
     pub cache_ttl_s: i32,
+    /// Mirror of `Route.cache_max_bytes`.
     pub cache_max_bytes: i64,
+    /// Mirror of `Route.max_connections`.
     pub max_connections: Option<u32>,
+    /// Mirror of `Route.slowloris_threshold_ms`.
     pub slowloris_threshold_ms: i32,
+    /// Mirror of `Route.auto_ban_threshold`.
     pub auto_ban_threshold: Option<u32>,
+    /// Mirror of `Route.auto_ban_duration_s`.
     pub auto_ban_duration_s: i32,
+    /// Per-path overrides evaluated in declaration order.
     pub path_rules: Vec<PathRuleResponse>,
+    /// Mirror of `Route.return_status`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_status: Option<u16>,
+    /// Mirror of `Route.sticky_session`.
     pub sticky_session: bool,
+    /// Basic-auth username (hash stays server-side, never in the
+    /// response).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basic_auth_username: Option<String>,
+    /// Mirror of `Route.stale_while_revalidate_s`.
     pub stale_while_revalidate_s: i32,
+    /// Mirror of `Route.stale_if_error_s`.
     pub stale_if_error_s: i32,
+    /// Mirror of `Route.retry_on_methods`.
     pub retry_on_methods: Vec<String>,
+    /// Mirror of `Route.maintenance_mode`.
     pub maintenance_mode: bool,
+    /// Mirror of `Route.error_page_html`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_page_html: Option<String>,
+    /// Mirror of `Route.cache_vary_headers`.
     pub cache_vary_headers: Vec<String>,
+    /// Header-based routing rules.
     pub header_rules: Vec<HeaderRuleRequest>,
+    /// Canary traffic splits.
     pub traffic_splits: Vec<TrafficSplitRequest>,
+    /// Forward-auth config ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forward_auth: Option<ForwardAuthConfigRequest>,
+    /// Request-mirror config ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mirror: Option<MirrorConfigRequest>,
+    /// Response-body rewrite config ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
+    /// mTLS client-cert gate ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtls: Option<MtlsConfigRequest>,
+    /// Token-bucket rate limit ; `None` = unlimited.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<lorica_config::models::RateLimit>,
+    /// Per-route GeoIP filter ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geoip: Option<lorica_config::models::GeoIpConfig>,
+    /// Per-route bot-protection filter ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
     /// Free-form classification label (prod / staging / homelab / ...).
     /// Empty string = ungrouped. Mirrors `Backend.group_name`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group_name: String,
+    /// RFC 3339 insert timestamp.
     pub created_at: String,
+    /// RFC 3339 last-write timestamp.
     pub updated_at: String,
 }
 
-/// JSON body for `POST /api/v1/routes`. Most fields are optional and fall back to defaults.
+/// JSON body for `POST /api/v1/routes`. Most fields are optional and
+/// fall back to defaults ; semantics mirror
+/// [`lorica_config::models::Route`] field-for-field.
 #[derive(Deserialize)]
 pub struct CreateRouteRequest {
+    /// Hostname served by the new route. Required.
     pub hostname: String,
+    /// URL path prefix ; defaults to `"/"`.
     pub path_prefix: Option<String>,
+    /// IDs of backends to link via `route_backends`. Order matters
+    /// for consistent-hash LB.
     pub backend_ids: Option<Vec<String>>,
+    /// TLS certificate ID ; omit for plaintext-only routes.
     pub certificate_id: Option<String>,
+    /// Load-balancing policy (snake_case name).
     pub load_balancing: Option<String>,
+    /// Enable the WAF filter chain on this route.
     pub waf_enabled: Option<bool>,
+    /// WAF mode : `"detection"` or `"blocking"`.
     pub waf_mode: Option<String>,
+    /// Force redirect to HTTPS on plaintext listeners.
     pub force_https: Option<bool>,
+    /// Canonical host for route-level redirects.
     pub redirect_hostname: Option<String>,
+    /// Full URL to redirect every request to.
     pub redirect_to: Option<String>,
+    /// Extra hostnames the route answers on.
     pub hostname_aliases: Option<Vec<String>>,
+    /// Request headers injected on the way to the upstream.
     pub proxy_headers: Option<HashMap<String, String>>,
+    /// Response headers appended on the way back.
     pub response_headers: Option<HashMap<String, String>>,
+    /// Named security-header preset.
     pub security_headers: Option<String>,
+    /// Upstream connect timeout (s).
     pub connect_timeout_s: Option<i32>,
+    /// Upstream read timeout (s).
     pub read_timeout_s: Option<i32>,
+    /// Upstream send timeout (s).
     pub send_timeout_s: Option<i32>,
+    /// Strip this prefix before forwarding.
     pub strip_path_prefix: Option<String>,
+    /// Prepend this prefix before forwarding.
     pub add_path_prefix: Option<String>,
+    /// Regex pattern for path rewriting.
     pub path_rewrite_pattern: Option<String>,
+    /// Replacement string for regex rewrite.
     pub path_rewrite_replacement: Option<String>,
+    /// Emit an access-log line per request.
     pub access_log_enabled: Option<bool>,
+    /// Request-header names removed before forwarding.
     pub proxy_headers_remove: Option<Vec<String>>,
+    /// Response-header names removed before returning.
     pub response_headers_remove: Option<Vec<String>>,
+    /// Hard cap on request body (bytes).
     pub max_request_body_bytes: Option<u64>,
+    /// Allow `Upgrade: websocket` requests.
     pub websocket_enabled: Option<bool>,
+    /// Per-client RPS rate limit.
     pub rate_limit_rps: Option<u32>,
+    /// Token-bucket burst capacity.
     pub rate_limit_burst: Option<u32>,
+    /// IP allow-list (CIDRs).
     pub ip_allowlist: Option<Vec<String>>,
+    /// IP deny-list (CIDRs).
     pub ip_denylist: Option<Vec<String>>,
+    /// CORS `Access-Control-Allow-Origin` values.
     pub cors_allowed_origins: Option<Vec<String>>,
+    /// CORS `Access-Control-Allow-Methods` values.
     pub cors_allowed_methods: Option<Vec<String>>,
+    /// CORS `Access-Control-Max-Age` (s).
     pub cors_max_age_s: Option<i32>,
+    /// Enable gzip / deflate response compression.
     pub compression_enabled: Option<bool>,
+    /// Idempotent-method retry count.
     pub retry_attempts: Option<u32>,
+    /// Enable in-proxy response cache.
     pub cache_enabled: Option<bool>,
+    /// Default cache TTL (s).
     pub cache_ttl_s: Option<i32>,
+    /// Per-entry cache size cap (bytes).
     pub cache_max_bytes: Option<i64>,
+    /// Hard cap on concurrent connections.
     pub max_connections: Option<u32>,
+    /// Slowloris request-header timeout (ms).
     pub slowloris_threshold_ms: Option<i32>,
+    /// Auto-ban request-count threshold.
     pub auto_ban_threshold: Option<u32>,
+    /// Auto-ban duration (s).
     pub auto_ban_duration_s: Option<i32>,
+    /// Per-path overrides evaluated in declaration order.
     pub path_rules: Option<Vec<PathRuleRequest>>,
+    /// Route-level short-circuit status.
     pub return_status: Option<u16>,
+    /// Enable cookie-based session affinity.
     pub sticky_session: Option<bool>,
+    /// Basic-auth username.
     pub basic_auth_username: Option<String>,
     /// Plaintext password - hashed with Argon2id before storage. Never stored
     /// or logged in cleartext. The management API binds to localhost only;
     /// ensure TLS or SSH tunnel if accessing remotely.
     pub basic_auth_password: Option<String>,
+    /// Cache-Control `stale-while-revalidate` (s).
     pub stale_while_revalidate_s: Option<i32>,
+    /// Cache-Control `stale-if-error` (s).
     pub stale_if_error_s: Option<i32>,
+    /// HTTP methods retryable by the retry logic.
     pub retry_on_methods: Option<Vec<String>>,
+    /// Return 503 on every request (maintenance).
     pub maintenance_mode: Option<bool>,
+    /// Operator-supplied HTML for terminal status codes.
     pub error_page_html: Option<String>,
+    /// Request headers that partition the cache.
     pub cache_vary_headers: Option<Vec<String>>,
+    /// Header-based routing rules.
     pub header_rules: Option<Vec<HeaderRuleRequest>>,
+    /// Canary traffic splits.
     pub traffic_splits: Option<Vec<TrafficSplitRequest>>,
+    /// Forward-auth config (optional).
     pub forward_auth: Option<ForwardAuthConfigRequest>,
+    /// Request-mirror config (optional).
     pub mirror: Option<MirrorConfigRequest>,
+    /// Response-body rewrite config (optional).
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
+    /// mTLS client-cert gate (optional).
     pub mtls: Option<MtlsConfigRequest>,
+    /// Token-bucket rate-limit struct (optional).
     pub rate_limit: Option<lorica_config::models::RateLimit>,
+    /// Per-route GeoIP filter (optional).
     pub geoip: Option<lorica_config::models::GeoIpConfig>,
+    /// Per-route bot-protection filter (optional).
     pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
     /// Free-form operator classification (prod / staging / homelab / ...).
     /// Omit or send empty string for ungrouped. Validated against a
@@ -2454,65 +2586,122 @@ pub struct CreateRouteRequest {
     pub group_name: Option<String>,
 }
 
-/// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are mutated.
+/// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are
+/// mutated ; every field is optional. Semantics mirror the matching
+/// [`lorica_config::models::Route`] field.
 #[derive(Deserialize)]
 pub struct UpdateRouteRequest {
+    /// New hostname (must stay unique across the route table).
     pub hostname: Option<String>,
+    /// New URL path prefix.
     pub path_prefix: Option<String>,
+    /// New backend ID list ; full replace when present.
     pub backend_ids: Option<Vec<String>>,
+    /// New TLS certificate ID.
     pub certificate_id: Option<String>,
+    /// Load-balancing policy name.
     pub load_balancing: Option<String>,
+    /// Enable / disable the WAF filter chain.
     pub waf_enabled: Option<bool>,
+    /// WAF mode (`"detection"` / `"blocking"`).
     pub waf_mode: Option<String>,
+    /// Admin toggle : disable to 404 all traffic.
     pub enabled: Option<bool>,
+    /// Force HTTPS redirect on plaintext listeners.
     pub force_https: Option<bool>,
+    /// Canonical redirect host.
     pub redirect_hostname: Option<String>,
+    /// Route-level redirect target URL.
     pub redirect_to: Option<String>,
+    /// Alias hostnames.
     pub hostname_aliases: Option<Vec<String>>,
+    /// Request headers to inject.
     pub proxy_headers: Option<HashMap<String, String>>,
+    /// Response headers to append.
     pub response_headers: Option<HashMap<String, String>>,
+    /// Named security-header preset.
     pub security_headers: Option<String>,
+    /// Upstream connect timeout (s).
     pub connect_timeout_s: Option<i32>,
+    /// Upstream read timeout (s).
     pub read_timeout_s: Option<i32>,
+    /// Upstream send timeout (s).
     pub send_timeout_s: Option<i32>,
+    /// Strip this prefix before forwarding.
     pub strip_path_prefix: Option<String>,
+    /// Prepend this prefix before forwarding.
     pub add_path_prefix: Option<String>,
+    /// Regex pattern for path rewriting.
     pub path_rewrite_pattern: Option<String>,
+    /// Replacement string for regex rewrite.
     pub path_rewrite_replacement: Option<String>,
+    /// Emit access-log lines.
     pub access_log_enabled: Option<bool>,
+    /// Request-header names to strip.
     pub proxy_headers_remove: Option<Vec<String>>,
+    /// Response-header names to strip.
     pub response_headers_remove: Option<Vec<String>>,
+    /// Hard cap on request body (bytes).
     pub max_request_body_bytes: Option<u64>,
+    /// Allow WebSocket upgrades.
     pub websocket_enabled: Option<bool>,
+    /// Per-client RPS rate limit.
     pub rate_limit_rps: Option<u32>,
+    /// Token-bucket burst capacity.
     pub rate_limit_burst: Option<u32>,
+    /// IP allow-list (CIDRs).
     pub ip_allowlist: Option<Vec<String>>,
+    /// IP deny-list (CIDRs).
     pub ip_denylist: Option<Vec<String>>,
+    /// CORS `Access-Control-Allow-Origin` values.
     pub cors_allowed_origins: Option<Vec<String>>,
+    /// CORS `Access-Control-Allow-Methods` values.
     pub cors_allowed_methods: Option<Vec<String>>,
+    /// CORS `Access-Control-Max-Age` (s).
     pub cors_max_age_s: Option<i32>,
+    /// Enable gzip / deflate response compression.
     pub compression_enabled: Option<bool>,
+    /// Idempotent-method retry count.
     pub retry_attempts: Option<u32>,
+    /// Enable in-proxy response cache.
     pub cache_enabled: Option<bool>,
+    /// Default cache TTL (s).
     pub cache_ttl_s: Option<i32>,
+    /// Per-entry cache size cap (bytes).
     pub cache_max_bytes: Option<i64>,
+    /// Hard cap on concurrent connections.
     pub max_connections: Option<u32>,
+    /// Slowloris request-header timeout (ms).
     pub slowloris_threshold_ms: Option<i32>,
+    /// Auto-ban request-count threshold.
     pub auto_ban_threshold: Option<u32>,
+    /// Auto-ban duration (s).
     pub auto_ban_duration_s: Option<i32>,
+    /// Per-path overrides (full replace).
     pub path_rules: Option<Vec<PathRuleRequest>>,
+    /// Route-level short-circuit status.
     pub return_status: Option<u16>,
+    /// Enable cookie-based session affinity.
     pub sticky_session: Option<bool>,
+    /// Basic-auth username.
     pub basic_auth_username: Option<String>,
     /// Plaintext password - hashed with Argon2id before storage.
     pub basic_auth_password: Option<String>,
+    /// Cache-Control `stale-while-revalidate` (s).
     pub stale_while_revalidate_s: Option<i32>,
+    /// Cache-Control `stale-if-error` (s).
     pub stale_if_error_s: Option<i32>,
+    /// HTTP methods retryable by the retry logic.
     pub retry_on_methods: Option<Vec<String>>,
+    /// Return 503 on every request (maintenance).
     pub maintenance_mode: Option<bool>,
+    /// Operator-supplied HTML for terminal status codes.
     pub error_page_html: Option<String>,
+    /// Cache-variance request-header names.
     pub cache_vary_headers: Option<Vec<String>>,
+    /// Header-based routing rules (full replace).
     pub header_rules: Option<Vec<HeaderRuleRequest>>,
+    /// Canary traffic splits (full replace).
     pub traffic_splits: Option<Vec<TrafficSplitRequest>>,
     /// Update semantics: missing field = leave current value alone;
     /// present with empty `address` = clear; present with non-empty
@@ -2549,6 +2738,9 @@ pub struct UpdateRouteRequest {
     /// the three cases orthogonal: neither sent = no-op, config
     /// sent = install, disable=true = clear.
     pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
+    /// Explicit clear flag for `bot_protection`. Setting this to
+    /// `true` removes the existing config ; `false` / absent is a
+    /// no-op (use the `bot_protection` field itself to replace).
     #[serde(default)]
     pub bot_protection_disable: Option<bool>,
     /// Free-form operator classification (prod / staging / homelab / ...).
@@ -2715,6 +2907,8 @@ fn route_to_response(
 /// (prod / staging / etc.) without fetching everything first.
 #[derive(Deserialize, Default)]
 pub struct ListRoutesQuery {
+    /// Filter : when set, only routes whose `group_name` equals this
+    /// value are returned.
     pub group: Option<String>,
 }
 

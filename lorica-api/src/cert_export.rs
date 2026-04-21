@@ -59,9 +59,17 @@ pub enum ExportOutcome {
 /// configuration issue (missing dir, bad mode) that shows up in logs.
 #[derive(Debug)]
 pub enum ExportError {
+    /// `GlobalSettings.cert_export_*` is inconsistent (missing dir,
+    /// out-of-range mode, ...).
     BadConfig(String),
+    /// Generic filesystem error (permission denied, ENOENT on parent
+    /// dir, EXDEV on cross-mount rename).
     Io(std::io::Error),
+    /// ENOSPC was detected ; surfaced separately so the caller can
+    /// alert.
     DiskFull(std::io::Error),
+    /// Hostname sanitiser rejected the cert's domain (wildcards /
+    /// path traversal / non-ASCII).
     InvalidHostname(String),
 }
 

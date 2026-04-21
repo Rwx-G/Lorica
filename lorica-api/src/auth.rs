@@ -32,27 +32,35 @@ fn argon2_hasher() -> argon2::Argon2<'static> {
 /// JSON body for `POST /api/v1/auth/login`.
 #[derive(Deserialize)]
 pub struct LoginRequest {
+    /// Username.
     pub username: String,
+    /// Plaintext password (hashed Argon2id in the store).
     pub password: String,
 }
 
 /// Successful login payload returned in the `data` envelope.
 #[derive(Serialize)]
 pub struct LoginResponse {
+    /// `true` when the user must rotate their password on next login
+    /// (post admin reset).
     pub must_change_password: bool,
+    /// RFC 3339 expiry timestamp of the issued session cookie.
     pub session_expires_at: String,
 }
 
 /// JSON body for `PUT /api/v1/auth/password`.
 #[derive(Deserialize)]
 pub struct ChangePasswordRequest {
+    /// Old password (verified against the stored Argon2id hash).
     pub current_password: String,
+    /// New password ; re-hashed and persisted.
     pub new_password: String,
 }
 
 /// Acknowledgement returned after a successful password change.
 #[derive(Serialize)]
 pub struct PasswordChangedResponse {
+    /// Human-readable message.
     pub message: String,
 }
 

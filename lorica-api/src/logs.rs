@@ -18,14 +18,23 @@ use crate::server::AppState;
 /// A single access log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
+    /// Monotonic entry id assigned at push time.
     pub id: u64,
+    /// RFC 3339 timestamp of the request.
     pub timestamp: String,
+    /// HTTP method.
     pub method: String,
+    /// Request path (including query string).
     pub path: String,
+    /// Host header / route hostname.
     pub host: String,
+    /// Response HTTP status.
     pub status: u16,
+    /// Total request-to-response latency (ms).
     pub latency_ms: u64,
+    /// Backend address that served the request.
     pub backend: String,
+    /// Optional error text for failed requests.
     pub error: Option<String>,
     /// Client IP address (from socket or X-Forwarded-For).
     #[serde(default)]

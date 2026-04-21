@@ -12,9 +12,13 @@ use crate::server::AppState;
 /// Response for a DNS provider (credentials are never returned).
 #[derive(Debug, Serialize)]
 pub struct DnsProviderResponse {
+    /// Provider row id.
     pub id: String,
+    /// Human-readable label.
     pub name: String,
+    /// Provider kind (`"ovh"` / `"cloudflare"` / `"route53"`).
     pub provider_type: String,
+    /// RFC 3339 insert timestamp.
     pub created_at: String,
 }
 
@@ -40,8 +44,11 @@ pub async fn list_dns_providers(
 /// Request body for creating/updating a DNS provider.
 #[derive(Debug, Deserialize)]
 pub struct CreateDnsProviderRequest {
+    /// Human-readable label.
     pub name: String,
+    /// Provider kind (`"ovh"` / `"cloudflare"` / `"route53"`).
     pub provider_type: String,
+    /// Provider-specific credentials.
     pub config: DnsProviderConfig,
 }
 
@@ -49,17 +56,27 @@ pub struct CreateDnsProviderRequest {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DnsProviderConfig {
     // OVH
+    /// OVH API endpoint host (`"eu.api.ovh.com"`, etc.).
     pub ovh_endpoint: Option<String>,
+    /// OVH `application_key`.
     pub ovh_application_key: Option<String>,
+    /// OVH `application_secret`.
     pub ovh_application_secret: Option<String>,
+    /// OVH `consumer_key`.
     pub ovh_consumer_key: Option<String>,
     // Cloudflare
+    /// Cloudflare API token (scoped to Zone:Edit).
     pub api_token: Option<String>,
+    /// Cloudflare zone id.
     pub zone_id: Option<String>,
     // Route53
+    /// AWS access key id for Route53.
     pub aws_access_key_id: Option<String>,
+    /// AWS secret access key for Route53.
     pub aws_secret_access_key: Option<String>,
+    /// AWS region for Route53 client (default `us-east-1`).
     pub aws_region: Option<String>,
+    /// Route53 hosted zone id.
     pub hosted_zone_id: Option<String>,
 }
 

@@ -19,9 +19,14 @@ use crate::server::AppState;
 /// JSON body for `POST /api/v1/cert-export/acls`.
 #[derive(Deserialize)]
 pub struct CreateAclRequest {
+    /// Hostname pattern (exact, leading-wildcard, or `*`).
     pub hostname_pattern: String,
+    /// Per-ACL owner uid override ; `None` inherits the global
+    /// default.
     #[serde(default)]
     pub allowed_uid: Option<u32>,
+    /// Per-ACL group gid override ; `None` inherits the global
+    /// default.
     #[serde(default)]
     pub allowed_gid: Option<u32>,
 }
@@ -29,10 +34,15 @@ pub struct CreateAclRequest {
 /// JSON projection of a stored ACL.
 #[derive(Serialize)]
 pub struct AclResponse {
+    /// ACL row id.
     pub id: String,
+    /// Hostname pattern (exact / wildcard / catch-all).
     pub hostname_pattern: String,
+    /// Owner uid override, `None` = inherit global default.
     pub allowed_uid: Option<u32>,
+    /// Group gid override, `None` = inherit global default.
     pub allowed_gid: Option<u32>,
+    /// RFC 3339 insert timestamp.
     pub created_at: String,
 }
 

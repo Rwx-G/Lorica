@@ -20,9 +20,13 @@ const SESSION_TIMEOUT_MINUTES: i64 = 30;
 /// Authenticated session injected into request extensions by [`require_auth`].
 #[derive(Debug, Clone)]
 pub struct Session {
+    /// AdminUser id that owns the session.
     pub user_id: String,
+    /// Username (denormalised for audit-logging convenience).
     pub username: String,
+    /// Creation timestamp (first login).
     pub created_at: DateTime<Utc>,
+    /// Expiry timestamp ; requests past this point are rejected 401.
     pub expires_at: DateTime<Utc>,
 }
 

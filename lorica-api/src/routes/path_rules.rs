@@ -9,24 +9,35 @@ use crate::error::ApiError;
 /// Per-path rule view returned alongside a route (path match plus per-path overrides).
 #[derive(Serialize)]
 pub struct PathRuleResponse {
+    /// Matched request path or prefix.
     pub path: String,
+    /// Match semantics : `"prefix"` or `"exact"`.
     pub match_type: String,
+    /// Backend IDs that serve matching requests ; `None` inherits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_ids: Option<Vec<String>>,
+    /// Cache-enabled override for matching requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_enabled: Option<bool>,
+    /// Cache-TTL override for matching requests (s).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_ttl_s: Option<i32>,
+    /// Response-headers override for matching requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_headers: Option<HashMap<String, String>>,
+    /// Response-header names stripped for matching requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_headers_remove: Option<Vec<String>>,
+    /// Rate-limit RPS override for matching requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_rps: Option<u32>,
+    /// Rate-limit burst override for matching requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit_burst: Option<u32>,
+    /// Literal redirect target for matching requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redirect_to: Option<String>,
+    /// Short-circuit status for matching requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_status: Option<u16>,
 }
@@ -34,16 +45,27 @@ pub struct PathRuleResponse {
 /// JSON body for a single path rule on a route create or update.
 #[derive(Deserialize)]
 pub struct PathRuleRequest {
+    /// Request-path pattern the rule tests.
     pub path: String,
+    /// Match-type name : `"prefix"` (default) or `"exact"`.
     pub match_type: Option<String>,
+    /// Backend IDs that serve matching requests.
     pub backend_ids: Option<Vec<String>>,
+    /// Cache-enabled override.
     pub cache_enabled: Option<bool>,
+    /// Cache-TTL override (s).
     pub cache_ttl_s: Option<i32>,
+    /// Response-headers override.
     pub response_headers: Option<HashMap<String, String>>,
+    /// Response-header names stripped.
     pub response_headers_remove: Option<Vec<String>>,
+    /// Rate-limit RPS override.
     pub rate_limit_rps: Option<u32>,
+    /// Rate-limit burst override.
     pub rate_limit_burst: Option<u32>,
+    /// Literal redirect URL.
     pub redirect_to: Option<String>,
+    /// Short-circuit status.
     pub return_status: Option<u16>,
 }
 

@@ -35,10 +35,17 @@ pub type MetricsRefresher =
 /// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]
 pub struct AppState {
+    /// SQLite-backed `ConfigStore` wrapped in a tokio `Mutex` so only
+    /// one handler writes at a time.
     pub store: Arc<Mutex<lorica_config::ConfigStore>>,
+    /// In-memory ring buffer + broadcast hub for access logs.
     pub log_buffer: Arc<LogBuffer>,
+    /// Cached system-metrics snapshot populated by
+    /// `GET /api/v1/system`.
     pub system_cache: Arc<Mutex<SystemCache>>,
+    /// Live count of accepted downstream connections.
     pub active_connections: Arc<AtomicU64>,
+    /// Proxy process start time for uptime computation.
     pub started_at: Instant,
     /// Lorica data directory (`--data-dir`, typically `/var/lib/lorica`).
     /// Used by `get_system` to report the disk usage of the filesystem

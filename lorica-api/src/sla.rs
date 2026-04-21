@@ -45,8 +45,11 @@ pub async fn get_route_sla(
 /// Query parameters for bucket queries: `?from=&to=&source=passive|active`.
 #[derive(Deserialize)]
 pub struct BucketQuery {
+    /// Start of the window (RFC 3339) ; default now - 24 h.
     pub from: Option<String>,
+    /// End of the window (RFC 3339) ; default now.
     pub to: Option<String>,
+    /// Bucket source (`"passive"` / `"active"`) ; default `"passive"`.
     pub source: Option<String>,
 }
 
@@ -105,9 +108,13 @@ pub async fn get_sla_config(
 /// JSON body for `PUT /api/v1/sla/routes/:id/config`. Only supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateSlaConfig {
+    /// New SLA target percentage (0..=100).
     pub target_pct: Option<f64>,
+    /// New latency ceiling (ms).
     pub max_latency_ms: Option<i64>,
+    /// New success-status range lower bound.
     pub success_status_min: Option<i32>,
+    /// New success-status range upper bound.
     pub success_status_max: Option<i32>,
 }
 
@@ -166,8 +173,11 @@ pub async fn update_sla_config(
 /// Query parameters for SLA export: `?from=&to=&format=json|csv` (default 30d, JSON).
 #[derive(Deserialize)]
 pub struct ExportQuery {
+    /// Start of the export window (RFC 3339). Default now - 30 d.
     pub from: Option<String>,
+    /// End of the export window (RFC 3339). Default now.
     pub to: Option<String>,
+    /// Output format (`"json"` / `"csv"`). Default `"json"`.
     pub format: Option<String>,
 }
 

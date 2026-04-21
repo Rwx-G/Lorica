@@ -11,8 +11,11 @@ use crate::server::AppState;
 /// Top-level payload returned by `GET /api/v1/system`.
 #[derive(Serialize)]
 pub struct SystemResponse {
+    /// Host-level CPU, memory, and disk usage.
     pub host: HostMetrics,
+    /// Lorica process resource counters.
     pub process: ProcessMetrics,
+    /// Build / runtime info about the proxy.
     pub proxy: ProxyInfo,
 }
 

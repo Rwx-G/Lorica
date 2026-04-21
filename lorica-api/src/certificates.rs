@@ -16,18 +16,30 @@ use crate::server::AppState;
 /// Compact certificate view returned by list endpoints (no PEM body).
 #[derive(Serialize)]
 pub struct CertificateResponse {
+    /// Cert row id.
     pub id: String,
+    /// Primary CN / SAN.
     pub domain: String,
+    /// Extra SAN DNS names parsed from the cert.
     pub san_domains: Vec<String>,
+    /// SHA-256 fingerprint (hex).
     pub fingerprint: String,
+    /// Issuer DN.
     pub issuer: String,
+    /// RFC 3339 not-before timestamp.
     pub not_before: String,
+    /// RFC 3339 not-after timestamp.
     pub not_after: String,
+    /// Whether the cert was issued by Lorica's ACME flow.
     pub is_acme: bool,
+    /// Whether the ACME renewal loop auto-renews this cert.
     pub acme_auto_renew: bool,
+    /// RFC 3339 insert timestamp.
     pub created_at: String,
+    /// ACME method (`"http01"` / `"dns01-*"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme_method: Option<String>,
+    /// Global DNS provider ID for DNS-01 renewals.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme_dns_provider_id: Option<String>,
 }
@@ -35,25 +47,35 @@ pub struct CertificateResponse {
 /// JSON body for `POST /api/v1/certificates` - upload a PEM cert and key.
 #[derive(Deserialize)]
 pub struct CreateCertificateRequest {
+    /// Primary hostname the cert binds to.
     pub domain: String,
+    /// PEM-encoded leaf + chain.
     pub cert_pem: String,
+    /// PEM-encoded private key.
     pub key_pem: String,
 }
 
 /// JSON body for `POST /api/v1/certificates/self-signed`.
 #[derive(Deserialize)]
 pub struct GenerateSelfSignedRequest {
+    /// Hostname the self-signed cert binds to.
     pub domain: String,
 }
 
 /// JSON body for `PUT /api/v1/certificates/:id`. Only supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateCertificateRequest {
+    /// New primary hostname.
     pub domain: Option<String>,
+    /// New PEM cert + chain.
     pub cert_pem: Option<String>,
+    /// New PEM private key.
     pub key_pem: Option<String>,
+    /// ACME method override.
     pub acme_method: Option<String>,
+    /// New DNS provider reference for DNS-01 renewals.
     pub acme_dns_provider_id: Option<String>,
+    /// Toggle auto-renewal for this cert.
     pub acme_auto_renew: Option<bool>,
 }
 
@@ -61,18 +83,31 @@ pub struct UpdateCertificateRequest {
 /// including the PEM body and the routes that reference it.
 #[derive(Serialize)]
 pub struct CertificateDetailResponse {
+    /// Cert row id.
     pub id: String,
+    /// Primary hostname.
     pub domain: String,
+    /// SAN DNS names from the cert.
     pub san_domains: Vec<String>,
+    /// SHA-256 fingerprint (hex).
     pub fingerprint: String,
+    /// PEM-encoded leaf + chain.
     pub cert_pem: String,
+    /// Issuer DN.
     pub issuer: String,
+    /// RFC 3339 not-before timestamp.
     pub not_before: String,
+    /// RFC 3339 not-after timestamp.
     pub not_after: String,
+    /// Whether the cert is ACME-issued.
     pub is_acme: bool,
+    /// Whether the ACME loop auto-renews this cert.
     pub acme_auto_renew: bool,
+    /// RFC 3339 insert timestamp.
     pub created_at: String,
+    /// IDs of routes currently pointing at this cert.
     pub associated_routes: Vec<String>,
+    /// ACME method when `is_acme`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme_method: Option<String>,
 }
@@ -457,6 +492,8 @@ pub async fn generate_self_signed(
 /// * `bundle` - cert + key concatenated (fullchain-style). Default.
 #[derive(Deserialize, Default)]
 pub struct DownloadCertificateQuery {
+    /// Which part of the bundle to serve : `"cert"` / `"key"` /
+    /// `"chain"` / `"bundle"` (default).
     #[serde(default)]
     pub part: Option<String>,
 }

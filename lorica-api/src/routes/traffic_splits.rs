@@ -7,9 +7,12 @@ use crate::error::ApiError;
 /// Canary traffic split assigning a percent of traffic to a backend pool.
 #[derive(Serialize, Deserialize)]
 pub struct TrafficSplitRequest {
+    /// Human-readable split label (shown in dashboards).
     #[serde(default)]
     pub name: String,
+    /// Percentage of eligible traffic that hits this split (0..=100).
     pub weight_percent: u8,
+    /// Backend IDs serving this split.
     #[serde(default)]
     pub backend_ids: Vec<String>,
 }

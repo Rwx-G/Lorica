@@ -11,9 +11,15 @@ use crate::server::AppState;
 /// Per-route mTLS configuration: trusted CA bundle and optional org allowlist.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MtlsConfigRequest {
+    /// Concatenated PEM CA bundle trusted to issue client certs.
     pub ca_cert_pem: String,
+    /// Whether a missing / untrusted client cert is rejected with
+    /// HTTP 496 (`true`) or the request continues without a cert
+    /// (`false`).
     #[serde(default)]
     pub required: bool,
+    /// Optional subject-organization allowlist ; empty accepts any
+    /// cert that chains to `ca_cert_pem`.
     #[serde(default)]
     pub allowed_organizations: Vec<String>,
 }
@@ -111,12 +117,14 @@ pub(super) fn build_mtls_config(
 /// JSON body for `POST /api/v1/validate/mtls-pem`.
 #[derive(Deserialize)]
 pub struct ValidateMtlsPemRequest {
+    /// Concatenated PEM CA bundle to validate.
     pub ca_cert_pem: String,
 }
 
 /// Response describing a validated mTLS CA bundle (count + per-cert subject summaries).
 #[derive(Serialize)]
 pub struct ValidateMtlsPemResponse {
+    /// Number of valid CERTIFICATE blocks parsed from the bundle.
     pub ca_count: usize,
     /// Subject summaries for each CERTIFICATE block found. One entry
     /// per cert so the operator can cross-check their bundle ("yes,

@@ -7,12 +7,16 @@ use crate::error::ApiError;
 /// Request mirroring configuration (shadow backends, sample percent, body cap, timeout).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MirrorConfigRequest {
+    /// Backend IDs that receive shadow copies.
     #[serde(default)]
     pub backend_ids: Vec<String>,
+    /// Percentage of eligible requests to mirror (0..=100).
     #[serde(default = "default_mirror_sample_percent")]
     pub sample_percent: u8,
+    /// Per-mirror-request timeout (ms).
     #[serde(default = "default_mirror_timeout_ms")]
     pub timeout_ms: u32,
+    /// Maximum request body to buffer for mirroring (bytes).
     #[serde(default = "default_mirror_max_body_bytes")]
     pub max_body_bytes: u32,
 }

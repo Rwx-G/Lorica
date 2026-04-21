@@ -47,15 +47,26 @@ pub async fn list_configs(
 /// JSON body for `POST /api/v1/loadtest/configs`. Optional fields receive defaults.
 #[derive(Deserialize)]
 pub struct CreateLoadTestConfig {
+    /// Human-readable label shown in the dashboard.
     pub name: String,
+    /// Absolute URL the load test hits (must point at a configured
+    /// route or localhost).
     pub target_url: String,
+    /// HTTP method (uppercase). Defaults to `GET`.
     pub method: Option<String>,
+    /// Request headers sent on every iteration.
     pub headers: Option<HashMap<String, String>>,
+    /// Optional request body (string, UTF-8).
     pub body: Option<String>,
+    /// Concurrent virtual users. Defaults to 10.
     pub concurrency: Option<i32>,
+    /// Target steady-state RPS. Defaults to 100.
     pub requests_per_second: Option<i32>,
+    /// Steady-state duration (s). Defaults to 30.
     pub duration_s: Option<i32>,
+    /// Auto-abort threshold on error rate (0.0..=100.0).
     pub error_threshold_pct: Option<f64>,
+    /// Cron expression for scheduled runs. `None` = manual only.
     pub schedule_cron: Option<String>,
 }
 
@@ -140,16 +151,27 @@ pub async fn create_config(
 /// JSON body for `PUT /api/v1/loadtest/configs/:id`. Only supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateLoadTestConfig {
+    /// New label.
     pub name: Option<String>,
+    /// New target URL (must be a configured route or localhost).
     pub target_url: Option<String>,
+    /// New HTTP method.
     pub method: Option<String>,
+    /// New request header map.
     pub headers: Option<HashMap<String, String>>,
+    /// New request body.
     pub body: Option<String>,
+    /// New concurrency level.
     pub concurrency: Option<i32>,
+    /// New steady-state RPS target.
     pub requests_per_second: Option<i32>,
+    /// New steady-state duration (s).
     pub duration_s: Option<i32>,
+    /// New auto-abort error-rate threshold (%).
     pub error_threshold_pct: Option<f64>,
+    /// New cron schedule (`None` + missing = manual).
     pub schedule_cron: Option<String>,
+    /// Enable / disable scheduled runs.
     pub enabled: Option<bool>,
 }
 
@@ -429,6 +451,7 @@ async fn handle_loadtest_stream(
 /// JSON body for `POST /api/v1/loadtest/configs/:id/clone` - optional new name.
 #[derive(Deserialize)]
 pub struct CloneConfig {
+    /// Optional new name for the clone ; defaults to `"<orig> (copy)"`.
     pub name: Option<String>,
 }
 

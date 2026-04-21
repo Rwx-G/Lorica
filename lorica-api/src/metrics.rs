@@ -603,6 +603,8 @@ pub fn forget_worker_generic_counters(worker_id: u32) {
     SUPERVISOR_GENERIC_SNAPSHOT.write().remove(&worker_id);
 }
 
+/// Test-only helper that wipes the supervisor's generic-counter
+/// snapshot so a fresh test starts from zero.
 #[cfg(test)]
 pub fn reset_generic_counter_snapshot_for_test() {
     SUPERVISOR_GENERIC_SNAPSHOT.write().clear();

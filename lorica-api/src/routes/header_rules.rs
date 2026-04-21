@@ -7,10 +7,14 @@ use crate::error::ApiError;
 /// Header-based routing rule (matches a header value, picks a backend pool).
 #[derive(Serialize, Deserialize)]
 pub struct HeaderRuleRequest {
+    /// HTTP header name the rule tests.
     pub header_name: String,
+    /// Match-type name : `"exact"` (default), `"prefix"`, or `"regex"`.
     #[serde(default)]
     pub match_type: Option<String>,
+    /// Literal string / regex source compared against the header.
     pub value: String,
+    /// Backends that serve matching requests.
     #[serde(default)]
     pub backend_ids: Vec<String>,
     /// Response-only indicator. Set to `true` by `route_to_response`

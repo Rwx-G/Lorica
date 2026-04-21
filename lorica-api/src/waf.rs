@@ -164,6 +164,7 @@ pub async fn get_waf_rules(
 /// JSON body for toggling a WAF rule on or off.
 #[derive(Debug, Deserialize)]
 pub struct RuleToggleRequest {
+    /// Desired rule state (`true` = enabled).
     pub enabled: bool,
 }
 
@@ -223,10 +224,15 @@ pub async fn clear_waf_events(
 /// JSON body for creating a user-defined WAF rule (regex pattern + category + severity).
 #[derive(Debug, Deserialize)]
 pub struct CreateCustomRuleRequest {
+    /// Operator-assigned numeric rule id (must be unique).
     pub id: u32,
+    /// Human-readable description.
     pub description: String,
+    /// Rule category (e.g. `"sqli"`, `"xss"`).
     pub category: String,
+    /// Rust `regex` pattern matched against the request.
     pub pattern: String,
+    /// Severity level 1..=5 (higher = more urgent). Default 3.
     pub severity: Option<u8>,
 }
 
@@ -339,6 +345,7 @@ pub async fn get_blocklist_status(
 /// JSON body for toggling the IP blocklist on or off.
 #[derive(Debug, Deserialize)]
 pub struct BlocklistToggleRequest {
+    /// Desired state for the IP blocklist (`true` = active).
     pub enabled: bool,
 }
 
