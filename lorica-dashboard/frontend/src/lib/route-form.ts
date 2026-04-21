@@ -322,6 +322,62 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
   // timeouts split: path rewrite -> transform, everything else -> upstream.
 };
 
+/**
+ * Extract a field name from a backend 400 error message and map it to
+ * the tab that owns the field, so the route drawer can auto-switch +
+ * focus the offending input when the server rejects a save the
+ * client-side validator let through.
+ *
+ * Backend messages consistently start with the field name, in one of
+ * these shapes :
+ *   - `"max_connections must be in 0..=1000000"`          -> flat
+ *   - `"bot_protection.cookie_ttl_s must be > 0"`        -> dotted
+ *   - `"path_rules[3].redirect_to must be a valid URL"`  -> indexed
+ *   - `"rate_limit.capacity must be > 0 ..."`            -> dotted
+ *
+ * The first token is extracted ; if it contains a `[i]` or `.`, we
+ * also try its root ("path_rules", "bot_protection", ...) which maps
+ * to a tab via a small explicit prefix table covering the nested
+ * route-config shapes that are not individual form fields.
+ *
+ * Returns `null` when no match — callers stay on the current tab.
+ */
+export function inferTabFromBackendError(message: string): string | null {
+  const match = message.trim().match(/^([A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?(?:\.[A-Za-z_][A-Za-z0-9_]*)*)/);
+  if (!match) return null;
+  const raw = match[1];
+
+  // Try the most-specific name first, then walk down the prefix tree
+  // so `path_rules[3].redirect_to` falls back to `path_rules[3]`, then
+  // `path_rules`, then `path` etc. TAB_FIELDS only carries flat
+  // form-state keys so we strip brackets + trailing `.x` to compare.
+  const flat = raw.replace(/\[\d+\]/g, '').split('.')[0];
+  for (const [tab, fields] of Object.entries(TAB_FIELDS)) {
+    if ((fields as string[]).includes(flat)) return tab;
+  }
+
+  // Fallback : nested config shapes that don't map 1:1 onto form
+  // state but always live in the same tab. Ordered most-specific
+  // prefix first so `bot_protection.pow_difficulty` matches
+  // `bot_protection` before falling through to the default branch.
+  const prefixToTab: Array<[string, string]> = [
+    ['bot_protection', 'protection'],
+    ['rate_limit', 'protection'],
+    ['geoip', 'protection'],
+    ['forward_auth', 'security'],
+    ['mtls', 'security'],
+    ['mirror', 'routing'],
+    ['response_rewrite', 'transform'],
+    ['path_rules', 'routing'],
+    ['header_rules', 'routing'],
+    ['traffic_splits', 'routing'],
+  ];
+  for (const [prefix, tab] of prefixToTab) {
+    if (flat === prefix || flat.startsWith(`${prefix}_`)) return tab;
+  }
+  return null;
+}
+
 function recordToText(rec: Record<string, string>): string {
   return Object.entries(rec).map(([k, v]) => `${k}=${v}`).join('\n');
 }

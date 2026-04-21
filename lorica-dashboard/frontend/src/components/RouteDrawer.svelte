@@ -11,6 +11,7 @@
     formStateToUpdateRequest,
     getModifiedFields,
     validateRouteFormWithTab,
+    inferTabFromBackendError,
   } from '../lib/route-form';
   import { showToast } from '../lib/toast';
   import ConfirmDialog from './ConfirmDialog.svelte';
@@ -317,6 +318,11 @@
       const res = await api.updateRoute(editing.id, body);
       if (res.error) {
         formError = res.error.message;
+        // Route the operator to the offending tab when the backend
+        // gives us an identifiable field name. Falls back to staying
+        // put when the message doesn't map to a known field.
+        const inferredTab = inferTabFromBackendError(res.error.message);
+        if (inferredTab) jumpToErrorTab(inferredTab);
         formSubmitting = false;
         return;
       }
@@ -326,6 +332,8 @@
       const res = await api.createRoute(body);
       if (res.error) {
         formError = res.error.message;
+        const inferredTab = inferTabFromBackendError(res.error.message);
+        if (inferredTab) jumpToErrorTab(inferredTab);
         formSubmitting = false;
         return;
       }
