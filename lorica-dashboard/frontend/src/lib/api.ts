@@ -679,6 +679,13 @@ export interface CertExportReapplyResponse {
   enabled: boolean;
   exported: number;
   failed: number;
+  /**
+   * Certificates skipped because their hostname did not match
+   * any configured ACL pattern. Distinct from `failed` : the
+   * ACL is the documented allowlist, so a skip is an intentional
+   * operator decision, not an error.
+   */
+  skipped: number;
 }
 
 export interface CertExportOrphan {

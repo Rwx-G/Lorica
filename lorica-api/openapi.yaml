@@ -2188,6 +2188,15 @@ paths:
                     type: integer
                   failed:
                     type: integer
+                  skipped:
+                    type: integer
+                    description: |
+                      Certificates skipped because their hostname did not
+                      match any configured ACL pattern. ACLs are the
+                      documented allowlist ("If no pattern matches, the
+                      cert is not exported"), so a skip is an intentional
+                      operator decision, not an error. Distinct from
+                      `failed`.
 
   /api/v1/cert-export/orphans:
     get:

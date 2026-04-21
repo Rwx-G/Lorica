@@ -171,11 +171,16 @@ pub async fn reapply(
     let acls = store.list_cert_export_acls().unwrap_or_default();
     let certs = store.list_certificates()?;
     drop(store);
-    let (ok, err) = crate::cert_export::reexport_all(&settings, &acls, &certs).await;
+    let (ok, err, skipped) = crate::cert_export::reexport_all(&settings, &acls, &certs).await;
     Ok(json_data(serde_json::json!({
         "enabled": settings.cert_export_enabled,
         "exported": ok,
         "failed": err,
+        // `skipped` counts certs whose hostname did not match any
+        // configured ACL pattern. The frontend surfaces it next to
+        // `exported` so the operator understands a low number is a
+        // narrow allowlist, not a broken exporter.
+        "skipped": skipped,
     })))
 }
 
