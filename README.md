@@ -9,8 +9,8 @@
   <img src="https://img.shields.io/badge/version-1.5.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-1280%2B-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-568-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-1356%2B-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-573-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -342,6 +342,8 @@ All endpoints are served on the management port (default `9443`) over HTTPS. Pro
 | `POST` | `/api/v1/cert-export/acls` | Create a cert-export ACL rule |
 | `DELETE` | `/api/v1/cert-export/acls/:id` | Delete a cert-export ACL rule |
 | `POST` | `/api/v1/cert-export/reapply` | Re-export every certificate to disk |
+| `GET` | `/api/v1/cert-export/orphans` | List per-hostname subdirectories with no matching live cert |
+| `DELETE` | `/api/v1/cert-export/orphans/:name` | Remove one orphan subdirectory (sanitised + live-cert guard) |
 
 ### ACME
 
@@ -455,19 +457,19 @@ cargo build --release
 ### Running tests
 
 ```bash
-# All Rust unit tests (~1850 tests across 22 crates)
+# All Rust unit tests (~1929 tests across 28 crates)
 cargo test --workspace
 
-# Product crate tests only (~1100 tests - lorica-native, include
-# the new v1.5.0 hardening coverage : rate-limit buckets, body-size
+# Product crate tests only (~1356 tests - lorica-native, include
+# the v1.5.0 hardening coverage : rate-limit buckets, body-size
 # layers, session rotation, public_version masking, ammonia bypass
-# corpus, map_err context preservation)
+# corpus, map_err context preservation, cert-export orphan sweep)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
            -p lorica-command -p lorica-limits -p lorica-shmem \
            -p lorica-challenge -p lorica-geoip
 
-# Pingora-forked crate tests (568 tests)
+# Pingora-forked crate tests (573 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-error -p lorica-tls -p lorica-cache \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
@@ -493,11 +495,11 @@ cd lorica-dashboard/frontend && npx vitest run
 
 | Layer | Count | Notes |
 |---|---|---|
-| Product unit (config, api, lib, waf, notify, bench, worker, command, limits, challenge, shmem, geoip) | ~1100 | Lorica-specific code, including v1.5.0 hardening coverage (ammonia bypass corpus, named rate-limit buckets with Retry-After, per-route body-size 413 path, session rotation integration test, `public_version` masking, map_err context preservation). Tests currently require `--test-threads=1` on a full-suite run due to the existing verdict-cache global-state race tracked as backlog #16. |
+| Product unit (config, api, lib, waf, notify, bench, worker, command, limits, challenge, shmem, geoip) | ~1356 | Lorica-specific code, including v1.5.0 hardening coverage (ammonia bypass corpus, named rate-limit buckets with Retry-After, per-route body-size 413 path, session rotation integration test, `public_version` masking, map_err context preservation, cert-export orphan sweep + path-traversal rejection). The verdict-cache global-state race (backlog #16) is fixed in v1.5.0 via `serial_test` so the full suite runs parallel. |
 | Product e2e (real Pingora `Server` + mock backends) | 70+ | 10 binaries: mTLS, response rewriting, mirroring, forward auth, SWR, connection filter, canary, header routing, config, routing |
-| Pingora-forked crates (core, proxy, http, error, tls, cache, pool, runtime, timeout, lb) | 568 | Inherited upstream coverage kept passing on every change |
+| Pingora-forked crates (core, proxy, http, error, tls, cache, pool, runtime, timeout, lb) | 573 | Inherited upstream coverage kept passing on every change |
 | Frontend (vitest / svelte-check) | 287 | Form validation, type safety, component wiring |
-| **Total shipping tests** | **~1850** | |
+| **Total shipping tests** | **~1929** | |
 
 #### Docker end-to-end suites
 
@@ -578,16 +580,14 @@ gpg --verify lorica.deb.asc lorica.deb
 | Version | Features | Status |
 |---------|----------|--------|
 | v1.4.0 | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Shipped |
-| **v1.5.0** | Operator-input guard-rails on every field with blur + input inline errors; Route `group_name` + filter + colored pill; Certificate download API + dashboard split-menu with private-key confirm; Filesystem certificate export zone with per-pattern ACL, Settings tab, operator re-export endpoint; Path-rule redirect fix ; Security hardening wave: `ammonia` HTML sanitiser, per-endpoint rate limits on management plane, per-route body-size limits with 1 MiB global default, session cookie rotation on password change, `/system` response filter, `rustls-pemfile → rustls-pki-types` migration, `rand 0.9` bump, source-error preservation on `.map_err` chains, WebSocket log-stream backpressure with close-on-slow-client | Current |
-| v1.6.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) ; `proxy_wiring.rs` + `main.rs` module split ; ACME module unit tests with mocked DNS providers | Planned |
+| **v1.5.0** | Operator-input guard-rails on every field with blur + input inline errors; Route `group_name` + filter + colored pill; Certificate download API + dashboard split-menu with private-key confirm; Filesystem certificate export zone with per-pattern ACL, Settings tab, operator re-export endpoint, orphan sweep + per-row delete; Path-rule redirect fix ; Security hardening wave: `ammonia` HTML sanitiser, per-endpoint rate limits on management plane, per-route body-size limits with 1 MiB global default, session cookie rotation on password change, `/system` response filter, `rustls-pemfile → rustls-pki-types` migration, `rand 0.9` bump, source-error preservation on `.map_err` chains, WebSocket log-stream backpressure with close-on-slow-client ; Doc coverage pass + `#![warn(missing_docs)]` on every Lorica-native crate ; ACME unit tests (`wiremock` on Cloudflare + OVH challengers, `is_valid_dns_server` shell-filter, pure `should_auto_renew` predicate) ; `verdict_cache` test-parallelism race fixed via `serial_test` | Current |
+| v1.6.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) ; `proxy_wiring.rs` + `main.rs` module split | Planned |
 | v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
 
-### Backlog (no planned version yet)
+### Backlog (tracking only, blocked on upstream)
 
-- **Third-party IP-reputation feeds.** Beyond the built-in Data-Shield blocklist: pluggable feed sources (FireHOL, Spamhaus DROP, abuse.ch, custom HTTP endpoints) with per-feed allow / deny policy. Deferred: the stability of the feeds we reviewed (SLA for URL stability, license compatibility with Apache-2.0) is mixed, and the current `connection_deny_cidrs` + Data-Shield combo already covers 95 % of what operators ask for without a third-party trust boundary.
-- **PKCS#12 / JKS bundle export.** Complement the PEM export zone with `.p12` / `.jks` for Java keystore consumers. Deferred: `openssl pkcs12 -export` on the already-written PEM files is one line and keeps the Lorica code path free of OpenSSL-versus-rustls format-serialization.
-- **Exported-cert orphan cleanup.** When the operator deletes a certificate in the dashboard, the on-disk export directory is NOT removed (by design, v1.5.0 leaves it to the operator). A dashboard "sweep orphans" button is the likely v1.6.x follow-up.
-- **Public-API doc coverage pass (`missing_docs`).** Enable `#![warn(missing_docs)]` on `lorica-api` / `lorica-config` / `lorica-challenge` + fill remaining gaps in request / response type fields, settings keys, model fields. Enumerated but deferred from the v1.5.0 hardening wave — it is grind, not mechanical, and would create ~100+ new warnings to triage.
+- **`rustls-pemfile` removal in the `lorica-tls` fork.** RUSTSEC-2025-0134 (unmaintained) still shows transitively through our Pingora fork. Native Lorica code migrated to `rustls-pki-types` in v1.5.0 ; the transitive dep clears once Pingora upstream migrates.
+- **`rand 0.8` removal in forked crates.** RUSTSEC-2026-0097 (unsound with custom logger) still shows transitively via `lorica-runtime`, `lorica-limits`, and the `captcha` crate. Native Lorica code bumped to `rand 0.9` in v1.5.0 ; same monitoring as the `rustls-pemfile` row.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 

@@ -80,7 +80,7 @@ These RUSTSEC advisories are visible to `cargo audit` but hit only through forke
 | ID | Crate | Surface in Lorica-native code | Path |
 |----|-------|-------------------------------|------|
 | RUSTSEC-2025-0134 | `rustls-pemfile 2.2.0` (unmaintained) | None since v1.5.0 (direct usage swapped to `rustls-pki-types`) | Transitive via `lorica-tls` → `rustls-native-certs` |
-| RUSTSEC-2026-0097 | `rand 0.8.5` (unsound with custom logger) | None after v1.5.0 bump (direct call sites migrated to `rand 0.10`) | Transitive via `captcha`, forked `lorica-runtime`/`lorica-limits` |
+| RUSTSEC-2026-0097 | `rand 0.8.5` (unsound with custom logger) | None after v1.5.0 bump (direct call sites migrated to `rand 0.9` ; `0.10` was considered but the surrounding ecosystem `argon2 0.5` + `rand_chacha 0.9` has not caught up with the rand-core 0.10 migration) | Transitive via `captcha`, forked `lorica-runtime`/`lorica-limits` |
 
 The forked crates eventually inherit the upstream fix when Pingora migrates. Until then, mitigation is scope limitation (Lorica-native code does not call the affected APIs directly) plus the fact that both advisories require conditions we do not create (unmaintained-but-functional parser on a known PEM format ; custom logger + `rand::rng()` combo, while Lorica uses the stock `tracing` subscriber).
 

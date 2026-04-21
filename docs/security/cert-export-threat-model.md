@@ -1,6 +1,6 @@
 # Certificate Filesystem Export - Threat Model
 
-**Feature:** v1.4.1 `cert_export_*` + `cert_export_acls` + `GET /api/v1/certificates/:id/download`
+**Feature:** v1.5.0 `cert_export_*` + `cert_export_acls` + `GET /api/v1/certificates/:id/download` + orphan sweep
 **Author:** Romain G.
 **Status:** Shipped. Disabled by default. Operator opt-in.
 
@@ -13,7 +13,7 @@ jobs, `monit`, anything that watches a filesystem path) can pick up
 the live bundle without talking to the management API.
 
 This document enumerates the trust boundaries, the threat actors,
-and the mitigations the v1.4.1 implementation takes. It is scoped to
+and the mitigations the v1.5.0 implementation takes. It is scoped to
 the export feature - the wider Lorica threat model lives in
 `docs/security/threat-model.md`.
 
@@ -63,7 +63,7 @@ Trust boundary 1 (browser ↔ API) is the same as every other
 dashboard action and reuses the existing session / CSRF /
 rate-limit plumbing.
 
-Trust boundary 2 (Lorica ↔ disk) is the new boundary v1.4.1
+Trust boundary 2 (Lorica ↔ disk) is the new boundary v1.5.0
 introduces. Everything below documents how that boundary is kept
 narrow.
 
@@ -153,7 +153,7 @@ service user (and root) can write into the export dir.
 
 ## 6. Explicit non-goals
 
-- **No PKCS#12 output.** v1.4.1 ships PEM only. Operators who need
+- **No PKCS#12 output.** v1.5.0 ships PEM only. Operators who need
   a `.p12` bundle for a Java keystore can generate one from the PEM
   files with `openssl pkcs12 -export`.
 - **No key encryption on disk.** The whole point of this feature is
@@ -174,7 +174,7 @@ service user (and root) can write into the export dir.
   through the hostname sanitiser + the live-cert set before any
   filesystem write, so a stale or racy click cannot blow away a
   directory that still corresponds to an issued cert.
-- **No mirror to remote storage.** v1.4.1 writes locally. S3 /
+- **No mirror to remote storage.** v1.5.0 writes locally. S3 /
   remote-sync flavours are out of scope.
 
 ## 7. Deployment checklist
