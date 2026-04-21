@@ -42,11 +42,17 @@
 //! [`pow::verify_solution`], the captcha verifier in [`captcha::verify`])
 //! returns a typed `Result` and never panics on malformed bytes,
 //! garbage UTF-8, wrong lengths, or expired timestamps.
+#![warn(missing_docs)]
 
+/// Image captcha generator + verifier.
 pub mod captcha;
+/// HMAC-signed verdict cookie (pass-through between challenge passes).
 pub mod cookie;
+/// JavaScript proof-of-work challenge + solution verifier.
 pub mod pow;
+/// Embedded HTML templates for the browser-facing challenge pages.
 pub mod render;
+/// Process-wide HMAC secret lifecycle (load, rotate, lock-free read).
 pub mod secret;
 
 use thiserror::Error;
@@ -74,11 +80,19 @@ pub enum ChallengeError {
     /// Cookie / challenge expired. Verifier applies a ± 30 s clock-
     /// skew grace to tolerate drift between Lorica and the client.
     #[error("expired: {reason}")]
-    Expired { reason: &'static str },
+    Expired {
+        /// Short static tag naming which timestamp failed (e.g.
+        /// `"cookie_iat"`, `"pow_challenge_expiry"`) for log triage.
+        reason: &'static str,
+    },
 
     /// PoW solution did not meet the difficulty target.
     #[error("proof-of-work solution does not satisfy difficulty {difficulty} zero bits")]
-    PowBelowDifficulty { difficulty: u8 },
+    PowBelowDifficulty {
+        /// Required number of leading zero bits the SHA-256 of the
+        /// solution must carry.
+        difficulty: u8,
+    },
 
     /// Captcha answer did not match the expected text.
     #[error("captcha answer mismatch")]
@@ -91,6 +105,8 @@ pub enum ChallengeError {
     Internal(&'static str),
 }
 
+/// Convenience alias for `Result<T, ChallengeError>` used by every
+/// public entry point in this crate.
 pub type Result<T> = std::result::Result<T, ChallengeError>;
 
 /// Which mode issued a given verdict cookie. Stamped into the
@@ -100,12 +116,17 @@ pub type Result<T> = std::result::Result<T, ChallengeError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Mode {
+    /// Passive: caller only trusts the pre-existing verdict cookie
+    /// (no interactive challenge). Fastest path.
     Cookie = 1,
+    /// Browser runs the JavaScript PoW loop and posts back a solution.
     Javascript = 2,
+    /// Operator-facing image captcha (typed answer).
     Captcha = 3,
 }
 
 impl Mode {
+    /// Short lowercase tag usable in metrics labels and log fields.
     pub fn as_str(self) -> &'static str {
         match self {
             Mode::Cookie => "cookie",
@@ -135,8 +156,10 @@ impl Mode {
 /// against `203.0.114.0/24`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpPrefix {
-    V4([u8; 4]),  // first 3 bytes significant, byte 3 zero-padded
-    V6([u8; 16]), // first 8 bytes significant, bytes 8..16 zero-padded
+    /// IPv4 `/24` : first 3 bytes significant, 4th byte zero-padded.
+    V4([u8; 4]),
+    /// IPv6 `/64` : first 8 bytes significant, bytes 8..16 zero-padded.
+    V6([u8; 16]),
 }
 
 impl IpPrefix {

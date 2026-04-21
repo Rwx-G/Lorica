@@ -67,7 +67,10 @@ pub struct Challenge {
     /// adequate to make nonce collisions across concurrent
     /// clients astronomically unlikely.
     pub nonce: [u8; NONCE_LEN],
+    /// Number of leading zero bits the SHA-256 of `nonce + solution`
+    /// must produce to be accepted.
     pub difficulty: u8,
+    /// Unix timestamp past which the verifier refuses the solution.
     pub expires_at: u64,
 }
 
