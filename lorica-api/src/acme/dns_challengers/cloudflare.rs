@@ -18,19 +18,33 @@ use tracing::info;
 
 use super::DnsChallenger;
 
+/// Default Cloudflare API v4 base URL. Swapped in tests via
+/// `with_base_url` to point at a `wiremock` mock server.
+const CLOUDFLARE_API_V4: &str = "https://api.cloudflare.com/client/v4";
+
 /// Cloudflare DNS-01 challenger using the Cloudflare API v4.
 pub struct CloudflareDnsChallenger {
     zone_id: String,
     api_token: String,
+    base_url: String,
     client: reqwest::Client,
 }
 
 impl CloudflareDnsChallenger {
-    /// Construct a new challenger bound to a Cloudflare zone and API token.
+    /// Construct a new challenger bound to a Cloudflare zone and API token,
+    /// targeting the public Cloudflare API.
     pub fn new(zone_id: String, api_token: String) -> Self {
+        Self::with_base_url(zone_id, api_token, CLOUDFLARE_API_V4.to_string())
+    }
+
+    /// Construct a challenger with a custom API base URL. `pub(crate)` so
+    /// unit tests in `acme::tests` can point the challenger at a
+    /// `wiremock::MockServer` instance.
+    pub(crate) fn with_base_url(zone_id: String, api_token: String, base_url: String) -> Self {
         Self {
             zone_id,
             api_token,
+            base_url,
             client: reqwest::Client::new(),
         }
     }
@@ -38,8 +52,8 @@ impl CloudflareDnsChallenger {
     /// Find the record ID for a given TXT record name.
     async fn find_record_id(&self, name: &str) -> Result<Option<String>, String> {
         let url = format!(
-            "https://api.cloudflare.com/client/v4/zones/{}/dns_records?type=TXT&name={}",
-            self.zone_id, name
+            "{}/zones/{}/dns_records?type=TXT&name={}",
+            self.base_url, self.zone_id, name
         );
         let resp = self
             .client
@@ -70,10 +84,7 @@ impl CloudflareDnsChallenger {
 impl DnsChallenger for CloudflareDnsChallenger {
     async fn create_txt_record(&self, domain: &str, value: &str) -> Result<(), String> {
         let record_name = format!("_acme-challenge.{domain}");
-        let url = format!(
-            "https://api.cloudflare.com/client/v4/zones/{}/dns_records",
-            self.zone_id
-        );
+        let url = format!("{}/zones/{}/dns_records", self.base_url, self.zone_id);
 
         let payload = serde_json::json!({
             "type": "TXT",
@@ -113,8 +124,8 @@ impl DnsChallenger for CloudflareDnsChallenger {
             .ok_or_else(|| format!("TXT record '{record_name}' not found for deletion"))?;
 
         let url = format!(
-            "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{record_id}",
-            self.zone_id
+            "{}/zones/{}/dns_records/{record_id}",
+            self.base_url, self.zone_id
         );
 
         let resp = self
