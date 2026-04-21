@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 /// "does this glob match" check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertExportAcl {
+    /// Stable UUID; primary key.
     pub id: String,
     /// Hostname pattern. Exact (`grafana.mibu.fr`), leading wildcard
     /// (`*.prod.example.com`), or `*` for "match every hostname".
@@ -36,6 +37,7 @@ pub struct CertExportAcl {
     /// Optional override for the gid. `None` = inherit the global
     /// default.
     pub allowed_gid: Option<u32>,
+    /// Insert timestamp.
     pub created_at: DateTime<Utc>,
 }
 

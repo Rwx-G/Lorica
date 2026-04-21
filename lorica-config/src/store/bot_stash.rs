@@ -25,16 +25,30 @@ use crate::error::Result;
 /// — semantics live in `lorica::bot`, we just move bytes.
 #[derive(Debug, Clone)]
 pub struct BotStashEntry {
+    /// Random hex nonce identifying the challenge.
     pub nonce: String,
+    /// Challenge kind (`"pow"` / `"captcha"`).
     pub kind: String,
+    /// Opaque JSON payload that the caller ser/deses.
     pub payload: String,
+    /// Numeric value of `lorica_challenge::Mode::as_u8()`.
     pub mode: u8,
+    /// `Route.id` this challenge belongs to.
     pub route_id: String,
+    /// IP prefix discriminator (1 = IPv4, 2 = IPv6).
     pub ip_prefix_disc: u8,
+    /// IP prefix bytes (3 for v4, 8 for v6 - see
+    /// `lorica_challenge::IpPrefix::as_bytes`).
     pub ip_prefix_bytes: Vec<u8>,
+    /// URL the client returns to after solving.
     pub return_url: String,
+    /// Desired verdict-cookie TTL in seconds once the challenge is
+    /// solved.
     pub cookie_ttl_s: u32,
+    /// Unix timestamp past which the challenge is evicted.
     pub expires_at: i64,
+    /// Captcha PNG bytes (only set when `kind == "captcha"` ; capped
+    /// at 512 KiB).
     pub png_bytes: Option<Vec<u8>>,
 }
 

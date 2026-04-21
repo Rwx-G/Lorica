@@ -11,20 +11,30 @@ use crate::store::ConfigStore;
 /// remain valid.
 #[derive(Debug, Deserialize)]
 pub struct ImportData {
+    /// Export schema version (must be >= 1 ; 0 is rejected).
     pub version: u32,
+    /// Snapshot of `GlobalSettings`.
     pub global_settings: GlobalSettings,
+    /// All rows of the `routes` table.
     #[serde(default)]
     pub routes: Vec<Route>,
+    /// All rows of the `backends` table.
     #[serde(default)]
     pub backends: Vec<Backend>,
+    /// All rows of the `route_backends` join table.
     #[serde(default)]
     pub route_backends: Vec<RouteBackend>,
+    /// All rows of the `certificates` table.
     #[serde(default)]
     pub certificates: Vec<Certificate>,
+    /// All rows of the `notification_configs` table.
     #[serde(default)]
     pub notification_configs: Vec<NotificationConfig>,
+    /// All rows of the `user_preferences` table.
     #[serde(default)]
     pub user_preferences: Vec<UserPreference>,
+    /// All rows of the `admin_users` table (password hashes are
+    /// redacted to `**REDACTED**` on export ; import rejects those).
     #[serde(default)]
     pub admin_users: Vec<AdminUser>,
 }

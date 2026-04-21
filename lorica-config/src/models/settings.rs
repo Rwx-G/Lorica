@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 /// `GlobalSettings`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityHeaderPreset {
+    /// Preset identifier (matches `Route.security_headers`).
     pub name: String,
+    /// Name → value map of HTTP response headers the preset emits.
     pub headers: HashMap<String, String>,
 }
 
@@ -83,19 +85,33 @@ pub fn resolve_security_preset<'a>(
 /// rewritten in full by `update_global_settings`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalSettings {
+    /// TCP port the management HTTP / WS API listens on (loopback
+    /// by default). 9443 out-of-box.
     pub management_port: u16,
+    /// `tracing` subscriber filter, e.g. `"info"`, `"debug"`,
+    /// `"lorica=debug,hyper=warn"`.
     pub log_level: String,
+    /// Fallback health-check interval applied when a backend has
+    /// none set of its own.
     pub default_health_check_interval_s: i32,
+    /// Days-to-expiry at which the cert expiry task emits a WARN
+    /// alert.
     #[serde(default = "default_cert_warning_days")]
     pub cert_warning_days: i32,
+    /// Days-to-expiry at which the cert expiry task escalates to a
+    /// CRITICAL alert.
     #[serde(default = "default_cert_critical_days")]
     pub cert_critical_days: i32,
+    /// Cap on concurrent synthetic probes running at once.
     #[serde(default = "default_max_active_probes")]
     pub max_active_probes: i32,
+    /// Load-test : max concurrent virtual users per run.
     #[serde(default = "default_loadtest_max_concurrency")]
     pub loadtest_max_concurrency: i32,
+    /// Load-test : max run duration in seconds.
     #[serde(default = "default_loadtest_max_duration_s")]
     pub loadtest_max_duration_s: i32,
+    /// Load-test : max steady-state RPS per run.
     #[serde(default = "default_loadtest_max_rps")]
     pub loadtest_max_rps: i32,
     /// Maximum total proxy connections across all routes.
