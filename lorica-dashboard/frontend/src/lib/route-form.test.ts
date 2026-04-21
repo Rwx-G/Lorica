@@ -1804,6 +1804,21 @@ describe('validateRouteFormWithTab', () => {
     expect(r.tab).toBeNull();
   });
 
+  it('accepts cache_ttl_s=0 (always-revalidate) and cache_max_mb=0 (no cap)', () => {
+    // v1.5.1 follow-up : 0 is a valid runtime sentinel on both
+    // fields. See the matching backend test
+    // `cache_ttl_and_max_bytes_accept_zero`.
+    const r = validateRouteFormWithTab(base({ cache_ttl_s: 0, cache_max_mb: 0 }));
+    expect(r.message).toBe('');
+    expect(r.tab).toBeNull();
+  });
+
+  it('still rejects cache_ttl_s past the 1-year cap', () => {
+    const r = validateRouteFormWithTab(base({ cache_ttl_s: 40_000_000 }));
+    expect(r.message).toMatch(/Cache TTL/);
+    expect(r.tab).toBe('cache');
+  });
+
   it('attributes timeout errors to the upstream tab', () => {
     const r = validateRouteFormWithTab(base({ connect_timeout_s: 9999 }));
     expect(r.message).toMatch(/Connect timeout/);

@@ -822,11 +822,21 @@ fn validate_route_numeric_bounds(
     if let Some(v) = send_timeout_s {
         check_range(v, 1, 3600, "send_timeout_s")?;
     }
+    // `cache_ttl_s == 0` is a valid HTTP cache configuration :
+    // `response_cache_filter` computes `fresh_until = now + ttl_s`
+    // so a zero TTL stores the entry but marks it already expired,
+    // forcing revalidation on every hit (equivalent to the origin
+    // sending `Cache-Control: max-age=0`, useful paired with
+    // stale-while-revalidate). `cache_max_bytes == 0` is the
+    // "no per-entry size cap" sentinel in `request_cache_filter`
+    // (the `cache_max_bytes > 0` guard skips
+    // `set_max_file_size_bytes`). Both legitimate values were
+    // rejected by the v1.5.0 lower-bound-1 validator.
     if let Some(v) = cache_ttl_s {
-        check_range(v, 1, 31_536_000, "cache_ttl_s")?;
+        check_range(v, 0, 31_536_000, "cache_ttl_s")?;
     }
     if let Some(v) = cache_max_bytes {
-        check_range(v, 1, 137_438_953_472, "cache_max_bytes")?; // 128 GiB
+        check_range(v, 0, 137_438_953_472, "cache_max_bytes")?; // 128 GiB
     }
     // `max_connections` and `auto_ban_threshold` treat `0` as the
     // "clear / disabled / no limit" sentinel on `update_route` (the
@@ -1723,6 +1733,61 @@ mod route_numeric_bounds_tests {
                 )
             },
             "return_status",
+        );
+    }
+
+    #[test]
+    fn cache_ttl_and_max_bytes_accept_zero() {
+        // v1.5.1 follow-up : `cache_ttl_s == 0` is a valid HTTP
+        // cache configuration (always revalidate, paired with SWR)
+        // and `cache_max_bytes == 0` is the runtime sentinel for
+        // "no per-entry size cap" (see the `cache_max_bytes > 0`
+        // guard in `request_cache_filter`). Both were rejected by
+        // the v1.5.0 lower-bound-1 validator.
+        ok(|| {
+            validate_route_numeric_bounds(
+                None,
+                None,
+                None,
+                Some(0), // cache_ttl_s
+                Some(0), // cache_max_bytes
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        });
+    }
+
+    #[test]
+    fn cache_ttl_still_rejects_values_past_the_cap() {
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    Some(40_000_000), // past the 1-year cap
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "cache_ttl_s",
         );
     }
 }

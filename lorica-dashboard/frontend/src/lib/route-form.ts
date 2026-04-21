@@ -1084,8 +1084,11 @@ export function validateRouteFormWithTab(form: RouteFormState): ValidationResult
   if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return r('Read timeout must be between 1 and 3600', 'upstream');
   if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return r('Send timeout must be between 1 and 3600', 'upstream');
   if (form.max_body_mb && Number(form.max_body_mb) <= 0) return r('Max body size must be greater than 0', 'protection');
-  if (form.cache_ttl_s < 1 || form.cache_ttl_s > 31_536_000) return r('Cache TTL must be between 1 and 31536000 (1 year)', 'cache');
-  if (form.cache_max_mb < 1 || form.cache_max_mb > 131_072) return r('Cache max size must be between 1 and 131072 MiB (128 GiB)', 'cache');
+  // Cache TTL / max size : 0 is a valid sentinel (always-
+  // revalidate for TTL, no size cap for max_size). See the
+  // matching backend comment in `validate_route_numeric_bounds`.
+  if (form.cache_ttl_s < 0 || form.cache_ttl_s > 31_536_000) return r('Cache TTL must be between 0 and 31536000 (1 year)', 'cache');
+  if (form.cache_max_mb < 0 || form.cache_max_mb > 131_072) return r('Cache max size must be between 0 and 131072 MiB (128 GiB)', 'cache');
   if (form.stale_while_revalidate_s < 0 || form.stale_while_revalidate_s > 86_400) return r('Stale-while-revalidate must be between 0 and 86400 (1 day)', 'cache');
   if (form.stale_if_error_s < 0 || form.stale_if_error_s > 86_400) return r('Stale-if-error must be between 0 and 86400 (1 day)', 'cache');
   if (form.max_connections) {
@@ -1274,8 +1277,8 @@ export function validateRouteForm(form: RouteFormState): string {
   if (form.read_timeout_s < 1 || form.read_timeout_s > 3600) return 'Read timeout must be between 1 and 3600';
   if (form.send_timeout_s < 1 || form.send_timeout_s > 3600) return 'Send timeout must be between 1 and 3600';
   if (form.max_body_mb && Number(form.max_body_mb) <= 0) return 'Max body size must be greater than 0';
-  if (form.cache_ttl_s < 1 || form.cache_ttl_s > 31_536_000) return 'Cache TTL must be between 1 and 31536000 (1 year)';
-  if (form.cache_max_mb < 1 || form.cache_max_mb > 131_072) return 'Cache max size must be between 1 and 131072 MiB (128 GiB)';
+  if (form.cache_ttl_s < 0 || form.cache_ttl_s > 31_536_000) return 'Cache TTL must be between 0 and 31536000 (1 year)';
+  if (form.cache_max_mb < 0 || form.cache_max_mb > 131_072) return 'Cache max size must be between 0 and 131072 MiB (128 GiB)';
   if (form.stale_while_revalidate_s < 0 || form.stale_while_revalidate_s > 86_400) return 'Stale-while-revalidate must be between 0 and 86400 (1 day)';
   if (form.stale_if_error_s < 0 || form.stale_if_error_s > 86_400) return 'Stale-if-error must be between 0 and 86400 (1 day)';
   if (form.max_connections) {

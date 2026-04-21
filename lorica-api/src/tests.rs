@@ -4321,3 +4321,77 @@ async fn test_create_route_max_connections_zero_stores_none() {
         "return_status=0 on create must land as None (absent or null)"
     );
 }
+
+/// v1.5.1 follow-up : `cache_ttl_s == 0` and `cache_max_bytes == 0`
+/// are valid runtime configurations (always-revalidate + no
+/// per-entry size cap). The v1.5.0 validator rejected both with
+/// "must be in 1..=MAX", breaking every route save on routes that
+/// were legitimately running a 0-TTL cache setup in production.
+#[tokio::test]
+async fn test_update_route_cache_ttl_zero_is_accepted() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create a route with the default TTL.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let create_body = serde_json::json!({
+        "hostname": "zero-ttl.example.com",
+        "cache_enabled": true,
+        "cache_ttl_s": 300,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/routes")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&create_body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    let route_id = json["data"]["id"].as_str().expect("test setup").to_string();
+
+    // Update to cache_ttl_s = 0 (always revalidate) + cache_max_bytes = 0
+    // (no per-entry size cap).
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let update_body = serde_json::json!({ "cache_ttl_s": 0, "cache_max_bytes": 0 });
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/routes/{route_id}"))
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&update_body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "cache_ttl_s=0 and cache_max_bytes=0 must not 400 any more"
+    );
+
+    // Re-fetch and confirm the values landed verbatim (cache fields
+    // do NOT use the "0 => None" normalisation ; 0 IS the stored
+    // value because it carries a distinct runtime semantic).
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/routes/{route_id}"))
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("test setup");
+    assert_eq!(json["data"]["cache_ttl_s"], 0);
+    assert_eq!(json["data"]["cache_max_bytes"], 0);
+}
