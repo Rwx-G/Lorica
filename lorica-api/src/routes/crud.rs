@@ -828,20 +828,37 @@ fn validate_route_numeric_bounds(
     if let Some(v) = cache_max_bytes {
         check_range(v, 1, 137_438_953_472, "cache_max_bytes")?; // 128 GiB
     }
+    // `max_connections` and `auto_ban_threshold` treat `0` as the
+    // "clear / disabled / no limit" sentinel on `update_route` (the
+    // handler normalises `Some(0) => None` before writing to the
+    // DB ; the dashboard relies on this via `empty(0)` in
+    // `route-form.ts` to re-clear an optional field). Extend the
+    // lower bound to 0 here so the clear path is not mistaken for
+    // a bad value ; any non-zero value still has to land inside
+    // the documented bounds.
     if let Some(v) = max_connections {
-        check_range(v, 1, 1_000_000, "max_connections")?;
+        check_range(v, 0, 1_000_000, "max_connections")?;
     }
     if let Some(v) = slowloris_threshold_ms {
         check_range(v, 100, 600_000, "slowloris_threshold_ms")?;
     }
     if let Some(v) = auto_ban_threshold {
-        check_range(v, 1, 10_000, "auto_ban_threshold")?;
+        check_range(v, 0, 10_000, "auto_ban_threshold")?;
     }
     if let Some(v) = auto_ban_duration_s {
         check_range(v, 1, 31_536_000, "auto_ban_duration_s")?;
     }
+    // `return_status` uses the same "0 = clear" convention, but
+    // unlike the two fields above, non-zero values MUST be a valid
+    // HTTP status code (100..=599). Extending the range to
+    // `0..=599` would let `return_status: 42` through and emit a
+    // malformed response line on the wire. Bypass the range check
+    // for 0 explicitly so the clear path works while the HTTP
+    // range stays strict for every other value.
     if let Some(v) = return_status {
-        check_range(v, 100, 599, "return_status")?;
+        if v != 0 {
+            check_range(v, 100, 599, "return_status")?;
+        }
     }
     if let Some(v) = retry_attempts {
         check_range(v, 0, 10, "retry_attempts")?;
@@ -1574,7 +1591,38 @@ mod route_numeric_bounds_tests {
     }
 
     #[test]
-    fn max_connections_and_auto_ban_thresholds() {
+    fn zero_is_accepted_as_clear_on_the_three_optional_fields() {
+        // v1.5.1 fix : `max_connections`, `auto_ban_threshold` and
+        // `return_status` all follow the "0 = clear / disabled /
+        // no limit" convention the frontend sends on every UPDATE
+        // via `route-form.ts::empty(0)`. The old validator
+        // rejected 0 for all three, producing "must be in 1..=X"
+        // 400s on every route save for routes that were never
+        // configured with a max / auto-ban / short-circuit.
+        assert!(validate_route_numeric_bounds(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(0), // max_connections
+            None,
+            Some(0), // auto_ban_threshold
+            None,
+            Some(0), // return_status
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn max_connections_still_rejects_values_past_the_cap() {
+        // Zero means "clear" (see above), but any non-zero value
+        // must still land inside the documented bounds.
         err_matches(
             || {
                 validate_route_numeric_bounds(
@@ -1583,7 +1631,7 @@ mod route_numeric_bounds_tests {
                     None,
                     None,
                     None,
-                    Some(0),
+                    Some(2_000_000), // past the 1_000_000 cap
                     None,
                     None,
                     None,
@@ -1597,6 +1645,10 @@ mod route_numeric_bounds_tests {
             },
             "max_connections",
         );
+    }
+
+    #[test]
+    fn auto_ban_threshold_still_rejects_values_past_the_cap() {
         err_matches(
             || {
                 validate_route_numeric_bounds(
@@ -1607,7 +1659,7 @@ mod route_numeric_bounds_tests {
                     None,
                     None,
                     None,
-                    Some(0),
+                    Some(50_000), // past the 10_000 cap
                     None,
                     None,
                     None,
@@ -1618,6 +1670,59 @@ mod route_numeric_bounds_tests {
                 )
             },
             "auto_ban_threshold",
+        );
+    }
+
+    #[test]
+    fn return_status_accepts_zero_but_rejects_invalid_http_status() {
+        // The 0 = clear sentinel is accepted, but unlike
+        // max_connections / auto_ban_threshold the non-zero range
+        // is restricted to valid HTTP status codes (100..=599) so
+        // a typo like `return_status: 42` doesn't emit a
+        // malformed response line on the wire.
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(42), // below HTTP range
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "return_status",
+        );
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(650), // above HTTP range
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "return_status",
         );
     }
 }
@@ -3159,10 +3264,21 @@ pub async fn create_route(
         access_log_enabled: body.access_log_enabled.unwrap_or(true),
         proxy_headers_remove: body.proxy_headers_remove.unwrap_or_default(),
         response_headers_remove: body.response_headers_remove.unwrap_or_default(),
-        max_request_body_bytes: body.max_request_body_bytes,
+        // Six fields below honour the "0 = clear" convention that
+        // `update_route` already implements : `Some(0)` in the DB
+        // either has no meaningful semantic (e.g. `rate_limit_rps=0`
+        // = reject every request, which nobody configures that way)
+        // or is equivalent to `None` (e.g. `max_request_body_bytes=0`
+        // is documented as "unlimited"). Normalise here too so a
+        // direct `curl POST` does not land a stray `Some(0)` in the
+        // DB ; CREATE and UPDATE stay symmetric.
+        // `retry_attempts` and `cors_max_age_s` deliberately keep
+        // `Some(0)` because 0 is a valid configuration there
+        // (no retries / preflight-uncached).
+        max_request_body_bytes: body.max_request_body_bytes.filter(|&v| v != 0),
         websocket_enabled: body.websocket_enabled.unwrap_or(true),
-        rate_limit_rps: body.rate_limit_rps,
-        rate_limit_burst: body.rate_limit_burst,
+        rate_limit_rps: body.rate_limit_rps.filter(|&v| v != 0),
+        rate_limit_burst: body.rate_limit_burst.filter(|&v| v != 0),
         ip_allowlist: body.ip_allowlist.unwrap_or_default(),
         ip_denylist: body.ip_denylist.unwrap_or_default(),
         cors_allowed_origins: body.cors_allowed_origins.unwrap_or_default(),
@@ -3173,12 +3289,12 @@ pub async fn create_route(
         cache_enabled: body.cache_enabled.unwrap_or(false),
         cache_ttl_s: body.cache_ttl_s.unwrap_or(300),
         cache_max_bytes: body.cache_max_bytes.unwrap_or(52428800),
-        max_connections: body.max_connections,
+        max_connections: body.max_connections.filter(|&v| v != 0),
         slowloris_threshold_ms: body.slowloris_threshold_ms.unwrap_or(5000),
-        auto_ban_threshold: body.auto_ban_threshold,
+        auto_ban_threshold: body.auto_ban_threshold.filter(|&v| v != 0),
         auto_ban_duration_s: body.auto_ban_duration_s.unwrap_or(3600),
         path_rules,
-        return_status: body.return_status,
+        return_status: body.return_status.filter(|&v| v != 0),
         sticky_session: body.sticky_session.unwrap_or(false),
         basic_auth_username: body.basic_auth_username.clone(),
         basic_auth_password_hash: if let Some(ref pw) = body.basic_auth_password {
