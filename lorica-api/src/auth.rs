@@ -32,27 +32,35 @@ fn argon2_hasher() -> argon2::Argon2<'static> {
 /// JSON body for `POST /api/v1/auth/login`.
 #[derive(Deserialize)]
 pub struct LoginRequest {
+    /// Username.
     pub username: String,
+    /// Plaintext password (hashed Argon2id in the store).
     pub password: String,
 }
 
 /// Successful login payload returned in the `data` envelope.
 #[derive(Serialize)]
 pub struct LoginResponse {
+    /// `true` when the user must rotate their password on next login
+    /// (post admin reset).
     pub must_change_password: bool,
+    /// RFC 3339 expiry timestamp of the issued session cookie.
     pub session_expires_at: String,
 }
 
 /// JSON body for `PUT /api/v1/auth/password`.
 #[derive(Deserialize)]
 pub struct ChangePasswordRequest {
+    /// Old password (verified against the stored Argon2id hash).
     pub current_password: String,
+    /// New password ; re-hashed and persisted.
     pub new_password: String,
 }
 
 /// Acknowledgement returned after a successful password change.
 #[derive(Serialize)]
 pub struct PasswordChangedResponse {
+    /// Human-readable message.
     pub message: String,
 }
 
@@ -70,9 +78,16 @@ pub async fn login(
     let client_ip = connect_info
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    let rate_key = format!("login:{client_ip}");
-    if !rate_limiter.check(&rate_key).await {
-        return Err(ApiError::RateLimited);
+    // Legacy fixed 5/60 s login bucket. Retained via
+    // `RateLimiter::check` (wrapper around the new
+    // `check_bucket("login", ...)`). The Retry-After on the 429
+    // response is computed from the same fixed window so clients
+    // polite enough to honour it back off correctly.
+    if !rate_limiter.check(client_ip.as_str()).await {
+        // 60 s fixed window ceiling is good enough for the legacy
+        // path ; the named-bucket version computes the exact
+        // remaining time.
+        return Err(ApiError::RateLimited(60));
     }
 
     let store = state.store.lock().await;
@@ -82,7 +97,7 @@ pub async fn login(
         .ok_or_else(|| ApiError::Unauthorized("invalid credentials".into()))?;
 
     let parsed_hash = argon2::PasswordHash::new(&user.password_hash)
-        .map_err(|_| ApiError::Internal("invalid stored password hash".into()))?;
+        .map_err(|e| ApiError::Internal(format!("invalid stored password hash: {e}")))?;
 
     use argon2::PasswordVerifier;
     argon2_hasher()
@@ -140,27 +155,19 @@ pub async fn logout(
     )
 }
 
-/// Extract the current session ID from request headers.
-fn extract_current_session_id(headers: &http::HeaderMap) -> Option<String> {
-    let cookie_header = headers.get(http::header::COOKIE)?.to_str().ok()?;
-    for cookie in cookie_header.split(';') {
-        let cookie = cookie.trim();
-        if let Some(value) = cookie.strip_prefix("lorica_session=") {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
 /// PUT /api/v1/auth/password - rotate the current user's password.
 ///
-/// Verifies the current password, enforces 8-128 character bounds on the new
-/// one, and invalidates every other session belonging to this user.
+/// Verifies the current password, enforces 8-128 character bounds
+/// on the new one, then invalidates **every** session belonging to
+/// this user (including the currently active one) and mints a
+/// fresh session. The response carries a `Set-Cookie` header with
+/// the new session id so the legitimate user stays logged in while
+/// any attacker holding the previous cookie gets a 401 on the
+/// next call (v1.5.0 audit LOW-13).
 pub async fn change_password(
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
     Extension(session): Extension<Session>,
-    headers: http::HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     if body.new_password.len() < 8 {
@@ -174,48 +181,66 @@ pub async fn change_password(
         ));
     }
 
-    let store = state.store.lock().await;
-    let user = store
-        .get_admin_user(&session.user_id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
+    // Verify current password + persist new hash. We scope the
+    // ConfigStore Mutex guard so it drops BEFORE calling
+    // `session_store.create(...)` below : `SessionStore::create`
+    // re-acquires the same `ConfigStore` Mutex to persist the new
+    // session row, and holding both would deadlock.
+    {
+        let store = state.store.lock().await;
+        let user = store
+            .get_admin_user(&session.user_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
 
-    // Verify current password
-    let parsed_hash = argon2::PasswordHash::new(&user.password_hash)
-        .map_err(|_| ApiError::Internal("invalid stored password hash".into()))?;
+        let parsed_hash = argon2::PasswordHash::new(&user.password_hash)
+            .map_err(|e| ApiError::Internal(format!("invalid stored password hash: {e}")))?;
 
-    use argon2::PasswordVerifier;
-    argon2_hasher()
-        .verify_password(body.current_password.as_bytes(), &parsed_hash)
-        .map_err(|_| ApiError::Unauthorized("current password is incorrect".into()))?;
+        use argon2::PasswordVerifier;
+        argon2_hasher()
+            .verify_password(body.current_password.as_bytes(), &parsed_hash)
+            .map_err(|_| ApiError::Unauthorized("current password is incorrect".into()))?;
 
-    // Hash new password
-    let new_hash = hash_password(&body.new_password)?;
+        let new_hash = hash_password(&body.new_password)?;
+        let mut updated_user = user;
+        updated_user.password_hash = new_hash;
+        updated_user.must_change_password = false;
+        store
+            .update_admin_user(&updated_user)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
 
-    let mut updated_user = user;
-    updated_user.password_hash = new_hash;
-    updated_user.must_change_password = false;
-    store
-        .update_admin_user(&updated_user)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    // Invalidate all sessions for this user except the current one
-    let current_session_id = extract_current_session_id(&headers).unwrap_or_default();
-    session_store
-        .remove_all_for_user_except(&session.user_id, &current_session_id)
+    // Invalidate EVERY session for this user (including the
+    // currently active one) so a stolen cookie cannot outlive a
+    // password rotation. Then mint a fresh session for the
+    // legitimate user and ship it back via Set-Cookie. Both
+    // session_store calls take `self.db.lock()` internally ; doing
+    // this AFTER dropping the store guard above avoids the
+    // classic lock-ordering deadlock.
+    session_store.remove_all_for_user(&session.user_id).await;
+    let new_session_id = session_store
+        .create(session.user_id.clone(), session.username.clone())
         .await;
 
-    Ok(json_data(PasswordChangedResponse {
-        message: "Password updated".into(),
-    }))
+    Ok((
+        [(http::header::SET_COOKIE, session_cookie(&new_session_id))],
+        json_data(PasswordChangedResponse {
+            message: "Password updated".into(),
+        }),
+    ))
 }
 
 /// Hash a password using argon2.
 pub fn hash_password(password: &str) -> Result<String, ApiError> {
-    use argon2::password_hash::SaltString;
+    use argon2::password_hash::{rand_core::OsRng, SaltString};
     use argon2::PasswordHasher;
-    use rand::rngs::OsRng;
 
+    // `argon2` 0.5 re-exports rand_core 0.6. Its `SaltString::generate`
+    // accepts the rand_core 0.6 `CryptoRngCore` trait, which `rand`
+    // 0.9's top-level `OsRng` does not implement (rand moved to
+    // rand_core 0.9 in 0.9.0). Using the re-exported type keeps
+    // argon2 on its own rand_core without forcing rand_core 0.6 as a
+    // separate direct dep here.
     let salt = SaltString::generate(&mut OsRng);
     let hash = argon2_hasher()
         .hash_password(password.as_bytes(), &salt)
@@ -225,22 +250,23 @@ pub fn hash_password(password: &str) -> Result<String, ApiError> {
 
 /// Generate a random password for first-run admin setup.
 ///
-/// Uses `OsRng` (getrandom) rather than `thread_rng` so the first-run
-/// password is unpredictable even if the thread_rng seeding path ever
-/// degrades. Matches the other crypto-sensitive RNG in this file
-/// (`hash_password`'s `SaltString::generate(OsRng)`). Audit L-5.
+/// Uses `OsRng` (getrandom) rather than the thread-local RNG so the
+/// first-run password is unpredictable even if any thread-local
+/// seeding path ever degrades. Matches the other crypto-sensitive
+/// RNG in this file (`hash_password`'s `SaltString::generate(OsRng)`).
+/// Audit L-5.
 pub fn generate_random_password() -> String {
-    use rand::{Rng, SeedableRng};
+    use rand::Rng;
+    use rand::SeedableRng;
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%&*";
-    // ChaCha20 seeded from OsRng: fast, deterministic-per-seed
-    // sequence but seeded from OS entropy. `rand::rngs::OsRng` itself
-    // is not a `Rng` in rand 0.8 (it's a `CryptoRng + RngCore`), and
-    // `gen_range` requires a `Rng`, so we re-seed a CSPRNG from OsRng.
-    let mut rng = rand_chacha::ChaCha20Rng::from_rng(rand::rngs::OsRng)
-        .expect("OsRng must seed ChaCha20 for admin password generation");
+    // ChaCha20 seeded from OsRng : fast, deterministic-per-seed
+    // sequence but seeded from OS entropy. `rand::rngs::OsRng` is
+    // `CryptoRng + RngCore` ; `random_range` requires a `Rng`, so we
+    // re-seed a CSPRNG from OsRng.
+    let mut rng = rand_chacha::ChaCha20Rng::from_os_rng();
     (0..24)
         .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
+            let idx = rng.random_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect()

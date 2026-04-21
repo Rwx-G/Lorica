@@ -79,6 +79,34 @@
     return importedFields?.has(field) ?? false;
   }
 
+  /**
+   * Per-split field errors. Matches `build_traffic_split` server-side
+   * rules (name <= 128 chars, no control chars; weight 0..100).
+   */
+  function splitErrors(split: TrafficSplitFormState) {
+    const name = split.name;
+    let nameErr: string | null = null;
+    if (name.length > 128) nameErr = 'name longer than 128 characters';
+    else {
+      for (const c of name) {
+        const code = c.codePointAt(0) ?? 0;
+        if (code < 0x20 || code === 0x7f) { nameErr = 'name contains a control character'; break; }
+      }
+    }
+    let weightErr: string | null = null;
+    const w = Number(split.weight_percent);
+    if (!Number.isInteger(w) || w < 0 || w > 100) {
+      weightErr = 'weight must be an integer in 0..100';
+    }
+    // A non-zero weight with no backends selected drops the traffic
+    // on the floor - fatal, flag it inline.
+    let backendsErr: string | null = null;
+    if (w > 0 && split.backend_ids.length === 0) {
+      backendsErr = 'a split with weight > 0 must pick at least one backend';
+    }
+    return { name: nameErr, weight: weightErr, backends: backendsErr };
+  }
+
   let totalWeight = $derived(
     form.traffic_splits.reduce((sum, s) => sum + (Number(s.weight_percent) || 0), 0),
   );
@@ -114,6 +142,7 @@
     </div>
 
     {#each form.traffic_splits as split, index (index)}
+      {@const errs = splitErrors(split)}
       <div class="rule-card">
         <div class="rule-header">
           <div class="rule-header-left">
@@ -122,6 +151,7 @@
               id="canary-name-{index}"
               type="text"
               class="name-input"
+              class:invalid={errs.name !== null}
               bind:value={split.name}
               placeholder="e.g. v2-canary"
               onchange={() => { form.traffic_splits = [...form.traffic_splits]; }}
@@ -133,6 +163,7 @@
                 type="number"
                 min="0"
                 max="100"
+                class:invalid={errs.weight !== null}
                 bind:value={split.weight_percent}
                 onchange={() => { form.traffic_splits = [...form.traffic_splits]; }}
               />
@@ -146,6 +177,9 @@
               <span class="override-pill warn">no backends</span>
             {/if}
           </div>
+          {#if errs.name}<span class="field-error" role="alert">Name: {errs.name}</span>{/if}
+          {#if errs.weight}<span class="field-error" role="alert">Weight: {errs.weight}</span>{/if}
+          {#if errs.backends}<span class="field-error" role="alert">{errs.backends}</span>{/if}
           <div class="rule-header-right">
             <!-- eslint-disable-next-line svelte/no-at-html-tags -->
             <button class="btn-icon" title="Move up" aria-label="Move up" disabled={index === 0} onclick={() => moveUp(index)}>{@html upIcon}</button>
@@ -237,11 +271,7 @@
   .override-section { padding: 0.5rem; background: var(--color-bg); border-radius: 0.25rem; }
   .override-title { display: block; font-size: 0.75rem; font-weight: 600; color: var(--color-text-muted); margin-bottom: 0.375rem; text-transform: uppercase; letter-spacing: 0.05em; }
 
-  .checkbox-list { display: flex; flex-direction: column; gap: 0.25rem; max-height: 12rem; overflow-y: auto; }
-  .checkbox-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8125rem; cursor: pointer; padding: 0.25rem 0; }
-  .checkbox-item input[type="checkbox"] { accent-color: var(--color-primary); }
-
-  .text-muted { color: var(--color-text-muted); }
-  .small { font-size: 0.75rem; }
   .imported-badge { display: inline-block; padding: 0.0625rem 0.375rem; border-radius: 9999px; font-size: 0.625rem; font-weight: 600; text-transform: uppercase; background: rgba(59, 130, 246, 0.15); color: var(--color-primary); vertical-align: middle; }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
+  .invalid { border-color: var(--color-red) !important; }
 </style>

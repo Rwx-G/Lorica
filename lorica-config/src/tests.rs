@@ -78,6 +78,7 @@ mod tests {
             rate_limit: None,
             geoip: None,
             bot_protection: None,
+            group_name: String::new(),
             created_at: now,
             updated_at: now,
         }
@@ -255,6 +256,65 @@ mod tests {
             .get_route(&route.id)
             .expect("test setup: route fetch")
             .is_none());
+    }
+
+    #[test]
+    fn test_route_group_name_round_trips_through_store() {
+        // v1.4.1: group_name is a new column; make sure INSERT, UPDATE
+        // and SELECT all carry it end-to-end. Uses two routes to also
+        // exercise ordering in list_routes.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let mut r1 = make_route();
+        r1.id = "r1".into();
+        r1.hostname = "a.example.com".into();
+        r1.group_name = "prod".into();
+        let mut r2 = make_route();
+        r2.id = "r2".into();
+        r2.hostname = "b.example.com".into();
+        r2.group_name = "staging".into();
+
+        store.create_route(&r1).expect("test setup");
+        store.create_route(&r2).expect("test setup");
+
+        // get_route
+        let got = store
+            .get_route("r1")
+            .expect("test setup")
+            .expect("test setup");
+        assert_eq!(got.group_name, "prod");
+
+        // list_routes preserves group_name
+        let list = store.list_routes().expect("test setup");
+        let groups: Vec<_> = list.iter().map(|r| r.group_name.clone()).collect();
+        assert!(groups.contains(&"prod".to_string()));
+        assert!(groups.contains(&"staging".to_string()));
+
+        // update_route changes only group_name
+        let mut r1_updated = r1.clone();
+        r1_updated.group_name = "retired".into();
+        r1_updated.updated_at = Utc::now();
+        store.update_route(&r1_updated).expect("test setup");
+        let got = store
+            .get_route("r1")
+            .expect("test setup")
+            .expect("test setup");
+        assert_eq!(got.group_name, "retired");
+    }
+
+    #[test]
+    fn test_route_group_name_defaults_to_empty() {
+        // A route created without touching the field should round-trip
+        // as empty string. `make_route` does not set group_name so the
+        // default Vec<String>::new() applies.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let route = make_route();
+        assert_eq!(route.group_name, "");
+        store.create_route(&route).expect("test setup");
+        let got = store
+            .get_route(&route.id)
+            .expect("test setup")
+            .expect("test setup");
+        assert_eq!(got.group_name, "");
     }
 
     #[test]
@@ -1175,6 +1235,30 @@ backend_id = "also-nonexistent"
 
         assert!(diff.routes.added.is_empty());
         assert!(diff.routes.removed.is_empty());
+        assert_eq!(diff.routes.modified.len(), 1);
+    }
+
+    #[test]
+    fn test_diff_detects_group_name_change() {
+        // v1.4.1: changing only group_name must surface in compute_diff
+        // so an import preview shows the classification drift. The
+        // proxy does not reload on this field alone, but an import
+        // diff is a user-facing view of "what will change".
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let mut route = make_route();
+        route.group_name = "staging".into();
+        store.create_route(&route).expect("test setup");
+
+        let mut modified = route.clone();
+        modified.group_name = "prod".into();
+        let toml_str = {
+            let temp = ConfigStore::open_in_memory().expect("test setup");
+            temp.create_route(&modified).expect("test setup");
+            export_to_toml(&temp).expect("test setup")
+        };
+        let import_data = parse_toml(&toml_str).expect("test setup");
+        let diff = crate::diff::compute_diff(&store, &import_data).expect("test setup");
+
         assert_eq!(diff.routes.modified.len(), 1);
     }
 

@@ -158,6 +158,9 @@
 </script>
 
 <div class="country-picker">
+  <!-- Group label for the SVG map + CSV fallback composite widget :
+       no single <input> to point at, so we cannot use `for=`. -->
+  <!-- svelte-ignore a11y_label_has_associated_control -->
   {#if label}<label>{label}</label>{/if}
 
   {#if loadError}

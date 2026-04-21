@@ -56,11 +56,17 @@ pub async fn list_probes_for_route(
 /// JSON body for `POST /api/v1/probes`. Optional fields fall back to safe defaults.
 #[derive(Deserialize)]
 pub struct CreateProbe {
+    /// `Route.id` the probe exercises.
     pub route_id: String,
+    /// HTTP method (uppercase). Default `GET`.
     pub method: Option<String>,
+    /// Request path. Default `/`.
     pub path: Option<String>,
+    /// HTTP status that counts as success. Default 200.
     pub expected_status: Option<i32>,
+    /// Interval between runs (s). Default 60.
     pub interval_s: Option<i32>,
+    /// Per-run timeout (ms). Default 5000.
     pub timeout_ms: Option<i32>,
 }
 
@@ -110,11 +116,17 @@ pub async fn create_probe(
 /// JSON body for `PUT /api/v1/probes/:id`. Only supplied fields are applied.
 #[derive(Deserialize)]
 pub struct UpdateProbe {
+    /// New HTTP method.
     pub method: Option<String>,
+    /// New request path.
     pub path: Option<String>,
+    /// New expected status code.
     pub expected_status: Option<i32>,
+    /// New interval between runs (s, min 5).
     pub interval_s: Option<i32>,
+    /// New per-run timeout (ms).
     pub timeout_ms: Option<i32>,
+    /// Toggle the probe on / off.
     pub enabled: Option<bool>,
 }
 
@@ -181,6 +193,7 @@ pub async fn delete_probe(
 /// Optional `?limit=N` query parameter for probe history; capped at 1000.
 #[derive(Deserialize)]
 pub struct ProbeHistoryQuery {
+    /// Maximum number of result rows to return.
     pub limit: Option<usize>,
 }
 

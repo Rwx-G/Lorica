@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-04-18 | Lorica v1.4.0
+> Last updated: 2026-04-21 | Lorica v1.5.0
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin/Module (not built-in)
 >
@@ -283,12 +283,12 @@ These features are either unique to Lorica or extremely rare among competitors:
 
 ## Summary: Remaining Gaps
 
-All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.4.0 are shipped. Remaining gaps are by design or planned for future versions.
+All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.5.0 are shipped. Remaining gaps are by design or planned for future versions.
 
 | Gap | Plan |
 |---|---|
-| Hot binary upgrade | Planned for v1.5.0. Pingora ships the infrastructure (SIGUSR2 fd passing); wiring is ~3-4 days |
-| Team settings (users & RBAC) | Planned for v1.5.0. Single-admin model today; multi-user with roles is needed for org-wide adoption |
+| Hot binary upgrade | Planned for v1.6.0. Pingora ships the infrastructure (SIGUSR2 fd passing); wiring is ~3-4 days |
+| Team settings (users & RBAC) | Planned for v1.6.0. Single-admin model today; multi-user with roles is needed for org-wide adoption |
 | HTTP/3 (QUIC) | Planned for v2.0.0. Blocked on [Pingora PR #524](https://github.com/cloudflare/pingora/pull/524) (tokio-quiche integration) |
 | TCP/L4 proxying | Planned for v2.0.0. Enables database, MQTT, SSH stream proxying |
 | Service discovery (Docker labels, K8s Ingress) | Out of scope by design. Lorica targets standalone edge / bastion, not in-cluster deployment |

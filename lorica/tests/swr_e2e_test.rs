@@ -234,6 +234,7 @@ fn cacheable_route(ttl_s: i32, swr_s: i32, sie_s: i32) -> Route {
         rate_limit: None,
         geoip: None,
         bot_protection: None,
+        group_name: String::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

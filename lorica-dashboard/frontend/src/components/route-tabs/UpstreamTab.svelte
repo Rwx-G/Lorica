@@ -4,6 +4,7 @@
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
+  import { validateHttpMethodList } from '../../lib/validators';
 
   interface Props {
     form: RouteFormState;
@@ -11,6 +12,26 @@
   }
 
   let { form = $bindable(), importedFields }: Props = $props();
+
+  function numErr(raw: number | string, min: number, max: number, label: string): string | null {
+    const str = String(raw).trim();
+    if (str === '') return null;
+    const n = Number(str);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      return `${label} must be an integer in ${min}..${max}`;
+    }
+    return null;
+  }
+  let connectErr = $state<string | null>(null);
+  let readErr = $state<string | null>(null);
+  let sendErr = $state<string | null>(null);
+  let retryAttemptsErr = $state<string | null>(null);
+  let retryMethodsErr = $state<string | null>(null);
+  function checkConnect() { connectErr = numErr(form.connect_timeout_s, 1, 3600, 'value'); }
+  function checkRead() { readErr = numErr(form.read_timeout_s, 1, 3600, 'value'); }
+  function checkSend() { sendErr = numErr(form.send_timeout_s, 1, 3600, 'value'); }
+  function checkRetryAttempts() { retryAttemptsErr = numErr(form.retry_attempts, 0, 10, 'value'); }
+  function checkRetryMethods() { retryMethodsErr = validateHttpMethodList(form.retry_on_methods); }
 
   let activeHelp = $state<
     | null
@@ -50,7 +71,8 @@
             <FieldHelpButton fieldLabel="Connect timeout" onhelp={() => { activeHelp = 'connect_timeout_s'; }} />
           </label>
           {#if isImported('connect_timeout_s')}<span class="imported-badge">imported</span>{/if}
-          <input id="connect-timeout" type="number" min="1" max="3600" bind:value={form.connect_timeout_s} />
+          <input id="connect-timeout" type="number" min="1" max="3600" bind:value={form.connect_timeout_s} onblur={checkConnect} oninput={checkConnect} />
+          {#if connectErr}<span class="field-error" role="alert">{connectErr}</span>{/if}
           <span class="hint">Max time to establish the TCP / TLS connection to a backend.</span>
         </div>
         <div class="form-group" class:modified={isModified('read_timeout_s')}>
@@ -59,7 +81,8 @@
             <FieldHelpButton fieldLabel="Read timeout" onhelp={() => { activeHelp = 'read_timeout_s'; }} />
           </label>
           {#if isImported('read_timeout_s')}<span class="imported-badge">imported</span>{/if}
-          <input id="read-timeout" type="number" min="1" max="3600" bind:value={form.read_timeout_s} />
+          <input id="read-timeout" type="number" min="1" max="3600" bind:value={form.read_timeout_s} onblur={checkRead} oninput={checkRead} />
+          {#if readErr}<span class="field-error" role="alert">{readErr}</span>{/if}
           <span class="hint">Max time between bytes received from the backend.</span>
         </div>
         <div class="form-group" class:modified={isModified('send_timeout_s')}>
@@ -68,7 +91,8 @@
             <FieldHelpButton fieldLabel="Send timeout" onhelp={() => { activeHelp = 'send_timeout_s'; }} />
           </label>
           {#if isImported('send_timeout_s')}<span class="imported-badge">imported</span>{/if}
-          <input id="send-timeout" type="number" min="1" max="3600" bind:value={form.send_timeout_s} />
+          <input id="send-timeout" type="number" min="1" max="3600" bind:value={form.send_timeout_s} onblur={checkSend} oninput={checkSend} />
+          {#if sendErr}<span class="field-error" role="alert">{sendErr}</span>{/if}
           <span class="hint">Max time between bytes sent to the backend.</span>
         </div>
       </div>
@@ -91,7 +115,8 @@
             <FieldHelpButton fieldLabel="Retry attempts" onhelp={() => { activeHelp = 'retry_attempts'; }} />
           </label>
           {#if isImported('retry_attempts')}<span class="imported-badge">imported</span>{/if}
-          <input id="retry-attempts" type="number" min="0" bind:value={form.retry_attempts} placeholder="No retry" />
+          <input id="retry-attempts" type="number" min="0" max="10" bind:value={form.retry_attempts} placeholder="No retry" onblur={checkRetryAttempts} oninput={checkRetryAttempts} />
+          {#if retryAttemptsErr}<span class="field-error" role="alert">{retryAttemptsErr}</span>{/if}
           <span class="hint">Extra attempts on 5xx / connection errors. 0 = never retry.</span>
         </div>
         <div class="form-group" class:modified={isModified('retry_on_methods')}>
@@ -99,7 +124,8 @@
             Retry on methods
             <FieldHelpButton fieldLabel="Retry on methods" onhelp={() => { activeHelp = 'retry_on_methods'; }} />
           </label>
-          <input id="retry-methods" type="text" bind:value={form.retry_on_methods} placeholder="GET, HEAD, OPTIONS" />
+          <input id="retry-methods" type="text" bind:value={form.retry_on_methods} placeholder="GET, HEAD, OPTIONS" onblur={checkRetryMethods} oninput={checkRetryMethods} />
+          {#if retryMethodsErr}<span class="field-error" role="alert">{retryMethodsErr}</span>{/if}
           <span class="hint">Comma-separated. Leave empty for all methods.</span>
         </div>
       </div>
@@ -294,6 +320,7 @@
   .form-row-3 { grid-template-columns: 1fr 1fr 1fr; }
 
   .hint { display: block; font-weight: 400; color: var(--color-text-muted); font-size: 0.75rem; margin-top: 0.25rem; }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 
   .imported-badge {
     display: inline-block;

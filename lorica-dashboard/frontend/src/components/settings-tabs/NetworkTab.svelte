@@ -1,4 +1,17 @@
 <script lang="ts">
+  import { validateCidr } from '../../lib/validators';
+
+  function cidrListErr(text: string): string | null {
+    const raw = text.trim();
+    if (raw === '') return null;
+    const entries = raw.split(/[,\n]/).map((s) => s.trim()).filter((s) => s.length > 0);
+    for (let i = 0; i < entries.length; i++) {
+      const e = validateCidr(entries[i]);
+      if (e) return `line ${i + 1} (${entries[i]}): ${e}`;
+    }
+    return null;
+  }
+
   interface NetworkFormShape {
     trusted_proxies: string;
     connection_deny_cidrs: string;
@@ -28,6 +41,13 @@
     settingsMsg,
     settingsError,
   }: Props = $props();
+
+  let trustedProxiesErr = $state<string | null>(null);
+  let denyCidrsErr = $state<string | null>(null);
+  let allowCidrsErr = $state<string | null>(null);
+  function checkTrustedProxies() { trustedProxiesErr = cidrListErr(settingsForm.trusted_proxies); }
+  function checkDenyCidrs() { denyCidrsErr = cidrListErr(settingsForm.connection_deny_cidrs); }
+  function checkAllowCidrs() { allowCidrsErr = cidrListErr(settingsForm.connection_allow_cidrs); }
 </script>
 
 <section class="settings-section">
@@ -54,7 +74,9 @@
           rows="4"
           bind:value={settingsForm.trusted_proxies}
           placeholder="192.168.0.0/16&#10;10.0.0.0/8&#10;172.16.0.0/12"
+          onblur={checkTrustedProxies} oninput={checkTrustedProxies}
         ></textarea>
+        {#if trustedProxiesErr}<span class="field-error" role="alert">{trustedProxiesErr}</span>{/if}
         <span class="hint">
           One CIDR range or IP per line. X-Forwarded-For is only trusted from
           these addresses. Empty = trust no XFF (direct client IP always used).
@@ -68,7 +90,9 @@
           rows="3"
           bind:value={settingsForm.connection_deny_cidrs}
           placeholder="198.51.100.0/24&#10;2001:db8::/32"
+          onblur={checkDenyCidrs} oninput={checkDenyCidrs}
         ></textarea>
+        {#if denyCidrsErr}<span class="field-error" role="alert">{denyCidrsErr}</span>{/if}
         <span class="hint">
           One IP or CIDR per line. Matching connections are dropped at TCP
           accept, before TLS handshake. Evaluated after the allow list; deny
@@ -83,7 +107,9 @@
           rows="3"
           bind:value={settingsForm.connection_allow_cidrs}
           placeholder="10.0.0.0/8&#10;192.168.0.0/16"
+          onblur={checkAllowCidrs} oninput={checkAllowCidrs}
         ></textarea>
+        {#if allowCidrsErr}<span class="field-error" role="alert">{allowCidrsErr}</span>{/if}
         <span class="hint">
           One IP or CIDR per line. Leave empty for default-allow. When
           non-empty, switches the pre-filter to default-deny: only listed IPs
@@ -186,11 +212,6 @@
     color: var(--color-text-muted);
     margin-top: 0.25rem;
   }
-  .form-success {
-    color: var(--color-green);
-    font-size: 0.8125rem;
-    margin: 0.5rem 0;
-  }
   h3 {
     margin: var(--space-4) 0 var(--space-2);
     font-size: var(--text-md);
@@ -205,4 +226,5 @@
     font-size: var(--text-sm);
     color: var(--color-text-muted);
   }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 </style>

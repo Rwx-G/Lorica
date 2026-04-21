@@ -53,6 +53,7 @@ pub const DEFAULT_CODE_LEN: u32 = 6;
 /// and renders legibly on a phone without too much horizontal
 /// wrap.
 pub const IMAGE_WIDTH: u32 = 220;
+/// Captcha image height in pixels. See `IMAGE_WIDTH` for rationale.
 pub const IMAGE_HEIGHT: u32 = 120;
 
 /// Validate an alphabet string passed in from config. Enforces:

@@ -351,6 +351,600 @@ fn validate_rate_limit(
     Ok(rl.clone())
 }
 
+/// Validate a `redirect_hostname` input for API acceptance.
+///
+/// The proxy emits redirects as `{scheme}://{redirect_hostname}{path}{?query}`;
+/// the field is a bare DNS hostname, NOT a full URL. Operators who
+/// paste `https://example.com/foo` end up with a malformed Location
+/// header (`https://https://example.com/foo/...`). We reject those at
+/// the API boundary with a clear error so the mistake surfaces on save
+/// instead of silently on the next client request.
+///
+/// Accepts: RFC 1123-style hostnames (letters, digits, `-`, `.`), with
+/// labels 1..=63 chars and total length <= 253. The input is returned
+/// trimmed of surrounding whitespace. An empty string (after trim) is
+/// caller-policy: the two callers below treat it as "clear the field".
+/// Validate a `group_name` input for a Route or a Backend. Empty
+/// string (after trim) is accepted as "ungrouped". Non-empty must
+/// match the RFC-1035-inspired identifier alphabet
+/// `^[a-z0-9_-]{1,64}$`: lowercase ASCII letters, digits, dash and
+/// underscore. The `Backend.group_name` column has been in production
+/// since v1.2 without validation; this helper applies the new rule
+/// to both routes and backends going forward. Returns the trimmed
+/// value.
+fn validate_group_name(raw: &str) -> Result<String, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > 64 {
+        return Err(ApiError::BadRequest(
+            "group_name must be <= 64 characters".into(),
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(ApiError::BadRequest(
+            "group_name may only contain ASCII lowercase letters, digits, `-` and `_`".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a canonical-host redirect target.
+///
+/// `redirect_hostname` is specifically for the "redirect every request
+/// on this route to the same path on a different hostname" pattern
+/// (aka canonical-host redirect). It intentionally accepts ONLY a
+/// bare DNS hostname (no scheme, path, query, port, userinfo) because
+/// the proxy emits `{scheme}://{redirect_hostname}{path}{?query}` at
+/// runtime and anything else produces malformed Location headers.
+///
+/// Ports are **deliberately** rejected here. Operators that need a
+/// redirect to a non-standard port (e.g. migrating from port 443 to
+/// 8443 on a new host) should use `redirect_to` with a full URL
+/// (`https://new.example.com:8443`) instead ; `redirect_to` supports
+/// ports, userinfo, and explicit schemes. Splitting the two fields
+/// keeps the common case (canonical-host) typo-proof without forcing
+/// a full URL parser on every write path.
+fn validate_redirect_hostname(raw: &str) -> Result<String, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.contains("://") {
+        return Err(ApiError::BadRequest(
+            "redirect_hostname must be a bare hostname (e.g. `example.com`) \
+             without a scheme - drop the `http://` / `https://` prefix"
+                .into(),
+        ));
+    }
+    if trimmed.contains('/') {
+        return Err(ApiError::BadRequest(
+            "redirect_hostname must be a bare hostname without a path or \
+             trailing slash - drop everything after the hostname"
+                .into(),
+        ));
+    }
+    // `:` rejection = no port in this field. See the module comment
+    // above: redirects to a non-standard port go through `redirect_to`
+    // with a full URL, which takes the whole authority shape.
+    if trimmed.contains(|c: char| c.is_whitespace() || matches!(c, '?' | '#' | ':' | '@')) {
+        return Err(ApiError::BadRequest(
+            "redirect_hostname contains a character that is not valid in a \
+             hostname (whitespace, `?`, `#`, `:`, `@`). If you need to \
+             redirect to a non-standard port, use `redirect_to` with a \
+             full URL like `https://target.example.com:8443` instead."
+                .into(),
+        ));
+    }
+    if trimmed.len() > 253 {
+        return Err(ApiError::BadRequest(
+            "redirect_hostname is longer than 253 characters (DNS limit)".into(),
+        ));
+    }
+    if trimmed.starts_with('.') || trimmed.ends_with('.') {
+        return Err(ApiError::BadRequest(
+            "redirect_hostname must not start or end with a dot".into(),
+        ));
+    }
+    for label in trimmed.split('.') {
+        if label.is_empty() {
+            return Err(ApiError::BadRequest(
+                "redirect_hostname contains an empty DNS label (consecutive dots)".into(),
+            ));
+        }
+        if label.len() > 63 {
+            return Err(ApiError::BadRequest(
+                "redirect_hostname contains a DNS label longer than 63 characters".into(),
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(ApiError::BadRequest(
+                "redirect_hostname contains a DNS label that starts or ends with `-`".into(),
+            ));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(ApiError::BadRequest(
+                "redirect_hostname may only contain ASCII letters, digits, `-` and `.`".into(),
+            ));
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a `redirect_to` input. Accepts a full HTTP(S) URL and
+/// returns it trimmed. Empty/whitespace => returns empty (caller
+/// interprets as "clear the field"). Non-empty values must have a
+/// `http://` or `https://` scheme and a non-empty host (fails closed:
+/// operators typing just `example.com` get a clear error instead of
+/// Lorica emitting a 301 with a relative Location header at runtime).
+/// Total length capped at 2048 which is comfortably above every
+/// browser URL limit and low enough to reject accidental paste-entire-
+/// document mistakes.
+pub(super) fn validate_redirect_to(raw: &str, field_label: &str) -> Result<String, ApiError> {
+    const MAX_URL_LEN: usize = 2048;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > MAX_URL_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} is longer than {MAX_URL_LEN} characters"
+        )));
+    }
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must not contain whitespace"
+        )));
+    }
+    let rest = if let Some(r) = trimmed.strip_prefix("http://") {
+        r
+    } else if let Some(r) = trimmed.strip_prefix("https://") {
+        r
+    } else {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must start with `http://` or `https://`"
+        )));
+    };
+    // Host ends at the first `/`, `?`, or `#`; must be non-empty.
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if host_end == 0 {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must include a host after the scheme"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a `path_rewrite_pattern` regex. Shared between `create_route`
+/// and `update_route` so the rule is enforced on both endpoints (the
+/// previous setup only validated on `update`, letting `POST /routes`
+/// silently accept a pattern that the proxy rejects at reload).
+fn validate_path_rewrite_pattern(pattern: &str) -> Result<String, ApiError> {
+    const MAX_PATTERN_LEN: usize = 1024;
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > MAX_PATTERN_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "path_rewrite_pattern must be <= {MAX_PATTERN_LEN} characters"
+        )));
+    }
+    if regex::Regex::new(trimmed).is_err() {
+        return Err(ApiError::BadRequest(format!(
+            "path_rewrite_pattern is not a valid regex: {trimmed}"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate an HTTP field-name per RFC 7230 §3.2.6 (`token`). Returns
+/// the name verbatim on success; caller is expected to pass the
+/// already-trimmed string. Rejects empty names so the UI does not
+/// silently ignore blank entries and rejects any character outside
+/// the RFC 7230 token alphabet (letters, digits, and
+/// `!#$%&'*+-.^_`|~`). Length capped at 256 which is well above any
+/// real-world field name.
+fn validate_http_header_name(name: &str, field_label: &str) -> Result<(), ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: header name must not be empty"
+        )));
+    }
+    if name.len() > 256 {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: header name must be <= 256 characters"
+        )));
+    }
+    for c in name.chars() {
+        let is_token = c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '!' | '#'
+                    | '$'
+                    | '%'
+                    | '&'
+                    | '\''
+                    | '*'
+                    | '+'
+                    | '-'
+                    | '.'
+                    | '^'
+                    | '_'
+                    | '`'
+                    | '|'
+                    | '~'
+            );
+        if !is_token {
+            return Err(ApiError::BadRequest(format!(
+                "{field_label}: header name {name:?} contains `{c}` which is not a \
+                 valid HTTP field-name character (RFC 7230 token)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate an HTTP field-value. The proxy forwards the bytes mostly
+/// verbatim so a rogue CR / LF in a header value would enable
+/// response-splitting attacks. NUL is rejected alongside for the same
+/// reason. Printable ASCII, horizontal tab, and any byte >= 0x80 (for
+/// UTF-8 header values like Content-Disposition filenames) are
+/// accepted. Length capped at 4096.
+fn validate_http_header_value(value: &str, field_label: &str) -> Result<(), ApiError> {
+    if value.len() > 4096 {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: header value must be <= 4096 characters"
+        )));
+    }
+    for b in value.bytes() {
+        if b == b'\r' || b == b'\n' || b == 0 {
+            return Err(ApiError::BadRequest(format!(
+                "{field_label}: header value contains CR, LF, or NUL (response splitting)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a `HashMap<String, String>` of HTTP headers - names and
+/// values both. Used for route-level `proxy_headers` and
+/// `response_headers` as well as per-path-rule overrides.
+pub(super) fn validate_http_headers_map(
+    map: &std::collections::HashMap<String, String>,
+    field_label: &str,
+) -> Result<(), ApiError> {
+    for (name, value) in map {
+        let trimmed = name.trim();
+        validate_http_header_name(trimmed, field_label)?;
+        validate_http_header_value(value, &format!("{field_label}[{trimmed}]"))?;
+    }
+    Ok(())
+}
+
+/// Validate a list of header names (e.g. `proxy_headers_remove`,
+/// `response_headers_remove`, `cache_vary_headers`).
+pub(super) fn validate_http_header_name_list(
+    names: &[String],
+    field_label: &str,
+) -> Result<(), ApiError> {
+    for name in names {
+        let trimmed = name.trim();
+        validate_http_header_name(trimmed, field_label)?;
+    }
+    Ok(())
+}
+
+/// Validate an HTTP method token. Accepts the canonical set
+/// (`GET`, `POST`, ...) plus any all-uppercase-letter token (to allow
+/// `PATCH`, `MKCOL`, custom verbs). Rejects lowercase, digits, and
+/// anything that is not a valid RFC 7230 token.
+fn validate_http_method(method: &str, field_label: &str) -> Result<(), ApiError> {
+    if method.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: method must not be empty"
+        )));
+    }
+    if method.len() > 32 {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: method {method:?} is longer than 32 characters"
+        )));
+    }
+    if !method.chars().all(|c| c.is_ascii_uppercase()) {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: method {method:?} must be ASCII uppercase letters only \
+             (e.g. `GET`, `POST`, `PATCH`)"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a single hostname alias. Same RFC 1123 shape check as
+/// `validate_redirect_hostname` but with its own field label so the
+/// UI can point at the right input. Returns the trimmed value on
+/// success.
+fn validate_hostname_alias(raw: &str, field_label: &str) -> Result<String, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must not be empty"
+        )));
+    }
+    if trimmed.len() > 253 {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} is longer than 253 characters"
+        )));
+    }
+    if trimmed.contains("://") || trimmed.contains('/') {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must be a bare hostname (no scheme, no path)"
+        )));
+    }
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must not contain whitespace"
+        )));
+    }
+    if trimmed.starts_with('.') || trimmed.ends_with('.') {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must not start or end with a dot"
+        )));
+    }
+    // Wildcards on the first label are legal for SNI match in Lorica
+    // (same rule the primary hostname field accepts). Let `*.example.com`
+    // through and validate the remaining labels normally.
+    let check_body = if let Some(rest) = trimmed.strip_prefix("*.") {
+        rest
+    } else {
+        trimmed
+    };
+    for label in check_body.split('.') {
+        if label.is_empty() {
+            return Err(ApiError::BadRequest(format!(
+                "{field_label} contains an empty DNS label"
+            )));
+        }
+        if label.len() > 63 {
+            return Err(ApiError::BadRequest(format!(
+                "{field_label} contains a DNS label longer than 63 characters"
+            )));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(ApiError::BadRequest(format!(
+                "{field_label} contains a DNS label that starts or ends with `-`"
+            )));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(ApiError::BadRequest(format!(
+                "{field_label} may only contain ASCII letters, digits, `-` and `.`"
+            )));
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate an `error_page_html` body. Size cap 128 KiB - more than
+/// enough for a branded error page including inline CSS and an SVG
+/// or two, far short of something that would pressure the response
+/// buffer. Runtime sanitisation still runs on every render; this is
+/// the boundary check.
+fn validate_error_page_html(raw: &str) -> Result<(), ApiError> {
+    const ERROR_PAGE_MAX_BYTES: usize = 128 * 1024;
+    if raw.len() > ERROR_PAGE_MAX_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "error_page_html must be <= {ERROR_PAGE_MAX_BYTES} bytes (128 KiB)"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a path-prefix-style field (route-level `path_prefix`,
+/// `strip_path_prefix`, `add_path_prefix`). Must start with `/`, no
+/// whitespace, length cap 1024. Empty => returns empty (caller
+/// interprets as "clear").
+fn validate_route_path(raw: &str, field_label: &str) -> Result<String, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if !trimmed.starts_with('/') {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must start with '/'"
+        )));
+    }
+    if trimmed.len() > 1024 {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must be <= 1024 characters"
+        )));
+    }
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must not contain whitespace"
+        )));
+    }
+    if trimmed.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} contains a control character"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Tiny helper for inline integer-range checks. Lets each call site
+/// spell its own range + field label without a macro.
+fn check_range<T: PartialOrd + std::fmt::Display>(
+    value: T,
+    min: T,
+    max: T,
+    field_label: &str,
+) -> Result<(), ApiError> {
+    if value < min || value > max {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label} must be in {min}..={max}"
+        )));
+    }
+    Ok(())
+}
+
+/// Route-level numeric bounds, shared between `create_route` and
+/// `update_route`. Each caller passes `Option<T>` for every field so
+/// missing ones are skipped (update semantics: don't touch what the
+/// operator did not send). Centralising avoids the bug where `POST`
+/// and `PUT` drift apart on validity rules.
+#[allow(clippy::too_many_arguments)] // intentional single-site fan-in of route numeric fields
+fn validate_route_numeric_bounds(
+    connect_timeout_s: Option<i32>,
+    read_timeout_s: Option<i32>,
+    send_timeout_s: Option<i32>,
+    cache_ttl_s: Option<i32>,
+    cache_max_bytes: Option<i64>,
+    max_connections: Option<u32>,
+    slowloris_threshold_ms: Option<i32>,
+    auto_ban_threshold: Option<u32>,
+    auto_ban_duration_s: Option<i32>,
+    return_status: Option<u16>,
+    retry_attempts: Option<u32>,
+    stale_while_revalidate_s: Option<i32>,
+    stale_if_error_s: Option<i32>,
+    cors_max_age_s: Option<i32>,
+    max_request_body_bytes: Option<u64>,
+) -> Result<(), ApiError> {
+    if let Some(v) = connect_timeout_s {
+        check_range(v, 1, 3600, "connect_timeout_s")?;
+    }
+    if let Some(v) = read_timeout_s {
+        check_range(v, 1, 3600, "read_timeout_s")?;
+    }
+    if let Some(v) = send_timeout_s {
+        check_range(v, 1, 3600, "send_timeout_s")?;
+    }
+    if let Some(v) = cache_ttl_s {
+        check_range(v, 1, 31_536_000, "cache_ttl_s")?;
+    }
+    if let Some(v) = cache_max_bytes {
+        check_range(v, 1, 137_438_953_472, "cache_max_bytes")?; // 128 GiB
+    }
+    if let Some(v) = max_connections {
+        check_range(v, 1, 1_000_000, "max_connections")?;
+    }
+    if let Some(v) = slowloris_threshold_ms {
+        check_range(v, 100, 600_000, "slowloris_threshold_ms")?;
+    }
+    if let Some(v) = auto_ban_threshold {
+        check_range(v, 1, 10_000, "auto_ban_threshold")?;
+    }
+    if let Some(v) = auto_ban_duration_s {
+        check_range(v, 1, 31_536_000, "auto_ban_duration_s")?;
+    }
+    if let Some(v) = return_status {
+        check_range(v, 100, 599, "return_status")?;
+    }
+    if let Some(v) = retry_attempts {
+        check_range(v, 0, 10, "retry_attempts")?;
+    }
+    if let Some(v) = stale_while_revalidate_s {
+        check_range(v, 0, 86_400, "stale_while_revalidate_s")?;
+    }
+    if let Some(v) = stale_if_error_s {
+        check_range(v, 0, 86_400, "stale_if_error_s")?;
+    }
+    if let Some(v) = cors_max_age_s {
+        check_range(v, 0, 86_400, "cors_max_age_s")?;
+    }
+    if let Some(v) = max_request_body_bytes {
+        // Upper bound = 128 GiB. Zero is legal (means "unlimited",
+        // translated to None by `update_route` and `create_route`).
+        check_range(v, 0, 137_438_953_472, "max_request_body_bytes")?;
+    }
+    Ok(())
+}
+
+/// Validate a CORS origin entry. Accepts `*`, `null`, or a full
+/// `scheme://host[:port]` URL without path / query / fragment. The
+/// CORS spec only attaches meaning to origin-equality, so an origin
+/// with a path is always a mistake.
+fn validate_cors_origin(origin: &str, field_label: &str) -> Result<(), ApiError> {
+    if origin == "*" || origin == "null" {
+        return Ok(());
+    }
+    if origin.len() > 2048 {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: origin {origin:?} is longer than 2048 characters"
+        )));
+    }
+    if origin.chars().any(|c| c.is_whitespace()) {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: origin {origin:?} contains whitespace"
+        )));
+    }
+    let rest = if let Some(r) = origin.strip_prefix("http://") {
+        r
+    } else if let Some(r) = origin.strip_prefix("https://") {
+        r
+    } else {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: origin {origin:?} must be `*`, `null`, or a full \
+             `http(s)://host[:port]` URL"
+        )));
+    };
+    if rest.contains('/') || rest.contains('?') || rest.contains('#') {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: origin {origin:?} must not contain a path, query, or fragment"
+        )));
+    }
+    if rest.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "{field_label}: origin {origin:?} must include a host after the scheme"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a `path_rewrite_replacement` string. Bounded-length guard
+/// (2048 chars, same ceiling as URLs). Rejects regex replacements that
+/// reference capture groups not present in the pattern (`$1` when the
+/// pattern has no groups) because those would silently emit the literal
+/// `$1` to the backend at runtime - a correctness footgun the operator
+/// can't diagnose from the proxy log.
+fn validate_path_rewrite_replacement(
+    replacement: &str,
+    pattern: Option<&str>,
+) -> Result<String, ApiError> {
+    const MAX_REPLACEMENT_LEN: usize = 2048;
+    if replacement.len() > MAX_REPLACEMENT_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "path_rewrite_replacement must be <= {MAX_REPLACEMENT_LEN} characters"
+        )));
+    }
+    if let Some(p) = pattern.filter(|p| !p.is_empty()) {
+        let captures = regex::Regex::new(p).map(|r| r.captures_len()).unwrap_or(1);
+        // captures_len() counts the implicit group-0 (the whole match)
+        // plus each `(...)`. A pattern with N explicit groups allows
+        // references `$0..$N`.
+        let max_ref = captures.saturating_sub(1);
+        // `$$` in a regex replacement is a literal `$`. Strip those
+        // pairs first so a legitimate `$$5` (meant as literal `$5`)
+        // does not get flagged as an invalid `$5` reference.
+        let scan = replacement.replace("$$", "");
+        let ref_re = regex::Regex::new(r"\$(\d+)").expect("static regex");
+        for cap in ref_re.captures_iter(&scan) {
+            let n: usize = cap[1].parse().unwrap_or(0);
+            if n > max_ref {
+                return Err(ApiError::BadRequest(format!(
+                    "path_rewrite_replacement references `${n}` but the pattern has \
+                     only {max_ref} capture group{s}",
+                    s = if max_ref == 1 { "" } else { "s" }
+                )));
+            }
+        }
+    }
+    Ok(replacement.to_string())
+}
+
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
@@ -427,6 +1021,917 @@ mod rate_limit_tests {
         // out is a clone, input untouched (the function takes &RateLimit).
         assert_eq!(input.capacity, 50);
         assert_eq!(out.capacity, 50);
+    }
+}
+
+#[cfg(test)]
+mod group_name_validation_tests {
+    use super::*;
+
+    fn expect_err(input: &str) -> String {
+        match validate_group_name(input) {
+            Ok(v) => panic!("expected validation error for {input:?}, got Ok({v:?})"),
+            Err(ApiError::BadRequest(m)) => m,
+            Err(e) => panic!("expected BadRequest, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_empty() {
+        assert_eq!(validate_group_name("").unwrap(), "");
+        assert_eq!(validate_group_name("   ").unwrap(), "");
+    }
+
+    #[test]
+    fn accepts_valid_identifiers() {
+        assert_eq!(validate_group_name("prod").unwrap(), "prod");
+        assert_eq!(
+            validate_group_name("homelab-staging").unwrap(),
+            "homelab-staging"
+        );
+        assert_eq!(validate_group_name("my_group_42").unwrap(), "my_group_42");
+        assert_eq!(validate_group_name("a").unwrap(), "a");
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        assert_eq!(validate_group_name("  prod  ").unwrap(), "prod");
+    }
+
+    #[test]
+    fn rejects_uppercase() {
+        assert!(expect_err("PROD").contains("lowercase"));
+        assert!(expect_err("Prod").contains("lowercase"));
+    }
+
+    #[test]
+    fn rejects_whitespace_and_special_chars() {
+        assert!(expect_err("my group").contains("lowercase"));
+        assert!(expect_err("my.group").contains("lowercase"));
+        assert!(expect_err("my/group").contains("lowercase"));
+        assert!(expect_err("accent-é").contains("lowercase"));
+    }
+
+    #[test]
+    fn rejects_too_long() {
+        let long = "a".repeat(100);
+        assert!(expect_err(&long).contains("64"));
+    }
+}
+
+#[cfg(test)]
+mod redirect_hostname_validation_tests {
+    use super::*;
+
+    fn expect_err(input: &str) -> String {
+        match validate_redirect_hostname(input) {
+            Ok(v) => panic!("expected validation error for {input:?}, got Ok({v:?})"),
+            Err(ApiError::BadRequest(m)) => m,
+            Err(e) => panic!("expected BadRequest, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_or_whitespace_clears_the_field() {
+        assert_eq!(validate_redirect_hostname("").unwrap(), "");
+        assert_eq!(validate_redirect_hostname("   ").unwrap(), "");
+        assert_eq!(validate_redirect_hostname("\t\n").unwrap(), "");
+    }
+
+    #[test]
+    fn accepts_bare_hostname() {
+        assert_eq!(
+            validate_redirect_hostname("example.com").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            validate_redirect_hostname("  www.example.com  ").unwrap(),
+            "www.example.com"
+        );
+        assert_eq!(
+            validate_redirect_hostname("a-b.c-d.example.co.uk").unwrap(),
+            "a-b.c-d.example.co.uk"
+        );
+    }
+
+    #[test]
+    fn accepts_single_label_hostname() {
+        // "localhost" and similar single-label internal names are common
+        // in home-lab Lorica setups; we must not reject them.
+        assert_eq!(
+            validate_redirect_hostname("localhost").unwrap(),
+            "localhost"
+        );
+        assert_eq!(validate_redirect_hostname("plex").unwrap(), "plex");
+    }
+
+    #[test]
+    fn rejects_scheme() {
+        assert!(expect_err("https://example.com").contains("scheme"));
+        assert!(expect_err("http://example.com").contains("scheme"));
+        assert!(expect_err("HTTP://example.com").contains("scheme"));
+    }
+
+    #[test]
+    fn rejects_path_or_trailing_slash() {
+        assert!(expect_err("example.com/").contains("path"));
+        assert!(expect_err("example.com/foo").contains("path"));
+        assert!(expect_err("/example.com").contains("path"));
+    }
+
+    #[test]
+    fn rejects_port_query_fragment() {
+        // Port (`:8080`), query (`?x=1`) and fragment (`#frag`) are
+        // URL syntax, not hostname syntax. Reject with the shared
+        // "not valid in a hostname" message so the UI fails fast.
+        assert!(expect_err("example.com:8080").contains("not valid"));
+        assert!(expect_err("example.com?x=1").contains("not valid"));
+        assert!(expect_err("example.com#foo").contains("not valid"));
+        assert!(expect_err("user@example.com").contains("not valid"));
+    }
+
+    #[test]
+    fn rejects_whitespace() {
+        // Surrounding whitespace is trimmed and accepted (tested
+        // separately above); whitespace *inside* the hostname is a
+        // syntax error.
+        assert!(expect_err("exa mple.com").contains("not valid"));
+        assert!(expect_err("example.\tcom").contains("not valid"));
+    }
+
+    #[test]
+    fn rejects_leading_or_trailing_dot() {
+        assert!(expect_err(".example.com").contains("dot"));
+        assert!(expect_err("example.com.").contains("dot"));
+    }
+
+    #[test]
+    fn rejects_consecutive_dots() {
+        assert!(expect_err("example..com").contains("empty DNS label"));
+    }
+
+    #[test]
+    fn rejects_label_too_long() {
+        let long_label = "a".repeat(64);
+        let input = format!("{long_label}.com");
+        assert!(expect_err(&input).contains("63"));
+    }
+
+    #[test]
+    fn rejects_total_too_long() {
+        // 64 labels of 3 chars + 63 dots = 255 chars, exceeds the 253 cap.
+        let input = (0..64).map(|_| "abc").collect::<Vec<_>>().join(".");
+        assert!(expect_err(&input).contains("253"));
+    }
+
+    #[test]
+    fn rejects_label_leading_or_trailing_dash() {
+        assert!(expect_err("-example.com").contains("`-`"));
+        assert!(expect_err("example-.com").contains("`-`"));
+        assert!(expect_err("example.-com").contains("`-`"));
+        assert!(expect_err("example.com-").contains("`-`"));
+    }
+
+    #[test]
+    fn rejects_non_ascii_or_punctuation() {
+        assert!(expect_err("exämple.com").contains("ASCII"));
+        assert!(expect_err("example_underscore.com").contains("ASCII"));
+    }
+}
+
+#[cfg(test)]
+mod hostname_alias_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_bare_hostnames_and_wildcards() {
+        assert!(validate_hostname_alias("example.com", "f").is_ok());
+        assert!(validate_hostname_alias("api.example.com", "f").is_ok());
+        assert!(validate_hostname_alias("*.example.com", "f").is_ok());
+    }
+
+    #[test]
+    fn rejects_scheme_path_whitespace_empty() {
+        assert!(validate_hostname_alias("https://example.com", "f").is_err());
+        assert!(validate_hostname_alias("example.com/foo", "f").is_err());
+        assert!(validate_hostname_alias("exa mple.com", "f").is_err());
+        assert!(validate_hostname_alias("", "f").is_err());
+    }
+
+    #[test]
+    fn rejects_leading_trailing_dot_and_dash() {
+        assert!(validate_hostname_alias(".example.com", "f").is_err());
+        assert!(validate_hostname_alias("example.com.", "f").is_err());
+        assert!(validate_hostname_alias("-example.com", "f").is_err());
+        assert!(validate_hostname_alias("example-.com", "f").is_err());
+    }
+
+    #[test]
+    fn rejects_too_long_label_or_hostname() {
+        let long_label = format!("{}.example.com", "a".repeat(64));
+        assert!(validate_hostname_alias(&long_label, "f").is_err());
+        let long_total = (0..64).map(|_| "abc").collect::<Vec<_>>().join(".");
+        assert!(validate_hostname_alias(&long_total, "f").is_err());
+    }
+}
+
+#[cfg(test)]
+mod error_page_html_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_small_page() {
+        assert!(validate_error_page_html("<h1>oops</h1>").is_ok());
+        assert!(validate_error_page_html("").is_ok());
+    }
+
+    #[test]
+    fn rejects_over_128_kib() {
+        let big = "a".repeat(128 * 1024 + 1);
+        let err = validate_error_page_html(&big).expect_err("test");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("128 KiB")));
+    }
+}
+
+#[cfg(test)]
+mod route_path_validation_tests {
+    use super::*;
+
+    #[test]
+    fn empty_clears_the_field() {
+        assert_eq!(validate_route_path("", "path_prefix").unwrap(), "");
+        assert_eq!(validate_route_path("   ", "path_prefix").unwrap(), "");
+    }
+
+    #[test]
+    fn accepts_paths_with_leading_slash() {
+        assert_eq!(validate_route_path("/", "f").unwrap(), "/");
+        assert_eq!(validate_route_path("/api", "f").unwrap(), "/api");
+        assert_eq!(
+            validate_route_path("/api/v1/users", "f").unwrap(),
+            "/api/v1/users"
+        );
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        assert_eq!(validate_route_path("  /api  ", "f").unwrap(), "/api");
+    }
+
+    #[test]
+    fn rejects_missing_leading_slash() {
+        let err = validate_route_path("api", "f").expect_err("test");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("'/'")));
+    }
+
+    #[test]
+    fn rejects_whitespace_inside() {
+        assert!(validate_route_path("/foo bar", "f").is_err());
+        assert!(validate_route_path("/foo\tbar", "f").is_err());
+    }
+
+    #[test]
+    fn rejects_too_long() {
+        let long = format!("/{}", "a".repeat(1100));
+        let err = validate_route_path(&long, "f").expect_err("test");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("1024")));
+    }
+
+    #[test]
+    fn rejects_control_char() {
+        let err = validate_route_path("/foo\x01bar", "f").expect_err("test");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("control character")));
+    }
+}
+
+#[cfg(test)]
+mod route_numeric_bounds_tests {
+    use super::*;
+
+    fn ok(f: impl FnOnce() -> Result<(), ApiError>) {
+        f().expect("expected Ok");
+    }
+
+    fn err_matches(f: impl FnOnce() -> Result<(), ApiError>, needle: &str) {
+        let e = f().expect_err("expected Err");
+        match e {
+            ApiError::BadRequest(m) => assert!(m.contains(needle), "got {m:?}, wanted {needle:?}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_all_defaults() {
+        ok(|| {
+            validate_route_numeric_bounds(
+                Some(5),
+                Some(60),
+                Some(60),
+                Some(300),
+                Some(52_428_800),
+                None,
+                Some(5000),
+                None,
+                Some(3600),
+                None,
+                None,
+                Some(10),
+                Some(60),
+                None,
+                None,
+            )
+        });
+    }
+
+    #[test]
+    fn timeouts_bounds() {
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "connect_timeout_s",
+        );
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    Some(3601),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "read_timeout_s",
+        );
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    Some(-1),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "send_timeout_s",
+        );
+    }
+
+    #[test]
+    fn return_status_must_be_in_http_range() {
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(42),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "return_status",
+        );
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(600),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "return_status",
+        );
+        ok(|| {
+            validate_route_numeric_bounds(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(418),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        });
+    }
+
+    #[test]
+    fn cors_max_age_rejects_negative_and_huge() {
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(-1),
+                    None,
+                )
+            },
+            "cors_max_age_s",
+        );
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(100_000),
+                    None,
+                )
+            },
+            "cors_max_age_s",
+        );
+    }
+
+    #[test]
+    fn retry_attempts_cap() {
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(11),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "retry_attempts",
+        );
+        ok(|| {
+            validate_route_numeric_bounds(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(3),
+                None,
+                None,
+                None,
+                None,
+            )
+        });
+    }
+
+    #[test]
+    fn max_connections_and_auto_ban_thresholds() {
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "max_connections",
+        );
+        err_matches(
+            || {
+                validate_route_numeric_bounds(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            },
+            "auto_ban_threshold",
+        );
+    }
+}
+
+#[cfg(test)]
+mod http_header_validation_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn header_name_accepts_rfc_token_chars() {
+        for name in &[
+            "X-Forwarded-For",
+            "Content-Type",
+            "X_My_Header",
+            "X-99-Proxy",
+            "!#$%&'*+-.^_`|~",
+        ] {
+            validate_http_header_name(name, "h")
+                .unwrap_or_else(|e| panic!("expected {name:?} to pass: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn header_name_rejects_empty() {
+        let err = validate_http_header_name("", "h").expect_err("test setup");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("must not be empty")));
+    }
+
+    #[test]
+    fn header_name_rejects_whitespace_and_special_chars() {
+        for name in &["X Forwarded", "Content Type", "X:Bad", "X\tBad", "X@bad"] {
+            assert!(
+                validate_http_header_name(name, "h").is_err(),
+                "name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_name_rejects_too_long() {
+        let long = "a".repeat(300);
+        let err = validate_http_header_name(&long, "h").expect_err("test setup");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("256")));
+    }
+
+    #[test]
+    fn header_value_accepts_printable_ascii_and_utf8() {
+        for value in &["foo", "no-cache, no-store", "café", ""] {
+            validate_http_header_value(value, "h")
+                .unwrap_or_else(|e| panic!("expected {value:?} to pass: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn header_value_rejects_cr_lf_nul() {
+        assert!(validate_http_header_value("foo\r", "h").is_err());
+        assert!(validate_http_header_value("foo\n", "h").is_err());
+        assert!(validate_http_header_value("foo\0", "h").is_err());
+        assert!(validate_http_header_value("foo\r\nX-Admin: yes", "h").is_err());
+    }
+
+    #[test]
+    fn header_value_rejects_too_long() {
+        let long = "a".repeat(5000);
+        assert!(validate_http_header_value(&long, "h").is_err());
+    }
+
+    #[test]
+    fn headers_map_catches_bad_name() {
+        let mut map = HashMap::new();
+        map.insert("X Bad".into(), "ok".into());
+        assert!(validate_http_headers_map(&map, "proxy_headers").is_err());
+    }
+
+    #[test]
+    fn headers_map_catches_bad_value() {
+        let mut map = HashMap::new();
+        map.insert("X-Good".into(), "bad\r\nX-Admin: yes".into());
+        assert!(validate_http_headers_map(&map, "proxy_headers").is_err());
+    }
+
+    #[test]
+    fn method_accepts_standard_verbs() {
+        for m in &[
+            "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "MKCOL",
+        ] {
+            validate_http_method(m, "methods")
+                .unwrap_or_else(|e| panic!("expected {m:?} to pass: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn method_rejects_lowercase_and_garbage() {
+        assert!(validate_http_method("get", "m").is_err());
+        assert!(validate_http_method("GET,POST", "m").is_err());
+        assert!(validate_http_method("GET ", "m").is_err());
+        assert!(validate_http_method("", "m").is_err());
+        assert!(validate_http_method("GET1", "m").is_err());
+    }
+
+    #[test]
+    fn cors_origin_accepts_wildcard_and_null() {
+        validate_cors_origin("*", "o").unwrap();
+        validate_cors_origin("null", "o").unwrap();
+    }
+
+    #[test]
+    fn cors_origin_accepts_scheme_host_port() {
+        validate_cors_origin("https://example.com", "o").unwrap();
+        validate_cors_origin("http://example.com:8080", "o").unwrap();
+    }
+
+    #[test]
+    fn cors_origin_rejects_path_query_fragment() {
+        assert!(validate_cors_origin("https://example.com/", "o").is_err());
+        assert!(validate_cors_origin("https://example.com/foo", "o").is_err());
+        assert!(validate_cors_origin("https://example.com?x=1", "o").is_err());
+        assert!(validate_cors_origin("https://example.com#frag", "o").is_err());
+    }
+
+    #[test]
+    fn cors_origin_rejects_bare_host_and_bad_scheme() {
+        assert!(validate_cors_origin("example.com", "o").is_err());
+        assert!(validate_cors_origin("ftp://example.com", "o").is_err());
+        assert!(validate_cors_origin("https://", "o").is_err());
+    }
+
+    #[test]
+    fn cors_origin_rejects_whitespace() {
+        assert!(validate_cors_origin("https://exam ple.com", "o").is_err());
+    }
+}
+
+#[cfg(test)]
+mod redirect_to_validation_tests {
+    use super::*;
+
+    fn expect_err(input: &str) -> String {
+        match validate_redirect_to(input, "redirect_to") {
+            Ok(v) => panic!("expected validation error for {input:?}, got Ok({v:?})"),
+            Err(ApiError::BadRequest(m)) => m,
+            Err(e) => panic!("expected BadRequest, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_or_whitespace_clears_the_field() {
+        assert_eq!(validate_redirect_to("", "redirect_to").unwrap(), "");
+        assert_eq!(validate_redirect_to("   ", "redirect_to").unwrap(), "");
+    }
+
+    #[test]
+    fn accepts_http_and_https_urls() {
+        assert_eq!(
+            validate_redirect_to("https://example.com", "redirect_to").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            validate_redirect_to("http://example.com/legacy", "redirect_to").unwrap(),
+            "http://example.com/legacy"
+        );
+        assert_eq!(
+            validate_redirect_to(
+                "https://www.youtube.com/redirect?q=https://plex.rwx-g.fr/",
+                "redirect_to"
+            )
+            .unwrap(),
+            "https://www.youtube.com/redirect?q=https://plex.rwx-g.fr/"
+        );
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        assert_eq!(
+            validate_redirect_to("  https://example.com  ", "redirect_to").unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_scheme() {
+        assert!(expect_err("example.com").contains("http"));
+        assert!(expect_err("//example.com").contains("http"));
+        assert!(expect_err("ftp://example.com").contains("http"));
+    }
+
+    #[test]
+    fn rejects_scheme_without_host() {
+        assert!(expect_err("https://").contains("host"));
+        assert!(expect_err("https:///path").contains("host"));
+    }
+
+    #[test]
+    fn rejects_whitespace_inside_url() {
+        assert!(expect_err("https://example .com").contains("whitespace"));
+        assert!(expect_err("https://example.com/foo bar").contains("whitespace"));
+    }
+
+    #[test]
+    fn rejects_too_long_url() {
+        let long = format!("https://example.com/{}", "a".repeat(2048));
+        assert!(expect_err(&long).contains("2048"));
+    }
+
+    #[test]
+    fn uses_the_provided_field_label_in_errors() {
+        // Path-rule callers pass `path_rules[3].redirect_to` as the
+        // label so the UI can show the operator which specific rule is
+        // the offender.
+        match validate_redirect_to("nope", "path_rules[3].redirect_to") {
+            Err(ApiError::BadRequest(m)) => {
+                assert!(m.contains("path_rules[3].redirect_to"))
+            }
+            _ => panic!("expected BadRequest"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod path_rewrite_validation_tests {
+    use super::*;
+
+    #[test]
+    fn pattern_empty_returns_empty_string() {
+        assert_eq!(validate_path_rewrite_pattern("").unwrap(), "");
+        assert_eq!(validate_path_rewrite_pattern("   ").unwrap(), "");
+    }
+
+    #[test]
+    fn pattern_accepts_valid_regex() {
+        assert_eq!(
+            validate_path_rewrite_pattern(r"^/api/v1/(.*)$").unwrap(),
+            r"^/api/v1/(.*)$"
+        );
+    }
+
+    #[test]
+    fn pattern_rejects_invalid_regex() {
+        match validate_path_rewrite_pattern("(unclosed") {
+            Err(ApiError::BadRequest(m)) => assert!(m.contains("not a valid regex")),
+            _ => panic!("expected BadRequest"),
+        }
+    }
+
+    #[test]
+    fn pattern_rejects_too_long() {
+        let long = "a".repeat(2048);
+        match validate_path_rewrite_pattern(&long) {
+            Err(ApiError::BadRequest(m)) => assert!(m.contains("1024")),
+            _ => panic!("expected BadRequest"),
+        }
+    }
+
+    #[test]
+    fn replacement_length_cap() {
+        let long = "a".repeat(3000);
+        match validate_path_rewrite_replacement(&long, None) {
+            Err(ApiError::BadRequest(m)) => assert!(m.contains("2048")),
+            _ => panic!("expected BadRequest"),
+        }
+    }
+
+    #[test]
+    fn replacement_accepts_no_group_reference_when_pattern_has_none() {
+        assert_eq!(
+            validate_path_rewrite_replacement("/static/$0", Some(r"^/api/")).unwrap(),
+            "/static/$0"
+        );
+    }
+
+    #[test]
+    fn replacement_accepts_in_range_group_references() {
+        assert_eq!(
+            validate_path_rewrite_replacement("/v2/$1", Some(r"^/api/v1/(.*)$")).unwrap(),
+            "/v2/$1"
+        );
+        assert_eq!(
+            validate_path_rewrite_replacement("/$1/$2/$3", Some(r"^/(a)/(b)/(c)$")).unwrap(),
+            "/$1/$2/$3"
+        );
+    }
+
+    #[test]
+    fn replacement_rejects_out_of_range_group_references() {
+        match validate_path_rewrite_replacement("/v2/$3", Some(r"^/api/v1/(.*)$")) {
+            Err(ApiError::BadRequest(m)) => {
+                assert!(m.contains("$3"));
+                assert!(m.contains("only 1"));
+            }
+            _ => panic!("expected BadRequest"),
+        }
+    }
+
+    #[test]
+    fn replacement_respects_dollar_escape() {
+        // `$$` is a literal `$` in the regex crate's replacement syntax.
+        // `$$5` means "$5" as a literal string; the validator must not
+        // flag it as a group reference.
+        assert_eq!(
+            validate_path_rewrite_replacement("price: $$5", Some(r"^/x$")).unwrap(),
+            "price: $$5"
+        );
+    }
+
+    #[test]
+    fn replacement_no_check_when_pattern_is_none() {
+        // Without a pattern the field is meaningless but the validator
+        // should not choke on capture-group refs - it just bounces at
+        // the pattern level.
+        assert_eq!(
+            validate_path_rewrite_replacement("/v2/$99", None).unwrap(),
+            "/v2/$99"
+        );
     }
 }
 
@@ -812,215 +2317,412 @@ mod bot_protection_validation_tests {
     }
 }
 
-/// Full JSON view of a route returned by list / get / create / update endpoints.
+/// Full JSON view of a route returned by list / get / create / update
+/// endpoints. Fields mirror `lorica_config::models::Route` one-for-one
+/// unless noted otherwise ; see that type for the full semantics.
 #[derive(Serialize)]
 pub struct RouteResponse {
+    /// Mirror of `Route.id`.
     pub id: String,
+    /// Mirror of `Route.hostname`.
     pub hostname: String,
+    /// Mirror of `Route.path_prefix`.
     pub path_prefix: String,
+    /// IDs of the backends linked via `route_backends`.
     pub backends: Vec<String>,
+    /// Mirror of `Route.certificate_id`.
     pub certificate_id: Option<String>,
+    /// Load-balancing policy (rendered as the lowercase string form).
     pub load_balancing: String,
+    /// Mirror of `Route.waf_enabled`.
     pub waf_enabled: bool,
+    /// WAF mode (rendered as the lowercase string form).
     pub waf_mode: String,
+    /// Mirror of `Route.enabled`.
     pub enabled: bool,
+    /// Mirror of `Route.force_https`.
     pub force_https: bool,
+    /// Mirror of `Route.redirect_hostname`.
     pub redirect_hostname: Option<String>,
+    /// Mirror of `Route.redirect_to`.
     pub redirect_to: Option<String>,
+    /// Mirror of `Route.hostname_aliases`.
     pub hostname_aliases: Vec<String>,
+    /// Mirror of `Route.proxy_headers`.
     pub proxy_headers: HashMap<String, String>,
+    /// Mirror of `Route.response_headers`.
     pub response_headers: HashMap<String, String>,
+    /// Mirror of `Route.security_headers`.
     pub security_headers: String,
+    /// Mirror of `Route.connect_timeout_s`.
     pub connect_timeout_s: i32,
+    /// Mirror of `Route.read_timeout_s`.
     pub read_timeout_s: i32,
+    /// Mirror of `Route.send_timeout_s`.
     pub send_timeout_s: i32,
+    /// Mirror of `Route.strip_path_prefix`.
     pub strip_path_prefix: Option<String>,
+    /// Mirror of `Route.add_path_prefix`.
     pub add_path_prefix: Option<String>,
+    /// Mirror of `Route.path_rewrite_pattern`.
     pub path_rewrite_pattern: Option<String>,
+    /// Mirror of `Route.path_rewrite_replacement`.
     pub path_rewrite_replacement: Option<String>,
+    /// Mirror of `Route.access_log_enabled`.
     pub access_log_enabled: bool,
+    /// Mirror of `Route.proxy_headers_remove`.
     pub proxy_headers_remove: Vec<String>,
+    /// Mirror of `Route.response_headers_remove`.
     pub response_headers_remove: Vec<String>,
+    /// Mirror of `Route.max_request_body_bytes`.
     pub max_request_body_bytes: Option<u64>,
+    /// Mirror of `Route.websocket_enabled`.
     pub websocket_enabled: bool,
+    /// Mirror of `Route.rate_limit_rps`.
     pub rate_limit_rps: Option<u32>,
+    /// Mirror of `Route.rate_limit_burst`.
     pub rate_limit_burst: Option<u32>,
+    /// Mirror of `Route.ip_allowlist`.
     pub ip_allowlist: Vec<String>,
+    /// Mirror of `Route.ip_denylist`.
     pub ip_denylist: Vec<String>,
+    /// Mirror of `Route.cors_allowed_origins`.
     pub cors_allowed_origins: Vec<String>,
+    /// Mirror of `Route.cors_allowed_methods`.
     pub cors_allowed_methods: Vec<String>,
+    /// Mirror of `Route.cors_max_age_s`.
     pub cors_max_age_s: Option<i32>,
+    /// Mirror of `Route.compression_enabled`.
     pub compression_enabled: bool,
+    /// Mirror of `Route.retry_attempts`.
     pub retry_attempts: Option<u32>,
+    /// Mirror of `Route.cache_enabled`.
     pub cache_enabled: bool,
+    /// Mirror of `Route.cache_ttl_s`.
     pub cache_ttl_s: i32,
+    /// Mirror of `Route.cache_max_bytes`.
     pub cache_max_bytes: i64,
+    /// Mirror of `Route.max_connections`.
     pub max_connections: Option<u32>,
+    /// Mirror of `Route.slowloris_threshold_ms`.
     pub slowloris_threshold_ms: i32,
+    /// Mirror of `Route.auto_ban_threshold`.
     pub auto_ban_threshold: Option<u32>,
+    /// Mirror of `Route.auto_ban_duration_s`.
     pub auto_ban_duration_s: i32,
+    /// Per-path overrides evaluated in declaration order.
     pub path_rules: Vec<PathRuleResponse>,
+    /// Mirror of `Route.return_status`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_status: Option<u16>,
+    /// Mirror of `Route.sticky_session`.
     pub sticky_session: bool,
+    /// Basic-auth username (hash stays server-side, never in the
+    /// response).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basic_auth_username: Option<String>,
+    /// Mirror of `Route.stale_while_revalidate_s`.
     pub stale_while_revalidate_s: i32,
+    /// Mirror of `Route.stale_if_error_s`.
     pub stale_if_error_s: i32,
+    /// Mirror of `Route.retry_on_methods`.
     pub retry_on_methods: Vec<String>,
+    /// Mirror of `Route.maintenance_mode`.
     pub maintenance_mode: bool,
+    /// Mirror of `Route.error_page_html`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_page_html: Option<String>,
+    /// Mirror of `Route.cache_vary_headers`.
     pub cache_vary_headers: Vec<String>,
+    /// Header-based routing rules.
     pub header_rules: Vec<HeaderRuleRequest>,
+    /// Canary traffic splits.
     pub traffic_splits: Vec<TrafficSplitRequest>,
+    /// Forward-auth config ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forward_auth: Option<ForwardAuthConfigRequest>,
+    /// Request-mirror config ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mirror: Option<MirrorConfigRequest>,
+    /// Response-body rewrite config ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
+    /// mTLS client-cert gate ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtls: Option<MtlsConfigRequest>,
+    /// Token-bucket rate limit ; `None` = unlimited.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<lorica_config::models::RateLimit>,
+    /// Per-route GeoIP filter ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geoip: Option<lorica_config::models::GeoIpConfig>,
+    /// Per-route bot-protection filter ; `None` = disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
+    /// Free-form classification label (prod / staging / homelab / ...).
+    /// Empty string = ungrouped. Mirrors `Backend.group_name`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group_name: String,
+    /// RFC 3339 insert timestamp.
     pub created_at: String,
+    /// RFC 3339 last-write timestamp.
     pub updated_at: String,
 }
 
-/// JSON body for `POST /api/v1/routes`. Most fields are optional and fall back to defaults.
+/// JSON body for `POST /api/v1/routes`. Most fields are optional and
+/// fall back to defaults ; semantics mirror
+/// [`lorica_config::models::Route`] field-for-field.
 #[derive(Deserialize)]
 pub struct CreateRouteRequest {
+    /// Hostname served by the new route. Required.
     pub hostname: String,
+    /// URL path prefix ; defaults to `"/"`.
     pub path_prefix: Option<String>,
+    /// IDs of backends to link via `route_backends`. Order matters
+    /// for consistent-hash LB.
     pub backend_ids: Option<Vec<String>>,
+    /// TLS certificate ID ; omit for plaintext-only routes.
     pub certificate_id: Option<String>,
+    /// Load-balancing policy (snake_case name).
     pub load_balancing: Option<String>,
+    /// Enable the WAF filter chain on this route.
     pub waf_enabled: Option<bool>,
+    /// WAF mode : `"detection"` or `"blocking"`.
     pub waf_mode: Option<String>,
+    /// Force redirect to HTTPS on plaintext listeners.
     pub force_https: Option<bool>,
+    /// Canonical host for route-level redirects.
     pub redirect_hostname: Option<String>,
+    /// Full URL to redirect every request to.
     pub redirect_to: Option<String>,
+    /// Extra hostnames the route answers on.
     pub hostname_aliases: Option<Vec<String>>,
+    /// Request headers injected on the way to the upstream.
     pub proxy_headers: Option<HashMap<String, String>>,
+    /// Response headers appended on the way back.
     pub response_headers: Option<HashMap<String, String>>,
+    /// Named security-header preset.
     pub security_headers: Option<String>,
+    /// Upstream connect timeout (s).
     pub connect_timeout_s: Option<i32>,
+    /// Upstream read timeout (s).
     pub read_timeout_s: Option<i32>,
+    /// Upstream send timeout (s).
     pub send_timeout_s: Option<i32>,
+    /// Strip this prefix before forwarding.
     pub strip_path_prefix: Option<String>,
+    /// Prepend this prefix before forwarding.
     pub add_path_prefix: Option<String>,
+    /// Regex pattern for path rewriting.
     pub path_rewrite_pattern: Option<String>,
+    /// Replacement string for regex rewrite.
     pub path_rewrite_replacement: Option<String>,
+    /// Emit an access-log line per request.
     pub access_log_enabled: Option<bool>,
+    /// Request-header names removed before forwarding.
     pub proxy_headers_remove: Option<Vec<String>>,
+    /// Response-header names removed before returning.
     pub response_headers_remove: Option<Vec<String>>,
+    /// Hard cap on request body (bytes).
     pub max_request_body_bytes: Option<u64>,
+    /// Allow `Upgrade: websocket` requests.
     pub websocket_enabled: Option<bool>,
+    /// Per-client RPS rate limit.
     pub rate_limit_rps: Option<u32>,
+    /// Token-bucket burst capacity.
     pub rate_limit_burst: Option<u32>,
+    /// IP allow-list (CIDRs).
     pub ip_allowlist: Option<Vec<String>>,
+    /// IP deny-list (CIDRs).
     pub ip_denylist: Option<Vec<String>>,
+    /// CORS `Access-Control-Allow-Origin` values.
     pub cors_allowed_origins: Option<Vec<String>>,
+    /// CORS `Access-Control-Allow-Methods` values.
     pub cors_allowed_methods: Option<Vec<String>>,
+    /// CORS `Access-Control-Max-Age` (s).
     pub cors_max_age_s: Option<i32>,
+    /// Enable gzip / deflate response compression.
     pub compression_enabled: Option<bool>,
+    /// Idempotent-method retry count.
     pub retry_attempts: Option<u32>,
+    /// Enable in-proxy response cache.
     pub cache_enabled: Option<bool>,
+    /// Default cache TTL (s).
     pub cache_ttl_s: Option<i32>,
+    /// Per-entry cache size cap (bytes).
     pub cache_max_bytes: Option<i64>,
+    /// Hard cap on concurrent connections.
     pub max_connections: Option<u32>,
+    /// Slowloris request-header timeout (ms).
     pub slowloris_threshold_ms: Option<i32>,
+    /// Auto-ban request-count threshold.
     pub auto_ban_threshold: Option<u32>,
+    /// Auto-ban duration (s).
     pub auto_ban_duration_s: Option<i32>,
+    /// Per-path overrides evaluated in declaration order.
     pub path_rules: Option<Vec<PathRuleRequest>>,
+    /// Route-level short-circuit status.
     pub return_status: Option<u16>,
+    /// Enable cookie-based session affinity.
     pub sticky_session: Option<bool>,
+    /// Basic-auth username.
     pub basic_auth_username: Option<String>,
     /// Plaintext password - hashed with Argon2id before storage. Never stored
     /// or logged in cleartext. The management API binds to localhost only;
     /// ensure TLS or SSH tunnel if accessing remotely.
     pub basic_auth_password: Option<String>,
+    /// Cache-Control `stale-while-revalidate` (s).
     pub stale_while_revalidate_s: Option<i32>,
+    /// Cache-Control `stale-if-error` (s).
     pub stale_if_error_s: Option<i32>,
+    /// HTTP methods retryable by the retry logic.
     pub retry_on_methods: Option<Vec<String>>,
+    /// Return 503 on every request (maintenance).
     pub maintenance_mode: Option<bool>,
+    /// Operator-supplied HTML for terminal status codes.
     pub error_page_html: Option<String>,
+    /// Request headers that partition the cache.
     pub cache_vary_headers: Option<Vec<String>>,
+    /// Header-based routing rules.
     pub header_rules: Option<Vec<HeaderRuleRequest>>,
+    /// Canary traffic splits.
     pub traffic_splits: Option<Vec<TrafficSplitRequest>>,
+    /// Forward-auth config (optional).
     pub forward_auth: Option<ForwardAuthConfigRequest>,
+    /// Request-mirror config (optional).
     pub mirror: Option<MirrorConfigRequest>,
+    /// Response-body rewrite config (optional).
     pub response_rewrite: Option<ResponseRewriteConfigRequest>,
+    /// mTLS client-cert gate (optional).
     pub mtls: Option<MtlsConfigRequest>,
+    /// Token-bucket rate-limit struct (optional).
     pub rate_limit: Option<lorica_config::models::RateLimit>,
+    /// Per-route GeoIP filter (optional).
     pub geoip: Option<lorica_config::models::GeoIpConfig>,
+    /// Per-route bot-protection filter (optional).
     pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
+    /// Free-form operator classification (prod / staging / homelab / ...).
+    /// Omit or send empty string for ungrouped. Validated against a
+    /// lowercase ASCII + digits + `-` + `_` alphabet, 1..=64 chars.
+    pub group_name: Option<String>,
 }
 
-/// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are mutated.
+/// JSON body for `PUT /api/v1/routes/:id`. Only supplied fields are
+/// mutated ; every field is optional. Semantics mirror the matching
+/// [`lorica_config::models::Route`] field.
 #[derive(Deserialize)]
 pub struct UpdateRouteRequest {
+    /// New hostname (must stay unique across the route table).
     pub hostname: Option<String>,
+    /// New URL path prefix.
     pub path_prefix: Option<String>,
+    /// New backend ID list ; full replace when present.
     pub backend_ids: Option<Vec<String>>,
+    /// New TLS certificate ID.
     pub certificate_id: Option<String>,
+    /// Load-balancing policy name.
     pub load_balancing: Option<String>,
+    /// Enable / disable the WAF filter chain.
     pub waf_enabled: Option<bool>,
+    /// WAF mode (`"detection"` / `"blocking"`).
     pub waf_mode: Option<String>,
+    /// Admin toggle : disable to 404 all traffic.
     pub enabled: Option<bool>,
+    /// Force HTTPS redirect on plaintext listeners.
     pub force_https: Option<bool>,
+    /// Canonical redirect host.
     pub redirect_hostname: Option<String>,
+    /// Route-level redirect target URL.
     pub redirect_to: Option<String>,
+    /// Alias hostnames.
     pub hostname_aliases: Option<Vec<String>>,
+    /// Request headers to inject.
     pub proxy_headers: Option<HashMap<String, String>>,
+    /// Response headers to append.
     pub response_headers: Option<HashMap<String, String>>,
+    /// Named security-header preset.
     pub security_headers: Option<String>,
+    /// Upstream connect timeout (s).
     pub connect_timeout_s: Option<i32>,
+    /// Upstream read timeout (s).
     pub read_timeout_s: Option<i32>,
+    /// Upstream send timeout (s).
     pub send_timeout_s: Option<i32>,
+    /// Strip this prefix before forwarding.
     pub strip_path_prefix: Option<String>,
+    /// Prepend this prefix before forwarding.
     pub add_path_prefix: Option<String>,
+    /// Regex pattern for path rewriting.
     pub path_rewrite_pattern: Option<String>,
+    /// Replacement string for regex rewrite.
     pub path_rewrite_replacement: Option<String>,
+    /// Emit access-log lines.
     pub access_log_enabled: Option<bool>,
+    /// Request-header names to strip.
     pub proxy_headers_remove: Option<Vec<String>>,
+    /// Response-header names to strip.
     pub response_headers_remove: Option<Vec<String>>,
+    /// Hard cap on request body (bytes).
     pub max_request_body_bytes: Option<u64>,
+    /// Allow WebSocket upgrades.
     pub websocket_enabled: Option<bool>,
+    /// Per-client RPS rate limit.
     pub rate_limit_rps: Option<u32>,
+    /// Token-bucket burst capacity.
     pub rate_limit_burst: Option<u32>,
+    /// IP allow-list (CIDRs).
     pub ip_allowlist: Option<Vec<String>>,
+    /// IP deny-list (CIDRs).
     pub ip_denylist: Option<Vec<String>>,
+    /// CORS `Access-Control-Allow-Origin` values.
     pub cors_allowed_origins: Option<Vec<String>>,
+    /// CORS `Access-Control-Allow-Methods` values.
     pub cors_allowed_methods: Option<Vec<String>>,
+    /// CORS `Access-Control-Max-Age` (s).
     pub cors_max_age_s: Option<i32>,
+    /// Enable gzip / deflate response compression.
     pub compression_enabled: Option<bool>,
+    /// Idempotent-method retry count.
     pub retry_attempts: Option<u32>,
+    /// Enable in-proxy response cache.
     pub cache_enabled: Option<bool>,
+    /// Default cache TTL (s).
     pub cache_ttl_s: Option<i32>,
+    /// Per-entry cache size cap (bytes).
     pub cache_max_bytes: Option<i64>,
+    /// Hard cap on concurrent connections.
     pub max_connections: Option<u32>,
+    /// Slowloris request-header timeout (ms).
     pub slowloris_threshold_ms: Option<i32>,
+    /// Auto-ban request-count threshold.
     pub auto_ban_threshold: Option<u32>,
+    /// Auto-ban duration (s).
     pub auto_ban_duration_s: Option<i32>,
+    /// Per-path overrides (full replace).
     pub path_rules: Option<Vec<PathRuleRequest>>,
+    /// Route-level short-circuit status.
     pub return_status: Option<u16>,
+    /// Enable cookie-based session affinity.
     pub sticky_session: Option<bool>,
+    /// Basic-auth username.
     pub basic_auth_username: Option<String>,
     /// Plaintext password - hashed with Argon2id before storage.
     pub basic_auth_password: Option<String>,
+    /// Cache-Control `stale-while-revalidate` (s).
     pub stale_while_revalidate_s: Option<i32>,
+    /// Cache-Control `stale-if-error` (s).
     pub stale_if_error_s: Option<i32>,
+    /// HTTP methods retryable by the retry logic.
     pub retry_on_methods: Option<Vec<String>>,
+    /// Return 503 on every request (maintenance).
     pub maintenance_mode: Option<bool>,
+    /// Operator-supplied HTML for terminal status codes.
     pub error_page_html: Option<String>,
+    /// Cache-variance request-header names.
     pub cache_vary_headers: Option<Vec<String>>,
+    /// Header-based routing rules (full replace).
     pub header_rules: Option<Vec<HeaderRuleRequest>>,
+    /// Canary traffic splits (full replace).
     pub traffic_splits: Option<Vec<TrafficSplitRequest>>,
     /// Update semantics: missing field = leave current value alone;
     /// present with empty `address` = clear; present with non-empty
@@ -1057,8 +2759,14 @@ pub struct UpdateRouteRequest {
     /// the three cases orthogonal: neither sent = no-op, config
     /// sent = install, disable=true = clear.
     pub bot_protection: Option<lorica_config::models::BotProtectionConfig>,
+    /// Explicit clear flag for `bot_protection`. Setting this to
+    /// `true` removes the existing config ; `false` / absent is a
+    /// no-op (use the `bot_protection` field itself to replace).
     #[serde(default)]
     pub bot_protection_disable: Option<bool>,
+    /// Free-form operator classification (prod / staging / homelab / ...).
+    /// Empty string clears the grouping. `None` leaves the field unchanged.
+    pub group_name: Option<String>,
 }
 
 fn route_to_response(
@@ -1209,19 +2917,50 @@ fn route_to_response(
         rate_limit: route.rate_limit.clone(),
         geoip: route.geoip.clone(),
         bot_protection: route.bot_protection.clone(),
+        group_name: route.group_name.clone(),
         created_at: route.created_at.to_rfc3339(),
         updated_at: route.updated_at.to_rfc3339(),
     }
 }
 
+/// Query string for `GET /api/v1/routes`. Optional `group` filter lets
+/// the dashboard narrow the list to a single operator classification
+/// (prod / staging / etc.) without fetching everything first.
+#[derive(Deserialize, Default)]
+pub struct ListRoutesQuery {
+    /// Filter : when set, only routes whose `group_name` equals this
+    /// value are returned.
+    pub group: Option<String>,
+}
+
 /// GET /api/v1/routes - list every configured route with its linked backend ids.
 pub async fn list_routes(
     Extension(state): Extension<AppState>,
+    axum::extract::Query(query): axum::extract::Query<ListRoutesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     let routes = store.list_routes()?;
+    // Optional `?group=...` filter: trimmed, exact match on
+    // `Route.group_name`. Invalid shapes (non-alphabet chars) return
+    // 400 early rather than silently matching nothing.
+    let group_filter = match query.group.as_deref() {
+        Some(raw) => {
+            let v = validate_group_name(raw)?;
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        None => None,
+    };
     let mut responses = Vec::with_capacity(routes.len());
     for route in &routes {
+        if let Some(ref g) = group_filter {
+            if &route.group_name != g {
+                continue;
+            }
+        }
         let backend_ids = store.list_backends_for_route(&route.id)?;
         responses.push(route_to_response(route, backend_ids));
     }
@@ -1240,6 +2979,84 @@ pub async fn create_route(
         return Err(ApiError::BadRequest("hostname is required".into()));
     }
 
+    let redirect_hostname = match body.redirect_hostname.as_deref() {
+        Some(h) => {
+            let v = validate_redirect_hostname(h)?;
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        None => None,
+    };
+
+    let redirect_to = match body.redirect_to.as_deref() {
+        Some(r) => {
+            let v = validate_redirect_to(r, "redirect_to")?;
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        None => None,
+    };
+
+    let path_prefix = {
+        let raw = body.path_prefix.clone().unwrap_or_else(|| "/".to_string());
+        let v = validate_route_path(&raw, "path_prefix")?;
+        if v.is_empty() {
+            "/".to_string()
+        } else {
+            v
+        }
+    };
+
+    let strip_path_prefix = match body.strip_path_prefix.as_deref() {
+        Some(p) => {
+            let v = validate_route_path(p, "strip_path_prefix")?;
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        None => None,
+    };
+
+    let add_path_prefix = match body.add_path_prefix.as_deref() {
+        Some(p) => {
+            let v = validate_route_path(p, "add_path_prefix")?;
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        None => None,
+    };
+
+    let path_rewrite_pattern = match body.path_rewrite_pattern.as_deref() {
+        Some(p) => {
+            let v = validate_path_rewrite_pattern(p)?;
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        None => None,
+    };
+
+    let path_rewrite_replacement = match body.path_rewrite_replacement.as_deref() {
+        Some(r) => Some(validate_path_rewrite_replacement(
+            r,
+            path_rewrite_pattern.as_deref(),
+        )?),
+        None => None,
+    };
+
     let lb = body
         .load_balancing
         .as_deref()
@@ -1254,6 +3071,49 @@ pub async fn create_route(
         .parse::<lorica_config::models::WafMode>()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
+    if let Some(ref h) = body.proxy_headers {
+        validate_http_headers_map(h, "proxy_headers")?;
+    }
+    if let Some(ref h) = body.response_headers {
+        validate_http_headers_map(h, "response_headers")?;
+    }
+    if let Some(ref h) = body.proxy_headers_remove {
+        validate_http_header_name_list(h, "proxy_headers_remove")?;
+    }
+    if let Some(ref h) = body.response_headers_remove {
+        validate_http_header_name_list(h, "response_headers_remove")?;
+    }
+    if let Some(ref h) = body.cache_vary_headers {
+        validate_http_header_name_list(h, "cache_vary_headers")?;
+    }
+    if let Some(ref origins) = body.cors_allowed_origins {
+        for o in origins {
+            validate_cors_origin(o.trim(), "cors_allowed_origins")?;
+        }
+    }
+    if let Some(ref methods) = body.cors_allowed_methods {
+        for m in methods {
+            validate_http_method(m.trim(), "cors_allowed_methods")?;
+        }
+    }
+    validate_route_numeric_bounds(
+        body.connect_timeout_s,
+        body.read_timeout_s,
+        body.send_timeout_s,
+        Some(body.cache_ttl_s.unwrap_or(300)),
+        Some(body.cache_max_bytes.unwrap_or(52_428_800)),
+        body.max_connections,
+        Some(body.slowloris_threshold_ms.unwrap_or(5000)),
+        body.auto_ban_threshold,
+        Some(body.auto_ban_duration_s.unwrap_or(3600)),
+        body.return_status,
+        body.retry_attempts,
+        Some(body.stale_while_revalidate_s.unwrap_or(10)),
+        Some(body.stale_if_error_s.unwrap_or(60)),
+        body.cors_max_age_s,
+        body.max_request_body_bytes,
+    )?;
+
     let path_rules = if let Some(ref prs) = body.path_rules {
         build_path_rules(prs)?
     } else {
@@ -1264,16 +3124,26 @@ pub async fn create_route(
     let route = lorica_config::models::Route {
         id: uuid::Uuid::new_v4().to_string(),
         hostname: body.hostname,
-        path_prefix: body.path_prefix.unwrap_or_else(|| "/".to_string()),
+        path_prefix,
         certificate_id: body.certificate_id,
         load_balancing: lb,
         waf_enabled: body.waf_enabled.unwrap_or(false),
         waf_mode,
         enabled: true,
         force_https: body.force_https.unwrap_or(false),
-        redirect_hostname: body.redirect_hostname,
-        redirect_to: body.redirect_to,
-        hostname_aliases: body.hostname_aliases.unwrap_or_default(),
+        redirect_hostname,
+        redirect_to,
+        hostname_aliases: {
+            let raw = body.hostname_aliases.clone().unwrap_or_default();
+            let mut out = Vec::with_capacity(raw.len());
+            for (i, a) in raw.iter().enumerate() {
+                out.push(validate_hostname_alias(
+                    a,
+                    &format!("hostname_aliases[{i}]"),
+                )?);
+            }
+            out
+        },
         proxy_headers: body.proxy_headers.unwrap_or_default(),
         response_headers: body.response_headers.unwrap_or_default(),
         security_headers: body
@@ -1282,10 +3152,10 @@ pub async fn create_route(
         connect_timeout_s: body.connect_timeout_s.unwrap_or(5),
         read_timeout_s: body.read_timeout_s.unwrap_or(60),
         send_timeout_s: body.send_timeout_s.unwrap_or(60),
-        strip_path_prefix: body.strip_path_prefix,
-        add_path_prefix: body.add_path_prefix,
-        path_rewrite_pattern: body.path_rewrite_pattern,
-        path_rewrite_replacement: body.path_rewrite_replacement,
+        strip_path_prefix,
+        add_path_prefix,
+        path_rewrite_pattern,
+        path_rewrite_replacement,
         access_log_enabled: body.access_log_enabled.unwrap_or(true),
         proxy_headers_remove: body.proxy_headers_remove.unwrap_or_default(),
         response_headers_remove: body.response_headers_remove.unwrap_or_default(),
@@ -1318,9 +3188,20 @@ pub async fn create_route(
         },
         stale_while_revalidate_s: body.stale_while_revalidate_s.unwrap_or(10),
         stale_if_error_s: body.stale_if_error_s.unwrap_or(60),
-        retry_on_methods: body.retry_on_methods.clone().unwrap_or_default(),
+        retry_on_methods: {
+            let raw = body.retry_on_methods.clone().unwrap_or_default();
+            for m in &raw {
+                validate_http_method(m.trim(), "retry_on_methods")?;
+            }
+            raw
+        },
         maintenance_mode: body.maintenance_mode.unwrap_or(false),
-        error_page_html: body.error_page_html.clone(),
+        error_page_html: {
+            if let Some(ref h) = body.error_page_html {
+                validate_error_page_html(h)?;
+            }
+            body.error_page_html.clone()
+        },
         cache_vary_headers: body.cache_vary_headers.clone().unwrap_or_default(),
         header_rules: body
             .header_rules
@@ -1371,6 +3252,10 @@ pub async fn create_route(
             Some(b) => Some(validate_bot_protection(b)?),
             None => None,
         },
+        group_name: match body.group_name.as_deref() {
+            Some(g) => validate_group_name(g)?,
+            None => String::new(),
+        },
         created_at: now,
         updated_at: now,
     };
@@ -1412,11 +3297,30 @@ pub async fn update_route(
         .get_route(&id)?
         .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
 
+    validate_route_numeric_bounds(
+        body.connect_timeout_s,
+        body.read_timeout_s,
+        body.send_timeout_s,
+        body.cache_ttl_s,
+        body.cache_max_bytes,
+        body.max_connections,
+        body.slowloris_threshold_ms,
+        body.auto_ban_threshold,
+        body.auto_ban_duration_s,
+        body.return_status,
+        body.retry_attempts,
+        body.stale_while_revalidate_s,
+        body.stale_if_error_s,
+        body.cors_max_age_s,
+        body.max_request_body_bytes,
+    )?;
+
     if let Some(hostname) = body.hostname {
         route.hostname = hostname;
     }
     if let Some(path_prefix) = body.path_prefix {
-        route.path_prefix = path_prefix;
+        let v = validate_route_path(&path_prefix, "path_prefix")?;
+        route.path_prefix = if v.is_empty() { "/".to_string() } else { v };
     }
     if let Some(certificate_id) = body.certificate_id {
         if certificate_id.is_empty() {
@@ -1446,26 +3350,29 @@ pub async fn update_route(
         route.force_https = force_https;
     }
     if let Some(redirect_hostname) = body.redirect_hostname {
-        route.redirect_hostname = if redirect_hostname.is_empty() {
-            None
-        } else {
-            Some(redirect_hostname)
-        };
+        let v = validate_redirect_hostname(&redirect_hostname)?;
+        route.redirect_hostname = if v.is_empty() { None } else { Some(v) };
     }
     if let Some(redirect_to) = body.redirect_to {
-        if redirect_to.is_empty() {
-            route.redirect_to = None;
-        } else {
-            route.redirect_to = Some(redirect_to);
-        }
+        let v = validate_redirect_to(&redirect_to, "redirect_to")?;
+        route.redirect_to = if v.is_empty() { None } else { Some(v) };
     }
     if let Some(hostname_aliases) = body.hostname_aliases {
-        route.hostname_aliases = hostname_aliases;
+        let mut out = Vec::with_capacity(hostname_aliases.len());
+        for (i, a) in hostname_aliases.iter().enumerate() {
+            out.push(validate_hostname_alias(
+                a,
+                &format!("hostname_aliases[{i}]"),
+            )?);
+        }
+        route.hostname_aliases = out;
     }
     if let Some(proxy_headers) = body.proxy_headers {
+        validate_http_headers_map(&proxy_headers, "proxy_headers")?;
         route.proxy_headers = proxy_headers;
     }
     if let Some(response_headers) = body.response_headers {
+        validate_http_headers_map(&response_headers, "response_headers")?;
         route.response_headers = response_headers;
     }
     if let Some(security_headers) = body.security_headers {
@@ -1481,48 +3388,40 @@ pub async fn update_route(
         route.send_timeout_s = send_timeout_s;
     }
     if let Some(strip_path_prefix) = body.strip_path_prefix {
-        route.strip_path_prefix = if strip_path_prefix.is_empty() {
-            None
-        } else {
-            Some(strip_path_prefix)
-        };
+        let v = validate_route_path(&strip_path_prefix, "strip_path_prefix")?;
+        route.strip_path_prefix = if v.is_empty() { None } else { Some(v) };
     }
     if let Some(add_path_prefix) = body.add_path_prefix {
-        route.add_path_prefix = if add_path_prefix.is_empty() {
-            None
-        } else {
-            Some(add_path_prefix)
-        };
+        let v = validate_route_path(&add_path_prefix, "add_path_prefix")?;
+        route.add_path_prefix = if v.is_empty() { None } else { Some(v) };
     }
     if let Some(ref pattern) = body.path_rewrite_pattern {
-        if pattern.is_empty() {
+        let v = validate_path_rewrite_pattern(pattern)?;
+        if v.is_empty() {
             route.path_rewrite_pattern = None;
             route.path_rewrite_replacement = None;
         } else {
-            // Validate regex at API level
-            if regex::Regex::new(pattern).is_err() {
-                return Err(ApiError::BadRequest(format!(
-                    "invalid path_rewrite_pattern regex: {pattern}"
-                )));
-            }
-            if pattern.len() > 1024 {
-                return Err(ApiError::BadRequest(
-                    "path_rewrite_pattern must be <= 1024 characters".into(),
-                ));
-            }
-            route.path_rewrite_pattern = Some(pattern.clone());
+            route.path_rewrite_pattern = Some(v);
         }
     }
     if let Some(replacement) = body.path_rewrite_replacement {
-        route.path_rewrite_replacement = Some(replacement);
+        let v =
+            validate_path_rewrite_replacement(&replacement, route.path_rewrite_pattern.as_deref())?;
+        route.path_rewrite_replacement = if v.is_empty() && route.path_rewrite_pattern.is_none() {
+            None
+        } else {
+            Some(v)
+        };
     }
     if let Some(access_log_enabled) = body.access_log_enabled {
         route.access_log_enabled = access_log_enabled;
     }
     if let Some(proxy_headers_remove) = body.proxy_headers_remove {
+        validate_http_header_name_list(&proxy_headers_remove, "proxy_headers_remove")?;
         route.proxy_headers_remove = proxy_headers_remove;
     }
     if let Some(response_headers_remove) = body.response_headers_remove {
+        validate_http_header_name_list(&response_headers_remove, "response_headers_remove")?;
         route.response_headers_remove = response_headers_remove;
     }
     if let Some(max_request_body_bytes) = body.max_request_body_bytes {
@@ -1556,9 +3455,15 @@ pub async fn update_route(
         route.ip_denylist = ip_denylist;
     }
     if let Some(cors_allowed_origins) = body.cors_allowed_origins {
+        for o in &cors_allowed_origins {
+            validate_cors_origin(o.trim(), "cors_allowed_origins")?;
+        }
         route.cors_allowed_origins = cors_allowed_origins;
     }
     if let Some(cors_allowed_methods) = body.cors_allowed_methods {
+        for m in &cors_allowed_methods {
+            validate_http_method(m.trim(), "cors_allowed_methods")?;
+        }
         route.cors_allowed_methods = cors_allowed_methods;
     }
     if let Some(cors_max_age_s) = body.cors_max_age_s {
@@ -1641,12 +3546,16 @@ pub async fn update_route(
         route.stale_if_error_s = sie;
     }
     if let Some(ref methods) = body.retry_on_methods {
+        for m in methods {
+            validate_http_method(m.trim(), "retry_on_methods")?;
+        }
         route.retry_on_methods = methods.clone();
     }
     if let Some(maintenance) = body.maintenance_mode {
         route.maintenance_mode = maintenance;
     }
     if let Some(ref html) = body.error_page_html {
+        validate_error_page_html(html)?;
         route.error_page_html = if html.is_empty() {
             None
         } else {
@@ -1657,11 +3566,13 @@ pub async fn update_route(
         // Normalise on write: trim whitespace, drop empties. Downstream
         // variance logic lowercases on the hot path so no need to do it
         // here - keeps the dashboard showing exactly what the operator typed.
-        route.cache_vary_headers = headers
+        let normalised: Vec<String> = headers
             .iter()
             .map(|h| h.trim().to_string())
             .filter(|h| !h.is_empty())
             .collect();
+        validate_http_header_name_list(&normalised, "cache_vary_headers")?;
+        route.cache_vary_headers = normalised;
     }
     if let Some(ref rules) = body.header_rules {
         route.header_rules = rules
@@ -1743,6 +3654,9 @@ pub async fn update_route(
         route.bot_protection = None;
     } else if let Some(ref b) = body.bot_protection {
         route.bot_protection = Some(validate_bot_protection(b)?);
+    }
+    if let Some(ref raw) = body.group_name {
+        route.group_name = validate_group_name(raw)?;
     }
     route.updated_at = Utc::now();
 

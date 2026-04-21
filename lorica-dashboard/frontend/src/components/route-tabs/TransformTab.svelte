@@ -5,7 +5,15 @@
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
   import ResponseRewriteTab from './ResponseRewriteTab.svelte';
-  import { validateRegex } from '../../lib/validators';
+  import {
+    validateRegex,
+    validateRewriteReplacement,
+    validateHeadersMapText,
+    validateHttpHeaderNameList,
+    validateHttpMethodList,
+    validateCorsOriginList,
+    validateRoutePath,
+  } from '../../lib/validators';
 
   interface Props {
     form: RouteFormState;
@@ -64,6 +72,45 @@
   function checkPathRewriteRegex() {
     pathRewriteRegexError = validateRegex(form.path_rewrite_pattern);
   }
+
+  // Blur-time validators for header + CORS fields. The API layer is
+  // still authoritative; these catch the obvious mistakes (missing
+  // `=`, CR/LF inside a value, lowercase CORS method) before the user
+  // hits Save.
+  let proxyHeadersError = $state<string | null>(null);
+  let respHeadersError = $state<string | null>(null);
+  let proxyHeadersRemoveError = $state<string | null>(null);
+  let respHeadersRemoveError = $state<string | null>(null);
+  let corsOriginsError = $state<string | null>(null);
+  let corsMethodsError = $state<string | null>(null);
+  let corsMaxAgeError = $state<string | null>(null);
+  let stripPathPrefixError = $state<string | null>(null);
+  let addPathPrefixError = $state<string | null>(null);
+  let pathRewriteReplacementError = $state<string | null>(null);
+  function checkProxyHeaders() { proxyHeadersError = validateHeadersMapText(form.proxy_headers); }
+  function checkRespHeaders() { respHeadersError = validateHeadersMapText(form.response_headers); }
+  function checkProxyHeadersRemove() { proxyHeadersRemoveError = validateHttpHeaderNameList(form.proxy_headers_remove); }
+  function checkRespHeadersRemove() { respHeadersRemoveError = validateHttpHeaderNameList(form.response_headers_remove); }
+  function checkCorsOrigins() { corsOriginsError = validateCorsOriginList(form.cors_allowed_origins); }
+  function checkCorsMethods() { corsMethodsError = validateHttpMethodList(form.cors_allowed_methods); }
+  function checkCorsMaxAge() {
+    const raw = form.cors_max_age_s.trim();
+    if (raw === '') { corsMaxAgeError = null; return; }
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0 || n > 86_400) {
+      corsMaxAgeError = 'must be an integer in 0..86400 (1 day)';
+    } else {
+      corsMaxAgeError = null;
+    }
+  }
+  function checkStripPathPrefix() { stripPathPrefixError = validateRoutePath(form.strip_path_prefix); }
+  function checkAddPathPrefix() { addPathPrefixError = validateRoutePath(form.add_path_prefix); }
+  function checkPathRewriteReplacement() {
+    pathRewriteReplacementError = validateRewriteReplacement(
+      form.path_rewrite_replacement,
+      form.path_rewrite_pattern,
+    );
+  }
 </script>
 
 <div class="tab-content">
@@ -81,13 +128,15 @@
         <label for="proxy-headers">Custom proxy headers</label>
         {#if isImported('proxy_headers')}<span class="imported-badge">imported</span>{/if}
         <textarea id="proxy-headers" rows="4" bind:value={form.proxy_headers}
-          placeholder={PROXY_HEADERS_PLACEHOLDER}></textarea>
+          placeholder={PROXY_HEADERS_PLACEHOLDER} onblur={checkProxyHeaders} oninput={checkProxyHeaders}></textarea>
+        {#if proxyHeadersError}<span class="field-error" role="alert">{proxyHeadersError}</span>{/if}
         <span class="hint">Format: <code>key=value</code>, one per line. Nginx: <code>proxy_set_header</code>.</span>
       </div>
       <div class="form-group" class:modified={isModified('proxy_headers_remove')}>
         <label for="proxy-headers-remove">Remove proxy headers</label>
         {#if isImported('proxy_headers_remove')}<span class="imported-badge">imported</span>{/if}
-        <input id="proxy-headers-remove" type="text" bind:value={form.proxy_headers_remove} placeholder="X-Powered-By, Server" />
+        <input id="proxy-headers-remove" type="text" bind:value={form.proxy_headers_remove} placeholder="X-Powered-By, Server" onblur={checkProxyHeadersRemove} oninput={checkProxyHeadersRemove} />
+        {#if proxyHeadersRemoveError}<span class="field-error" role="alert">{proxyHeadersRemoveError}</span>{/if}
         <span class="hint">Comma-separated. Applied before custom headers above.</span>
       </div>
     </div>
@@ -116,7 +165,8 @@
         <label for="response-headers">Custom response headers</label>
         {#if isImported('response_headers')}<span class="imported-badge">imported</span>{/if}
         <textarea id="response-headers" rows="4" bind:value={form.response_headers}
-          placeholder={RESPONSE_HEADERS_PLACEHOLDER}></textarea>
+          placeholder={RESPONSE_HEADERS_PLACEHOLDER} onblur={checkRespHeaders} oninput={checkRespHeaders}></textarea>
+        {#if respHeadersError}<span class="field-error" role="alert">{respHeadersError}</span>{/if}
         <span class="hint">
           Format: <code>key=value</code>, one per line. Avoid <code>Access-Control-*</code> here - set them via the CORS subsection below.
         </span>
@@ -124,7 +174,8 @@
       <div class="form-group" class:modified={isModified('response_headers_remove')}>
         <label for="response-headers-remove">Remove response headers</label>
         {#if isImported('response_headers_remove')}<span class="imported-badge">imported</span>{/if}
-        <input id="response-headers-remove" type="text" bind:value={form.response_headers_remove} placeholder="X-Powered-By, Server" />
+        <input id="response-headers-remove" type="text" bind:value={form.response_headers_remove} placeholder="X-Powered-By, Server" onblur={checkRespHeadersRemove} oninput={checkRespHeadersRemove} />
+        {#if respHeadersRemoveError}<span class="field-error" role="alert">{respHeadersRemoveError}</span>{/if}
         <span class="hint">Comma-separated. Applied before custom headers above.</span>
       </div>
     </div>
@@ -142,19 +193,22 @@
       <div class="form-group" class:modified={isModified('cors_allowed_origins')}>
         <label for="cors-origins">Allowed origins</label>
         {#if isImported('cors_allowed_origins')}<span class="imported-badge">imported</span>{/if}
-        <input id="cors-origins" type="text" bind:value={form.cors_allowed_origins} placeholder="https://example.com, https://app.example.com" />
+        <input id="cors-origins" type="text" bind:value={form.cors_allowed_origins} placeholder="https://example.com, https://app.example.com" onblur={checkCorsOrigins} oninput={checkCorsOrigins} />
+        {#if corsOriginsError}<span class="field-error" role="alert">{corsOriginsError}</span>{/if}
         <span class="hint">Comma-separated. Use <code>*</code> for any origin (incompatible with credentials).</span>
       </div>
       <div class="form-row">
         <div class="form-group" class:modified={isModified('cors_allowed_methods')}>
           <label for="cors-methods">Allowed methods</label>
           {#if isImported('cors_allowed_methods')}<span class="imported-badge">imported</span>{/if}
-          <input id="cors-methods" type="text" bind:value={form.cors_allowed_methods} placeholder="GET, POST, PUT, DELETE" />
+          <input id="cors-methods" type="text" bind:value={form.cors_allowed_methods} placeholder="GET, POST, PUT, DELETE" onblur={checkCorsMethods} oninput={checkCorsMethods} />
+          {#if corsMethodsError}<span class="field-error" role="alert">{corsMethodsError}</span>{/if}
         </div>
         <div class="form-group" class:modified={isModified('cors_max_age_s')}>
           <label for="cors-max-age">Max age (s)</label>
           {#if isImported('cors_max_age_s')}<span class="imported-badge">imported</span>{/if}
-          <input id="cors-max-age" type="number" min="0" bind:value={form.cors_max_age_s} placeholder="No limit" />
+          <input id="cors-max-age" type="number" min="0" max="86400" bind:value={form.cors_max_age_s} placeholder="No limit" onblur={checkCorsMaxAge} oninput={checkCorsMaxAge} />
+          {#if corsMaxAgeError}<span class="field-error" role="alert">{corsMaxAgeError}</span>{/if}
         </div>
       </div>
     </div>
@@ -173,13 +227,15 @@
         <div class="form-group" class:modified={isModified('strip_path_prefix')}>
           <label for="strip-path">Strip path prefix</label>
           {#if isImported('strip_path_prefix')}<span class="imported-badge">imported</span>{/if}
-          <input id="strip-path" type="text" bind:value={form.strip_path_prefix} placeholder="/api/v1" />
+          <input id="strip-path" type="text" bind:value={form.strip_path_prefix} placeholder="/api/v1" onblur={checkStripPathPrefix} oninput={checkStripPathPrefix} />
+          {#if stripPathPrefixError}<span class="field-error" role="alert">{stripPathPrefixError}</span>{/if}
           <span class="hint">Removed from the request path before proxying.</span>
         </div>
         <div class="form-group" class:modified={isModified('add_path_prefix')}>
           <label for="add-path">Add path prefix</label>
           {#if isImported('add_path_prefix')}<span class="imported-badge">imported</span>{/if}
-          <input id="add-path" type="text" bind:value={form.add_path_prefix} placeholder="/backend" />
+          <input id="add-path" type="text" bind:value={form.add_path_prefix} placeholder="/backend" onblur={checkAddPathPrefix} oninput={checkAddPathPrefix} />
+          {#if addPathPrefixError}<span class="field-error" role="alert">{addPathPrefixError}</span>{/if}
           <span class="hint">Prepended after stripping.</span>
         </div>
       </div>
@@ -194,7 +250,7 @@
             type="text"
             class:invalid={pathRewriteRegexError !== null}
             bind:value={form.path_rewrite_pattern}
-            onblur={checkPathRewriteRegex}
+            onblur={checkPathRewriteRegex} oninput={checkPathRewriteRegex}
             placeholder="^/api/v1/(.*)"
           />
           <span class="hint">Rust regex syntax. Linear time, ReDoS-safe. Applied after strip/add.</span>
@@ -204,7 +260,8 @@
         </div>
         <div class="form-group" class:modified={isModified('path_rewrite_replacement')}>
           <label for="rewrite-replacement">Regex rewrite replacement</label>
-          <input id="rewrite-replacement" type="text" bind:value={form.path_rewrite_replacement} placeholder="/v2/$1" />
+          <input id="rewrite-replacement" type="text" bind:value={form.path_rewrite_replacement} placeholder="/v2/$1" onblur={checkPathRewriteReplacement} oninput={checkPathRewriteReplacement} />
+          {#if pathRewriteReplacementError}<span class="field-error" role="alert">{pathRewriteReplacementError}</span>{/if}
           <span class="hint">Use <code>$1</code>, <code>$2</code> ... for capture groups.</span>
         </div>
       </div>

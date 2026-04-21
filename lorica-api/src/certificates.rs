@@ -1,30 +1,45 @@
 //! TLS certificate CRUD plus self-signed generation. ACME-issued certs are
 //! created via the [`crate::acme`] module but managed here once stored.
 
-use axum::extract::{Extension, Path};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Extension, Path, Query};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::rate_limit::RateLimiter;
 use crate::server::AppState;
 
 /// Compact certificate view returned by list endpoints (no PEM body).
 #[derive(Serialize)]
 pub struct CertificateResponse {
+    /// Cert row id.
     pub id: String,
+    /// Primary CN / SAN.
     pub domain: String,
+    /// Extra SAN DNS names parsed from the cert.
     pub san_domains: Vec<String>,
+    /// SHA-256 fingerprint (hex).
     pub fingerprint: String,
+    /// Issuer DN.
     pub issuer: String,
+    /// RFC 3339 not-before timestamp.
     pub not_before: String,
+    /// RFC 3339 not-after timestamp.
     pub not_after: String,
+    /// Whether the cert was issued by Lorica's ACME flow.
     pub is_acme: bool,
+    /// Whether the ACME renewal loop auto-renews this cert.
     pub acme_auto_renew: bool,
+    /// RFC 3339 insert timestamp.
     pub created_at: String,
+    /// ACME method (`"http01"` / `"dns01-*"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme_method: Option<String>,
+    /// Global DNS provider ID for DNS-01 renewals.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme_dns_provider_id: Option<String>,
 }
@@ -32,25 +47,35 @@ pub struct CertificateResponse {
 /// JSON body for `POST /api/v1/certificates` - upload a PEM cert and key.
 #[derive(Deserialize)]
 pub struct CreateCertificateRequest {
+    /// Primary hostname the cert binds to.
     pub domain: String,
+    /// PEM-encoded leaf + chain.
     pub cert_pem: String,
+    /// PEM-encoded private key.
     pub key_pem: String,
 }
 
 /// JSON body for `POST /api/v1/certificates/self-signed`.
 #[derive(Deserialize)]
 pub struct GenerateSelfSignedRequest {
+    /// Hostname the self-signed cert binds to.
     pub domain: String,
 }
 
 /// JSON body for `PUT /api/v1/certificates/:id`. Only supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateCertificateRequest {
+    /// New primary hostname.
     pub domain: Option<String>,
+    /// New PEM cert + chain.
     pub cert_pem: Option<String>,
+    /// New PEM private key.
     pub key_pem: Option<String>,
+    /// ACME method override.
     pub acme_method: Option<String>,
+    /// New DNS provider reference for DNS-01 renewals.
     pub acme_dns_provider_id: Option<String>,
+    /// Toggle auto-renewal for this cert.
     pub acme_auto_renew: Option<bool>,
 }
 
@@ -58,18 +83,31 @@ pub struct UpdateCertificateRequest {
 /// including the PEM body and the routes that reference it.
 #[derive(Serialize)]
 pub struct CertificateDetailResponse {
+    /// Cert row id.
     pub id: String,
+    /// Primary hostname.
     pub domain: String,
+    /// SAN DNS names from the cert.
     pub san_domains: Vec<String>,
+    /// SHA-256 fingerprint (hex).
     pub fingerprint: String,
+    /// PEM-encoded leaf + chain.
     pub cert_pem: String,
+    /// Issuer DN.
     pub issuer: String,
+    /// RFC 3339 not-before timestamp.
     pub not_before: String,
+    /// RFC 3339 not-after timestamp.
     pub not_after: String,
+    /// Whether the cert is ACME-issued.
     pub is_acme: bool,
+    /// Whether the ACME loop auto-renews this cert.
     pub acme_auto_renew: bool,
+    /// RFC 3339 insert timestamp.
     pub created_at: String,
+    /// IDs of routes currently pointing at this cert.
     pub associated_routes: Vec<String>,
+    /// ACME method when `is_acme`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme_method: Option<String>,
 }
@@ -259,6 +297,7 @@ pub async fn create_certificate(
 
     let store = state.store.lock().await;
     store.create_certificate(&cert)?;
+    crate::cert_export::export_from_store(&store, &cert);
     drop(store);
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
@@ -433,6 +472,7 @@ pub async fn generate_self_signed(
 
     let store = state.store.lock().await;
     store.create_certificate(&certificate)?;
+    crate::cert_export::export_from_store(&store, &certificate);
     drop(store);
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
@@ -441,4 +481,171 @@ pub async fn generate_self_signed(
         StatusCode::CREATED,
         cert_to_response(&certificate),
     ))
+}
+
+/// Query string for `GET /api/v1/certificates/:id/download`.
+/// `part` selects which PEM blob ends up in the response body:
+/// * `cert` - the leaf certificate only
+/// * `key` - the private key only (most sensitive)
+/// * `chain` - the certificate followed by any additional chain in
+///   the PEM
+/// * `bundle` - cert + key concatenated (fullchain-style). Default.
+#[derive(Deserialize, Default)]
+pub struct DownloadCertificateQuery {
+    /// Which part of the bundle to serve : `"cert"` / `"key"` /
+    /// `"chain"` / `"bundle"` (default).
+    #[serde(default)]
+    pub part: Option<String>,
+}
+
+/// GET /api/v1/certificates/:id/download - emit the PEM payload as a
+/// file download. Auth-gated (this endpoint lives under
+/// `protected_routes`), rate-limited per client IP (5 downloads / 60 s,
+/// same bucket shape used for login), audited via `tracing::warn!` with
+/// the client IP, cert id, domain and selected part so a rogue export
+/// leaves a trail in the access log. The `Content-Disposition`
+/// filename is built from the cert domain with a sanitiser that
+/// rejects path-traversal / non-ASCII sequences; a malformed domain
+/// falls back to the opaque cert id so the download never serves a
+/// file named from attacker-controlled bytes.
+pub async fn download_certificate(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    Extension(state): Extension<AppState>,
+    Extension(rate_limiter): Extension<RateLimiter>,
+    Path(id): Path<String>,
+    Query(q): Query<DownloadCertificateQuery>,
+) -> Result<Response, ApiError> {
+    let client_ip = connect_info
+        .map(|ci| ci.0.ip().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    // Rate-limit per client IP in a dedicated `cert_download` bucket
+    // (5 attempts / 60 s window) so a runaway script cannot exfiltrate
+    // every cert in a tight loop. Legitimate "backup all certs" use
+    // cases pace themselves trivially. The bucket is independent of
+    // the login bucket so a cert-download flood does not block the
+    // operator from logging in.
+    if let Err(retry_after) = rate_limiter
+        .check_bucket("cert_download", &client_ip, 5, 60)
+        .await
+    {
+        return Err(ApiError::RateLimited(retry_after));
+    }
+
+    let store = state.store.lock().await;
+    let cert = store
+        .get_certificate(&id)?
+        .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
+
+    let part = q.part.as_deref().unwrap_or("bundle");
+    let (body, suffix) = match part {
+        "cert" => (cert.cert_pem.clone(), "cert"),
+        "key" => (cert.key_pem.clone(), "key"),
+        "chain" => (cert.cert_pem.clone(), "chain"),
+        "bundle" => {
+            let mut b = cert.cert_pem.clone();
+            if !b.ends_with('\n') {
+                b.push('\n');
+            }
+            b.push_str(&cert.key_pem);
+            (b, "bundle")
+        }
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown `part` value {other:?}; expected cert | key | chain | bundle"
+            )));
+        }
+    };
+
+    let safe_domain = sanitize_filename(&cert.domain).unwrap_or_else(|| cert.id.clone());
+    let filename = format!("{safe_domain}-{suffix}.pem");
+
+    tracing::warn!(
+        client_ip = %client_ip,
+        cert_id = %cert.id,
+        domain = %cert.domain,
+        part = %suffix,
+        "certificate download",
+    );
+
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    let mut resp = body.into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-pem-file"),
+    );
+    // `HeaderValue::from_str` is not infallible here (filename contains
+    // only ASCII after sanitize_filename), but we still defend against
+    // a surprise with a conservative fallback.
+    if let Ok(v) = HeaderValue::from_str(&disposition) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    Ok(resp)
+}
+
+/// Sanitize a cert domain into a safe filename component. Returns
+/// `None` when the input has no usable characters left (triggers the
+/// caller's fallback to the opaque cert id). Rules: keep only ASCII
+/// letters, digits, `-`, `_`, `.`. Reject leading dot / empty result /
+/// any `..` sequence. Hostnames fit naturally; wildcard domains
+/// (`*.example.com`) get their `*` dropped since it is not a
+/// filesystem-safe character.
+fn sanitize_filename(domain: &str) -> Option<String> {
+    let mut out = String::with_capacity(domain.len());
+    for c in domain.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            out.push(c);
+        }
+    }
+    if out.is_empty() || out.starts_with('.') || out.contains("..") {
+        return None;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_filename_keeps_hostnames() {
+        assert_eq!(
+            sanitize_filename("grafana.mibu.fr").as_deref(),
+            Some("grafana.mibu.fr")
+        );
+        assert_eq!(
+            sanitize_filename("my_host-01.example.com").as_deref(),
+            Some("my_host-01.example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_wildcard() {
+        // `*` is unsafe on most filesystems (Windows especially) and
+        // most shells interpret it. The sanitiser drops it, but the
+        // remaining `.example.com` starts with a dot so the guard
+        // rejects it - the caller falls back to the opaque cert id,
+        // which is exactly what we want for a wildcard cert.
+        assert_eq!(sanitize_filename("*.example.com"), None);
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_traversal() {
+        assert_eq!(sanitize_filename(".."), None);
+        assert_eq!(sanitize_filename("../etc/passwd"), None);
+        assert_eq!(sanitize_filename(""), None);
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_non_ascii() {
+        // Non-ASCII characters are silently dropped so a domain like
+        // `grafäna.fr` becomes `grafna.fr` rather than smuggling
+        // Unicode through the filename. A domain that reduces to the
+        // empty string after stripping returns None.
+        assert_eq!(
+            sanitize_filename("grafäna.fr").as_deref(),
+            Some("grafna.fr")
+        );
+        assert_eq!(sanitize_filename("é").as_deref(), None);
+    }
 }

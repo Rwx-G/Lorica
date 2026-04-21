@@ -41,8 +41,12 @@
   let draft = $state('');
   let inputEl: HTMLInputElement | undefined = $state();
 
-  const sep = separator === 'csv' ? ', ' : '\n';
-  const splitPattern = separator === 'csv' ? /[,\s]+/ : /[\r\n]+/;
+  // `separator` is a Svelte 5 prop : derive the joiner + split
+  // regex from it so a parent that flips `csv` ↔ `lines` at runtime
+  // sees the new shape on the next render instead of being stuck
+  // on whatever value was set at component init.
+  const sep = $derived(separator === 'csv' ? ', ' : '\n');
+  const splitPattern = $derived(separator === 'csv' ? /[,\s]+/ : /[\r\n]+/);
 
   // chips derive from `value` so the parent can mutate it freely
   // (imports, undo, etc.) without fighting a local cache.

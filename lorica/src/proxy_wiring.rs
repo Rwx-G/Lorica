@@ -515,10 +515,10 @@ impl ProxyConfig {
 
         // Sort each host's routes by path_prefix length descending (longest prefix match first)
         for entries in routes_by_host.values_mut() {
-            entries.sort_by(|a, b| b.route.path_prefix.len().cmp(&a.route.path_prefix.len()));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.route.path_prefix.len()));
         }
         for (_, entries) in &mut wildcard_routes {
-            entries.sort_by(|a, b| b.route.path_prefix.len().cmp(&a.route.path_prefix.len()));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.route.path_prefix.len()));
         }
 
         // Merge security presets: start with builtins, let custom override by name
@@ -967,6 +967,12 @@ pub struct RequestCtx {
     pub retry_count: u32,
     /// Backends overridden by a matched path rule (None = use route backends).
     pub matched_backends: Option<Vec<Backend>>,
+    /// True when the active `redirect_to` originates from a path rule
+    /// override. In that case the target URL is used verbatim (no
+    /// path/query appended), because the operator explicitly set the
+    /// destination for this specific path. Route-level `redirect_to`
+    /// still appends the request path + query for migration use cases.
+    pub path_rule_literal_redirect: bool,
     /// Human-readable reason when the proxy short-circuits with an error status
     /// (e.g. "WAF blocked", "rate limited", "return_status rule", "IP banned").
     pub block_reason: Option<String>,
@@ -1884,12 +1890,40 @@ fn extract_sticky_backend(cookie_header: &str) -> Option<&str> {
 /// deterministic output given `(now, thread_id)` inputs, so an
 /// attacker observing a few IDs could predict future ones.
 fn generate_request_id() -> String {
-    use rand::RngCore;
+    use rand::TryRngCore;
     let mut bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG must produce entropy for request id");
     let hi = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
     let lo = u64::from_le_bytes(bytes[8..].try_into().expect("8 bytes"));
     format!("{hi:016x}{lo:016x}")
+}
+
+/// Build the `Location` header value for a `redirect_to` rule.
+///
+/// When `literal` is true (a path rule explicitly set `redirect_to`),
+/// the target is emitted verbatim: the operator picked the exact
+/// destination for this matched path, so appending the request path
+/// would only produce a broken URL (the Plex `/tesla` case).
+///
+/// When `literal` is false (route-level `redirect_to`), the request
+/// path and query are appended to the target with its trailing `/`
+/// trimmed. This is the documented migration-friendly behavior:
+/// pointing `old.example.com` at `https://new.example.com/` preserves
+/// every subpath.
+fn build_redirect_location(
+    target: &str,
+    req_path: &str,
+    req_query: Option<&str>,
+    literal: bool,
+) -> String {
+    if literal {
+        return target.to_string();
+    }
+    let query_suffix = req_query.map(|q| format!("?{q}")).unwrap_or_default();
+    let base = target.trim_end_matches('/');
+    format!("{base}{req_path}{query_suffix}")
 }
 
 /// Escape HTML special characters to prevent XSS when injecting dynamic values
@@ -1944,6 +1978,7 @@ impl ProxyHttp for LoricaProxy {
             rate_limit_info: None,
             retry_count: 0,
             matched_backends: None,
+            path_rule_literal_redirect: false,
             block_reason: None,
             body_bytes_received: 0,
             waf_body_buffer: None,
@@ -2728,6 +2763,16 @@ impl ProxyHttp for LoricaProxy {
                             ctx.matched_backends = Some(backends.clone());
                         }
                     }
+                    // A path rule that explicitly sets redirect_to means
+                    // the operator picked the exact destination for this
+                    // path. Flag it so the redirect branches below emit
+                    // the target verbatim instead of appending the
+                    // request's path/query (which is the documented
+                    // route-level behavior, but nonsensical here: the
+                    // path has already been matched).
+                    if rule.redirect_to.is_some() {
+                        ctx.path_rule_literal_redirect = true;
+                    }
                     break;
                 }
             }
@@ -2904,10 +2949,12 @@ impl ProxyHttp for LoricaProxy {
                     .and_then(|r| r.redirect_to.clone())
                 {
                     // return_status + redirect_to = redirect with specific status code
-                    let redir_path = req.uri.path();
-                    let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-                    let base = target.trim_end_matches('/');
-                    let location = format!("{base}{redir_path}{redir_query}");
+                    let location = build_redirect_location(
+                        target,
+                        req.uri.path(),
+                        req.uri.query(),
+                        ctx.path_rule_literal_redirect,
+                    );
                     let mut header = lorica_http::ResponseHeader::build(status, None)?;
                     header.insert_header("Location", &location)?;
                     session
@@ -2954,10 +3001,12 @@ impl ProxyHttp for LoricaProxy {
                 .as_ref()
                 .and_then(|r| r.redirect_to.clone())
             {
-                let redir_path = req.uri.path();
-                let redir_query = req.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-                let base = target.trim_end_matches('/');
-                let location = format!("{base}{redir_path}{redir_query}");
+                let location = build_redirect_location(
+                    target,
+                    req.uri.path(),
+                    req.uri.query(),
+                    ctx.path_rule_literal_redirect,
+                );
                 let mut header = lorica_http::ResponseHeader::build(301, None)?;
                 header.insert_header("Location", &location)?;
                 session

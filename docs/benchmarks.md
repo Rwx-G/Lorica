@@ -97,7 +97,8 @@ multiple hosts via `k6` / `wrk` against the same Lorica instance.
 The forward-auth verdict cache and the basic-auth credential cache
 are exposed only as private internals on `LoricaProxy`. Adding a
 `pub(crate)` accessor + a bench would close PERF-12 for those two
-paths; tracked for v1.4.0.
+paths ; no owner scheduled yet, reopen when someone needs the
+numbers.
 
 ## Adding a new bench
 

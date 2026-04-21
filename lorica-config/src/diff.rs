@@ -10,27 +10,39 @@ use crate::store::ConfigStore;
 /// Summary of changes that an import would produce.
 #[derive(Debug, Serialize)]
 pub struct ConfigDiff {
+    /// Per-entity diff for the `routes` table.
     pub routes: EntityDiff,
+    /// Per-entity diff for the `backends` table.
     pub backends: EntityDiff,
+    /// Per-entity diff for the `certificates` table.
     pub certificates: EntityDiff,
+    /// Per-entity diff for the `route_backends` join table.
     pub route_backends: EntityDiff,
+    /// Per-entity diff for `notification_configs`.
     pub notification_configs: EntityDiff,
+    /// Per-entity diff for `user_preferences`.
     pub user_preferences: EntityDiff,
+    /// Per-entity diff for `admin_users`.
     pub admin_users: EntityDiff,
+    /// Key-level diff for `global_settings`.
     pub global_settings: SettingsDiff,
 }
 
 /// Per-entity type summary of adds, modifications, and removals.
 #[derive(Debug, Serialize)]
 pub struct EntityDiff {
+    /// IDs present in the import but absent from the current store.
     pub added: Vec<String>,
+    /// IDs present on both sides whose values differ.
     pub modified: Vec<String>,
+    /// IDs present in the store but absent from the import.
     pub removed: Vec<String>,
 }
 
 /// Diff for global settings key-value pairs.
 #[derive(Debug, Serialize)]
 pub struct SettingsDiff {
+    /// One entry per changed key.
     pub changes: Vec<SettingChange>,
 }
 
@@ -38,8 +50,11 @@ pub struct SettingsDiff {
 /// rendered both before and after as strings for display purposes.
 #[derive(Debug, Serialize)]
 pub struct SettingChange {
+    /// Name of the changed setting.
     pub key: String,
+    /// Previous value (rendered as string).
     pub old_value: String,
+    /// New value from the import (rendered as string).
     pub new_value: String,
 }
 
@@ -272,6 +287,7 @@ fn route_eq(a: &Route, b: &Route) -> bool {
         && a.path_rewrite_replacement == b.path_rewrite_replacement
         && a.path_rules.len() == b.path_rules.len()
         && a.return_status == b.return_status
+        && a.group_name == b.group_name
 }
 
 fn backend_eq(a: &Backend, b: &Backend) -> bool {

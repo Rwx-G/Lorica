@@ -21,6 +21,37 @@ use tracing::{error, info, warn};
 use crate::error::ApiError;
 use crate::server::AppState;
 
+/// Pure predicate : does this certificate qualify for automated ACME
+/// renewal at `now`, given a "renew when days_remaining ≤ threshold"
+/// policy ? Returns `true` when ALL of the following are true :
+///
+/// - `cert.is_acme == true` (uploaded / self-signed certs are never
+///   renewed automatically, regardless of their expiry)
+/// - `cert.acme_auto_renew == true` (operator has opted in to auto-
+///   renewal for this cert)
+/// - `(cert.not_after - now).num_days() <= threshold_days` (inside
+///   the renewal window)
+/// - `cert.acme_method != Some("dns01-manual")` (manual DNS-01
+///   flows require a human — the auto-renewal loop cannot fire
+///   them, see the `spawn_renewal_task` body for the handling)
+///
+/// Extracted so the filtering logic is unit-testable without
+/// spawning the background task or hitting the network.
+pub(super) fn should_auto_renew(
+    cert: &lorica_config::models::Certificate,
+    now: chrono::DateTime<chrono::Utc>,
+    threshold_days: i64,
+) -> bool {
+    if !cert.is_acme || !cert.acme_auto_renew {
+        return false;
+    }
+    if cert.acme_method.as_deref() == Some("dns01-manual") {
+        return false;
+    }
+    let days_remaining = (cert.not_after - now).num_days();
+    days_remaining <= threshold_days
+}
+
 use super::config::AcmeConfig;
 use super::dns01::provision_with_acme_dns;
 use super::dns_challengers::{build_dns_challenger, DnsChallengeConfig};
@@ -55,10 +86,17 @@ pub fn spawn_renewal_task(
 
             let now = chrono::Utc::now();
             for cert in &certs {
+                // Pre-filter via the pure `should_auto_renew` helper so
+                // the branching stays unit-testable. The helper already
+                // rules out non-ACME, opt-out, dns01-manual, and out-of-
+                // window certs ; we add a separate notification arm
+                // below for the "inside window but not eligible for
+                // auto" case (dns01-manual), which the helper collapses
+                // to `false` but the operator still wants to be alerted
+                // about.
                 if !cert.is_acme || !cert.acme_auto_renew {
                     continue;
                 }
-
                 let days_remaining = (cert.not_after - now).num_days();
                 if days_remaining > renewal_threshold_days {
                     continue;
@@ -71,7 +109,10 @@ pub fn spawn_renewal_task(
                     "ACME certificate approaching expiry, attempting renewal"
                 );
 
-                // Dispatch cert_expiring notification
+                // Dispatch cert_expiring notification (fires for both
+                // auto-renewable and dns01-manual certs, since the
+                // operator wants to know about the upcoming expiry in
+                // both cases).
                 if let Some(ref sender) = alert_sender {
                     sender.send(
                         lorica_notify::AlertEvent::new(
@@ -87,8 +128,9 @@ pub fn spawn_renewal_task(
                     );
                 }
 
-                // Skip dns01-manual certs in auto-renewal
-                if cert.acme_method.as_deref() == Some("dns01-manual") {
+                // Skip dns01-manual certs from the ACME renewal call
+                // itself — the operator must confirm the new TXT.
+                if !should_auto_renew(cert, now, renewal_threshold_days) {
                     info!(
                         domain = %cert.domain,
                         "skipping auto-renewal for manual DNS-01 certificate"

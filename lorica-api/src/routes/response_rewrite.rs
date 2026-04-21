@@ -7,10 +7,17 @@ use crate::error::ApiError;
 /// One literal-or-regex find/replace rule applied to response bodies.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ResponseRewriteRuleRequest {
+    /// Literal string or regex source searched against the response
+    /// body.
     pub pattern: String,
+    /// Replacement string (`$N` capture groups allowed when
+    /// `is_regex`).
     pub replacement: String,
+    /// Whether `pattern` compiles as a regex (default literal).
     #[serde(default)]
     pub is_regex: bool,
+    /// Cap on the number of matches replaced per response. `None` =
+    /// unlimited.
     #[serde(default)]
     pub max_replacements: Option<u32>,
 }
@@ -18,10 +25,14 @@ pub struct ResponseRewriteRuleRequest {
 /// Response body rewrite configuration: ordered rules, body size cap, content-type filter.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ResponseRewriteConfigRequest {
+    /// Ordered list of rewrite rules (applied sequentially).
     #[serde(default)]
     pub rules: Vec<ResponseRewriteRuleRequest>,
+    /// Maximum buffered body size (bytes) ; larger responses pass
+    /// through unchanged.
     #[serde(default = "default_rewrite_max_body_bytes")]
     pub max_body_bytes: u32,
+    /// Response Content-Type prefixes that enable rewriting.
     #[serde(default)]
     pub content_type_prefixes: Vec<String>,
 }
@@ -60,6 +71,12 @@ pub(super) fn build_response_rewrite(
             REWRITE_MAX_BODY_CEILING / 1_048_576
         )));
     }
+    const PATTERN_MAX_LEN: usize = 4096;
+    const REPLACEMENT_MAX_LEN: usize = 4096;
+    // `$N` capture-group references in the replacement - compiled
+    // once outside the per-rule loop.
+    static REF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let ref_re = REF_RE.get_or_init(|| regex::Regex::new(r"\$(\d+)").expect("static regex"));
     let mut rules = Vec::with_capacity(body.rules.len());
     for (i, rule) in body.rules.iter().enumerate() {
         if rule.pattern.is_empty() {
@@ -67,11 +84,37 @@ pub(super) fn build_response_rewrite(
                 "response_rewrite.rules[{i}]: pattern must not be empty"
             )));
         }
+        if rule.pattern.len() > PATTERN_MAX_LEN {
+            return Err(ApiError::BadRequest(format!(
+                "response_rewrite.rules[{i}]: pattern must be <= {PATTERN_MAX_LEN} characters"
+            )));
+        }
+        if rule.replacement.len() > REPLACEMENT_MAX_LEN {
+            return Err(ApiError::BadRequest(format!(
+                "response_rewrite.rules[{i}]: replacement must be <= {REPLACEMENT_MAX_LEN} characters"
+            )));
+        }
         if rule.is_regex {
             // Pre-compile: catches "(unclosed" before a reload.
-            regex::Regex::new(&rule.pattern).map_err(|e| {
+            let compiled = regex::Regex::new(&rule.pattern).map_err(|e| {
                 ApiError::BadRequest(format!("response_rewrite.rules[{i}]: invalid regex: {e}"))
             })?;
+            // Guard against replacements that reference capture groups
+            // not present in the pattern (e.g. `$1` against `/foo` would
+            // emit literal `$1` into the response stream and the
+            // operator only notices once a user hits the page).
+            let max_ref = compiled.captures_len().saturating_sub(1);
+            let scan = rule.replacement.replace("$$", "");
+            for cap in ref_re.captures_iter(&scan) {
+                let n: usize = cap[1].parse().unwrap_or(0);
+                if n > max_ref {
+                    return Err(ApiError::BadRequest(format!(
+                        "response_rewrite.rules[{i}]: replacement references `${n}` \
+                         but the pattern has only {max_ref} capture group{s}",
+                        s = if max_ref == 1 { "" } else { "s" }
+                    )));
+                }
+            }
         }
         if let Some(n) = rule.max_replacements {
             if n == 0 {
@@ -180,6 +223,40 @@ mod tests {
         cfg.rules[0].max_replacements = Some(0);
         let err = build_response_rewrite(&cfg).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("max_replacements")));
+    }
+
+    #[test]
+    fn build_response_rewrite_rejects_pattern_too_long() {
+        let long = "a".repeat(8192);
+        let cfg = rr_cfg(vec![rr_rule(&long, "x", false)]);
+        let err = build_response_rewrite(&cfg).expect_err("test setup");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("4096")));
+    }
+
+    #[test]
+    fn build_response_rewrite_rejects_out_of_range_capture_reference() {
+        // Pattern has no capture groups; `$1` in the replacement would
+        // render as literal `$1` at runtime - almost certainly not what
+        // the operator wanted.
+        let cfg = rr_cfg(vec![rr_rule(r"\d+", "value: $1", true)]);
+        let err = build_response_rewrite(&cfg).expect_err("test setup");
+        assert!(
+            matches!(err, ApiError::BadRequest(ref m) if m.contains("`$1`") && m.contains("only 0"))
+        );
+    }
+
+    #[test]
+    fn build_response_rewrite_accepts_dollar_dollar_escape() {
+        // `$$5` in the replacement is a literal `$5`, not a capture
+        // reference. The validator must not flag it.
+        let cfg = rr_cfg(vec![rr_rule(r"\d+", "price: $$5", true)]);
+        assert!(build_response_rewrite(&cfg).is_ok());
+    }
+
+    #[test]
+    fn build_response_rewrite_accepts_in_range_capture_reference() {
+        let cfg = rr_cfg(vec![rr_rule(r"(\d+) apples", "$1 oranges", true)]);
+        assert!(build_response_rewrite(&cfg).is_ok());
     }
 
     #[test]

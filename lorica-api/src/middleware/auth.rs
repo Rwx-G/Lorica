@@ -20,9 +20,13 @@ const SESSION_TIMEOUT_MINUTES: i64 = 30;
 /// Authenticated session injected into request extensions by [`require_auth`].
 #[derive(Debug, Clone)]
 pub struct Session {
+    /// AdminUser id that owns the session.
     pub user_id: String,
+    /// Username (denormalised for audit-logging convenience).
     pub username: String,
+    /// Creation timestamp (first login).
     pub created_at: DateTime<Utc>,
+    /// Expiry timestamp ; requests past this point are rejected 401.
     pub expires_at: DateTime<Utc>,
 }
 
@@ -237,6 +241,27 @@ impl SessionStore {
             let store = db.lock().await;
             let _ = store.delete_sessions_for_user_except(&uid, &keep);
         });
+    }
+
+    /// Remove every session belonging to a user, including the
+    /// currently-active one. Used by the password-change flow so
+    /// a stolen cookie cannot survive a rotation (v1.5.0 audit
+    /// finding LOW-13). Caller is expected to follow up with
+    /// `create(...)` to mint a fresh session + `Set-Cookie` on
+    /// the response so the legitimate user stays logged in.
+    ///
+    /// The DB purge runs **synchronously** here, not spawned, so
+    /// an immediate follow-up `get(old_session_id)` call cannot
+    /// re-hydrate the deleted row from the DB fallback path.
+    /// Latency impact: one SQLite DELETE (~1 ms on a warm page
+    /// cache), negligible in the password-change flow.
+    pub async fn remove_all_for_user(&self, user_id: &str) {
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|_sid, session| session.user_id != user_id);
+        }
+        let store = self.db.lock().await;
+        let _ = store.delete_all_sessions_for_user(user_id);
     }
 
     /// Remove all expired sessions from memory and database.

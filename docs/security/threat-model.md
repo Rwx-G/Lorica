@@ -73,6 +73,17 @@ Internet  -->  [ Lorica Proxy (8080/8443) ]  -->  Backend Services
 | Malicious crate injection | Cargo.lock pinned, reproducible builds | Implemented |
 | Binary tampering | GPG package signing | Implemented |
 
+#### Known transitive advisories (awaiting upstream)
+
+These RUSTSEC advisories are visible to `cargo audit` but hit only through forked Pingora crates (`lorica-tls`, `lorica-core`, etc.) that we deliberately do not modify to keep upstream resync cheap. They are tracked here so an incremental review is unambiguous:
+
+| ID | Crate | Surface in Lorica-native code | Path |
+|----|-------|-------------------------------|------|
+| RUSTSEC-2025-0134 | `rustls-pemfile 2.2.0` (unmaintained) | None since v1.5.0 (direct usage swapped to `rustls-pki-types`) | Transitive via `lorica-tls` → `rustls-native-certs` |
+| RUSTSEC-2026-0097 | `rand 0.8.5` (unsound with custom logger) | None after v1.5.0 bump (direct call sites migrated to `rand 0.9` ; `0.10` was considered but the surrounding ecosystem `argon2 0.5` + `rand_chacha 0.9` has not caught up with the rand-core 0.10 migration) | Transitive via `captcha`, forked `lorica-runtime`/`lorica-limits` |
+
+The forked crates eventually inherit the upstream fix when Pingora migrates. Until then, mitigation is scope limitation (Lorica-native code does not call the affected APIs directly) plus the fact that both advisories require conditions we do not create (unmaintained-but-functional parser on a known PEM format ; custom logger + `rand::rng()` combo, while Lorica uses the stock `tracing` subscriber).
+
 ### T6: Operational
 
 | Threat | Mitigation | Status |

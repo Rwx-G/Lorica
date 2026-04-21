@@ -7,10 +7,14 @@ use crate::error::ApiError;
 /// Header-based routing rule (matches a header value, picks a backend pool).
 #[derive(Serialize, Deserialize)]
 pub struct HeaderRuleRequest {
+    /// HTTP header name the rule tests.
     pub header_name: String,
+    /// Match-type name : `"exact"` (default), `"prefix"`, or `"regex"`.
     #[serde(default)]
     pub match_type: Option<String>,
+    /// Literal string / regex source compared against the header.
     pub value: String,
+    /// Backends that serve matching requests.
     #[serde(default)]
     pub backend_ids: Vec<String>,
     /// Response-only indicator. Set to `true` by `route_to_response`
@@ -35,6 +39,37 @@ pub(super) fn build_header_rule(
         return Err(ApiError::BadRequest(
             "header_rules: header_name must not be empty".into(),
         ));
+    }
+    if header_name.len() > 256 {
+        return Err(ApiError::BadRequest(
+            "header_rules: header_name must be <= 256 characters".into(),
+        ));
+    }
+    for c in header_name.chars() {
+        let is_token = c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '!' | '#'
+                    | '$'
+                    | '%'
+                    | '&'
+                    | '\''
+                    | '*'
+                    | '+'
+                    | '-'
+                    | '.'
+                    | '^'
+                    | '_'
+                    | '`'
+                    | '|'
+                    | '~'
+            );
+        if !is_token {
+            return Err(ApiError::BadRequest(format!(
+                "header_rules: header_name {header_name:?} contains `{c}` which is not a \
+                 valid HTTP field-name character (RFC 7230 token)"
+            )));
+        }
     }
     let match_type: lorica_config::models::HeaderMatchType = body
         .match_type

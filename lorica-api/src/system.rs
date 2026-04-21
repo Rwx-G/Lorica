@@ -11,8 +11,11 @@ use crate::server::AppState;
 /// Top-level payload returned by `GET /api/v1/system`.
 #[derive(Serialize)]
 pub struct SystemResponse {
+    /// Host-level CPU, memory, and disk usage.
     pub host: HostMetrics,
+    /// Lorica process resource counters.
     pub process: ProcessMetrics,
+    /// Build / runtime info about the proxy.
     pub proxy: ProxyInfo,
 }
 
@@ -45,8 +48,13 @@ pub struct HostMetrics {
 /// and the data-dir mount.
 #[derive(Serialize)]
 pub struct DiskUsage {
-    /// Absolute path of the mount point (e.g. `/` or `/var/lib`).
-    pub mount_point: String,
+    /// Short label identifying the mount role (`root`, `data`) -
+    /// not the absolute path. We intentionally hide the real
+    /// path because this response rides a session-gated endpoint
+    /// but still goes to operators whose session may have been
+    /// compromised ; absolute paths feed reconnaissance post-auth
+    /// (v1.5.0 audit finding LOW-14).
+    pub mount_label: String,
     /// Total bytes available to users on this filesystem.
     pub total_bytes: u64,
     /// Bytes currently in use (total - available).
@@ -67,7 +75,12 @@ pub struct ProcessMetrics {
 /// Proxy version, uptime, listen ports, and live connection count.
 #[derive(Serialize)]
 pub struct ProxyInfo {
-    /// Lorica version string.
+    /// Lorica version string, masked to `MAJOR.MINOR` (e.g.
+    /// `"1.5"`). The patch version is intentionally hidden to
+    /// reduce reconnaissance value on a compromised session ;
+    /// operators who genuinely need the exact version can read
+    /// the package metadata (`dpkg -s lorica`, `rpm -qi lorica`)
+    /// or the journal startup line.
     pub version: String,
     /// Uptime in seconds since the process started.
     pub uptime_seconds: u64,
@@ -150,8 +163,8 @@ pub async fn get_system(
     // inflates the computed "used" by the reserved pool (~5 % of
     // total on ext4 default). statvfs gives us the same numbers as
     // `df -h`.
-    let disk_root = disk_usage_statvfs(std::path::Path::new("/"));
-    let disk_data = disk_usage_statvfs(&state.data_dir);
+    let disk_root = disk_usage_statvfs(std::path::Path::new("/"), "root");
+    let disk_data = disk_usage_statvfs(&state.data_dir, "data");
 
     // Process metrics
     let pid = Pid::from_u32(std::process::id());
@@ -187,7 +200,7 @@ pub async fn get_system(
             cpu_usage_percent: proc_cpu,
         },
         proxy: ProxyInfo {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: public_version(env!("CARGO_PKG_VERSION")),
             uptime_seconds: uptime,
             active_connections,
             http_port: state.http_port,
@@ -196,6 +209,28 @@ pub async fn get_system(
     };
 
     Ok(json_data(response))
+}
+
+/// Mask the full `CARGO_PKG_VERSION` to `MAJOR.MINOR` for the
+/// `/api/v1/system` response (v1.5.0 audit LOW-14). Returns the
+/// input unchanged when the version string does not match the
+/// expected `X.Y[.Z...]` shape so a dev build like
+/// `"1.5.0-dev"` still surfaces something meaningful.
+fn public_version(full: &str) -> String {
+    let mut parts = full.splitn(3, '.');
+    match (parts.next(), parts.next()) {
+        (Some(major), Some(minor))
+            if !major.is_empty()
+                && !minor.is_empty()
+                && major.chars().all(|c| c.is_ascii_digit())
+                && minor
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '-' || c.is_ascii_alphabetic()) =>
+        {
+            format!("{major}.{minor}")
+        }
+        _ => full.to_string(),
+    }
 }
 
 /// Run `statvfs(path)` and translate the result into a `DiskUsage`
@@ -209,9 +244,15 @@ pub async fn get_system(
 /// - `usage_percent` = used / (used + avail), matches df's "Use%"
 ///   column exactly.
 ///
+/// `label` is the role string surfaced in the JSON response
+/// (`"root"` / `"data"`) ; we intentionally do NOT serialise the
+/// absolute mount path — it is useful for reconnaissance on a
+/// compromised session and the two labels are enough for an
+/// operator to identify which filesystem is which.
+///
 /// Returns `None` if the path does not exist, is on a filesystem
 /// that does not support statvfs, or the call fails.
-fn disk_usage_statvfs(path: &std::path::Path) -> Option<DiskUsage> {
+fn disk_usage_statvfs(path: &std::path::Path, label: &str) -> Option<DiskUsage> {
     let stat = nix::sys::statvfs::statvfs(path).ok()?;
 
     let frsize = stat.fragment_size();
@@ -233,9 +274,42 @@ fn disk_usage_statvfs(path: &std::path::Path) -> Option<DiskUsage> {
     };
 
     Some(DiskUsage {
-        mount_point: path.to_string_lossy().into_owned(),
+        mount_label: label.to_string(),
         total_bytes,
         used_bytes,
         usage_percent: (percent * 10.0).round() / 10.0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::public_version;
+
+    #[test]
+    fn public_version_masks_patch() {
+        assert_eq!(public_version("1.5.0"), "1.5");
+        assert_eq!(public_version("2.0.13"), "2.0");
+        assert_eq!(public_version("0.1.42"), "0.1");
+    }
+
+    #[test]
+    fn public_version_preserves_major_minor_only() {
+        assert_eq!(public_version("1.5"), "1.5");
+    }
+
+    #[test]
+    fn public_version_preserves_prerelease_suffix() {
+        // Dev / rc tags may put non-numeric bits in the minor
+        // slot. Rather than strip them (which would drop useful
+        // "this is an rc" signal), keep the second segment
+        // verbatim when it's alphanumeric.
+        assert_eq!(public_version("1.5.0-rc.1"), "1.5");
+    }
+
+    #[test]
+    fn public_version_falls_back_on_malformed_input() {
+        assert_eq!(public_version(""), "");
+        assert_eq!(public_version("not-a-version"), "not-a-version");
+        assert_eq!(public_version("single"), "single");
+    }
 }

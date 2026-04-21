@@ -96,6 +96,18 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Delete every session belonging to a user. Used by the
+    /// password-change flow to invalidate all currently-active
+    /// cookies (including the one that triggered the change) so a
+    /// stolen cookie cannot survive the rotation. Caller is
+    /// expected to mint a fresh session + `Set-Cookie` immediately
+    /// after so the legitimate user stays logged in.
+    pub fn delete_all_sessions_for_user(&self, user_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
+        Ok(())
+    }
+
     /// Delete sessions that have expired (expires_at < now).
     pub fn cleanup_expired_sessions(&self) -> Result<usize> {
         let now = Utc::now().to_rfc3339();

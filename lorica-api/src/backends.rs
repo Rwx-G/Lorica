@@ -12,55 +12,96 @@ use crate::server::AppState;
 /// JSON view of a backend enriched with live EWMA score and active connection count.
 #[derive(Serialize)]
 pub struct BackendResponse {
+    /// Backend row id.
     pub id: String,
+    /// `host:port` target.
     pub address: String,
+    /// Human-readable label.
     pub name: String,
+    /// Free-form classification (prod / staging / ...).
     pub group_name: String,
+    /// Load-balancing weight.
     pub weight: i32,
+    /// Last observed health status (lowercase name).
     pub health_status: String,
+    /// Lifecycle state (normal / closing / closed).
     pub lifecycle_state: String,
+    /// Live count of active connections to this backend.
     pub active_connections: i32,
+    /// Whether the health-check loop probes this backend.
     pub health_check_enabled: bool,
+    /// Health-check interval (s).
     pub health_check_interval_s: i32,
+    /// Optional HTTP health-check path ; TCP connect when `None`.
     pub health_check_path: Option<String>,
+    /// Whether the upstream expects TLS.
     pub tls_upstream: bool,
+    /// Whether the TLS cert chain is validated ; `true` accepts
+    /// self-signed / invalid certs.
     pub tls_skip_verify: bool,
+    /// SNI override ; `None` reuses the route hostname.
     pub tls_sni: Option<String>,
+    /// Force HTTP/2 on the upstream leg.
     pub h2_upstream: bool,
+    /// Live EWMA latency score for the Peak-EWMA LB policy (μs).
     pub ewma_score_us: f64,
+    /// RFC 3339 insert timestamp.
     pub created_at: String,
+    /// RFC 3339 last-write timestamp.
     pub updated_at: String,
 }
 
 /// JSON body for `POST /api/v1/backends`. Optional fields fall back to defaults.
 #[derive(Deserialize)]
 pub struct CreateBackendRequest {
+    /// `host:port` upstream address. Required.
     pub address: String,
+    /// Human-readable label.
     pub name: Option<String>,
+    /// Free-form classification label.
     pub group_name: Option<String>,
+    /// LB weight.
     pub weight: Option<i32>,
+    /// Enable the health-check loop.
     pub health_check_enabled: Option<bool>,
+    /// Health-check interval (s).
     pub health_check_interval_s: Option<i32>,
+    /// HTTP health-check path ; TCP connect when `None`.
     pub health_check_path: Option<String>,
+    /// Whether the upstream expects TLS.
     pub tls_upstream: Option<bool>,
+    /// Skip upstream cert validation.
     pub tls_skip_verify: Option<bool>,
+    /// SNI override for the upstream handshake.
     pub tls_sni: Option<String>,
+    /// Force HTTP/2 on the upstream leg.
     pub h2_upstream: Option<bool>,
 }
 
 /// JSON body for `PUT /api/v1/backends/:id`. Only the supplied fields are mutated.
 #[derive(Deserialize)]
 pub struct UpdateBackendRequest {
+    /// New `host:port` upstream address.
     pub address: Option<String>,
+    /// New human-readable label.
     pub name: Option<String>,
+    /// New free-form classification label.
     pub group_name: Option<String>,
+    /// New LB weight.
     pub weight: Option<i32>,
+    /// Toggle the health-check loop.
     pub health_check_enabled: Option<bool>,
+    /// New health-check interval (s).
     pub health_check_interval_s: Option<i32>,
+    /// New HTTP health-check path.
     pub health_check_path: Option<String>,
+    /// Upstream TLS toggle.
     pub tls_upstream: Option<bool>,
+    /// Skip upstream cert validation.
     pub tls_skip_verify: Option<bool>,
+    /// SNI override.
     pub tls_sni: Option<String>,
+    /// Force HTTP/2 on the upstream leg.
     pub h2_upstream: Option<bool>,
 }
 

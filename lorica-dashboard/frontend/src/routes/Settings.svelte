@@ -20,6 +20,8 @@
   import NotificationHistoryTab from '../components/settings-tabs/NotificationHistoryTab.svelte';
   import PreferencesTab from '../components/settings-tabs/PreferencesTab.svelte';
   import ExportImportTab from '../components/settings-tabs/ExportImportTab.svelte';
+  import CertExportTab from '../components/settings-tabs/CertExportTab.svelte';
+  import { parseOctalMode } from '../lib/validators';
 
   // Global settings
   let settings: GlobalSettingsResponse | null = $state(null);
@@ -50,6 +52,14 @@
     geoip_auto_update_enabled: false,
     asn_db_path: '',
     asn_auto_update_enabled: false,
+    // Cert export (v1.4.1). Modes are held as user-facing octal
+    // strings so the input shows "640" rather than decimal 416.
+    cert_export_enabled: false,
+    cert_export_dir: '',
+    cert_export_owner_uid: '',
+    cert_export_group_gid: '',
+    cert_export_file_mode: '640',
+    cert_export_dir_mode: '750',
   });
   let settingsSaving = $state(false);
   let settingsMsg = $state('');
@@ -95,6 +105,7 @@
     preferences: true,
     export: true,
     ban_rules: true,
+    cert_export: true,
   };
   let expandedSections = $state<Record<string, boolean>>((() => {
     try {
@@ -143,6 +154,24 @@
         asn_db_path: settingsRes.data.asn_db_path ?? '',
         asn_auto_update_enabled:
           settingsRes.data.asn_auto_update_enabled ?? false,
+        cert_export_enabled: settingsRes.data.cert_export_enabled ?? false,
+        cert_export_dir: settingsRes.data.cert_export_dir ?? '',
+        cert_export_owner_uid:
+          settingsRes.data.cert_export_owner_uid != null
+            ? String(settingsRes.data.cert_export_owner_uid)
+            : '',
+        cert_export_group_gid:
+          settingsRes.data.cert_export_group_gid != null
+            ? String(settingsRes.data.cert_export_group_gid)
+            : '',
+        cert_export_file_mode:
+          settingsRes.data.cert_export_file_mode != null
+            ? (settingsRes.data.cert_export_file_mode as number).toString(8)
+            : '640',
+        cert_export_dir_mode:
+          settingsRes.data.cert_export_dir_mode != null
+            ? (settingsRes.data.cert_export_dir_mode as number).toString(8)
+            : '750',
       };
       customPresets = settingsRes.data.custom_security_presets ?? [];
     }
@@ -189,9 +218,21 @@
     settingsSaving = true;
     settingsMsg = '';
     settingsError = '';
+    // Peel the user-facing string-typed cert_export fields off
+    // `settingsForm` before spreading so the payload has backend
+    // types (number / bool / string) rather than the text inputs.
+    const {
+      cert_export_enabled,
+      cert_export_dir,
+      cert_export_owner_uid,
+      cert_export_group_gid,
+      cert_export_file_mode,
+      cert_export_dir_mode,
+      ...formRest
+    } = settingsForm;
     // Convert textarea fields (newline-separated) to string arrays
     const payload = {
-      ...settingsForm,
+      ...formRest,
       trusted_proxies: settingsForm.trusted_proxies
         .split('\n')
         .map((s: string) => s.trim())
@@ -217,6 +258,23 @@
       otlp_endpoint: settingsForm.otlp_endpoint.trim(),
       geoip_db_path: settingsForm.geoip_db_path.trim(),
       asn_db_path: settingsForm.asn_db_path.trim(),
+      // Cert export: the enable flag + directory always ride, and
+      // uid / gid / modes are only sent when the operator supplied
+      // a valid value (empty input => leave backend unchanged).
+      cert_export_enabled,
+      cert_export_dir: cert_export_dir.trim(),
+      ...(cert_export_owner_uid.trim() !== ''
+        ? { cert_export_owner_uid: Number(cert_export_owner_uid.trim()) }
+        : {}),
+      ...(cert_export_group_gid.trim() !== ''
+        ? { cert_export_group_gid: Number(cert_export_group_gid.trim()) }
+        : {}),
+      ...(parseOctalMode(cert_export_file_mode) !== null
+        ? { cert_export_file_mode: parseOctalMode(cert_export_file_mode)! }
+        : {}),
+      ...(parseOctalMode(cert_export_dir_mode) !== null
+        ? { cert_export_dir_mode: parseOctalMode(cert_export_dir_mode)! }
+        : {}),
     };
     const res = await api.updateSettings(payload);
     if (res.error) {
@@ -238,6 +296,24 @@
         geoip_auto_update_enabled: res.data.geoip_auto_update_enabled ?? false,
         asn_db_path: res.data.asn_db_path ?? '',
         asn_auto_update_enabled: res.data.asn_auto_update_enabled ?? false,
+        cert_export_enabled: res.data.cert_export_enabled ?? false,
+        cert_export_dir: res.data.cert_export_dir ?? '',
+        cert_export_owner_uid:
+          res.data.cert_export_owner_uid != null
+            ? String(res.data.cert_export_owner_uid)
+            : '',
+        cert_export_group_gid:
+          res.data.cert_export_group_gid != null
+            ? String(res.data.cert_export_group_gid)
+            : '',
+        cert_export_file_mode:
+          res.data.cert_export_file_mode != null
+            ? (res.data.cert_export_file_mode as number).toString(8)
+            : '640',
+        cert_export_dir_mode:
+          res.data.cert_export_dir_mode != null
+            ? (res.data.cert_export_dir_mode as number).toString(8)
+            : '750',
       };
       showToast('Settings saved.', 'success');
     }
@@ -288,6 +364,16 @@
       bind:settingsForm
       expanded={expandedSections.observability}
       toggleSection={() => toggleSection('observability')}
+      onSave={saveSettings}
+      {settingsSaving}
+      {settingsMsg}
+      {settingsError}
+    />
+
+    <CertExportTab
+      bind:settingsForm
+      expanded={expandedSections.cert_export}
+      toggleSection={() => toggleSection('cert_export')}
       onSave={saveSettings}
       {settingsSaving}
       {settingsMsg}

@@ -12,6 +12,7 @@ use crate::server::AppState;
 /// JSON body wrapping a TOML configuration document.
 #[derive(Deserialize)]
 pub struct ImportRequest {
+    /// Full TOML document produced by `/config/export`.
     pub toml_content: String,
 }
 

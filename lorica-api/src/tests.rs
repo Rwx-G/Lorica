@@ -259,6 +259,98 @@ async fn test_change_password() {
 }
 
 #[tokio::test]
+async fn test_change_password_rotates_session_cookie() {
+    // Password change must rotate the session cookie (v1.5.0 A.5).
+    // The old cookie becomes invalid immediately ; the response
+    // carries a new Set-Cookie that the browser picks up. A
+    // stolen-cookie attacker holding the old value gets a 401 on
+    // the next call.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let known_password = "test_password_123";
+    {
+        let store = state.store.lock().await;
+        let mut user = store
+            .get_admin_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup");
+        user.password_hash = hash_password(known_password).expect("test setup");
+        store.update_admin_user(&user).expect("test setup");
+    }
+
+    // Login, capture cookie_A.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let login_body = serde_json::json!({
+        "username": "admin",
+        "password": known_password,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&login_body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    let cookie_a_value = extract_session_cookie(&response).expect("test setup");
+    let cookie_a = format!("lorica_session={cookie_a_value}");
+
+    // Change password — the response carries a fresh Set-Cookie
+    // whose session id differs from cookie_A.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "current_password": known_password,
+        "new_password": "new_secure_password_456",
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/auth/password")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie_a)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie_b_value = extract_session_cookie(&response)
+        .expect("password change response must carry a Set-Cookie for the new session");
+    let cookie_b = format!("lorica_session={cookie_b_value}");
+    assert_ne!(
+        cookie_a_value, cookie_b_value,
+        "new session id must differ from old"
+    );
+
+    // cookie_A must now be rejected by any protected endpoint.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/status")
+        .header("Cookie", &cookie_a)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "old session cookie must no longer authenticate after password rotation"
+    );
+
+    // cookie_B authenticates normally.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/status")
+        .header("Cookie", &cookie_b)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_rate_limiting() {
     let (state, session_store, rate_limiter) = test_state().await;
 
@@ -1491,6 +1583,400 @@ async fn test_update_settings_invalid_log_level() {
 
     let response = router.oneshot(req).await.expect("test setup");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_update_settings_otlp_service_name_rejects_control_chars() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    // LF inside the service name - rejected by the new validator
+    // added in Batch 6 so a pasted binary blob can't reach the OTel
+    // exporter as-is.
+    let body = serde_json::json!({ "otlp_service_name": "bad\nname" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("control character"));
+}
+
+#[tokio::test]
+async fn test_update_settings_sla_purge_retention_cap() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "sla_purge_retention_days": 5000 });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_update_settings_cert_export_roundtrip() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "cert_export_enabled": true,
+        "cert_export_dir": "/var/lib/lorica/exported-certs",
+        "cert_export_owner_uid": 1001,
+        "cert_export_group_gid": 2001,
+        "cert_export_file_mode": 0o640,
+        "cert_export_dir_mode": 0o750,
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&payload).expect("test setup");
+    // Handler returns the full GlobalSettings doc under the
+    // standard "data" envelope. Assert each cert_export field
+    // round-tripped with the posted value.
+    assert_eq!(json["data"]["cert_export_enabled"], true);
+    assert_eq!(
+        json["data"]["cert_export_dir"].as_str(),
+        Some("/var/lib/lorica/exported-certs")
+    );
+    assert_eq!(json["data"]["cert_export_owner_uid"], 1001);
+    assert_eq!(json["data"]["cert_export_group_gid"], 2001);
+    assert_eq!(json["data"]["cert_export_file_mode"], 0o640);
+    assert_eq!(json["data"]["cert_export_dir_mode"], 0o750);
+}
+
+#[tokio::test]
+async fn test_update_settings_cert_export_rejects_relative_dir() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "cert_export_dir": "var/lib/lorica" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("absolute path"));
+}
+
+#[tokio::test]
+async fn test_update_settings_cert_export_rejects_traversal_dir() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "cert_export_dir": "/var/lib/../etc/shadow" });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("traversal"));
+}
+
+#[tokio::test]
+async fn test_update_settings_cert_export_rejects_mode_out_of_range() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    // 0o1000 = 512 = one bit past the 9 permission bits.
+    let body = serde_json::json!({ "cert_export_file_mode": 0o1000 });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("9 permission bits"));
+}
+
+#[tokio::test]
+async fn test_update_settings_cert_export_clears_dir_on_empty_string() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // First set a dir so we can observe the clear.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "cert_export_dir": "/tmp/lorica-export" });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Now clear it with an empty string - the field should flip
+    // back to null (None on the backend) instead of "unchanged".
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "cert_export_dir": "" });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&payload).expect("test setup");
+    assert!(json["data"]["cert_export_dir"].is_null());
+}
+
+#[tokio::test]
+async fn test_rate_limit_settings_bucket_returns_429_after_limit() {
+    // PUT /api/v1/settings is capped at 30/60s per IP (v1.5.0 A.3
+    // — relaxed from the initial 10/60s after the e2e smoke flagged
+    // realistic operator activity on the /settings endpoint under
+    // test-isolation). Drive 31 PUTs from the same (simulated)
+    // client and assert the 31st returns 429 with a Retry-After
+    // header.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let body = serde_json::json!({ "log_level": "info" });
+    for i in 0..30 {
+        let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/settings")
+            .header("Content-Type", "application/json")
+            .header("Cookie", &cookie)
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test setup"),
+            ))
+            .expect("test setup");
+        let response = router.oneshot(req).await.expect("test setup");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "request {i} within budget should be 200"
+        );
+    }
+
+    // 11th request over the limit -> 429 + Retry-After.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry = response
+        .headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok())
+        .expect("Retry-After header present on 429");
+    let retry_seconds: u64 = retry.parse().expect("Retry-After is a number");
+    assert!(
+        (1..=60).contains(&retry_seconds),
+        "Retry-After {retry_seconds} out of [1, 60]"
+    );
+}
+
+#[tokio::test]
+async fn test_rate_limit_buckets_are_isolated() {
+    // Exhausting the settings bucket (10/60s) must NOT affect the
+    // routes CRUD bucket (100/60s). Each state-mutating endpoint
+    // carries its own bucket so a flood on one does not block the
+    // operator from fixing the config elsewhere.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Exhaust the settings bucket (30/60s).
+    let body = serde_json::json!({ "log_level": "info" });
+    for _ in 0..=30 {
+        let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/settings")
+            .header("Content-Type", "application/json")
+            .header("Cookie", &cookie)
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test setup"),
+            ))
+            .expect("test setup");
+        let _ = router.oneshot(req).await;
+    }
+
+    // routes_cud bucket should still have budget: a GET /routes
+    // (no bucket) + a POST /routes returns a normal 201/400, not
+    // a 429. Skip the 400-prone full payload; a GET is enough to
+    // prove the router still serves the authenticated session.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/routes")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_ne!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "GET /routes must not be rate limited by the settings bucket"
+    );
+}
+
+#[tokio::test]
+async fn test_per_route_body_limit_rejects_oversize_payload() {
+    // Global default is 1 MiB (v1.5.0 A.4). `POST /api/v1/waf/rules/
+    // custom` has a per-route override at 8 KiB because a
+    // ModSecurity rule is never legitimately that large. A payload
+    // just above that override must land as 413 Payload Too Large
+    // without reaching the handler.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Build a JSON body > 8 KiB. The handler would normally need
+    // real WAF-rule fields ; the body here is padded garbage that
+    // axum rejects BEFORE entering the handler (413 from the body
+    // limit, not 400 from validation).
+    let padding = "A".repeat(9 * 1024);
+    let body = format!("{{\"description\":\"{padding}\"}}");
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/waf/rules/custom")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(body))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "body over 8 KiB should be rejected with 413"
+    );
+}
+
+#[tokio::test]
+async fn test_global_body_limit_applied_to_unbounded_routes() {
+    // Routes without a per-route body-limit override fall back on
+    // the global 1 MiB ceiling. Drive a 1.5 MiB payload at
+    // `POST /api/v1/backends` (no specific override) and assert
+    // 413 bubbles up.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let padding = "A".repeat(1_500_000);
+    let body = format!("{{\"name\":\"{padding}\"}}");
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/backends")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(body))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "body over 1 MiB on an unbounded route should be rejected with 413"
+    );
 }
 
 // ---- Notification Endpoint Tests ----

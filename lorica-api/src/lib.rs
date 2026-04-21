@@ -1,5 +1,6 @@
 #![deny(clippy::all)]
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 
 //! REST management API for the Lorica reverse proxy.
 //!
@@ -15,6 +16,7 @@ pub mod acme;
 pub mod auth;
 pub mod backends;
 pub mod cache;
+pub mod cert_export;
 pub mod certificates;
 pub mod config;
 pub mod connections;
@@ -27,6 +29,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod probes;
 pub mod routes;
+/// Axum router + shared `AppState` construction.
 pub mod server;
 pub mod settings;
 pub mod sla;

@@ -3,6 +3,7 @@
 //! so that `lorica_config::models::<Type>` paths keep working.
 
 mod backend;
+mod cert_export_acl;
 mod certificate;
 mod enums;
 mod loadtest;
@@ -17,6 +18,9 @@ mod sla;
 mod tests;
 
 pub use backend::{Backend, RouteBackend};
+pub use cert_export_acl::{
+    pattern_matches, resolve as resolve_cert_export_acl, specificity, CertExportAcl,
+};
 pub use certificate::{Certificate, DnsProvider};
 pub use enums::{
     HeaderMatchType, HealthStatus, LifecycleState, LoadBalancing, NotificationChannel,

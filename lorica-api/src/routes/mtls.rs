@@ -11,9 +11,15 @@ use crate::server::AppState;
 /// Per-route mTLS configuration: trusted CA bundle and optional org allowlist.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MtlsConfigRequest {
+    /// Concatenated PEM CA bundle trusted to issue client certs.
     pub ca_cert_pem: String,
+    /// Whether a missing / untrusted client cert is rejected with
+    /// HTTP 496 (`true`) or the request continues without a cert
+    /// (`false`).
     #[serde(default)]
     pub required: bool,
+    /// Optional subject-organization allowlist ; empty accepts any
+    /// cert that chains to `ca_cert_pem`.
     #[serde(default)]
     pub allowed_organizations: Vec<String>,
 }
@@ -66,6 +72,13 @@ pub(super) fn build_mtls_config(
         ));
     }
 
+    const ORG_MAX_LEN: usize = 256;
+    const ORGS_CAP: usize = 100;
+    if body.allowed_organizations.len() > ORGS_CAP {
+        return Err(ApiError::BadRequest(format!(
+            "mtls.allowed_organizations: at most {ORGS_CAP} entries allowed"
+        )));
+    }
     let mut seen = std::collections::HashSet::new();
     let mut orgs = Vec::with_capacity(body.allowed_organizations.len());
     for (i, org) in body.allowed_organizations.iter().enumerate() {
@@ -73,6 +86,20 @@ pub(super) fn build_mtls_config(
         if t.is_empty() {
             return Err(ApiError::BadRequest(format!(
                 "mtls.allowed_organizations[{i}] must not be empty"
+            )));
+        }
+        if t.len() > ORG_MAX_LEN {
+            return Err(ApiError::BadRequest(format!(
+                "mtls.allowed_organizations[{i}] is longer than {ORG_MAX_LEN} characters"
+            )));
+        }
+        // The X.509 subject/issuer O= RDN is a utf8String or printableString
+        // per RFC 5280; control characters (CR / LF / NUL / <0x20 except
+        // space / DEL) never appear in a legitimate CA bundle. Reject them
+        // so a pasted binary blob does not slip through.
+        if t.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
+            return Err(ApiError::BadRequest(format!(
+                "mtls.allowed_organizations[{i}] contains a control character"
             )));
         }
         if seen.insert(t.to_string()) {
@@ -90,12 +117,14 @@ pub(super) fn build_mtls_config(
 /// JSON body for `POST /api/v1/validate/mtls-pem`.
 #[derive(Deserialize)]
 pub struct ValidateMtlsPemRequest {
+    /// Concatenated PEM CA bundle to validate.
     pub ca_cert_pem: String,
 }
 
 /// Response describing a validated mTLS CA bundle (count + per-cert subject summaries).
 #[derive(Serialize)]
 pub struct ValidateMtlsPemResponse {
+    /// Number of valid CERTIFICATE blocks parsed from the bundle.
     pub ca_count: usize,
     /// Subject summaries for each CERTIFICATE block found. One entry
     /// per cert so the operator can cross-check their bundle ("yes,
@@ -254,5 +283,34 @@ mod tests {
         let err =
             build_mtls_config(&mtls_req(&pem, false, vec!["Acme", "   "])).expect_err("test setup");
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn build_mtls_rejects_organization_too_long() {
+        let pem = gen_ca_pem();
+        let long = "a".repeat(300);
+        let err = build_mtls_config(&mtls_req(&pem, false, vec![&long])).expect_err("test setup");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("256")));
+    }
+
+    #[test]
+    fn build_mtls_rejects_organization_with_control_char() {
+        let pem = gen_ca_pem();
+        let err =
+            build_mtls_config(&mtls_req(&pem, false, vec!["Acme\nInc"])).expect_err("test setup");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("control character")));
+    }
+
+    #[test]
+    fn build_mtls_rejects_too_many_organizations() {
+        let pem = gen_ca_pem();
+        let many: Vec<String> = (0..101).map(|i| format!("Org{i}")).collect();
+        let req = MtlsConfigRequest {
+            ca_cert_pem: pem,
+            required: false,
+            allowed_organizations: many,
+        };
+        let err = build_mtls_config(&req).expect_err("test setup");
+        assert!(matches!(err, ApiError::BadRequest(ref m) if m.contains("100")));
     }
 }

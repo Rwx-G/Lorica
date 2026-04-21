@@ -6,11 +6,11 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.4.0-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.5.0-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-985-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-568-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-1356%2B-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-573-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -54,6 +54,7 @@ Built on [Cloudflare Pingora](https://github.com/cloudflare/pingora), the engine
 - **Security headers** - presets (strict/moderate/none) with HSTS, CSP, X-Frame-Options, X-Content-Type-Options
 - **HTTP Basic Auth** - per-route username/password authentication (Argon2id-hashed) with cached verification
 - **IP allowlist/denylist** and **CORS configuration** per route
+- **Certificate export** (v1.5.0, disabled by default) - mirror issued certificates as PEM files under `/var/lib/lorica/exported-certs/<hostname>/{cert,chain,fullchain,privkey}.pem` every time a cert is issued or renewed. Lets Ansible / HAProxy sidecar / backup jobs read the live bundle straight off disk without hitting the HTTP API. Atomic writes (`.tmp` stage + `fsync` + `rename`, cross-mount `EXDEV` fallback), per-file `chmod` + `chown` with configurable owner UID / group GID / octal modes (defaults 0o640 files / 0o750 dirs), fail-soft (export error never blocks the ACME renewal). Per-pattern ACL table narrows which hostnames are exported and with which UID / GID (exact match, leading `*.` wildcard, or bare `*`). Audit-logged + rate-limited `GET /api/v1/certificates/:id/download` complements on-disk export for one-off downloads. Threat model: `docs/security/cert-export-threat-model.md`
 
 ### :bar_chart: Monitoring & Observability
 
@@ -204,12 +205,12 @@ The dashboard ships inside the binary and is served on the management port (defa
 - **Active Probes** - CRUD for synthetic health probes with route selection, HTTP method/path/status/interval/timeout
 - **Access Logs** - scrollable real-time log stream via WebSocket with green pulsing indicator
 - **System** - worker table with PID, health, heartbeat latency; CPU/memory/disk gauges
-- **Settings** - notification channels, security header presets, config export/import with diff preview
+- **Settings** - notification channels, security header presets, DNS providers (Cloudflare / Route53 / OVH), ban rules, OpenTelemetry exporter, GeoIP / ASN databases, certificate filesystem export zone + ACL editor, config export / import with diff preview
 - **Theme** - light/dark mode toggle
 
 ## Architecture
 
-Lorica is a Rust workspace with 25 crates: 15 forked from Cloudflare Pingora and 10 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
+Lorica is a Rust workspace with 28 crates: 16 forked from Cloudflare Pingora and 12 product crates. See [FORK.md](FORK.md) for the full fork lineage and renaming rules.
 
 | Crate | Purpose |
 |-------|---------|
@@ -334,8 +335,15 @@ All endpoints are served on the management port (default `9443`) over HTTPS. Pro
 | `POST` | `/api/v1/certificates` | Upload PEM certificate |
 | `POST` | `/api/v1/certificates/self-signed` | Generate self-signed certificate |
 | `GET` | `/api/v1/certificates/:id` | Get certificate |
+| `GET` | `/api/v1/certificates/:id/download?part={cert\|key\|chain\|bundle}` | Download PEM material (rate-limited, audit-logged) |
 | `PUT` | `/api/v1/certificates/:id` | Update certificate |
 | `DELETE` | `/api/v1/certificates/:id` | Delete certificate |
+| `GET` | `/api/v1/cert-export/acls` | List per-pattern cert-export ACLs |
+| `POST` | `/api/v1/cert-export/acls` | Create a cert-export ACL rule |
+| `DELETE` | `/api/v1/cert-export/acls/:id` | Delete a cert-export ACL rule |
+| `POST` | `/api/v1/cert-export/reapply` | Re-export every certificate to disk |
+| `GET` | `/api/v1/cert-export/orphans` | List per-hostname subdirectories with no matching live cert |
+| `DELETE` | `/api/v1/cert-export/orphans/:name` | Remove one orphan subdirectory (sanitised + live-cert guard) |
 
 ### ACME
 
@@ -449,21 +457,25 @@ cargo build --release
 ### Running tests
 
 ```bash
-# All Rust unit tests (1553 tests across 19 crates)
+# All Rust unit tests (~1929 tests across 28 crates)
 cargo test --workspace
 
-# Product crate tests only (739 tests)
+# Product crate tests only (~1356 tests - lorica-native, include
+# the v1.5.0 hardening coverage : rate-limit buckets, body-size
+# layers, session rotation, public_version masking, ammonia bypass
+# corpus, map_err context preservation, cert-export orphan sweep)
 cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-notify -p lorica-bench -p lorica-worker \
-           -p lorica-command -p lorica-limits -p lorica-shmem
+           -p lorica-command -p lorica-limits -p lorica-shmem \
+           -p lorica-challenge -p lorica-geoip
 
-# Pingora-forked crate tests (568 tests)
+# Pingora-forked crate tests (573 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-error -p lorica-tls -p lorica-cache \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
            --features ring -p lorica-lb
 
-# End-to-end tests driving a real Pingora Server (68 tests, 10 binaries)
+# End-to-end tests driving a real Pingora Server (70+ tests, 10 binaries)
 cargo test -p lorica --test mtls_e2e_test \
                      --test response_rewrite_e2e_test \
                      --test mirror_e2e_test \
@@ -475,7 +487,7 @@ cargo test -p lorica --test mtls_e2e_test \
                      --test proxy_config_test \
                      --test proxy_routing_test
 
-# Frontend tests (178 Vitest tests across 6 files)
+# Frontend tests (287 Vitest tests across 8 files)
 cd lorica-dashboard/frontend && npx vitest run
 ```
 
@@ -483,25 +495,26 @@ cd lorica-dashboard/frontend && npx vitest run
 
 | Layer | Count | Notes |
 |---|---|---|
-| Product unit (config, api, lib, waf, notify, bench, worker, command, limits) | 739 | Lorica-specific code |
-| Product e2e (real Pingora `Server` + mock backends) | 68 | 10 binaries: mTLS, response rewriting, mirroring, forward auth, SWR, connection filter, canary, header routing, config, routing |
-| Pingora-forked crates (core, proxy, http, error, tls, cache, pool, runtime, timeout, lb) | 568 | Inherited upstream coverage kept passing on every change |
-| Frontend (vitest / svelte-check) | 178 | Form validation, type safety, component wiring |
-| **Total shipping tests** | **1553** | |
+| Product unit (config, api, lib, waf, notify, bench, worker, command, limits, challenge, shmem, geoip) | ~1356 | Lorica-specific code, including v1.5.0 hardening coverage (ammonia bypass corpus, named rate-limit buckets with Retry-After, per-route body-size 413 path, session rotation integration test, `public_version` masking, map_err context preservation, cert-export orphan sweep + path-traversal rejection). The verdict-cache global-state race (backlog #16) is fixed in v1.5.0 via `serial_test` so the full suite runs parallel. |
+| Product e2e (real Pingora `Server` + mock backends) | 70+ | 10 binaries: mTLS, response rewriting, mirroring, forward auth, SWR, connection filter, canary, header routing, config, routing |
+| Pingora-forked crates (core, proxy, http, error, tls, cache, pool, runtime, timeout, lb) | 573 | Inherited upstream coverage kept passing on every change |
+| Frontend (vitest / svelte-check) | 287 | Form validation, type safety, component wiring |
+| **Total shipping tests** | **~1929** | |
 
 #### Docker end-to-end suites
 
 `tests-e2e-docker/` spins Lorica up against real backend containers
-and drives 400+ assertions through the actual network stack:
+and drives 460+ assertions through the actual network stack:
 
 ```bash
 cd tests-e2e-docker
-./run.sh                                    # single-process (315 asserts) + workers mode (86)
+./run.sh                                    # single-process (336 asserts) + workers mode (86) + cert-export (38)
 docker compose --profile bot run --rm bot-smoke                   # 33 asserts - graded bot challenge
 docker compose --profile geoip run --rm geoip-smoke               # 16 asserts - country allow/deny
 docker compose --profile rdns run --rm rdns-smoke                 # 8  asserts - forward-confirmed rDNS bypass
 docker compose --profile otel run --rm otel-smoke                 # 15 asserts - OTLP + W3C + log/trace correlation
 docker compose --profile otel-workers run --rm otel-smoke-workers # 15 asserts - same under --workers 2
+docker compose --profile cert-export run --rm cert-export-smoke   # 38 asserts - PEM disk export + ACL + reapply
 ```
 
 The two intentional gaps in the Docker harness are:
@@ -566,9 +579,15 @@ gpg --verify lorica.deb.asc lorica.deb
 
 | Version | Features | Status |
 |---------|----------|--------|
-| **v1.4.0** | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Current |
-| v1.5.0 | Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) | Planned |
+| v1.4.0 | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Shipped |
+| **v1.5.0** | Operator-input guard-rails on every field with blur + input inline errors; Route `group_name` + filter + colored pill; Certificate download API + dashboard split-menu with private-key confirm; Filesystem certificate export zone with per-pattern ACL, Settings tab, operator re-export endpoint, orphan sweep + per-row delete; Path-rule redirect fix ; Security hardening wave: `ammonia` HTML sanitiser, per-endpoint rate limits on management plane, per-route body-size limits with 1 MiB global default, session cookie rotation on password change, `/system` response filter, `rustls-pemfile → rustls-pki-types` migration, `rand 0.9` bump, source-error preservation on `.map_err` chains, WebSocket log-stream backpressure with close-on-slow-client ; Doc coverage pass + `#![warn(missing_docs)]` on every Lorica-native crate ; ACME unit tests (`wiremock` on Cloudflare + OVH challengers, `is_valid_dns_server` shell-filter, pure `should_auto_renew` predicate) ; `verdict_cache` test-parallelism race fixed via `serial_test` | Current |
+| v1.6.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) ; `proxy_wiring.rs` + `main.rs` module split | Planned |
 | v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
+
+### Backlog (tracking only, blocked on upstream)
+
+- **`rustls-pemfile` removal in the `lorica-tls` fork.** RUSTSEC-2025-0134 (unmaintained) still shows transitively through our Pingora fork. Native Lorica code migrated to `rustls-pki-types` in v1.5.0 ; the transitive dep clears once Pingora upstream migrates.
+- **`rand 0.8` removal in forked crates.** RUSTSEC-2026-0097 (unsound with custom logger) still shows transitively via `lorica-runtime`, `lorica-limits`, and the `captcha` crate. Native Lorica code bumped to `rand 0.9` in v1.5.0 ; same monitoring as the `rustls-pemfile` row.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 

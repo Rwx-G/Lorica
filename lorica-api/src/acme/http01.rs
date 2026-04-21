@@ -286,6 +286,7 @@ pub(super) async fn provision_with_acme(
 
     let store = state.store.lock().await;
     store.create_certificate(&cert)?;
+    crate::cert_export::export_from_store(&store, &cert);
     drop(store);
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();

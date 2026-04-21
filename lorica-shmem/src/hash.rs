@@ -80,10 +80,11 @@ fn siphash_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
 
 /// Generate a fresh random 128-bit key using OS-backed entropy.
 pub fn random_key() -> [u64; 2] {
-    use rand::RngCore;
+    use rand::TryRngCore;
     let mut rng = rand::rngs::OsRng;
     let mut bytes = [0u8; 16];
-    rng.fill_bytes(&mut bytes);
+    rng.try_fill_bytes(&mut bytes)
+        .expect("OS RNG must produce entropy for shmem hash key");
     let k0 = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
     let k1 = u64::from_le_bytes(bytes[8..].try_into().expect("8 bytes"));
     [k0, k1]

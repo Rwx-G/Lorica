@@ -18,14 +18,23 @@ use crate::server::AppState;
 /// A single access log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
+    /// Monotonic entry id assigned at push time.
     pub id: u64,
+    /// RFC 3339 timestamp of the request.
     pub timestamp: String,
+    /// HTTP method.
     pub method: String,
+    /// Request path (including query string).
     pub path: String,
+    /// Host header / route hostname.
     pub host: String,
+    /// Response HTTP status.
     pub status: u16,
+    /// Total request-to-response latency (ms).
     pub latency_ms: u64,
+    /// Backend address that served the request.
     pub backend: String,
+    /// Optional error text for failed requests.
     pub error: Option<String>,
     /// Client IP address (from socket or X-Forwarded-For).
     #[serde(default)]
@@ -459,11 +468,28 @@ pub async fn logs_ws(
     ws.on_upgrade(move |socket| handle_log_stream(socket, rx))
 }
 
+/// Hard ceiling on cumulative per-connection log drops before we
+/// close the WebSocket with a Policy Violation (1008). Protects
+/// Lorica from stuck-client backpressure amplification : a client
+/// that never reads cannot hold on to a broadcast slot forever.
+const LOG_WS_CLOSE_ON_DROPS: u64 = 1000;
+
 async fn handle_log_stream(socket: WebSocket, mut rx: broadcast::Receiver<LogEntry>) {
+    use axum::extract::ws::CloseCode;
+    use axum::extract::ws::CloseFrame;
     let (mut sender, mut receiver) = socket.split();
 
-    // Forward broadcast entries to the WebSocket client
+    // Forward broadcast entries to the WebSocket client. The
+    // broadcast channel is bounded at the sender side (see
+    // `LogBuffer::new`) ; when a slow subscriber cannot keep up,
+    // the receiver gets `RecvError::Lagged(n)` carrying the number
+    // of messages it missed. We surface that as a Prometheus
+    // counter (`lorica_logs_ws_dropped_total`) and, if a single
+    // connection racks up more than `LOG_WS_CLOSE_ON_DROPS` drops,
+    // close it with WS code 1008 (Policy Violation) so the kernel
+    // send buffer cannot be used as an amplifier.
     let send_task = tokio::spawn(async move {
+        let mut drops: u64 = 0;
         loop {
             match rx.recv().await {
                 Ok(entry) => {
@@ -474,7 +500,25 @@ async fn handle_log_stream(socket: WebSocket, mut rx: broadcast::Receiver<LogEnt
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::debug!(skipped = n, "log WebSocket subscriber lagged, resuming");
+                    drops = drops.saturating_add(n);
+                    crate::metrics::inc_logs_ws_dropped("slow_client", n);
+                    tracing::warn!(
+                        skipped = n,
+                        total_drops = drops,
+                        "log WebSocket subscriber lagged"
+                    );
+                    if drops >= LOG_WS_CLOSE_ON_DROPS {
+                        // Best-effort close frame. Ignore error :
+                        // the send path is already wedged so we'll
+                        // just hit the Err arm next and exit.
+                        let _ = sender
+                            .send(Message::Close(Some(CloseFrame {
+                                code: 1008 as CloseCode,
+                                reason: "log stream too slow".into(),
+                            })))
+                            .await;
+                        break;
+                    }
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,

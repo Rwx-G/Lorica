@@ -150,6 +150,37 @@
     await loadData();
   }
 
+  // Two-stage download for private keys: the `key` and `bundle` parts
+  // include the private key PEM bytes. We surface an explicit confirm
+  // modal so one click never silently drops a private key onto the
+  // operator's filesystem. `cert` and `chain` bypass the confirm -
+  // they carry no secret material.
+  let pendingDownload: { cert: CertificateResponse; part: 'cert' | 'key' | 'chain' | 'bundle' } | null = $state(null);
+
+  function requestDownload(cert: CertificateResponse, part: 'cert' | 'key' | 'chain' | 'bundle') {
+    if (part === 'key' || part === 'bundle') {
+      pendingDownload = { cert, part };
+      return;
+    }
+    void performDownload(cert, part);
+  }
+
+  async function confirmPrivateKeyDownload() {
+    if (!pendingDownload) return;
+    const { cert, part } = pendingDownload;
+    pendingDownload = null;
+    await performDownload(cert, part);
+  }
+
+  async function performDownload(cert: CertificateResponse, part: 'cert' | 'key' | 'chain' | 'bundle') {
+    const res = await api.downloadCertificate(cert.id, part);
+    if (res.ok) {
+      showToast(`Downloaded ${cert.domain} (${part})`, 'success');
+    } else {
+      showToast(`Download failed: ${res.message}`, 'error');
+    }
+  }
+
   function deleteMessage(): string {
     if (!deletingCert) return '';
     const base = `Are you sure you want to delete the certificate for "${deletingCert.domain}"?`;
@@ -237,6 +268,7 @@
       onEdit={openEditForm}
       onRenew={handleRenew}
       onDelete={openDelete}
+      onDownload={requestDownload}
     />
   {/if}
 </div>
@@ -271,6 +303,19 @@
     message={deleteMessage()}
     onconfirm={handleDelete}
     oncancel={() => { deletingCert = null; deleteRoutes = []; }}
+  />
+{/if}
+
+{#if pendingDownload}
+  <ConfirmDialog
+    title="Download private key"
+    message={pendingDownload.part === 'bundle'
+      ? `The bundle for ${pendingDownload.cert.domain} includes the private key in plain text. Store the downloaded file in a secure location (encrypted volume or password manager). The download is also audit-logged server-side.`
+      : `The private key for ${pendingDownload.cert.domain} is about to leave Lorica in plain text. Store the downloaded file in a secure location (encrypted volume or password manager). The download is also audit-logged server-side.`}
+    confirmLabel="Download"
+    confirmStyle="danger"
+    onconfirm={confirmPrivateKeyDownload}
+    oncancel={() => { pendingDownload = null; }}
   />
 {/if}
 

@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 /// `GlobalSettings`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityHeaderPreset {
+    /// Preset identifier (matches `Route.security_headers`).
     pub name: String,
+    /// Name → value map of HTTP response headers the preset emits.
     pub headers: HashMap<String, String>,
 }
 
@@ -83,19 +85,33 @@ pub fn resolve_security_preset<'a>(
 /// rewritten in full by `update_global_settings`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalSettings {
+    /// TCP port the management HTTP / WS API listens on (loopback
+    /// by default). 9443 out-of-box.
     pub management_port: u16,
+    /// `tracing` subscriber filter, e.g. `"info"`, `"debug"`,
+    /// `"lorica=debug,hyper=warn"`.
     pub log_level: String,
+    /// Fallback health-check interval applied when a backend has
+    /// none set of its own.
     pub default_health_check_interval_s: i32,
+    /// Days-to-expiry at which the cert expiry task emits a WARN
+    /// alert.
     #[serde(default = "default_cert_warning_days")]
     pub cert_warning_days: i32,
+    /// Days-to-expiry at which the cert expiry task escalates to a
+    /// CRITICAL alert.
     #[serde(default = "default_cert_critical_days")]
     pub cert_critical_days: i32,
+    /// Cap on concurrent synthetic probes running at once.
     #[serde(default = "default_max_active_probes")]
     pub max_active_probes: i32,
+    /// Load-test : max concurrent virtual users per run.
     #[serde(default = "default_loadtest_max_concurrency")]
     pub loadtest_max_concurrency: i32,
+    /// Load-test : max run duration in seconds.
     #[serde(default = "default_loadtest_max_duration_s")]
     pub loadtest_max_duration_s: i32,
+    /// Load-test : max steady-state RPS per run.
     #[serde(default = "default_loadtest_max_rps")]
     pub loadtest_max_rps: i32,
     /// Maximum total proxy connections across all routes.
@@ -218,6 +234,44 @@ pub struct GlobalSettings {
     /// CC-BY 4.0 attribution note.
     #[serde(default)]
     pub asn_auto_update_enabled: bool,
+    /// Enable the filesystem certificate export (v1.4.1). When true,
+    /// every time an ACME cert is issued or renewed (and at startup
+    /// for already-issued certs) Lorica writes the PEM + key under
+    /// `cert_export_dir/<hostname>/` so external tools (Ansible, a
+    /// HAProxy sidecar, a backup job) can read the live bundle
+    /// directly from disk. Requires `cert_export_dir` to be set; the
+    /// dashboard surfaces a warning banner before the operator turns
+    /// this on because the key is written in plain text.
+    #[serde(default)]
+    pub cert_export_enabled: bool,
+    /// Absolute path of the directory that receives exported certs.
+    /// Each cert lands under `<dir>/<sanitised-hostname>/{cert,chain,
+    /// fullchain,privkey}.pem`. `None` = feature off.
+    #[serde(default)]
+    pub cert_export_dir: Option<String>,
+    /// Numeric UID set on every exported file / directory (ownership).
+    /// `None` = keep the default (same as the Lorica process user).
+    /// Required when Ansible or another external process needs to
+    /// read the bundle.
+    #[serde(default)]
+    pub cert_export_owner_uid: Option<u32>,
+    /// Numeric GID set on every exported file / directory. Same
+    /// semantics as `cert_export_owner_uid`. Typical setup is a
+    /// dedicated Unix group (`lorica-certs`) that the external
+    /// process's user is a member of.
+    #[serde(default)]
+    pub cert_export_group_gid: Option<u32>,
+    /// Octal mode (file permission bits) applied to each `.pem`
+    /// file. Default `0o640` (owner rw, group r, world nothing).
+    /// Stored as decimal so the existing key-value `global_settings`
+    /// table does not need a special type - the dashboard input
+    /// surfaces octal notation.
+    #[serde(default = "default_cert_export_file_mode")]
+    pub cert_export_file_mode: u32,
+    /// Octal mode (directory permission bits) applied to the export
+    /// dir and its per-hostname subdirectories. Default `0o750`.
+    #[serde(default = "default_cert_export_dir_mode")]
+    pub cert_export_dir_mode: u32,
     /// HMAC secret used to sign the bot-protection verdict cookie
     /// (v1.4.0 Epic 3). 32 raw bytes, stored as a hex string so the
     /// existing key-value `global_settings` table does not need a
@@ -293,6 +347,14 @@ fn default_otlp_sampling_ratio() -> f64 {
     0.1
 }
 
+fn default_cert_export_file_mode() -> u32 {
+    0o640
+}
+
+fn default_cert_export_dir_mode() -> u32 {
+    0o750
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
@@ -328,6 +390,12 @@ impl Default for GlobalSettings {
             asn_db_path: None,
             asn_auto_update_enabled: false,
             bot_hmac_secret_hex: String::new(),
+            cert_export_enabled: false,
+            cert_export_dir: None,
+            cert_export_owner_uid: None,
+            cert_export_group_gid: None,
+            cert_export_file_mode: default_cert_export_file_mode(),
+            cert_export_dir_mode: default_cert_export_dir_mode(),
         }
     }
 }

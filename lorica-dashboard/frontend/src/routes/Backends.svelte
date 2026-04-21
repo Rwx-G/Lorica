@@ -98,6 +98,38 @@
     addressError = validateAddress(formAddress);
   }
 
+  // Blur-time validators for the remaining backend-form fields. The
+  // create/update routes also range-check these server-side, but the
+  // dashboard should not let the operator blur out of the field still
+  // thinking the value is OK.
+  let weightError = $state('');
+  let hcIntervalError = $state('');
+  let hcPathError = $state('');
+  function handleWeightBlur() {
+    const n = Number(formWeight);
+    if (!Number.isInteger(n) || n < 1 || n > 1000) {
+      weightError = 'Weight must be an integer in 1..1000';
+    } else {
+      weightError = '';
+    }
+  }
+  function handleHcIntervalBlur() {
+    const n = Number(formHealthCheckInterval);
+    if (!Number.isInteger(n) || n < 5 || n > 3600) {
+      hcIntervalError = 'Interval must be an integer in 5..3600 s';
+    } else {
+      hcIntervalError = '';
+    }
+  }
+  function handleHcPathBlur() {
+    const p = formHealthCheckPath.trim();
+    if (p === '') { hcPathError = ''; return; }
+    if (!p.startsWith('/')) { hcPathError = "must start with '/'"; return; }
+    if (p.length > 1024) { hcPathError = 'must be <= 1024 characters'; return; }
+    if (/\s/.test(p)) { hcPathError = 'must not contain whitespace'; return; }
+    hcPathError = '';
+  }
+
   async function loadData() {
     loading = true;
     error = '';
@@ -348,7 +380,7 @@
 
         <div class="form-group">
           <label for="backend-address">Address <span class="required">*</span></label>
-          <input id="backend-address" type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" pattern={'^[a-zA-Z0-9._-]+:\\d{1,5}$'} onblur={handleAddressBlur} />
+          <input id="backend-address" type="text" bind:value={formAddress} placeholder="10.0.0.1:8080" pattern={'^[a-zA-Z0-9._-]+:\\d{1,5}$'} onblur={handleAddressBlur} oninput={handleAddressBlur} />
           {#if addressError}
             <span class="field-error">{addressError}</span>
           {/if}
@@ -357,17 +389,20 @@
         <div class="form-row">
           <div class="form-group">
             <label for="backend-weight">Weight</label>
-            <input id="backend-weight" type="number" bind:value={formWeight} min="1" max="1000" />
+            <input id="backend-weight" type="number" bind:value={formWeight} min="1" max="1000" onblur={handleWeightBlur} oninput={handleWeightBlur} />
+            {#if weightError}<span class="field-error">{weightError}</span>{/if}
           </div>
           <div class="form-group">
             <label for="backend-healthcheck-interval">Health Check Interval (s)</label>
-            <input id="backend-healthcheck-interval" type="number" bind:value={formHealthCheckInterval} min="5" max="3600" />
+            <input id="backend-healthcheck-interval" type="number" bind:value={formHealthCheckInterval} min="5" max="3600" onblur={handleHcIntervalBlur} oninput={handleHcIntervalBlur} />
+            {#if hcIntervalError}<span class="field-error">{hcIntervalError}</span>{/if}
           </div>
         </div>
 
         <div class="form-group">
           <label for="backend-healthcheck-path">Health Check Path (empty = TCP only)</label>
-          <input id="backend-healthcheck-path" type="text" bind:value={formHealthCheckPath} placeholder="/healthz" />
+          <input id="backend-healthcheck-path" type="text" bind:value={formHealthCheckPath} placeholder="/healthz" onblur={handleHcPathBlur} oninput={handleHcPathBlur} />
+          {#if hcPathError}<span class="field-error">{hcPathError}</span>{/if}
         </div>
 
         <div class="checkbox-row">

@@ -25,8 +25,12 @@ use strum::{EnumString, IntoStaticStr};
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum LoadBalancing {
+    /// Rotate through backends in declaration order.
     RoundRobin,
+    /// Hash the client IP (or a configured key) to a backend for
+    /// session stickiness.
     ConsistentHash,
+    /// Pick uniformly at random on each request.
     Random,
     /// Peak EWMA: pick the backend with the lowest exponentially-weighted
     /// moving average of recent response latencies.
@@ -49,7 +53,9 @@ impl LoadBalancing {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum WafMode {
+    /// Log rule hits without rejecting the request.
     Detection,
+    /// Reject matching requests with 403.
     Blocking,
 }
 
@@ -67,9 +73,13 @@ impl WafMode {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum HealthStatus {
+    /// Probe succeeded on the last cycle.
     Healthy,
+    /// Last cycle intermittent (soft fail, not yet fully down).
     Degraded,
+    /// Probe failed on the last cycle past the fail threshold.
     Down,
+    /// No probe has run yet (startup) or probing is disabled.
     Unknown,
 }
 
@@ -91,8 +101,11 @@ impl HealthStatus {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum LifecycleState {
+    /// Accepts new connections normally.
     Normal,
+    /// Draining : existing connections finish, new ones go elsewhere.
     Closing,
+    /// Fully out of rotation.
     Closed,
 }
 
@@ -111,8 +124,11 @@ impl LifecycleState {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum NotificationChannel {
+    /// SMTP email (settings carry the host + from / to addresses).
     Email,
+    /// Generic HTTP POST to an operator-configured URL.
     Webhook,
+    /// Slack-flavoured webhook (incoming webhook URL + payload shape).
     Slack,
 }
 
@@ -132,8 +148,11 @@ impl NotificationChannel {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum PreferenceValue {
+    /// User opted out permanently.
     Never,
+    /// User opted in permanently.
     Always,
+    /// Remember the decision for the current session only.
     Once,
 }
 
@@ -155,8 +174,10 @@ impl PreferenceValue {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum PathMatchType {
+    /// Request path starts with the rule's `path` value.
     #[default]
     Prefix,
+    /// Request path equals the rule's `path` value.
     Exact,
 }
 
@@ -180,9 +201,12 @@ impl PathMatchType {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum HeaderMatchType {
+    /// Header value equals the rule's `value`.
     #[default]
     Exact,
+    /// Header value starts with the rule's `value`.
     Prefix,
+    /// Rule's `value` is compiled as a regex and matched.
     Regex,
 }
 

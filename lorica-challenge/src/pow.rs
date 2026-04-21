@@ -25,7 +25,7 @@
 //! See `docs/architecture/bot-protection.md` § 5 for the full
 //! specification.
 
-use rand::RngCore;
+use rand::TryRngCore;
 use sha2::{Digest, Sha256};
 
 use crate::{ChallengeError, Result};
@@ -67,7 +67,10 @@ pub struct Challenge {
     /// adequate to make nonce collisions across concurrent
     /// clients astronomically unlikely.
     pub nonce: [u8; NONCE_LEN],
+    /// Number of leading zero bits the SHA-256 of `nonce + solution`
+    /// must produce to be accepted.
     pub difficulty: u8,
+    /// Unix timestamp past which the verifier refuses the solution.
     pub expires_at: u64,
 }
 
@@ -81,7 +84,9 @@ impl Challenge {
             ));
         }
         let mut nonce = [0u8; NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut nonce)
+            .expect("OS RNG must produce entropy for PoW nonce");
         Ok(Challenge {
             nonce,
             difficulty,

@@ -91,6 +91,19 @@ fi
 chown -R lorica:lorica /var/lib/lorica
 chmod 750 /var/lib/lorica
 
+# Pre-create the default cert-export zone (v1.4.1) with the
+# restrictive mode the exporter uses by default. The feature is
+# disabled at install time; this directory only gets files when
+# the operator turns `cert_export_enabled` on via the dashboard.
+# Keeping the dir pre-created lets the ReadWritePaths in the
+# systemd unit take effect even before the first export, and
+# makes it obvious to operators where exported bundles will land.
+if [ ! -d /var/lib/lorica/exported-certs ]; then
+    mkdir -p /var/lib/lorica/exported-certs
+fi
+chown lorica:lorica /var/lib/lorica/exported-certs
+chmod 750 /var/lib/lorica/exported-certs
+
 # Enable and (re)start service
 systemctl daemon-reload
 systemctl enable lorica.service

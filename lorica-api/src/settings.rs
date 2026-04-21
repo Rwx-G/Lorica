@@ -19,35 +19,75 @@ pub async fn get_settings(
     Ok(json_data(settings))
 }
 
-/// JSON body for `PUT /api/v1/settings`. Only the supplied fields are mutated.
+/// JSON body for `PUT /api/v1/settings`. Only the supplied fields are
+/// mutated ; each field mirrors the matching
+/// [`lorica_config::models::GlobalSettings`] key.
 #[derive(Deserialize)]
 pub struct UpdateSettingsRequest {
+    /// Management API TCP port.
     pub management_port: Option<u16>,
+    /// `tracing` subscriber filter.
     pub log_level: Option<String>,
+    /// Fallback health-check interval (s).
     pub default_health_check_interval_s: Option<i32>,
+    /// Cert expiry warning threshold (days).
     pub cert_warning_days: Option<i32>,
+    /// Cert expiry critical threshold (days).
     pub cert_critical_days: Option<i32>,
+    /// Hard cap on global concurrent connections (0 = unlimited).
     pub max_global_connections: Option<i32>,
+    /// Proxy-wide flood threshold (RPS).
     pub flood_threshold_rps: Option<i32>,
+    /// Number of WAF blocks before auto-ban.
     pub waf_ban_threshold: Option<i32>,
+    /// WAF auto-ban duration (s).
     pub waf_ban_duration_s: Option<i32>,
+    /// Retention cap on the persistent access-log buffer.
     pub access_log_retention: Option<i64>,
+    /// Toggle the periodic SLA bucket purge.
     pub sla_purge_enabled: Option<bool>,
+    /// SLA bucket retention window (days).
     pub sla_purge_retention_days: Option<i32>,
+    /// Purge schedule (`"first_of_month"`, `"daily"`, or day number).
     pub sla_purge_schedule: Option<String>,
+    /// Operator-defined security-header presets.
     pub custom_security_presets: Option<Vec<lorica_config::models::SecurityHeaderPreset>>,
+    /// CIDRs of trusted reverse proxies (XFF parsing gate).
     pub trusted_proxies: Option<Vec<String>>,
+    /// IPs / CIDRs that bypass WAF + rate-limit + auto-ban.
     pub waf_whitelist_ips: Option<Vec<String>>,
+    /// CIDRs denied at TCP accept time.
     pub connection_deny_cidrs: Option<Vec<String>>,
+    /// CIDRs allowed at TCP accept time (default-deny when non-empty).
     pub connection_allow_cidrs: Option<Vec<String>>,
+    /// OTLP collector endpoint URL.
     pub otlp_endpoint: Option<String>,
+    /// OTLP transport protocol (`grpc` / `http-proto` / `http-json`).
     pub otlp_protocol: Option<String>,
+    /// OTel `service.name` attribute.
     pub otlp_service_name: Option<String>,
+    /// Head sampler ratio (0.0..=1.0).
     pub otlp_sampling_ratio: Option<f64>,
+    /// Filesystem path to the GeoIP `.mmdb`.
     pub geoip_db_path: Option<String>,
+    /// Whether Lorica auto-updates the GeoIP DB.
     pub geoip_auto_update_enabled: Option<bool>,
+    /// Filesystem path to the ASN `.mmdb`.
     pub asn_db_path: Option<String>,
+    /// Whether Lorica auto-updates the ASN DB.
     pub asn_auto_update_enabled: Option<bool>,
+    /// Toggle filesystem cert export.
+    pub cert_export_enabled: Option<bool>,
+    /// Absolute path of the export directory.
+    pub cert_export_dir: Option<String>,
+    /// Owner uid applied to exported files.
+    pub cert_export_owner_uid: Option<u32>,
+    /// Group gid applied to exported files.
+    pub cert_export_group_gid: Option<u32>,
+    /// Octal file mode for exported `.pem` files.
+    pub cert_export_file_mode: Option<u32>,
+    /// Octal directory mode for the export root + per-hostname dirs.
+    pub cert_export_dir_mode: Option<u32>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -138,9 +178,9 @@ pub async fn update_settings(
         settings.sla_purge_enabled = enabled;
     }
     if let Some(days) = body.sla_purge_retention_days {
-        if days < 1 {
+        if !(1..=3650).contains(&days) {
             return Err(ApiError::BadRequest(
-                "sla_purge_retention_days must be >= 1".into(),
+                "sla_purge_retention_days must be in 1..=3650 (10 years)".into(),
             ));
         }
         settings.sla_purge_retention_days = days;
@@ -262,6 +302,11 @@ pub async fn update_settings(
                 "otlp_service_name must be 1-256 characters".into(),
             ));
         }
+        if trimmed.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
+            return Err(ApiError::BadRequest(
+                "otlp_service_name must not contain control characters".into(),
+            ));
+        }
         settings.otlp_service_name = trimmed.to_string();
     }
     if let Some(ratio) = body.otlp_sampling_ratio {
@@ -326,6 +371,54 @@ pub async fn update_settings(
     }
     if let Some(auto_update) = body.asn_auto_update_enabled {
         settings.asn_auto_update_enabled = auto_update;
+    }
+    if let Some(enabled) = body.cert_export_enabled {
+        settings.cert_export_enabled = enabled;
+    }
+    if let Some(ref dir) = body.cert_export_dir {
+        let trimmed = dir.trim();
+        if trimmed.is_empty() {
+            settings.cert_export_dir = None;
+        } else {
+            if !trimmed.starts_with('/') {
+                return Err(ApiError::BadRequest(
+                    "cert_export_dir must be an absolute path (starting with '/')".into(),
+                ));
+            }
+            if trimmed.len() > 4096 {
+                return Err(ApiError::BadRequest(
+                    "cert_export_dir too long (> 4096 chars)".into(),
+                ));
+            }
+            if trimmed.contains("/../") || trimmed.ends_with("/..") {
+                return Err(ApiError::BadRequest(
+                    "cert_export_dir must not contain path traversal (../)".into(),
+                ));
+            }
+            settings.cert_export_dir = Some(trimmed.to_string());
+        }
+    }
+    if let Some(uid) = body.cert_export_owner_uid {
+        settings.cert_export_owner_uid = Some(uid);
+    }
+    if let Some(gid) = body.cert_export_group_gid {
+        settings.cert_export_group_gid = Some(gid);
+    }
+    if let Some(mode) = body.cert_export_file_mode {
+        if mode > 0o777 {
+            return Err(ApiError::BadRequest(
+                "cert_export_file_mode must fit in 9 permission bits (<= 0o777)".into(),
+            ));
+        }
+        settings.cert_export_file_mode = mode;
+    }
+    if let Some(mode) = body.cert_export_dir_mode {
+        if mode > 0o777 {
+            return Err(ApiError::BadRequest(
+                "cert_export_dir_mode must fit in 9 permission bits (<= 0o777)".into(),
+            ));
+        }
+        settings.cert_export_dir_mode = mode;
     }
 
     store.update_global_settings(&settings)?;
@@ -471,9 +564,13 @@ pub async fn list_notifications(
 /// JSON body for creating or updating a notification channel.
 #[derive(Deserialize)]
 pub struct CreateNotificationRequest {
+    /// Channel type (`"email"`, `"webhook"`, `"slack"`).
     pub channel: String,
+    /// Whether this channel is dispatched.
     pub enabled: Option<bool>,
+    /// Channel-specific JSON config payload (encrypted at rest).
     pub config: String,
+    /// Alert types this destination subscribes to.
     pub alert_types: Vec<String>,
 }
 
@@ -642,10 +739,10 @@ pub async fn update_notification(
                     )
                 })?;
                 let existing_val: serde_json::Value = serde_json::from_str(&existing.config)
-                    .map_err(|_| {
-                        ApiError::BadRequest(
-                            "existing email config is corrupt; cannot restore smtp_password".into(),
-                        )
+                    .map_err(|e| {
+                        ApiError::BadRequest(format!(
+                            "existing email config is corrupt; cannot restore smtp_password: {e}"
+                        ))
                     })?;
                 let pwd = existing_val.get("smtp_password").ok_or_else(|| {
                     ApiError::BadRequest(
@@ -653,8 +750,8 @@ pub async fn update_notification(
                     )
                 })?;
                 new_val["smtp_password"] = pwd.clone();
-                config = serde_json::to_string(&new_val).map_err(|_| {
-                    ApiError::BadRequest("failed to re-serialize notification config".into())
+                config = serde_json::to_string(&new_val).map_err(|e| {
+                    ApiError::BadRequest(format!("failed to re-serialize notification config: {e}"))
                 })?;
                 drop(store);
             }
@@ -702,6 +799,8 @@ pub async fn list_preferences(
 /// JSON body for `PUT /api/v1/preferences/:id`.
 #[derive(Deserialize)]
 pub struct UpdatePreferenceRequest {
+    /// New value to store for the preference (`"never"` / `"always"`
+    /// / `"once"`).
     pub value: String,
 }
 

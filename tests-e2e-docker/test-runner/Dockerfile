@@ -6,7 +6,7 @@ FROM alpine:3.20
 RUN apk add --no-cache curl jq bash python3 openssl
 RUN adduser -D -s /sbin/nologin testuser
 WORKDIR /tests
-COPY helpers.sh run-tests.sh run-tests-workers.sh run-otel-smoke.sh run-geoip-smoke.sh run-bot-smoke.sh run-rdns-smoke.sh ./
-RUN chmod +x run-tests.sh run-tests-workers.sh run-otel-smoke.sh run-geoip-smoke.sh run-bot-smoke.sh run-rdns-smoke.sh helpers.sh
+COPY helpers.sh run-tests.sh run-tests-workers.sh run-otel-smoke.sh run-geoip-smoke.sh run-bot-smoke.sh run-rdns-smoke.sh run-cert-export-smoke.sh ./
+RUN chmod +x run-tests.sh run-tests-workers.sh run-otel-smoke.sh run-geoip-smoke.sh run-bot-smoke.sh run-rdns-smoke.sh run-cert-export-smoke.sh helpers.sh
 USER testuser
 ENTRYPOINT ["bash", "run-tests.sh"]

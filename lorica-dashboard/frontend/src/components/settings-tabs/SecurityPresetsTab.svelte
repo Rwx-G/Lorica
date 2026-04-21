@@ -2,6 +2,7 @@
   import { api, type SecurityHeaderPreset } from '../../lib/api';
   import ConfirmDialog from '../ConfirmDialog.svelte';
   import { showToast } from '../../lib/toast';
+  import { validateHeadersMapText } from '../../lib/validators';
 
   interface Props {
     customPresets: SecurityHeaderPreset[];
@@ -28,6 +29,25 @@
   let presetError = $state('');
   let presetSaving = $state(false);
   let deletingPresetIdx: number | null = $state(null);
+
+  // Blur-time validators. Preset name: 1..64 ASCII letters/digits/
+  // dash/underscore (it's a DB key referenced by routes); header
+  // map: same rule as the route-level `response_headers` textarea.
+  let presetNameError = $state<string | null>(null);
+  let presetHeadersError = $state<string | null>(null);
+  function checkPresetName() {
+    const s = presetName.trim();
+    if (s === '') { presetNameError = 'name must not be empty'; return; }
+    if (s.length > 64) { presetNameError = 'name must be <= 64 characters'; return; }
+    if (!/^[A-Za-z0-9_-]+$/.test(s)) {
+      presetNameError = 'name may only contain ASCII letters, digits, `-` and `_`';
+      return;
+    }
+    presetNameError = null;
+  }
+  function checkPresetHeaders() {
+    presetHeadersError = validateHeadersMapText(presetHeaders);
+  }
 
   function headersToText(headers: Record<string, string>): string {
     return Object.entries(headers).map(([k, v]) => `${k}=${v}`).join('\n');
@@ -158,11 +178,13 @@
       <h3>{presetEditing !== null ? 'Edit' : 'Add'} Security Header Preset</h3>
       <div class="settings-form-row">
         <label for="preset-name">Preset Name <span class="settings-required">*</span></label>
-        <input id="preset-name" type="text" bind:value={presetName} placeholder="e.g. my-api-preset" />
+        <input id="preset-name" type="text" bind:value={presetName} placeholder="e.g. my-api-preset" onblur={checkPresetName} oninput={checkPresetName} />
+        {#if presetNameError}<span class="field-error" role="alert">{presetNameError}</span>{/if}
       </div>
       <div class="settings-form-row">
         <label for="preset-headers">Headers (one per line, Key=Value) <span class="settings-required">*</span></label>
-        <textarea id="preset-headers" bind:value={presetHeaders} rows="6" placeholder="X-Frame-Options=DENY&#10;X-Content-Type-Options=nosniff&#10;Referrer-Policy=no-referrer"></textarea>
+        <textarea id="preset-headers" bind:value={presetHeaders} rows="6" placeholder="X-Frame-Options=DENY&#10;X-Content-Type-Options=nosniff&#10;Referrer-Policy=no-referrer" onblur={checkPresetHeaders} oninput={checkPresetHeaders}></textarea>
+        {#if presetHeadersError}<span class="field-error" role="alert">{presetHeadersError}</span>{/if}
       </div>
       {#if presetError}
         <div class="settings-form-error">{presetError}</div>
@@ -252,4 +274,5 @@
     padding: 0.125rem 0.375rem;
     border-radius: 0.25rem;
   }
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 </style>

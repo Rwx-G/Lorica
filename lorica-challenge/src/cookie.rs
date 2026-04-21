@@ -81,9 +81,16 @@ const PAYLOAD_SUFFIX_LEN: usize = 4 + 1;
 /// positional arguments.
 #[derive(Debug, Clone)]
 pub struct Payload {
+    /// 16-byte route identifier (from `Route.id`) so a verdict
+    /// issued for route A never validates against route B.
     pub route_id: [u8; 16],
+    /// Client-IP prefix binding (`/24` for v4, `/64` for v6) so a
+    /// stolen cookie cannot be replayed from a different subnet.
     pub ip_prefix: IpPrefix,
+    /// Unix timestamp past which the verifier rejects the cookie.
     pub expires_at: i64,
+    /// Which challenge mode minted this verdict (stamped for metrics
+    /// breakdown, not enforced on the read path).
     pub mode: Mode,
 }
 

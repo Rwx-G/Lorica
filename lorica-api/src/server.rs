@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::logs::LogBuffer;
 use crate::middleware::auth::{require_auth, SessionStore};
-use crate::middleware::rate_limit::RateLimiter;
+use crate::middleware::rate_limit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
 use crate::system::SystemCache;
 use crate::workers::WorkerMetrics;
 
@@ -35,10 +35,17 @@ pub type MetricsRefresher =
 /// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]
 pub struct AppState {
+    /// SQLite-backed `ConfigStore` wrapped in a tokio `Mutex` so only
+    /// one handler writes at a time.
     pub store: Arc<Mutex<lorica_config::ConfigStore>>,
+    /// In-memory ring buffer + broadcast hub for access logs.
     pub log_buffer: Arc<LogBuffer>,
+    /// Cached system-metrics snapshot populated by
+    /// `GET /api/v1/system`.
     pub system_cache: Arc<Mutex<SystemCache>>,
+    /// Live count of accepted downstream connections.
     pub active_connections: Arc<AtomicU64>,
+    /// Proxy process start time for uptime computation.
     pub started_at: Instant,
     /// Lorica data directory (`--data-dir`, typically `/var/lib/lorica`).
     /// Used by `get_system` to report the disk usage of the filesystem
@@ -137,9 +144,11 @@ impl AppState {
     /// higher-priority operation).
     pub async fn rotate_bot_hmac_on_cert_event(&self) {
         let new_bytes: [u8; 32] = {
-            use rand::RngCore;
+            use rand::TryRngCore;
             let mut out = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut out);
+            rand::rngs::OsRng
+                .try_fill_bytes(&mut out)
+                .expect("OS RNG must produce entropy for HMAC rotation");
             out
         };
         let mut hex_buf = String::with_capacity(64);
@@ -179,6 +188,30 @@ pub fn build_router(
     session_store: SessionStore,
     rate_limiter: RateLimiter,
 ) -> Router {
+    // Helper: build a rate-limit middleware layer for a specific
+    // bucket. Attached per-route on state-mutating management
+    // endpoints (v1.5.0 audit A.3). Defense-in-depth for when the
+    // dashboard is exposed behind a reverse proxy : a compromised
+    // session cookie cannot flood ACME quotas, overwrite the whole
+    // config, or password-spray.
+    let rl = |bucket: &'static str, limit: u32, window_seconds: u64| {
+        middleware::from_fn_with_state(
+            RateLimitConfig {
+                bucket,
+                limit,
+                window_seconds,
+            },
+            rate_limit_middleware,
+        )
+    };
+
+    // Helper : build a per-route body-size limit layer (v1.5.0
+    // audit A.4). Global default is 1 MiB ; this helper raises it
+    // for specific endpoints that legitimately carry larger
+    // payloads (cert PEM upload, TOML import, route configs with
+    // many path rules).
+    let bl = axum::extract::DefaultBodyLimit::max;
+
     // Public routes (no auth required)
     let auth_routes = Router::new()
         .route("/api/v1/auth/login", post(crate::auth::login))
@@ -194,12 +227,28 @@ pub fn build_router(
 
     // Protected routes (auth required)
     let protected_routes = Router::new()
-        .route("/api/v1/auth/password", put(crate::auth::change_password))
+        .route(
+            "/api/v1/auth/password",
+            put(crate::auth::change_password).layer(rl("password_change", 3, 60)),
+        )
         .route("/api/v1/routes", get(crate::routes::list_routes))
-        .route("/api/v1/routes", post(crate::routes::create_route))
+        .route(
+            "/api/v1/routes",
+            post(crate::routes::create_route)
+                .layer(bl(128 * 1024))
+                .layer(rl("routes_cud", 100, 60)),
+        )
         .route("/api/v1/routes/:id", get(crate::routes::get_route))
-        .route("/api/v1/routes/:id", put(crate::routes::update_route))
-        .route("/api/v1/routes/:id", delete(crate::routes::delete_route))
+        .route(
+            "/api/v1/routes/:id",
+            put(crate::routes::update_route)
+                .layer(bl(128 * 1024))
+                .layer(rl("routes_cud", 100, 60)),
+        )
+        .route(
+            "/api/v1/routes/:id",
+            delete(crate::routes::delete_route).layer(rl("routes_cud", 100, 60)),
+        )
         .route(
             "/api/v1/validate/mtls-pem",
             post(crate::routes::validate_mtls_pem),
@@ -229,11 +278,13 @@ pub fn build_router(
         )
         .route(
             "/api/v1/certificates",
-            post(crate::certificates::create_certificate),
+            post(crate::certificates::create_certificate)
+                .layer(bl(512 * 1024))
+                .layer(rl("cert_create", 20, 60)),
         )
         .route(
             "/api/v1/certificates/self-signed",
-            post(crate::certificates::generate_self_signed),
+            post(crate::certificates::generate_self_signed).layer(rl("cert_create", 20, 60)),
         )
         .route(
             "/api/v1/certificates/:id",
@@ -247,6 +298,40 @@ pub fn build_router(
             "/api/v1/certificates/:id",
             delete(crate::certificates::delete_certificate),
         )
+        .route(
+            "/api/v1/certificates/:id/download",
+            get(crate::certificates::download_certificate),
+        )
+        .route(
+            "/api/v1/cert-export/acls",
+            get(crate::routes::cert_export::list_acls),
+        )
+        .route(
+            "/api/v1/cert-export/acls",
+            post(crate::routes::cert_export::create_acl).layer(rl("cert_export_acls", 100, 60)),
+        )
+        .route(
+            "/api/v1/cert-export/acls/:id",
+            delete(crate::routes::cert_export::delete_acl).layer(rl("cert_export_acls", 100, 60)),
+        )
+        .route(
+            "/api/v1/cert-export/reapply",
+            post(crate::routes::cert_export::reapply)
+                .layer(bl(4 * 1024))
+                .layer(rl("cert_export_reapply", 5, 60)),
+        )
+        .route(
+            "/api/v1/cert-export/orphans",
+            get(crate::routes::cert_export::list_orphans),
+        )
+        .route(
+            "/api/v1/cert-export/orphans/:name",
+            delete(crate::routes::cert_export::delete_orphan).layer(rl(
+                "cert_export_acls",
+                100,
+                60,
+            )),
+        )
         .route("/api/v1/status", get(crate::status::get_status))
         .route("/api/v1/logs", get(crate::logs::get_logs))
         .route("/api/v1/logs", delete(crate::logs::clear_logs))
@@ -255,13 +340,25 @@ pub fn build_router(
         .route("/api/v1/system", get(crate::system::get_system))
         .route("/api/v1/workers", get(crate::workers::get_workers))
         .route("/api/v1/config/export", post(crate::config::export_config))
-        .route("/api/v1/config/import", post(crate::config::import_config))
+        .route(
+            "/api/v1/config/import",
+            post(crate::config::import_config)
+                .layer(bl(2 * 1024 * 1024))
+                .layer(rl("config_import", 3, 60)),
+        )
         .route(
             "/api/v1/config/import/preview",
-            post(crate::config::import_preview),
+            post(crate::config::import_preview)
+                .layer(bl(2 * 1024 * 1024))
+                .layer(rl("config_import", 3, 60)),
         )
         .route("/api/v1/settings", get(crate::settings::get_settings))
-        .route("/api/v1/settings", put(crate::settings::update_settings))
+        .route(
+            "/api/v1/settings",
+            put(crate::settings::update_settings)
+                .layer(bl(64 * 1024))
+                .layer(rl("settings", 30, 60)),
+        )
         .route(
             "/api/v1/settings/otel/test",
             post(crate::settings::test_otel_connection),
@@ -336,27 +433,39 @@ pub fn build_router(
         )
         .route(
             "/api/v1/acme/provision",
-            post(crate::acme::provision_certificate),
+            post(crate::acme::provision_certificate)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns",
-            post(crate::acme::provision_certificate_dns),
+            post(crate::acme::provision_certificate_dns)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual",
-            post(crate::acme::provision_dns_manual),
+            post(crate::acme::provision_dns_manual)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual/check",
-            post(crate::acme::check_dns_manual),
+            post(crate::acme::check_dns_manual)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/acme/provision-dns-manual/confirm",
-            post(crate::acme::provision_dns_manual_confirm),
+            post(crate::acme::provision_dns_manual_confirm)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route(
             "/api/v1/certificates/:id/renew",
-            post(crate::acme::renew_certificate),
+            post(crate::acme::renew_certificate)
+                .layer(bl(16 * 1024))
+                .layer(rl("acme_provision", 3, 60)),
         )
         .route("/api/v1/waf/rules", get(crate::waf::get_waf_rules))
         .route(
@@ -365,7 +474,7 @@ pub fn build_router(
         )
         .route(
             "/api/v1/waf/rules/custom",
-            post(crate::waf::create_custom_rule),
+            post(crate::waf::create_custom_rule).layer(bl(8 * 1024)),
         )
         .route(
             "/api/v1/waf/rules/custom/:id",
@@ -473,7 +582,14 @@ pub fn build_router(
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
                 .allow_headers(Any),
         )
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        // Global body-size ceiling : 1 MiB (v1.5.0 audit finding
+        // MEDIUM, tightened from the previous 10 MiB). Endpoints that
+        // legitimately need more (config import, cert PEM upload, route
+        // CRUD with many path rules) declare their own limit via
+        // `.layer(DefaultBodyLimit::max(N))` on the specific route ;
+        // anything larger than this global default and without a per-
+        // route override is rejected with 413 Payload Too Large.
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MiB
         .layer(axum::Extension(state))
         .layer(axum::Extension(session_store))
         .layer(axum::Extension(rate_limiter))

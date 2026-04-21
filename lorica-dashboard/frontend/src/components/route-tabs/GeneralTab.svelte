@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { RouteFormState } from '../../lib/route-form';
-  import { ROUTE_DEFAULTS, validateHostname } from '../../lib/route-form';
+  import { ROUTE_DEFAULTS, validateHostname, validateRedirectHostname } from '../../lib/route-form';
+  import { validateUrl, validateRoutePath, validateHostnameAliasList, validateErrorPageHtml, validateGroupName } from '../../lib/validators';
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
@@ -14,10 +15,52 @@
   let { form = $bindable(), editing, importedFields }: Props = $props();
 
   let hostnameError = $state('');
+  let redirectHostnameError = $state('');
+  let redirectToError = $state<string | null>(null);
+  let pathPrefixError = $state<string | null>(null);
+  let hostnameAliasesError = $state<string | null>(null);
+  let groupNameError = $state<string | null>(null);
+  let returnStatusError = $state<string | null>(null);
+  let errorPageHtmlError = $state<string | null>(null);
   let activeHelp = $state<null | 'section:identity' | 'section:response_override' | 'hostname' | 'path_prefix' | 'hostname_aliases' | 'enabled' | 'websocket_enabled' | 'access_log_enabled' | 'redirect_to' | 'redirect_hostname' | 'return_status' | 'error_page_html'>(null);
 
   function handleHostnameBlur() {
     hostnameError = validateHostname(form.hostname);
+  }
+
+  function handleRedirectHostnameBlur() {
+    redirectHostnameError = validateRedirectHostname(form.redirect_hostname);
+  }
+
+  function handleRedirectToBlur() {
+    redirectToError = validateUrl(form.redirect_to);
+  }
+
+  function handlePathPrefixBlur() {
+    pathPrefixError = validateRoutePath(form.path_prefix);
+  }
+
+  function handleHostnameAliasesBlur() {
+    hostnameAliasesError = validateHostnameAliasList(form.hostname_aliases);
+  }
+
+  function handleGroupNameBlur() {
+    groupNameError = validateGroupName(form.group_name);
+  }
+
+  function handleReturnStatusBlur() {
+    const raw = form.return_status.trim();
+    if (raw === '') { returnStatusError = null; return; }
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 100 || n > 599) {
+      returnStatusError = 'must be an HTTP code in 100..599';
+    } else {
+      returnStatusError = null;
+    }
+  }
+
+  function handleErrorPageHtmlBlur() {
+    errorPageHtmlError = validateErrorPageHtml(form.error_page_html);
   }
 
   function isModified(field: keyof RouteFormState): boolean {
@@ -51,7 +94,7 @@
           <FieldHelpButton fieldLabel="Hostname" onhelp={() => { activeHelp = 'hostname'; }} />
         </label>
         {#if isImported('hostname')}<span class="imported-badge">imported</span>{/if}
-        <input id="hostname" type="text" bind:value={form.hostname} placeholder="example.com" onblur={handleHostnameBlur} />
+        <input id="hostname" type="text" bind:value={form.hostname} placeholder="example.com" onblur={handleHostnameBlur} oninput={handleHostnameBlur} />
         {#if hostnameError}
           <span class="field-error">{hostnameError}</span>
         {/if}
@@ -63,7 +106,8 @@
           <FieldHelpButton fieldLabel="Path prefix" onhelp={() => { activeHelp = 'path_prefix'; }} />
         </label>
         {#if isImported('path_prefix')}<span class="imported-badge">imported</span>{/if}
-        <input id="path" type="text" bind:value={form.path_prefix} placeholder="/" />
+        <input id="path" type="text" bind:value={form.path_prefix} placeholder="/" onblur={handlePathPrefixBlur} oninput={handlePathPrefixBlur} />
+        {#if pathPrefixError}<span class="field-error" role="alert">{pathPrefixError}</span>{/if}
         <span class="hint">Longest-match wins when multiple routes share the same hostname.</span>
       </div>
 
@@ -73,8 +117,21 @@
           <FieldHelpButton fieldLabel="Hostname aliases" onhelp={() => { activeHelp = 'hostname_aliases'; }} />
         </label>
         {#if isImported('hostname_aliases')}<span class="imported-badge">imported</span>{/if}
-        <input id="hostname-aliases" type="text" bind:value={form.hostname_aliases} placeholder="alias1.com, alias2.com" />
+        <input id="hostname-aliases" type="text" bind:value={form.hostname_aliases} placeholder="alias1.com, alias2.com" onblur={handleHostnameAliasesBlur} oninput={handleHostnameAliasesBlur} />
+        {#if hostnameAliasesError}<span class="field-error" role="alert">{hostnameAliasesError}</span>{/if}
         <span class="hint">Additional hostnames routed to this same configuration. Comma-separated.</span>
+      </div>
+
+      <div class="form-group" class:modified={isModified('group_name')}>
+        <label for="route-group">Group</label>
+        {#if isImported('group_name')}<span class="imported-badge">imported</span>{/if}
+        <input id="route-group" type="text" bind:value={form.group_name} placeholder="e.g. prod, staging, homelab" onblur={handleGroupNameBlur} oninput={handleGroupNameBlur} />
+        {#if groupNameError}<span class="field-error" role="alert">{groupNameError}</span>{/if}
+        <span class="hint">
+          Free-form classification for filtering in the routes list.
+          Lowercase letters, digits, <code>-</code> and <code>_</code>,
+          up to 64 chars. Empty = ungrouped.
+        </span>
       </div>
 
       {#if editing}
@@ -127,7 +184,10 @@
           <FieldHelpButton fieldLabel="Redirect to" onhelp={() => { activeHelp = 'redirect_to'; }} />
         </label>
         {#if isImported('redirect_to')}<span class="imported-badge">imported</span>{/if}
-        <input id="redirect-to" type="text" bind:value={form.redirect_to} placeholder="https://example.com/legacy" />
+        <input id="redirect-to" type="text" bind:value={form.redirect_to} placeholder="https://example.com/legacy" onblur={handleRedirectToBlur} oninput={handleRedirectToBlur} />
+        {#if redirectToError}
+          <span class="field-error">{redirectToError}</span>
+        {/if}
         <span class="hint">
           Use when you want full control: force a specific scheme (http/https),
           optionally prepend a path prefix. 301 with your URL + request's path
@@ -141,7 +201,10 @@
           <FieldHelpButton fieldLabel="Redirect to another host" onhelp={() => { activeHelp = 'redirect_hostname'; }} />
         </label>
         {#if isImported('redirect_hostname')}<span class="imported-badge">imported</span>{/if}
-        <input id="redirect-hostname" type="text" bind:value={form.redirect_hostname} placeholder="e.g. example.com" />
+        <input id="redirect-hostname" type="text" bind:value={form.redirect_hostname} placeholder="e.g. example.com" onblur={handleRedirectHostnameBlur} oninput={handleRedirectHostnameBlur} />
+        {#if redirectHostnameError}
+          <span class="field-error">{redirectHostnameError}</span>
+        {/if}
         <span class="hint">
           Use for canonical-host redirects (e.g. <code>www.example.com</code> &rarr;
           <code>example.com</code>). Hostname-only; preserves the client's scheme
@@ -155,7 +218,8 @@
           <FieldHelpButton fieldLabel="Return status" onhelp={() => { activeHelp = 'return_status'; }} />
         </label>
         {#if isImported('return_status')}<span class="imported-badge">imported</span>{/if}
-        <input id="return-status" type="number" min="100" max="599" bind:value={form.return_status} placeholder="e.g. 403, 404, 410" />
+        <input id="return-status" type="number" min="100" max="599" bind:value={form.return_status} placeholder="e.g. 403, 404, 410" onblur={handleReturnStatusBlur} oninput={handleReturnStatusBlur} />
+        {#if returnStatusError}<span class="field-error" role="alert">{returnStatusError}</span>{/if}
         <span class="hint">Respond with this status instead of proxying.</span>
       </div>
 
@@ -165,7 +229,9 @@
           <FieldHelpButton fieldLabel="Custom error page HTML" onhelp={() => { activeHelp = 'error_page_html'; }} />
         </label>
         <textarea id="error-page-html" rows="6" bind:value={form.error_page_html}
-          placeholder={'<html><body><h1>{{status}}</h1><p>{{message}}</p></body></html>'}></textarea>
+          placeholder={'<html><body><h1>{{status}}</h1><p>{{message}}</p></body></html>'}
+          onblur={handleErrorPageHtmlBlur} oninput={handleErrorPageHtmlBlur}></textarea>
+        {#if errorPageHtmlError}<span class="field-error" role="alert">{errorPageHtmlError}</span>{/if}
         <span class="hint">Optional override of Lorica's built-in error page.</span>
       </div>
 
@@ -440,8 +506,7 @@
   .form-group:last-child { margin-bottom: 0.5rem; }
   .form-group.modified { border-left: 3px solid var(--color-primary); padding-left: 0.75rem; }
 
-  .form-group label,
-  .form-group .field-label {
+  .form-group label {
     display: block;
     font-size: 0.8125rem;
     font-weight: 500;
@@ -454,7 +519,6 @@
 
   .form-group input[type="text"],
   .form-group input[type="number"],
-  .form-group select,
   .form-group textarea {
     width: 100%;
     padding: 0.5rem 0.75rem;
@@ -468,7 +532,6 @@
 
   .form-group input[type="text"]:focus,
   .form-group input[type="number"]:focus,
-  .form-group select:focus,
   .form-group textarea:focus {
     outline: none;
     border-color: var(--color-primary);

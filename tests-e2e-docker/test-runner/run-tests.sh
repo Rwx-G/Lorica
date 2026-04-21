@@ -269,6 +269,34 @@ if [ -n "$SESSION" ]; then
         fail "Expected >= 2 routes, got $ROUTE_COUNT"
     fi
 
+    # ---- group_name: v1.4.1 free-form classification (mirror of Backend.group_name) ----
+    # Set group_name on R1 and R2, list with the ?group= filter, confirm
+    # the API only returns the matching subset, then verify an invalid
+    # alphabet (uppercase) is rejected by the server-side validator.
+
+    api_put "/api/v1/routes/$R1_ID" '{"group_name":"e2e-prod"}' >/dev/null
+    api_put "/api/v1/routes/$R2_ID" '{"group_name":"e2e-staging"}' >/dev/null
+
+    R1_AFTER=$(api_get "/api/v1/routes/$R1_ID")
+    assert_json "$R1_AFTER" ".data.group_name" "e2e-prod" "group_name round-trips through PUT /routes"
+
+    FILTERED=$(api_get "/api/v1/routes?group=e2e-prod")
+    FILTERED_COUNT=$(echo "$FILTERED" | jq '.data.routes | length')
+    if [ "$FILTERED_COUNT" -eq 1 ]; then
+        ok "?group=e2e-prod filter narrows to 1 route"
+    else
+        fail "?group=e2e-prod filter: expected 1, got $FILTERED_COUNT"
+    fi
+    assert_json "$FILTERED" ".data.routes[0].hostname" "test.local" "Filtered route has the expected hostname"
+
+    # Invalid alphabet rejected (uppercase)
+    assert_status PUT "$API/api/v1/routes/$R1_ID" "400" "Uppercase group_name rejected with 400" \
+        -H "Content-Type: application/json" --data '{"group_name":"PROD"}'
+
+    # Clear group_name (empty string clears the field)
+    api_put "/api/v1/routes/$R1_ID" '{"group_name":""}' >/dev/null
+    api_put "/api/v1/routes/$R2_ID" '{"group_name":""}' >/dev/null
+
 # =============================================================================
 # 6. PROXY - ROUTING + ROUND ROBIN
 # =============================================================================

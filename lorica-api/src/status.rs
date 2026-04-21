@@ -11,12 +11,19 @@ use crate::server::AppState;
 /// Snapshot returned by `GET /api/v1/status` summarizing the proxy fleet.
 #[derive(Serialize)]
 pub struct StatusResponse {
+    /// Number of routes in the `routes` table.
     pub routes_count: usize,
+    /// Number of backends in the `backends` table.
     pub backends_count: usize,
+    /// Backends with `health_status == Healthy`.
     pub backends_healthy: usize,
+    /// Backends with `health_status == Degraded`.
     pub backends_degraded: usize,
+    /// Backends with `health_status == Down`.
     pub backends_down: usize,
+    /// Number of certificates in the `certificates` table.
     pub certificates_count: usize,
+    /// Certificates whose `not_after` is within 30 days.
     pub certificates_expiring_soon: usize,
 }
 

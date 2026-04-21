@@ -51,7 +51,7 @@ use lorica_challenge::{IpPrefix, Mode};
 use lorica_config::ConfigStore;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use rand::RngCore;
+use rand::TryRngCore;
 
 /// Path prefix for all Lorica-handled bot-protection endpoints.
 /// Chosen to be improbable-to-collide with real routes; the `lorica`
@@ -175,7 +175,9 @@ impl BotEngine {
     pub fn fresh_nonce(&self) -> String {
         use std::fmt::Write;
         let mut raw = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut raw)
+            .expect("OS RNG must produce entropy for bot-protection nonce");
         let mut out = String::with_capacity(32);
         for b in raw.iter() {
             let _ = write!(out, "{b:02x}");
@@ -931,6 +933,7 @@ pub fn extract_verdict_cookie(cookie_header: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use lorica_config::models::{BotBypassRules, BotProtectionConfig, BotProtectionMode};
+    use serial_test::serial;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn cfg() -> BotProtectionConfig {
@@ -1411,6 +1414,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(verdict_cache)]
     fn verdict_cache_hit_skips_hmac_verify() {
         cache_reset_for_test();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
@@ -1492,6 +1496,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(verdict_cache)]
     fn verdict_cache_expired_entry_is_miss() {
         cache_reset_for_test();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
@@ -1521,6 +1526,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(verdict_cache)]
     fn verdict_cache_fifo_evicts_oldest_when_full() {
         cache_reset_for_test();
         // Insert one more than the cap; the first entry must be

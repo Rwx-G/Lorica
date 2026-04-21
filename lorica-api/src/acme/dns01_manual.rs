@@ -278,7 +278,11 @@ pub async fn check_dns_manual(
 
 /// Validate that a DNS server string is a safe IP address or hostname.
 /// Rejects values containing shell metacharacters, spaces, semicolons, etc.
-fn is_valid_dns_server(server: &str) -> bool {
+///
+/// `pub(super)` so `acme::tests` can unit-test the full alphabet
+/// without going through the `check_txt_record` wrapper (which
+/// spawns `dig` and is integration-only).
+pub(super) fn is_valid_dns_server(server: &str) -> bool {
     if server.is_empty() || server.len() > 253 {
         return false;
     }
@@ -505,6 +509,7 @@ pub async fn provision_dns_manual_confirm(
     store
         .create_certificate(&cert)
         .map_err(|e| ApiError::Internal(format!("failed to store certificate: {e}")))?;
+    crate::cert_export::export_from_store(&store, &cert);
     drop(store);
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();

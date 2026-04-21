@@ -24,7 +24,10 @@ use super::DnsChallenger;
 /// Each request is signed with a SHA1 hash of the concatenation:
 /// `application_secret+consumer_key+METHOD+URL+BODY+timestamp`.
 pub struct OvhDnsChallenger {
-    endpoint: String,
+    /// Full URL prefix including scheme and API version suffix (e.g.
+    /// `"https://eu.api.ovh.com/1.0"`). Tests swap this for a mock
+    /// server origin like `"http://127.0.0.1:xxxx/1.0"`.
+    base_url: String,
     application_key: String,
     application_secret: String,
     consumer_key: String,
@@ -35,14 +38,34 @@ pub struct OvhDnsChallenger {
 
 impl OvhDnsChallenger {
     /// Construct a new OVH challenger from the four-part credential set.
+    /// `endpoint` is the bare host (e.g. `"eu.api.ovh.com"`) ; the
+    /// `https://{endpoint}/1.0` prefix is computed internally.
     pub fn new(
         endpoint: String,
         application_key: String,
         application_secret: String,
         consumer_key: String,
     ) -> Self {
+        Self::with_base_url(
+            format!("https://{endpoint}/1.0"),
+            application_key,
+            application_secret,
+            consumer_key,
+        )
+    }
+
+    /// Construct a challenger with a fully-qualified API base URL. `pub(crate)`
+    /// so unit tests in `acme::tests` can point the challenger at a
+    /// `wiremock::MockServer` instance (where the scheme is `http://` and the
+    /// host carries a random port).
+    pub(crate) fn with_base_url(
+        base_url: String,
+        application_key: String,
+        application_secret: String,
+        consumer_key: String,
+    ) -> Self {
         Self {
-            endpoint,
+            base_url,
             application_key,
             application_secret,
             consumer_key,
@@ -70,7 +93,7 @@ impl OvhDnsChallenger {
 
     /// Get the OVH server timestamp for request signing.
     async fn get_server_time(&self) -> Result<i64, String> {
-        let url = format!("https://{}/1.0/auth/time", self.endpoint);
+        let url = format!("{}/auth/time", self.base_url);
         let resp = self
             .client
             .get(&url)
@@ -104,7 +127,7 @@ impl OvhDnsChallenger {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<reqwest::Response, String> {
-        let url = format!("https://{}/1.0{}", self.endpoint, path);
+        let url = format!("{}{}", self.base_url, path);
         let body_str = match body {
             Some(b) => serde_json::to_string(b)
                 .map_err(|e| format!("OVH: failed to serialize request body: {e}"))?,

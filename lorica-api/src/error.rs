@@ -29,9 +29,12 @@ pub enum ApiError {
     #[error("conflict: {0}")]
     Conflict(String),
 
-    /// 429 Too Many Requests: client exceeded the per-IP login rate limiter.
-    #[error("rate limited")]
-    RateLimited,
+    /// 429 Too Many Requests: client exceeded a per-bucket rate
+    /// limiter. The inner `u64` is the Retry-After value in
+    /// seconds (0 if unknown; the response still emits the
+    /// header for client tooling consistency).
+    #[error("rate limited (retry after {0}s)")]
+    RateLimited(u64),
 
     /// 500 Internal Server Error: unexpected failure (DB, IO, serialization).
     #[error("internal error: {0}")]
@@ -67,7 +70,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
-            ApiError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -79,7 +82,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => "unauthorized",
             ApiError::Forbidden(_) => "forbidden",
             ApiError::Conflict(_) => "conflict",
-            ApiError::RateLimited => "rate_limited",
+            ApiError::RateLimited(_) => "rate_limited",
             ApiError::Internal(_) => "internal_error",
         }
     }
@@ -88,13 +91,26 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+        // 429 responses carry a Retry-After header (RFC 6585) so
+        // polite clients know when to retry. The inner u64 is the
+        // seconds until the current window rolls over.
+        let retry_after = match &self {
+            ApiError::RateLimited(secs) => Some(*secs),
+            _ => None,
+        };
         let body = ErrorEnvelope {
             error: ErrorBody {
                 code: self.code().to_string(),
                 message: self.to_string(),
             },
         };
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        if let Some(secs) = retry_after {
+            if let Ok(value) = http::HeaderValue::from_str(&secs.to_string()) {
+                response.headers_mut().insert("Retry-After", value);
+            }
+        }
+        response
     }
 }
 
@@ -139,7 +155,7 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(
-            ApiError::RateLimited.status_code(),
+            ApiError::RateLimited(30).status_code(),
             StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(
@@ -155,7 +171,7 @@ mod tests {
         assert_eq!(ApiError::Unauthorized("x".into()).code(), "unauthorized");
         assert_eq!(ApiError::Forbidden("x".into()).code(), "forbidden");
         assert_eq!(ApiError::Conflict("x".into()).code(), "conflict");
-        assert_eq!(ApiError::RateLimited.code(), "rate_limited");
+        assert_eq!(ApiError::RateLimited(30).code(), "rate_limited");
         assert_eq!(ApiError::Internal("x".into()).code(), "internal_error");
     }
 
@@ -169,7 +185,10 @@ mod tests {
             ApiError::BadRequest("bad".into()).to_string(),
             "bad request: bad"
         );
-        assert_eq!(ApiError::RateLimited.to_string(), "rate limited");
+        assert_eq!(
+            ApiError::RateLimited(30).to_string(),
+            "rate limited (retry after 30s)"
+        );
     }
 
     #[tokio::test]
@@ -202,6 +221,18 @@ mod tests {
     fn test_config_error_other_converts_to_internal() {
         let err: ApiError = lorica_config::ConfigError::Serialization("toml fail".into()).into();
         assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_sets_retry_after_header() {
+        let err = ApiError::RateLimited(42);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(retry, Some("42"));
     }
 
     #[test]

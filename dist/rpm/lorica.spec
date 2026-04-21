@@ -1,5 +1,5 @@
 Name:           lorica
-Version:        1.4.0
+Version:        1.5.0
 Release:        1%{?dist}
 Summary:        Modern reverse proxy with built-in dashboard
 License:        Apache-2.0
@@ -19,6 +19,7 @@ mkdir -p %{buildroot}/usr/lib/systemd/system
 mkdir -p %{buildroot}/usr/share/doc/lorica
 mkdir -p %{buildroot}/usr/share/licenses/lorica
 mkdir -p %{buildroot}/var/lib/lorica
+mkdir -p %{buildroot}/var/lib/lorica/exported-certs
 
 install -m 755 %{_sourcedir}/lorica %{buildroot}/usr/bin/lorica
 install -m 644 %{_sourcedir}/dist/lorica.service %{buildroot}/usr/lib/systemd/system/lorica.service
@@ -34,6 +35,13 @@ getent passwd lorica >/dev/null || useradd -r -g lorica -d /var/lib/lorica -s /s
 %post
 chown -R lorica:lorica /var/lib/lorica
 chmod 750 /var/lib/lorica
+# Default cert-export zone (v1.4.1). Empty until the operator
+# turns the feature on via the dashboard.
+if [ ! -d /var/lib/lorica/exported-certs ]; then
+    mkdir -p /var/lib/lorica/exported-certs
+fi
+chown lorica:lorica /var/lib/lorica/exported-certs
+chmod 750 /var/lib/lorica/exported-certs
 systemctl daemon-reload
 systemctl enable lorica.service
 systemctl restart lorica.service 2>/dev/null || systemctl start lorica.service
@@ -83,3 +91,4 @@ systemctl daemon-reload
 %attr(755, root, root) /usr/bin/lorica
 %attr(644, root, root) /usr/lib/systemd/system/lorica.service
 %dir %attr(750, lorica, lorica) /var/lib/lorica
+%dir %attr(750, lorica, lorica) /var/lib/lorica/exported-certs

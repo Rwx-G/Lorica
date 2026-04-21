@@ -23,7 +23,20 @@ PrivateTmp=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
+# The v1.4.1 certificate filesystem export zone lives by default
+# under `/var/lib/lorica/exported-certs`, already covered by the
+# ReadWritePaths below. If the operator points
+# `cert_export_dir` at a different path, add it here too or the
+# exporter will fail with EACCES under `ProtectSystem=strict`.
 ReadWritePaths=/var/lib/lorica
+# CAP_NET_BIND_SERVICE lets the proxy bind privileged ports (80,
+# 443) without running as root. CAP_CHOWN is optional and only
+# needed when the v1.4.1 cert export feature is configured with
+# an owner UID / group GID different from the lorica service
+# user - the writer falls back to `ExportOutcome::PermissionsSkipped`
+# (documented) rather than failing when the capability is absent,
+# but operators who want the `chown` to actually take effect
+# should add CAP_CHOWN to both lines.
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 ProtectKernelTunables=yes

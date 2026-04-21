@@ -5,6 +5,7 @@
   } from '../../lib/api';
   import ConfirmDialog from '../ConfirmDialog.svelte';
   import { showToast } from '../../lib/toast';
+  import { validateUrl } from '../../lib/validators';
 
   let {
     notifications = $bindable([]),
@@ -34,6 +35,28 @@
   // Webhook/Slack fields
   let notifUrl = $state('');
   let notifAuthHeader = $state('');
+  // Blur-time validators so the operator sees the problem before
+  // they click Save. Auth header value = Authorization header raw
+  // value (e.g. `Bearer xyz`, `Basic abc==`). Reject CR / LF / NUL
+  // so a malformed value can not enable response splitting.
+  let notifUrlError = $state<string | null>(null);
+  let notifAuthHeaderError = $state<string | null>(null);
+  function checkNotifUrl() {
+    notifUrlError = validateUrl(notifUrl);
+  }
+  function checkNotifAuthHeader() {
+    const raw = notifAuthHeader;
+    if (raw.trim() === '') { notifAuthHeaderError = null; return; }
+    if (/[\r\n\0]/.test(raw)) {
+      notifAuthHeaderError = 'must not contain CR, LF, or NUL';
+      return;
+    }
+    if (raw.length > 4096) {
+      notifAuthHeaderError = 'must be <= 4096 characters';
+      return;
+    }
+    notifAuthHeaderError = null;
+  }
   // Alert type checkboxes
   let notifAlertBackendDown = $state(false);
   let notifAlertCertExpiring = $state(false);
@@ -283,12 +306,14 @@
       {:else}
         <div class="settings-form-row">
           <label for="notif-url">URL <span class="settings-required">*</span></label>
-          <input id="notif-url" type="url" bind:value={notifUrl} placeholder={notifChannel === 'slack' ? 'https://hooks.slack.com/services/T.../B.../xxx' : 'https://example.com/webhook'} required />
+          <input id="notif-url" type="url" bind:value={notifUrl} placeholder={notifChannel === 'slack' ? 'https://hooks.slack.com/services/T.../B.../xxx' : 'https://example.com/webhook'} required onblur={checkNotifUrl} oninput={checkNotifUrl} />
+          {#if notifUrlError}<span class="field-error" role="alert">{notifUrlError}</span>{/if}
         </div>
         {#if notifChannel === 'webhook'}
           <div class="settings-form-row">
             <label for="notif-auth">Authorization Header</label>
-            <input id="notif-auth" type="text" bind:value={notifAuthHeader} placeholder="Bearer your-token" />
+            <input id="notif-auth" type="text" bind:value={notifAuthHeader} placeholder="Bearer your-token" onblur={checkNotifAuthHeader} oninput={checkNotifAuthHeader} />
+            {#if notifAuthHeaderError}<span class="field-error" role="alert">{notifAuthHeaderError}</span>{/if}
             <span class="settings-form-hint">Optional - sent as Authorization header</span>
           </div>
         {/if}
@@ -332,4 +357,8 @@
     oncancel={() => deletingNotif = null}
   />
 {/if}
+
+<style>
+  .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
+</style>
 

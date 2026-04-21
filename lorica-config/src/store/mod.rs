@@ -26,6 +26,7 @@ use crate::error::{ConfigError, Result};
 
 mod backends;
 pub mod bot_stash;
+mod cert_export_acls;
 mod certs;
 mod dns_providers;
 mod loadtest;
@@ -628,6 +629,34 @@ impl ConfigStore {
             );
              CREATE INDEX IF NOT EXISTS idx_bot_pending_expires_at
                 ON bot_pending_challenges(expires_at);",
+        );
+
+        // V37: per-route group_name (v1.4.1 dashboard UX). Free-form
+        // classification label mirroring `Backend.group_name` so
+        // operators can filter / group routes in the dashboard
+        // (prod / staging / homelab / legacy, etc.). Pure metadata -
+        // never read on the proxy hot path, never exposed as a
+        // Prometheus label (bounded-cardinality concern). Empty
+        // string = ungrouped.
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN group_name TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+
+        // V38: per-pattern ACL for the certificate export zone
+        // (v1.4.1). One row = one rule. Exporter walks ACLs in
+        // longest-pattern-first order and applies the first match's
+        // uid / gid instead of the global default. `allowed_uid` and
+        // `allowed_gid` are NULLable so an ACL can override only the
+        // group without touching the owner, or vice versa.
+        let _ = self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cert_export_acls (
+                id TEXT PRIMARY KEY,
+                hostname_pattern TEXT NOT NULL,
+                allowed_uid INTEGER,
+                allowed_gid INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
         );
 
         Ok(())

@@ -11,15 +11,22 @@ use crate::server::AppState;
 /// Forward-auth subrequest configuration (address, timeout, propagated headers, verdict cache TTL).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ForwardAuthConfigRequest {
+    /// Absolute URL of the auth service endpoint.
     pub address: String,
+    /// Per-subrequest timeout (ms).
     #[serde(default = "default_forward_auth_timeout_ms")]
     pub timeout_ms: u32,
+    /// Header names to copy from the auth response into the upstream
+    /// request.
     #[serde(default)]
     pub response_headers: Vec<String>,
+    /// Cache `Allow` verdicts for this many milliseconds. Hard-capped
+    /// at 60 000. `0` = disabled.
     #[serde(default)]
     pub verdict_cache_ttl_ms: u32,
 }
 
+/// Default forward-auth timeout (5 s).
 pub(super) fn default_forward_auth_timeout_ms() -> u32 {
     5_000
 }
@@ -125,7 +132,9 @@ pub(super) fn build_forward_auth(
 /// JSON body for `POST /api/v1/validate/forward-auth`.
 #[derive(Deserialize)]
 pub struct ValidateForwardAuthRequest {
+    /// URL of the auth service to probe.
     pub address: String,
+    /// Probe timeout (ms).
     #[serde(default = "default_forward_auth_timeout_ms")]
     pub timeout_ms: u32,
 }

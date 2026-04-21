@@ -1,6 +1,6 @@
 [package]
 name = "lorica"
-version = "1.4.0"
+version = "1.5.0"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -32,22 +32,29 @@ lorica-http = { version = "0.1.0", path = "../lorica-http" }
 lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }
 lorica-lb = { version = "0.1.0", path = "../lorica-lb", optional = true, default-features = false }
 lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, default-features = false }
-lorica-config = { version = "1.4.0", path = "../lorica-config" }
-lorica-api = { version = "1.4.0", path = "../lorica-api" }
+lorica-config = { version = "1.5.0", path = "../lorica-config" }
+lorica-api = { version = "1.5.0", path = "../lorica-api" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
-lorica-worker = { version = "1.4.0", path = "../lorica-worker" }
-lorica-command = { version = "1.4.0", path = "../lorica-command" }
-lorica-shmem = { version = "1.4.0", path = "../lorica-shmem" }
+lorica-worker = { version = "1.5.0", path = "../lorica-worker" }
+lorica-command = { version = "1.5.0", path = "../lorica-command" }
+lorica-shmem = { version = "1.5.0", path = "../lorica-shmem" }
 lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
 lorica-notify = { version = "0.1.0", path = "../lorica-notify" }
 lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-geoip = { version = "1.4.0", path = "../lorica-geoip" }
-lorica-challenge = { version = "1.4.0", path = "../lorica-challenge" }
+lorica-geoip = { version = "1.5.0", path = "../lorica-geoip" }
+lorica-challenge = { version = "1.5.0", path = "../lorica-challenge" }
 once_cell = { workspace = true }
-lorica-bench = { version = "1.4.0", path = "../lorica-bench" }
+lorica-bench = { version = "1.5.0", path = "../lorica-bench" }
 regex = "1"
+# HTML sanitization for operator-supplied error_page_html (v1.5.0
+# audit finding HIGH-1). Whitelist-based parser replaces the
+# previous 3-pass regex - those are historically contournables
+# via `<svg onload>`, HTML malformé, encoded bypasses. ammonia
+# parses through html5ever, so the attack surface collapses onto
+# what the Servo team already hardens.
+ammonia = "4"
 sha2 = "0.10"
 bytes = "1"
 # Async DNS resolver for the bot-protection rDNS bypass
@@ -59,11 +66,16 @@ hickory-resolver = { version = "0.24", default-features = false, features = ["to
 lru = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "cookies", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rustls-pemfile = "2"
+# PEM parsing via the official rustls pki-types crate. Replaces
+# rustls-pemfile (v1.5.0 audit HIGH-2: RUSTSEC-2025-0134, unmaintained).
+# pki-types is maintained by the rustls team and its `pem_slice_iter`
+# API is a 1:1 replacement for the old iterator. Advisory remains
+# transitive via the forked lorica-tls crate; tracked upstream.
+rustls-pki-types = { version = "1", features = ["alloc"] }
 futures-util = "0.3"
 arc-swap = "1"
 dashmap = "6"
-rand = "0.8"
+rand = "0.9"
 parking_lot = "0.12"
 argon2 = "0.5"
 base64 = "0.22"
@@ -87,6 +99,12 @@ tracing-opentelemetry = { version = "0.32", optional = true, default-features = 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+# Serial-test barrier for the global VERDICT_CACHE state in
+# `lorica::bot` (v1.5.0 backlog #16). The three tests that mutate
+# the process-wide `DashMap` + `Mutex<VecDeque>` carry
+# `#[serial(verdict_cache)]` so cargo test's parallel scheduler
+# does not interleave them and produce a FIFO-ordering flake.
+serial_test = "3"
 async-trait = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }

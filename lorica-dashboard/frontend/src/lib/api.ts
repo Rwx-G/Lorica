@@ -168,6 +168,9 @@ export interface RouteResponse {
   rate_limit?: RateLimitConfig | null;
   geoip?: GeoIpConfig | null;
   bot_protection?: BotProtectionConfig | null;
+  /// Free-form classification label (prod / staging / homelab / ...).
+  /// Empty string = ungrouped. Mirrors `Backend.group_name`.
+  group_name?: string;
   created_at: string;
   updated_at: string;
 }
@@ -364,6 +367,7 @@ export interface CreateRouteRequest {
   rate_limit?: RateLimitConfig;
   geoip?: GeoIpConfig;
   bot_protection?: BotProtectionConfig;
+  group_name?: string;
 }
 
 
@@ -436,6 +440,11 @@ export interface UpdateRouteRequest {
   /// `bot_protection` leaves the stored value alone - the
   /// "missing = no-op" contract preserved for every other field.
   bot_protection_disable?: boolean;
+  /// Free-form operator classification (prod / staging / homelab / ...).
+  /// Empty string clears the grouping. `undefined` leaves the field
+  /// unchanged (follows the same missing-= no-op rule as every other
+  /// UpdateRouteRequest field).
+  group_name?: string;
 }
 
 export interface BackendResponse {
@@ -534,7 +543,9 @@ export interface LogsQuery {
 }
 
 export interface DiskUsage {
-  mount_point: string;
+  /// Short role label for the mount: `"root"` or `"data"`. The
+  /// absolute path is intentionally not exposed (v1.5.0 hardening).
+  mount_label: string;
   total_bytes: number;
   used_bytes: number;
   usage_percent: number;
@@ -606,6 +617,13 @@ export interface GlobalSettingsResponse {
   geoip_auto_update_enabled?: boolean;
   asn_db_path?: string | null;
   asn_auto_update_enabled?: boolean;
+  // Filesystem certificate export (v1.4.1).
+  cert_export_enabled?: boolean;
+  cert_export_dir?: string | null;
+  cert_export_owner_uid?: number | null;
+  cert_export_group_gid?: number | null;
+  cert_export_file_mode?: number;
+  cert_export_dir_mode?: number;
 }
 
 export interface UpdateSettingsRequest {
@@ -635,6 +653,43 @@ export interface UpdateSettingsRequest {
   geoip_auto_update_enabled?: boolean;
   asn_db_path?: string | null;
   asn_auto_update_enabled?: boolean;
+  cert_export_enabled?: boolean;
+  cert_export_dir?: string | null;
+  cert_export_owner_uid?: number | null;
+  cert_export_group_gid?: number | null;
+  cert_export_file_mode?: number;
+  cert_export_dir_mode?: number;
+}
+
+export interface CertExportAclResponse {
+  id: string;
+  hostname_pattern: string;
+  allowed_uid?: number | null;
+  allowed_gid?: number | null;
+  created_at: string;
+}
+
+export interface CreateCertExportAclRequest {
+  hostname_pattern: string;
+  allowed_uid?: number | null;
+  allowed_gid?: number | null;
+}
+
+export interface CertExportReapplyResponse {
+  enabled: boolean;
+  exported: number;
+  failed: number;
+}
+
+export interface CertExportOrphan {
+  name: string;
+  modified_at: string;
+  size_bytes: number;
+}
+
+export interface CertExportOrphansResponse {
+  enabled: boolean;
+  orphans: CertExportOrphan[];
 }
 
 /// Result of the "Test connection" probe on the OTel settings
@@ -791,6 +846,47 @@ export const api = {
   renewCertificate: (id: string) =>
     request<{ renewed: boolean; old_cert_id: string; new_cert_id: string; domain: string }>('POST', `/certificates/${id}/renew`),
 
+  /**
+   * Trigger a browser download of the PEM payload for one certificate.
+   * Bypasses the `request()` wrapper (which expects a JSON envelope) and
+   * talks directly to the endpoint via fetch + Blob so the browser's
+   * native download flow picks up the `Content-Disposition` filename.
+   * `part` selects `cert` / `key` / `chain` / `bundle` (default).
+   * Returns `{ ok }` on success, or `{ ok: false, message }` on error;
+   * callers surface a toast and never auto-retry (rate-limit is 5 per
+   * 60 s).
+   */
+  downloadCertificate: async (id: string, part: 'cert' | 'key' | 'chain' | 'bundle' = 'bundle'): Promise<{ ok: true } | { ok: false; message: string }> => {
+    const qs = new URLSearchParams({ part }).toString();
+    const res = await fetch(`/api/v1/certificates/${id}/download?${qs}`, {
+      method: 'GET',
+      credentials: 'same-origin',
+    });
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`;
+      try {
+        const j = await res.json();
+        if (j?.error?.message) message = j.error.message;
+      } catch { /* ignore */ }
+      return { ok: false, message };
+    }
+    const blob = await res.blob();
+    // Prefer the server-supplied filename from Content-Disposition; fall
+    // back to `{id}-{part}.pem` if the header is missing or malformed.
+    const cd = res.headers.get('Content-Disposition') ?? '';
+    const match = /filename="([^"]+)"/.exec(cd);
+    const filename = match?.[1] ?? `${id}-${part}.pem`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    return { ok: true };
+  },
+
   generateSelfSigned: (body: GenerateSelfSignedRequest) =>
     request<CertificateResponse>('POST', '/certificates/self-signed', body),
 
@@ -865,6 +961,28 @@ export const api = {
 
   testDnsProvider: (id: string) =>
     request<{ message: string; provider_type: string }>('POST', `/dns-providers/${id}/test`),
+
+  // Cert export ACLs (v1.4.1)
+  listCertExportAcls: () =>
+    request<{ acls: CertExportAclResponse[] }>('GET', '/cert-export/acls'),
+
+  createCertExportAcl: (body: CreateCertExportAclRequest) =>
+    request<CertExportAclResponse>('POST', '/cert-export/acls', body),
+
+  deleteCertExportAcl: (id: string) =>
+    request<{ deleted: string }>('DELETE', `/cert-export/acls/${id}`),
+
+  reapplyCertExport: () =>
+    request<CertExportReapplyResponse>('POST', '/cert-export/reapply', {}),
+
+  listCertExportOrphans: () =>
+    request<CertExportOrphansResponse>('GET', '/cert-export/orphans'),
+
+  deleteCertExportOrphan: (name: string) =>
+    request<{ name: string; removed: boolean }>(
+      'DELETE',
+      `/cert-export/orphans/${encodeURIComponent(name)}`,
+    ),
 
   // Preferences
   listPreferences: () =>

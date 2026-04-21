@@ -18,14 +18,23 @@ const EXPORT_FORMAT_VERSION: u32 = 1;
 /// serialization and re-import is rejected if the placeholder remains.
 #[derive(Debug, Serialize)]
 pub struct ExportData {
+    /// Export schema version (matches `EXPORT_FORMAT_VERSION`).
     pub version: u32,
+    /// Current `GlobalSettings` snapshot.
     pub global_settings: GlobalSettings,
+    /// All rows of the `routes` table.
     pub routes: Vec<Route>,
+    /// All rows of the `backends` table.
     pub backends: Vec<Backend>,
+    /// All rows of the `route_backends` join table.
     pub route_backends: Vec<RouteBackend>,
+    /// All rows of the `certificates` table (private keys redacted).
     pub certificates: Vec<Certificate>,
+    /// All rows of `notification_configs` (SMTP passwords redacted).
     pub notification_configs: Vec<NotificationConfig>,
+    /// All rows of `user_preferences`.
     pub user_preferences: Vec<UserPreference>,
+    /// All rows of `admin_users` (password hashes redacted).
     pub admin_users: Vec<AdminUser>,
 }
 
