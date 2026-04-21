@@ -393,6 +393,22 @@ fn validate_group_name(raw: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_string())
 }
 
+/// Validate a canonical-host redirect target.
+///
+/// `redirect_hostname` is specifically for the "redirect every request
+/// on this route to the same path on a different hostname" pattern
+/// (aka canonical-host redirect). It intentionally accepts ONLY a
+/// bare DNS hostname (no scheme, path, query, port, userinfo) because
+/// the proxy emits `{scheme}://{redirect_hostname}{path}{?query}` at
+/// runtime and anything else produces malformed Location headers.
+///
+/// Ports are **deliberately** rejected here. Operators that need a
+/// redirect to a non-standard port (e.g. migrating from port 443 to
+/// 8443 on a new host) should use `redirect_to` with a full URL
+/// (`https://new.example.com:8443`) instead ; `redirect_to` supports
+/// ports, userinfo, and explicit schemes. Splitting the two fields
+/// keeps the common case (canonical-host) typo-proof without forcing
+/// a full URL parser on every write path.
 fn validate_redirect_hostname(raw: &str) -> Result<String, ApiError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -412,10 +428,15 @@ fn validate_redirect_hostname(raw: &str) -> Result<String, ApiError> {
                 .into(),
         ));
     }
+    // `:` rejection = no port in this field. See the module comment
+    // above: redirects to a non-standard port go through `redirect_to`
+    // with a full URL, which takes the whole authority shape.
     if trimmed.contains(|c: char| c.is_whitespace() || matches!(c, '?' | '#' | ':' | '@')) {
         return Err(ApiError::BadRequest(
             "redirect_hostname contains a character that is not valid in a \
-             hostname (whitespace, `?`, `#`, `:`, `@`)"
+             hostname (whitespace, `?`, `#`, `:`, `@`). If you need to \
+             redirect to a non-standard port, use `redirect_to` with a \
+             full URL like `https://target.example.com:8443` instead."
                 .into(),
         ));
     }

@@ -261,12 +261,7 @@ impl SessionStore {
             sessions.retain(|_sid, session| session.user_id != user_id);
         }
         let store = self.db.lock().await;
-        // Delete-all is implemented on top of the existing
-        // delete-all-except helper with a sentinel that can
-        // never match an issued session id (a session id is a
-        // UUID v4; the literal `__rotate_all__` does not match
-        // that shape).
-        let _ = store.delete_sessions_for_user_except(user_id, "__rotate_all__");
+        let _ = store.delete_all_sessions_for_user(user_id);
     }
 
     /// Remove all expired sessions from memory and database.
