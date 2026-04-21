@@ -580,6 +580,21 @@ impl LogStore {
         Ok(())
     }
 
+    /// Count the total number of persisted notification history
+    /// rows. Cheap `SELECT COUNT(*)` so the API can surface an
+    /// accurate total without paying for the full list payload
+    /// (symmetry with `waf_event_stats` — avoids the same
+    /// load-and-count plateau the WAF stats endpoint hit).
+    pub fn notification_history_count(&self) -> Result<u64, String> {
+        let conn = self.conn.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notification_history", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| format!("failed to count notification history: {e}"))?;
+        Ok(count as u64)
+    }
+
     /// List recent notification events, newest first.
     /// Return up to `limit` recent notification history rows.
     pub fn list_notification_history(
@@ -747,5 +762,53 @@ mod waf_stats_tests {
         let (total, by_cat) = store.waf_event_stats().expect("stats");
         assert_eq!(total, 0);
         assert!(by_cat.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod notification_history_tests {
+    use super::*;
+
+    fn tmp_store() -> (LogStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LogStore::open(dir.path()).expect("open store");
+        (store, dir)
+    }
+
+    fn mk_event(i: u32) -> lorica_notify::AlertEvent {
+        lorica_notify::AlertEvent {
+            alert_type: lorica_notify::events::AlertType::ConfigChanged,
+            summary: format!("event {i}"),
+            details: std::collections::HashMap::new(),
+            timestamp: "2026-04-21T12:00:00Z".into(),
+        }
+    }
+
+    /// Regression pin for the v1.5.1 fix : the notification
+    /// history endpoint previously returned `events.len()` as
+    /// the total, which would plateau at the `list_` page size
+    /// once the history table grew past it. `notification_history_count`
+    /// uses `SELECT COUNT(*)` so the total tracks the real row
+    /// count regardless of the page size.
+    #[test]
+    fn notification_history_count_is_not_capped_at_the_page_size() {
+        let (store, _dir) = tmp_store();
+        let n = 250u32; // > the 200 page size used by the API handler.
+        for i in 0..n {
+            store
+                .insert_notification_event(&mk_event(i))
+                .expect("insert");
+        }
+        let count = store.notification_history_count().expect("count");
+        assert_eq!(count, n as u64);
+        // Listing is still capped to the page size.
+        let events = store.list_notification_history(200).expect("list");
+        assert_eq!(events.len(), 200);
+    }
+
+    #[test]
+    fn notification_history_count_on_empty_table() {
+        let (store, _dir) = tmp_store();
+        assert_eq!(store.notification_history_count().expect("count"), 0);
     }
 }
