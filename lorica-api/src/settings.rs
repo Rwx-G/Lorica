@@ -17,12 +17,29 @@ use crate::server::AppState;
 /// scrub was already in place ; it was not. A leaked hex secret is
 /// equivalent to a forgeable bot-protection cookie for every IP
 /// across every route until the next certificate renewal rotates it.
+///
+/// Three-state output (H-1 followup) so a consumer can tell apart
+/// "secret never initialised" from "secret in place but masked" :
+///
+/// - `""` (empty string) - secret has not been generated yet
+///   (fresh boot, or import of a historical export with the field
+///   already empty). The next reload will populate it.
+/// - `"**REDACTED**"` (the same sentinel the TOML exporter uses)
+///   - secret is set in the store but withheld from the response.
+///
+/// The actual hex value is never returned by this endpoint and
+/// `UpdateSettingsRequest` does not expose a write path either,
+/// so the secret stays inside the store + cookie-signing code.
 pub async fn get_settings(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     let mut settings = store.get_global_settings()?;
-    settings.bot_hmac_secret_hex = String::new();
+    settings.bot_hmac_secret_hex = if settings.bot_hmac_secret_hex.is_empty() {
+        String::new()
+    } else {
+        "**REDACTED**".to_string()
+    };
     Ok(json_data(settings))
 }
 
