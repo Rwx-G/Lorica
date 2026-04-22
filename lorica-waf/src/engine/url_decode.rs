@@ -15,24 +15,79 @@
 //! Recursive URL decoding helpers used by the WAF to defeat
 //! double- or triple-encoded bypass attempts.
 //!
-//! Exposed as associated functions on [`super::WafEngine`] so the
-//! public calling convention (`WafEngine::url_decode(...)`) is
-//! preserved - tests and downstream crates rely on that path.
+//! Two flavors are exposed :
+//!
+//! - [`WafEngine::url_decode_uri`] - generic URI percent-decoding.
+//!   `+` is preserved literally. Used for fields where `+` carries
+//!   no special meaning per RFC 3986 (the URI request-target path,
+//!   header values).
+//! - [`WafEngine::url_decode_form`] - `application/x-www-form-urlencoded`
+//!   decoding. `+` is rewritten to a literal space. Used for the
+//!   query string and request bodies.
+//!
+//! [`WafEngine::url_decode`] is kept as an alias to [`Self::url_decode_form`]
+//! for backward compatibility with the legacy tests and downstream
+//! callers that rely on the original calling convention. The legacy
+//! behaviour was form-style on every field, which inflated the
+//! false-positive surface on paths and headers (a header value
+//! `attacker+payload` decoded to `attacker payload` and could trip
+//! space-anchored signatures like ` or 1=`).
+//!
+//! v1.5.1 audit H-4 hardening :
+//!
+//! - Decoding works on raw bytes (`Vec<u8>`) rather than `char`s, so
+//!   multi-byte UTF-8 escapes like `%C3%A9` (`é`) reassemble into
+//!   the original codepoint instead of mojibaking into two
+//!   `U+00C3 U+00A9` codepoints. SQLi / XSS regexes that look for
+//!   specific UTF-8 byte sequences now see them post-decode.
+//! - Overlong UTF-8 forms (`%C0%80` for NUL, `%C0%BC` for `<`) are
+//!   rejected by `String::from_utf8_lossy` and surface as the
+//!   Unicode replacement character `U+FFFD` instead of leaking the
+//!   underlying ASCII codepoint to downstream regexes - closes the
+//!   classic CRS overlong-bypass evasion path.
 
 use super::WafEngine;
 
 impl WafEngine {
-    /// Recursive URL decoding for encoded attack payloads.
+    /// URI percent-decoding suitable for fields where `+` is a
+    /// literal character (paths, header values).
     ///
-    /// Decodes until stable or max 3 iterations to prevent double-encoding bypass.
+    /// Decodes recursively (up to 3 passes, until stable) so that
+    /// double / triple-encoded payloads (`%252e%252e` -> `%2e%2e`
+    /// -> `..`) are caught.
+    pub(super) fn url_decode_uri(input: &str) -> String {
+        Self::url_decode_recursive(input, false)
+    }
+
+    /// Form-style percent-decoding (`application/x-www-form-urlencoded`)
+    /// suitable for query strings and form-encoded request bodies.
+    ///
+    /// Identical to [`Self::url_decode_uri`] except that `+` is
+    /// rewritten to a literal space.
+    pub(super) fn url_decode_form(input: &str) -> String {
+        Self::url_decode_recursive(input, true)
+    }
+
+    /// Backward-compatibility alias for [`Self::url_decode_form`].
+    ///
+    /// Existing tests and call sites that did not yet migrate to
+    /// the explicit `*_uri` / `*_form` variants keep working
+    /// because the legacy single function always treated `+` as
+    /// space (form behaviour).
     pub(super) fn url_decode(input: &str) -> String {
-        // Fast path: no percent-encoding or plus signs -> skip decode entirely
-        if !input.contains('%') && !input.contains('+') {
+        Self::url_decode_form(input)
+    }
+
+    fn url_decode_recursive(input: &str, plus_to_space: bool) -> String {
+        // Fast path: no percent-encoding and (when applicable) no
+        // `+` to rewrite -> nothing to decode.
+        let needs_plus = plus_to_space && input.contains('+');
+        if !input.contains('%') && !needs_plus {
             return input.to_string();
         }
         let mut current = input.to_string();
         for _ in 0..3 {
-            let decoded = Self::url_decode_once(&current);
+            let decoded = Self::url_decode_once(&current, plus_to_space);
             if decoded == current {
                 break;
             }
@@ -41,28 +96,52 @@ impl WafEngine {
         current
     }
 
-    /// Single-pass URL decoding helper.
-    fn url_decode_once(input: &str) -> String {
-        let mut result = String::with_capacity(input.len());
-        let mut chars = input.chars();
-
-        while let Some(c) = chars.next() {
-            if c == '%' {
-                let hex: String = chars.by_ref().take(2).collect();
-                if hex.len() == 2 {
-                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                        result.push(byte as char);
-                        continue;
-                    }
+    /// Single-pass byte-level percent decode, with optional
+    /// form-style `+` -> space substitution.
+    ///
+    /// Operates on bytes (not chars) so that multi-byte UTF-8
+    /// percent escapes reassemble correctly. The output is rebuilt
+    /// from the raw byte buffer via [`String::from_utf8_lossy`] :
+    /// invalid UTF-8 sequences (e.g. overlong forms) become
+    /// `U+FFFD` rather than leaking through to downstream regexes
+    /// as their ASCII alias.
+    fn url_decode_once(input: &str, plus_to_space: bool) -> String {
+        let bytes = input.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'%' && i + 2 < bytes.len() {
+                if let (Some(d1), Some(d2)) =
+                    (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
+                {
+                    out.push((d1 << 4) | d2);
+                    i += 3;
+                    continue;
                 }
-                result.push('%');
-                result.push_str(&hex);
-            } else if c == '+' {
-                result.push(' ');
+                // Invalid escape (e.g. `%G1`, `%X` at end of input)
+                // - keep the literal `%` and let the caller see the
+                // raw garbage rather than silently dropping bytes.
+                out.push(b);
+                i += 1;
+            } else if b == b'+' && plus_to_space {
+                out.push(b' ');
+                i += 1;
             } else {
-                result.push(c);
+                out.push(b);
+                i += 1;
             }
         }
-        result
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+/// ASCII hex digit -> nibble. Returns `None` for non-hex bytes.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }

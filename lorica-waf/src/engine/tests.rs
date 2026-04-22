@@ -292,6 +292,103 @@ fn test_url_decode_stable_input() {
     assert_eq!(WafEngine::url_decode("hello world"), "hello world");
 }
 
+// --- v1.5.1 audit H-4 : UTF-8 + URI / form variants ---
+
+#[test]
+fn test_url_decode_form_multibyte_utf8_roundtrips() {
+    // %C3%A9 is UTF-8 for `é` (U+00E9). Pre-fix, the byte-as-char
+    // cast decoded this to two codepoints `U+00C3 U+00A9`. The
+    // byte-level decode + from_utf8_lossy reassembly now restores
+    // the original codepoint so a regex anchored on `é` actually
+    // matches.
+    assert_eq!(WafEngine::url_decode_form("%C3%A9"), "\u{00E9}");
+    assert_eq!(WafEngine::url_decode_form("%E2%9C%93"), "\u{2713}"); // ✓
+    assert_eq!(WafEngine::url_decode_form("%E2%80%A8"), "\u{2028}"); // LINE SEPARATOR
+}
+
+#[test]
+fn test_url_decode_form_preserves_null_byte() {
+    // A real %00 must survive decoding so signatures looking for
+    // a NUL byte (e.g. truncation attacks) still fire.
+    let decoded = WafEngine::url_decode_form("admin%00.png");
+    assert!(decoded.contains('\0'));
+    assert_eq!(decoded, "admin\0.png");
+}
+
+#[test]
+fn test_url_decode_form_overlong_utf8_neutralised() {
+    // %C0%80 is an overlong UTF-8 encoding of NUL (U+0000) - a
+    // classic CRS bypass shape that pre-fix decoded byte-by-byte
+    // into the codepoints `U+00C0 U+0080` (one of which then
+    // ASCII-aliased back to NUL through the regex). The
+    // from_utf8_lossy pass now rejects the overlong sequence and
+    // surfaces U+FFFD instead, so an attacker cannot smuggle a
+    // NUL past `\0`-anchored signatures via overlong encoding.
+    let decoded = WafEngine::url_decode_form("%C0%80");
+    assert!(!decoded.contains('\0'), "overlong NUL must not decode to a real NUL");
+    assert!(decoded.contains('\u{FFFD}'), "overlong NUL must surface as REPLACEMENT CHARACTER");
+
+    // Same for `%C0%BC` (overlong `<`) - must NOT decode to `<`.
+    let decoded = WafEngine::url_decode_form("%C0%BC");
+    assert!(!decoded.contains('<'), "overlong `<` must not decode to a real `<`");
+}
+
+#[test]
+fn test_url_decode_form_invalid_escape_left_literal() {
+    // Malformed %XX (non-hex digits, missing trailing chars) is
+    // kept literally rather than silently dropped.
+    assert_eq!(WafEngine::url_decode_form("%G1"), "%G1");
+    assert_eq!(WafEngine::url_decode_form("%2"), "%2");
+    assert_eq!(WafEngine::url_decode_form("trailing%"), "trailing%");
+}
+
+#[test]
+fn test_url_decode_uri_keeps_plus_literal() {
+    // RFC 3986 says `+` in a URI path / header value is literal.
+    // Form-style decoding (treating `+` as space) is wrong for
+    // these fields - it inflates the false-positive surface
+    // (e.g. a header value `attacker+payload` would decode to
+    // `attacker payload` and trip space-anchored signatures).
+    assert_eq!(WafEngine::url_decode_uri("hello+world"), "hello+world");
+    assert_eq!(WafEngine::url_decode_uri("a+b+c"), "a+b+c");
+    assert_eq!(WafEngine::url_decode_uri("%2B"), "+"); // %2B IS the literal `+`, decoded as such
+}
+
+#[test]
+fn test_url_decode_form_keeps_plus_to_space_semantics() {
+    // Form-encoded fields (query string, x-www-form-urlencoded
+    // body) treat `+` as space - keep that behaviour.
+    assert_eq!(WafEngine::url_decode_form("hello+world"), "hello world");
+    assert_eq!(WafEngine::url_decode_form("a+b+c"), "a b c");
+}
+
+#[test]
+fn test_url_decode_uri_decodes_percent_escapes() {
+    // URI variant must still do %XX decoding ; only the `+`
+    // semantics differ from the form variant.
+    assert_eq!(WafEngine::url_decode_uri("%3Cscript%3E"), "<script>");
+    assert_eq!(WafEngine::url_decode_uri("%252e%252e"), "..");
+}
+
+#[test]
+fn test_url_decode_uri_multibyte_utf8_roundtrips() {
+    // UTF-8 multi-byte handling is the same as form (only `+`
+    // semantics differ).
+    assert_eq!(WafEngine::url_decode_uri("%C3%A9"), "\u{00E9}");
+    assert_eq!(WafEngine::url_decode_uri("%E2%9C%93"), "\u{2713}");
+}
+
+#[test]
+fn test_url_decode_legacy_alias_is_form() {
+    // The legacy `url_decode` alias keeps form-style behaviour so
+    // existing tests + downstream callers do not break.
+    assert_eq!(
+        WafEngine::url_decode("hello+world"),
+        WafEngine::url_decode_form("hello+world")
+    );
+    assert_eq!(WafEngine::url_decode("hello+world"), "hello world");
+}
+
 // --- Mode behavior ---
 
 #[test]

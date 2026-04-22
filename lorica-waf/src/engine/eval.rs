@@ -54,24 +54,31 @@ impl WafEngine {
         // are preserved for observability.
         let has_custom_rules = !self.custom_rules.read().is_empty();
 
-        // Check path (URL-decode to catch encoded traversal attacks)
-        let decoded_path = Self::url_decode(path);
+        // Check path (URI percent-decoding ; `+` is a literal in
+        // paths per RFC 3986, do not rewrite to space). Decoding
+        // is recursive to defeat double / triple-encoded traversal
+        // attacks.
+        let decoded_path = Self::url_decode_uri(path);
         if has_custom_rules || self.prefilter.matches(&decoded_path) {
             self.scan_field("path", &decoded_path, &now, &mut events);
         }
 
-        // Check query string
+        // Check query string (form-style decoding ; `+` -> space).
         if let Some(q) = query {
-            // URL-decode the query for better detection
-            let decoded = Self::url_decode(q);
+            let decoded = Self::url_decode_form(q);
             if has_custom_rules || self.prefilter.matches(&decoded) {
                 self.scan_field("query", &decoded, &now, &mut events);
             }
         }
 
-        // Check relevant headers
+        // Check relevant headers (URI percent-decoding ; `+` is a
+        // literal in header values - rewriting it to space inflated
+        // the false-positive surface on the previous form-style
+        // decode, e.g. a header value `attacker+payload` decoded
+        // to `attacker payload` and tripped space-anchored rules
+        // like ` or 1=`).
         for (name, value) in headers {
-            let decoded = Self::url_decode(value);
+            let decoded = Self::url_decode_uri(value);
             if has_custom_rules || self.prefilter.matches(&decoded) {
                 self.scan_field(&format!("header:{name}"), &decoded, &now, &mut events);
             }
@@ -100,7 +107,7 @@ impl WafEngine {
                     {
                         continue;
                     }
-                    let decoded = Self::url_decode(value);
+                    let decoded = Self::url_decode_uri(value);
                     if let Some(m) = scoped.pattern.find(&decoded) {
                         events.push(WafEvent {
                             rule_id: scoped.id,
@@ -202,10 +209,15 @@ impl WafEngine {
         let mut events = Vec::new();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // URL-decode the body to catch encoded payloads. PERF-9:
-        // skip the regex pass entirely when neither the prefilter
-        // nor any custom user rule applies.
-        let decoded = Self::url_decode(text);
+        // URL-decode the body to catch encoded payloads. Form-style
+        // (`+` -> space) is the safe default for request bodies :
+        // `application/x-www-form-urlencoded` is the most common
+        // shape on the routes WAF is enabled for, and the rewrite
+        // is harmless for JSON / XML / multipart bodies (regex
+        // patterns rarely anchor on a literal `+`). PERF-9 : skip
+        // the regex pass entirely when neither the prefilter nor
+        // any custom user rule applies.
+        let decoded = Self::url_decode_form(text);
         let has_custom_rules = !self.custom_rules.read().is_empty();
         if has_custom_rules || self.prefilter.matches(&decoded) {
             self.scan_field("body", &decoded, &now, &mut events);
