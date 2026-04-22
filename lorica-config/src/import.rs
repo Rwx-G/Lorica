@@ -119,6 +119,19 @@ fn validate(data: &ImportData) -> Result<()> {
         }
     }
 
+    // Reject redacted bot-protection HMAC secret (v1.5.1 audit H-1).
+    // Forces the operator to either provide the real hex secret or
+    // clear the field (which triggers regeneration on next reload),
+    // so an old export cannot silently rotate a live secret on
+    // re-import.
+    if data.global_settings.bot_hmac_secret_hex == "**REDACTED**" {
+        return Err(ConfigError::Validation(
+            "global_settings.bot_hmac_secret_hex is redacted (from export); \
+             set the real hex secret or clear the field (it regenerates on next reload)"
+                .into(),
+        ));
+    }
+
     // Validate certificate references in routes
     for route in &data.routes {
         if let Some(cert_id) = &route.certificate_id {

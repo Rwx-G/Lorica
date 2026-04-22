@@ -1618,6 +1618,82 @@ cert_critical_days = 3
     }
 
     #[test]
+    fn test_export_redacts_bot_hmac_secret_hex() {
+        // v1.5.1 audit H-1 : `bot_hmac_secret_hex` must be replaced
+        // with the REDACTED placeholder on TOML export so a config
+        // file shipped to CI / git / S3 does not leak a forgeable
+        // bot-protection cookie key. An empty / never-initialised
+        // secret is exported as-is (nothing to leak).
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let secret_hex = "a".repeat(64);
+        let mut s = store.get_global_settings().expect("test setup");
+        s.bot_hmac_secret_hex = secret_hex.clone();
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+
+        assert!(
+            toml_str.contains("bot_hmac_secret_hex = \"**REDACTED**\""),
+            "non-empty secret must be replaced with the REDACTED placeholder"
+        );
+        assert!(
+            !toml_str.contains(&secret_hex),
+            "raw hex must not appear anywhere in the export"
+        );
+    }
+
+    #[test]
+    fn test_export_preserves_empty_bot_hmac_secret_hex() {
+        // Empty secret (never-initialised) is exported as-is (no
+        // placeholder, no `REDACTED`) so a fresh store round-trips
+        // cleanly and regenerates the secret on first reload after
+        // import.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        assert!(
+            toml_str.contains("bot_hmac_secret_hex = \"\""),
+            "empty secret stays empty in export"
+        );
+        assert!(
+            !toml_str.contains("bot_hmac_secret_hex = \"**REDACTED**\""),
+            "empty secret must not surface as REDACTED"
+        );
+    }
+
+    #[test]
+    fn test_import_rejects_redacted_bot_hmac_secret_hex() {
+        // v1.5.1 audit H-1 : importing a TOML with the `**REDACTED**`
+        // placeholder must fail loudly so an old export cannot
+        // silently rotate a live HMAC secret and invalidate every
+        // outstanding bot-protection cookie. Operator must either
+        // provide the real hex or clear the field.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut s = store.get_global_settings().expect("test setup");
+        s.bot_hmac_secret_hex = "a".repeat(64);
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        let import_data = parse_toml(&toml_str).expect("test setup: toml parses");
+
+        let target = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let err = import_to_store(&target, &import_data)
+            .expect_err("import must reject the REDACTED placeholder");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bot_hmac_secret_hex"),
+            "error message must name the field, got: {msg}"
+        );
+        assert!(
+            msg.contains("redacted"),
+            "error message must mention the redacted state, got: {msg}"
+        );
+    }
+
+    #[test]
     fn test_export_preserves_all_entity_types() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 

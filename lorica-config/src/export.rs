@@ -78,9 +78,22 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
         })
         .collect();
 
+    // Redact the bot-protection HMAC secret on export (v1.5.1
+    // audit H-1). A non-empty secret in a TOML file shipped to CI
+    // / git / S3 is equivalent to a forgeable bot-protection cookie
+    // for every IP across every route until the next certificate
+    // renewal rotates it. Import rejects the placeholder so a
+    // round-trip cannot accidentally clear a live secret ; an empty
+    // value (never-initialised) is exported as-is and re-generated
+    // on first reload after import.
+    let mut global_settings = store.get_global_settings()?;
+    if !global_settings.bot_hmac_secret_hex.is_empty() {
+        global_settings.bot_hmac_secret_hex = REDACTED.into();
+    }
+
     let data = ExportData {
         version: EXPORT_FORMAT_VERSION,
-        global_settings: store.get_global_settings()?,
+        global_settings,
         routes: store.list_routes()?,
         backends: store.list_backends()?,
         route_backends: store.list_route_backends()?,

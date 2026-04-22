@@ -1564,6 +1564,51 @@ async fn test_update_settings() {
 }
 
 #[tokio::test]
+async fn test_get_settings_scrubs_bot_hmac_secret_hex() {
+    // v1.5.1 audit H-1 : the GET /api/v1/settings handler must
+    // never serialise the bot-protection HMAC secret. Seed a known
+    // 64-hex-char secret, hit the endpoint, and assert the field
+    // comes back as the empty string while every other field is
+    // intact.
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let secret_hex = "a".repeat(64);
+    {
+        let s = state.store.lock().await;
+        let mut cur = s.get_global_settings().expect("test setup");
+        cur.bot_hmac_secret_hex = secret_hex.clone();
+        s.update_global_settings(&cur).expect("test setup");
+    }
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/settings")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(
+        json["data"]["bot_hmac_secret_hex"], "",
+        "secret must be scrubbed to empty string in API response"
+    );
+    assert!(
+        !body.windows(secret_hex.len()).any(|w| w == secret_hex.as_bytes()),
+        "raw hex must not appear anywhere in the response body"
+    );
+    // Sanity : an unrelated field is still present.
+    assert_eq!(json["data"]["management_port"], 9443);
+}
+
+#[tokio::test]
 async fn test_update_settings_invalid_log_level() {
     let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;

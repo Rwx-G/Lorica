@@ -11,11 +11,18 @@ use crate::server::AppState;
 // ---- Global Settings ----
 
 /// GET /api/v1/settings - return the global settings document.
+///
+/// `bot_hmac_secret_hex` is scrubbed before serialisation (v1.5.1
+/// audit H-1). The field's own doc on `GlobalSettings` claims this
+/// scrub was already in place ; it was not. A leaked hex secret is
+/// equivalent to a forgeable bot-protection cookie for every IP
+/// across every route until the next certificate renewal rotates it.
 pub async fn get_settings(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
-    let settings = store.get_global_settings()?;
+    let mut settings = store.get_global_settings()?;
+    settings.bot_hmac_secret_hex = String::new();
     Ok(json_data(settings))
 }
 

@@ -9,6 +9,10 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Security
+
+- v1.5.1 audit H-1 : the bot-protection HMAC secret (`bot_hmac_secret_hex` on `GlobalSettings`) was leaking via `GET /api/v1/settings` (the field's own doc claimed it was scrubbed at the API layer ; it was not) and via TOML config export. A leaked hex secret is equivalent to a forgeable bot-protection cookie for every IP across every route until the next certificate renewal rotates it. `get_settings` now overwrites the field with the empty string before serialising (parity with the field's existing doc) ; `export_to_toml` replaces a non-empty secret with the `**REDACTED**` placeholder (parity with `password_hash` / `key_pem` / `smtp_password`) ; an empty / never-initialised secret exports as-is so a fresh store round-trips cleanly and regenerates on first reload after import ; `import_to_store::validate` rejects the `**REDACTED**` placeholder with a clear error so an old export cannot silently rotate a live secret and invalidate every outstanding bot-protection cookie. 3 new unit tests in `lorica-config::tests` (export-redacts-non-empty, export-preserves-empty, import-rejects-redacted) and 1 new handler test in `lorica-api::tests` (`test_get_settings_scrubs_bot_hmac_secret_hex`) pin the behaviour.
+
 ## [1.5.1] - 2026-04-21
 
 ### Fixed
