@@ -378,6 +378,148 @@ fn test_url_decode_uri_multibyte_utf8_roundtrips() {
     assert_eq!(WafEngine::url_decode_uri("%E2%9C%93"), "\u{2713}");
 }
 
+// --- v1.5.1 audit M-4 : custom rules + prefilter contract ---
+
+#[test]
+fn test_custom_rule_still_fires_with_builtins_loaded() {
+    // Functional regression : a custom rule that matches its
+    // pattern must still produce a `WafEvent`, even though built-in
+    // rules are now scanned through a separate code path.
+    let e = engine();
+    e.add_custom_rule(
+        90001,
+        "internal-marker".to_string(),
+        RuleCategory::ProtocolViolation,
+        r"INTERNAL_MARKER_42",
+        4,
+    )
+    .expect("custom rule must compile");
+
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/api/v1/foo",
+        Some("q=INTERNAL_MARKER_42"),
+        &[("user-agent", "test")],
+        "example.com",
+        "10.0.0.1",
+    );
+    match verdict {
+        WafVerdict::Blocked(events) => {
+            assert!(events.iter().any(|ev| ev.rule_id == 90001));
+        }
+        other => panic!("expected Blocked on custom rule match, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_builtin_still_fires_when_custom_rule_present() {
+    // PERF-9 + M-4 invariant : loading a custom rule must not
+    // break the built-in detection. Add a custom rule that does
+    // NOT match the request, send a SQLi attack, verify the
+    // built-in 942100 (UNION SELECT) still fires.
+    let e = engine();
+    e.add_custom_rule(
+        90002,
+        "irrelevant-marker".to_string(),
+        RuleCategory::ProtocolViolation,
+        r"this_string_will_not_appear_in_traffic",
+        2,
+    )
+    .expect("custom rule must compile");
+
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/search",
+        Some("q=1%20UNION%20SELECT%20*%20FROM%20users"),
+        &[],
+        "example.com",
+        "10.0.0.1",
+    );
+    match verdict {
+        WafVerdict::Blocked(events) => {
+            assert!(
+                events
+                    .iter()
+                    .any(|ev| ev.category == RuleCategory::SqlInjection),
+                "built-in SQLi rule must still fire when a custom rule is loaded"
+            );
+            // And the custom rule did NOT misfire.
+            assert!(
+                events.iter().all(|ev| ev.rule_id != 90002),
+                "custom rule with non-matching pattern must not fire"
+            );
+        }
+        other => panic!("expected Blocked on SQLi, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_clean_request_passes_with_custom_rule_loaded() {
+    // M-4 regression pin : a clean request with a custom rule
+    // loaded must NOT produce events from either the built-in
+    // pass (prefilter does not match -> built-in scan skipped)
+    // or the custom pass (request does not match the custom
+    // pattern). Pre-fix, the presence of any custom rule
+    // disabled the prefilter shortcut and ran every built-in
+    // rule on every field of every request.
+    let e = engine();
+    e.add_custom_rule(
+        90003,
+        "marker".to_string(),
+        RuleCategory::ProtocolViolation,
+        r"WILL_NEVER_APPEAR",
+        2,
+    )
+    .expect("custom rule must compile");
+
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/api/v1/users/42",
+        Some("page=1&limit=20"),
+        &[("user-agent", "Mozilla/5.0"), ("accept", "application/json")],
+        "example.com",
+        "10.0.0.1",
+    );
+    assert_eq!(verdict, WafVerdict::Pass);
+}
+
+#[test]
+fn test_custom_and_builtin_can_both_fire() {
+    // When a request matches BOTH a custom rule and a built-in
+    // rule, both events surface (full-scan semantics preserved).
+    let e = engine();
+    e.add_custom_rule(
+        90004,
+        "marker-on-script".to_string(),
+        RuleCategory::Xss,
+        r"INTERNAL_XSS_TAG",
+        4,
+    )
+    .expect("custom rule must compile");
+
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/search",
+        Some("q=%3Cscript%3Ealert(1)%3C/script%3EINTERNAL_XSS_TAG"),
+        &[],
+        "example.com",
+        "10.0.0.1",
+    );
+    match verdict {
+        WafVerdict::Blocked(events) => {
+            assert!(
+                events.iter().any(|ev| ev.rule_id == 90004),
+                "custom rule must fire"
+            );
+            assert!(
+                events.iter().any(|ev| ev.category == RuleCategory::Xss),
+                "built-in XSS rule must also fire"
+            );
+        }
+        other => panic!("expected Blocked, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_url_decode_legacy_alias_is_form() {
     // The legacy `url_decode` alias keeps form-style behaviour so
