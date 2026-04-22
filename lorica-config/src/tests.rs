@@ -1677,11 +1677,13 @@ cert_critical_days = 3
             .expect("test setup: settings update");
 
         let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
-        let import_data = parse_toml(&toml_str).expect("test setup: toml parses");
 
-        let target = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        let err = import_to_store(&target, &import_data)
-            .expect_err("import must reject the REDACTED placeholder");
+        // `parse_toml` runs `validate()` inline (paired with the
+        // existing `password_hash` / `key_pem` / SMTP-password
+        // rejections), so the REDACTED bot HMAC secret is caught
+        // at parse time - even earlier than `import_to_store`.
+        let err = parse_toml(&toml_str)
+            .expect_err("parse must reject the REDACTED placeholder");
         let msg = err.to_string();
         assert!(
             msg.contains("bot_hmac_secret_hex"),
