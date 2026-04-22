@@ -3168,7 +3168,6 @@ dependencies = [
  "ring",
  "rustls 0.23.37",
  "rustls-native-certs 0.7.3",
- "rustls-pemfile",
  "rustls-pki-types",
  "tokio-rustls 0.26.4",
  "x509-parser",
