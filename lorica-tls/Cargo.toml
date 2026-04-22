@@ -21,8 +21,12 @@ arc-swap = "1"
 ring = "0.17.12"
 rustls = "0.23.12"
 rustls-native-certs = "0.7.1"
-rustls-pemfile = "2"
-rustls-pki-types = "1.7.0"
+# rustls-pemfile dropped in v1.5.2 (audit L-16, RUSTSEC-2025-0134
+# unmaintained). PEM parsing now goes through `rustls-pki-types`'s
+# `PemObject` trait (the rustls team's actively-maintained
+# replacement). Closes the only outstanding RUSTSEC chain in the
+# workspace - the runtime crate had already migrated in v1.5.0.
+rustls-pki-types = { version = "1.7.0", features = ["alloc", "std"] }
 tokio-rustls = "0.26.0"
 # no_debug = "3.1.0" inlined into src/no_debug.rs in v1.3.0
 # (audit SC-L-3). The upstream single-file wrapper was flagged

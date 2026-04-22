@@ -24,7 +24,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -32,7 +31,12 @@ use lorica_error::{Error, ErrorType, OrErr, Result};
 use rustls::crypto::aws_lc_rs::sign::any_supported_type;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls_pemfile::Item;
+// v1.5.1 audit L-16 : `rustls-pemfile` (RUSTSEC-2025-0134,
+// unmaintained) replaced by the `PemObject` trait from
+// `rustls-pki-types`. Iterators yield only the section type they
+// were called on, which collapses the previous "match Item variant"
+// per-call pattern.
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Data needed to load a certificate into the resolver.
@@ -189,20 +193,9 @@ fn build_certified_key(
 }
 
 fn parse_certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(Cursor::new(pem.as_bytes()));
-    let items: Vec<Item> = rustls_pemfile::read_all(&mut reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
         .filter_map(|r| r.ok())
-        .collect();
-
-    let certs: Vec<CertificateDer<'static>> = items
-        .into_iter()
-        .filter_map(|item| {
-            if let Item::X509Certificate(cert) = item {
-                Some(cert)
-            } else {
-                None
-            }
-        })
+        .map(|c| c.into_owned())
         .collect();
 
     if certs.is_empty() {
@@ -213,21 +206,12 @@ fn parse_certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn parse_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(Cursor::new(pem.as_bytes()));
-    let items: Vec<Item> = rustls_pemfile::read_all(&mut reader)
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for item in items {
-        match item {
-            Item::Pkcs1Key(key) => return Ok(PrivateKeyDer::from(key)),
-            Item::Pkcs8Key(key) => return Ok(PrivateKeyDer::from(key)),
-            Item::Sec1Key(key) => return Ok(PrivateKeyDer::from(key)),
-            _ => continue,
-        }
-    }
-
-    Error::e_explain(ErrorType::InvalidCert, "no private key found in PEM")
+    // `PrivateKeyDer::from_pem_slice` returns the first supported
+    // key block (PKCS1 / PKCS8 / SEC1) and is `Err` when none is
+    // present or the PEM is malformed - matches the previous
+    // "iterate Items, return first key, fail otherwise" semantics.
+    PrivateKeyDer::from_pem_slice(pem.as_bytes())
+        .or_err(ErrorType::InvalidCert, "no private key found in PEM")
 }
 
 #[cfg(test)]
