@@ -3946,7 +3946,7 @@ impl ProxyHttp for LoricaProxy {
             let cap_meta = ctx
                 .route_snapshot
                 .as_ref()
-                .map(|r| (r.waf_enabled, r.waf_mode, r.id.clone(), r.hostname.clone()));
+                .map(|r| (r.waf_enabled, r.waf_mode.clone(), r.id.clone(), r.hostname.clone()));
             if let Some((waf_enabled, waf_mode, route_id, route_hostname)) = cap_meta {
                 if waf_enabled && ctx.body_bytes_received > WAF_BODY_SCAN_MAX as u64 {
                     match waf_mode {
