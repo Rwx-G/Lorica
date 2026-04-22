@@ -115,6 +115,53 @@ impl std::fmt::Debug for WafRule {
     }
 }
 
+/// A WAF rule scoped to one or more named request headers.
+///
+/// The pattern is matched against the header VALUE only - never
+/// against the `name: value` concatenation. Used for rules that
+/// need to interpret the value of a specific header (e.g. CRS
+/// 920140 for `Transfer-Encoding: chunked, chunked` smuggling, or
+/// CRS 920120 for shell metacharacters in trusted-proxy headers).
+///
+/// v1.5.1 audit H-3 : the original CRS-derived patterns for these
+/// rules included the header name (`(?i)transfer-encoding\s*:.*chunked.*chunked`)
+/// expecting to match `name: value` strings, but Pingora's HTTP
+/// parser pre-splits headers into `(name, value)` tuples before
+/// the WAF sees them - the value never carries the name, so the
+/// rules were inert. Moving them into a dedicated header-scoped
+/// type with value-only patterns and a name allow-list restores
+/// the protection.
+pub struct HeaderScopedRule {
+    /// Unique rule ID (CRS-style numbering, shared namespace with `WafRule`).
+    pub id: u32,
+    /// Human-readable description.
+    pub description: &'static str,
+    /// Attack category.
+    pub category: RuleCategory,
+    /// Precompiled regex pattern, applied to the header VALUE only.
+    pub pattern: Regex,
+    /// Severity score (1-5, higher = more severe).
+    pub severity: u8,
+    /// Header names this rule applies to (case-insensitive,
+    /// lowercase). Multi-element when the same protection applies
+    /// to several similarly-shaped headers (e.g. the trio
+    /// `x-forwarded-host` / `x-original-url` / `x-rewrite-url`
+    /// for proxy-header-injection detection).
+    pub target_headers: &'static [&'static str],
+}
+
+impl std::fmt::Debug for HeaderScopedRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeaderScopedRule")
+            .field("id", &self.id)
+            .field("description", &self.description)
+            .field("category", &self.category)
+            .field("severity", &self.severity)
+            .field("target_headers", &self.target_headers)
+            .finish()
+    }
+}
+
 /// A compiled set of WAF rules ready for evaluation.
 ///
 /// Built once at engine startup via [`RuleSet::default_crs`] and held
@@ -123,6 +170,10 @@ impl std::fmt::Debug for WafRule {
 /// the compiled regexes can be shared without locking.
 pub struct RuleSet {
     rules: Vec<WafRule>,
+    /// Rules that apply only when scanning a specific named header.
+    /// Held separately from `rules` because their dispatch needs
+    /// the header name as well as the value (v1.5.1 audit H-3).
+    header_scoped: Vec<HeaderScopedRule>,
 }
 
 impl RuleSet {
@@ -266,13 +317,10 @@ impl RuleSet {
                 severity: 4,
             },
             // --- Protocol Violations (CRS 920xxx) ---
-            WafRule {
-                id: 920100,
-                description: "HTTP request smuggling via invalid content-length",
-                category: RuleCategory::ProtocolViolation,
-                pattern: Regex::new(r"(?i)content-length\s*:\s*[^\d]").expect("invalid WAF regex pattern"),
-                severity: 5,
-            },
+            // Rule 920100 ("invalid content-length") moved to
+            // `header_scoped` below (v1.5.1 audit H-3) - the
+            // original pattern looked for `content-length:` inside
+            // the value and was inert against tuple-split headers.
             WafRule {
                 id: 920110,
                 description: "CRLF injection via encoded line break",
@@ -414,15 +462,10 @@ impl RuleSet {
                 severity: 4,
             },
             // --- Additional Protocol Violations ---
-            WafRule {
-                id: 920120,
-                description: "Header injection via trusted proxy headers",
-                category: RuleCategory::ProtocolViolation,
-                pattern: Regex::new(
-                    r"(?i)(X-Forwarded-Host|X-Original-URL|X-Rewrite-URL)\s*:.*[;&|<>]",
-                ).expect("CRS pattern is a compile-time constant and compiles"),
-                severity: 3,
-            },
+            // Rule 920120 ("header injection via trusted proxy
+            // headers") moved to `header_scoped` below (v1.5.1
+            // audit H-3) - the original pattern looked for the
+            // header name inside the value and was inert.
             WafRule {
                 id: 920130,
                 description: "Open redirect via URL-encoded external redirect",
@@ -530,15 +573,10 @@ impl RuleSet {
                 severity: 5,
             },
             // --- HTTP request smuggling ---
-            WafRule {
-                id: 920140,
-                description: "HTTP request smuggling via Transfer-Encoding manipulation",
-                category: RuleCategory::ProtocolViolation,
-                pattern: Regex::new(
-                    r"(?i)(transfer-encoding\s*:.*chunked.*chunked|transfer-encoding\s*:.*,|content-length.*transfer-encoding|transfer-encoding.*content-length)",
-                ).expect("CRS pattern is a compile-time constant and compiles"),
-                severity: 5,
-            },
+            // Rule 920140 ("Transfer-Encoding manipulation") moved
+            // to `header_scoped` below (v1.5.1 audit H-3) - the
+            // original pattern looked for `transfer-encoding:`
+            // inside the value and was inert.
             // --- Scanner/bot detection ---
             WafRule {
                 id: 913100,
@@ -571,22 +609,87 @@ impl RuleSet {
             },
         ];
 
-        Self { rules }
+        // Header-scoped rules (v1.5.1 audit H-3). Patterns match the
+        // header VALUE only ; dispatch is gated by `target_headers`
+        // against the request's actual header names. Rule IDs match
+        // the original CRS-derived numbering so operator-side
+        // disable/enable lists keep working unchanged.
+        let header_scoped = vec![
+            HeaderScopedRule {
+                id: 920100,
+                description: "HTTP request smuggling via invalid Content-Length",
+                category: RuleCategory::ProtocolViolation,
+                // Valid Content-Length is decimal digits only
+                // (RFC 9110). Any other character in the value
+                // is a smuggling indicator (negative, hex, comma-
+                // list, mixed CL+TE relay confusion). Allow
+                // surrounding whitespace.
+                pattern: Regex::new(r"^\s*$|[^0-9 \t]")
+                    .expect("CRS pattern is a compile-time constant and compiles"),
+                severity: 5,
+                target_headers: &["content-length"],
+            },
+            HeaderScopedRule {
+                id: 920120,
+                description: "Header injection via trusted proxy headers",
+                category: RuleCategory::ProtocolViolation,
+                // Shell metacharacters / HTML brackets in the value
+                // of a trusted-proxy header strongly suggest an
+                // attacker is trying to inject through to a backend
+                // that trusts these headers blindly.
+                pattern: Regex::new(r"[;&|<>]")
+                    .expect("CRS pattern is a compile-time constant and compiles"),
+                severity: 3,
+                target_headers: &["x-forwarded-host", "x-original-url", "x-rewrite-url"],
+            },
+            HeaderScopedRule {
+                id: 920140,
+                description: "HTTP request smuggling via Transfer-Encoding manipulation",
+                category: RuleCategory::ProtocolViolation,
+                // `chunked` listed twice in the same TE value is
+                // the canonical TE-TE smuggling shape. Pingora's
+                // httparse already rejects most CL+TE crossings at
+                // the parser level, so this is a belt-and-suspenders
+                // catch for the parser-tolerated edge.
+                pattern: Regex::new(r"(?i)chunked.*chunked")
+                    .expect("CRS pattern is a compile-time constant and compiles"),
+                severity: 5,
+                target_headers: &["transfer-encoding"],
+            },
+        ];
+
+        Self {
+            rules,
+            header_scoped,
+        }
     }
 
-    /// Return a reference to all rules in this set.
+    /// Return a reference to all general (field-agnostic) rules.
+    ///
+    /// Header-scoped rules are returned separately via
+    /// [`Self::header_scoped`] - both vectors together form the
+    /// complete ruleset visible to operators.
     pub fn rules(&self) -> &[WafRule] {
         &self.rules
     }
 
-    /// Return the number of rules in this set.
-    pub fn len(&self) -> usize {
-        self.rules.len()
+    /// Return a reference to all header-scoped rules.
+    ///
+    /// These rules dispatch on header NAME and match against
+    /// header VALUE only (v1.5.1 audit H-3).
+    pub fn header_scoped(&self) -> &[HeaderScopedRule] {
+        &self.header_scoped
     }
 
-    /// Return true if there are no rules.
+    /// Return the total number of rules across all categories
+    /// (general + header-scoped).
+    pub fn len(&self) -> usize {
+        self.rules.len() + self.header_scoped.len()
+    }
+
+    /// Return true if there are no rules at all.
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.rules.is_empty() && self.header_scoped.is_empty()
     }
 }
 
@@ -1095,16 +1198,77 @@ mod tests {
 
     #[test]
     fn test_request_smuggling() {
+        // v1.5.1 audit H-3 : rule 920140 moved to `header_scoped`
+        // and now matches the header VALUE only (the previous
+        // pattern looked for `transfer-encoding:` inside the value
+        // and was inert against tuple-split headers). The
+        // smuggling shape is `chunked` listed twice in the same
+        // Transfer-Encoding value.
         let rs = RuleSet::default_crs();
         let rule = rs
-            .rules()
+            .header_scoped()
             .iter()
             .find(|r| r.id == 920140)
-            .expect("test setup: rule 920140 must exist in CRS ruleset");
-        assert!(rule.pattern.is_match("transfer-encoding: chunked chunked"));
-        assert!(rule
-            .pattern
-            .is_match("transfer-encoding: chunked, identity"));
+            .expect("test setup: rule 920140 must exist in CRS header-scoped ruleset");
+        assert_eq!(rule.target_headers, &["transfer-encoding"]);
+        // Smuggling shapes (value only)
+        assert!(rule.pattern.is_match("chunked, chunked"));
+        assert!(rule.pattern.is_match("chunked,chunked"));
+        assert!(rule.pattern.is_match("CHUNKED, chunked")); // case-insensitive
+        // Legitimate shapes must NOT match
+        assert!(!rule.pattern.is_match("chunked"));
+        assert!(!rule.pattern.is_match("gzip, chunked"));
+        assert!(!rule.pattern.is_match("identity"));
+    }
+
+    #[test]
+    fn test_invalid_content_length_header_scoped() {
+        // v1.5.1 audit H-3 : rule 920100 moved to header_scoped
+        // and now matches the value of `Content-Length` only.
+        // A valid CL is decimal digits + optional surrounding
+        // whitespace ; anything else is a smuggling indicator.
+        let rs = RuleSet::default_crs();
+        let rule = rs
+            .header_scoped()
+            .iter()
+            .find(|r| r.id == 920100)
+            .expect("test setup: rule 920100 must exist in CRS header-scoped ruleset");
+        assert_eq!(rule.target_headers, &["content-length"]);
+        // Smuggling shapes
+        assert!(rule.pattern.is_match("abc"));
+        assert!(rule.pattern.is_match("100, 200"));
+        assert!(rule.pattern.is_match("-1"));
+        assert!(rule.pattern.is_match("0x10"));
+        assert!(rule.pattern.is_match("")); // empty value is also invalid
+        // Legitimate shapes
+        assert!(!rule.pattern.is_match("0"));
+        assert!(!rule.pattern.is_match("1024"));
+        assert!(!rule.pattern.is_match("  42  ")); // surrounding whitespace OK
+    }
+
+    #[test]
+    fn test_proxy_header_injection_header_scoped() {
+        // v1.5.1 audit H-3 : rule 920120 moved to header_scoped
+        // and now matches shell metacharacters in the value of
+        // any of the trusted-proxy headers.
+        let rs = RuleSet::default_crs();
+        let rule = rs
+            .header_scoped()
+            .iter()
+            .find(|r| r.id == 920120)
+            .expect("test setup: rule 920120 must exist in CRS header-scoped ruleset");
+        assert_eq!(
+            rule.target_headers,
+            &["x-forwarded-host", "x-original-url", "x-rewrite-url"]
+        );
+        // Shell-meta / HTML injection
+        assert!(rule.pattern.is_match("evil.com|whoami"));
+        assert!(rule.pattern.is_match("evil.com; rm -rf /"));
+        assert!(rule.pattern.is_match("a&b"));
+        assert!(rule.pattern.is_match("<script>"));
+        // Legitimate
+        assert!(!rule.pattern.is_match("api.example.com"));
+        assert!(!rule.pattern.is_match("/admin/users/123"));
     }
 
     #[test]

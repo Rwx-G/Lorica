@@ -619,3 +619,201 @@ fn test_waf_event_serde_default_client_ip() {
     let event: WafEvent = serde_json::from_str(json).expect("deserialization failed");
     assert_eq!(event.client_ip, "");
 }
+
+// ---------------------------------------------------------------------------
+// Header-scoped rules (v1.5.1 audit H-3)
+//
+// These rules used to live in the main `rules` vec with patterns that
+// looked for `name: value` strings (e.g. `(?i)transfer-encoding\s*:.*chunked.*chunked`)
+// but Pingora's parser pre-splits headers into (name, value) tuples,
+// so the patterns were inert. The dispatch now matches the header
+// NAME against `target_headers` and applies the value-only pattern
+// to the value alone. End-to-end tests through `evaluate` cover the
+// dispatch logic.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_te_chunked_chunked_smuggling_detected() {
+    let e = engine();
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/api/v1/upload",
+        None,
+        &[("transfer-encoding", "chunked, chunked")],
+        "example.com",
+        "10.0.0.1",
+    );
+    match verdict {
+        WafVerdict::Blocked(events) => {
+            assert!(events.iter().any(|ev| ev.rule_id == 920140));
+        }
+        other => panic!("expected Blocked on TE chunked-chunked smuggling, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_te_legitimate_chunked_passes() {
+    let e = engine();
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/api/v1/upload",
+        None,
+        &[("transfer-encoding", "chunked")],
+        "example.com",
+        "10.0.0.1",
+    );
+    assert_eq!(verdict, WafVerdict::Pass);
+}
+
+#[test]
+fn test_te_gzip_then_chunked_passes() {
+    // Common compression+chunked combo - must not trip 920140.
+    let e = engine();
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/api/v1/upload",
+        None,
+        &[("transfer-encoding", "gzip, chunked")],
+        "example.com",
+        "10.0.0.1",
+    );
+    assert_eq!(verdict, WafVerdict::Pass);
+}
+
+#[test]
+fn test_invalid_content_length_detected() {
+    let e = engine();
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/api/v1/login",
+        None,
+        &[("content-length", "abc")],
+        "example.com",
+        "10.0.0.1",
+    );
+    match verdict {
+        WafVerdict::Blocked(events) => {
+            assert!(events.iter().any(|ev| ev.rule_id == 920100));
+        }
+        other => panic!("expected Blocked on invalid CL, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_valid_content_length_passes() {
+    let e = engine();
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/api/v1/login",
+        None,
+        &[("content-length", "1024")],
+        "example.com",
+        "10.0.0.1",
+    );
+    assert_eq!(verdict, WafVerdict::Pass);
+}
+
+#[test]
+fn test_proxy_header_injection_detected() {
+    let e = engine();
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/api/v1/foo",
+        None,
+        &[("x-forwarded-host", "evil.com|whoami")],
+        "example.com",
+        "10.0.0.1",
+    );
+    match verdict {
+        WafVerdict::Blocked(events) => {
+            assert!(events.iter().any(|ev| ev.rule_id == 920120));
+        }
+        other => panic!("expected Blocked on proxy-header injection, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_proxy_header_legitimate_value_passes() {
+    let e = engine();
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/api/v1/foo",
+        None,
+        &[("x-forwarded-host", "api.example.com")],
+        "example.com",
+        "10.0.0.1",
+    );
+    assert_eq!(verdict, WafVerdict::Pass);
+}
+
+#[test]
+fn test_header_scoped_dispatch_skips_other_headers() {
+    // The `chunked, chunked` value on a NON-`transfer-encoding`
+    // header must not trip rule 920140 - the dispatch is
+    // name-gated.
+    let e = engine();
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/",
+        None,
+        &[("user-agent", "chunked, chunked")],
+        "example.com",
+        "10.0.0.1",
+    );
+    assert_eq!(verdict, WafVerdict::Pass);
+}
+
+#[test]
+fn test_header_scoped_dispatch_case_insensitive() {
+    // RFC 9110 says header names are ASCII case-insensitive ;
+    // verify the dispatch tolerates `Content-Length` upper-case.
+    let e = engine();
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/",
+        None,
+        &[("Content-Length", "abc")],
+        "example.com",
+        "10.0.0.1",
+    );
+    match verdict {
+        WafVerdict::Blocked(events) => {
+            assert!(events.iter().any(|ev| ev.rule_id == 920100));
+        }
+        other => panic!("expected Blocked on case-insensitive header dispatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_header_scoped_disable_takes_effect() {
+    let e = engine();
+    assert!(e.disable_rule(920140), "disable_rule must accept scoped IDs");
+    let verdict = e.evaluate(
+        WafMode::Blocking,
+        "/",
+        None,
+        &[("transfer-encoding", "chunked, chunked")],
+        "example.com",
+        "10.0.0.1",
+    );
+    assert_eq!(verdict, WafVerdict::Pass);
+    assert!(e.enable_rule(920140), "enable_rule must accept scoped IDs");
+    let verdict2 = e.evaluate(
+        WafMode::Blocking,
+        "/",
+        None,
+        &[("transfer-encoding", "chunked, chunked")],
+        "example.com",
+        "10.0.0.1",
+    );
+    assert!(matches!(verdict2, WafVerdict::Blocked(_)));
+}
+
+#[test]
+fn test_list_rules_includes_header_scoped() {
+    let e = engine();
+    let summaries = e.list_rules();
+    assert!(summaries.iter().any(|s| s.id == 920100));
+    assert!(summaries.iter().any(|s| s.id == 920120));
+    assert!(summaries.iter().any(|s| s.id == 920140));
+}

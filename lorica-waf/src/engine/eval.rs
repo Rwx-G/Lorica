@@ -77,6 +77,48 @@ impl WafEngine {
             }
         }
 
+        // Header-scoped rules (v1.5.1 audit H-3). Dispatched on
+        // header NAME and matched against the URL-decoded VALUE.
+        // The CRS-derived patterns for these rules used to look for
+        // the header name inside the value (`(?i)transfer-encoding\s*:.*chunked.*chunked`)
+        // which never matched after Pingora's parser pre-split
+        // headers into `(name, value)` tuples - they were inert.
+        // Scoped rules bypass the prefilter (the prefilter is
+        // content-shape based and adds no signal here) and are
+        // still subject to the per-rule disable list.
+        {
+            let disabled = self.disabled_rules.read();
+            for scoped in self.ruleset.header_scoped() {
+                if disabled.contains(&scoped.id) {
+                    continue;
+                }
+                for (name, value) in headers {
+                    if !scoped
+                        .target_headers
+                        .iter()
+                        .any(|target| name.eq_ignore_ascii_case(target))
+                    {
+                        continue;
+                    }
+                    let decoded = Self::url_decode(value);
+                    if let Some(m) = scoped.pattern.find(&decoded) {
+                        events.push(WafEvent {
+                            rule_id: scoped.id,
+                            description: scoped.description.to_string(),
+                            category: scoped.category.clone(),
+                            severity: scoped.severity,
+                            matched_field: format!("header:{name}"),
+                            matched_value: m.as_str().to_string(),
+                            timestamp: now.clone(),
+                            client_ip: String::new(),
+                            route_hostname: String::new(),
+                            action: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+
         let elapsed = start.elapsed();
 
         if !events.is_empty() {

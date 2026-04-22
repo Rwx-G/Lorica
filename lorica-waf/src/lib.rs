@@ -36,4 +36,4 @@ pub mod rules;
 
 pub use engine::{RuleSummary, WafEngine, WafEvent, WafMode, WafVerdict};
 pub use ip_blocklist::IpBlocklist;
-pub use rules::{RuleCategory, RuleSet, WafRule};
+pub use rules::{HeaderScopedRule, RuleCategory, RuleSet, WafRule};
