@@ -14,9 +14,21 @@
 
 //! OVH DNS-01 challenger using the OVH API.
 
+use std::time::Duration;
+
 use tracing::info;
 
 use super::DnsChallenger;
+
+/// Per-request timeout for the OVH API client (v1.5.1 audit L-7).
+/// Pre-fix, the client was built with `reqwest::Client::new()`
+/// which has no timeout set ; a hung OVH endpoint could hold the
+/// ACME flow open indefinitely. OVH's API is typically sub-
+/// second on healthy paths, so 30 s is well above worst-case
+/// healthy response while still bounding a stuck call. The
+/// challenger's own DNS-propagation wait loop has its own
+/// bigger timeout - this only bounds the per-call HTTP work.
+const OVH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// OVH DNS-01 challenger using the OVH API.
 ///
@@ -64,12 +76,16 @@ impl OvhDnsChallenger {
         application_secret: String,
         consumer_key: String,
     ) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(OVH_HTTP_TIMEOUT)
+            .build()
+            .expect("reqwest::Client builder with a static timeout is infallible");
         Self {
             base_url,
             application_key,
             application_secret,
             consumer_key,
-            client: reqwest::Client::new(),
+            client,
             created_records: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }

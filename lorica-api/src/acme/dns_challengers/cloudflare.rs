@@ -14,9 +14,20 @@
 
 //! Cloudflare DNS-01 challenger using the Cloudflare API v4.
 
+use std::time::Duration;
+
 use tracing::info;
 
 use super::DnsChallenger;
+
+/// Per-request timeout for the Cloudflare API client (v1.5.1
+/// audit L-7). Pre-fix, the client was built with
+/// `reqwest::Client::new()` which has no timeout set ; a hung
+/// Cloudflare API endpoint could hold the ACME flow open
+/// indefinitely. Cloudflare's documented SLO targets sub-second
+/// API responses, so 30 s is well above the worst-case healthy
+/// response while still bounding a stuck call.
+const CLOUDFLARE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default Cloudflare API v4 base URL. Swapped in tests via
 /// `with_base_url` to point at a `wiremock` mock server.
@@ -41,11 +52,15 @@ impl CloudflareDnsChallenger {
     /// unit tests in `acme::tests` can point the challenger at a
     /// `wiremock::MockServer` instance.
     pub(crate) fn with_base_url(zone_id: String, api_token: String, base_url: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(CLOUDFLARE_HTTP_TIMEOUT)
+            .build()
+            .expect("reqwest::Client builder with a static timeout is infallible");
         Self {
             zone_id,
             api_token,
             base_url,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 
