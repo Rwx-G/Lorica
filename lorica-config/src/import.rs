@@ -97,12 +97,22 @@ fn validate(data: &ImportData) -> Result<()> {
         }
     }
 
-    // Reject redacted SMTP passwords in notification configs
+    // Reject redacted secrets in notification configs (v1.5.1
+    // audit L-5 widened the check from Email-only to every
+    // channel : Webhook + Slack now scrub `url` + `auth_header`
+    // on export, and a round-tripped import must fail loudly so
+    // an old TOML cannot silently swap a live webhook URL for the
+    // placeholder, breaking alert delivery without trace).
     for nc in &data.notification_configs {
-        if nc.channel == NotificationChannel::Email && nc.config.contains("**REDACTED**") {
+        if nc.config.contains("**REDACTED**") {
+            let kind = match nc.channel {
+                NotificationChannel::Email => "SMTP password",
+                NotificationChannel::Webhook => "webhook URL or auth header",
+                NotificationChannel::Slack => "Slack webhook URL or auth header",
+            };
             return Err(ConfigError::Validation(format!(
-                "notification config '{}' has a redacted SMTP password (from export); \
-                 set a real password or remove the config from the import file",
+                "notification config '{}' has a redacted {kind} (from export); \
+                 set the real value or remove the config from the import file",
                 nc.id
             )));
         }
