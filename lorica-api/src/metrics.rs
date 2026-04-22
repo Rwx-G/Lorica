@@ -22,7 +22,8 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Registry, TextEncoder,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    Registry, TextEncoder,
 };
 
 use crate::server::AppState;
@@ -661,6 +662,41 @@ pub fn inc_logs_ws_dropped(reason: &str, count: u64) {
     LOGS_WS_DROPPED_TOTAL
         .with_label_values(&[reason])
         .inc_by(count);
+}
+
+/// Counter: WAF event persistence failures (v1.5.1 audit L-6).
+///
+/// Bumped each time the proxy hot path tries to persist a
+/// `WafEvent` to the SQLite-backed `LogStore` and the call
+/// returns `Err`. Pre-fix, every call site swallowed the result
+/// with `let _ = ...` so a full disk / corrupted DB / schema
+/// mismatch silently dropped events without an operator signal.
+/// The companion log line at `tracing::warn!` carries the
+/// underlying error string + the rule id / category so the
+/// counter is "is the persistence working ?" and the log line
+/// is "what failed". Non-zero values warrant investigation -
+/// the proxy keeps running (events still flow through the
+/// in-memory ring buffer + Prometheus categories), but the
+/// persistent forensics trail is broken.
+static WAF_EVENT_PERSIST_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::with_opts(
+        prometheus::opts!(
+            "waf_event_persist_failed_total",
+            "WAF events the proxy could not persist to the LogStore"
+        )
+        .namespace("lorica"),
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Bump the WAF-event-persistence-failed counter by one.
+///
+/// Called from `LoricaProxy::persist_waf_event` whenever a
+/// `LogStore::insert_waf_event` call returns `Err`.
+pub fn inc_waf_event_persist_failed() {
+    WAF_EVENT_PERSIST_FAILED_TOTAL.inc();
 }
 
 /// Counter: BanIp commands dropped by the supervisor -> worker

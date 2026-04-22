@@ -1469,6 +1469,34 @@ impl LoricaProxy {
         &self.waf_engine
     }
 
+    /// Persist a `WafEvent` to the SQLite-backed `LogStore`.
+    ///
+    /// No-op when no log store is configured (worker mode +
+    /// supervisor-only persistence ; the workers ship events back
+    /// via the metrics-pull RPC instead). Errors are logged at
+    /// `warn!` with the underlying message + the event's rule id
+    /// + category, and bump
+    /// `lorica_waf_event_persist_failed_total` so an operator
+    /// can alert on a stalled persistence path (full disk,
+    /// corrupted DB, schema drift) - v1.5.1 audit L-6 closed the
+    /// silent `let _ = ...` swallow at six call sites in this
+    /// file. The proxy keeps serving regardless ; the in-memory
+    /// ring buffer + Prometheus category counters still surface
+    /// the events, only the persistent forensics trail is broken.
+    fn persist_waf_event(&self, ev: &lorica_waf::WafEvent) {
+        if let Some(ref store) = self.log_store {
+            if let Err(e) = store.insert_waf_event(ev) {
+                tracing::warn!(
+                    error = %e,
+                    rule_id = ev.rule_id,
+                    category = ev.category.as_str(),
+                    "WAF event persistence failed"
+                );
+                lorica_api::metrics::inc_waf_event_persist_failed();
+            }
+        }
+    }
+
     /// Record that a request body crossed `WAF_BODY_SCAN_MAX` while
     /// the route's WAF was in Detection mode (v1.5.1 audit H-2).
     ///
@@ -1510,23 +1538,21 @@ impl LoricaProxy {
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
 
-        if let Some(ref store) = self.log_store {
-            let ev = lorica_waf::WafEvent {
-                rule_id: 0,
-                description: format!(
-                    "request body ({observed_size} bytes) exceeded WAF scan window ({WAF_BODY_SCAN_MAX} bytes); partial scan only"
-                ),
-                category: lorica_waf::RuleCategory::ProtocolViolation,
-                severity: 5,
-                matched_field: "body_size".to_string(),
-                matched_value: observed_size.to_string(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
-                route_hostname: route_hostname.to_string(),
-                action: "detected".to_string(),
-            };
-            let _ = store.insert_waf_event(&ev);
-        }
+        let ev = lorica_waf::WafEvent {
+            rule_id: 0,
+            description: format!(
+                "request body ({observed_size} bytes) exceeded WAF scan window ({WAF_BODY_SCAN_MAX} bytes); partial scan only"
+            ),
+            category: lorica_waf::RuleCategory::ProtocolViolation,
+            severity: 5,
+            matched_field: "body_size".to_string(),
+            matched_value: observed_size.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            client_ip: ctx.client_ip.as_deref().unwrap_or("-").to_string(),
+            route_hostname: route_hostname.to_string(),
+            action: "detected".to_string(),
+        };
+        self.persist_waf_event(&ev);
     }
 
     /// Spawn the worker-side pipelined RPC listener that handles
@@ -2441,29 +2467,27 @@ impl ProxyHttp for LoricaProxy {
                             .entry(("ip_blocklist".to_string(), "blocked".to_string()))
                             .or_insert_with(|| AtomicU64::new(0))
                             .fetch_add(1, Ordering::Relaxed);
-                        if let Some(ref store) = self.log_store {
-                            let ev = lorica_waf::WafEvent {
-                                rule_id: 0,
-                                description: format!("IP {ip} blocked by IP blocklist"),
-                                category: lorica_waf::RuleCategory::IpBlocklist,
-                                severity: 5,
-                                matched_field: "client_ip".to_string(),
-                                matched_value: ip.to_string(),
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                client_ip: ip.to_string(),
-                                route_hostname: {
-                                    let h = extract_host(req);
-                                    if h.is_empty() {
-                                        "-"
-                                    } else {
-                                        h
-                                    }
+                        let ev = lorica_waf::WafEvent {
+                            rule_id: 0,
+                            description: format!("IP {ip} blocked by IP blocklist"),
+                            category: lorica_waf::RuleCategory::IpBlocklist,
+                            severity: 5,
+                            matched_field: "client_ip".to_string(),
+                            matched_value: ip.to_string(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            client_ip: ip.to_string(),
+                            route_hostname: {
+                                let h = extract_host(req);
+                                if h.is_empty() {
+                                    "-"
+                                } else {
+                                    h
                                 }
-                                .to_string(),
-                                action: "blocked".to_string(),
-                            };
-                            let _ = store.insert_waf_event(&ev);
-                        }
+                            }
+                            .to_string(),
+                            action: "blocked".to_string(),
+                        };
+                        self.persist_waf_event(&ev);
                         // Pre-route stage: no route override consultable.
                         let host_header = extract_host(session.req_header()).to_string();
                         let body = render_error_body(
@@ -3744,9 +3768,7 @@ impl ProxyHttp for LoricaProxy {
                             .entry((ev.category.as_str().to_string(), "blocked".to_string()))
                             .or_insert_with(|| AtomicU64::new(0))
                             .fetch_add(1, Ordering::Relaxed);
-                        if let Some(ref store) = self.log_store {
-                            let _ = store.insert_waf_event(ev);
-                        }
+                        self.persist_waf_event(ev);
                     }
                     // Dispatch waf_alert notification
                     if let (Some(ref sender), Some(ev)) = (&self.alert_sender, events.first()) {
@@ -3865,9 +3887,7 @@ impl ProxyHttp for LoricaProxy {
                             .entry((ev.category.as_str().to_string(), "detected".to_string()))
                             .or_insert_with(|| AtomicU64::new(0))
                             .fetch_add(1, Ordering::Relaxed);
-                        if let Some(ref store) = self.log_store {
-                            let _ = store.insert_waf_event(ev);
-                        }
+                        self.persist_waf_event(ev);
                     }
                     ctx.waf_detected = true;
                     Ok(false)
@@ -4094,9 +4114,7 @@ impl ProxyHttp for LoricaProxy {
                                     ))
                                     .or_insert_with(|| AtomicU64::new(0))
                                     .fetch_add(1, Ordering::Relaxed);
-                                if let Some(ref store) = self.log_store {
-                                    let _ = store.insert_waf_event(ev);
-                                }
+                                self.persist_waf_event(ev);
                             }
                             ctx.waf_blocked = true;
                             let host_header = extract_host(session.req_header()).to_string();
@@ -4138,9 +4156,7 @@ impl ProxyHttp for LoricaProxy {
                                     ))
                                     .or_insert_with(|| AtomicU64::new(0))
                                     .fetch_add(1, Ordering::Relaxed);
-                                if let Some(ref store) = self.log_store {
-                                    let _ = store.insert_waf_event(ev);
-                                }
+                                self.persist_waf_event(ev);
                             }
                             ctx.waf_detected = true;
                         }
