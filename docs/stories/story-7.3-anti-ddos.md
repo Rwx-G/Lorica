@@ -29,18 +29,18 @@ I want automatic DDoS mitigation to protect the proxy and backends from volumetr
 ## Tasks
 
 - [x] Implement slowloris detection in connection handler (header receive timeout)
-- [x] Add configurable header_timeout_s field to global proxy settings (default 10s)
+- [ ] Add configurable header_timeout_s field to global proxy settings (default 10s) - **deferred to v1.6.0** (audit H-5, backlog #17). Slowloris timeout is currently the Pingora default ; operator-tunable threshold tracked separately.
 - [x] Implement auto-ban tracker (per-IP rate limit violation counter with time window)
-- [x] Add configurable ban_threshold (violations before ban, default 5) and ban_duration_s (default 600)
+- [x] Add configurable waf_ban_threshold (violations before ban, default 3) and waf_ban_duration_s (default 3600). **Field naming corrected from the original `ban_threshold` / `ban_duration_s`** (v1.5.1 audit L-13) - the implementation prefixes both with `waf_` because they are triggered by WAF events specifically, not by the rate-limit subsystem ; defaults differ from the original story (3 / 3600 vs 5 / 600).
 - [x] Implement ban list with DashMap and auto-expiry via background task
 - [x] Check ban list in early request_filter phase, return 403 for banned IPs
 - [x] Implement global connection limit (AtomicU64 counter, configurable max_connections per route)
 - [x] Return 503 when max connections exceeded
 - [x] Implement flood detection: track global RPS via rate observer
-- [x] Add configurable flood_threshold_rps and flood_strict_rps fields to global settings
+- [ ] Add configurable flood_threshold_rps and flood_strict_rps fields to global settings - **partially deferred to v1.6.0** (audit H-5, backlog #17). `flood_threshold_rps` ships ; `flood_strict_rps` is hardcoded at 0.5x (halve) and operator-tunable variant tracked separately.
 - [x] Dispatch AlertType::IpBanned event to notification system on auto-ban
 - [x] Add ban list API endpoints (GET /api/v1/bans, DELETE /api/v1/bans/:ip)
-- [ ] Add dashboard ban list view with IP, ban reason, expiry time, and unban button
+- [x] Add dashboard ban list view with IP, expiry time, and unban button. **`reason` field deferred to v1.6.0** (audit L-12, backlog #22) - the backend currently stores `(banned_at, duration_s)` only ; surfacing the trigger reason (RateLimit / Flood / Manual) requires a backend `BanReason` enum + API field addition that is feat-shaped, not patch-shaped (v1.5.1 audit L-11 unticked the box ; this re-tick reflects the dashboard's 3-of-4 fields ship state).
 - [x] Write tests for slowloris detection and connection abort
 - [x] Write tests for auto-ban escalation (violation counting and ban trigger)
 - [x] Write tests for ban expiry and automatic removal
