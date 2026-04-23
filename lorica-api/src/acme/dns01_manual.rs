@@ -509,8 +509,13 @@ pub async fn provision_dns_manual_confirm(
     store
         .create_certificate(&cert)
         .map_err(|e| ApiError::Internal(format!("failed to store certificate: {e}")))?;
-    crate::cert_export::export_from_store(&store, &cert);
+    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
     drop(store);
+    // v1.5.1 audit M-9 : disk export off-loaded to spawn_blocking
+    // and dispatched AFTER the store mutex is released.
+    if let Some((settings, acls)) = export_snapshot {
+        crate::cert_export::export_after_release(settings, acls, cert).await;
+    }
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 

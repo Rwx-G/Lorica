@@ -356,8 +356,15 @@ pub(super) async fn provision_with_acme_dns(
 
     let store = state.store.lock().await;
     store.create_certificate(&cert)?;
-    crate::cert_export::export_from_store(&store, &cert);
+    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
     drop(store);
+    // v1.5.1 audit M-9 : run the disk export in `spawn_blocking`
+    // AFTER releasing the store mutex so concurrent API handlers
+    // do not block on the cross-mount EXDEV `copy + fsync + rename`
+    // path while waiting for the same lock.
+    if let Some((settings, acls)) = export_snapshot {
+        crate::cert_export::export_after_release(settings, acls, cert).await;
+    }
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 

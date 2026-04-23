@@ -286,8 +286,13 @@ pub(super) async fn provision_with_acme(
 
     let store = state.store.lock().await;
     store.create_certificate(&cert)?;
-    crate::cert_export::export_from_store(&store, &cert);
+    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
     drop(store);
+    // v1.5.1 audit M-9 : disk export off-loaded to spawn_blocking
+    // and dispatched AFTER the store mutex is released.
+    if let Some((settings, acls)) = export_snapshot {
+        crate::cert_export::export_after_release(settings, acls, cert).await;
+    }
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
