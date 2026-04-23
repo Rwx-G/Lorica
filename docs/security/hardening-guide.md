@@ -86,7 +86,7 @@ Lorica uses **rustls** exclusively (no OpenSSL). This provides:
 
 ### IP Blocklist
 
-- Enable the IPv4 blocklist (800k+ known malicious IPs from Data-Shield)
+- Enable the IPv4 blocklist (~80k known malicious IPs from Data-Shield)
 - The list auto-refreshes every 6 hours
 - Manual reload available via dashboard or API
 

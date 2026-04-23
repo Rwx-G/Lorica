@@ -153,8 +153,8 @@ lorica/
     src/
       lib.rs
       engine.rs                 # Rule evaluation engine with custom rule support
-      rules.rs                  # 18 OWASP-inspired regex rules
-      ip_blocklist.rs           # IPv4 blocklist (800k+ IPs from Data-Shield)
+      rules.rs                  # 49 OWASP-inspired regex rules (46 general + 3 header-scoped)
+      ip_blocklist.rs           # IPv4 blocklist (~80k IPs from Data-Shield)
 
   lorica-bench/                 # NEW - SLA monitoring & load testing
     Cargo.toml
