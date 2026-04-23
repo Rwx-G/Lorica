@@ -141,7 +141,14 @@
   async function showHistory(probe: ProbeConfigResponse) {
     historyProbe = probe;
     historyLoading = true;
+    // v1.5.1 audit M-11 : capture the requested probe id before
+    // the fetch dispatches so a follow-up click on another
+    // probe (race) does not let the stale history response
+    // overwrite the new selection's view. `historyProbe` is the
+    // source of truth for the current selection.
+    const captured = probe.id;
     const res = await api.probeHistory(probe.id, 50);
+    if (historyProbe?.id !== captured) return;
     historyResults = res.data?.results ?? [];
     historyLoading = false;
   }
