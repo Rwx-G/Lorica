@@ -1,5 +1,45 @@
 const BASE = '/api/v1';
 
+/**
+ * Defense-in-depth sanitisation of a `Content-Disposition` filename
+ * extracted from a server response (v1.5.1 audit L-8).
+ *
+ * The server side already runs `sanitize_filename` on the cert
+ * `domain` (rejects path traversal, non-ASCII, etc.) and falls
+ * back to the opaque cert id when the result is empty, so the
+ * happy path returns a clean ASCII string. This helper is the
+ * browser-side belt that keeps `<a download>` honest if a future
+ * regression, a malformed response, or a different endpoint that
+ * borrows the same client code ever surfaces a header with
+ * control characters or path separators.
+ *
+ * - Strips `[\x00-\x1f]` (NUL, CR, LF, BEL, all C0 controls) and
+ *   `/` `\` path separators - the browser already strips path
+ *   components from `<a download>`, so the worst case absent this
+ *   helper is "confusing filename", but the explicit replace
+ *   removes the ambiguity.
+ * - Caps the result at 255 chars (POSIX `NAME_MAX`) so a 4 MiB
+ *   header value cannot grow `a.download` to a string browsers
+ *   then refuse to handle.
+ * - Returns `fallback` when the header is missing, malformed
+ *   (no `filename="..."` token), or the sanitised result is
+ *   empty - never returns `""`.
+ *
+ * Only handles the basic RFC 6266 `filename="..."` form ; the
+ * `filename*=UTF-8''...` extended form is not used by any Lorica
+ * endpoint today, so adding parsing for it would be dead code.
+ */
+export function sanitizeFilenameFromHeader(
+  contentDisposition: string,
+  fallback: string,
+): string {
+  const match = /filename="([^"]+)"/.exec(contentDisposition);
+  if (!match) return fallback;
+  // eslint-disable-next-line no-control-regex
+  const cleaned = match[1].replace(/[\x00-\x1f\\/]/g, '_').slice(0, 255);
+  return cleaned.length > 0 ? cleaned : fallback;
+}
+
 export interface ApiError {
   code: string;
   message: string;
@@ -878,11 +918,13 @@ export const api = {
       return { ok: false, message };
     }
     const blob = await res.blob();
-    // Prefer the server-supplied filename from Content-Disposition; fall
-    // back to `{id}-{part}.pem` if the header is missing or malformed.
+    // Prefer the server-supplied filename from Content-Disposition ;
+    // fall back to `{id}-{part}.pem` if the header is missing or
+    // malformed. The helper sanitises away control chars / path
+    // separators in case the server ever surfaces a name through
+    // a future regression (v1.5.1 audit L-8).
     const cd = res.headers.get('Content-Disposition') ?? '';
-    const match = /filename="([^"]+)"/.exec(cd);
-    const filename = match?.[1] ?? `${id}-${part}.pem`;
+    const filename = sanitizeFilenameFromHeader(cd, `${id}-${part}.pem`);
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
