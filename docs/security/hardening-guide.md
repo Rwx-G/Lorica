@@ -123,11 +123,48 @@ chmod 600 /var/lib/lorica/lorica.db
 
 ### systemd Hardening
 
-The packaged systemd unit (`lorica.service`) includes:
+The packaged systemd unit (`lorica.service`) ships with a defense-in-depth stack so a future Lorica RCE has a much smaller blast radius. Settings below are grouped by what they deny ; all are active by default in the Debian / RPM package.
+
+**Privilege + capability surface :**
+
 - `NoNewPrivileges=yes`
-- `ProtectSystem=strict`
+- `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` (only capability the proxy needs ; operators who run the cert-export feature with a non-`lorica` owner should add `CAP_CHOWN` to both the bounding and ambient sets)
+- `RestrictSUIDSGID=yes`
+- `PrivateUsers=yes` is intentionally **not** set : incompatible with `CAP_NET_BIND_SERVICE` (a user-namespaced process cannot inherit that capability from its parent). Operators who do not need port 80 / 443 can flip it on manually for a stronger sandbox.
+
+**Filesystem :**
+
+- `ProtectSystem=strict` + `ReadWritePaths=/var/lib/lorica`
 - `ProtectHome=yes`
-- `ReadWritePaths=/var/lib/lorica`
+- `PrivateTmp=yes`
+- `PrivateDevices=yes` (no `/dev/*` raw access)
+- `ProtectKernelTunables=yes` + `ProtectKernelModules=yes` + `ProtectControlGroups=yes`
+- `ProtectClock=yes` (blocks `settimeofday` / `clock_adjtime`)
+- `ProtectHostname=yes` (blocks `sethostname` / `setdomainname`)
+- `ProtectProc=invisible` + `ProcSubset=pid` (hides other services' `/proc` entries and non-pid `/proc` leaks)
+- `UMask=0077`
+
+**Namespaces + memory :**
+
+- `RestrictNamespaces=yes`
+- `LockPersonality=yes`
+- `MemoryDenyWriteExecute=yes`
+- `RestrictRealtime=yes`
+- `KeyringMode=private` (per-service kernel keyring)
+- `RemoveIPC=yes` (cleanup POSIX shm / SysV IPC owned by the `lorica` user on service stop ; Lorica itself uses `memfd_create` so this is a no-op on the happy path)
+
+**Syscall + socket family allowlist :**
+
+- `SystemCallFilter=@system-service` (whitelist baseline)
+- `SystemCallFilter=~@privileged @resources` (subtract `CAP_SYS_ADMIN`-class syscalls and `setrlimit` / `prlimit`)
+- `SystemCallArchitectures=native` (no 32-bit syscall table on x86_64, prevents ABI-switching evasion)
+- `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` (everything else - `AF_PACKET`, `AF_CAN`, `AF_BLUETOOTH`, `AF_AX25` etc. - is denied)
+
+An operator who wants to verify the sandbox is active :
+
+```bash
+systemctl show lorica | grep -E '(Protect|Restrict|Private|Capability|SystemCall)'
+```
 
 ## 6. Monitoring
 
