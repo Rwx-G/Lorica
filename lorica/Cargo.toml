@@ -58,11 +58,13 @@ ammonia = "4"
 sha2 = "0.10"
 bytes = "1"
 # Async DNS resolver for the bot-protection rDNS bypass
-# (v1.4.0 Epic 3 follow-up). `hickory-resolver` 0.24 is the
-# actively-maintained fork of trust-dns with a stable API surface
-# and a small dep footprint. `tokio-runtime` feature only — we do
-# not need the dnssec / dns-over-quic crates here.
-hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
+# (v1.4.0 Epic 3 follow-up). Bumped 0.24 -> 0.26 in v1.5.2
+# (audit L-15) for the CNAME-chain edge-case fixes that landed
+# between 0.24 and 0.26. `tokio-runtime` feature only - we do
+# not need the dnssec / dns-over-quic crates here. The 0.25
+# release renamed `TokioAsyncResolver` -> `TokioResolver` ;
+# the import in `bot_rdns.rs` follows.
+hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"] }
 lru = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "cookies", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }

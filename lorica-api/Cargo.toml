@@ -29,7 +29,12 @@ rand_chacha = "0.9"
 rcgen = "0.13"
 regex = "1"
 ring = "0.17"
-x509-parser = "0.16"
+# Bumped 0.16 -> 0.18 in v1.5.2 (audit L-15) for the BER/DER
+# decoder fixes accumulated since 0.16. API surface used in
+# `certificates.rs` + `routes/mtls.rs` (parse_x509_certificate,
+# prelude::GeneralName::DNSName, prelude::ASN1Time) is stable
+# across the bump.
+x509-parser = "0.18"
 pem = "3"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"], optional = true }
 aws-sdk-route53 = { version = "1", optional = true }
@@ -42,7 +47,23 @@ sysinfo = "0.33"
 # `#![deny(unsafe_code)]` stays intact.
 nix = { version = "0.29", default-features = false, features = ["fs"] }
 thiserror = "2"
-instant-acme = "0.7"
+# Bumped 0.7 -> 0.8 in v1.5.2 (audit L-15). Maintainer is djc
+# (Dirkjan Ochtman, well-known crate maintainer ; low takeover
+# risk). 0.8 added ACME-CAA + revoked-account error handling.
+# API breaks migrated in `acme/{http01,dns01,dns01_manual}.rs` :
+# Account creation goes through `AccountBuilder` ; NewOrder uses
+# the `::new(&identifiers)` constructor ; authorizations are a
+# stream-style iterator ; challenge readiness moved from
+# `Order::set_challenge_ready(url)` to
+# `ChallengeHandle::set_ready()` ; `finalize` lost its CSR arg
+# in favour of a separate `finalize_csr(der)` method.
+# Default features bring `aws-lc-rs` + `hyper-rustls` ; we
+# pin `ring` instead to match the rest of the workspace
+# (`lorica-tls`, `lorica/rustls`) so the binary does not
+# carry two crypto providers in parallel. `rcgen` not needed
+# (we generate the CSR with `rcgen` directly and feed it into
+# `finalize_csr`).
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 async-trait = { workspace = true }
 base64 = "0.22"

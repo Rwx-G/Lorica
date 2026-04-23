@@ -164,6 +164,7 @@ pub(super) async fn provision_with_acme_dns(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
         Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
+        RetryPolicy,
     };
 
     let primary_domain = &domains[0];
@@ -172,158 +173,142 @@ pub(super) async fn provision_with_acme_dns(
     let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
     let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
 
-    let (account, _) = Account::create(
-        &NewAccount {
-            contact: &contact_refs,
-            terms_of_service_agreed: true,
-            only_return_existing: false,
-        },
-        config.directory_url(),
-        None,
-    )
-    .await?;
-
-    // Create order with all domains as identifiers
-    let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
-    let mut order = account
-        .new_order(&NewOrder {
-            identifiers: &identifiers,
-        })
+    // instant-acme 0.8 (audit L-15) : `Account::create` moved to
+    // a builder-mediated path. The builder owns the HTTP client
+    // (default `hyper-rustls` feature) ; `directory_url` is now
+    // an owned `String` ; the rest of the shape is preserved.
+    let (account, _) = Account::builder()?
+        .create(
+            &NewAccount {
+                contact: &contact_refs,
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            config.directory_url().to_string(),
+            None,
+        )
         .await?;
 
-    // Get authorizations (one per domain)
-    let authorizations = order.authorizations().await?;
+    // Create order with all domains as identifiers. instant-acme
+    // 0.8 made `NewOrder`'s extra fields (`replaces`, `profile`)
+    // private and exposes a `NewOrder::new(&identifiers)`
+    // constructor as the public entry point.
+    let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
+    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
 
-    // Phase 1: Create all TXT records before signaling readiness
-    // Track (base_domain, challenge_url) for cleanup and signaling
-    let mut challenge_info: Vec<(String, String)> = Vec::new(); // (base_domain, challenge_url)
+    // instant-acme 0.8 (audit L-15) : authorizations is a
+    // stream-style iterator and ChallengeHandle borrows the
+    // order, so we cannot keep all challenge handles alive
+    // across two phases. Strategy : (1) walk the iterator once
+    // to collect challenge metadata (token + key_authorization
+    // + identifier) AND create the TXT records ; (2) sleep for
+    // DNS propagation ; (3) walk the iterator a SECOND time to
+    // call set_ready on each challenge ; (4) poll_ready for
+    // global readiness. Cleanup of TXT records always runs in
+    // both happy and error paths so the DNS provider does not
+    // accumulate stale `_acme-challenge.<host>` rows.
+    let mut created_records: Vec<String> = Vec::new(); // base_domains we created TXT for
 
-    for auth in &authorizations {
-        if matches!(auth.status, AuthorizationStatus::Valid) {
-            continue;
+    // Phase 1 : create TXT records.
+    {
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result?;
+            if matches!(authz.status, AuthorizationStatus::Valid) {
+                continue;
+            }
+            let challenge = authz
+                .challenge(ChallengeType::Dns01)
+                .ok_or("no DNS-01 challenge available")?;
+            let key_authorization = challenge.key_authorization();
+
+            // For DNS-01, the TXT record value is the
+            // base64url-encoded SHA-256 digest of the key
+            // authorization.
+            use base64::Engine;
+            use ring::digest;
+            let digest_val = digest::digest(&digest::SHA256, key_authorization.as_str().as_bytes());
+            let txt_value =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest_val.as_ref());
+
+            // For wildcards, strip the `*.` prefix for the TXT
+            // record domain. `challenge.identifier()` gives an
+            // `AuthorizedIdentifier` whose Display is the
+            // hostname (matching the legacy
+            // `Identifier::Dns(d).clone()` extraction).
+            let auth_domain = challenge.identifier().to_string();
+            let base_domain = acme_dns_base_domain(&auth_domain).to_string();
+
+            challenger
+                .create_txt_record(&base_domain, &txt_value)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+            created_records.push(base_domain);
         }
-
-        // Find DNS-01 challenge
-        let challenge = auth
-            .challenges
-            .iter()
-            .find(|c| c.r#type == ChallengeType::Dns01)
-            .ok_or("no DNS-01 challenge available")?;
-
-        let key_authorization = order.key_authorization(challenge);
-
-        // For DNS-01, the TXT record value is the base64url-encoded SHA-256 digest
-        // of the key authorization.
-        use base64::Engine;
-        use ring::digest;
-        let digest_val = digest::digest(&digest::SHA256, key_authorization.as_str().as_bytes());
-        let txt_value =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest_val.as_ref());
-
-        // For wildcards, strip the `*.` prefix for the TXT record domain
-        let auth_domain = match &auth.identifier {
-            Identifier::Dns(d) => d.clone(),
-        };
-        let base_domain = acme_dns_base_domain(&auth_domain).to_string();
-
-        // Create TXT record via DNS provider
-        challenger
-            .create_txt_record(&base_domain, &txt_value)
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-
-        challenge_info.push((base_domain, challenge.url.clone()));
     }
 
     // Wait for DNS propagation
     info!(domains = ?domains, "waiting for DNS propagation (30s)");
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-    // Phase 2: Signal readiness for all challenges
-    for (_, url) in &challenge_info {
-        order.set_challenge_ready(url).await?;
-    }
-
-    // Phase 3: Wait for all authorizations to become valid
-    let mut attempts = 0;
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let fresh_auths = order.authorizations().await?;
-
-        let all_valid = fresh_auths
-            .iter()
-            .all(|a| matches!(a.status, AuthorizationStatus::Valid));
-        if all_valid {
-            break;
-        }
-
-        let any_invalid = fresh_auths
-            .iter()
-            .any(|a| matches!(a.status, AuthorizationStatus::Invalid));
-        if any_invalid {
-            // Clean up all TXT records before returning error
-            for (base_domain, _) in &challenge_info {
-                let _ = challenger.delete_txt_record(base_domain).await;
+    // Phase 2 : signal readiness for all challenges by walking
+    // the authorizations again. The second walk re-fetches
+    // server state so set_ready transitions the now-pending
+    // challenge into PROCESSING.
+    {
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result?;
+            if matches!(authz.status, AuthorizationStatus::Valid) {
+                continue;
             }
-            let failed: Vec<String> = fresh_auths
-                .iter()
-                .filter(|a| matches!(a.status, AuthorizationStatus::Invalid))
-                .map(|a| format!("{:?}", a.identifier))
-                .collect();
-            return Err(format!(
-                "DNS-01 challenge validation failed for: {}",
-                failed.join(", ")
-            )
-            .into());
-        }
-
-        attempts += 1;
-        if attempts > 24 {
-            // Clean up all TXT records before returning error
-            for (base_domain, _) in &challenge_info {
-                let _ = challenger.delete_txt_record(base_domain).await;
-            }
-            return Err("DNS-01 challenge validation timed out after 120s".into());
+            let mut challenge = authz
+                .challenge(ChallengeType::Dns01)
+                .ok_or("no DNS-01 challenge available")?;
+            challenge.set_ready().await?;
         }
     }
 
-    // Clean up all TXT records
-    for (base_domain, _) in &challenge_info {
-        if let Err(e) = challenger.delete_txt_record(base_domain).await {
-            warn!(domain = %base_domain, error = %e, "failed to clean up DNS TXT record");
-        }
+    // Phase 3 : wait for all authorizations to become valid (or
+    // hit a terminal failure). `poll_ready` exponentially backs
+    // off and returns the final OrderStatus.
+    let ready_status = order.poll_ready(&RetryPolicy::default()).await;
+
+    // Cleanup TXT records regardless of poll outcome.
+    for base_domain in &created_records {
+        let _ = challenger.delete_txt_record(base_domain).await;
     }
 
-    // Generate CSR with all domains as SANs and finalize order
+    let ready_status = ready_status?;
+    if ready_status != OrderStatus::Ready {
+        return Err(format!(
+            "DNS-01 challenge validation did not reach Ready: {ready_status:?}"
+        )
+        .into());
+    }
+
+    // (TXT-record cleanup already happened just before the
+    // poll_ready check above ; no second pass needed.)
+
+    // Generate CSR with all domains as SANs and finalize order.
+    // `finalize_csr` is the explicit-CSR variant in 0.8 ; the
+    // sibling `finalize()` would use a fresh rcgen key generated
+    // by the crate (requires the `rcgen` feature, which we do
+    // not enable - see `Cargo.toml`).
     let mut params = rcgen::CertificateParams::new(domains.to_vec())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     let private_key = rcgen::KeyPair::generate()?;
     let csr = params.serialize_request(&private_key)?;
 
-    order.finalize(csr.der()).await?;
+    order.finalize_csr(csr.der()).await?;
 
-    // Wait for certificate issuance
-    let mut attempts = 0;
-    let cert_pem = loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let order_state = order.state();
-        match order_state.status {
-            OrderStatus::Valid => {
-                let cert = order.certificate().await?;
-                break cert.ok_or("no certificate returned")?;
-            }
-            OrderStatus::Processing => {
-                attempts += 1;
-                if attempts > 30 {
-                    return Err("certificate issuance timed out".into());
-                }
-                order.refresh().await?;
-            }
-            status => {
-                return Err(format!("unexpected order status: {status:?}").into());
-            }
-        }
-    };
+    // Poll for issuance with exponential backoff. Returns the
+    // PEM-encoded certificate chain on success.
+    let cert_pem = order
+        .poll_certificate(&RetryPolicy::default())
+        .await
+        .map_err(|e| format!("certificate poll failed: {e}"))?;
 
     let key_pem = private_key.serialize_pem();
 

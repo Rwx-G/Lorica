@@ -39,7 +39,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashSet;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+// hickory 0.25 renamed `TokioAsyncResolver` to `TokioResolver`
+// (audit L-15 dep bump) and 0.26 turned the `::tokio(...)`
+// associated function into a builder-mediated path
+// (`Resolver::builder_with_config(...).with_options(...).build()?`).
+// The `Resolver` generic type alias `TokioResolver` is what
+// callers store now ; the builder lives on `Resolver`.
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::rdata::PTR;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::{Resolver, TokioResolver};
 use lru::LruCache;
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
@@ -80,7 +89,7 @@ pub struct RdnsCacheEntry {
 /// initialised state without plumbing a resolver through every
 /// call.
 pub struct RdnsResolver {
-    inner: TokioAsyncResolver,
+    inner: TokioResolver,
     cache: Mutex<LruCache<IpAddr, RdnsCacheEntry>>,
     /// IPs currently being resolved by a background populate task.
     /// `try_spawn_resolve` consults this set before spawning a
@@ -102,10 +111,15 @@ pub struct RdnsResolver {
 impl RdnsResolver {
     /// Build a resolver from the system `/etc/resolv.conf`. Returns
     /// an `io::Error` when the resolv.conf is absent or malformed
-    /// — which in practice only happens on bare containers without
+    /// - which in practice only happens on bare containers without
     /// a DNS configuration. Caller logs and skips registration.
     pub fn from_system_conf() -> std::io::Result<Self> {
-        let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()?;
+        // hickory 0.26 changed `read_system_conf` to return its
+        // own `NetError` instead of `std::io::Error` ; map back
+        // to `io::Error::other` so the public signature stays
+        // stable for callers (audit L-15 dep bump).
+        let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()
+            .map_err(std::io::Error::other)?;
         // Short timeouts — a stuck DNS server must not wedge the
         // background populate task. Two retries + 2 s each = ≤ 6 s
         // end-to-end per lookup, well inside the tokio spawn's
@@ -121,7 +135,17 @@ impl RdnsResolver {
     }
 
     fn build(config: ResolverConfig, opts: ResolverOpts) -> Self {
-        let inner = TokioAsyncResolver::tokio(config, opts);
+        // hickory 0.26 (audit L-15) : `Resolver::builder_with_config`
+        // takes the runtime provider as an explicit arg ; the
+        // `tokio` feature ships `TokioConnectionProvider`.
+        // `with_options` overwrites the system-conf opts (we
+        // already have what we want here, no merge needed).
+        // `build()` is infallible with an explicit config -
+        // `expect` documents that for the next reader.
+        let inner = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(opts)
+            .build()
+            .expect("hickory builder with explicit config is infallible");
         let capacity = NonZeroUsize::new(CACHE_CAPACITY).expect("non-zero cache cap");
         Self {
             inner,
@@ -223,12 +247,21 @@ impl RdnsResolver {
     }
 
     async fn lookup_with_forward_confirm(&self, ip: IpAddr) -> Option<String> {
-        // PTR lookup. hickory returns a list of names; iterate and
-        // take the first that forward-confirms. In practice the
-        // list is length 1 for every real-world rDNS deployment.
+        // PTR lookup. hickory 0.26 (audit L-15) replaced
+        // `ReverseLookup::iter()` with `Lookup::answers() -> &[Record]`
+        // on the generic `Lookup` type ; we filter for `RData::PTR`
+        // variants to recover the names. In practice the list is
+        // length 1 for every real-world rDNS deployment.
         let reverse = self.inner.reverse_lookup(ip).await.ok()?;
-        for name in reverse.iter() {
-            let name_str = name.to_ascii();
+        let names: Vec<String> = reverse
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::PTR(PTR(name)) => Some(name.to_ascii()),
+                _ => None,
+            })
+            .collect();
+        for name_str in names {
             // Forward lookup. Hickory's `lookup_ip` handles both
             // A and AAAA; we scan every returned IpAddr for an
             // equality match with the client.
@@ -269,7 +302,7 @@ static RDNS_HANDLE: OnceLock<Arc<RdnsResolver>> = OnceLock::new();
 
 /// Register the process-wide rDNS resolver. Called once at
 /// startup after the tokio runtime is up (the resolver needs
-/// `TokioAsyncResolver::tokio` which expects a runtime). Second
+/// `TokioResolver::tokio` which expects a runtime). Second
 /// call is a silent no-op.
 pub fn set_handle(resolver: Arc<RdnsResolver>) {
     let _ = RDNS_HANDLE.set(resolver);
@@ -375,18 +408,22 @@ mod tests {
     /// task pending while we inspect `inflight_count`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn try_spawn_resolve_dedups_concurrent_calls_for_same_ip() {
-        use hickory_resolver::config::{NameServerConfig, Protocol};
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig};
         use std::net::SocketAddr;
 
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let mut config = ResolverConfig::new();
-        config.add_name_server(NameServerConfig {
-            socket_addr: addr,
-            protocol: Protocol::Udp,
-            tls_dns_name: None,
-            trust_negative_responses: false,
-            bind_addr: None,
-        });
+        // hickory 0.26 (audit L-15) : `ResolverConfig::new()`
+        // is gone ; use `from_parts(domain, search, name_servers)`
+        // with an empty seed instead.
+        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
+        // hickory 0.26 (audit L-15) : `NameServerConfig` is now
+        // non-exhaustive with `(ip, trust_negative_responses,
+        // connections)`. Connection-level config (port + protocol
+        // + bind_addr) moved to `ConnectionConfig`.
+        let mut conn = ConnectionConfig::udp();
+        conn.port = addr.port();
+        let ns_config = NameServerConfig::new(addr.ip(), false, vec![conn]);
+        config.add_name_server(ns_config);
         let mut opts = ResolverOpts::default();
         opts.timeout = Duration::from_millis(200);
         opts.attempts = 1;
@@ -424,18 +461,22 @@ mod tests {
     /// concurrent tasks (no false dedup across IPs).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn try_spawn_resolve_does_not_dedup_across_ips() {
-        use hickory_resolver::config::{NameServerConfig, Protocol};
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig};
         use std::net::SocketAddr;
 
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let mut config = ResolverConfig::new();
-        config.add_name_server(NameServerConfig {
-            socket_addr: addr,
-            protocol: Protocol::Udp,
-            tls_dns_name: None,
-            trust_negative_responses: false,
-            bind_addr: None,
-        });
+        // hickory 0.26 (audit L-15) : `ResolverConfig::new()`
+        // is gone ; use `from_parts(domain, search, name_servers)`
+        // with an empty seed instead.
+        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
+        // hickory 0.26 (audit L-15) : `NameServerConfig` is now
+        // non-exhaustive with `(ip, trust_negative_responses,
+        // connections)`. Connection-level config (port + protocol
+        // + bind_addr) moved to `ConnectionConfig`.
+        let mut conn = ConnectionConfig::udp();
+        conn.port = addr.port();
+        let ns_config = NameServerConfig::new(addr.ip(), false, vec![conn]);
+        config.add_name_server(ns_config);
         let mut opts = ResolverOpts::default();
         opts.timeout = Duration::from_millis(200);
         opts.attempts = 1;
@@ -469,21 +510,25 @@ mod tests {
     /// bypass category.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolve_and_cache_writes_negative_entry_on_resolver_failure() {
-        use hickory_resolver::config::{NameServerConfig, Protocol};
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig};
         use std::net::SocketAddr;
 
         // 127.0.0.1:1 is deliberately a port nothing listens on —
         // UDP sends will drop / time out. The short opts below cap
         // the test at ≤ 1 s wall-clock.
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let mut config = ResolverConfig::new();
-        config.add_name_server(NameServerConfig {
-            socket_addr: addr,
-            protocol: Protocol::Udp,
-            tls_dns_name: None,
-            trust_negative_responses: false,
-            bind_addr: None,
-        });
+        // hickory 0.26 (audit L-15) : `ResolverConfig::new()`
+        // is gone ; use `from_parts(domain, search, name_servers)`
+        // with an empty seed instead.
+        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
+        // hickory 0.26 (audit L-15) : `NameServerConfig` is now
+        // non-exhaustive with `(ip, trust_negative_responses,
+        // connections)`. Connection-level config (port + protocol
+        // + bind_addr) moved to `ConnectionConfig`.
+        let mut conn = ConnectionConfig::udp();
+        conn.port = addr.port();
+        let ns_config = NameServerConfig::new(addr.ip(), false, vec![conn]);
+        config.add_name_server(ns_config);
         let mut opts = ResolverOpts::default();
         opts.timeout = Duration::from_millis(200);
         opts.attempts = 1;
