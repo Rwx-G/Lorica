@@ -3296,14 +3296,18 @@ impl ProxyHttp for LoricaProxy {
                             match resolver.cache_check(ip_addr, now_i) {
                                 Some(cached) => cached,
                                 None => {
-                                    // Fire-and-forget populate. Bounded
-                                    // by hickory's timeout + attempts
-                                    // config (≤ 6 s). Dropped on
-                                    // runtime shutdown.
-                                    let resolver = resolver.clone();
-                                    tokio::spawn(async move {
-                                        let _ = resolver.resolve_and_cache(ip_addr).await;
-                                    });
+                                    // Fire-and-forget populate via the
+                                    // resolver's bounded `try_spawn_resolve`
+                                    // (v1.5.1 audit L-10). Dedups
+                                    // concurrent misses for the same
+                                    // fresh IP and caps total in-flight
+                                    // resolve tasks at
+                                    // `MAX_INFLIGHT_RESOLVES` (256).
+                                    // Each spawned task is bounded by
+                                    // hickory's own timeout + attempts
+                                    // (≤ 6 s) and dropped on runtime
+                                    // shutdown.
+                                    resolver.try_spawn_resolve(ip_addr);
                                     None
                                 }
                             }
