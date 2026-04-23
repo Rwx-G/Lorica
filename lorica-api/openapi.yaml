@@ -46,6 +46,10 @@ tags:
     description: Notification channel management
   - name: Preferences
     description: User preferences
+  - name: DnsProviders
+    description: DNS provider credentials for ACME DNS-01 challenges
+  - name: Validation
+    description: Pre-flight validation helpers (mTLS PEM, forward-auth health check)
 
 paths:
   # ---------------------------------------------------------------------------
@@ -2339,6 +2343,387 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Validation helpers (v1.5.1 audit M-14 backfill)
+  # ---------------------------------------------------------------------------
+  /api/v1/validate/mtls-pem:
+    post:
+      tags: [Validation]
+      summary: Pre-flight check on a PEM-encoded mTLS CA bundle
+      description: |
+        Parses the supplied PEM and reports the leaf + chain cert
+        details (subject, SANs, validity dates) so the operator
+        can confirm a CA / client cert is well-formed before
+        wiring it into a route's mTLS config.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pem]
+              properties:
+                pem:
+                  type: string
+                  description: One or more `-----BEGIN CERTIFICATE-----` blocks.
+      responses:
+        "200":
+          description: Parse outcome
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/validate/forward-auth:
+    post:
+      tags: [Validation]
+      summary: Pre-flight check on a forward-auth endpoint
+      description: |
+        Issues a probe request to the operator-supplied URL and
+        reports the response shape (status code, latency, returned
+        headers) so the operator can confirm the endpoint is
+        reachable and emits the expected forward-auth contract
+        before binding it to a route.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Probe outcome
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # DNS providers (used by ACME DNS-01)
+  # ---------------------------------------------------------------------------
+  /api/v1/dns-providers:
+    get:
+      tags: [DnsProviders]
+      summary: List configured DNS providers
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Provider list (credentials redacted)
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [DnsProviders]
+      summary: Create a DNS provider credential entry
+      description: |
+        Adds a Cloudflare / OVH / Route53 credential set used by
+        the ACME DNS-01 flow. Credentials are encrypted at rest
+        with the global encryption key.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Provider created
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/dns-providers/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    put:
+      tags: [DnsProviders]
+      summary: Update a DNS provider
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Provider updated
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [DnsProviders]
+      summary: Delete a DNS provider
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Provider deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/dns-providers/{id}/test:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    post:
+      tags: [DnsProviders]
+      summary: Probe the DNS provider credentials end-to-end
+      description: |
+        Issues a "list zones" call against the provider API to
+        confirm the stored credentials are valid and the network
+        path to the provider works. Read-only ; no DNS records
+        are mutated.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Test outcome (success / failure + provider message)
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Notification history
+  # ---------------------------------------------------------------------------
+  /api/v1/notifications/history:
+    get:
+      tags: [Notifications]
+      summary: Recent notification dispatch attempts (in-memory ring buffer)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Recent events + total count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+
+  # ---------------------------------------------------------------------------
+  # SLA bucket clear (v1.5.1 audit M-14 backfill)
+  # ---------------------------------------------------------------------------
+  /api/v1/sla/routes/{id}/data:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    delete:
+      tags: [SLA]
+      summary: Clear all SLA bucket data for one route
+      description: |
+        Wipes the persisted passive + active SLA buckets for the
+        target route. Useful when an operator wants to reset the
+        rolling window after a tuning change or a known-bad
+        outage period that should not skew historical SLA. The
+        SLA config (target_pct, max_latency_ms, etc.) stays
+        intact.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: SLA data cleared
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Probe history
+  # ---------------------------------------------------------------------------
+  /api/v1/probes/{id}/history:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      tags: [Probes]
+      summary: Recent results for one probe (last N executions)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Probe results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------------------------------------------------------------------------
+  # OTel exporter test
+  # ---------------------------------------------------------------------------
+  /api/v1/settings/otel/test:
+    post:
+      tags: [Settings]
+      summary: Probe the configured OTLP exporter endpoint
+      description: |
+        Sends a test span to the operator-configured OTel
+        collector and reports whether the export round-trip
+        succeeded. Useful when wiring up `otlp_endpoint` /
+        `otlp_protocol` for the first time.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Test outcome
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # Logs export
+  # ---------------------------------------------------------------------------
+  /api/v1/logs/export:
+    get:
+      tags: [Logs]
+      summary: Export the persistent access log buffer (CSV / JSONL)
+      description: |
+        Streams the current access-log persistent ring buffer in
+        the requested format. Honours the same `route` / `status`
+        / `since` / `until` filters as `GET /api/v1/logs`.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [csv, jsonl]
+            default: jsonl
+      responses:
+        "200":
+          description: Log payload as a downloadable file
+          content:
+            application/json:
+              schema:
+                type: string
+            text/csv:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # ACME DNS-01 manual : pre-confirm DNS propagation check
+  # ---------------------------------------------------------------------------
+  /api/v1/acme/provision-dns-manual/check:
+    post:
+      tags: [ACME]
+      summary: Verify the operator-published TXT record is visible
+      description: |
+        Queries the public DNS for the `_acme-challenge.<domain>`
+        TXT record and reports whether the expected token is
+        present. Used by the dashboard to gate the "Confirm"
+        button so the operator does not finalise the ACME flow
+        before propagation lands.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain]
+              properties:
+                domain:
+                  type: string
+      responses:
+        "200":
+          description: Probe outcome
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # Certificate ACME renewal
+  # ---------------------------------------------------------------------------
+  /api/v1/certificates/{id}/renew:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    post:
+      tags: [Certificates]
+      summary: Force an ACME renewal for one certificate
+      description: |
+        Triggers an immediate ACME renewal for the named cert
+        regardless of its remaining validity. Honours the cert's
+        recorded ACME method (HTTP-01 / DNS-01) and provider id.
+        Returns the new cert id on success ; the old row is
+        replaced atomically.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Renewal succeeded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cert_id:
+                    type: string
+                    format: uuid
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Renewal failed (ACME server error, DNS, etc.)
 
 components:
   securitySchemes:
