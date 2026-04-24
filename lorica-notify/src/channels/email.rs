@@ -18,12 +18,31 @@ use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
-use super::{EmailConfig, NotifyError};
+use super::{EmailConfig, NotifyError, SmtpEncryption};
 use crate::events::AlertEvent;
+
+/// Default port when `smtp_port` is unset, per encryption mode.
+fn default_port_for(enc: SmtpEncryption) -> u16 {
+    match enc {
+        SmtpEncryption::Starttls => 587,
+        SmtpEncryption::Tls => 465,
+        SmtpEncryption::None => 25,
+    }
+}
 
 /// Send an alert event as a plain-text SMTP email.
 ///
-/// Uses STARTTLS on `smtp_port` (default 587) and authenticates when both
+/// Transport is selected by `smtp_encryption`:
+/// - [`SmtpEncryption::Starttls`] (default) - plaintext then STARTTLS
+///   upgrade, typical port 587. Public-internet relays.
+/// - [`SmtpEncryption::Tls`] - implicit TLS (SMTPS), typical port 465.
+/// - [`SmtpEncryption::None`] - plaintext, no TLS at all. Port 25 LAN
+///   MTA relays (Postfix, sendmail, mailhog, corporate gateways).
+///   Credentials and message bodies travel in clear - operator MUST
+///   constrain this to a trusted network.
+///
+/// When `smtp_port` is unset, falls back to the standard default for
+/// the encryption mode (587 / 465 / 25). Authenticates when both
 /// `smtp_username` and `smtp_password` are provided. Returns
 /// [`NotifyError::Email`] on address parse failures, transport setup
 /// errors, or SMTP send failures.
@@ -56,12 +75,22 @@ pub async fn send(config: &EmailConfig, event: &AlertEvent) -> Result<(), Notify
         .body(body)
         .map_err(|e| NotifyError::Email(format!("failed to build email: {e}")))?;
 
-    let port = config.smtp_port.unwrap_or(587);
+    let port = config
+        .smtp_port
+        .unwrap_or_else(|| default_port_for(config.smtp_encryption));
 
-    let mut transport_builder =
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)
-            .map_err(|e| NotifyError::Email(format!("SMTP relay error: {e}")))?
-            .port(port);
+    let builder = match config.smtp_encryption {
+        SmtpEncryption::Starttls => {
+            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)
+                .map_err(|e| NotifyError::Email(format!("SMTP STARTTLS relay error: {e}")))?
+        }
+        SmtpEncryption::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host)
+            .map_err(|e| NotifyError::Email(format!("SMTP TLS relay error: {e}")))?,
+        SmtpEncryption::None => {
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.smtp_host)
+        }
+    };
+    let mut transport_builder = builder.port(port);
 
     if let (Some(ref username), Some(ref password)) = (&config.smtp_username, &config.smtp_password)
     {
@@ -159,6 +188,7 @@ mod tests {
             smtp_port: None,
             smtp_username: None,
             smtp_password: None,
+            smtp_encryption: SmtpEncryption::Starttls,
             from_address: "not-an-email".into(),
             to_address: "admin@example.com".into(),
         };
@@ -175,6 +205,7 @@ mod tests {
             smtp_port: None,
             smtp_username: None,
             smtp_password: None,
+            smtp_encryption: SmtpEncryption::Starttls,
             from_address: "noreply@example.com".into(),
             to_address: "not-an-email".into(),
         };
@@ -191,6 +222,72 @@ mod tests {
             smtp_port: Some(25),
             smtp_username: None,
             smtp_password: None,
+            smtp_encryption: SmtpEncryption::None,
+            from_address: "noreply@example.com".into(),
+            to_address: "admin@example.com".into(),
+        };
+        let event = AlertEvent::new(AlertType::BackendDown, "test");
+        let result = send(&config, &event).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_default_port_for_starttls_is_587() {
+        assert_eq!(default_port_for(SmtpEncryption::Starttls), 587);
+    }
+
+    #[test]
+    fn test_default_port_for_tls_is_465() {
+        assert_eq!(default_port_for(SmtpEncryption::Tls), 465);
+    }
+
+    #[test]
+    fn test_default_port_for_none_is_25() {
+        assert_eq!(default_port_for(SmtpEncryption::None), 25);
+    }
+
+    #[tokio::test]
+    async fn test_send_with_plaintext_encryption_builds_transport() {
+        // Regression for v1.5.2 bug #2 : sendmail-style port 25 relay
+        // without STARTTLS must not fail at transport-build time.
+        // `192.0.2.1` is TEST-NET-1 (RFC 5737), unroutable so the
+        // send step fails - but that is AFTER the builder_dangerous
+        // branch runs. Previously `starttls_relay` returned a build
+        // error on this shape before the network call was even
+        // attempted.
+        let config = EmailConfig {
+            smtp_host: "192.0.2.1".into(),
+            smtp_port: None, // exercises default_port_for(None) = 25
+            smtp_username: None,
+            smtp_password: None,
+            smtp_encryption: SmtpEncryption::None,
+            from_address: "noreply@example.com".into(),
+            to_address: "admin@example.com".into(),
+        };
+        let event = AlertEvent::new(AlertType::BackendDown, "test");
+        let result = send(&config, &event).await;
+        // Must fail with "SMTP send failed" (network), NOT a
+        // transport-setup error.
+        let err = result.expect_err("unroutable host cannot deliver");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SMTP send failed"),
+            "expected network error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("relay error"),
+            "transport setup should not fail for SmtpEncryption::None, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_with_implicit_tls_builds_transport() {
+        let config = EmailConfig {
+            smtp_host: "192.0.2.1".into(),
+            smtp_port: None, // exercises default_port_for(Tls) = 465
+            smtp_username: None,
+            smtp_password: None,
+            smtp_encryption: SmtpEncryption::Tls,
             from_address: "noreply@example.com".into(),
             to_address: "admin@example.com".into(),
         };

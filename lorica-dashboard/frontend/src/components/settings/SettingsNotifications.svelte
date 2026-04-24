@@ -28,6 +28,7 @@
   // Email fields
   let notifSmtpHost = $state('');
   let notifSmtpPort = $state(587);
+  let notifSmtpEncryption = $state<'starttls' | 'tls' | 'none'>('starttls');
   let notifSmtpUsername = $state('');
   let notifSmtpPassword = $state('');
   let notifFromAddress = $state('');
@@ -76,6 +77,7 @@
     notifConfig = '';
     notifSmtpHost = '';
     notifSmtpPort = 587;
+    notifSmtpEncryption = 'starttls';
     notifSmtpUsername = '';
     notifSmtpPassword = '';
     notifFromAddress = '';
@@ -104,6 +106,11 @@
       if (nc.channel === 'email') {
         notifSmtpHost = cfg.smtp_host || '';
         notifSmtpPort = cfg.smtp_port || 587;
+        // Pre-v1.5.2 configs omit this field : default to starttls
+        // so the drawer reflects the real transport behaviour.
+        notifSmtpEncryption = (cfg.smtp_encryption === 'tls' || cfg.smtp_encryption === 'none')
+          ? cfg.smtp_encryption
+          : 'starttls';
         notifSmtpUsername = cfg.smtp_username || '';
         notifSmtpPassword = ''; // masked, don't populate
         notifFromAddress = cfg.from_address || '';
@@ -115,6 +122,7 @@
         notifAuthHeader = cfg.auth_header || '';
         notifSmtpHost = '';
         notifSmtpPort = 587;
+        notifSmtpEncryption = 'starttls';
         notifSmtpUsername = '';
         notifSmtpPassword = '';
         notifFromAddress = '';
@@ -147,6 +155,7 @@
       configObj = {
         smtp_host: notifSmtpHost,
         smtp_port: notifSmtpPort,
+        smtp_encryption: notifSmtpEncryption,
         from_address: notifFromAddress,
         to_address: notifToAddress,
       };
@@ -279,9 +288,26 @@
             <input id="notif-smtp-host" type="text" bind:value={notifSmtpHost} placeholder="smtp.example.com" required />
           </div>
           <div class="settings-form-row">
+            <label for="notif-smtp-encryption">Encryption</label>
+            <select id="notif-smtp-encryption" bind:value={notifSmtpEncryption}>
+              <option value="starttls">STARTTLS (port 587)</option>
+              <option value="tls">Implicit TLS / SMTPS (port 465)</option>
+              <option value="none">None (plaintext, port 25)</option>
+            </select>
+            <span class="settings-form-hint">
+              {#if notifSmtpEncryption === 'none'}
+                Plaintext SMTP for LAN relays (Postfix, sendmail, mailhog). Never use over an untrusted network.
+              {:else if notifSmtpEncryption === 'tls'}
+                Implicit TLS from the start of the connection.
+              {:else}
+                Start plaintext then upgrade to TLS via STARTTLS.
+              {/if}
+            </span>
+          </div>
+          <div class="settings-form-row">
             <label for="notif-smtp-port">SMTP Port</label>
             <input id="notif-smtp-port" type="number" bind:value={notifSmtpPort} placeholder="587" min="1" max="65535" />
-            <span class="settings-form-hint">587 (STARTTLS) or 465 (SSL)</span>
+            <span class="settings-form-hint">Leave at the default for the selected encryption (587 / 465 / 25) unless your relay uses a custom port.</span>
           </div>
           <div class="settings-form-row">
             <label for="notif-smtp-user">Username</label>
