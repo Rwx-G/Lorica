@@ -1,5 +1,7 @@
 //! Global settings, notification channels, and per-user UI preferences endpoints.
 
+use std::sync::Arc;
+
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
@@ -684,14 +686,20 @@ pub async fn test_notification(
 pub async fn notification_history(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Read from persistent log store (survives restarts)
+    // Read from persistent log store (survives restarts).
+    // Off the tokio worker (audit M-7 / backlog #23) - both calls
+    // hit the SQLite WAL via `Mutex<Connection>` and an unrelated
+    // proxy-side write would otherwise stall the reactor.
     if let Some(ref log_store) = state.log_store {
-        let events = log_store
-            .list_notification_history(200)
-            .map_err(ApiError::Internal)?;
-        let total = log_store
-            .notification_history_count()
-            .map_err(ApiError::Internal)?;
+        let store = Arc::clone(log_store);
+        let (events, total) = tokio::task::spawn_blocking(move || {
+            let events = store.list_notification_history(200)?;
+            let total = store.notification_history_count()?;
+            Ok::<_, String>((events, total))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("notification history join failed: {e}")))?
+        .map_err(ApiError::Internal)?;
         return Ok(json_data(serde_json::json!({
             "events": events,
             "total": total,

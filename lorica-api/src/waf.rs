@@ -14,6 +14,8 @@
 
 //! WAF security events API for the management dashboard.
 
+use std::sync::Arc;
+
 use axum::extract::{Extension, Query};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -65,8 +67,12 @@ pub async fn get_waf_events(
     // the persistent store (so LIMIT applies to the filtered set), and
     // post-query for the in-memory fallback.
     let events = if let Some(ref store) = state.log_store {
-        store
-            .list_waf_events(limit, params.category.as_deref())
+        // Off the tokio worker (audit M-7 / backlog #23).
+        let store = Arc::clone(store);
+        let category = params.category.clone();
+        tokio::task::spawn_blocking(move || store.list_waf_events(limit, category.as_deref()))
+            .await
+            .map_err(|e| ApiError::Internal(format!("waf event query join failed: {e}")))?
             .map_err(|e| ApiError::Internal(format!("waf event query failed: {e}")))?
     } else if let Some(ref waf_buffer) = state.waf_event_buffer {
         let buf = waf_buffer.lock();
@@ -106,7 +112,14 @@ pub async fn get_waf_stats(
 
     // Read from persistent store if available, fall back to in-memory buffer
     let (total_events, by_category) = if let Some(ref store) = state.log_store {
-        match store.waf_event_stats() {
+        // Off the tokio worker. COUNT(*) + GROUP BY can scan the
+        // whole waf_events table under retention (up to 100 000
+        // rows by default).
+        let store = Arc::clone(store);
+        let stats = tokio::task::spawn_blocking(move || store.waf_event_stats())
+            .await
+            .map_err(|e| ApiError::Internal(format!("waf stats join failed: {e}")))?;
+        match stats {
             Ok((total, cats)) => {
                 let by_cat = cats
                     .into_iter()
