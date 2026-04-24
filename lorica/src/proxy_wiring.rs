@@ -1586,6 +1586,7 @@ impl LoricaProxy {
         mut incoming: lorica_command::IncomingCommands,
         store: Arc<tokio::sync::Mutex<lorica_config::ConfigStore>>,
         connection_filter: Option<Arc<crate::connection_filter::GlobalConnectionFilter>>,
+        cert_resolver: Arc<lorica_tls::cert_resolver::CertResolver>,
         worker_id: u32,
     ) -> tokio::task::JoinHandle<()> {
         let proxy_config = Arc::clone(&self.config);
@@ -1625,6 +1626,7 @@ impl LoricaProxy {
                             &gate,
                             worker_id,
                             &store,
+                            &cert_resolver,
                         )
                         .await;
                     }
@@ -1899,6 +1901,7 @@ async fn handle_config_reload_abort(
 /// slot, verifies the generation, and atomically ArcSwaps. A commit
 /// with no pending entry or a mismatched generation replies Error so
 /// the supervisor's coordinator can decide whether to retry.
+#[allow(clippy::too_many_arguments)]
 async fn handle_config_reload_commit(
     inc: lorica_command::IncomingCommand,
     proxy_config: &Arc<ArcSwap<ProxyConfig>>,
@@ -1907,6 +1910,7 @@ async fn handle_config_reload_commit(
     gate: &Arc<lorica_command::GenerationGate>,
     worker_id: u32,
     store: &Arc<tokio::sync::Mutex<lorica_config::ConfigStore>>,
+    cert_resolver: &Arc<lorica_tls::cert_resolver::CertResolver>,
 ) {
     let commit = match inc.command().payload.clone() {
         Some(lorica_command::command::Payload::ConfigReloadCommit(c)) => c,
@@ -1972,6 +1976,12 @@ async fn handle_config_reload_commit(
             crate::reload::apply_geoip_settings_from_store(store).await;
             crate::reload::apply_asn_settings_from_store(store).await;
             crate::reload::apply_bot_secret_from_store(store).await;
+            // Reload the TLS cert resolver so uploaded / ACME-issued
+            // certificates become visible on the worker without a
+            // restart. Previously only the supervisor's single-process
+            // reload path called `reload_cert_resolver`, so in worker
+            // mode the cert set was frozen at worker boot (v1.5.2 fix).
+            crate::reload::reload_cert_resolver(store, cert_resolver).await;
             let _ = inc.reply(lorica_command::Response::ok(0)).await;
         }
         None => {

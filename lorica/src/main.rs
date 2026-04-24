@@ -1419,6 +1419,13 @@ fn run_supervisor(cli: Cli) {
         // task's AppState and the shutdown drain path.
         let api_task_tracker = task_tracker.clone();
         let shutdown_task_tracker = task_tracker.clone();
+        // Clone the alert sender so the ACME renewal + cert-expiry
+        // background tasks spawned inside the API block can surface
+        // alerts through the same dispatcher the health / WAF paths
+        // already use. Single-process mode mirrors this at the matching
+        // spawn site further down (v1.5.2 fix: worker mode was missing
+        // auto-renewal entirely).
+        let api_alert_sender = alert_sender.clone();
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -1458,6 +1465,23 @@ fn run_supervisor(cli: Cli) {
                 .await
                 .with_task_tracker(state.task_tracker.clone());
             let rate_limiter = RateLimiter::new();
+
+            // Spawn ACME auto-renewal (check every 12h, renew at 30 days
+            // before expiry) and cert-expiry notifier for worker mode.
+            // Previously these tasks lived only in the single-process
+            // branch, so worker-mode installs went through cert expiry
+            // without warnings and never auto-renewed (v1.5.2 fix).
+            let _acme_renewal = lorica_api::acme::spawn_renewal_task(
+                state.clone(),
+                std::time::Duration::from_secs(12 * 3600),
+                30,
+                Some(api_alert_sender.clone()),
+            );
+            let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
+                state.clone(),
+                std::time::Duration::from_secs(12 * 3600),
+                api_alert_sender,
+            );
 
             if let Err(e) =
                 lorica_api::server::start_server(management_port, state, session_store, rate_limiter)
@@ -3269,6 +3293,13 @@ fn run_worker(
                     // (audit H-3). Previously `None` left the filter
                     // out of the two-phase semantics.
                     Some(Arc::clone(&connection_filter)),
+                    // Pass the cert resolver so `ConfigReloadCommit`
+                    // propagates uploaded / ACME-issued certificates
+                    // to the worker's TLS stack without a restart
+                    // (v1.5.2 fix - was previously only reloaded by
+                    // single-process `config_reload_rx` or the dead
+                    // legacy `CommandType::ConfigReload` path).
+                    Arc::clone(&cert_resolver),
                     id,
                 );
                 let _sync_handle = lorica_proxy.spawn_rate_limit_sync(
