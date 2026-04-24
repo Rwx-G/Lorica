@@ -2001,7 +2001,7 @@ paths:
                       notifications:
                         type: array
                         items:
-                          type: object
+                          $ref: "#/components/schemas/NotificationConfig"
         "401":
           $ref: "#/components/responses/Unauthorized"
     post:
@@ -2014,7 +2014,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
+              $ref: "#/components/schemas/CreateNotificationRequest"
       responses:
         "201":
           description: Notification channel created
@@ -2024,7 +2024,7 @@ paths:
                 type: object
                 properties:
                   data:
-                    type: object
+                    $ref: "#/components/schemas/NotificationConfig"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -2043,7 +2043,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
+              $ref: "#/components/schemas/UpdateNotificationRequest"
       responses:
         "200":
           description: Notification channel updated
@@ -2053,7 +2053,7 @@ paths:
                 type: object
                 properties:
                   data:
-                    type: object
+                    $ref: "#/components/schemas/NotificationConfig"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2295,7 +2295,7 @@ paths:
                       preferences:
                         type: array
                         items:
-                          type: object
+                          $ref: "#/components/schemas/UserPreference"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2312,7 +2312,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
+              $ref: "#/components/schemas/UpdatePreferenceRequest"
       responses:
         "200":
           description: Preference updated
@@ -2322,7 +2322,7 @@ paths:
                 type: object
                 properties:
                   data:
-                    type: object
+                    $ref: "#/components/schemas/UserPreference"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -3031,6 +3031,100 @@ components:
           properties:
             message:
               type: string
+
+    # v1.5.1 audit L-14 : richer schemas for the
+    # Notification + Preference endpoints that previously
+    # surfaced as `type: object` (no fields). External
+    # consumers (curl users, generated SDKs, third-party
+    # docs) now have the actual contract.
+
+    NotificationConfig:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        channel:
+          type: string
+          enum: [email, webhook, slack]
+        enabled:
+          type: boolean
+        config:
+          type: string
+          description: |
+            Channel-specific JSON blob (encrypted at rest when
+            the store has an encryption key). For Email :
+            `{"smtp_host", "smtp_port"?, "smtp_username"?,
+            "smtp_password"?, "from_address", "to_address"}`. For
+            Webhook / Slack : `{"url", "auth_header"?}`.
+            Channel secrets (`smtp_password`, `url`,
+            `auth_header`) are scrubbed to `**REDACTED**` when
+            this struct surfaces through `GET /api/v1/config/export`
+            and on read paths that do not require the live
+            credential (v1.5.1 audit H-1 + L-5).
+        alert_types:
+          type: array
+          items:
+            type: string
+          description: Alert categories this destination subscribes to (`cert_expiring`, `backend_down`, `waf_alert`, `config_changed`, `sla_breached`, `sla_recovered`, `ip_banned`).
+
+    CreateNotificationRequest:
+      type: object
+      required: [channel, config]
+      properties:
+        channel:
+          type: string
+          enum: [email, webhook, slack]
+        enabled:
+          type: boolean
+          default: true
+        config:
+          type: string
+          description: Channel-specific JSON blob (see `NotificationConfig.config`).
+        alert_types:
+          type: array
+          items:
+            type: string
+
+    UpdateNotificationRequest:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        config:
+          type: string
+        alert_types:
+          type: array
+          items:
+            type: string
+
+    UserPreference:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        preference_key:
+          type: string
+          description: Stable key (e.g. `self_signed_cert`).
+        value:
+          type: string
+          enum: [never, always, once]
+          description: Tri-state preference value.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    UpdatePreferenceRequest:
+      type: object
+      required: [value]
+      properties:
+        value:
+          type: string
+          enum: [never, always, once]
 
     ErrorResponse:
       type: object
