@@ -1472,17 +1472,16 @@ impl LoricaProxy {
     /// Persist a `WafEvent` to the SQLite-backed `LogStore`.
     ///
     /// No-op when no log store is configured (worker mode +
-    /// supervisor-only persistence ; the workers ship events back
-    /// via the metrics-pull RPC instead). Errors are logged at
-    /// `warn!` with the underlying message + the event's rule id
-    /// + category, and bump
-    /// `lorica_waf_event_persist_failed_total` so an operator
-    /// can alert on a stalled persistence path (full disk,
-    /// corrupted DB, schema drift) - v1.5.1 audit L-6 closed the
-    /// silent `let _ = ...` swallow at six call sites in this
-    /// file. The proxy keeps serving regardless ; the in-memory
-    /// ring buffer + Prometheus category counters still surface
-    /// the events, only the persistent forensics trail is broken.
+    /// supervisor-only persistence ; the workers ship events back via
+    /// the metrics-pull RPC instead). Errors are logged at `warn!`
+    /// with the underlying message + the event's rule id + category,
+    /// and bump `lorica_waf_event_persist_failed_total` so an operator
+    /// can alert on a stalled persistence path (full disk, corrupted
+    /// DB, schema drift) - v1.5.1 audit L-6 closed the silent
+    /// `let _ = ...` swallow at six call sites in this file. The
+    /// proxy keeps serving regardless ; the in-memory ring buffer +
+    /// Prometheus category counters still surface the events, only
+    /// the persistent forensics trail is broken.
     fn persist_waf_event(&self, ev: &lorica_waf::WafEvent) {
         if let Some(ref store) = self.log_store {
             if let Err(e) = store.insert_waf_event(ev) {
@@ -1976,13 +1975,30 @@ async fn handle_config_reload_commit(
             crate::reload::apply_geoip_settings_from_store(store).await;
             crate::reload::apply_asn_settings_from_store(store).await;
             crate::reload::apply_bot_secret_from_store(store).await;
+            // Reply BEFORE the cert resolver reload. The supervisor
+            // coordinator's `CONFIG_RELOAD_COMMIT_TIMEOUT` is 500 ms,
+            // and `reload_cert_resolver` does OCSP fetches with a
+            // 10 s per-responder timeout (see `try_fetch_ocsp`). A
+            // slow OCSP responder would otherwise blow the deadline,
+            // trigger the legacy-broadcast fallback, and duplicate
+            // the reload work on a second command channel. Replying
+            // first keeps the two-phase semantics atomic at the
+            // ProxyConfig + connection-filter level (what the 500 ms
+            // deadline actually protects) while letting the TLS
+            // resolver update best-effort in the background of the
+            // same handler. Single-process mode already has this
+            // exact window (see `main.rs:3868-3878` : sequential
+            // `reload_proxy_config_with_mtls` then
+            // `reload_cert_resolver`) - worker mode now matches.
+            let _ = inc.reply(lorica_command::Response::ok(0)).await;
             // Reload the TLS cert resolver so uploaded / ACME-issued
             // certificates become visible on the worker without a
             // restart. Previously only the supervisor's single-process
             // reload path called `reload_cert_resolver`, so in worker
             // mode the cert set was frozen at worker boot (v1.5.2 fix).
+            // Kept last because of the OCSP latency risk documented
+            // above.
             crate::reload::reload_cert_resolver(store, cert_resolver).await;
-            let _ = inc.reply(lorica_command::Response::ok(0)).await;
         }
         None => {
             let _ = inc
