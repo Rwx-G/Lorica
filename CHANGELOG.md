@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-04-24
+
 ### Changed
 
 - v1.5.1 audit M-7 (backlog #23) : six SQLite read / clear handlers in `lorica-api` ran their `LogStore` calls inline inside `pub async fn` bodies. The store methods are sync (`pub fn query(...)`, `lorica-api/src/log_store.rs:155`) and acquire `parking_lot::Mutex<rusqlite::Connection>` ; with WAL + `busy_timeout=5000`, a contended writer in another worker (the proxy access-log path inserts on every request) could stall the tokio reactor for up to 5 seconds, freezing every other handler bound to the same runtime. Six call sites migrated to `tokio::task::spawn_blocking({ let store = Arc::clone(store); move || store.<method>(...) }).await` : `get_logs` (`logs.rs:181`), `export_logs` (`logs.rs:331`), `clear_logs` (`logs.rs:451`), `get_waf_events` (`waf.rs:67`), `get_waf_stats` (`waf.rs:108`), `notification_history` (`settings.rs:688`, two calls fused in one closure since they share the same store handle). `LogsQuery` gained `#[derive(Clone)]` so the params can move into the closure while the surrounding `if let / else` still has the original binding for the in-memory fallback path. Two-tier `?` on every site : the outer `JoinError` becomes an `ApiError::Internal` with a "join failed" prefix so a runtime-shutdown blocking-task abort surfaces distinctly from the SQLite-side error. Behaviour-preserving for healthy traffic ; the blast radius of a stalled SQLite write collapses from "every API handler" to "the one handler that asked for the read". Same pattern that `lorica-api/src/acme/store.rs:120-132` already used. 442 lorica-api tests + the lorica suite stay green.

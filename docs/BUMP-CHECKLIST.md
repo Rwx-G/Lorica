@@ -43,8 +43,9 @@ A handful of user-visible numbers live in code AND in marketing-style docs, and 
 ```bash
 # WAF rule count (code = 49 today : 46 general in `RuleSet::rules` +
 # 3 header-scoped in `RuleSet::header_scoped` since v1.5.2 H-3).
-# Authoritative source is `lorica-waf/src/rules.rs`.
-grep -c '^\s*name: "' lorica-waf/src/rules.rs
+# Authoritative source is `lorica-waf/src/rules.rs` ; one
+# `description: "..."` per rule struct (both vecs).
+grep -c 'description: "' lorica-waf/src/rules.rs
 grep -rn 'OWASP-inspired\|OWASP CRS' README.md COMPARISON.md docs/
 
 # IP blocklist size (~80k today, sourced from Data-Shield IPv4
