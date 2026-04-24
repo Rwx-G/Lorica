@@ -179,7 +179,9 @@ pub async fn provision_dns_manual(
         });
         txt_records_pending.push((txt_record_name, txt_value, auth_domain));
     }
-    drop(authorizations);
+    // `authorizations` borrows `order` ; let NLL release the borrow
+    // here so subsequent `order` calls can re-borrow mut.
+    let _ = authorizations;
 
     if txt_records_out.is_empty() {
         return Err(ApiError::BadRequest(

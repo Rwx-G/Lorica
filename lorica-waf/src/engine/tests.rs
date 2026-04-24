@@ -267,29 +267,29 @@ fn test_clean_request_no_events() {
 
 #[test]
 fn test_url_decode_basic() {
-    assert_eq!(WafEngine::url_decode("%3Cscript%3E"), "<script>");
-    assert_eq!(WafEngine::url_decode("hello+world"), "hello world");
-    assert_eq!(WafEngine::url_decode("no_encoding"), "no_encoding");
+    assert_eq!(WafEngine::url_decode_form("%3Cscript%3E"), "<script>");
+    assert_eq!(WafEngine::url_decode_form("hello+world"), "hello world");
+    assert_eq!(WafEngine::url_decode_form("no_encoding"), "no_encoding");
 }
 
 #[test]
 fn test_url_decode_double_encoded() {
     // %252e = %2e after first decode = . after second (recursive decoding)
-    let decoded = WafEngine::url_decode("%252e%252e");
+    let decoded = WafEngine::url_decode_form("%252e%252e");
     assert_eq!(decoded, "..");
 }
 
 #[test]
 fn test_url_decode_triple_encoded() {
     // %25252e -> %252e -> %2e -> . (three iterations needed)
-    let decoded = WafEngine::url_decode("%25252e");
+    let decoded = WafEngine::url_decode_form("%25252e");
     assert_eq!(decoded, ".");
 }
 
 #[test]
 fn test_url_decode_stable_input() {
     // Already decoded input should remain unchanged
-    assert_eq!(WafEngine::url_decode("hello world"), "hello world");
+    assert_eq!(WafEngine::url_decode_form("hello world"), "hello world");
 }
 
 // --- v1.5.1 audit H-4 : UTF-8 + URI / form variants ---
@@ -518,17 +518,6 @@ fn test_custom_and_builtin_can_both_fire() {
         }
         other => panic!("expected Blocked, got {other:?}"),
     }
-}
-
-#[test]
-fn test_url_decode_legacy_alias_is_form() {
-    // The legacy `url_decode` alias keeps form-style behaviour so
-    // existing tests + downstream callers do not break.
-    assert_eq!(
-        WafEngine::url_decode("hello+world"),
-        WafEngine::url_decode_form("hello+world")
-    );
-    assert_eq!(WafEngine::url_decode("hello+world"), "hello world");
 }
 
 // --- Mode behavior ---

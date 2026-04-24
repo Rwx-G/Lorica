@@ -367,8 +367,8 @@ fn chain_pem_from(pem: &str) -> String {
 /// happens. v1.5.1 audit M-9 (was : every cert-creation path
 /// called the synchronous `export_from_store(&store, &cert)` from
 /// inside the `state.store.lock().await` scope, so a slow disk -
-/// or worse, the cross-mount EXDEV `copy + fsync + rename` fallback
-/// - head-of-line-blocked every other API handler for the duration
+/// or worse, the cross-mount EXDEV `copy + fsync + rename` fallback -
+/// head-of-line-blocked every other API handler for the duration
 /// of the IO).
 ///
 /// Awaits the spawn_blocking handle so the caller's response

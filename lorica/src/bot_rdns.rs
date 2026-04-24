@@ -110,8 +110,8 @@ pub struct RdnsResolver {
 
 impl RdnsResolver {
     /// Build a resolver from the system `/etc/resolv.conf`. Returns
-    /// an `io::Error` when the resolv.conf is absent or malformed
-    /// - which in practice only happens on bare containers without
+    /// an `io::Error` when the resolv.conf is absent or malformed -
+    /// which in practice only happens on bare containers without
     /// a DNS configuration. Caller logs and skips registration.
     pub fn from_system_conf() -> std::io::Result<Self> {
         // hickory 0.26 changed `read_system_conf` to return its

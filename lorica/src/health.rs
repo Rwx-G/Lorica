@@ -37,9 +37,9 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// invocation - one per backend per probe interval (default 5 s).
 /// Each build allocated a connection pool, TLS context, resolver
 /// state, and forced a fresh TCP handshake (no idle-pool reuse)
-/// plus a TLS context setup on every probe ; with 100 backends
-/// + 5 s interval that was 20 client builds / s plus the
-/// connection churn. Mirrors the static-client precedent in
+/// plus a TLS context setup on every probe ; with 100 backends and
+/// a 5 s interval that was 20 client builds / s plus the connection
+/// churn. Mirrors the static-client precedent in
 /// `proxy_wiring/mirror_rewrite.rs::MIRROR_CLIENT` and
 /// `proxy_wiring/forward_auth.rs::FORWARD_AUTH_CLIENT`.
 ///

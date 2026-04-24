@@ -176,7 +176,9 @@ pub(super) async fn provision_with_acme(
         stored_tokens.push(token);
         challenge.set_ready().await?;
     }
-    drop(authorizations);
+    // `authorizations` borrows `order` ; let NLL release the borrow
+    // here so the next `order.poll_ready()` call can re-borrow mut.
+    let _ = authorizations;
 
     // Wait for all authorizations to become valid (or hit a
     // terminal failure). `poll_ready` exponentially backs off

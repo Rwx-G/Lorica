@@ -25,13 +25,12 @@
 //!   decoding. `+` is rewritten to a literal space. Used for the
 //!   query string and request bodies.
 //!
-//! [`WafEngine::url_decode`] is kept as an alias to [`Self::url_decode_form`]
-//! for backward compatibility with the legacy tests and downstream
-//! callers that rely on the original calling convention. The legacy
-//! behaviour was form-style on every field, which inflated the
-//! false-positive surface on paths and headers (a header value
-//! `attacker+payload` decoded to `attacker payload` and could trip
-//! space-anchored signatures like ` or 1=`).
+//! The legacy `url_decode` single-name helper was removed in v1.5.2
+//! (backlog #25 cleanup pass). Callers always go through one of the
+//! explicit `*_uri` / `*_form` variants - the old alias encouraged
+//! form-style decoding on header values, which inflated the
+//! false-positive surface (`attacker+payload` decoded to
+//! `attacker payload` and could trip space-anchored signatures).
 //!
 //! v1.5.1 audit H-4 hardening :
 //!
@@ -66,16 +65,6 @@ impl WafEngine {
     /// rewritten to a literal space.
     pub(super) fn url_decode_form(input: &str) -> String {
         Self::url_decode_recursive(input, true)
-    }
-
-    /// Backward-compatibility alias for [`Self::url_decode_form`].
-    ///
-    /// Existing tests and call sites that did not yet migrate to
-    /// the explicit `*_uri` / `*_form` variants keep working
-    /// because the legacy single function always treated `+` as
-    /// space (form behaviour).
-    pub(super) fn url_decode(input: &str) -> String {
-        Self::url_decode_form(input)
     }
 
     fn url_decode_recursive(input: &str, plus_to_space: bool) -> String {

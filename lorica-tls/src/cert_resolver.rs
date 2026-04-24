@@ -133,7 +133,7 @@ impl CertResolver {
 
         // Sort each domain's certs by expiry descending (longest-lived first)
         for entries in map.values_mut() {
-            entries.sort_by(|a, b| b.not_after_epoch.cmp(&a.not_after_epoch));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.not_after_epoch));
         }
 
         self.inner.store(Arc::new(CertResolverInner { certs: map }));
