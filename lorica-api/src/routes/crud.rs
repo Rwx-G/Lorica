@@ -30,7 +30,36 @@ use super::traffic_splits::{build_traffic_split, validate_traffic_splits, Traffi
 /// enough for any realistic proxy workload while still rejecting
 /// accidental values (e.g. u32::MAX) that would overflow downstream
 /// arithmetic in the token-bucket refill path.
-const RATE_LIMIT_MAX: u32 = 1_000_000;
+///
+/// `pub` so the OpenAPI generator + future SDK builders can read the
+/// same upper bound the validator enforces (audit L-23) - operators
+/// who hit the limit see "rate_limit.capacity must be <= 1000000"
+/// from the API today, but the documented contract should match.
+pub const RATE_LIMIT_MAX: u32 = 1_000_000;
+
+/// Maximum bot-protection cookie TTL (7 days) accepted by the API.
+pub const BOT_COOKIE_TTL_MAX: u32 = 604_800;
+
+/// Minimum bot-protection PoW difficulty (bits of leading-zero
+/// constraint on the SHA-256 challenge digest). Below this the
+/// challenge is trivially solvable on a phone CPU.
+pub const BOT_POW_DIFFICULTY_MIN: u8 = 14;
+
+/// Maximum PoW difficulty. Above this, even a desktop browser may
+/// take seconds to solve the challenge - bad UX.
+pub const BOT_POW_DIFFICULTY_MAX: u8 = 22;
+
+/// Captcha alphabet length bounds. Below 10, the answer space is
+/// too small to be useful ; above 128, the rendered image gets
+/// unreadable.
+pub const BOT_CAPTCHA_ALPHABET_MIN: usize = 10;
+pub const BOT_CAPTCHA_ALPHABET_MAX: usize = 128;
+
+/// Maximum entries per bot-protection bypass category (paths /
+/// hostnames / countries / IPs / user-agent regexes). Above this,
+/// the per-request bypass-matrix evaluation cost crosses into
+/// "single broad config can DoS the proxy" territory.
+pub const BOT_MAX_BYPASS_ENTRIES_PER_CATEGORY: usize = 500;
 
 /// Validate a per-route `GeoIpConfig` for API acceptance. Country
 /// codes must be ISO 3166-1 alpha-2 (two ASCII letters, normalised to
@@ -100,27 +129,24 @@ fn validate_bot_protection(
     // crate constants are not re-exported here to avoid forcing
     // lorica-api to depend on lorica-challenge at compile time —
     // the values are tiny and duplicated as named constants below).
-    const COOKIE_TTL_MAX: u32 = 604_800; // 7 days
-    const POW_DIFFICULTY_MIN: u8 = 14;
-    const POW_DIFFICULTY_MAX: u8 = 22;
-    const CAPTCHA_ALPHABET_MIN: usize = 10;
-    const CAPTCHA_ALPHABET_MAX: usize = 128;
-    const MAX_BYPASS_ENTRIES_PER_CATEGORY: usize = 500;
+    // Audit L-23 : the `BOT_*` and `BYPASS_*` constants are public
+    // so OpenAPI / SDK generators can read the same upper bounds
+    // the validators enforce.
 
     if cfg.cookie_ttl_s == 0 {
         return Err(ApiError::BadRequest(
             "bot_protection.cookie_ttl_s must be > 0".into(),
         ));
     }
-    if cfg.cookie_ttl_s > COOKIE_TTL_MAX {
+    if cfg.cookie_ttl_s > BOT_COOKIE_TTL_MAX {
         return Err(ApiError::BadRequest(format!(
-            "bot_protection.cookie_ttl_s must be <= {COOKIE_TTL_MAX} (7 days)"
+            "bot_protection.cookie_ttl_s must be <= {BOT_COOKIE_TTL_MAX} (7 days)"
         )));
     }
 
-    if !(POW_DIFFICULTY_MIN..=POW_DIFFICULTY_MAX).contains(&cfg.pow_difficulty) {
+    if !(BOT_POW_DIFFICULTY_MIN..=BOT_POW_DIFFICULTY_MAX).contains(&cfg.pow_difficulty) {
         return Err(ApiError::BadRequest(format!(
-            "bot_protection.pow_difficulty must be in {POW_DIFFICULTY_MIN}..={POW_DIFFICULTY_MAX}"
+            "bot_protection.pow_difficulty must be in {BOT_POW_DIFFICULTY_MIN}..={BOT_POW_DIFFICULTY_MAX}"
         )));
     }
 
@@ -128,16 +154,16 @@ fn validate_bot_protection(
     // duplicates. Same rules as `lorica_challenge::captcha::validate_alphabet`
     // so the API + crate agree on the contract.
     let alpha_chars: Vec<char> = cfg.captcha_alphabet.chars().collect();
-    if alpha_chars.len() < CAPTCHA_ALPHABET_MIN {
+    if alpha_chars.len() < BOT_CAPTCHA_ALPHABET_MIN {
         return Err(ApiError::BadRequest(format!(
             "bot_protection.captcha_alphabet shorter than minimum of \
-             {CAPTCHA_ALPHABET_MIN} characters"
+             {BOT_CAPTCHA_ALPHABET_MIN} characters"
         )));
     }
-    if alpha_chars.len() > CAPTCHA_ALPHABET_MAX {
+    if alpha_chars.len() > BOT_CAPTCHA_ALPHABET_MAX {
         return Err(ApiError::BadRequest(format!(
             "bot_protection.captcha_alphabet longer than maximum of \
-             {CAPTCHA_ALPHABET_MAX} characters"
+             {BOT_CAPTCHA_ALPHABET_MAX} characters"
         )));
     }
     {
@@ -166,10 +192,10 @@ fn validate_bot_protection(
     // carries a different element type (String / u32) and
     // trimming / normalisation rules.
     fn check_cap(label: &str, len: usize) -> Result<(), ApiError> {
-        if len > MAX_BYPASS_ENTRIES_PER_CATEGORY {
+        if len > BOT_MAX_BYPASS_ENTRIES_PER_CATEGORY {
             return Err(ApiError::BadRequest(format!(
                 "bot_protection.bypass.{label}: at most \
-                 {MAX_BYPASS_ENTRIES_PER_CATEGORY} entries allowed"
+                 {BOT_MAX_BYPASS_ENTRIES_PER_CATEGORY} entries allowed"
             )));
         }
         Ok(())
