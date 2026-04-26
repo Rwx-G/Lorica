@@ -110,6 +110,20 @@ assert_json "$SET" '.data.cert_export_dir' "/var/lib/lorica/exported-certs" "cer
 assert_json "$SET" '.data.cert_export_file_mode' "416" "cert_export_file_mode persisted"
 assert_json "$SET" '.data.cert_export_dir_mode' "488" "cert_export_dir_mode persisted"
 
+# Pre-create a blanket ACL so the issue + observe block below actually
+# triggers the export. The cert-export ACL table is an allowlist by
+# design (v1.5.0+) : a cert whose hostname matches NO pattern is
+# skipped at export time. The test was previously relying on stale
+# ACL state persisted in the `lorica-cert-export-data` Docker volume
+# from prior sessions ; on a truly clean volume (e.g. fresh CI
+# runner, `docker compose --profile cert-export down -v`), the cert
+# would be created but never written to disk, breaking the
+# "directory exists" assertion 4 lines below.
+BOOTSTRAP_ACL=$(api_post /api/v1/cert-export/acls '{"hostname_pattern":"*"}')
+BOOTSTRAP_ACL_ID=$(echo "$BOOTSTRAP_ACL" | jq -r '.data.id // empty')
+[ -n "$BOOTSTRAP_ACL_ID" ] && ok "bootstrap ACL (* pattern) created" \
+    || { fail "bootstrap ACL create failed: $BOOTSTRAP_ACL"; print_results; }
+
 # --- Issue a self-signed cert -> exporter mirrors to disk ----------------
 log "=== cert-export smoke: issue + observe ==="
 CERT=$(api_post /api/v1/certificates/self-signed '{"domain": "export-smoke.local"}')
@@ -204,6 +218,11 @@ fi
 
 # --- ACL CRUD ------------------------------------------------------------
 log "=== cert-export smoke: ACL CRUD ==="
+# Bootstrap `*` ACL stays in place across this section so the
+# reapply step further down has a matching pattern for the
+# `export-smoke.local` cert (otherwise reapply correctly skips and
+# the EXPORTED >= 1 assertion fails). Counts are adjusted to expect
+# bootstrap + new = 2, then bootstrap-only = 1 after the CRUD delete.
 ACL=$(api_post /api/v1/cert-export/acls '{
     "hostname_pattern": "*.prod.example",
     "allowed_uid": 1001,
@@ -215,11 +234,14 @@ ACL_ID=$(echo "$ACL" | jq -r '.data.id // empty')
 
 LIST=$(api_get /api/v1/cert-export/acls)
 COUNT=$(echo "$LIST" | jq -r '.data.acls | length')
-[ "$COUNT" = "1" ] && ok "ACL list has one row" \
-    || fail "ACL list count expected 1, got $COUNT"
-assert_json "$LIST" '.data.acls[0].hostname_pattern' "*.prod.example" "ACL pattern round-trips"
-assert_json "$LIST" '.data.acls[0].allowed_uid' "1001" "ACL uid round-trips"
-assert_json "$LIST" '.data.acls[0].allowed_gid' "2001" "ACL gid round-trips"
+[ "$COUNT" = "2" ] && ok "ACL list has two rows (bootstrap + CRUD)" \
+    || fail "ACL list count expected 2, got $COUNT"
+# The CRUD ACL is the most recent one ; resolve its index by id
+# rather than indexing 0 since the order is unspecified.
+CRUD_IDX=$(echo "$LIST" | jq -r --arg id "$ACL_ID" '.data.acls | to_entries | map(select(.value.id == $id))[0].key // 0')
+assert_json "$LIST" ".data.acls[$CRUD_IDX].hostname_pattern" "*.prod.example" "ACL pattern round-trips"
+assert_json "$LIST" ".data.acls[$CRUD_IDX].allowed_uid" "1001" "ACL uid round-trips"
+assert_json "$LIST" ".data.acls[$CRUD_IDX].allowed_gid" "2001" "ACL gid round-trips"
 
 # Pattern validation on the wire.
 assert_status POST "$API/api/v1/cert-export/acls" "400" "ACL rejects empty pattern" \
@@ -251,8 +273,10 @@ assert_json "$DEL_AGAIN" '.data.deleted' "$ACL_ID" "ACL delete is idempotent"
 
 LIST_AFTER=$(api_get /api/v1/cert-export/acls)
 COUNT_AFTER=$(echo "$LIST_AFTER" | jq -r '.data.acls | length')
-[ "$COUNT_AFTER" = "0" ] && ok "ACL list is empty after delete" \
-    || fail "ACL list expected 0 after delete, got $COUNT_AFTER"
+# Bootstrap `*` ACL stays after the CRUD delete, so the post-delete
+# count is 1 (was 0 before the bootstrap was added at preflight).
+[ "$COUNT_AFTER" = "1" ] && ok "ACL list down to bootstrap row after CRUD delete" \
+    || fail "ACL list expected 1 after delete, got $COUNT_AFTER"
 
 # --- Disable ends the export pipeline ------------------------------------
 log "=== cert-export smoke: disable path ==="
