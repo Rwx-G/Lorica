@@ -641,7 +641,7 @@ fn run_supervisor(cli: Cli) {
                                             // Workers persist access logs directly via their own
                                             // LogStore, so we only push to the in-memory buffer
                                             // here (for WebSocket streaming to the dashboard).
-                                            sink.push(entry).await;
+                                            sink.push(entry);
                                         }
                                     }
                                     Err(_) => break,
@@ -4127,12 +4127,40 @@ fn spawn_persisted_alert_dispatcher(
                     d.dispatch(&event).await;
                     drop(d);
 
-                    // Persist to log store
+                    // Persist to log store. Both calls are sync rusqlite under
+                    // `parking_lot::Mutex<Connection>` ; running them inline
+                    // would block the alert dispatcher's async reactor (audit
+                    // H-7). Off-load both to one `spawn_blocking` so the
+                    // mutex acquisition + the SELECT COUNT(*) + DELETE pair
+                    // happen on the blocking pool, and surface retention
+                    // failures via the existing notifier-events-dropped metric
+                    // (was a silent `let _ = ...` swallow that left the table
+                    // unbounded if DELETE ever failed).
                     if let Some(ref store) = log_store {
-                        if let Err(e) = store.insert_notification_event(&event) {
-                            tracing::warn!(error = %e, "failed to persist notification event");
+                        let store = Arc::clone(store);
+                        let event_for_blocking = event.clone();
+                        let blocking_outcome = tokio::task::spawn_blocking(move || {
+                            let insert = store.insert_notification_event(&event_for_blocking);
+                            let retention = store.enforce_notification_retention(500);
+                            (insert, retention)
+                        })
+                        .await;
+                        match blocking_outcome {
+                            Ok((insert, retention)) => {
+                                if let Err(e) = insert {
+                                    tracing::warn!(error = %e, "failed to persist notification event");
+                                    lorica_api::metrics::inc_notifier_events_dropped("persist_failed", 1);
+                                }
+                                if let Err(e) = retention {
+                                    tracing::warn!(error = %e, "notification retention enforcement failed");
+                                    lorica_api::metrics::inc_notifier_events_dropped("retention_failed", 1);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "notification persistence task join failed");
+                                lorica_api::metrics::inc_notifier_events_dropped("join_failed", 1);
+                            }
                         }
-                        let _ = store.enforce_notification_retention(500);
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

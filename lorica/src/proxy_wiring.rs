@@ -5386,7 +5386,7 @@ impl ProxyHttp for LoricaProxy {
                     tracing::warn!(error = %e, "failed to persist access log entry");
                 }
             }
-            self.log_buffer.push(entry).await;
+            self.log_buffer.push(entry);
         }
 
         // Record Prometheus metrics (bounded labels: route_id, not hostname)

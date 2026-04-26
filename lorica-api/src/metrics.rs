@@ -858,12 +858,23 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
         }
     }
 
-    // Refresh system metrics
+    // Refresh system metrics. `sys_cache.refresh()` is sync I/O on
+    // /proc (CPU, memory, process) that takes tens of milliseconds
+    // on a busy box. Use `tokio::task::block_in_place` so the current
+    // worker thread can host other tasks during the sync work instead
+    // of stalling the entire reactor for the duration of every
+    // /metrics scrape (audit L-8). Multi-threaded runtime required ;
+    // Lorica's tokio runtime is multi-threaded by default. The lock
+    // itself is brief (no .await crossing) so it stays a tokio Mutex.
     {
         let mut sys_cache = state.system_cache.lock().await;
-        sys_cache.refresh();
-        let cpu = sys_cache.cpu_usage_percent() as f64;
-        let mem = sys_cache.memory_used_bytes() as i64;
+        let (cpu, mem) = tokio::task::block_in_place(|| {
+            sys_cache.refresh();
+            (
+                sys_cache.cpu_usage_percent() as f64,
+                sys_cache.memory_used_bytes() as i64,
+            )
+        });
         set_system_metrics(cpu, mem);
     }
 

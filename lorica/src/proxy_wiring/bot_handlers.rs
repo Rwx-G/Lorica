@@ -370,13 +370,25 @@ pub async fn serve_challenge(
                     return write_plain(session, 503, "bot-protection misconfigured").await;
                 }
             };
-            let (text, png) = match lorica_challenge::captcha::generate(
-                &chars,
-                lorica_challenge::captcha::DEFAULT_CODE_LEN,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
+            // Captcha PNG generation is CPU-bound (~5-15 ms per call,
+            // image render with embedded font + filter). Off-load to
+            // the blocking pool so the async reactor stays free for
+            // other requests during a bot-flood (audit M-9).
+            let captcha_outcome = tokio::task::spawn_blocking(move || {
+                lorica_challenge::captcha::generate(
+                    &chars,
+                    lorica_challenge::captcha::DEFAULT_CODE_LEN,
+                )
+            })
+            .await;
+            let (text, png) = match captcha_outcome {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
                     warn!(error = ?e, "captcha generation failed");
+                    return write_plain(session, 503, "captcha unavailable").await;
+                }
+                Err(e) => {
+                    warn!(error = %e, "captcha generation task join failed");
                     return write_plain(session, 503, "captcha unavailable").await;
                 }
             };

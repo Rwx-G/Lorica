@@ -1123,8 +1123,7 @@ async fn test_logs_endpoint_with_entries() {
                 xff_proxy_ip: String::new(),
                 source: String::new(),
                 request_id: String::new(),
-            })
-            .await;
+            });
     }
 
     let router = app(state, session_store, rate_limiter);
@@ -1175,8 +1174,7 @@ async fn test_logs_endpoint_filtering() {
             xff_proxy_ip: String::new(),
             source: String::new(),
             request_id: String::new(),
-        })
-        .await;
+        });
     state
         .log_buffer
         .push(LogEntry {
@@ -1194,8 +1192,7 @@ async fn test_logs_endpoint_filtering() {
             xff_proxy_ip: String::new(),
             source: String::new(),
             request_id: String::new(),
-        })
-        .await;
+        });
 
     // Filter by route
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1254,8 +1251,7 @@ async fn test_clear_logs_endpoint() {
             xff_proxy_ip: String::new(),
             source: String::new(),
             request_id: String::new(),
-        })
-        .await;
+        });
 
     // Clear logs
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1310,8 +1306,7 @@ async fn test_logs_endpoint_status_range() {
                 xff_proxy_ip: String::new(),
                 source: String::new(),
                 request_id: String::new(),
-            })
-            .await;
+            });
     }
 
     // Filter 4xx-5xx
@@ -1354,8 +1349,7 @@ async fn test_logs_endpoint_time_range() {
             xff_proxy_ip: String::new(),
             source: String::new(),
             request_id: String::new(),
-        })
-        .await;
+        });
     state
         .log_buffer
         .push(LogEntry {
@@ -1373,8 +1367,7 @@ async fn test_logs_endpoint_time_range() {
             xff_proxy_ip: String::new(),
             source: String::new(),
             request_id: String::new(),
-        })
-        .await;
+        });
 
     // Filter: only entries from 12:00 onwards
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
@@ -1418,8 +1411,7 @@ async fn test_logs_endpoint_limit_and_after_id() {
                 xff_proxy_ip: String::new(),
                 source: String::new(),
                 request_id: String::new(),
-            })
-            .await;
+            });
     }
 
     // Limit to 3

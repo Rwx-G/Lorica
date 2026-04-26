@@ -56,8 +56,16 @@ pub struct LogEntry {
 }
 
 /// Thread-safe in-memory ring buffer for access logs with real-time broadcast.
+///
+/// `entries` is a `parking_lot::Mutex` rather than `tokio::sync::RwLock`
+/// because every operation is short, allocation-free, and never crosses
+/// an `.await` (the broadcast `tx.send` does not yield). Using the
+/// async lock here held the write guard across the broadcast send on
+/// every request and serialised the lock-wait queue under load (audit
+/// M-10) ; the synchronous mutex is the right instrument and removes
+/// that contention point.
 pub struct LogBuffer {
-    entries: tokio::sync::RwLock<LogBufferInner>,
+    entries: parking_lot::Mutex<LogBufferInner>,
     /// Broadcast channel for real-time WebSocket subscribers.
     tx: broadcast::Sender<LogEntry>,
 }
@@ -78,7 +86,7 @@ impl LogBuffer {
         assert!(capacity > 0, "LogBuffer capacity must be > 0");
         let (tx, _) = broadcast::channel(2048);
         Self {
-            entries: tokio::sync::RwLock::new(LogBufferInner {
+            entries: parking_lot::Mutex::new(LogBufferInner {
                 buf: Vec::with_capacity(capacity),
                 capacity,
                 next_id: 1,
@@ -89,26 +97,34 @@ impl LogBuffer {
         }
     }
 
-    /// Push a new log entry into the ring buffer and broadcast to WebSocket subscribers.
-    pub async fn push(&self, mut entry: LogEntry) {
-        let mut inner = self.entries.write().await;
-        entry.id = inner.next_id;
-        inner.next_id += 1;
+    /// Push a new log entry into the ring buffer and broadcast to
+    /// WebSocket subscribers. Synchronous - the parking_lot mutex
+    /// is taken briefly, never crosses an `.await`, and the broadcast
+    /// send happens after the guard is dropped.
+    pub fn push(&self, mut entry: LogEntry) {
+        let entry_clone;
+        {
+            let mut inner = self.entries.lock();
+            entry.id = inner.next_id;
+            inner.next_id += 1;
 
-        let entry_clone = entry.clone();
+            entry_clone = entry.clone();
 
-        if inner.buf.len() < inner.capacity {
-            inner.buf.push(entry);
-        } else {
-            let pos = inner.write_pos;
-            inner.buf[pos] = entry;
+            if inner.buf.len() < inner.capacity {
+                inner.buf.push(entry);
+            } else {
+                let pos = inner.write_pos;
+                inner.buf[pos] = entry;
+            }
+            inner.write_pos = (inner.write_pos + 1) % inner.capacity;
+            if inner.len < inner.capacity {
+                inner.len += 1;
+            }
         }
-        inner.write_pos = (inner.write_pos + 1) % inner.capacity;
-        if inner.len < inner.capacity {
-            inner.len += 1;
-        }
 
-        // Broadcast to WebSocket subscribers (ignore if no receivers)
+        // Broadcast to WebSocket subscribers (ignore if no receivers).
+        // Done outside the lock so a slow / contended subscriber list
+        // cannot block the next push.
         let _ = self.tx.send(entry_clone);
     }
 
@@ -118,8 +134,8 @@ impl LogBuffer {
     }
 
     /// Return all entries in chronological order (oldest first).
-    pub async fn snapshot(&self) -> Vec<LogEntry> {
-        let inner = self.entries.read().await;
+    pub fn snapshot(&self) -> Vec<LogEntry> {
+        let inner = self.entries.lock();
         if inner.len < inner.capacity {
             // Buffer not yet full - entries are in order from index 0
             inner.buf.clone()
@@ -135,8 +151,8 @@ impl LogBuffer {
     }
 
     /// Drop every buffered entry and reset the write position.
-    pub async fn clear(&self) {
-        let mut inner = self.entries.write().await;
+    pub fn clear(&self) {
+        let mut inner = self.entries.lock();
         inner.buf.clear();
         inner.write_pos = 0;
         inner.len = 0;
@@ -193,7 +209,7 @@ pub async fn get_logs(
         return Ok(json_data(LogsResponse { entries, total }));
     }
 
-    let all_entries = state.log_buffer.snapshot().await;
+    let all_entries = state.log_buffer.snapshot();
     let limit = params.limit.unwrap_or(200).min(10_000);
 
     let filtered: Vec<LogEntry> = all_entries
@@ -369,7 +385,7 @@ pub async fn export_logs(
             .map_err(|e| ApiError::Internal(format!("log export query failed: {e}")))?
     } else {
         // Fallback: filter in-memory buffer (same logic as get_logs but without limit).
-        let all = state.log_buffer.snapshot().await;
+        let all = state.log_buffer.snapshot();
         all.into_iter()
             .filter(|e| {
                 if let Some(ref route) = logs_query.route {
@@ -482,7 +498,7 @@ pub async fn export_logs(
 pub async fn clear_logs(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state.log_buffer.clear().await;
+    state.log_buffer.clear();
     if let Some(ref store) = state.log_store {
         // `DELETE FROM access_logs` rewrites the WAL and can take a
         // few seconds on a busy DB - off the tokio worker.
@@ -606,11 +622,10 @@ mod tests {
                 xff_proxy_ip: String::new(),
                 source: String::new(),
                 request_id: String::new(),
-            })
-            .await;
+            });
         }
 
-        let snap = buf.snapshot().await;
+        let snap = buf.snapshot();
         assert_eq!(snap.len(), 3);
         assert_eq!(snap[0].id, 1);
         assert_eq!(snap[2].id, 3);
@@ -636,11 +651,10 @@ mod tests {
                 xff_proxy_ip: String::new(),
                 source: String::new(),
                 request_id: String::new(),
-            })
-            .await;
+            });
         }
 
-        let snap = buf.snapshot().await;
+        let snap = buf.snapshot();
         assert_eq!(snap.len(), 3);
         // Should contain entries 3, 4, 5 (oldest first)
         assert_eq!(snap[0].id, 3);
@@ -759,11 +773,10 @@ mod tests {
             xff_proxy_ip: String::new(),
             source: String::new(),
             request_id: String::new(),
-        })
-        .await;
+        });
 
-        assert_eq!(buf.snapshot().await.len(), 1);
-        buf.clear().await;
-        assert_eq!(buf.snapshot().await.len(), 0);
+        assert_eq!(buf.snapshot().len(), 1);
+        buf.clear();
+        assert_eq!(buf.snapshot().len(), 0);
     }
 }
