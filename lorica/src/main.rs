@@ -152,133 +152,6 @@ enum Commands {
     },
 }
 
-/// Guard that must be held alive for the non-blocking file appender to flush.
-/// Stored in main() to keep it alive for the process lifetime.
-#[allow(dead_code)]
-static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
-    std::sync::OnceLock::new();
-
-fn init_logging(log_level: &str, log_format: &str, log_file: Option<&str>) {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::EnvFilter;
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
-
-    // Resolve the writer + ANSI combo once here so the subscriber
-    // composition below has a single source of truth. The non-blocking
-    // file path keeps its `WorkerGuard` alive in a process-wide
-    // static so flushes continue until shutdown; the stdout path
-    // uses ANSI colours. Daily rotation with 14-file retention
-    // bounds disk usage on unattended installs.
-    let (writer, ansi): (tracing_subscriber::fmt::writer::BoxMakeWriter, bool) = if let Some(path) =
-        log_file
-    {
-        let dir = std::path::Path::new(path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let filename = std::path::Path::new(path)
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("lorica.log");
-        let appender = tracing_appender::rolling::RollingFileAppender::builder()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix(filename)
-            .max_log_files(14)
-            .build(dir);
-        let appender = match appender {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!(
-                        "warning: rolling log appender failed for {path}: {e}; falling back to non-rotating append"
-                    );
-                tracing_appender::rolling::never(dir, filename)
-            }
-        };
-        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-        let _ = LOG_GUARD.set(guard);
-        (
-            tracing_subscriber::fmt::writer::BoxMakeWriter::new(non_blocking),
-            false,
-        )
-    } else {
-        (
-            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout),
-            true,
-        )
-    };
-
-    // JSON and text fmt layers have different concrete types, so
-    // the whole subscriber must be built separately in each branch
-    // (`Box<dyn Layer<S>>` does not satisfy the
-    // `Layer<Layered<_, S>>` bound needed when the boxed layer is
-    // then layered on top of another, which is the shape we would
-    // need to lift the OTel bridge out of both branches). The
-    // duplication is the price we pay for leaning on concrete
-    // monomorphic types; each branch composes cleanly and
-    // `init()` accepts the resulting `Layered` stack.
-    //
-    // Inside each branch, when the `otel` feature is on, we add a
-    // `tracing_opentelemetry::layer` wrapped in a `reload::Layer`
-    // so `otel::init` can swap the embedded `BoxedTracer` from its
-    // startup-noop placeholder to a real tracer bound to the
-    // freshly-installed global provider. The reload callback is
-    // stored in `OTEL_RELOAD_HOOK` with its subscriber-chain type
-    // parameters erased behind a `Box<dyn Fn(...)>` so the public
-    // OTel API stays free of subscriber-generic plumbing.
-    if log_format == "text" {
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_timer(tracing_subscriber::fmt::time::SystemTime)
-            .with_ansi(ansi)
-            .with_writer(writer);
-        let subscriber = tracing_subscriber::Registry::default()
-            .with(filter)
-            .with(fmt_layer);
-        #[cfg(feature = "otel")]
-        {
-            let noop_tracer = opentelemetry::global::tracer("lorica");
-            let initial = tracing_opentelemetry::layer().with_tracer(noop_tracer);
-            let (otel_bridge, handle) = tracing_subscriber::reload::Layer::new(initial);
-            let hook: Box<dyn Fn(opentelemetry::global::BoxedTracer) + Send + Sync> =
-                Box::new(move |tracer| {
-                    let _ =
-                        handle.modify(|l| *l = tracing_opentelemetry::layer().with_tracer(tracer));
-                });
-            let _ = lorica::otel::OTEL_RELOAD_HOOK.set(hook);
-            subscriber.with(otel_bridge).init();
-        }
-        #[cfg(not(feature = "otel"))]
-        subscriber.init();
-    } else {
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .json()
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_timer(tracing_subscriber::fmt::time::SystemTime)
-            .with_writer(writer);
-        let subscriber = tracing_subscriber::Registry::default()
-            .with(filter)
-            .with(fmt_layer);
-        #[cfg(feature = "otel")]
-        {
-            let noop_tracer = opentelemetry::global::tracer("lorica");
-            let initial = tracing_opentelemetry::layer().with_tracer(noop_tracer);
-            let (otel_bridge, handle) = tracing_subscriber::reload::Layer::new(initial);
-            let hook: Box<dyn Fn(opentelemetry::global::BoxedTracer) + Send + Sync> =
-                Box::new(move |tracer| {
-                    let _ =
-                        handle.modify(|l| *l = tracing_opentelemetry::layer().with_tracer(tracer));
-                });
-            let _ = lorica::otel::OTEL_RELOAD_HOOK.set(hook);
-            subscriber.with(otel_bridge).init();
-        }
-        #[cfg(not(feature = "otel"))]
-        subscriber.init();
-    }
-}
-
 fn startup_banner(cli: &Cli) {
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -310,7 +183,7 @@ fn main() {
             log_file,
             upstream_crl_file,
         }) => {
-            init_logging(&log_level, &log_format, log_file.as_deref());
+            startup::logging::init(&log_level, &log_format, log_file.as_deref());
             run_worker(
                 id,
                 cmd_fd,
@@ -326,7 +199,7 @@ fn main() {
             cli::unban::run(cli.management_port, &ip, &user, &password);
         }
         None => {
-            init_logging(&cli.log_level, &cli.log_format, cli.log_file.as_deref());
+            startup::logging::init(&cli.log_level, &cli.log_format, cli.log_file.as_deref());
             startup_banner(&cli);
 
             if cli.workers > 0 {
@@ -519,7 +392,7 @@ fn run_supervisor(cli: Cli) {
         let active_connections = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let worker_metrics = Arc::new(lorica_api::workers::WorkerMetrics::new());
 
-        try_init_otel_from_settings(&store, "supervisor").await;
+        startup::otel::try_init_from_settings(&store, "supervisor").await;
 
         // Supervisor-side GeoIP / ASN state. Workers load the `.mmdb`
         // files from disk at fork and keep their own copy (see the
@@ -1700,7 +1573,7 @@ fn run_supervisor(cli: Cli) {
         });
 
         // Wait for shutdown signal
-        shutdown_signal().await;
+        startup::signals::shutdown_signal().await;
 
         info!("supervisor shutting down");
         // CRITICAL ordering: stop the worker monitor BEFORE telling
@@ -2785,7 +2658,7 @@ fn run_worker(
     // worker thus maintains its own independent exporter; spans emitted
     // on one worker do not block another worker's flush queue. The
     // supervisor has its own init (for API / health spans).
-    rt.block_on(try_init_otel_from_settings(&store, "worker"));
+    rt.block_on(startup::otel::try_init_from_settings(&store, "worker"));
 
     // Build CertResolver for TLS termination in worker
     let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
@@ -3581,7 +3454,7 @@ fn run_single_process(cli: Cli) {
             std::process::exit(1);
         }
 
-        try_init_otel_from_settings(&store, "single-process").await;
+        startup::otel::try_init_from_settings(&store, "single-process").await;
 
         // Build the CertResolver for SNI-based certificate selection
         let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
@@ -3965,7 +3838,7 @@ fn run_single_process(cli: Cli) {
         });
 
         // Wait for shutdown signal
-        shutdown_signal().await;
+        startup::signals::shutdown_signal().await;
 
         info!("Lorica shutting down gracefully");
 
@@ -4001,44 +3874,6 @@ fn run_single_process(cli: Cli) {
 ///
 /// Errors are logged at `warn!` and swallowed: observability is not
 /// a critical path, so a misconfigured endpoint never blocks startup.
-async fn try_init_otel_from_settings(store: &Arc<Mutex<lorica_config::ConfigStore>>, role: &str) {
-    let s = store.lock().await;
-    let gs = match s.get_global_settings() {
-        Ok(gs) => gs,
-        Err(e) => {
-            warn!(error = %e, "failed to read global settings for OTel init");
-            return;
-        }
-    };
-    drop(s);
-
-    let Some(endpoint) = gs.otlp_endpoint.as_ref().filter(|e| !e.trim().is_empty()) else {
-        return;
-    };
-
-    let otel_cfg = lorica::otel::OtelConfig {
-        endpoint: endpoint.clone(),
-        protocol: lorica::otel::OtlpProtocol::from_settings(&gs.otlp_protocol),
-        service_name: gs.otlp_service_name.clone(),
-        sampling_ratio: gs.otlp_sampling_ratio,
-    };
-    match lorica::otel::init(&otel_cfg) {
-        Ok(()) => info!(
-            role = role,
-            endpoint = %otel_cfg.endpoint,
-            protocol = otel_cfg.protocol.as_str(),
-            service_name = %otel_cfg.service_name,
-            sampling_ratio = otel_cfg.sampling_ratio,
-            "OpenTelemetry tracing enabled"
-        ),
-        Err(e) => warn!(
-            role = role,
-            error = %e,
-            "OpenTelemetry init failed; tracing disabled (startup continues)"
-        ),
-    }
-}
-
 /// Build a NotifyDispatcher from database notification configs.
 /// Run the SLA data purge if enabled and the schedule matches today.
 /// Returns the day-of-month on which the last purge ran (used as guard to run once per day).
@@ -4194,22 +4029,6 @@ fn restrict_key_permissions(path: &std::path::Path) -> bool {
         return false;
     }
     true
-}
-
-async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-
-    tokio::select! {
-        _ = sigterm.recv() => {
-            warn!("Received SIGTERM");
-        }
-        _ = sigint.recv() => {
-            warn!("Received SIGINT");
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
