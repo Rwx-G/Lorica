@@ -1,5 +1,36 @@
 # Source Tree
 
+> **Status: HISTORICAL (v1.0 baseline) — partially out of date as of v1.5.2.**
+>
+> This document was authored against the v1.0 workspace layout and has
+> drifted in several places (audit M-24, v1.5.2). Rather than chase a
+> moving target by re-flowing the entire tree on every release, treat
+> this file as a high-level orientation map ; for the **canonical
+> current layout** consult the workspace itself :
+>
+> - **Native crates** : `ls lorica*/src/` shows the actual module
+>   layout (notably `lorica-config/src/store/` is now a 17-module
+>   directory, not a single file ; `lorica/src/proxy_wiring/` is a
+>   sub-tree of helpers ; `lorica-api/src/acme/` is a 9-file directory
+>   including `dns_challengers/`).
+> - **Migrations** : `lorica-config/src/migrations/` carries 19 files
+>   today (001 through 019), not the 6 listed below.
+> - **Frontend** : `lorica-dashboard/frontend/src/lib/api.ts` exposes
+>   ~78 distinct paths / 104 operations as of v1.5.2 (cross-checked
+>   against `lorica-api/openapi.yaml`) ; the per-section breakdown
+>   below was a v1.0 snapshot.
+> - **Notification channels** : `lorica-notify/src/channels/` includes
+>   `slack.rs` since v1.4.0 (in addition to `stdout`, `email`, and
+>   `webhook`).
+>
+> A full rewrite is `feat`-shaped (touches a 200-line doc with
+> hand-walked file paths) and tracked in `docs/backlog.md` as a
+> v1.6.0 candidate ; for now, prefer reading the actual `tree`
+> output, the `BUMP-CHECKLIST.md` (which lists every versionable
+> file), and the `CHANGELOG.md` (which calls out architectural moves
+> per release). The high-level "what crate does what" intent below is
+> still a useful first read.
+
 ## Workspace Structure
 
 ```
