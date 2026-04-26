@@ -40,5 +40,12 @@ tokio-rustls = { version = "0.26.0", default-features = false, features = ["ring
 # (audit SC-L-3). The upstream single-file wrapper was flagged
 # unmaintained since 2022; inlining removes the supply-chain
 # takeover surface without functional change.
-x509-parser = "0.16"
+# Bumped 0.16 -> 0.18 in v1.5.2 (audit L-10) to align with
+# `lorica-api`'s `x509-parser` (also 0.18 since L-15) and drop the
+# `asn1-rs` / `oid-registry` / `der-parser` triple-duplication in
+# the dep tree. API surface used here (`pem::parse_x509_pem`,
+# `parse_x509_certificate`, `extensions::{ParsedExtension::Authority
+# InfoAccess, GeneralName::URI}`, `oid_registry::OID_PKIX_ACCESS_
+# DESCRIPTOR_OCSP`) is stable across 0.16 -> 0.17 -> 0.18.
+x509-parser = "0.18"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }

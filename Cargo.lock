@@ -3345,7 +3345,7 @@ dependencies = [
  "rustls-native-certs 0.7.3",
  "rustls-pki-types",
  "tokio-rustls 0.26.4",
- "x509-parser 0.16.0",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]
