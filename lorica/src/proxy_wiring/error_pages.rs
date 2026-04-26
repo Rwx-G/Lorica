@@ -351,6 +351,52 @@ fn badge(is_broken: bool) -> (&'static str, &'static str, &'static str, &'static
     }
 }
 
+/// Render a default-or-custom error page AND write the response back
+/// to the client in one call.
+///
+/// Replaces the 17 inline blocks scattered through `request_filter`
+/// that all repeated the same five-step pattern :
+/// `extract_host` -> `render_error_body` -> `ResponseHeader::build`
+/// -> `insert_header` for `Content-Type` / `Content-Length` ->
+/// `write_response_header` + `write_response_body` + `Ok(true)`.
+///
+/// `extra_headers` is the escape hatch for sites that need additional
+/// headers beyond `Content-Type` / `Content-Length` - rate-limit
+/// rejects pass `("Retry-After", "1")` and `("X-RateLimit-Reset",
+/// reset_ts.to_string())`. Pre-extraction, only one of the seventeen
+/// sites carried `Retry-After` and only one carried
+/// `X-RateLimit-Reset` ; the rest silently dropped them. Folding the
+/// drift into a first-class parameter makes the per-site policy
+/// explicit at the call site instead of buried in five lines of
+/// boilerplate.
+///
+/// Returns `Ok(true)` on success - the request_filter contract for
+/// "this request was handled, do not proxy upstream".
+pub(crate) async fn write_decision(
+    session: &mut lorica_proxy::Session,
+    request_id: &str,
+    status: u16,
+    error_page_html: Option<&str>,
+    reason: &str,
+    extra_headers: &[(&'static str, String)],
+) -> lorica_error::Result<bool> {
+    let host_header = super::helpers::extract_host(session.req_header()).to_string();
+    let body = render_error_body(status, request_id, &host_header, error_page_html, reason);
+    let mut header = lorica_http::ResponseHeader::build(status, None)?;
+    for (name, value) in extra_headers {
+        header.insert_header(*name, value)?;
+    }
+    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+    header.insert_header("Content-Length", body.len().to_string())?;
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::from(body)), true)
+        .await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
