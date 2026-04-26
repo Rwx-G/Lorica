@@ -3355,33 +3355,20 @@ fn run_worker(
     // the supervisor via the pipelined RPC channel every 100 ms. See
     // `spawn_rate_limit_sync` below and design doc § 6.
     lorica_proxy.rate_limit_buckets = lorica::proxy_wiring::RateLimitEngine::local();
-    // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so worker
-    // lookups can resolve client IPs to country codes. Each worker
-    // keeps its own copy (the DB is small — ~3 MiB for DB-IP Lite
-    // Country). The resolver handle is stashed in the per-worker
-    // `lorica::geoip` static so the config-reload path can hot-swap
-    // the DB on setting change, and a periodic 24-hour reload task
-    // below picks up updater-written files on disk. Silent no-op
-    // when the path is unset.
-    lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
-    lorica::geoip::set_asn_handle(Arc::clone(&lorica_proxy.asn_resolver));
-    // rDNS resolver (v1.4.0 follow-up). Must be built inside the
-    // worker's tokio runtime because hickory-resolver's
-    // TokioAsyncResolver latches onto the current runtime at
-    // construction. `rt.enter()` gives us that context.
+    // GeoIP / ASN handles + rDNS resolver init shared with single-process
+    // mode (see `startup/data_plane.rs`). The rDNS constructor latches
+    // onto the current tokio runtime, so we enter `rt` for the call ;
+    // worker mode sits between two `rt.block_on` blocks here, single
+    // mode is already inside its outer `rt.block_on` and skips the
+    // explicit guard.
     {
         let _rt_guard = rt.enter();
-        match lorica::bot_rdns::RdnsResolver::from_system_conf() {
-            Ok(r) => {
-                lorica::bot_rdns::set_handle(Arc::new(r));
-                info!("worker: rDNS resolver initialised from system resolv.conf");
-            }
-            Err(e) => warn!(
-                error = %e,
-                "worker: rDNS resolver init failed; bot_protection.bypass.rdns will be a silent no-op"
-            ),
-        }
+        startup::data_plane::init_data_plane_handles(&lorica_proxy, "worker");
     }
+    // GeoIP / ASN database files: worker loads them inline from settings
+    // here (single-process leaves this to the `apply_supervisor_settings_
+    // from_store` hook called further down). The two roles diverge here
+    // because worker boot does not call the apply hook.
     {
         let s = store.blocking_lock();
         if let Ok(settings) = s.get_global_settings() {
@@ -3423,18 +3410,7 @@ fn run_worker(
     // The spawned tasks outlive the guard (tokio keeps them attached
     // to the runtime itself).
     let _rt_guard = rt.enter();
-    let _basic_auth_prune = lorica_proxy
-        .spawn_basic_auth_cache_prune(&worker_auth_prune_tracker, Duration::from_secs(30));
-    // Per-IP rate-limit buckets need the same lazy-prune treatment:
-    // a scan or high-cardinality traffic pattern would otherwise
-    // accumulate one bucket per distinct IP forever. 5 min idle TTL
-    // matches the shmem WAF eviction cadence.
-    let _rate_limit_prune = lorica_proxy.spawn_rate_limit_prune(
-        &worker_auth_prune_tracker,
-        Duration::from_secs(60),
-        Duration::from_secs(5 * 60),
-    );
-    let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&worker_auth_prune_tracker);
+    startup::data_plane::spawn_data_plane_pruners(&lorica_proxy, &worker_auth_prune_tracker);
     // Spawn the cross-worker sync task when the supervisor provided
     // an RPC socketpair (production worker mode). The task drains
     // `LocalBucket::take_delta` every 100 ms, pushes the batch via
@@ -3806,51 +3782,18 @@ fn run_single_process(cli: Cli) {
         lorica_proxy.alert_sender = Some(alert_sender.clone());
         lorica_proxy.log_store = log_store.clone();
 
-        // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so
-        // the request_filter can resolve client IPs. If auto-update is
-        // enabled, also spawn the periodic refresh task inside the
-        // current tokio runtime. Silent no-op when the path is unset
-        // (installations without GeoIP pay nothing). The resolver
-        // handle is also stashed in the process-wide `lorica::geoip`
-        // static so `reload::apply_geoip_settings_from_store` can
-        // hot-swap the DB when the dashboard changes the path,
-        // without forcing a restart.
-        lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
-        lorica::geoip::set_asn_handle(Arc::clone(&lorica_proxy.asn_resolver));
-        // rDNS resolver for bot-protection's rdns bypass (v1.4.0
-        // follow-up). Built from the system resolv.conf — a
-        // missing / broken file is not fatal, it just disables
-        // the rDNS bypass category for this process (other
-        // bot-protection categories keep working).
-        match lorica::bot_rdns::RdnsResolver::from_system_conf() {
-            Ok(r) => {
-                lorica::bot_rdns::set_handle(Arc::new(r));
-                info!("rDNS resolver initialised from system resolv.conf");
-            }
-            Err(e) => warn!(
-                error = %e,
-                "rDNS resolver init failed; bot_protection.bypass.rdns will be a silent no-op"
-            ),
-        }
-        // Load + auto-update spawn are handled by
-        // `apply_supervisor_settings_from_store` further down, after
-        // `register_supervisor_reload_trigger`. That call does the
-        // initial load via the same hot-reload path that fires on
-        // every dashboard save, so boot and runtime behave identically.
+        // GeoIP / ASN handles + rDNS resolver init shared with worker
+        // mode (see `startup/data_plane.rs`). GeoIP / ASN database file
+        // load is deferred to `apply_supervisor_settings_from_store`
+        // further down (after `register_supervisor_reload_trigger`) so
+        // boot and the dashboard hot-reload path go through identical
+        // code. Worker boot loads the DBs inline because it does not
+        // call the apply hook at boot.
+        startup::data_plane::init_data_plane_handles(&lorica_proxy, "single");
 
-        // Periodic prune of expired basic-auth cache entries so a
-        // password-spray with no successful logins cannot grow the
-        // cache unboundedly until next restart (PERF-8).
-        let _basic_auth_prune = lorica_proxy
-            .spawn_basic_auth_cache_prune(&single_task_tracker, Duration::from_secs(30));
-        // Same lazy-prune for per-IP rate-limit buckets; see worker
-        // path comment for rationale.
-        let _rate_limit_prune = lorica_proxy.spawn_rate_limit_prune(
-            &single_task_tracker,
-            Duration::from_secs(60),
-            Duration::from_secs(5 * 60),
-        );
-        let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&single_task_tracker);
+        // Lazy-prune background tasks (basic-auth cache, per-IP rate-
+        // limit buckets, bot challenge stash). See `startup/data_plane.rs`.
+        startup::data_plane::spawn_data_plane_pruners(&lorica_proxy, &single_task_tracker);
         let backend_conns = Arc::clone(&lorica_proxy.backend_connections);
         let health_backend_conns = Arc::clone(&backend_conns);
         let proxy_cache_hits = Arc::clone(&lorica_proxy.cache_hits);

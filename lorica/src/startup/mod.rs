@@ -16,3 +16,4 @@
 //! where one role silently misses a spawn that landed in the others.
 
 pub mod control_plane;
+pub mod data_plane;
