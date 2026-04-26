@@ -23,6 +23,16 @@
   // Live test state
   let progress: LoadTestProgress | null = $state(null);
   let wsConn: WebSocket | null = $state(null);
+  // v1.5.1 audit M-13 : the `ws.onclose` reconnect path used to
+  // call `setTimeout(connectWS, 3000)` without storing the timer
+  // id, so navigating away during the 3 s backoff window left
+  // the timer alive ; it fired after `onDestroy`, opened a fresh
+  // WebSocket with no consumer, and accumulated one zombie
+  // connection per navigate-out-and-back-in cycle. Track the
+  // pending reconnect timer + the mounted state so onDestroy can
+  // cancel both pending and future reconnects.
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let mounted = false;
 
   // Results
   let selectedConfigId = $state('');
@@ -71,15 +81,30 @@
   }
 
   onMount(() => {
+    mounted = true;
     loadData();
     connectWS();
   });
 
   onDestroy(() => {
+    // v1.5.1 audit M-13 : cancel a pending reconnect AND mark
+    // the component unmounted so any in-flight `ws.onclose`
+    // that fires after this point short-circuits in `connectWS`
+    // instead of opening a zombie WebSocket.
+    mounted = false;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     if (wsConn) wsConn.close();
   });
 
   function connectWS() {
+    // Gate the spawn on the mounted flag so a stale reconnect
+    // timer that survived the cancel race in onDestroy (or a
+    // future caller from a different lifecycle hook) cannot
+    // open a fresh WebSocket on a destroyed component.
+    if (!mounted) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${proto}//${location.host}/api/v1/loadtest/ws`);
     ws.onmessage = (e) => {
@@ -100,7 +125,16 @@
     ws.onerror = () => { progress = null; };
     ws.onclose = () => {
       wsConn = null;
-      setTimeout(connectWS, 3000);
+      // Track the reconnect timer so onDestroy can cancel it
+      // (v1.5.1 audit M-13). Skip scheduling the reconnect at
+      // all when the component is already unmounting - the
+      // close was triggered by our own onDestroy and there is
+      // nothing to reconnect to.
+      if (!mounted) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectWS();
+      }, 3000);
     };
     wsConn = ws;
   }

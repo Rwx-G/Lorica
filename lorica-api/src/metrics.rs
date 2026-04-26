@@ -22,7 +22,8 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Registry, TextEncoder,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    Registry, TextEncoder,
 };
 
 use crate::server::AppState;
@@ -157,9 +158,16 @@ static SYSTEM_MEMORY_USED_BYTES: Lazy<IntGauge> = Lazy::new(|| {
 });
 
 /// Record an HTTP request in the metrics.
+///
+/// Uses `itoa::Buffer` instead of `status_code.to_string()` so the
+/// per-request hot path doesn't allocate a 3-char `String` for a
+/// label that's always `100..=599`. Mirrors the existing itoa usage
+/// in `proxy_wiring.rs` for header rule indices (audit M-15).
 pub fn record_request(route_id: &str, status_code: u16, latency_seconds: f64) {
+    let mut status_buf = itoa::Buffer::new();
+    let status_str = status_buf.format(status_code);
     HTTP_REQUESTS_TOTAL
-        .with_label_values(&[route_id, &status_code.to_string()])
+        .with_label_values(&[route_id, status_str])
         .inc();
     HTTP_REQUEST_DURATION_SECONDS
         .with_label_values(&[route_id])
@@ -663,6 +671,41 @@ pub fn inc_logs_ws_dropped(reason: &str, count: u64) {
         .inc_by(count);
 }
 
+/// Counter: WAF event persistence failures (v1.5.1 audit L-6).
+///
+/// Bumped each time the proxy hot path tries to persist a
+/// `WafEvent` to the SQLite-backed `LogStore` and the call
+/// returns `Err`. Pre-fix, every call site swallowed the result
+/// with `let _ = ...` so a full disk / corrupted DB / schema
+/// mismatch silently dropped events without an operator signal.
+/// The companion log line at `tracing::warn!` carries the
+/// underlying error string + the rule id / category so the
+/// counter is "is the persistence working ?" and the log line
+/// is "what failed". Non-zero values warrant investigation -
+/// the proxy keeps running (events still flow through the
+/// in-memory ring buffer + Prometheus categories), but the
+/// persistent forensics trail is broken.
+static WAF_EVENT_PERSIST_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::with_opts(
+        prometheus::opts!(
+            "waf_event_persist_failed_total",
+            "WAF events the proxy could not persist to the LogStore"
+        )
+        .namespace("lorica"),
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Bump the WAF-event-persistence-failed counter by one.
+///
+/// Called from `LoricaProxy::persist_waf_event` whenever a
+/// `LogStore::insert_waf_event` call returns `Err`.
+pub fn inc_waf_event_persist_failed() {
+    WAF_EVENT_PERSIST_FAILED_TOTAL.inc();
+}
+
 /// Counter: BanIp commands dropped by the supervisor -> worker
 /// broadcast channel when a worker subscriber falls behind the
 /// bounded queue. Non-zero values signal that the ban channel
@@ -731,6 +774,111 @@ pub fn inc_ban_broadcast_lagged(worker_id: &str, count: u64) {
         .inc_by(count);
 }
 
+/// Counter: ConfigReload broadcast messages missed by a worker
+/// subscriber due to channel-capacity overflow. Same shape as
+/// `ban_broadcast_lagged_total` ; non-zero means the legacy reload
+/// broadcast (used as fallback when the two-phase RPC fails) lost
+/// reload notifications faster than the worker could consume them.
+/// The supervisor catches up by re-issuing a single ConfigReload on
+/// the next iteration so the worker reaches the latest DB state, but
+/// individual `seq` numbers are dropped on the floor (audit C-2).
+static RELOAD_BROADCAST_LAGGED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "reload_broadcast_lagged_total",
+            "ConfigReload broadcast messages missed by a worker subscriber due to channel lag"
+        )
+        .namespace("lorica"),
+        &["worker_id"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one or more ConfigReload broadcast messages lagged on a
+/// given worker's subscription.
+pub fn inc_reload_broadcast_lagged(worker_id: &str, count: u64) {
+    RELOAD_BROADCAST_LAGGED_TOTAL
+        .with_label_values(&[worker_id])
+        .inc_by(count);
+}
+
+/// Counter: per-process resolver hooks (`apply_geoip` / `apply_asn`
+/// / `apply_otel` / `apply_bot_secret`) that failed to apply because
+/// the store fetch returned `Err`. Non-zero values pin the matching
+/// resolver state at whatever was last applied successfully and are
+/// only recoverable by the next successful settings read - so a
+/// transient SQLite error during a `.mmdb` autoupdate cycle would
+/// otherwise freeze the resolver for the lifetime of the process
+/// without any operator-visible signal (audit M-19).
+static RESOLVER_APPLY_FAILED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "resolver_apply_failed_total",
+            "Per-process resolver hook failed to apply settings (store fetch error)"
+        )
+        .namespace("lorica"),
+        &["kind"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one resolver-apply failure. `kind` is one of `geoip`,
+/// `asn`, `otel`, `bot_secret`.
+pub fn inc_resolver_apply_failed(kind: &str) {
+    RESOLVER_APPLY_FAILED_TOTAL
+        .with_label_values(&[kind])
+        .inc();
+}
+
+/// Counter: bot verdict cross-worker propagation RPCs (worker ->
+/// supervisor verdict cache push) that failed. Bot cache propagation
+/// is fire-and-forget (the local worker is already populated, so a
+/// failure only delays cross-worker sharing) but a non-zero rate
+/// flags a stuck supervisor RPC channel and was previously a silent
+/// `let _ = endpoint.request_rpc(...).await` swallow (audit L-14).
+static BOT_VERDICT_PUSH_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "lorica_bot_verdict_push_failed_total",
+        "Bot verdict cross-worker propagation RPCs (worker -> supervisor) that failed",
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one bot-verdict-push RPC failure.
+pub fn inc_bot_verdict_push_failed() {
+    BOT_VERDICT_PUSH_FAILED_TOTAL.inc();
+}
+
+/// Counter: two-phase config reload rounds where the Commit phase
+/// partially succeeded - some workers committed, others failed
+/// (timeout / error). The supervisor coordinator falls back to the
+/// legacy broadcast which makes the failed workers re-do the work
+/// via the legacy ConfigReload handler ; in the interim the fleet
+/// is split (different workers serving different generations of the
+/// config). Audit M-17 ; non-zero values flag a real fleet-coherence
+/// gap that operators need to know about even though the system
+/// self-heals on the next reload.
+static CONFIG_RELOAD_SPLIT_FLEET_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "lorica_config_reload_split_fleet_total",
+        "Config reload commits where some workers committed and others failed (transient fleet split)",
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one config-reload split-fleet event.
+pub fn inc_config_reload_split_fleet() {
+    CONFIG_RELOAD_SPLIT_FLEET_TOTAL.inc();
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,
@@ -792,12 +940,23 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
         }
     }
 
-    // Refresh system metrics
+    // Refresh system metrics. `sys_cache.refresh()` is sync I/O on
+    // /proc (CPU, memory, process) that takes tens of milliseconds
+    // on a busy box. Use `tokio::task::block_in_place` so the current
+    // worker thread can host other tasks during the sync work instead
+    // of stalling the entire reactor for the duration of every
+    // /metrics scrape (audit L-8). Multi-threaded runtime required ;
+    // Lorica's tokio runtime is multi-threaded by default. The lock
+    // itself is brief (no .await crossing) so it stays a tokio Mutex.
     {
         let mut sys_cache = state.system_cache.lock().await;
-        sys_cache.refresh();
-        let cpu = sys_cache.cpu_usage_percent() as f64;
-        let mem = sys_cache.memory_used_bytes() as i64;
+        let (cpu, mem) = tokio::task::block_in_place(|| {
+            sys_cache.refresh();
+            (
+                sys_cache.cpu_usage_percent() as f64,
+                sys_cache.memory_used_bytes() as i64,
+            )
+        });
         set_system_metrics(cpu, mem);
     }
 

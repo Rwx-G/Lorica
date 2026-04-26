@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [fuzz_waf_evaluate, fuzz_api_input]
+        target: [fuzz_waf_evaluate, fuzz_api_input, fuzz_ocsp_response]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

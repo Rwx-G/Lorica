@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { api, type SystemResponse, type WorkerStatus } from '../lib/api';
+  import { formatBytes } from '../lib/format';
   import Card from '../components/Card.svelte';
 
   let system: SystemResponse | null = $state(null);
@@ -39,14 +40,6 @@
       clearInterval(refreshInterval);
       refreshInterval = null;
     }
-  }
-
-  function formatBytes(bytes: number): string {
-    if (bytes === 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    const val = bytes / Math.pow(1024, i);
-    return `${val.toFixed(1)} ${units[i]}`;
   }
 
   function formatUptime(seconds: number): string {
@@ -168,7 +161,7 @@
         <span class="gauge-value" style="color: {gaugeColor(system.host.memory_usage_percent)}">
           {system.host.memory_usage_percent.toFixed(1)}%
         </span>
-        <span class="gauge-detail">{formatBytes(system.host.memory_used_bytes)} / {formatBytes(system.host.memory_total_bytes)}</span>
+        <span class="gauge-detail">{formatBytes(system.host.memory_used_bytes, { units: 'decimal' })} / {formatBytes(system.host.memory_total_bytes, { units: 'decimal' })}</span>
       </div>
 
       {#if system.host.disk_root}
@@ -184,7 +177,7 @@
         <span class="gauge-value" style="color: {gaugeColor(system.host.disk_root.usage_percent)}">
           {system.host.disk_root.usage_percent.toFixed(1)}%
         </span>
-        <span class="gauge-detail">{formatBytes(system.host.disk_root.used_bytes)} / {formatBytes(system.host.disk_root.total_bytes)}</span>
+        <span class="gauge-detail">{formatBytes(system.host.disk_root.used_bytes, { units: 'decimal' })} / {formatBytes(system.host.disk_root.total_bytes, { units: 'decimal' })}</span>
       </div>
       {/if}
 
@@ -206,14 +199,14 @@
         <span class="gauge-value" style="color: {gaugeColor(system.host.disk_data.usage_percent)}">
           {system.host.disk_data.usage_percent.toFixed(1)}%
         </span>
-        <span class="gauge-detail">{formatBytes(system.host.disk_data.used_bytes)} / {formatBytes(system.host.disk_data.total_bytes)}</span>
+        <span class="gauge-detail">{formatBytes(system.host.disk_data.used_bytes, { units: 'decimal' })} / {formatBytes(system.host.disk_data.total_bytes, { units: 'decimal' })}</span>
       </div>
       {/if}
     </div>
 
     <h2>Lorica Process</h2>
     <div class="card-grid">
-      <Card title="Process Memory" value={formatBytes(system.process.memory_bytes)} />
+      <Card title="Process Memory" value={formatBytes(system.process.memory_bytes, { units: 'decimal' })} />
       <Card title="Process CPU" value="{system.process.cpu_usage_percent.toFixed(1)}%" />
     </div>
   {/if}

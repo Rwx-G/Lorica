@@ -355,9 +355,27 @@ impl WorkerManager {
     /// increments and a delay of `min(2^count, 30)` seconds is applied.
     /// If it ran long enough, the counter resets.
     ///
-    /// Returns the new worker's command channel FD (for re-registering in the
-    /// supervisor's channel map).
-    pub fn restart_worker(&mut self, id: u32) -> Result<Option<OwnedFd>, WorkerError> {
+    /// Returns the new worker's BOTH socketpair file descriptors -
+    /// the legacy `cmd_fd` (Heartbeat / ConfigReload / BanIp) AND the
+    /// pipelined `rpc_fd` (two-phase config reload, metrics pull,
+    /// rate-limit / verdict / breaker RPCs) - so the supervisor's
+    /// crash branch can re-register BOTH channels (audit C-1
+    /// closure : the previous signature `Result<Option<OwnedFd>, _>`
+    /// only carried the cmd_fd, so the supervisor never re-registered
+    /// the respawned worker's RPC endpoint and subsequent two-phase
+    /// config reloads silently skipped it).
+    ///
+    /// **The caller must sleep `self.restart_backoff(id)` BEFORE
+    /// calling this function** - audit M-26 closure. The previous
+    /// version did `std::thread::sleep` internally, which blocked the
+    /// supervisor tokio thread for up to 30 s and starved every other
+    /// task on the same runtime (heartbeats from peer workers, API
+    /// requests, OTel exports). The split lets the caller use
+    /// `tokio::time::sleep` instead.
+    pub fn restart_worker(
+        &mut self,
+        id: u32,
+    ) -> Result<Option<(OwnedFd, OwnedFd)>, WorkerError> {
         // Retrieve the old handle's backoff state
         let (prev_restart_count, prev_spawned_at) = self
             .workers
@@ -368,25 +386,17 @@ impl WorkerManager {
 
         self.workers.retain(|w| w.id != id);
 
-        // Reset counter if the worker was stable, otherwise increment
+        // Reset counter if the worker was stable, otherwise increment.
+        // Mirrors the formula in `restart_backoff` ; the two are kept
+        // in sync because the caller is expected to call
+        // `restart_backoff` then sleep then `restart_worker` under
+        // separate locks (no other thread mutates `self.workers`
+        // between the two calls).
         let next_count = if prev_spawned_at.elapsed() >= STABLE_THRESHOLD {
             0
         } else {
             prev_restart_count + 1
         };
-
-        // Apply exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s, ...
-        if next_count > 0 {
-            let delay_secs = (1u64 << (next_count - 1).min(5)).min(MAX_BACKOFF.as_secs());
-            let delay = Duration::from_secs(delay_secs);
-            warn!(
-                worker_id = id,
-                restart_count = next_count,
-                backoff_secs = delay_secs,
-                "applying restart backoff"
-            );
-            std::thread::sleep(delay);
-        }
 
         info!(
             worker_id = id,
@@ -408,13 +418,53 @@ impl WorkerManager {
         self.listen_fds.clear();
         self.listen_addrs.clear();
 
-        // Return the cmd_fd of the newly spawned worker
-        let fd = self
+        // Take BOTH the cmd_fd AND the rpc_fd of the newly spawned
+        // worker (audit C-1 closure - see fn-doc above).
+        let fds = self
             .workers
             .iter_mut()
             .find(|w| w.id == id)
-            .and_then(|w| w.take_cmd_fd());
-        Ok(fd)
+            .and_then(|w| {
+                let cmd = w.take_cmd_fd()?;
+                let rpc = w.take_rpc_fd()?;
+                Some((cmd, rpc))
+            });
+        Ok(fds)
+    }
+
+    /// Compute the exponential-backoff delay BEFORE the next call to
+    /// `restart_worker(id)`. Read-only - the caller is responsible for
+    /// actually sleeping (with `tokio::time::sleep`, NOT the synchronous
+    /// `std::thread::sleep` that previously blocked the supervisor's
+    /// tokio thread for up to 30 s, audit M-26 closure).
+    ///
+    /// Returns `Duration::ZERO` for stable workers (those that ran past
+    /// the `STABLE_THRESHOLD` window before crashing) ; otherwise
+    /// returns `min(2^restart_count, MAX_BACKOFF)`.
+    pub fn restart_backoff(&self, id: u32) -> Duration {
+        let (prev_restart_count, prev_spawned_at) = self
+            .workers
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| (w.restart_count, w.spawned_at))
+            .unwrap_or((0, Instant::now()));
+        let next_count = if prev_spawned_at.elapsed() >= STABLE_THRESHOLD {
+            0
+        } else {
+            prev_restart_count + 1
+        };
+        if next_count > 0 {
+            let delay_secs = (1u64 << (next_count - 1).min(5)).min(MAX_BACKOFF.as_secs());
+            warn!(
+                worker_id = id,
+                restart_count = next_count,
+                backoff_secs = delay_secs,
+                "computed restart backoff (caller must tokio::time::sleep before calling restart_worker)"
+            );
+            Duration::from_secs(delay_secs)
+        } else {
+            Duration::ZERO
+        }
     }
 
     /// Send SIGTERM to all workers for graceful shutdown.

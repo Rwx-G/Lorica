@@ -50,6 +50,53 @@ MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
 UMask=0077
+# v1.5.2 audit M-1 - modern systemd hardening triad.
+# Defense-in-depth : none of these are single-points-of-failure
+# by themselves, but together they shrink the post-RCE blast
+# radius considerably if any part of the proxy ever gets
+# compromised.
+# Block access to the system clock (Lorica does not need to
+# set time ; restricts `settimeofday` / `clock_adjtime` / etc).
+ProtectClock=yes
+# Block `sethostname` / `setdomainname` (never called by the proxy).
+ProtectHostname=yes
+# Hide other processes from /proc so a future Lorica RCE cannot
+# pivot onto colocated services by reading /proc/*/environ or
+# /proc/*/cmdline. `invisible` means non-self processes are
+# not visible ; `ProcSubset=pid` hides non-pid /proc entries
+# (/proc/kmsg, /proc/kcore, etc) that leak kernel info.
+ProtectProc=invisible
+ProcSubset=pid
+# Socket families the proxy actually uses :
+#   AF_INET / AF_INET6 - HTTP listeners + upstream connects
+#   AF_UNIX            - worker command channel + fd-passing
+#                        via SCM_RIGHTS for privileged ports
+# AF_NETLINK stays allowed because the DNS resolver (hickory)
+# and some glibc internals use it opportunistically ; keeping
+# it here keeps legitimate behaviour working while still
+# blocking AF_PACKET / AF_CAN / AF_BLUETOOTH / AF_AX25 / etc.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# Remove any POSIX shm / SysV IPC owned by the lorica user on
+# service stop. Lorica itself uses `memfd_create` (process-local,
+# GCed when FDs close) not POSIX shm, so this is a no-op on the
+# happy path - the defense is against a compromised process
+# leaving stale shm segments behind.
+RemoveIPC=yes
+# Block `/dev/*` raw access. The proxy reads certs + opens
+# sockets ; it does not need block devices, raw disks, or
+# `/dev/mem`.
+PrivateDevices=yes
+# Each service gets its own kernel keyring. Prevents a future
+# RCE from reading keys another colocated service put in the
+# user keyring.
+KeyringMode=private
+# Additional blacklist on top of `@system-service` :
+#   @privileged - CAP_SYS_ADMIN-class syscalls (reboot,
+#                 init_module, kexec_load, bpf, etc.).
+#   @resources  - setrlimit / prlimit ; systemd applies
+#                 LimitNOFILE via prlimit BEFORE exec, the
+#                 service itself never needs to call it.
+SystemCallFilter=~@privileged @resources
 
 [Install]
 WantedBy=multi-user.target

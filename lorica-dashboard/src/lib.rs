@@ -10,6 +10,32 @@ use rust_embed::Embed;
 #[folder = "frontend/dist"]
 struct DashboardAssets;
 
+/// Content-Security-Policy emitted on every dashboard asset.
+///
+/// `connect-src` is restricted to the same-origin HTTP(S) document
+/// (via `'self'`) plus same-host WebSocket schemes scoped to the
+/// loopback addresses Lorica binds the management API to. The
+/// management port can be reconfigured via `management_port`, so a
+/// `:*` port wildcard keeps the policy honest across operator
+/// deployments without admitting arbitrary remote `ws://attacker.example`
+/// connections (v1.5.1 audit L-2 - the previous bare `ws:` token
+/// allowed any host).
+///
+/// `style-src 'unsafe-inline'` is still needed for Svelte's runtime-
+/// injected scoped styles (audit L-1 - a CSP3 nonce migration is
+/// tracked in `docs/backlog.md` as a v2.0 candidate).
+const CSP_HEADER: &str = "default-src 'self'; \
+script-src 'self'; \
+style-src 'self' 'unsafe-inline'; \
+img-src 'self' data:; \
+connect-src 'self' \
+ws://localhost:* ws://127.0.0.1:* ws://[::1]:* \
+wss://localhost:* wss://127.0.0.1:* wss://[::1]:*; \
+frame-ancestors 'none'; \
+form-action 'self'; \
+base-uri 'none'; \
+object-src 'none'";
+
 /// Build the dashboard router for serving embedded frontend assets.
 ///
 /// Mount this alongside the API router to serve the dashboard on the
@@ -71,9 +97,7 @@ fn serve_embedded_file(path: &str) -> Response {
             headers.insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
             headers.insert(
                 header::CONTENT_SECURITY_POLICY,
-                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws:"
-                    .parse()
-                    .unwrap(),
+                CSP_HEADER.parse().unwrap(),
             );
             headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
             headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());

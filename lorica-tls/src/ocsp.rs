@@ -85,9 +85,13 @@ pub async fn fetch_ocsp_response(cert_pem: &str, responder_url: &str) -> Result<
     let cert_id = build_cert_id(issuer_name_hash.as_ref(), issuer_key_hash.as_ref(), serial);
     let ocsp_request = build_ocsp_request(&cert_id);
 
-    // POST to OCSP responder
+    // POST to OCSP responder. The responder URL comes from the cert
+    // AIA extension, which an attacker-issued chain controls. Disable
+    // redirect following so we don't get steered into an internal
+    // service (`http://169.254.169.254/`). Audit L-7.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
 
@@ -108,18 +112,49 @@ pub async fn fetch_ocsp_response(cert_pem: &str, responder_url: &str) -> Result<
         .await
         .map_err(|e| format!("read OCSP response: {e}"))?;
 
-    // Validate OCSP response structure (RFC 6960 section 4.2.1):
-    // OCSPResponse ::= SEQUENCE { responseStatus ENUMERATED, ... }
-    // The response must be a DER SEQUENCE (0x30) and the responseStatus
-    // (first field, ENUMERATED tag 0x0A) must be 0 (successful).
+    validate_ocsp_response_bytes(&bytes)?;
+    Ok(bytes.to_vec())
+}
+
+/// Validate the structural well-formedness of an OCSP response
+/// payload (RFC 6960 section 4.2.1). Pure function that takes
+/// raw bytes and returns either `Ok(())` or a human-readable
+/// error string ; extracted from `fetch_ocsp_response` so the
+/// hand-rolled DER parsing has a fuzz harness target outside
+/// the network path (v1.5.1 audit L-4).
+///
+/// Checks performed :
+///
+/// - Overall length >= 5 bytes (the smallest valid OCSP
+///   response shape : SEQUENCE-tag + 1-byte len + ENUMERATED-tag
+///   + 1-byte len + value).
+/// - First byte is `0x30` (DER SEQUENCE tag).
+/// - SEQUENCE length encoding parses cleanly (short form with
+///   `bytes[1] < 0x80`, or long form `0x81` / `0x82`). Other
+///   long-form bytes are accepted as the legacy `4`-offset
+///   path - the function does NOT panic on malformed length
+///   bytes ; it surfaces an error.
+/// - The responseStatus ENUMERATED field (tag `0x0A`, length 1,
+///   value 0 = successful) is present at the computed offset
+///   and the value is 0.
+///
+/// Known limitation : the function does not cross-check that
+/// the SEQUENCE-declared content length matches `bytes.len() -
+/// status_offset` ; a length byte declaring more content than
+/// the buffer carries surfaces as an error from the
+/// downstream rustls OCSP-stapling parse rather than from this
+/// pre-flight check. The worst case is `try_fetch_ocsp`
+/// returning `None` and the proxy serving the request without
+/// a stapled OCSP response (best-effort behaviour, no security
+/// regression). The fuzz harness in `fuzz/fuzz_targets/fuzz_ocsp_response.rs`
+/// pins the no-panic invariant on arbitrary input.
+pub fn validate_ocsp_response_bytes(bytes: &[u8]) -> Result<(), String> {
     if bytes.len() < 5 {
         return Err("OCSP response too short".to_string());
     }
     if bytes[0] != 0x30 {
         return Err("invalid OCSP response (not a DER SEQUENCE)".to_string());
     }
-    // Find the responseStatus ENUMERATED field. It follows the SEQUENCE
-    // length bytes (1-3 bytes depending on total length).
     let status_offset = if bytes[1] < 0x80 {
         2 // short form: 1-byte length
     } else if bytes[1] == 0x81 {
@@ -130,7 +165,6 @@ pub async fn fetch_ocsp_response(cert_pem: &str, responder_url: &str) -> Result<
     if bytes.len() <= status_offset + 2 {
         return Err("OCSP response too short for status field".to_string());
     }
-    // ENUMERATED tag (0x0A), length 1, value must be 0 (successful)
     if bytes[status_offset] != 0x0A || bytes[status_offset + 2] != 0x00 {
         let status = bytes.get(status_offset + 2).copied().unwrap_or(0xFF);
         return Err(format!(
@@ -138,8 +172,7 @@ pub async fn fetch_ocsp_response(cert_pem: &str, responder_url: &str) -> Result<
             status
         ));
     }
-
-    Ok(bytes.to_vec())
+    Ok(())
 }
 
 /// Fetch OCSP response for a certificate, returning None on any error.
@@ -268,5 +301,63 @@ LJagjH4BgO+sTf0qoGih6SSTt0rBLHmSrtYxHOFGNwPDR1WxKaHmg0c3w==
         let request = build_ocsp_request(&cert_id);
         // Nested SEQUENCEs: OCSPRequest > TBSRequest > RequestList > Request
         assert_eq!(request[0], 0x30); // OCSPRequest SEQUENCE
+    }
+
+    // v1.5.1 audit L-4 : the OCSP response validator is extracted
+    // into a pure fn so the fuzz harness in `fuzz/fuzz_targets/`
+    // can exercise it outside the network path. These unit tests
+    // pin the specific shapes the audit flagged ; the fuzz harness
+    // covers "no panic on arbitrary input" more broadly.
+
+    #[test]
+    fn validate_ocsp_response_rejects_empty_input() {
+        assert!(validate_ocsp_response_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn validate_ocsp_response_rejects_short_input() {
+        assert!(validate_ocsp_response_bytes(&[0x30, 0x03, 0x0A]).is_err());
+    }
+
+    #[test]
+    fn validate_ocsp_response_rejects_non_sequence_tag() {
+        // Tag 0x31 = SET (not SEQUENCE) ; must fail the "DER SEQUENCE" check.
+        assert!(validate_ocsp_response_bytes(&[0x31, 0x03, 0x0A, 0x01, 0x00]).is_err());
+    }
+
+    #[test]
+    fn validate_ocsp_response_accepts_successful_short_form() {
+        // 0x30 SEQUENCE, 0x03 length=3 content, 0x0A ENUMERATED,
+        // 0x01 length=1, 0x00 value=successful.
+        let ok_payload = [0x30, 0x03, 0x0A, 0x01, 0x00];
+        assert!(validate_ocsp_response_bytes(&ok_payload).is_ok());
+    }
+
+    #[test]
+    fn validate_ocsp_response_rejects_non_zero_status() {
+        // status byte = 1 (malformedRequest) - not success.
+        let bad_status = [0x30, 0x03, 0x0A, 0x01, 0x01];
+        assert!(validate_ocsp_response_bytes(&bad_status).is_err());
+    }
+
+    #[test]
+    fn validate_ocsp_response_does_not_panic_on_long_form_overshoot() {
+        // Audit L-4 shape : long-form 0x82 declares a 5-byte
+        // content length on a 7-byte buffer - the bound check
+        // at `bytes.len() <= status_offset + 2` passes (the
+        // overshoot is structural, not a length underflow).
+        // The function must return `Ok` or `Err` but MUST NOT
+        // panic.
+        let overshoot = [0x30, 0x82, 0x00, 0x05, 0x0A, 0x01, 0x00];
+        // Explicitly not asserting Ok or Err - just "no panic".
+        let _ = validate_ocsp_response_bytes(&overshoot);
+    }
+
+    #[test]
+    fn validate_ocsp_response_does_not_panic_on_truncated_long_form() {
+        // Long-form 0x82 announces 2 length bytes but the buffer
+        // only has 5 bytes (enough to barely pass the length check).
+        let truncated = [0x30, 0x82, 0x00, 0x05, 0x0A];
+        let _ = validate_ocsp_response_bytes(&truncated);
     }
 }

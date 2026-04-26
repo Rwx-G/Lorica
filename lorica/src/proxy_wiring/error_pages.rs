@@ -214,30 +214,105 @@ pub(crate) fn render_error_page(status: u16, request_id: &str, host_header: &str
     let (host_badge, host_glyph, host_state, host_state_class) =
         badge(info.broken_tier == BrokenTier::Host);
 
-    TEMPLATE
-        .replace("__STATUS__", &status.to_string())
-        .replace("__TITLE__", info.title)
-        .replace("__WIKI_ANCHOR__", info.wiki_anchor)
-        .replace("__TIMESTAMP__", &timestamp)
-        .replace("__HOST_LABEL__", &host_label)
-        .replace("__REQUEST_ID__", request_id)
-        .replace("__WHAT_HAPPENED__", info.what_happened)
-        .replace("__WHAT_CAN_I_DO__", info.what_can_i_do)
-        .replace("__YOU_BROKEN__", you_broken)
-        .replace("__NETWORK_BROKEN__", network_broken)
-        .replace("__HOST_BROKEN__", host_broken)
-        .replace("__YOU_BADGE__", you_badge)
-        .replace("__YOU_GLYPH__", you_glyph)
-        .replace("__YOU_STATE__", you_state)
-        .replace("__YOU_STATE_CLASS__", you_state_class)
-        .replace("__NET_BADGE__", net_badge)
-        .replace("__NET_GLYPH__", net_glyph)
-        .replace("__NET_STATE__", net_state)
-        .replace("__NET_STATE_CLASS__", net_state_class)
-        .replace("__HOST_BADGE__", host_badge)
-        .replace("__HOST_GLYPH__", host_glyph)
-        .replace("__HOST_STATE__", host_state)
-        .replace("__HOST_STATE_CLASS__", host_state_class)
+    let status_str = status.to_string();
+    // Single-pass marker substitution. Each `String::replace` call
+    // clones the entire ~5 KB template into a fresh buffer ; with
+    // 24 markers that's 24 allocations + 24 linear scans per error
+    // response (~120 KB intermediate allocations). A WAF block storm
+    // or a 503 flood multiplied this. The single-pass walker below
+    // does one allocation (pre-sized to template + average expansion)
+    // and one linear scan. Audit M-11.
+    let subs: &[(&str, &str)] = &[
+        ("__STATUS__", &status_str),
+        ("__TITLE__", info.title),
+        ("__WIKI_ANCHOR__", info.wiki_anchor),
+        ("__TIMESTAMP__", &timestamp),
+        ("__HOST_LABEL__", &host_label),
+        ("__REQUEST_ID__", request_id),
+        ("__WHAT_HAPPENED__", info.what_happened),
+        ("__WHAT_CAN_I_DO__", info.what_can_i_do),
+        ("__YOU_BROKEN__", you_broken),
+        ("__NETWORK_BROKEN__", network_broken),
+        ("__HOST_BROKEN__", host_broken),
+        ("__YOU_BADGE__", you_badge),
+        ("__YOU_GLYPH__", you_glyph),
+        ("__YOU_STATE__", you_state),
+        ("__YOU_STATE_CLASS__", you_state_class),
+        ("__NET_BADGE__", net_badge),
+        ("__NET_GLYPH__", net_glyph),
+        ("__NET_STATE__", net_state),
+        ("__NET_STATE_CLASS__", net_state_class),
+        ("__HOST_BADGE__", host_badge),
+        ("__HOST_GLYPH__", host_glyph),
+        ("__HOST_STATE__", host_state),
+        ("__HOST_STATE_CLASS__", host_state_class),
+    ];
+    substitute_markers(TEMPLATE, subs)
+}
+
+/// Single-pass `__MARKER__` substitution. Walks the template once,
+/// emitting chunks into a pre-sized String. Each marker is matched
+/// at every `__` position via linear scan over the substitution
+/// table - 23 markers means each `__` site does at most 23 prefix
+/// comparisons, which is cheap vs the alternative of 23 full-template
+/// `String::replace` passes.
+///
+/// Markers MUST be of the form `__NAME__` (double underscore on both
+/// sides). Any `__NAME__` not in `subs` is emitted literally - the
+/// template author's safety net against an unmapped marker silently
+/// going missing in the rendered output.
+fn substitute_markers(template: &str, subs: &[(&str, &str)]) -> String {
+    let bytes = template.as_bytes();
+    // Pre-size : template + average ~30 char per substitution.
+    let mut out = String::with_capacity(template.len() + subs.len() * 32);
+    let mut i = 0;
+    while i < bytes.len() {
+        // Find next `__` from position i. If none, copy the rest
+        // and we're done.
+        let next = match memchr_dunder(bytes, i) {
+            Some(p) => p,
+            None => {
+                out.push_str(&template[i..]);
+                break;
+            }
+        };
+        // Copy everything before the `__` verbatim.
+        if next > i {
+            out.push_str(&template[i..next]);
+        }
+        // Try to match a known marker at `next`.
+        let mut consumed = 0usize;
+        for (marker, value) in subs {
+            if bytes[next..].starts_with(marker.as_bytes()) {
+                out.push_str(value);
+                consumed = marker.len();
+                break;
+            }
+        }
+        if consumed == 0 {
+            // Unknown marker prefix : emit the `__` literally and
+            // resume after them so the next iteration scans past.
+            out.push_str("__");
+            consumed = 2;
+        }
+        i = next + consumed;
+    }
+    out
+}
+
+/// Find the next occurrence of the byte pair `__` at or after `from`.
+fn memchr_dunder(bytes: &[u8], from: usize) -> Option<usize> {
+    if from >= bytes.len() {
+        return None;
+    }
+    let mut i = from;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'_' && bytes[i + 1] == b'_' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Resolve the body served for a status-code-driven error response.

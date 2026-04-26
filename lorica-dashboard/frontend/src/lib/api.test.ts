@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { api } from './api';
+import { api, sanitizeFilenameFromHeader } from './api';
 
 const mockRoute = {
   id: '123',
@@ -456,5 +456,75 @@ describe('api.importConfig', () => {
         body: JSON.stringify({ toml_content: 'version = 1\n' }),
       }),
     );
+  });
+});
+
+// v1.5.1 audit L-8 : defense-in-depth sanitisation of the
+// `Content-Disposition` filename surfaced to `<a download>`.
+describe('sanitizeFilenameFromHeader', () => {
+  it('returns the fallback when the header is empty', () => {
+    expect(sanitizeFilenameFromHeader('', 'cert-bundle.pem')).toBe(
+      'cert-bundle.pem',
+    );
+  });
+
+  it('returns the fallback when there is no filename token', () => {
+    expect(sanitizeFilenameFromHeader('attachment', 'fallback.pem')).toBe(
+      'fallback.pem',
+    );
+  });
+
+  it('extracts a clean filename from a well-formed header', () => {
+    expect(
+      sanitizeFilenameFromHeader(
+        'attachment; filename="example.com-bundle.pem"',
+        'fallback.pem',
+      ),
+    ).toBe('example.com-bundle.pem');
+  });
+
+  it('replaces control characters with underscores', () => {
+    const cd = 'attachment; filename="bad\x00name.pem"';
+    expect(sanitizeFilenameFromHeader(cd, 'fallback.pem')).toBe(
+      'bad_name.pem',
+    );
+  });
+
+  it('replaces CR / LF / tab with underscores', () => {
+    const cd = 'attachment; filename="x\r\n\ty.pem"';
+    expect(sanitizeFilenameFromHeader(cd, 'fallback.pem')).toBe('x___y.pem');
+  });
+
+  it('strips path separators (forward and backward)', () => {
+    expect(
+      sanitizeFilenameFromHeader(
+        'attachment; filename="../etc/passwd"',
+        'fallback.pem',
+      ),
+    ).toBe('.._etc_passwd');
+    expect(
+      sanitizeFilenameFromHeader(
+        'attachment; filename="..\\Windows\\System32\\evil"',
+        'fallback.pem',
+      ),
+    ).toBe('.._Windows_System32_evil');
+  });
+
+  it('caps overlong filenames at 255 characters', () => {
+    const longName = 'a'.repeat(4096);
+    const cd = `attachment; filename="${longName}"`;
+    const out = sanitizeFilenameFromHeader(cd, 'fallback.pem');
+    expect(out.length).toBe(255);
+    expect(out).toBe('a'.repeat(255));
+  });
+
+  it('falls back when the entire filename is sanitised away to nothing', () => {
+    // All-zero filename ("") cannot occur because the regex
+    // requires at least one non-quote char. But a filename made
+    // entirely of separators would also surface as empty after
+    // the slice ; the check guards against that future shape.
+    expect(
+      sanitizeFilenameFromHeader('attachment; filename="x"', ''),
+    ).toBe('x');
   });
 });

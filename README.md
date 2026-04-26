@@ -6,11 +6,11 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-1.5.1-brightgreen.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.5.2-brightgreen.svg" alt="Version">
   <img src="https://img.shields.io/badge/Rust-2024-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/Platform-Linux-0078D6.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Lorica%20Tests-1356%2B-brightgreen.svg" alt="Lorica Tests">
-  <img src="https://img.shields.io/badge/Pingora%20Tests-573-blue.svg" alt="Inherited Tests">
+  <img src="https://img.shields.io/badge/Lorica%20Tests-1306%2B-brightgreen.svg" alt="Lorica Tests">
+  <img src="https://img.shields.io/badge/Pingora%20Tests-690-blue.svg" alt="Inherited Tests">
 </p>
 
 ---
@@ -443,7 +443,7 @@ All endpoints are served on the management port (default `9443`) over HTTPS. Pro
 ```bash
 # Prerequisites
 # - Rust 1.88+
-# - Node.js 18+ (for dashboard compilation)
+# - Node.js 20+ (Vite 8 minimum, dashboard compilation)
 # - Linux (x86_64)
 
 git clone https://github.com/Rwx-G/Lorica.git
@@ -457,10 +457,10 @@ cargo build --release
 ### Running tests
 
 ```bash
-# All Rust unit tests (~1929 tests across 28 crates)
+# All Rust unit tests (~2091 tests across 28 crates)
 cargo test --workspace
 
-# Product crate tests only (~1356 tests - lorica-native, include
+# Product crate tests only (~1306 tests - lorica-native, include
 # the v1.5.0 hardening coverage : rate-limit buckets, body-size
 # layers, session rotation, public_version masking, ammonia bypass
 # corpus, map_err context preservation, cert-export orphan sweep)
@@ -469,25 +469,31 @@ cargo test -p lorica-config -p lorica-api -p lorica -p lorica-waf \
            -p lorica-command -p lorica-limits -p lorica-shmem \
            -p lorica-challenge -p lorica-geoip
 
-# Pingora-forked crate tests (573 tests)
+# Pingora-forked crate tests (~690 tests)
 cargo test -p lorica-core -p lorica-proxy -p lorica-http \
            -p lorica-error -p lorica-tls -p lorica-cache \
            -p lorica-pool -p lorica-runtime -p lorica-timeout \
            --features ring -p lorica-lb
 
-# End-to-end tests driving a real Pingora Server (70+ tests, 10 binaries)
-cargo test -p lorica --test mtls_e2e_test \
-                     --test response_rewrite_e2e_test \
-                     --test mirror_e2e_test \
-                     --test forward_auth_e2e_test \
-                     --test swr_e2e_test \
-                     --test connection_filter_test \
+# End-to-end tests driving a real Pingora Server (95 tests, 16 binaries)
+cargo test -p lorica --test bot_rpc_cache_e2e_test \
                      --test canary_e2e_test \
+                     --test config_reload_rpc_e2e_test \
+                     --test connection_filter_test \
+                     --test forward_auth_e2e_test \
                      --test header_routing_e2e_test \
+                     --test metrics_pull_rpc_e2e_test \
+                     --test mirror_e2e_test \
+                     --test mtls_e2e_test \
                      --test proxy_config_test \
-                     --test proxy_routing_test
+                     --test proxy_routing_test \
+                     --test rate_limit_e2e_test \
+                     --test rate_limit_sync_e2e_test \
+                     --test response_rewrite_e2e_test \
+                     --test swr_e2e_test \
+                     --test verdict_breaker_rpc_e2e_test
 
-# Frontend tests (287 Vitest tests across 8 files)
+# Frontend tests (320 Vitest tests across 9 files)
 cd lorica-dashboard/frontend && npx vitest run
 ```
 
@@ -495,26 +501,27 @@ cd lorica-dashboard/frontend && npx vitest run
 
 | Layer | Count | Notes |
 |---|---|---|
-| Product unit (config, api, lib, waf, notify, bench, worker, command, limits, challenge, shmem, geoip) | ~1356 | Lorica-specific code, including v1.5.0 hardening coverage (ammonia bypass corpus, named rate-limit buckets with Retry-After, per-route body-size 413 path, session rotation integration test, `public_version` masking, map_err context preservation, cert-export orphan sweep + path-traversal rejection). The verdict-cache global-state race (backlog #16) is fixed in v1.5.0 via `serial_test` so the full suite runs parallel. |
-| Product e2e (real Pingora `Server` + mock backends) | 70+ | 10 binaries: mTLS, response rewriting, mirroring, forward auth, SWR, connection filter, canary, header routing, config, routing |
-| Pingora-forked crates (core, proxy, http, error, tls, cache, pool, runtime, timeout, lb) | 573 | Inherited upstream coverage kept passing on every change |
-| Frontend (vitest / svelte-check) | 287 | Form validation, type safety, component wiring |
-| **Total shipping tests** | **~1929** | |
+| Product unit (config, api, lib, waf, notify, bench, worker, command, limits, challenge, shmem, geoip) | ~1306 | Lorica-specific code, including v1.5.0 hardening coverage (ammonia bypass corpus, named rate-limit buckets with Retry-After, per-route body-size 413 path, session rotation integration test, `public_version` masking, map_err context preservation, cert-export orphan sweep + path-traversal rejection). The verdict-cache global-state race (backlog #16) is fixed in v1.5.0 via `serial_test` so the full suite runs parallel. |
+| Product e2e (real Pingora `Server` + mock backends) | 95 | 16 binaries: mTLS, response rewriting, mirroring, forward auth, SWR, connection filter, canary, header routing, config, routing, rate-limit (legacy + sync), bot RPC cache, config-reload RPC, metrics-pull RPC, verdict-breaker RPC |
+| Pingora-forked crates (core, proxy, http, error, tls, cache, pool, runtime, timeout, lb, ketama, lru, memory-cache, limits, header-serde, tinyufo) | ~690 | Inherited upstream coverage kept passing on every change, plus Lorica-added regression tests in `lorica-core` (396) and `lorica-cache` (103) |
+| Frontend (vitest / svelte-check) | 320 | Form validation, type safety, component wiring |
+| **Total shipping tests** | **~2411** | |
 
 #### Docker end-to-end suites
 
 `tests-e2e-docker/` spins Lorica up against real backend containers
-and drives 460+ assertions through the actual network stack:
+and drives 660+ assertions through the actual network stack:
 
 ```bash
 cd tests-e2e-docker
-./run.sh                                    # single-process (336 asserts) + workers mode (86) + cert-export (38)
-docker compose --profile bot run --rm bot-smoke                   # 33 asserts - graded bot challenge
+./run.sh                                    # single-process (429 asserts) + workers mode (109) + cert-export (26)
+docker compose --profile bot run --rm bot-smoke                   # 29 asserts - graded bot challenge
+docker compose --profile bot-workers run --rm bot-smoke-workers   # 29 asserts - same under --workers 2
 docker compose --profile geoip run --rm geoip-smoke               # 16 asserts - country allow/deny
-docker compose --profile rdns run --rm rdns-smoke                 # 8  asserts - forward-confirmed rDNS bypass
-docker compose --profile otel run --rm otel-smoke                 # 15 asserts - OTLP + W3C + log/trace correlation
-docker compose --profile otel-workers run --rm otel-smoke-workers # 15 asserts - same under --workers 2
-docker compose --profile cert-export run --rm cert-export-smoke   # 38 asserts - PEM disk export + ACL + reapply
+docker compose --profile rdns run --rm rdns-smoke                 # 7  asserts - forward-confirmed rDNS bypass
+docker compose --profile otel run --rm otel-smoke                 # 16 asserts - OTLP + W3C + log/trace correlation
+docker compose --profile otel-workers run --rm otel-smoke-workers # 16 asserts - same under --workers 2
+docker compose --profile cert-export run --rm cert-export-smoke   # 26 asserts - PEM disk export + ACL + reapply
 ```
 
 The two intentional gaps in the Docker harness are:
@@ -580,7 +587,8 @@ gpg --verify lorica.deb.asc lorica.deb
 | Version | Features | Status |
 |---------|----------|--------|
 | v1.4.0 | OpenTelemetry tracing (OTLP), GeoIP country blocking, Bot protection (PoW / captcha / cookie with 5-category bypass matrix) | Shipped |
-| **v1.5.0** | Operator-input guard-rails on every field with blur + input inline errors; Route `group_name` + filter + colored pill; Certificate download API + dashboard split-menu with private-key confirm; Filesystem certificate export zone with per-pattern ACL, Settings tab, operator re-export endpoint, orphan sweep + per-row delete; Path-rule redirect fix ; Security hardening wave: `ammonia` HTML sanitiser, per-endpoint rate limits on management plane, per-route body-size limits with 1 MiB global default, session cookie rotation on password change, `/system` response filter, `rustls-pemfile → rustls-pki-types` migration, `rand 0.9` bump, source-error preservation on `.map_err` chains, WebSocket log-stream backpressure with close-on-slow-client ; Doc coverage pass + `#![warn(missing_docs)]` on every Lorica-native crate ; ACME unit tests (`wiremock` on Cloudflare + OVH challengers, `is_valid_dns_server` shell-filter, pure `should_auto_renew` predicate) ; `verdict_cache` test-parallelism race fixed via `serial_test` | Current |
+| v1.5.0 | Operator-input guard-rails on every field with blur + input inline errors; Route `group_name` + filter + colored pill; Certificate download API + dashboard split-menu with private-key confirm; Filesystem certificate export zone with per-pattern ACL, Settings tab, operator re-export endpoint, orphan sweep + per-row delete; Path-rule redirect fix ; Security hardening wave: `ammonia` HTML sanitiser, per-endpoint rate limits on management plane, per-route body-size limits with 1 MiB global default, session cookie rotation on password change, `/system` response filter, `rustls-pemfile → rustls-pki-types` migration, `rand 0.9` bump, source-error preservation on `.map_err` chains, WebSocket log-stream backpressure with close-on-slow-client ; Doc coverage pass + `#![warn(missing_docs)]` on every Lorica-native crate ; ACME unit tests (`wiremock` on Cloudflare + OVH challengers, `is_valid_dns_server` shell-filter, pure `should_auto_renew` predicate) ; `verdict_cache` test-parallelism race fixed via `serial_test` | Shipped |
+| **v1.5.1 + v1.5.2 (audit-closure cycles)** | Worker-mode cert hot-reload (cert install / renew now serves new cert across all workers without restart) ; SMTP encryption modes (`starttls` / `tls` / `none`) for the Email notification channel ; security defense-in-depth pass : webhook URL + Slack URL + auth_header scrubbed on JSON GET (matched the v1.5.1 TOML scrub asymmetry), CSV formula injection guard on access-log export, CSP3 directives (`frame-ancestors`, `form-action`, `base-uri`, `object-src`), per-endpoint rate limits broadened to ~16 mutating endpoints, redirect-policy=none on webhook / OCSP / blocklist clients ; reactor-stall pass : `LogStore` + `enforce_notification_retention` off-loaded to `spawn_blocking` ; reload pass : two-phase + legacy converged through one `apply_per_process_resolver_hooks` helper, cert-resolver reload serialised, OTel / GeoIP / ASN apply-error counter ; perf : Cow URL decode + `itoa` status formatting + chrono deferred until WAF match + `dashmap` fast-path on bot stash + `parking_lot::Mutex` on hot path + `RuleSet::matches` prefilter shortcut ; deps : `rustls-webpki 0.103.13` (RUSTSEC-2026-0104 + 0099), `postcss 8.5.10` (CVE-2026-41305), `aws-lc-rs` dropped from binary in favor of `ring`-only crypto stack, `x509-parser 0.18` aligned across `lorica-tls` / `lorica-api` ; chore : `~50` magic-number `bl()` / `rl()` calls in `server.rs` lifted to `pub const`, 3 `formatBytes` dashboard implementations consolidated into `lib/format.ts`, 3 `docs/security.md` drift items fixed (49 WAF rules + ~80k IP blocklist) | Current |
 | v1.6.0 | AI-crawler (LLM) deny-list as a first-class feature (known-bot User-Agent + rDNS matcher, per-route opt-in / opt-out, Prometheus counter), Hot binary upgrade (zero-downtime restart), Team settings (multiple users, roles, RBAC) ; `proxy_wiring.rs` + `main.rs` module split | Planned |
 | v2.0.0 | HTTP/3 (QUIC), TCP/L4 proxying | Planned |
 

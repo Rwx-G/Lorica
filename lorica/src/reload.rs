@@ -124,18 +124,34 @@ pub async fn reload_proxy_config_with_mtls(
     Ok(())
 }
 
-/// Supervisor-only entry point. Re-applies the process-local hooks
-/// (OTel exporter, GeoIP / ASN updater task lifecycle, bot HMAC
-/// secret) when the dashboard saves a new `GlobalSettings` document.
-/// The supervisor's `config_reload_tx` listener does not call
-/// [`reload_proxy_config`] (only workers do, via the two-phase RPC
-/// coordinator), so without this entry point the supervisor would
-/// never re-evaluate `geoip_auto_update_enabled` after boot.
-pub async fn apply_supervisor_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
+/// Re-apply the four per-process resolver hooks (OTel exporter,
+/// GeoIP / ASN updater task lifecycle, bot HMAC secret) from the
+/// current store state. Idempotent ; each `apply_*` helper dedups
+/// internally so calling this on every reload is cheap when the
+/// settings haven't changed.
+///
+/// Used by both the supervisor's `config_reload_tx` listener (the
+/// supervisor never calls `reload_proxy_config` itself - only workers
+/// do, via the two-phase RPC coordinator) AND by every worker reload
+/// path. The two-phase RPC `ConfigReloadCommit` handler at
+/// `proxy_wiring.rs::handle_config_reload_commit` calls it ; the
+/// legacy `CommandType::ConfigReload` worker handler at `main.rs`
+/// calls it too (audit M-18 - was previously skipping this sequence,
+/// so a fallback-from-two-phase reload left GeoIP / OTel / ASN /
+/// bot-secret state frozen even though the proxy config swap
+/// completed).
+pub async fn apply_per_process_resolver_hooks(store: &Arc<Mutex<ConfigStore>>) {
     apply_otel_settings_from_store(store).await;
     apply_geoip_settings_from_store(store).await;
     apply_asn_settings_from_store(store).await;
     apply_bot_secret_from_store(store).await;
+}
+
+/// Supervisor-only alias for [`apply_per_process_resolver_hooks`].
+/// Kept as the public symbol used by `main.rs` boot + reload listener
+/// for backwards naming clarity ; the body delegates.
+pub async fn apply_supervisor_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
+    apply_per_process_resolver_hooks(store).await;
 }
 
 /// Supervisor-side reload trigger registered at boot. The
@@ -182,7 +198,11 @@ pub(crate) async fn apply_asn_settings_from_store(store: &Arc<Mutex<ConfigStore>
     let s = store.lock().await;
     let settings = match s.get_global_settings() {
         Ok(settings) => settings,
-        Err(_) => return,
+        Err(e) => {
+            warn!(error = %e, "apply_asn_settings_from_store: store fetch failed, resolver pinned at last applied state");
+            lorica_api::metrics::inc_resolver_apply_failed("asn");
+            return;
+        }
     };
     drop(s);
 
@@ -263,7 +283,11 @@ pub(crate) async fn apply_bot_secret_from_store(store: &Arc<Mutex<ConfigStore>>)
     let s = store.lock().await;
     let settings = match s.get_global_settings() {
         Ok(settings) => settings,
-        Err(_) => return,
+        Err(e) => {
+            warn!(error = %e, "apply_bot_secret_from_store: store fetch failed, secret pinned at last installed value");
+            lorica_api::metrics::inc_resolver_apply_failed("bot_secret");
+            return;
+        }
     };
     drop(s);
 
@@ -401,7 +425,11 @@ pub(crate) async fn apply_geoip_settings_from_store(store: &Arc<Mutex<ConfigStor
     let s = store.lock().await;
     let settings = match s.get_global_settings() {
         Ok(settings) => settings,
-        Err(_) => return,
+        Err(e) => {
+            warn!(error = %e, "apply_geoip_settings_from_store: store fetch failed, resolver pinned at last applied state");
+            lorica_api::metrics::inc_resolver_apply_failed("geoip");
+            return;
+        }
     };
     drop(s);
 
@@ -545,7 +573,11 @@ pub(crate) async fn apply_otel_settings_from_store(store: &Arc<Mutex<ConfigStore
     let s = store.lock().await;
     let settings = match s.get_global_settings() {
         Ok(settings) => settings,
-        Err(_) => return,
+        Err(e) => {
+            warn!(error = %e, "apply_otel_settings_from_store: store fetch failed, exporter pinned at last applied state");
+            lorica_api::metrics::inc_resolver_apply_failed("otel");
+            return;
+        }
     };
     drop(s);
 
@@ -744,6 +776,18 @@ async fn build_proxy_config_inner(
     })
 }
 
+/// Per-process serialisation guard for `reload_cert_resolver`. The
+/// reload involves an SQLite read of the cert table + parallel OCSP
+/// fetches with a 10 s per-responder timeout. If two reload calls
+/// land back-to-back (e.g. the supervisor's two-phase coordinator
+/// fires Commit RPCs for two consecutive generations within the OCSP
+/// fetch window), without this guard both futures race ; the LAST
+/// one to finish wins the `cert_resolver.reload(cert_data)` arc-swap,
+/// which can leave the resolver pinned to the OLDER db state if its
+/// OCSP fetches happened to finish second. Audit L-16 ; serialising
+/// at the per-process level is the simplest correct fix.
+static CERT_RESOLVER_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Reload the TLS certificate resolver from the database.
 /// Only loads certificates that are actively referenced by at least one route.
 /// Called alongside `reload_proxy_config` when certificates change.
@@ -751,6 +795,14 @@ pub async fn reload_cert_resolver(
     store: &Arc<Mutex<ConfigStore>>,
     cert_resolver: &Arc<CertResolver>,
 ) {
+    // Serialise concurrent invocations so two back-to-back commits
+    // cannot have their OCSP fetches finish out-of-order and end up
+    // arc-swapping the older db state on top of the newer (audit
+    // L-16). Lock is per-process ; held for the whole reload
+    // (SQLite read + OCSP fetch + arc-swap) so the next caller sees
+    // a complete predecessor.
+    let _reload_guard = CERT_RESOLVER_RELOAD_LOCK.lock().await;
+
     let s = store.lock().await;
     let db_certs = match s.list_certificates() {
         Ok(c) => c,

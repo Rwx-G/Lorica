@@ -62,12 +62,22 @@
   async function selectRoute(routeId: string) {
     selectedRouteId = routeId;
     detailLoading = true;
+    // v1.5.1 audit M-11 : capture the requested routeId before
+    // the concurrent fetches start. If the user clicks another
+    // route (or the 30 s refreshTimer fires with a different
+    // selection) before all four promises resolve, the stale
+    // responses must NOT overwrite the freshly-selected route's
+    // view. `selectedRouteId` is the source of truth for the
+    // current selection ; we compare against our local `captured`
+    // and bail out if they differ.
+    const captured = routeId;
     const [passiveRes, activeRes, configRes, bucketsRes] = await Promise.all([
       api.getRouteSla(routeId),
       api.getRouteSlaActive(routeId),
       api.getSlaConfig(routeId),
       api.getRouteSlaBuckets(routeId, { source: 'passive' }),
     ]);
+    if (selectedRouteId !== captured) return;
     if (passiveRes.data) passiveSla = passiveRes.data;
     if (activeRes.data) activeSla = activeRes.data;
     if (configRes.data) slaConfig = configRes.data;

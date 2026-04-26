@@ -70,9 +70,24 @@ pub struct CreateLoadTestConfig {
     pub schedule_cron: Option<String>,
 }
 
-/// Validate that the load test target URL points to a configured route.
-/// This prevents using the load test engine to attack external hosts.
-fn validate_target_url(url: &str, store: &lorica_config::ConfigStore) -> Result<(), ApiError> {
+/// Validate that the load test target URL points to a configured
+/// route AND lands on the proxy's own listener port AND does not
+/// target the management plane.
+///
+/// This prevents using the load test engine as an internal port-
+/// scanner / amplifier : without the port + path constraints, an
+/// admin-controlled config for `route.example.com` could drive
+/// traffic to `https://route.example.com:6379/_health` (which the
+/// load tester forces to resolve to 127.0.0.1) or to
+/// `https://route.example.com/api/v1/...` (the management API
+/// shares the host) - turning the load tester into a stolen-session
+/// pivot tool. Audit L-2.
+fn validate_target_url(
+    url: &str,
+    store: &lorica_config::ConfigStore,
+    http_port: u16,
+    https_port: u16,
+) -> Result<(), ApiError> {
     let without_scheme = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
@@ -80,18 +95,52 @@ fn validate_target_url(url: &str, store: &lorica_config::ConfigStore) -> Result<
             ApiError::BadRequest("target URL must start with http:// or https://".into())
         })?;
 
-    let authority = without_scheme.split('/').next().unwrap_or("");
-    let host = if authority.starts_with('[') {
-        authority
-            .split(']')
-            .next()
-            .unwrap_or("")
-            .trim_start_matches('[')
-    } else {
-        authority.split(':').next().unwrap_or("")
+    let scheme_is_https = url.starts_with("https://");
+    let (authority, path_suffix) = match without_scheme.split_once('/') {
+        Some((a, rest)) => (a, format!("/{rest}")),
+        None => (without_scheme, String::from("/")),
     };
 
-    // Allow localhost for backward compatibility
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        // IPv6 literal : `[::1]:8080`
+        let (h, rest) = stripped
+            .split_once(']')
+            .ok_or_else(|| ApiError::BadRequest("malformed IPv6 literal in target URL".into()))?;
+        let p = rest.trim_start_matches(':').parse::<u16>().ok();
+        (h, p)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().ok()),
+            None => (authority, None),
+        }
+    };
+
+    // Effective port : explicit > scheme default. If neither yields
+    // a parseable u16, fall back to the proxy's own listener for the
+    // scheme so the operator's "no port" shorthand stays valid.
+    let effective_port = port.unwrap_or(if scheme_is_https { https_port } else { http_port });
+
+    if effective_port != http_port && effective_port != https_port {
+        return Err(ApiError::BadRequest(format!(
+            "load test target port {effective_port} must match the proxy's http_port ({http_port}) or https_port ({https_port}) - the load tester resolves the host to loopback and would otherwise drive traffic to an arbitrary local service"
+        )));
+    }
+
+    // Reject paths that hit the management plane / well-known
+    // surfaces - the load tester would amplify a malicious admin
+    // session into a self-DoS or a bypass of the dashboard's own
+    // rate limits.
+    let lower_path = path_suffix.to_ascii_lowercase();
+    for forbidden in ["/api/", "/lorica/", "/.well-known/", "/metrics"] {
+        if lower_path == forbidden.trim_end_matches('/') || lower_path.starts_with(forbidden) {
+            return Err(ApiError::BadRequest(format!(
+                "load test target path `{lower_path}` is reserved for the management plane and not a valid traffic target"
+            )));
+        }
+    }
+
+    // Allow localhost for backward compatibility (lets operators
+    // smoke-test the proxy directly via 127.0.0.1).
     if matches!(host, "127.0.0.1" | "localhost" | "::1") {
         return Ok(());
     }
@@ -116,7 +165,7 @@ pub async fn create_config(
     Json(body): Json<CreateLoadTestConfig>,
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
     let store = state.store.lock().await;
-    validate_target_url(&body.target_url, &store)?;
+    validate_target_url(&body.target_url, &store, state.http_port, state.https_port)?;
     drop(store);
 
     let now = Utc::now();
@@ -183,7 +232,7 @@ pub async fn update_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     if let Some(ref url) = body.target_url {
-        validate_target_url(url, &store)?;
+        validate_target_url(url, &store, state.http_port, state.https_port)?;
     }
     let mut config = store
         .get_load_test_config(&id)
@@ -480,29 +529,88 @@ mod tests {
         lorica_config::ConfigStore::open_in_memory().expect("test setup: open in-memory store")
     }
 
+    // Port args mirror the proxy's defaults ; tests use 8080 / 8443
+    // for HTTP / HTTPS so the port-validation arms can be exercised.
+    const TEST_HTTP_PORT: u16 = 8080;
+    const TEST_HTTPS_PORT: u16 = 8443;
+
     #[test]
     fn validate_target_url_allows_localhost() {
         let store = test_store();
-        assert!(validate_target_url("http://127.0.0.1:8080/", &store).is_ok());
-        assert!(validate_target_url("https://127.0.0.1:8443/api/health", &store).is_ok());
-        assert!(validate_target_url("http://localhost:8080/", &store).is_ok());
-        assert!(validate_target_url("https://localhost:8443/path", &store).is_ok());
-        assert!(validate_target_url("http://[::1]:8080/", &store).is_ok());
+        assert!(validate_target_url("http://127.0.0.1:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok());
+        assert!(validate_target_url("https://127.0.0.1:8443/health", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok());
+        assert!(validate_target_url("http://localhost:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok());
+        assert!(validate_target_url("https://localhost:8443/path", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok());
+        assert!(validate_target_url("http://[::1]:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok());
     }
 
     #[test]
     fn validate_target_url_rejects_external() {
         let store = test_store();
-        assert!(validate_target_url("http://10.0.0.1:8080/", &store).is_err());
-        assert!(validate_target_url("https://example.com/", &store).is_err());
-        assert!(validate_target_url("http://192.168.1.1/", &store).is_err());
-        assert!(validate_target_url("http://0.0.0.0:8080/", &store).is_err());
+        assert!(validate_target_url("http://10.0.0.1:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
+        assert!(validate_target_url("https://example.com:8443/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
+        assert!(validate_target_url("http://192.168.1.1:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
+        assert!(validate_target_url("http://0.0.0.0:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
     }
 
     #[test]
     fn validate_target_url_rejects_bad_scheme() {
         let store = test_store();
-        assert!(validate_target_url("ftp://127.0.0.1/", &store).is_err());
-        assert!(validate_target_url("127.0.0.1:8080/", &store).is_err());
+        assert!(validate_target_url("ftp://127.0.0.1/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
+        assert!(validate_target_url("127.0.0.1:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
+    }
+
+    // v1.5.2 audit L-2 : port + path constraints.
+
+    #[test]
+    fn validate_target_url_rejects_off_proxy_port() {
+        let store = test_store();
+        // Port 6379 (Redis) on a localhost target must be rejected
+        // even though the host is loopback.
+        assert!(
+            validate_target_url("http://127.0.0.1:6379/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
+        );
+        // Port 22 (SSH) similar.
+        assert!(
+            validate_target_url("http://localhost:22/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
+        );
+    }
+
+    #[test]
+    fn validate_target_url_rejects_management_paths() {
+        let store = test_store();
+        // /api/ is the management plane prefix.
+        assert!(
+            validate_target_url("http://127.0.0.1:8080/api/v1/auth/login", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
+        );
+        // /metrics is the unauth Prometheus endpoint (cf. backlog #20).
+        assert!(
+            validate_target_url("http://127.0.0.1:8080/metrics", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
+        );
+        // /lorica/ + /.well-known/ are reserved.
+        assert!(
+            validate_target_url("http://127.0.0.1:8080/lorica/bot/solve", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
+        );
+        assert!(
+            validate_target_url("http://127.0.0.1:8080/.well-known/acme-challenge/x", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
+        );
+        // Non-management paths still pass.
+        assert!(
+            validate_target_url("http://127.0.0.1:8080/healthz", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_target_url_path_check_is_case_insensitive() {
+        // Operators uppercasing /API/ or mixing /Api/ should still
+        // be rejected ; the proxy normalises case at routing time so
+        // the load tester must too.
+        let store = test_store();
+        assert!(
+            validate_target_url("http://127.0.0.1:8080/API/foo", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
+        );
+        assert!(
+            validate_target_url("http://127.0.0.1:8080/Lorica/bot/solve", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
+        );
     }
 }

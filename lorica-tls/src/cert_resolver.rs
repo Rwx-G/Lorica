@@ -24,15 +24,21 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use lorica_error::{Error, ErrorType, OrErr, Result};
-use rustls::crypto::aws_lc_rs::sign::any_supported_type;
+// Pinned to `ring` to match the workspace-wide crypto stack
+// (audit M-6 : avoid carrying both ring + aws-lc-rs in the binary).
+use rustls::crypto::ring::sign::any_supported_type;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls_pemfile::Item;
+// v1.5.1 audit L-16 : `rustls-pemfile` (RUSTSEC-2025-0134,
+// unmaintained) replaced by the `PemObject` trait from
+// `rustls-pki-types`. Iterators yield only the section type they
+// were called on, which collapses the previous "match Item variant"
+// per-call pattern.
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Data needed to load a certificate into the resolver.
@@ -129,7 +135,7 @@ impl CertResolver {
 
         // Sort each domain's certs by expiry descending (longest-lived first)
         for entries in map.values_mut() {
-            entries.sort_by(|a, b| b.not_after_epoch.cmp(&a.not_after_epoch));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.not_after_epoch));
         }
 
         self.inner.store(Arc::new(CertResolverInner { certs: map }));
@@ -144,11 +150,25 @@ impl CertResolver {
 
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let sni = client_hello.server_name()?.to_lowercase();
+        let sni_raw = client_hello.server_name()?;
         let inner = self.inner.load();
 
+        // Audit M-13 : every TLS handshake calls this. Avoid the
+        // `to_lowercase()` String allocation when the SNI is already
+        // lowercase (the common case ; modern clients normalise) -
+        // RFC 5890 leaves DNS labels case-insensitive but practical
+        // SNI traffic is overwhelmingly lower-case ASCII.
+        let already_lower = sni_raw.bytes().all(|b| !b.is_ascii_uppercase());
+        let sni_owned;
+        let sni: &str = if already_lower {
+            sni_raw
+        } else {
+            sni_owned = sni_raw.to_ascii_lowercase();
+            &sni_owned
+        };
+
         // 1. Exact match
-        if let Some(entries) = inner.certs.get(&sni) {
+        if let Some(entries) = inner.certs.get(sni) {
             if let Some(entry) = entries.first() {
                 return Some(Arc::clone(&entry.key));
             }
@@ -156,10 +176,23 @@ impl ResolvesServerCert for CertResolver {
 
         // 2. Wildcard match: replace first label with *
         if let Some(dot_pos) = sni.find('.') {
-            let wildcard = format!("*{}", &sni[dot_pos..]);
-            if let Some(entries) = inner.certs.get(&wildcard) {
-                if let Some(entry) = entries.first() {
-                    return Some(Arc::clone(&entry.key));
+            // Build the wildcard form into a stack-friendly buffer.
+            // DNS names are <= 253 bytes ; `*` + suffix fits in 256.
+            // Avoids the `format!` allocation on every handshake.
+            let suffix = &sni[dot_pos..];
+            let mut wildcard_buf = [0u8; 256];
+            let needed = 1 + suffix.len();
+            if needed <= wildcard_buf.len() {
+                wildcard_buf[0] = b'*';
+                wildcard_buf[1..needed].copy_from_slice(suffix.as_bytes());
+                // SAFETY: `*` is ASCII, `suffix` is a valid &str sub-
+                // slice ; the concatenation is therefore valid UTF-8.
+                let wildcard = std::str::from_utf8(&wildcard_buf[..needed])
+                    .expect("ASCII '*' + UTF-8 DNS suffix is UTF-8");
+                if let Some(entries) = inner.certs.get(wildcard) {
+                    if let Some(entry) = entries.first() {
+                        return Some(Arc::clone(&entry.key));
+                    }
                 }
             }
         }
@@ -189,20 +222,9 @@ fn build_certified_key(
 }
 
 fn parse_certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(Cursor::new(pem.as_bytes()));
-    let items: Vec<Item> = rustls_pemfile::read_all(&mut reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
         .filter_map(|r| r.ok())
-        .collect();
-
-    let certs: Vec<CertificateDer<'static>> = items
-        .into_iter()
-        .filter_map(|item| {
-            if let Item::X509Certificate(cert) = item {
-                Some(cert)
-            } else {
-                None
-            }
-        })
+        .map(|c| c.into_owned())
         .collect();
 
     if certs.is_empty() {
@@ -213,21 +235,12 @@ fn parse_certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn parse_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(Cursor::new(pem.as_bytes()));
-    let items: Vec<Item> = rustls_pemfile::read_all(&mut reader)
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for item in items {
-        match item {
-            Item::Pkcs1Key(key) => return Ok(PrivateKeyDer::from(key)),
-            Item::Pkcs8Key(key) => return Ok(PrivateKeyDer::from(key)),
-            Item::Sec1Key(key) => return Ok(PrivateKeyDer::from(key)),
-            _ => continue,
-        }
-    }
-
-    Error::e_explain(ErrorType::InvalidCert, "no private key found in PEM")
+    // `PrivateKeyDer::from_pem_slice` returns the first supported
+    // key block (PKCS1 / PKCS8 / SEC1) and is `Err` when none is
+    // present or the PEM is malformed - matches the previous
+    // "iterate Items, return first key, fail otherwise" semantics.
+    PrivateKeyDer::from_pem_slice(pem.as_bytes())
+        .or_err(ErrorType::InvalidCert, "no private key found in PEM")
 }
 
 #[cfg(test)]

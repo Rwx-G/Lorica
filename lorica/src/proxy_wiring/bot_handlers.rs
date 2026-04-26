@@ -330,9 +330,7 @@ pub async fn serve_challenge(
         }
 
         BotProtectionMode::Javascript => {
-            let nonce_hex = engine.fresh_nonce();
-            let raw =
-                hex_to_16_bytes(&nonce_hex).expect("fresh_nonce returns a 32-char hex string");
+            let (raw, nonce_hex) = engine.fresh_nonce();
             let challenge = pow::Challenge {
                 nonce: raw,
                 difficulty: cfg.pow_difficulty,
@@ -372,18 +370,33 @@ pub async fn serve_challenge(
                     return write_plain(session, 503, "bot-protection misconfigured").await;
                 }
             };
-            let (text, png) = match lorica_challenge::captcha::generate(
-                &chars,
-                lorica_challenge::captcha::DEFAULT_CODE_LEN,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
+            // Captcha PNG generation is CPU-bound (~5-15 ms per call,
+            // image render with embedded font + filter). Off-load to
+            // the blocking pool so the async reactor stays free for
+            // other requests during a bot-flood (audit M-9).
+            let captcha_outcome = tokio::task::spawn_blocking(move || {
+                lorica_challenge::captcha::generate(
+                    &chars,
+                    lorica_challenge::captcha::DEFAULT_CODE_LEN,
+                )
+            })
+            .await;
+            let (text, png) = match captcha_outcome {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
                     warn!(error = ?e, "captcha generation failed");
+                    return write_plain(session, 503, "captcha unavailable").await;
+                }
+                Err(e) => {
+                    warn!(error = %e, "captcha generation task join failed");
                     return write_plain(session, 503, "captcha unavailable").await;
                 }
             };
 
-            let nonce = engine.fresh_nonce();
+            // Captcha path uses the hex string for both the cookie
+            // lookup key and the image URL; the raw 16 bytes are not
+            // needed here (no PoW payload).
+            let (_, nonce) = engine.fresh_nonce();
             let image_url = format!("{BOT_CAPTCHA_PATH_PREFIX}{nonce}");
             let html = chrender::render_captcha_page(&image_url, BOT_SOLVE_PATH, &nonce, None);
 
@@ -582,19 +595,6 @@ async fn write_plain(session: &mut Session, status: u16, msg: &str) -> lorica_co
     Ok(true)
 }
 
-fn hex_to_16_bytes(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        let hi = hex_digit(chunk[0])?;
-        let lo = hex_digit(chunk[1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
 impl PendingEntry {
     /// Compute the 16-byte route-id hash stored in the verdict
     /// cookie. Kept here (rather than on `BotEngine`) because the
@@ -677,17 +677,4 @@ mod tests {
         assert!(s.contains("Path=/"));
     }
 
-    #[test]
-    fn hex_16_roundtrip() {
-        let raw: [u8; 16] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-            0x0f, 0x10,
-        ];
-        let hex = "0102030405060708090a0b0c0d0e0f10";
-        assert_eq!(hex_to_16_bytes(hex), Some(raw));
-        // Wrong length.
-        assert_eq!(hex_to_16_bytes("short"), None);
-        // Bad digit.
-        assert_eq!(hex_to_16_bytes("01020304050607080910111213141z12"), None);
-    }
 }

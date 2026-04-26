@@ -37,6 +37,29 @@ pub enum NotifyError {
     Config(String),
 }
 
+/// Transport-level encryption mode for outbound SMTP.
+///
+/// - `Starttls` (default) connects in plaintext and upgrades to TLS via
+///   the STARTTLS command (typical port 587 on the public internet).
+/// - `Tls` opens an implicit-TLS connection (SMTPS, typical port 465).
+/// - `None` sends in plaintext with no TLS at all. Required for LAN
+///   MTA relays on port 25 that do not advertise STARTTLS (Postfix,
+///   sendmail, Docker mailhog, corporate SMTP gateways). Credentials
+///   and message bodies are transmitted in clear - never enable this
+///   over a network the operator does not control end-to-end.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpEncryption {
+    /// Opportunistic STARTTLS upgrade. Default for backwards-compat
+    /// with v1.5.1 configs that pre-date this field.
+    #[default]
+    Starttls,
+    /// Implicit TLS (SMTPS).
+    Tls,
+    /// No TLS. Plaintext SMTP for LAN relays on port 25.
+    None,
+}
+
 /// Configuration for an email notification channel.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct EmailConfig {
@@ -44,6 +67,10 @@ pub struct EmailConfig {
     pub smtp_port: Option<u16>,
     pub smtp_username: Option<String>,
     pub smtp_password: Option<String>,
+    /// TLS mode for the outbound SMTP connection. Defaults to
+    /// `starttls` when absent so pre-v1.5.2 configs keep working.
+    #[serde(default)]
+    pub smtp_encryption: SmtpEncryption,
     pub from_address: String,
     pub to_address: String,
 }
@@ -403,6 +430,40 @@ mod tests {
     }
 
     #[test]
+    fn test_email_config_defaults_to_starttls_when_field_missing() {
+        // Backward compat : pre-v1.5.2 stored configs have no
+        // `smtp_encryption` key at all. Deserialization must land on
+        // `SmtpEncryption::Starttls` so existing operators keep the
+        // same transport behaviour after upgrade.
+        let json = r#"{"smtp_host":"mail.example.com","from_address":"a@b.com","to_address":"c@d.com"}"#;
+        let config = validate_email_config(json).expect("pre-v1.5.2 JSON must still parse");
+        assert_eq!(config.smtp_encryption, SmtpEncryption::Starttls);
+    }
+
+    #[test]
+    fn test_email_config_smtp_encryption_none_parses() {
+        // v1.5.2 : operators can pick `"none"` for LAN MTA port 25.
+        let json = r#"{"smtp_host":"mailhog.internal","smtp_encryption":"none","from_address":"a@b.com","to_address":"c@d.com"}"#;
+        let config = validate_email_config(json).expect("smtp_encryption=none must parse");
+        assert_eq!(config.smtp_encryption, SmtpEncryption::None);
+    }
+
+    #[test]
+    fn test_email_config_smtp_encryption_tls_parses() {
+        let json = r#"{"smtp_host":"smtp.gmail.com","smtp_encryption":"tls","from_address":"a@b.com","to_address":"c@d.com"}"#;
+        let config = validate_email_config(json).expect("smtp_encryption=tls must parse");
+        assert_eq!(config.smtp_encryption, SmtpEncryption::Tls);
+    }
+
+    #[test]
+    fn test_email_config_smtp_encryption_unknown_value_rejected() {
+        // A typo like `"ssl"` should not silently fall back to the
+        // default - the operator needs a clear error.
+        let json = r#"{"smtp_host":"x","smtp_encryption":"ssl","from_address":"a@b.com","to_address":"c@d.com"}"#;
+        assert!(validate_email_config(json).is_err());
+    }
+
+    #[test]
     fn test_validate_email_config_missing_host() {
         let json = r#"{"smtp_host":"","from_address":"a@b.com","to_address":"c@d.com"}"#;
         assert!(validate_email_config(json).is_err());
@@ -452,6 +513,7 @@ mod tests {
                 smtp_port: None,
                 smtp_username: None,
                 smtp_password: None,
+                smtp_encryption: SmtpEncryption::Starttls,
                 from_address: "a@b.com".into(),
                 to_address: "c@d.com".into(),
             },
@@ -618,6 +680,7 @@ mod tests {
                 smtp_port: None,
                 smtp_username: None,
                 smtp_password: None,
+                smtp_encryption: SmtpEncryption::Starttls,
                 from_address: "not-valid".into(),
                 to_address: "admin@example.com".into(),
             },

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use lorica_config::models::{HealthStatus, LifecycleState};
 use lorica_config::ConfigStore;
+use once_cell::sync::Lazy;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -28,6 +29,34 @@ use lorica::proxy_wiring::{BackendConnections, ProxyConfig};
 use lorica::reload::reload_proxy_config;
 
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Process-wide HTTP client for backend health probes (v1.5.1
+/// audit M-10).
+///
+/// Pre-fix, `http_probe` built a fresh `reqwest::Client` per
+/// invocation - one per backend per probe interval (default 5 s).
+/// Each build allocated a connection pool, TLS context, resolver
+/// state, and forced a fresh TCP handshake (no idle-pool reuse)
+/// plus a TLS context setup on every probe ; with 100 backends and
+/// a 5 s interval that was 20 client builds / s plus the connection
+/// churn. Mirrors the static-client precedent in
+/// `proxy_wiring/mirror_rewrite.rs::MIRROR_CLIENT` and
+/// `proxy_wiring/forward_auth.rs::FORWARD_AUTH_CLIENT`.
+///
+/// `danger_accept_invalid_certs(true)` is kept because operator
+/// backends commonly run with self-signed or wildcard certs that
+/// the proxy is not expected to validate (this is a liveness
+/// probe, not an end-to-end TLS chain check). The probe target
+/// is the operator-configured backend URL ; the trust boundary
+/// is the operator's network, not the public internet.
+static HEALTH_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(TCP_CONNECT_TIMEOUT)
+        .danger_accept_invalid_certs(true)
+        .pool_max_idle_per_host(8)
+        .build()
+        .expect("build health-probe reqwest client (static config is infallible)")
+});
 
 /// Default drain timeout before force-closing a Closing backend.
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -239,22 +268,15 @@ async fn tcp_probe(address: &str) -> ProbeResult {
 
 /// Attempt an HTTP GET and check for a 2xx response.
 /// Returns Healthy if response is 2xx within the degraded threshold, Degraded if slow, Down on failure.
+///
+/// Uses the process-wide [`HEALTH_HTTP_CLIENT`] so successive
+/// probes against the same backend reuse an idle TCP connection
+/// from the pool instead of paying for a fresh handshake +
+/// TLS context setup every time (v1.5.1 audit M-10).
 async fn http_probe(url: &str) -> ProbeResult {
     let start = Instant::now();
 
-    let client = match reqwest::Client::builder()
-        .timeout(TCP_CONNECT_TIMEOUT)
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            debug!(url = %url, error = %e, "HTTP health check client build failed");
-            return ProbeResult::Down;
-        }
-    };
-
-    match client.get(url).send().await {
+    match HEALTH_HTTP_CLIENT.get(url).send().await {
         Ok(resp) => {
             let elapsed_ms = start.elapsed().as_millis();
             if !resp.status().is_success() {

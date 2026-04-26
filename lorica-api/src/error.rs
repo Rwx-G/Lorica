@@ -88,6 +88,14 @@ impl ApiError {
     }
 }
 
+/// Generic placeholder emitted in the JSON body for every
+/// `ApiError::Internal`. The full inner detail (which may
+/// contain `rusqlite::Error` strings, file paths under
+/// `/var/lib/lorica/...`, library version banners, etc.) is
+/// logged at `tracing::error!` for operator forensics but
+/// never crosses the API boundary. v1.5.1 audit M-12.
+const INTERNAL_USER_MESSAGE: &str = "internal error";
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
@@ -98,10 +106,32 @@ impl IntoResponse for ApiError {
             ApiError::RateLimited(secs) => Some(*secs),
             _ => None,
         };
+        // v1.5.1 audit M-12 : sanitise `Internal` errors at the
+        // response boundary. The inner detail (built by ~84
+        // `format!("...: {e}")` call sites across `lorica-api`)
+        // commonly carries `rusqlite::Error` text with SQL
+        // fragments, file paths, library version banners. Log
+        // the full detail at `error!` level so the operator
+        // keeps a forensics trail, then emit a generic
+        // placeholder in the JSON body so an authenticated
+        // dashboard toast - or a future federated multi-tenant
+        // deployment, or a screen-captured triage session -
+        // never surfaces internal bytes. Other variants
+        // (`NotFound`, `BadRequest`, `Unauthorized`, etc.)
+        // carry operator-supplied or user-supplied content
+        // and stay verbatim - their messages are part of the
+        // documented contract.
+        let user_message = match &self {
+            ApiError::Internal(detail) => {
+                tracing::error!(detail = %detail, "API internal error");
+                INTERNAL_USER_MESSAGE.to_string()
+            }
+            _ => self.to_string(),
+        };
         let body = ErrorEnvelope {
             error: ErrorBody {
                 code: self.code().to_string(),
-                message: self.to_string(),
+                message: user_message,
             },
         };
         let mut response = (status, axum::Json(body)).into_response();
@@ -203,6 +233,80 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("response body is JSON");
         assert_eq!(json["error"]["code"], "not_found");
         assert_eq!(json["error"]["message"], "not found: route 42");
+    }
+
+    /// v1.5.1 audit M-12 : `ApiError::Internal` must NEVER
+    /// surface its inner detail to the API consumer. Whatever
+    /// the call site put in the inner String (rusqlite error
+    /// text, file paths, library version banners) stays in the
+    /// `tracing::error!` log only ; the JSON body returns the
+    /// generic placeholder.
+    #[tokio::test]
+    async fn test_into_response_internal_does_not_leak_inner_detail() {
+        // Worst-case-shape inner detail : SQL fragment + file
+        // path + library banner.
+        let leaky_detail =
+            "rusqlite error: UNIQUE constraint failed: routes.hostname (file: /var/lib/lorica/lorica.db, sqlite 3.42.0)";
+        let err = ApiError::Internal(leaky_detail.to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should fit in memory");
+        let body_str = std::str::from_utf8(&body).expect("response body is UTF-8");
+        let json: serde_json::Value =
+            serde_json::from_str(body_str).expect("response body is JSON");
+
+        assert_eq!(json["error"]["code"], "internal_error");
+        assert_eq!(
+            json["error"]["message"], "internal error",
+            "internal errors must surface the generic placeholder, not the inner detail"
+        );
+        // Defense-in-depth byte scan on the whole body :
+        // none of the leaky tokens may appear anywhere.
+        assert!(
+            !body_str.contains("rusqlite"),
+            "`rusqlite` token must not leak to the response body"
+        );
+        assert!(
+            !body_str.contains("/var/lib/lorica"),
+            "filesystem paths must not leak to the response body"
+        );
+        assert!(
+            !body_str.contains("UNIQUE constraint"),
+            "SQL fragments must not leak to the response body"
+        );
+        assert!(
+            !body_str.contains("3.42.0"),
+            "library version banners must not leak to the response body"
+        );
+    }
+
+    /// v1.5.1 audit M-12 : non-Internal variants keep their
+    /// documented message format - the sanitisation only
+    /// applies to `Internal`. NotFound / BadRequest / etc.
+    /// carry operator- or user-supplied content that is part
+    /// of the API contract and must round-trip verbatim.
+    #[tokio::test]
+    async fn test_into_response_non_internal_variants_keep_message() {
+        for (err, expected) in [
+            (ApiError::NotFound("x".into()), "not found: x"),
+            (ApiError::BadRequest("y".into()), "bad request: y"),
+            (ApiError::Unauthorized("z".into()), "unauthorized: z"),
+            (ApiError::Forbidden("a".into()), "forbidden: a"),
+            (ApiError::Conflict("b".into()), "conflict: b"),
+        ] {
+            let response = err.into_response();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+            assert_eq!(
+                json["error"]["message"], expected,
+                "non-Internal variant message must round-trip verbatim"
+            );
+        }
     }
 
     #[test]

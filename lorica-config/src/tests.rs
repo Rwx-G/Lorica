@@ -1618,6 +1618,215 @@ cert_critical_days = 3
     }
 
     #[test]
+    fn test_export_redacts_webhook_url() {
+        // v1.5.1 audit L-5 : a Slack incoming-webhook URL is itself
+        // a bearer-style credential (anyone with the URL can post
+        // to the channel). The exporter must replace it with the
+        // REDACTED placeholder so the URL does not leak through
+        // every TOML export an operator ships to CI / git / S3.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let nc = NotificationConfig {
+            id: new_id(),
+            channel: NotificationChannel::Slack,
+            enabled: true,
+            config: r#"{"url":"https://hooks.slack.com/services/T0/B0/SECRET-TOKEN"}"#.into(),
+            alert_types: vec!["cert_expiry".into()],
+        };
+        store
+            .create_notification_config(&nc)
+            .expect("test setup: notification config inserts");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        assert!(
+            !toml_str.contains("SECRET-TOKEN"),
+            "raw webhook URL must not appear in the export"
+        );
+        assert!(
+            !toml_str.contains("hooks.slack.com/services/T0/B0"),
+            "even the prefix path must not leak"
+        );
+        assert!(
+            toml_str.contains("**REDACTED**"),
+            "REDACTED placeholder must appear (in the scrubbed URL field)"
+        );
+    }
+
+    #[test]
+    fn test_export_redacts_webhook_auth_header() {
+        // Generic webhook with Bearer auth_header - the token must
+        // never reach a TOML export.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let nc = NotificationConfig {
+            id: new_id(),
+            channel: NotificationChannel::Webhook,
+            enabled: true,
+            config: r#"{"url":"https://alerts.example.com/in","auth_header":"Bearer abc123-secret-token"}"#.into(),
+            alert_types: vec!["waf_alert".into()],
+        };
+        store
+            .create_notification_config(&nc)
+            .expect("test setup: notification config inserts");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        assert!(
+            !toml_str.contains("abc123-secret-token"),
+            "raw bearer token must not appear in the export"
+        );
+        assert!(
+            !toml_str.contains("alerts.example.com/in"),
+            "raw webhook URL must not appear in the export"
+        );
+    }
+
+    #[test]
+    fn test_export_preserves_empty_webhook_fields() {
+        // A webhook config that has no URL / auth_header set yet
+        // (operator opened the dialog but did not save) must
+        // round-trip cleanly without inheriting a REDACTED
+        // placeholder that would later trip the import validator.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let nc = NotificationConfig {
+            id: new_id(),
+            channel: NotificationChannel::Webhook,
+            enabled: false,
+            config: r#"{"url":"","auth_header":""}"#.into(),
+            alert_types: vec![],
+        };
+        store
+            .create_notification_config(&nc)
+            .expect("test setup: notification config inserts");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        // The webhook entry must NOT contribute a REDACTED token
+        // (admin_user password_hash will, so we cannot grep the
+        // whole document - check the notification block only).
+        let nc_block = toml_str
+            .split("[[notification_configs]]")
+            .nth(1)
+            .expect("notification block present");
+        // Stop at the next top-level section so we don't read into
+        // admin_users / certificates / ...
+        let nc_block = nc_block.split("\n[[").next().unwrap_or(nc_block);
+        assert!(
+            !nc_block.contains("**REDACTED**"),
+            "empty webhook fields must not be replaced by REDACTED, got block: {nc_block}"
+        );
+    }
+
+    #[test]
+    fn test_import_rejects_redacted_webhook_url() {
+        // v1.5.1 audit L-5 : the import validator must reject the
+        // REDACTED placeholder on Webhook / Slack channels (was
+        // previously Email-only) so an old TOML cannot silently
+        // swap a live webhook URL for the placeholder, breaking
+        // alert delivery without trace.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let nc = NotificationConfig {
+            id: new_id(),
+            channel: NotificationChannel::Slack,
+            enabled: true,
+            config: r#"{"url":"https://hooks.slack.com/services/T0/B0/SECRET"}"#.into(),
+            alert_types: vec!["cert_expiry".into()],
+        };
+        store
+            .create_notification_config(&nc)
+            .expect("test setup: notification config inserts");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        // parse_toml runs validate() inline (paired with the
+        // existing redacted-secret rejections), so a round-tripped
+        // export with the REDACTED placeholder fails at parse time.
+        let err = parse_toml(&toml_str).expect_err("parse must reject the REDACTED placeholder");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("redacted"),
+            "error message must mention the redacted state, got: {msg}"
+        );
+        assert!(
+            msg.contains("Slack") || msg.contains("webhook"),
+            "error message must name the channel kind, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_export_redacts_bot_hmac_secret_hex() {
+        // v1.5.1 audit H-1 : `bot_hmac_secret_hex` must be replaced
+        // with the REDACTED placeholder on TOML export so a config
+        // file shipped to CI / git / S3 does not leak a forgeable
+        // bot-protection cookie key. An empty / never-initialised
+        // secret is exported as-is (nothing to leak).
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let secret_hex = "a".repeat(64);
+        let mut s = store.get_global_settings().expect("test setup");
+        s.bot_hmac_secret_hex = secret_hex.clone();
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+
+        assert!(
+            toml_str.contains("bot_hmac_secret_hex = \"**REDACTED**\""),
+            "non-empty secret must be replaced with the REDACTED placeholder"
+        );
+        assert!(
+            !toml_str.contains(&secret_hex),
+            "raw hex must not appear anywhere in the export"
+        );
+    }
+
+    #[test]
+    fn test_export_preserves_empty_bot_hmac_secret_hex() {
+        // Empty secret (never-initialised) is exported as-is (no
+        // placeholder, no `REDACTED`) so a fresh store round-trips
+        // cleanly and regenerates the secret on first reload after
+        // import.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+        assert!(
+            toml_str.contains("bot_hmac_secret_hex = \"\""),
+            "empty secret stays empty in export"
+        );
+        assert!(
+            !toml_str.contains("bot_hmac_secret_hex = \"**REDACTED**\""),
+            "empty secret must not surface as REDACTED"
+        );
+    }
+
+    #[test]
+    fn test_import_rejects_redacted_bot_hmac_secret_hex() {
+        // v1.5.1 audit H-1 : importing a TOML with the `**REDACTED**`
+        // placeholder must fail loudly so an old export cannot
+        // silently rotate a live HMAC secret and invalidate every
+        // outstanding bot-protection cookie. Operator must either
+        // provide the real hex or clear the field.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut s = store.get_global_settings().expect("test setup");
+        s.bot_hmac_secret_hex = "a".repeat(64);
+        store
+            .update_global_settings(&s)
+            .expect("test setup: settings update");
+
+        let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
+
+        // `parse_toml` runs `validate()` inline (paired with the
+        // existing `password_hash` / `key_pem` / SMTP-password
+        // rejections), so the REDACTED bot HMAC secret is caught
+        // at parse time - even earlier than `import_to_store`.
+        let err = parse_toml(&toml_str)
+            .expect_err("parse must reject the REDACTED placeholder");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bot_hmac_secret_hex"),
+            "error message must name the field, got: {msg}"
+        );
+        assert!(
+            msg.contains("redacted"),
+            "error message must mention the redacted state, got: {msg}"
+        );
+    }
+
+    #[test]
     fn test_export_preserves_all_entity_types() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
 

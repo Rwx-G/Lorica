@@ -1,5 +1,7 @@
 //! Global settings, notification channels, and per-user UI preferences endpoints.
 
+use std::sync::Arc;
+
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
@@ -11,11 +13,35 @@ use crate::server::AppState;
 // ---- Global Settings ----
 
 /// GET /api/v1/settings - return the global settings document.
+///
+/// `bot_hmac_secret_hex` is scrubbed before serialisation (v1.5.1
+/// audit H-1). The field's own doc on `GlobalSettings` claims this
+/// scrub was already in place ; it was not. A leaked hex secret is
+/// equivalent to a forgeable bot-protection cookie for every IP
+/// across every route until the next certificate renewal rotates it.
+///
+/// Three-state output (H-1 followup) so a consumer can tell apart
+/// "secret never initialised" from "secret in place but masked" :
+///
+/// - `""` (empty string) - secret has not been generated yet
+///   (fresh boot, or import of a historical export with the field
+///   already empty). The next reload will populate it.
+/// - `"**REDACTED**"` (the same sentinel the TOML exporter uses)
+///   - secret is set in the store but withheld from the response.
+///
+/// The actual hex value is never returned by this endpoint and
+/// `UpdateSettingsRequest` does not expose a write path either,
+/// so the secret stays inside the store + cookie-signing code.
 pub async fn get_settings(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
-    let settings = store.get_global_settings()?;
+    let mut settings = store.get_global_settings()?;
+    settings.bot_hmac_secret_hex = if settings.bot_hmac_secret_hex.is_empty() {
+        String::new()
+    } else {
+        "**REDACTED**".to_string()
+    };
     Ok(json_data(settings))
 }
 
@@ -617,26 +643,41 @@ pub async fn test_notification(
         "Lorica test notification - if you receive this, your channel is working!",
     );
 
+    // Audit L-4 : the v1.5.1 M-12 work sanitised `ApiError::Internal`
+    // bodies but the BadRequest path still echoed verbatim
+    // `serde_json::Error` Display, which can include input bytes from
+    // the malformed JSON ("expected value at line 1 column 23"). On
+    // a dashboard toast that's surfaced to the operator's screen.
+    // Log the full inner detail at `tracing::warn!` (operator
+    // forensics trail preserved) and return a fixed user-facing
+    // string keyed to the channel kind.
     match nc.channel {
         lorica_config::models::NotificationChannel::Email => {
             let config: lorica_notify::channels::EmailConfig = serde_json::from_str(&nc.config)
-                .map_err(|e| ApiError::BadRequest(format!("invalid email config: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(channel = "email", error = %e, "stored notification config failed JSON deserialisation");
+                    ApiError::BadRequest("stored email notification config is malformed".into())
+                })?;
             lorica_notify::channels::email::send(&config, &test_event)
                 .await
                 .map_err(|e| ApiError::Internal(format!("email send failed: {e}")))?;
         }
         lorica_config::models::NotificationChannel::Webhook => {
             let config: lorica_notify::channels::WebhookConfig =
-                serde_json::from_str(&nc.config)
-                    .map_err(|e| ApiError::BadRequest(format!("invalid webhook config: {e}")))?;
+                serde_json::from_str(&nc.config).map_err(|e| {
+                    tracing::warn!(channel = "webhook", error = %e, "stored notification config failed JSON deserialisation");
+                    ApiError::BadRequest("stored webhook notification config is malformed".into())
+                })?;
             lorica_notify::channels::webhook::send(&config, &test_event)
                 .await
                 .map_err(|e| ApiError::Internal(format!("webhook send failed: {e}")))?;
         }
         lorica_config::models::NotificationChannel::Slack => {
             let config: lorica_notify::channels::WebhookConfig =
-                serde_json::from_str(&nc.config)
-                    .map_err(|e| ApiError::BadRequest(format!("invalid slack config: {e}")))?;
+                serde_json::from_str(&nc.config).map_err(|e| {
+                    tracing::warn!(channel = "slack", error = %e, "stored notification config failed JSON deserialisation");
+                    ApiError::BadRequest("stored slack notification config is malformed".into())
+                })?;
             lorica_notify::channels::slack::send(&config, &test_event)
                 .await
                 .map_err(|e| ApiError::Internal(format!("slack send failed: {e}")))?;
@@ -660,14 +701,20 @@ pub async fn test_notification(
 pub async fn notification_history(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Read from persistent log store (survives restarts)
+    // Read from persistent log store (survives restarts).
+    // Off the tokio worker (audit M-7 / backlog #23) - both calls
+    // hit the SQLite WAL via `Mutex<Connection>` and an unrelated
+    // proxy-side write would otherwise stall the reactor.
     if let Some(ref log_store) = state.log_store {
-        let events = log_store
-            .list_notification_history(200)
-            .map_err(ApiError::Internal)?;
-        let total = log_store
-            .notification_history_count()
-            .map_err(ApiError::Internal)?;
+        let store = Arc::clone(log_store);
+        let (events, total) = tokio::task::spawn_blocking(move || {
+            let events = store.list_notification_history(200)?;
+            let total = store.notification_history_count()?;
+            Ok::<_, String>((events, total))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("notification history join failed: {e}")))?
+        .map_err(ApiError::Internal)?;
         return Ok(json_data(serde_json::json!({
             "events": events,
             "total": total,
@@ -691,18 +738,31 @@ fn mask_sensitive_config(
     channel: &lorica_config::models::NotificationChannel,
     config: &str,
 ) -> String {
-    if *channel == lorica_config::models::NotificationChannel::Email {
-        if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(config) {
-            if val
-                .get("smtp_password")
-                .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
-            {
-                val["smtp_password"] = serde_json::json!("********");
-            }
-            return serde_json::to_string(&val).unwrap_or_else(|_| config.to_string());
+    use lorica_config::models::NotificationChannel;
+
+    let mut val = match serde_json::from_str::<serde_json::Value>(config) {
+        Ok(v) => v,
+        Err(_) => return config.to_string(),
+    };
+
+    // Mirror the v1.5.1 audit L-5 TOML-export scrub : non-empty
+    // `smtp_password` (Email), `url` + `auth_header` (Webhook + Slack)
+    // are bearer-style credentials that the JSON GET path was leaking
+    // verbatim. v1.5.2 audit M-1 closure : same field set, same
+    // sentinel (`********`), same accept-back contract on PUT.
+    let secret_fields: &[&str] = match channel {
+        NotificationChannel::Email => &["smtp_password"],
+        NotificationChannel::Webhook | NotificationChannel::Slack => &["url", "auth_header"],
+    };
+    for field in secret_fields {
+        if val
+            .get(field)
+            .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        {
+            val[*field] = serde_json::json!("********");
         }
     }
-    config.to_string()
+    serde_json::to_string(&val).unwrap_or_else(|_| config.to_string())
 }
 
 fn validate_notification_config(config: &str) -> Result<(), ApiError> {
@@ -727,39 +787,53 @@ pub async fn update_notification(
 
     validate_notification_config(&body.config)?;
 
+    // If the submitted config carries the `"********"` sentinel for
+    // any secret field, restore the previously stored value for that
+    // field. Any failure in the restore path must surface as an error
+    // - silently falling through would persist the literal mask
+    // string and erase the real secret. Email gets `smtp_password` ;
+    // Webhook + Slack get `url` + `auth_header` (v1.5.2 audit M-1
+    // closes the asymmetry between TOML export scrub and JSON GET
+    // scrub).
+    let restore_fields: &[&str] = match channel {
+        lorica_config::models::NotificationChannel::Email => &["smtp_password"],
+        lorica_config::models::NotificationChannel::Webhook
+        | lorica_config::models::NotificationChannel::Slack => &["url", "auth_header"],
+    };
     let mut config = body.config.clone();
-    if channel == lorica_config::models::NotificationChannel::Email {
-        // If the submitted config carries the sentinel mask
-        // `"********"` for the password, the UI wants us to keep the
-        // previously stored value. Any failure in that restore path
-        // (config unparseable, no existing row, no password in the
-        // existing row) must be surfaced as an error; silently
-        // falling through would persist the literal mask string and
-        // erase the real SMTP password.
+    if !restore_fields.is_empty() {
         if let Ok(mut new_val) = serde_json::from_str::<serde_json::Value>(&config) {
-            if new_val
-                .get("smtp_password")
-                .is_some_and(|v| v.as_str() == Some("********"))
-            {
+            let needs_restore = restore_fields.iter().any(|f| {
+                new_val
+                    .get(*f)
+                    .is_some_and(|v| v.as_str() == Some("********"))
+            });
+            if needs_restore {
                 let store = state.store.lock().await;
                 let existing = store.get_notification_config(&id)?.ok_or_else(|| {
                     ApiError::BadRequest(
-                        "cannot restore masked smtp_password: no existing config for this channel"
-                            .into(),
+                        "cannot restore masked secret: no existing config for this channel".into(),
                     )
                 })?;
-                let existing_val: serde_json::Value = serde_json::from_str(&existing.config)
-                    .map_err(|e| {
+                let existing_val: serde_json::Value =
+                    serde_json::from_str(&existing.config).map_err(|e| {
                         ApiError::BadRequest(format!(
-                            "existing email config is corrupt; cannot restore smtp_password: {e}"
+                            "existing notification config is corrupt; cannot restore secrets: {e}"
                         ))
                     })?;
-                let pwd = existing_val.get("smtp_password").ok_or_else(|| {
-                    ApiError::BadRequest(
-                        "existing email config has no smtp_password to restore".into(),
-                    )
-                })?;
-                new_val["smtp_password"] = pwd.clone();
+                for field in restore_fields {
+                    if new_val
+                        .get(*field)
+                        .is_some_and(|v| v.as_str() == Some("********"))
+                    {
+                        let v = existing_val.get(*field).ok_or_else(|| {
+                            ApiError::BadRequest(format!(
+                                "existing config has no `{field}` to restore"
+                            ))
+                        })?;
+                        new_val[*field] = v.clone();
+                    }
+                }
                 config = serde_json::to_string(&new_val).map_err(|e| {
                     ApiError::BadRequest(format!("failed to re-serialize notification config: {e}"))
                 })?;

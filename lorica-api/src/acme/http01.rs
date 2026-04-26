@@ -121,6 +121,7 @@ pub(super) async fn provision_with_acme(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
         Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
+        RetryPolicy,
     };
 
     let primary_domain = &domains[0];
@@ -129,130 +130,97 @@ pub(super) async fn provision_with_acme(
     let contact = config.contact_email.as_ref().map(|e| format!("mailto:{e}"));
     let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
 
-    let (account, _) = Account::create(
-        &NewAccount {
-            contact: &contact_refs,
-            terms_of_service_agreed: true,
-            only_return_existing: false,
-        },
-        config.directory_url(),
-        None,
-    )
-    .await?;
+    // instant-acme 0.8 (audit L-15) : Account creation goes
+    // through a builder, NewOrder needs the public constructor.
+    let (account, _) = Account::builder()?
+        .create(
+            &NewAccount {
+                contact: &contact_refs,
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            config.directory_url().to_string(),
+            None,
+        )
+        .await?;
 
     // Create order with all domains as identifiers
     let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
-    let mut order = account
-        .new_order(&NewOrder {
-            identifiers: &identifiers,
-        })
-        .await?;
+    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
 
-    // Get authorizations (one per domain)
-    let authorizations = order.authorizations().await?;
-
-    // Phase 1: Store all challenge tokens before signaling readiness
-    let mut challenge_info: Vec<(String, String)> = Vec::new(); // (token, challenge_url)
-    for auth in &authorizations {
-        if matches!(auth.status, AuthorizationStatus::Valid) {
+    // instant-acme 0.8 (audit L-15) : authorizations is now a
+    // stream-style iterator yielding `AuthorizationHandle`s ;
+    // we iterate once, store each token + signal readiness on
+    // the same handle, then poll the order for "all auths
+    // valid" via the new `poll_ready` helper. Cleanup of stored
+    // tokens happens in both the success and failure paths so
+    // the proxy never serves a stale challenge after the order
+    // resolves.
+    let mut authorizations = order.authorizations();
+    let mut stored_tokens: Vec<String> = Vec::new();
+    while let Some(result) = authorizations.next().await {
+        let mut authz = result?;
+        if matches!(authz.status, AuthorizationStatus::Valid) {
             continue;
         }
-
-        let challenge = auth
-            .challenges
-            .iter()
-            .find(|c| c.r#type == ChallengeType::Http01)
+        let mut challenge = authz
+            .challenge(ChallengeType::Http01)
             .ok_or("no HTTP-01 challenge available")?;
-
-        let key_authorization = order.key_authorization(challenge);
-
-        // Store challenge response for the proxy to serve
+        let key_authorization = challenge.key_authorization();
+        let token = challenge.token.clone();
         if let Some(ref store) = state.acme_challenge_store {
             store
-                .set(
-                    challenge.token.clone(),
-                    key_authorization.as_str().to_string(),
-                )
+                .set(token.clone(), key_authorization.as_str().to_string())
                 .await;
         }
-
-        challenge_info.push((challenge.token.clone(), challenge.url.clone()));
+        stored_tokens.push(token);
+        challenge.set_ready().await?;
     }
+    // `authorizations` borrows `order` ; let NLL release the borrow
+    // here so the next `order.poll_ready()` call can re-borrow mut.
+    let _ = authorizations;
 
-    // Phase 2: Signal readiness for all challenges
-    for (_, url) in &challenge_info {
-        order.set_challenge_ready(url).await?;
-    }
+    // Wait for all authorizations to become valid (or hit a
+    // terminal failure). `poll_ready` exponentially backs off
+    // and returns the final OrderStatus.
+    let ready_status = order.poll_ready(&RetryPolicy::default()).await?;
 
-    // Phase 3: Wait for all authorizations to become valid
-    let mut attempts = 0;
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let fresh_auths = order.authorizations().await?;
-
-        let all_valid = fresh_auths
-            .iter()
-            .all(|a| matches!(a.status, AuthorizationStatus::Valid));
-        if all_valid {
-            break;
-        }
-
-        let any_invalid = fresh_auths
-            .iter()
-            .any(|a| matches!(a.status, AuthorizationStatus::Invalid));
-        if any_invalid {
-            // Find which domain failed
-            let failed: Vec<String> = fresh_auths
-                .iter()
-                .filter(|a| matches!(a.status, AuthorizationStatus::Invalid))
-                .map(|a| format!("{:?}", a.identifier))
-                .collect();
-            return Err(format!("challenge validation failed for: {}", failed.join(", ")).into());
-        }
-
-        attempts += 1;
-        if attempts > 15 {
-            return Err("challenge validation timed out after 30s".into());
-        }
-    }
-
-    // Clean up all challenge tokens
+    // Clean up all challenge tokens regardless of outcome - the
+    // proxy must not serve a stale token after the order
+    // resolves either way.
     if let Some(ref store) = state.acme_challenge_store {
-        for (token, _) in &challenge_info {
+        for token in &stored_tokens {
             store.remove(token).await;
         }
     }
 
-    // Generate CSR with all domains as SANs and finalize order
+    if ready_status != OrderStatus::Ready {
+        return Err(format!(
+            "ACME challenge validation did not reach Ready: {ready_status:?}"
+        )
+        .into());
+    }
+
+    // Generate CSR with all domains as SANs and finalize order.
+    // `finalize_csr` is the explicit-CSR variant in 0.8 ; the
+    // sibling `finalize()` would use a fresh rcgen key generated
+    // by the crate (requires the `rcgen` feature, which we do
+    // not enable - see `Cargo.toml`).
     let mut params = rcgen::CertificateParams::new(domains.to_vec())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     let private_key = rcgen::KeyPair::generate()?;
     let csr = params.serialize_request(&private_key)?;
 
-    order.finalize(csr.der()).await?;
+    order.finalize_csr(csr.der()).await?;
 
-    // Wait for certificate issuance
-    let mut attempts = 0;
-    let cert_pem = loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let state = order.state();
-        match state.status {
-            OrderStatus::Valid => {
-                let cert = order.certificate().await?;
-                break cert.ok_or("no certificate returned")?;
-            }
-            OrderStatus::Processing => {
-                attempts += 1;
-                if attempts > 30 {
-                    return Err("certificate issuance timed out".into());
-                }
-                order.refresh().await?;
-            }
-            status => {
-                return Err(format!("unexpected order status: {status:?}").into());
-            }
-        }
-    };
+    // Poll for issuance with exponential backoff. Returns the
+    // PEM-encoded certificate chain on success ; the helper
+    // handles `Processing` -> `Valid` transitions internally
+    // and replaces the v0.7-era manual sleep-and-refresh loop.
+    let cert_pem = order
+        .poll_certificate(&RetryPolicy::default())
+        .await
+        .map_err(|e| format!("certificate poll failed: {e}"))?;
 
     let key_pem = private_key.serialize_pem();
 
@@ -286,8 +254,13 @@ pub(super) async fn provision_with_acme(
 
     let store = state.store.lock().await;
     store.create_certificate(&cert)?;
-    crate::cert_export::export_from_store(&store, &cert);
+    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
     drop(store);
+    // v1.5.1 audit M-9 : disk export off-loaded to spawn_blocking
+    // and dispatched AFTER the store mutex is released.
+    if let Some((settings, acls)) = export_snapshot {
+        crate::cert_export::export_after_release(settings, acls, cert).await;
+    }
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 

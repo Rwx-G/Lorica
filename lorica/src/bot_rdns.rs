@@ -37,10 +37,21 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use dashmap::DashSet;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+// hickory 0.25 renamed `TokioAsyncResolver` to `TokioResolver`
+// (audit L-15 dep bump) and 0.26 turned the `::tokio(...)`
+// associated function into a builder-mediated path
+// (`Resolver::builder_with_config(...).with_options(...).build()?`).
+// The `Resolver` generic type alias `TokioResolver` is what
+// callers store now ; the builder lives on `Resolver`.
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::rdata::PTR;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::{Resolver, TokioResolver};
 use lru::LruCache;
 use parking_lot::Mutex;
+use tokio::sync::Semaphore;
 
 /// How long a successful rDNS result stays cached. One hour matches
 /// typical operator rDNS deployments AND caps the window where a
@@ -52,6 +63,15 @@ const CACHE_TTL_S: i64 = 3600;
 /// LRU capacity. 16 384 entries × ~128 bytes per slot = ~2 MiB
 /// worst-case memory. Bounded, deterministic.
 const CACHE_CAPACITY: usize = 16_384;
+
+/// Hard cap on concurrent background `resolve_and_cache` tasks
+/// (v1.5.1 audit L-10). Bounds the in-flight async work even
+/// under a flood of unique IPs that bypass the dedup. Mirrors
+/// the `MIRROR_SEMAPHORE` precedent in `proxy_wiring/mirror_rewrite.rs`.
+/// Each resolve task holds a hickory query future + the connection
+/// state for at most ~6 s (timeout+attempts), so 256 in-flight ≈
+/// a few MiB of pending state - well within budget.
+const MAX_INFLIGHT_RESOLVES: usize = 256;
 
 /// What the cache stores per client IP. `None` confirmed name =
 /// "we looked up, no PTR or forward-confirm failed" — still a
@@ -69,17 +89,37 @@ pub struct RdnsCacheEntry {
 /// initialised state without plumbing a resolver through every
 /// call.
 pub struct RdnsResolver {
-    inner: TokioAsyncResolver,
+    inner: TokioResolver,
     cache: Mutex<LruCache<IpAddr, RdnsCacheEntry>>,
+    /// IPs currently being resolved by a background populate task.
+    /// `try_spawn_resolve` consults this set before spawning a
+    /// new task : a concurrent miss for the same fresh IP is a
+    /// no-op rather than a duplicate spawn. Entries are removed
+    /// when the task completes (success or fail). v1.5.1 audit
+    /// L-10 (was : every cache miss spawned an unbounded
+    /// `tokio::spawn`, so a flood of N concurrent requests for
+    /// the same fresh IP allocated N redundant resolve futures).
+    inflight: DashSet<IpAddr>,
+    /// Bounded permits for concurrent background resolve tasks.
+    /// `try_spawn_resolve` drops the spawn silently when the cap
+    /// is reached - the next request from the same IP retries
+    /// once a slot frees up. Bounds total in-flight async work
+    /// even under a botnet flood of unique IPs.
+    permits: Arc<Semaphore>,
 }
 
 impl RdnsResolver {
     /// Build a resolver from the system `/etc/resolv.conf`. Returns
-    /// an `io::Error` when the resolv.conf is absent or malformed
-    /// — which in practice only happens on bare containers without
+    /// an `io::Error` when the resolv.conf is absent or malformed -
+    /// which in practice only happens on bare containers without
     /// a DNS configuration. Caller logs and skips registration.
     pub fn from_system_conf() -> std::io::Result<Self> {
-        let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()?;
+        // hickory 0.26 changed `read_system_conf` to return its
+        // own `NetError` instead of `std::io::Error` ; map back
+        // to `io::Error::other` so the public signature stays
+        // stable for callers (audit L-15 dep bump).
+        let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()
+            .map_err(std::io::Error::other)?;
         // Short timeouts — a stuck DNS server must not wedge the
         // background populate task. Two retries + 2 s each = ≤ 6 s
         // end-to-end per lookup, well inside the tokio spawn's
@@ -95,12 +135,84 @@ impl RdnsResolver {
     }
 
     fn build(config: ResolverConfig, opts: ResolverOpts) -> Self {
-        let inner = TokioAsyncResolver::tokio(config, opts);
+        // hickory 0.26 (audit L-15) : `Resolver::builder_with_config`
+        // takes the runtime provider as an explicit arg ; the
+        // `tokio` feature ships `TokioConnectionProvider`.
+        // `with_options` overwrites the system-conf opts (we
+        // already have what we want here, no merge needed).
+        // `build()` is infallible with an explicit config -
+        // `expect` documents that for the next reader.
+        let inner = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(opts)
+            .build()
+            .expect("hickory builder with explicit config is infallible");
         let capacity = NonZeroUsize::new(CACHE_CAPACITY).expect("non-zero cache cap");
         Self {
             inner,
             cache: Mutex::new(LruCache::new(capacity)),
+            inflight: DashSet::new(),
+            permits: Arc::new(Semaphore::new(MAX_INFLIGHT_RESOLVES)),
         }
+    }
+
+    /// Spawn a background resolve for `ip` if no other task is
+    /// already in flight for the same IP and the in-flight cap
+    /// has not been reached. Idempotent and lock-free on the
+    /// happy path - intended to be called from the proxy
+    /// `request_filter` on every cache miss for the rDNS
+    /// bypass category.
+    ///
+    /// Behaviour matrix :
+    ///
+    /// - `ip` already in flight -> no-op (dedup, the previous
+    ///   spawn will populate the cache).
+    /// - At permit cap -> no-op (drop, the next request for
+    ///   this IP will retry once a slot frees up). The cache
+    ///   stays unpopulated for this IP and the bot evaluator
+    ///   keeps treating "rDNS bypass does not fire" - same
+    ///   semantic as a fresh boot.
+    /// - Otherwise spawn a task that calls `resolve_and_cache`
+    ///   then removes the IP from `inflight`.
+    ///
+    /// v1.5.1 audit L-10 : pre-fix, the proxy spawned an
+    /// unbounded `tokio::spawn(resolve_and_cache)` per cache
+    /// miss. A flood of N concurrent requests for the same
+    /// fresh IP allocated N redundant resolve futures ; a
+    /// botnet flood of unique IPs allocated unbounded async
+    /// work proportional to attack volume.
+    pub fn try_spawn_resolve(self: &Arc<Self>, ip: IpAddr) {
+        // Dedup : DashSet::insert returns false if the IP was
+        // already present. A second concurrent miss for the
+        // same fresh IP is a no-op.
+        if !self.inflight.insert(ip) {
+            return;
+        }
+        // Hard cap : try_acquire_owned is non-blocking. When
+        // the semaphore is exhausted we drop the spawn and
+        // remove the IP from inflight so a later attempt can
+        // retry once a slot frees up.
+        let permit = match Arc::clone(&self.permits).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                self.inflight.remove(&ip);
+                return;
+            }
+        };
+        let resolver = Arc::clone(self);
+        tokio::spawn(async move {
+            // Hold the permit for the lifetime of the resolve so
+            // the cap reflects real in-flight work.
+            let _permit = permit;
+            let _ = resolver.resolve_and_cache(ip).await;
+            resolver.inflight.remove(&ip);
+        });
+    }
+
+    /// Number of resolve tasks currently in flight. Test-only
+    /// accessor used by `try_spawn_resolve` regression tests.
+    #[cfg(test)]
+    pub(crate) fn inflight_count(&self) -> usize {
+        self.inflight.len()
     }
 
     /// Synchronous cache-only lookup. Returns `Some(Some(name))`
@@ -135,12 +247,21 @@ impl RdnsResolver {
     }
 
     async fn lookup_with_forward_confirm(&self, ip: IpAddr) -> Option<String> {
-        // PTR lookup. hickory returns a list of names; iterate and
-        // take the first that forward-confirms. In practice the
-        // list is length 1 for every real-world rDNS deployment.
+        // PTR lookup. hickory 0.26 (audit L-15) replaced
+        // `ReverseLookup::iter()` with `Lookup::answers() -> &[Record]`
+        // on the generic `Lookup` type ; we filter for `RData::PTR`
+        // variants to recover the names. In practice the list is
+        // length 1 for every real-world rDNS deployment.
         let reverse = self.inner.reverse_lookup(ip).await.ok()?;
-        for name in reverse.iter() {
-            let name_str = name.to_ascii();
+        let names: Vec<String> = reverse
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::PTR(PTR(name)) => Some(name.to_ascii()),
+                _ => None,
+            })
+            .collect();
+        for name_str in names {
             // Forward lookup. Hickory's `lookup_ip` handles both
             // A and AAAA; we scan every returned IpAddr for an
             // equality match with the client.
@@ -181,7 +302,7 @@ static RDNS_HANDLE: OnceLock<Arc<RdnsResolver>> = OnceLock::new();
 
 /// Register the process-wide rDNS resolver. Called once at
 /// startup after the tokio runtime is up (the resolver needs
-/// `TokioAsyncResolver::tokio` which expects a runtime). Second
+/// `TokioResolver::tokio` which expects a runtime). Second
 /// call is a silent no-op.
 pub fn set_handle(resolver: Arc<RdnsResolver>) {
     let _ = RDNS_HANDLE.set(resolver);
@@ -279,6 +400,103 @@ mod tests {
         );
     }
 
+    /// v1.5.1 audit L-10 : `try_spawn_resolve` must dedup
+    /// concurrent calls for the same fresh IP - exactly one
+    /// background task should be in flight regardless of how many
+    /// times the request_filter fires for that IP. Uses the same
+    /// black-hole resolver from the test below to keep the spawned
+    /// task pending while we inspect `inflight_count`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_spawn_resolve_dedups_concurrent_calls_for_same_ip() {
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig};
+        use std::net::SocketAddr;
+
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // hickory 0.26 (audit L-15) : `ResolverConfig::new()`
+        // is gone ; use `from_parts(domain, search, name_servers)`
+        // with an empty seed instead.
+        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
+        // hickory 0.26 (audit L-15) : `NameServerConfig` is now
+        // non-exhaustive with `(ip, trust_negative_responses,
+        // connections)`. Connection-level config (port + protocol
+        // + bind_addr) moved to `ConnectionConfig`.
+        let mut conn = ConnectionConfig::udp();
+        conn.port = addr.port();
+        let ns_config = NameServerConfig::new(addr.ip(), false, vec![conn]);
+        config.add_name_server(ns_config);
+        let mut opts = ResolverOpts::default();
+        opts.timeout = Duration::from_millis(200);
+        opts.attempts = 1;
+        opts.cache_size = 0;
+
+        let resolver = Arc::new(RdnsResolver::with_config(config, opts));
+        let ip: IpAddr = "192.0.2.7".parse().unwrap();
+
+        assert_eq!(resolver.inflight_count(), 0);
+
+        // Five concurrent spawn calls for the same IP : the
+        // first inserts into `inflight` and spawns ; the next
+        // four short-circuit on the dedup check.
+        for _ in 0..5 {
+            resolver.try_spawn_resolve(ip);
+        }
+        assert_eq!(
+            resolver.inflight_count(),
+            1,
+            "five concurrent spawns for the same IP must collapse to one in-flight task"
+        );
+
+        // Wait for the single task to time out + complete. The
+        // black-hole resolver gives up after 200 ms ; budget 1 s
+        // for the spawn scheduling + cache write + inflight remove.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            resolver.inflight_count(),
+            0,
+            "inflight set must drain after the resolve task completes"
+        );
+    }
+
+    /// `try_spawn_resolve` for two different IPs must run two
+    /// concurrent tasks (no false dedup across IPs).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_spawn_resolve_does_not_dedup_across_ips() {
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig};
+        use std::net::SocketAddr;
+
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // hickory 0.26 (audit L-15) : `ResolverConfig::new()`
+        // is gone ; use `from_parts(domain, search, name_servers)`
+        // with an empty seed instead.
+        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
+        // hickory 0.26 (audit L-15) : `NameServerConfig` is now
+        // non-exhaustive with `(ip, trust_negative_responses,
+        // connections)`. Connection-level config (port + protocol
+        // + bind_addr) moved to `ConnectionConfig`.
+        let mut conn = ConnectionConfig::udp();
+        conn.port = addr.port();
+        let ns_config = NameServerConfig::new(addr.ip(), false, vec![conn]);
+        config.add_name_server(ns_config);
+        let mut opts = ResolverOpts::default();
+        opts.timeout = Duration::from_millis(200);
+        opts.attempts = 1;
+        opts.cache_size = 0;
+
+        let resolver = Arc::new(RdnsResolver::with_config(config, opts));
+        let ip1: IpAddr = "192.0.2.10".parse().unwrap();
+        let ip2: IpAddr = "192.0.2.11".parse().unwrap();
+        let ip3: IpAddr = "192.0.2.12".parse().unwrap();
+
+        resolver.try_spawn_resolve(ip1);
+        resolver.try_spawn_resolve(ip2);
+        resolver.try_spawn_resolve(ip3);
+
+        assert_eq!(resolver.inflight_count(), 3);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(resolver.inflight_count(), 0);
+    }
+
     /// `resolve_and_cache` must populate the cache even when the PTR
     /// lookup fails or forward-confirm does not match (the negative
     /// entry prevents a hot-path from re-resolving the same IP every
@@ -292,21 +510,25 @@ mod tests {
     /// bypass category.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolve_and_cache_writes_negative_entry_on_resolver_failure() {
-        use hickory_resolver::config::{NameServerConfig, Protocol};
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig};
         use std::net::SocketAddr;
 
         // 127.0.0.1:1 is deliberately a port nothing listens on —
         // UDP sends will drop / time out. The short opts below cap
         // the test at ≤ 1 s wall-clock.
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let mut config = ResolverConfig::new();
-        config.add_name_server(NameServerConfig {
-            socket_addr: addr,
-            protocol: Protocol::Udp,
-            tls_dns_name: None,
-            trust_negative_responses: false,
-            bind_addr: None,
-        });
+        // hickory 0.26 (audit L-15) : `ResolverConfig::new()`
+        // is gone ; use `from_parts(domain, search, name_servers)`
+        // with an empty seed instead.
+        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
+        // hickory 0.26 (audit L-15) : `NameServerConfig` is now
+        // non-exhaustive with `(ip, trust_negative_responses,
+        // connections)`. Connection-level config (port + protocol
+        // + bind_addr) moved to `ConnectionConfig`.
+        let mut conn = ConnectionConfig::udp();
+        conn.port = addr.port();
+        let ns_config = NameServerConfig::new(addr.ip(), false, vec![conn]);
+        config.add_name_server(ns_config);
         let mut opts = ResolverOpts::default();
         opts.timeout = Duration::from_millis(200);
         opts.attempts = 1;

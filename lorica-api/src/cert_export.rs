@@ -359,22 +359,37 @@ fn chain_pem_from(pem: &str) -> String {
     out
 }
 
-/// Convenience wrapper called by every cert-creation path
-/// (`create_certificate`, `generate_self_signed`, the ACME HTTP-01 /
-/// DNS-01 success handlers). Reads `GlobalSettings` + ACLs from the
-/// store, invokes `export_certificate`, logs the outcome. Never
-/// returns an error - the cert is already persisted in the DB, a
-/// missing disk copy never blocks the request.
-pub fn export_from_store(store: &lorica_config::ConfigStore, cert: &Certificate) {
-    let settings = match store.get_global_settings() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "cert export: could not read global settings");
-            return;
-        }
-    };
-    let acls = store.list_cert_export_acls().unwrap_or_default();
-    match export_certificate(&settings, &acls, cert) {
+/// Off-load a single-cert export to a `spawn_blocking` task and
+/// await completion. Takes owned `settings` + `acls` + `cert`
+/// snapshots so the caller can release any `ConfigStore` lock
+/// BEFORE invoking this function - concurrent API handlers waiting
+/// on the same store mutex stay responsive while the disk write
+/// happens. v1.5.1 audit M-9 (was : every cert-creation path
+/// called the synchronous `export_from_store(&store, &cert)` from
+/// inside the `state.store.lock().await` scope, so a slow disk -
+/// or worse, the cross-mount EXDEV `copy + fsync + rename` fallback -
+/// head-of-line-blocked every other API handler for the duration
+/// of the IO).
+///
+/// Awaits the spawn_blocking handle so the caller's response
+/// timing matches the previous synchronous behaviour : the disk
+/// copy is on disk by the time the response goes out. The export
+/// is fail-soft (cert is already persisted in the DB before this
+/// runs) ; awaiting only delays the response when the spawn
+/// itself completes, not on persistent IO failures.
+pub async fn export_after_release(
+    settings: GlobalSettings,
+    acls: Vec<CertExportAcl>,
+    cert: Certificate,
+) {
+    let _ = tokio::task::spawn_blocking(move || {
+        log_export_outcome(export_certificate(&settings, &acls, &cert), &cert);
+    })
+    .await;
+}
+
+fn log_export_outcome(result: Result<ExportOutcome, ExportError>, cert: &Certificate) {
+    match result {
         Ok(ExportOutcome::Ok) => {
             tracing::info!(cert_id = %cert.id, domain = %cert.domain, "cert export: ok");
         }
@@ -402,6 +417,27 @@ pub fn export_from_store(store: &lorica_config::ConfigStore, cert: &Certificate)
             );
         }
     }
+}
+
+/// Snapshot the inputs required by [`export_after_release`] from
+/// a held `ConfigStore` lock. Returns `None` when the settings
+/// query fails (a corrupted-DB shape that the previous
+/// `export_from_store` swallowed silently with a `warn!` ; same
+/// behaviour preserved here so callers stay one-line and the
+/// "cert is in the DB but disk copy did not happen" path keeps
+/// logging the same way).
+pub fn snapshot_export_inputs(
+    store: &lorica_config::ConfigStore,
+) -> Option<(GlobalSettings, Vec<CertExportAcl>)> {
+    let settings = match store.get_global_settings() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "cert export: could not read global settings");
+            return None;
+        }
+    };
+    let acls = store.list_cert_export_acls().unwrap_or_default();
+    Some((settings, acls))
 }
 
 /// One orphan entry returned by [`scan_orphans`].

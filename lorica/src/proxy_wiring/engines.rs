@@ -241,25 +241,37 @@ impl RateLimitEngine {
     ) -> bool {
         match self {
             RateLimitEngine::Authoritative(map) => {
-                let bucket = map
-                    .entry(key.to_string())
-                    .or_insert_with(|| {
-                        Arc::new(lorica_limits::token_bucket::AuthoritativeBucket::new(
-                            rl.capacity,
-                            rl.refill_per_sec,
-                            now_ns,
-                        ))
-                    })
-                    .clone();
+                // Fast path : lock-free `get` with `&str` ; only fall
+                // back to the `entry(String)` allocation on miss.
+                // Hot path is the existing-key case (rate limiter
+                // serves the same client repeatedly), so this avoids
+                // the per-request `key.to_string()` allocation that
+                // `entry()` requires (audit M-12).
+                let bucket = if let Some(b) = map.get(key) {
+                    b.value().clone()
+                } else {
+                    map.entry(key.to_string())
+                        .or_insert_with(|| {
+                            Arc::new(lorica_limits::token_bucket::AuthoritativeBucket::new(
+                                rl.capacity,
+                                rl.refill_per_sec,
+                                now_ns,
+                            ))
+                        })
+                        .clone()
+                };
                 bucket.try_consume(cost, now_ns)
             }
             RateLimitEngine::Local(map) => {
-                let bucket = map
-                    .entry(key.to_string())
-                    .or_insert_with(|| {
-                        Arc::new(lorica_limits::token_bucket::LocalBucket::new(rl.capacity))
-                    })
-                    .clone();
+                let bucket = if let Some(b) = map.get(key) {
+                    b.value().clone()
+                } else {
+                    map.entry(key.to_string())
+                        .or_insert_with(|| {
+                            Arc::new(lorica_limits::token_bucket::LocalBucket::new(rl.capacity))
+                        })
+                        .clone()
+                };
                 bucket.try_consume(cost)
             }
         }

@@ -44,45 +44,127 @@ impl WafEngine {
     ) -> WafVerdict {
         let start = Instant::now();
         let mut events = Vec::new();
-        let now = chrono::Utc::now().to_rfc3339();
+        // v1.5.2 audit L-20 : defer the `chrono::Utc::now().to_rfc3339()`
+        // call (~200 ns per request) until at least one event fires.
+        // Empty `now` is stamped on every WafEvent during the scan ;
+        // the post-scan loop fills the real timestamp only when
+        // events end up non-empty.
+        let now = "";
 
-        // PERF-9: two-phase eval. Per-field, run the cheap
-        // Aho-Corasick prefilter first; only fall through to the
-        // regex pass when the prefilter hits. Custom user rules are
-        // outside the prefilter contract so we still scan them
-        // regardless. Full-scan semantics (all events collected)
-        // are preserved for observability.
+        // PERF-9 + v1.5.1 audit M-4 : two-phase eval. Per-field,
+        // run the cheap Aho-Corasick prefilter first ; only fall
+        // through to the built-in regex pass when the prefilter
+        // hits. Custom user rules are outside the prefilter
+        // coverage contract (their patterns are unknown at build
+        // time) so they run unconditionally when any custom rule
+        // is loaded. Pre-fix, the presence of a single custom rule
+        // bypassed the prefilter for the 49 built-in rules on
+        // every field, turning every clean request into an
+        // O(rules x fields) regex scan and amplifying admin
+        // misconfiguration into a DoS vector.
         let has_custom_rules = !self.custom_rules.read().is_empty();
 
-        // Check path (URL-decode to catch encoded traversal attacks)
-        let decoded_path = Self::url_decode(path);
-        if has_custom_rules || self.prefilter.matches(&decoded_path) {
-            self.scan_field("path", &decoded_path, &now, &mut events);
+        // Check path (URI percent-decoding ; `+` is a literal in
+        // paths per RFC 3986, do not rewrite to space). Decoding
+        // is recursive to defeat double / triple-encoded traversal
+        // attacks.
+        let decoded_path = Self::url_decode_uri(path);
+        if self.prefilter.matches(&decoded_path) {
+            self.scan_builtin_rules("path", &decoded_path, now, &mut events);
+        }
+        if has_custom_rules {
+            self.scan_custom_rules("path", &decoded_path, now, &mut events);
         }
 
-        // Check query string
+        // Check query string (form-style decoding ; `+` -> space).
         if let Some(q) = query {
-            // URL-decode the query for better detection
-            let decoded = Self::url_decode(q);
-            if has_custom_rules || self.prefilter.matches(&decoded) {
-                self.scan_field("query", &decoded, &now, &mut events);
+            let decoded = Self::url_decode_form(q);
+            if self.prefilter.matches(&decoded) {
+                self.scan_builtin_rules("query", &decoded, now, &mut events);
+            }
+            if has_custom_rules {
+                self.scan_custom_rules("query", &decoded, now, &mut events);
             }
         }
 
-        // Check relevant headers
+        // Check relevant headers (URI percent-decoding ; `+` is a
+        // literal in header values - rewriting it to space inflated
+        // the false-positive surface on the previous form-style
+        // decode, e.g. a header value `attacker+payload` decoded
+        // to `attacker payload` and tripped space-anchored rules
+        // like ` or 1=`).
         for (name, value) in headers {
-            let decoded = Self::url_decode(value);
-            if has_custom_rules || self.prefilter.matches(&decoded) {
-                self.scan_field(&format!("header:{name}"), &decoded, &now, &mut events);
+            let decoded = Self::url_decode_uri(value);
+            // Audit M-14 : defer the `format!("header:{name}")`
+            // allocation until either the prefilter actually hits
+            // OR a custom rule is loaded. Clean traffic through
+            // headers (the common case) skips the format entirely.
+            let prefilter_hit = self.prefilter.matches(&decoded);
+            if prefilter_hit || has_custom_rules {
+                let field = format!("header:{name}");
+                if prefilter_hit {
+                    self.scan_builtin_rules(&field, &decoded, now, &mut events);
+                }
+                if has_custom_rules {
+                    self.scan_custom_rules(&field, &decoded, now, &mut events);
+                }
+            }
+        }
+
+        // Header-scoped rules (v1.5.1 audit H-3). Dispatched on
+        // header NAME and matched against the URL-decoded VALUE.
+        // The CRS-derived patterns for these rules used to look for
+        // the header name inside the value (`(?i)transfer-encoding\s*:.*chunked.*chunked`)
+        // which never matched after Pingora's parser pre-split
+        // headers into `(name, value)` tuples - they were inert.
+        // Scoped rules bypass the prefilter (the prefilter is
+        // content-shape based and adds no signal here) and are
+        // still subject to the per-rule disable list.
+        {
+            let disabled = self.disabled_rules.read();
+            for scoped in self.ruleset.header_scoped() {
+                if disabled.contains(&scoped.id) {
+                    continue;
+                }
+                for (name, value) in headers {
+                    if !scoped
+                        .target_headers
+                        .iter()
+                        .any(|target| name.eq_ignore_ascii_case(target))
+                    {
+                        continue;
+                    }
+                    let decoded = Self::url_decode_uri(value);
+                    if let Some(m) = scoped.pattern.find(&decoded) {
+                        events.push(WafEvent {
+                            rule_id: scoped.id,
+                            description: scoped.description.to_string(),
+                            category: scoped.category.clone(),
+                            severity: scoped.severity,
+                            matched_field: format!("header:{name}"),
+                            matched_value: m.as_str().to_string(),
+                            // Stamped post-scan in the !events.is_empty()
+                            // branch (audit L-20 - chrono call deferred).
+                            timestamp: String::new(),
+                            client_ip: String::new(),
+                            route_hostname: String::new(),
+                            action: String::new(),
+                        });
+                    }
+                }
             }
         }
 
         let elapsed = start.elapsed();
 
         if !events.is_empty() {
-            // Stamp each event with the client IP
+            // Compute timestamp lazily : only when we know at least
+            // one event fired (v1.5.2 audit L-20).
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            // Stamp each event with the client IP + the timestamp
             for ev in &mut events {
                 ev.client_ip = client_ip.to_string();
+                ev.timestamp = timestamp.clone();
             }
             // Store events in the ring buffer
             let mut buf = self.event_buffer.lock();
@@ -158,15 +240,24 @@ impl WafEngine {
 
         let start = Instant::now();
         let mut events = Vec::new();
-        let now = chrono::Utc::now().to_rfc3339();
+        // v1.5.2 audit L-20 : defer chrono::Utc::now until events
+        // are non-empty (same fast path as `evaluate`).
+        let now = "";
 
-        // URL-decode the body to catch encoded payloads. PERF-9:
-        // skip the regex pass entirely when neither the prefilter
-        // nor any custom user rule applies.
-        let decoded = Self::url_decode(text);
-        let has_custom_rules = !self.custom_rules.read().is_empty();
-        if has_custom_rules || self.prefilter.matches(&decoded) {
-            self.scan_field("body", &decoded, &now, &mut events);
+        // URL-decode the body to catch encoded payloads. Form-style
+        // (`+` -> space) is the safe default for request bodies :
+        // `application/x-www-form-urlencoded` is the most common
+        // shape on the routes WAF is enabled for, and the rewrite
+        // is harmless for JSON / XML / multipart bodies (regex
+        // patterns rarely anchor on a literal `+`). PERF-9 + audit
+        // M-4 : built-in body rules only run when the prefilter
+        // hits ; custom rules run unconditionally when present.
+        let decoded = Self::url_decode_form(text);
+        if self.prefilter.matches(&decoded) {
+            self.scan_builtin_rules("body", &decoded, now, &mut events);
+        }
+        if !self.custom_rules.read().is_empty() {
+            self.scan_custom_rules("body", &decoded, now, &mut events);
         }
 
         let elapsed = start.elapsed();
@@ -180,9 +271,11 @@ impl WafEngine {
             return WafVerdict::Pass;
         }
 
-        // Stamp each event with the client IP
+        // Stamp each event with the client IP + the (deferred) timestamp
+        let timestamp = chrono::Utc::now().to_rfc3339();
         for ev in &mut events {
             ev.client_ip = client_ip.to_string();
+            ev.timestamp = timestamp.clone();
         }
 
         // Store events in the ring buffer
@@ -224,10 +317,22 @@ impl WafEngine {
         }
     }
 
-    /// Scan a single field against all enabled rules.
-    /// When `field` is "body", rules that don't apply to body content
-    /// (e.g. path traversal, protocol violations) are skipped.
-    fn scan_field(&self, field: &str, value: &str, timestamp: &str, events: &mut Vec<WafEvent>) {
+    /// Scan a single field against the built-in rules only.
+    ///
+    /// Call sites gate this on the Aho-Corasick prefilter so a clean
+    /// field skips the regex pass entirely (PERF-9). Custom user
+    /// rules are scanned separately by [`Self::scan_custom_rules`]
+    /// because they are outside the prefilter coverage contract.
+    /// When `field` is "body", rules that don't apply to body
+    /// content (e.g. path traversal, protocol violations) are
+    /// skipped.
+    fn scan_builtin_rules(
+        &self,
+        field: &str,
+        value: &str,
+        timestamp: &str,
+        events: &mut Vec<WafEvent>,
+    ) {
         let is_body = field == "body";
         let disabled = self.disabled_rules.read();
         for rule in self.ruleset.rules() {
@@ -254,8 +359,26 @@ impl WafEngine {
                 });
             }
         }
+    }
 
-        // Also check custom rules
+    /// Scan a single field against the operator-supplied custom
+    /// rules.
+    ///
+    /// Custom rules are NOT covered by the Aho-Corasick prefilter
+    /// (their patterns are unknown at build time), so call sites
+    /// invoke this unconditionally whenever any custom rule is
+    /// loaded. Disabled rules are skipped. v1.5.1 audit M-4 split
+    /// this off from the previous monolithic `scan_field` so the
+    /// presence of a single (possibly broad) custom rule no longer
+    /// disables the prefilter shortcut for the 49 built-in rules
+    /// on every field of every request.
+    fn scan_custom_rules(
+        &self,
+        field: &str,
+        value: &str,
+        timestamp: &str,
+        events: &mut Vec<WafEvent>,
+    ) {
         let custom = self.custom_rules.read();
         for (rule, regex) in custom.iter() {
             if !rule.enabled {

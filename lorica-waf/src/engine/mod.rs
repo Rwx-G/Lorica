@@ -133,24 +133,38 @@ impl WafEngine {
     }
 
     /// List all rules with their enabled/disabled status.
+    ///
+    /// Includes both general rules and header-scoped rules (v1.5.1
+    /// audit H-3) so the dashboard listing reflects the full
+    /// ruleset that an operator can disable.
     pub fn list_rules(&self) -> Vec<RuleSummary> {
         let disabled = self.disabled_rules.read();
-        self.ruleset
-            .rules()
-            .iter()
-            .map(|r| RuleSummary {
-                id: r.id,
-                description: r.description.to_string(),
-                category: r.category.clone(),
-                severity: r.severity,
-                enabled: !disabled.contains(&r.id),
-            })
-            .collect()
+        let general = self.ruleset.rules().iter().map(|r| RuleSummary {
+            id: r.id,
+            description: r.description.to_string(),
+            category: r.category.clone(),
+            severity: r.severity,
+            enabled: !disabled.contains(&r.id),
+        });
+        let scoped = self.ruleset.header_scoped().iter().map(|r| RuleSummary {
+            id: r.id,
+            description: r.description.to_string(),
+            category: r.category.clone(),
+            severity: r.severity,
+            enabled: !disabled.contains(&r.id),
+        });
+        general.chain(scoped).collect()
     }
 
     /// Disable a specific rule by ID. Returns false if rule ID not found.
     pub fn disable_rule(&self, rule_id: u32) -> bool {
-        if self.ruleset.rules().iter().any(|r| r.id == rule_id) {
+        let known = self.ruleset.rules().iter().any(|r| r.id == rule_id)
+            || self
+                .ruleset
+                .header_scoped()
+                .iter()
+                .any(|r| r.id == rule_id);
+        if known {
             self.disabled_rules.write().insert(rule_id);
             true
         } else {
@@ -160,7 +174,13 @@ impl WafEngine {
 
     /// Enable a previously disabled rule by ID. Returns false if rule ID not found.
     pub fn enable_rule(&self, rule_id: u32) -> bool {
-        if self.ruleset.rules().iter().any(|r| r.id == rule_id) {
+        let known = self.ruleset.rules().iter().any(|r| r.id == rule_id)
+            || self
+                .ruleset
+                .header_scoped()
+                .iter()
+                .any(|r| r.id == rule_id);
+        if known {
             self.disabled_rules.write().remove(&rule_id);
             true
         } else {

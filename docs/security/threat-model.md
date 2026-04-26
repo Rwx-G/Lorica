@@ -38,12 +38,12 @@ Internet  -->  [ Lorica Proxy (8080/8443) ]  -->  Backend Services
 
 | Threat | Mitigation | Status |
 |--------|-----------|--------|
-| SQL injection via proxy | WAF engine with 18 OWASP-inspired rules | Implemented |
+| SQL injection via proxy | WAF engine with 49 OWASP-inspired rules | Implemented |
 | XSS via proxy | WAF detection/blocking with configurable rules | Implemented |
 | Path traversal | WAF rules + URL decoding before inspection | Implemented |
 | Command injection | WAF rules covering common injection patterns | Implemented |
 | Request smuggling | HTTP parsing via httparse (strict mode) | Implemented |
-| IP-based attacks | IPv4 blocklist with 800k+ known malicious IPs | Implemented |
+| IP-based attacks | IPv4 blocklist with ~80k known malicious IPs (Data-Shield) | Implemented |
 
 ### T3: Management API Attacks
 
@@ -79,7 +79,7 @@ These RUSTSEC advisories are visible to `cargo audit` but hit only through forke
 
 | ID | Crate | Surface in Lorica-native code | Path |
 |----|-------|-------------------------------|------|
-| RUSTSEC-2025-0134 | `rustls-pemfile 2.2.0` (unmaintained) | None since v1.5.0 (direct usage swapped to `rustls-pki-types`) | Transitive via `lorica-tls` → `rustls-native-certs` |
+| RUSTSEC-2025-0134 | `rustls-pemfile 2.2.0` (unmaintained) | None : direct usage swapped to `rustls-pki-types::pem_slice_iter` in the `lorica` runtime crate (v1.5.0) and the forked `lorica-tls` crate (v1.5.2 audit L-16) | Transitive via `lorica-tls` → `rustls-native-certs 0.7.x` only. Closes when `lorica-tls` bumps `rustls-native-certs` to `0.8` (which itself dropped the dep) - tracked in `docs/backlog.md` deps batch (audit L-15) |
 | RUSTSEC-2026-0097 | `rand 0.8.5` (unsound with custom logger) | None after v1.5.0 bump (direct call sites migrated to `rand 0.9` ; `0.10` was considered but the surrounding ecosystem `argon2 0.5` + `rand_chacha 0.9` has not caught up with the rand-core 0.10 migration) | Transitive via `captcha`, forked `lorica-runtime`/`lorica-limits` |
 
 The forked crates eventually inherit the upstream fix when Pingora migrates. Until then, mitigation is scope limitation (Lorica-native code does not call the affected APIs directly) plus the fact that both advisories require conditions we do not create (unmaintained-but-functional parser on a known PEM format ; custom logger + `rand::rng()` combo, while Lorica uses the stock `tracing` subscriber).

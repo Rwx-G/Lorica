@@ -183,6 +183,21 @@ impl IncomingCommand {
         let resp = Response::error(self.cmd.sequence, msg);
         send_envelope(&self.tx_out, Envelope::response(resp)).await
     }
+
+    /// Build an `IncomingCommand` for test fixtures that need to drive
+    /// handlers without a real RPC pipeline. Marked `#[doc(hidden)]`
+    /// because it bypasses the normal `RpcEndpoint` dispatch path -
+    /// production code must construct `IncomingCommand` only via the
+    /// reader loop in `RpcEndpoint::new`.
+    ///
+    /// The supplied `tx_out` channel receives whatever the handler
+    /// passes to `reply` / `reply_ok` / `reply_error` ; the test reads
+    /// from the matching `mpsc::Receiver<Envelope>` to assert what the
+    /// handler sent.
+    #[doc(hidden)]
+    pub fn for_test(cmd: Command, tx_out: mpsc::Sender<Envelope>) -> Self {
+        IncomingCommand { cmd, tx_out }
+    }
 }
 
 /// Receiver of incoming commands. The caller typically runs a loop like:

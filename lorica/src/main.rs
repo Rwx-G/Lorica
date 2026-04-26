@@ -641,7 +641,7 @@ fn run_supervisor(cli: Cli) {
                                             // Workers persist access logs directly via their own
                                             // LogStore, so we only push to the in-memory buffer
                                             // here (for WebSocket streaming to the dashboard).
-                                            sink.push(entry).await;
+                                            sink.push(entry);
                                         }
                                     }
                                     Err(_) => break,
@@ -770,6 +770,25 @@ fn run_supervisor(cli: Cli) {
                         + 1;
                     let report = coordinate_config_reload(&endpoints_for_reload, gen).await;
                     if !report.prepare_failed.is_empty() || !report.commit_failed.is_empty() {
+                        // Audit M-17 : when commit_failed is non-empty
+                        // AND committed is non-empty, the fleet is
+                        // transiently split (some workers serve the
+                        // new config, others still on the old) until
+                        // the legacy fallback below brings the
+                        // stragglers in line. Surface as a Prometheus
+                        // counter so operators can alert on
+                        // fleet-coherence gaps even though the system
+                        // self-heals on the next reload.
+                        if !report.commit_failed.is_empty() && !report.committed.is_empty() {
+                            warn!(
+                                seq,
+                                generation = report.generation,
+                                committed = report.committed.len(),
+                                commit_failed = report.commit_failed.len(),
+                                "two-phase config reload split fleet : some workers committed, others did not - legacy broadcast fallback will reconcile"
+                            );
+                            lorica_api::metrics::inc_config_reload_split_fleet();
+                        }
                         warn!(
                             seq,
                             generation = report.generation,
@@ -858,80 +877,23 @@ fn run_supervisor(cli: Cli) {
             let hb_shutting_down = Arc::clone(&shutting_down);
 
             // Pipelined RPC channel task: consumes the per-worker
-            // RpcEndpoint stream and handles `RateLimitDelta` by applying
-            // each entry to the authoritative bucket registry. Spawned
-            // alongside the legacy channel task; dies with the worker.
-            {
-                let rpc_fd = rpc_raw_fd;
-                let registry = Arc::clone(&rl_registry);
-                let rl_policy = Arc::clone(&rl_policy_cache);
-                let store_for_rpc = Arc::clone(&store);
-                let vcache = Arc::clone(&verdict_cache);
-                let breakers = Arc::clone(&breaker_registry);
-                let endpoints = Arc::clone(&worker_rpc_endpoints);
-                tokio::spawn(async move {
-                    // SAFETY: rpc_fd is a valid socketpair end from
-                    // WorkerManager::spawn_worker, exclusively owned by
-                    // this task.
-                    let (endpoint, mut incoming) = match unsafe {
-                        lorica_command::RpcEndpoint::from_raw_fd(rpc_fd)
-                    } {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            error!(
-                                worker_id,
-                                error = %e,
-                                "failed to create supervisor RpcEndpoint"
-                            );
-                            return;
-                        }
-                    };
-                    // Register for supervisor-initiated RPCs (config
-                    // reload coordinator, future metrics pull).
-                    endpoints.insert(worker_id, endpoint);
-                    while let Some(inc) = incoming.recv().await {
-                        match inc.command_type() {
-                            lorica_command::CommandType::RateLimitDelta => {
-                                handle_rate_limit_delta(
-                                    inc,
-                                    &registry,
-                                    &rl_policy,
-                                    &store_for_rpc,
-                                    worker_id,
-                                )
-                                .await;
-                            }
-                            lorica_command::CommandType::VerdictLookup => {
-                                handle_verdict_lookup(inc, &vcache).await;
-                            }
-                            lorica_command::CommandType::VerdictPush => {
-                                handle_verdict_push(inc, &vcache).await;
-                            }
-                            lorica_command::CommandType::BreakerQuery => {
-                                handle_breaker_query(inc, &breakers).await;
-                            }
-                            lorica_command::CommandType::BreakerReport => {
-                                handle_breaker_report(inc, &breakers).await;
-                            }
-                            other => {
-                                tracing::debug!(
-                                    worker_id,
-                                    command_type = ?other,
-                                    "supervisor RPC: ignoring command (no handler)"
-                                );
-                                let _ = inc
-                                    .reply_error("no handler registered for this command")
-                                    .await;
-                            }
-                        }
-                    }
-                    // Worker died or channel EOF: drop the registered
-                    // endpoint so the config-reload coordinator does
-                    // not try to fan out commands to a dead worker.
-                    endpoints.remove(&worker_id);
-                    tracing::debug!(worker_id, "supervisor RPC loop exiting");
-                });
-            }
+            // RpcEndpoint stream and handles RateLimitDelta /
+            // VerdictLookup / VerdictPush / BreakerQuery /
+            // BreakerReport. Spawned alongside the legacy channel
+            // task ; dies with the worker. Same wiring is re-issued
+            // by the crash branch in `monitor_workers` (audit C-1
+            // closure) - both call sites go through one helper so a
+            // new RPC variant is wired uniformly.
+            spawn_supervisor_rpc_handler(
+                worker_id,
+                rpc_raw_fd,
+                Arc::clone(&rl_registry),
+                Arc::clone(&rl_policy_cache),
+                Arc::clone(&store),
+                Arc::clone(&verdict_cache),
+                Arc::clone(&breaker_registry),
+                Arc::clone(&worker_rpc_endpoints),
+            );
 
             let handle = tokio::spawn(async move {
                 let heartbeat_interval = Duration::from_secs(5);
@@ -984,8 +946,40 @@ fn run_supervisor(cli: Cli) {
                                 }
                             }
                         }
-                        // Config reload triggered by API
-                        Ok(seq) = reload_rx.recv() => {
+                        // Config reload triggered by API.
+                        //
+                        // Use an explicit `match` on `reload_rx.recv()` instead
+                        // of the convenience `Ok(seq) = ...` pattern so that a
+                        // `RecvError::Lagged(n)` is surfaced (counter + warn +
+                        // catch-up reload) instead of silently disabling the
+                        // branch for this select iteration. Without this, a
+                        // burst > the broadcast capacity (16 today) leaves the
+                        // worker on a stale config with zero log, zero metric,
+                        // zero notification (audit C-2 ; mirrors the BanIp
+                        // arm above).
+                        reload_result = reload_rx.recv() => {
+                            let seq = match reload_result {
+                                Ok(s) => s,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    warn!(
+                                        worker_id,
+                                        dropped = n,
+                                        "ConfigReload broadcast lagged ; issuing catch-up reload to bring worker to latest DB state"
+                                    );
+                                    lorica_api::metrics::inc_reload_broadcast_lagged(
+                                        &worker_id.to_string(),
+                                        n,
+                                    );
+                                    // Synthesize a single catch-up reload with
+                                    // a fresh sequence number from the per-
+                                    // worker counter so the seq stays unique
+                                    // on this command channel.
+                                    hb_seq.fetch_add(1, Ordering::Relaxed)
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
+                            };
                             let cmd = Command::new(CommandType::ConfigReload, seq);
                             if let Err(e) = channel.send(&cmd).await {
                                 warn!(worker_id, error = %e, "config reload send failed");
@@ -1419,6 +1413,13 @@ fn run_supervisor(cli: Cli) {
         // task's AppState and the shutdown drain path.
         let api_task_tracker = task_tracker.clone();
         let shutdown_task_tracker = task_tracker.clone();
+        // Clone the alert sender so the ACME renewal + cert-expiry
+        // background tasks spawned inside the API block can surface
+        // alerts through the same dispatcher the health / WAF paths
+        // already use. Single-process mode mirrors this at the matching
+        // spawn site further down (v1.5.2 fix: worker mode was missing
+        // auto-renewal entirely).
+        let api_alert_sender = alert_sender.clone();
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -1458,6 +1459,23 @@ fn run_supervisor(cli: Cli) {
                 .await
                 .with_task_tracker(state.task_tracker.clone());
             let rate_limiter = RateLimiter::new();
+
+            // Spawn ACME auto-renewal (check every 12h, renew at 30 days
+            // before expiry) and cert-expiry notifier for worker mode.
+            // Previously these tasks lived only in the single-process
+            // branch, so worker-mode installs went through cert expiry
+            // without warnings and never auto-renewed (v1.5.2 fix).
+            let _acme_renewal = lorica_api::acme::spawn_renewal_task(
+                state.clone(),
+                std::time::Duration::from_secs(12 * 3600),
+                30,
+                Some(api_alert_sender.clone()),
+            );
+            let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
+                state.clone(),
+                std::time::Duration::from_secs(12 * 3600),
+                api_alert_sender,
+            );
 
             if let Err(e) =
                 lorica_api::server::start_server(management_port, state, session_store, rate_limiter)
@@ -1510,6 +1528,18 @@ fn run_supervisor(cli: Cli) {
         let monitor_hb_metrics = Arc::clone(&worker_metrics);
         let monitor_agg_metrics = Arc::clone(&aggregated_metrics);
         let monitor_task_handles = Arc::clone(&worker_task_handles);
+        // Audit C-1 fix : the worker-respawn path now re-wires the
+        // RPC endpoint as well as the legacy command channel, so the
+        // supervisor's two-phase config-reload coordinator finds the
+        // restarted worker and stops silently skipping it. Cloning
+        // the deps the helper needs once at monitor scope so the
+        // crash branch can move them into `spawn_supervisor_rpc_handler`.
+        let monitor_rpc_endpoints = Arc::clone(&worker_rpc_endpoints);
+        let monitor_rl_registry = Arc::clone(&rl_registry);
+        let monitor_rl_policy = Arc::clone(&rl_policy_cache);
+        let monitor_store = Arc::clone(&store);
+        let monitor_verdict_cache = Arc::clone(&verdict_cache);
+        let monitor_breaker_registry = Arc::clone(&breaker_registry);
         // `shutting_down` is declared above, shared with the per-worker
         // heartbeat tasks. The monitor short-circuits on the same flag
         // so shutdown-driven worker SIGKILLs don't trigger a respawn:
@@ -1530,20 +1560,30 @@ fn run_supervisor(cli: Cli) {
                     return;
                 }
 
-                let mut mgr = monitor_mgr.lock().unwrap_or_else(|e| {
-                    warn!("worker monitor mutex poisoned, recovering");
-                    e.into_inner()
-                });
-                // Re-check after acquiring the mutex: shutdown may have
-                // grabbed the mutex while we waited (the supervisor
-                // shutdown path holds it for the full ~30 s drain). If
-                // we observe the flag now, the workers we are about to
-                // see as "crashed" were actually SIGKILL'd by us and
-                // must not be respawned.
-                if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
-                    return;
-                }
-                let events = mgr.check_workers();
+                let events = {
+                    let mgr = monitor_mgr.lock().unwrap_or_else(|e| {
+                        warn!("worker monitor mutex poisoned, recovering");
+                        e.into_inner()
+                    });
+                    // Re-check after acquiring the mutex: shutdown may have
+                    // grabbed the mutex while we waited (the supervisor
+                    // shutdown path holds it for the full ~30 s drain). If
+                    // we observe the flag now, the workers we are about to
+                    // see as "crashed" were actually SIGKILL'd by us and
+                    // must not be respawned.
+                    if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    mgr.check_workers()
+                };
+                // The std::sync::Mutex guard is dropped here on
+                // purpose. Audit M-26 closure : the per-event restart
+                // path below uses `tokio::time::sleep` for the
+                // exponential backoff, which is illegal across an
+                // .await while holding a !Send sync-Mutex guard.
+                // Re-acquire the lock briefly inside the loop for
+                // each `restart_backoff` / `restart_worker` /
+                // `worker_pids` read.
                 for event in events {
                     let (id, log_msg) = match event {
                         WorkerEvent::Exited { id, pid, status } => {
@@ -1562,19 +1602,83 @@ fn run_supervisor(cli: Cli) {
                         info!(worker_id = id, "aborted stale worker task");
                     }
 
-                    match mgr.restart_worker(id) {
-                        Ok(Some(new_fd)) => {
-                            // Get the new PID for metrics reporting
-                            let new_pid = mgr
-                                .worker_pids()
-                                .iter()
-                                .find(|(wid, _)| *wid == id)
-                                .map(|(_, pid)| pid.as_raw())
-                                .unwrap_or(0);
+                    // Re-check shutdown flag before respawning - a
+                    // crash detected just before SIGTERM should not
+                    // trigger a respawn that races shutdown.
+                    if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                        info!(worker_id = id, "shutdown in progress, skipping respawn");
+                        break;
+                    }
+
+                    // Audit M-26 closure : compute the exponential-
+                    // backoff delay, drop the mgr lock, sleep async
+                    // (was `std::thread::sleep` inside `restart_worker`
+                    // - blocked the supervisor tokio thread for up to
+                    // 30 s, starving heartbeats from peer workers and
+                    // every other tokio task on the same runtime).
+                    let backoff = {
+                        let mgr = monitor_mgr.lock().unwrap_or_else(|e| {
+                            warn!("worker monitor mutex poisoned, recovering");
+                            e.into_inner()
+                        });
+                        mgr.restart_backoff(id)
+                    };
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                        if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                            info!(worker_id = id, "shutdown raced backoff sleep, skipping respawn");
+                            break;
+                        }
+                    }
+
+                    let (restart_result, new_pid) = {
+                        let mut mgr = monitor_mgr.lock().unwrap_or_else(|e| {
+                            warn!("worker monitor mutex poisoned, recovering");
+                            e.into_inner()
+                        });
+                        let result = mgr.restart_worker(id);
+                        let pid = mgr
+                            .worker_pids()
+                            .iter()
+                            .find(|(wid, _)| *wid == id)
+                            .map(|(_, pid)| pid.as_raw())
+                            .unwrap_or(0);
+                        (result, pid)
+                    };
+
+                    match restart_result {
+                        Ok(Some((new_cmd_fd, new_rpc_fd))) => {
                             info!(worker_id = id, new_pid, reason = log_msg, "worker restarted, reconnecting channel");
-                            // SAFETY: new_fd is a fresh socketpair fd from
-                            // WorkerManager::restart_worker(), exclusively owned here.
-                            match unsafe { CommandChannel::from_raw_fd(new_fd.into_raw_fd()) } {
+
+                            // Audit C-1 closure : re-spawn the
+                            // pipelined RPC handler so the supervisor's
+                            // two-phase config-reload coordinator finds
+                            // the restarted worker. Without this, the
+                            // worker silently sits outside
+                            // `worker_rpc_endpoints` and every
+                            // subsequent ConfigReloadPrepare / Commit
+                            // fan-out skips it (proxy config /
+                            // CertResolver / OTel / GeoIP / ASN /
+                            // bot-secret state stay frozen at boot
+                            // until full process restart). Same helper
+                            // the initial-spawn path uses, so a new
+                            // RPC variant added to the match arm is
+                            // wired uniformly across both paths.
+                            spawn_supervisor_rpc_handler(
+                                id,
+                                new_rpc_fd.into_raw_fd(),
+                                Arc::clone(&monitor_rl_registry),
+                                Arc::clone(&monitor_rl_policy),
+                                Arc::clone(&monitor_store),
+                                Arc::clone(&monitor_verdict_cache),
+                                Arc::clone(&monitor_breaker_registry),
+                                Arc::clone(&monitor_rpc_endpoints),
+                            );
+
+                            // SAFETY: new_cmd_fd is a fresh socketpair fd
+                            // from WorkerManager::restart_worker(),
+                            // exclusively owned here.
+                            match unsafe { CommandChannel::from_raw_fd(new_cmd_fd.into_raw_fd()) } {
                                 Ok(mut channel) => {
                                     let mut rx = monitor_reload_tx.subscribe();
                                     let mut ban_rx = monitor_ban_tx.subscribe();
@@ -1595,7 +1699,25 @@ fn run_supervisor(cli: Cli) {
                                                         let _ = channel.recv::<Response>().await;
                                                     }
                                                 }
-                                                Ok(s) = rx.recv() => {
+                                                // Same lagged-aware shape as the
+                                                // initial-spawn branch (audit C-2).
+                                                reload_result = rx.recv() => {
+                                                    let s = match reload_result {
+                                                        Ok(s) => s,
+                                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                                            warn!(
+                                                                worker_id = id,
+                                                                dropped = n,
+                                                                "ConfigReload broadcast lagged on restarted worker ; issuing catch-up reload"
+                                                            );
+                                                            lorica_api::metrics::inc_reload_broadcast_lagged(
+                                                                &id.to_string(),
+                                                                n,
+                                                            );
+                                                            seq.fetch_add(1, Ordering::Relaxed)
+                                                        }
+                                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                                    };
                                                     let cmd = Command::new(CommandType::ConfigReload, s);
                                                     if channel.send(&cmd).await.is_ok() {
                                                         if let Ok(r) = channel.recv::<Response>().await {
@@ -1744,6 +1866,94 @@ fn run_supervisor(cli: Cli) {
 }
 
 /// Supervisor-side handler for `CommandType::RateLimitDelta`. Walks the
+/// Spawn the supervisor-side RPC handler for one worker. Owns the
+/// `RpcEndpoint`'s incoming half and dispatches each command type to
+/// the matching `handle_*` function. On EOF (worker died), removes
+/// the worker's entry from `worker_rpc_endpoints` so the config-
+/// reload coordinator stops fanning out to a dead channel.
+///
+/// Extracted from the inline initial-spawn block (was duplicated when
+/// audit C-1 added the same wiring to the worker-respawn crash branch
+/// in `monitor_workers`). One source of truth for "supervisor RPC
+/// loop for worker N" means the next RPC variant added to the match
+/// arm is wired uniformly across initial-spawn AND respawn paths.
+#[allow(clippy::too_many_arguments)]
+fn spawn_supervisor_rpc_handler(
+    worker_id: u32,
+    rpc_fd: std::os::fd::RawFd,
+    rl_registry: Arc<
+        dashmap::DashMap<String, Arc<lorica_limits::token_bucket::AuthoritativeBucket>>,
+    >,
+    rl_policy_cache: Arc<dashmap::DashMap<String, Option<lorica_config::models::RateLimit>>>,
+    store: Arc<Mutex<lorica_config::ConfigStore>>,
+    verdict_cache: Arc<SupervisorVerdictCache>,
+    breaker_registry: Arc<SupervisorBreakerRegistry>,
+    worker_rpc_endpoints: Arc<dashmap::DashMap<u32, lorica_command::RpcEndpoint>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // SAFETY: rpc_fd is a fresh socketpair end from
+        // WorkerManager::spawn_worker / restart_worker, exclusively
+        // owned by this task.
+        let (endpoint, mut incoming) = match unsafe {
+            lorica_command::RpcEndpoint::from_raw_fd(rpc_fd)
+        } {
+            Ok(pair) => pair,
+            Err(e) => {
+                error!(
+                    worker_id,
+                    error = %e,
+                    "failed to create supervisor RpcEndpoint"
+                );
+                return;
+            }
+        };
+        // Register for supervisor-initiated RPCs (config reload
+        // coordinator, metrics pull, breaker queries).
+        worker_rpc_endpoints.insert(worker_id, endpoint);
+        while let Some(inc) = incoming.recv().await {
+            match inc.command_type() {
+                lorica_command::CommandType::RateLimitDelta => {
+                    handle_rate_limit_delta(
+                        inc,
+                        &rl_registry,
+                        &rl_policy_cache,
+                        &store,
+                        worker_id,
+                    )
+                    .await;
+                }
+                lorica_command::CommandType::VerdictLookup => {
+                    handle_verdict_lookup(inc, &verdict_cache).await;
+                }
+                lorica_command::CommandType::VerdictPush => {
+                    handle_verdict_push(inc, &verdict_cache).await;
+                }
+                lorica_command::CommandType::BreakerQuery => {
+                    handle_breaker_query(inc, &breaker_registry).await;
+                }
+                lorica_command::CommandType::BreakerReport => {
+                    handle_breaker_report(inc, &breaker_registry).await;
+                }
+                other => {
+                    tracing::debug!(
+                        worker_id,
+                        command_type = ?other,
+                        "supervisor RPC: ignoring command (no handler)"
+                    );
+                    let _ = inc
+                        .reply_error("no handler registered for this command")
+                        .await;
+                }
+            }
+        }
+        // Worker died or channel EOF: drop the registered endpoint so
+        // the config-reload coordinator does not try to fan out
+        // commands to a dead worker.
+        worker_rpc_endpoints.remove(&worker_id);
+        tracing::debug!(worker_id, "supervisor RPC loop exiting");
+    })
+}
+
 /// batched entries, applies each consumption to the authoritative
 /// bucket for `{route_id}|{scope_key}`, and replies with a
 /// `RateLimitDeltaResult` carrying the current token count per key
@@ -1930,28 +2140,38 @@ impl SupervisorVerdictCache {
         ttl_ms: u64,
     ) {
         let key = Self::key(route_id, cookie);
-        // FIFO bound: pop oldest keys until strictly under the cap.
-        // Matches `verdict_cache_insert` in proxy_wiring.rs so worker
-        // mode and single-process mode agree on memory ceiling.
-        let mut order = self.order.lock();
-        while order.len() >= SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES {
-            if let Some(old) = order.pop_front() {
-                self.entries.remove(&old);
-            } else {
-                break;
-            }
-        }
-        order.push_back(key.clone());
-        drop(order);
         let expires_at = Instant::now() + Duration::from_millis(ttl_ms);
-        self.entries.insert(
-            key,
+        let prior = self.entries.insert(
+            key.clone(),
             SupervisorVerdictCacheEntry {
                 verdict,
                 response_headers,
                 expires_at,
             },
         );
+        // Only push to the FIFO `order` when this insert actually
+        // grew the entries map. Audit L-13 closure : a duplicate
+        // verdict refresh used to push twice into `order` ; on
+        // overflow `pop_front` removed the entries row even though a
+        // logically-still-present duplicate sat further back in the
+        // queue, the next pop became a no-op, and the effective FIFO
+        // cap shrunk per duplicate. DashMap's `insert` returns the
+        // previous value on overwrite ; gate the push on `is_none()`.
+        if prior.is_none() {
+            // FIFO bound: pop oldest keys until strictly under the cap.
+            // Matches `verdict_cache_insert` in proxy_wiring.rs so
+            // worker mode and single-process mode agree on memory
+            // ceiling.
+            let mut order = self.order.lock();
+            while order.len() >= SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES {
+                if let Some(old) = order.pop_front() {
+                    self.entries.remove(&old);
+                } else {
+                    break;
+                }
+            }
+            order.push_back(key);
+        }
     }
 
     #[cfg(test)]
@@ -2854,6 +3074,22 @@ fn run_worker(
                                     &cmd_cert_resolver,
                                 )
                                 .await;
+                                // Re-apply the per-process resolver
+                                // hooks (OTel exporter, GeoIP / ASN
+                                // updater task lifecycle, bot HMAC
+                                // secret) so the legacy fallback path
+                                // converges with the two-phase RPC
+                                // commit handler. Audit M-18 closure :
+                                // before this, falling back to the
+                                // legacy ConfigReload (e.g. when
+                                // two-phase Prepare timed out) left
+                                // GeoIP / OTel / ASN / bot-secret
+                                // state frozen even though the proxy
+                                // config swap completed.
+                                lorica::reload::apply_per_process_resolver_hooks(
+                                    &cmd_store,
+                                )
+                                .await;
                                 let resp = Response::ok(cmd.sequence);
                                 if let Err(e) = channel.send(&resp).await {
                                     warn!(error = %e, "failed to send response");
@@ -3269,6 +3505,13 @@ fn run_worker(
                     // (audit H-3). Previously `None` left the filter
                     // out of the two-phase semantics.
                     Some(Arc::clone(&connection_filter)),
+                    // Pass the cert resolver so `ConfigReloadCommit`
+                    // propagates uploaded / ACME-issued certificates
+                    // to the worker's TLS stack without a restart
+                    // (v1.5.2 fix - was previously only reloaded by
+                    // single-process `config_reload_rx` or the dead
+                    // legacy `CommandType::ConfigReload` path).
+                    Arc::clone(&cert_resolver),
                     id,
                 );
                 let _sync_handle = lorica_proxy.spawn_rate_limit_sync(
@@ -4046,12 +4289,40 @@ fn spawn_persisted_alert_dispatcher(
                     d.dispatch(&event).await;
                     drop(d);
 
-                    // Persist to log store
+                    // Persist to log store. Both calls are sync rusqlite under
+                    // `parking_lot::Mutex<Connection>` ; running them inline
+                    // would block the alert dispatcher's async reactor (audit
+                    // H-7). Off-load both to one `spawn_blocking` so the
+                    // mutex acquisition + the SELECT COUNT(*) + DELETE pair
+                    // happen on the blocking pool, and surface retention
+                    // failures via the existing notifier-events-dropped metric
+                    // (was a silent `let _ = ...` swallow that left the table
+                    // unbounded if DELETE ever failed).
                     if let Some(ref store) = log_store {
-                        if let Err(e) = store.insert_notification_event(&event) {
-                            tracing::warn!(error = %e, "failed to persist notification event");
+                        let store = Arc::clone(store);
+                        let event_for_blocking = event.clone();
+                        let blocking_outcome = tokio::task::spawn_blocking(move || {
+                            let insert = store.insert_notification_event(&event_for_blocking);
+                            let retention = store.enforce_notification_retention(500);
+                            (insert, retention)
+                        })
+                        .await;
+                        match blocking_outcome {
+                            Ok((insert, retention)) => {
+                                if let Err(e) = insert {
+                                    tracing::warn!(error = %e, "failed to persist notification event");
+                                    lorica_api::metrics::inc_notifier_events_dropped("persist_failed", 1);
+                                }
+                                if let Err(e) = retention {
+                                    tracing::warn!(error = %e, "notification retention enforcement failed");
+                                    lorica_api::metrics::inc_notifier_events_dropped("retention_failed", 1);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "notification persistence task join failed");
+                                lorica_api::metrics::inc_notifier_events_dropped("join_failed", 1);
+                            }
                         }
-                        let _ = store.enforce_notification_retention(500);
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

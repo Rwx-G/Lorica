@@ -1,5 +1,43 @@
 # Data Models and Schema Changes
 
+> **Status: HISTORICAL (v1.0 schema baseline) — partially out of date
+> as of v1.5.2.**
+>
+> This document was written against the v1.0 schema (7 tables, 4
+> indexes). The current schema as of v1.5.2 is substantially larger
+> (16+ tables, multiple migrations adding columns to existing rows) ;
+> the per-table column lists below reflect what was in v1.0, not what
+> the running database carries today. Audit M-24 (v1.5.2).
+>
+> For the **canonical current schema**, the source of truth lives in :
+>
+> - `lorica-config/src/migrations/` — every migration applied since
+>   v1.0 (001 through 019 as of v1.5.2). Read in numeric order, this
+>   tells you the current shape of every column, index, and table.
+> - `lorica-config/src/store/mod.rs` — the inline `ALTER TABLE` /
+>   `CREATE INDEX IF NOT EXISTS` calls that live alongside the
+>   migrations (some indexes are only added at runtime, e.g. session
+>   indexes per audit L-1 / sessions.rs).
+> - `lorica-config/src/store/{routes,backends,certs,...}.rs` — one
+>   module per table, each holding the SELECT / INSERT / UPDATE
+>   queries against the current column set.
+> - `lorica-config/src/models/` — the Rust struct shape that round-
+>   trips through serde for the API. Field names match the column
+>   names ; field doc-comments explain when each was added.
+>
+> Notable additions since v1.0 not described in this document :
+> `sessions`, `bot_pending_challenges`, `cert_export_acls`,
+> `dns_providers`, `probe_configs`, `probe_results`, `sla_buckets`,
+> `load_test_configs`, `load_test_results`. The `Route` table grew
+> from 9 columns to 30+ (basic-auth, stale-while-revalidate,
+> rate-limit struct, geoip, mTLS, forward-auth, mirror, response-
+> rewrite, header-rules, traffic-splits, bot-protection,
+> group-name, ...). The `NotificationChannel` enum gained `Slack`
+> (v1.4.0) ; `UserPreference.value` gained additional variants.
+>
+> A full rewrite is `feat`-shaped and tracked in `docs/backlog.md` ;
+> for now, treat this file as the v1.0 reference baseline.
+
 ## New Data Models
 
 ### Route

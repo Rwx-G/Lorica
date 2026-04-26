@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 lorica-waf = { path = "../lorica-waf" }
 lorica-config = { path = "../lorica-config" }
+lorica-tls = { path = "../lorica-tls" }
 serde_json = "1"
 
 [[bin]]
@@ -21,4 +22,9 @@ doc = false
 [[bin]]
 name = "fuzz_api_input"
 path = "fuzz_targets/fuzz_api_input.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ocsp_response"
+path = "fuzz_targets/fuzz_ocsp_response.rs"
 doc = false

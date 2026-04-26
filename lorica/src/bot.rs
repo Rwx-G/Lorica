@@ -169,20 +169,28 @@ impl BotEngine {
         }
     }
 
-    /// Generate a fresh 16-byte hex nonce. Uses `OsRng` so nonces
-    /// are unpredictable — a predictable nonce would let an attacker
-    /// pre-register a matching row and bypass the verify step.
-    pub fn fresh_nonce(&self) -> String {
+    /// Generate a fresh 16-byte random nonce with its hex encoding.
+    /// Uses `OsRng` so nonces are unpredictable - a predictable nonce
+    /// would let an attacker pre-register a matching row and bypass
+    /// the verify step.
+    ///
+    /// Returns `(raw, hex)` as a pair so callers that need both the
+    /// raw bytes (challenge payload) and the hex string (cookie /
+    /// cache key) get them without re-parsing. Previously the caller
+    /// got only the hex and had to re-parse via a `.expect(...)` on
+    /// a separate helper, which coupled generator and parser by
+    /// string contract (audit L-9).
+    pub fn fresh_nonce(&self) -> ([u8; 16], String) {
         use std::fmt::Write;
         let mut raw = [0u8; 16];
         rand::rngs::OsRng
             .try_fill_bytes(&mut raw)
             .expect("OS RNG must produce entropy for bot-protection nonce");
-        let mut out = String::with_capacity(32);
+        let mut hex = String::with_capacity(32);
         for b in raw.iter() {
-            let _ = write!(out, "{b:02x}");
+            let _ = write!(hex, "{b:02x}");
         }
-        out
+        (raw, hex)
     }
 
     /// Stash a pending challenge. Overwrites any prior entry with
@@ -888,9 +896,18 @@ pub async fn rpc_cache_push(
                     response_headers: Vec::<lorica_command::ForwardAuthHeader>::new(),
                     ttl_ms,
                 });
-            let _ = endpoint
+            // Bot cache propagation is fire-and-forget (the local
+            // worker is already populated). Surface failures via a
+            // Prometheus counter so a stuck supervisor RPC channel
+            // doesn't go unobserved (audit L-14 - was a silent
+            // `let _ = ...` swallow).
+            if let Err(e) = endpoint
                 .request_rpc(lorica_command::CommandType::VerdictPush, payload, *timeout)
-                .await;
+                .await
+            {
+                tracing::debug!(error = %e, "bot verdict push to supervisor failed");
+                lorica_api::metrics::inc_bot_verdict_push_failed();
+            }
         }
     }
 }
@@ -1215,8 +1232,9 @@ mod tests {
     #[tokio::test]
     async fn engine_stash_roundtrip() {
         let e = BotEngine::new();
-        let nonce = e.fresh_nonce();
+        let (raw, nonce) = e.fresh_nonce();
         assert_eq!(nonce.len(), 32, "hex of 16 bytes = 32 chars");
+        assert_eq!(raw.len(), 16, "raw nonce is 16 bytes");
 
         e.insert(
             nonce.clone(),

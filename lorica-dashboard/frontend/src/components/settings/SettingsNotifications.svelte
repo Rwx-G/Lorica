@@ -28,6 +28,7 @@
   // Email fields
   let notifSmtpHost = $state('');
   let notifSmtpPort = $state(587);
+  let notifSmtpEncryption = $state<'starttls' | 'tls' | 'none'>('starttls');
   let notifSmtpUsername = $state('');
   let notifSmtpPassword = $state('');
   let notifFromAddress = $state('');
@@ -76,6 +77,7 @@
     notifConfig = '';
     notifSmtpHost = '';
     notifSmtpPort = 587;
+    notifSmtpEncryption = 'starttls';
     notifSmtpUsername = '';
     notifSmtpPassword = '';
     notifFromAddress = '';
@@ -104,6 +106,11 @@
       if (nc.channel === 'email') {
         notifSmtpHost = cfg.smtp_host || '';
         notifSmtpPort = cfg.smtp_port || 587;
+        // Pre-v1.5.2 configs omit this field : default to starttls
+        // so the drawer reflects the real transport behaviour.
+        notifSmtpEncryption = (cfg.smtp_encryption === 'tls' || cfg.smtp_encryption === 'none')
+          ? cfg.smtp_encryption
+          : 'starttls';
         notifSmtpUsername = cfg.smtp_username || '';
         notifSmtpPassword = ''; // masked, don't populate
         notifFromAddress = cfg.from_address || '';
@@ -111,10 +118,15 @@
         notifUrl = '';
         notifAuthHeader = '';
       } else {
-        notifUrl = cfg.url || '';
-        notifAuthHeader = cfg.auth_header || '';
+        // Server scrubs `url` + `auth_header` to "********" on read
+        // (audit M-1) ; never paint the mask into the form, mirror
+        // the smtp_password convention. Operator types a new value
+        // or leaves empty + we send "********" on save to preserve.
+        notifUrl = '';
+        notifAuthHeader = '';
         notifSmtpHost = '';
         notifSmtpPort = 587;
+        notifSmtpEncryption = 'starttls';
         notifSmtpUsername = '';
         notifSmtpPassword = '';
         notifFromAddress = '';
@@ -147,6 +159,7 @@
       configObj = {
         smtp_host: notifSmtpHost,
         smtp_port: notifSmtpPort,
+        smtp_encryption: notifSmtpEncryption,
         from_address: notifFromAddress,
         to_address: notifToAddress,
       };
@@ -154,8 +167,14 @@
       if (notifSmtpPassword) configObj.smtp_password = notifSmtpPassword;
       else if (notifEditing) configObj.smtp_password = '********'; // preserve existing
     } else {
-      configObj = { url: notifUrl };
-      if (notifChannel === 'webhook' && notifAuthHeader) configObj.auth_header = notifAuthHeader;
+      // Match the smtp_password convention : empty form field on
+      // edit means "keep stored secret". The server side accepts
+      // the literal "********" sentinel and restores from the DB.
+      configObj = { url: notifUrl || (notifEditing ? '********' : '') };
+      if (notifChannel === 'webhook') {
+        if (notifAuthHeader) configObj.auth_header = notifAuthHeader;
+        else if (notifEditing) configObj.auth_header = '********';
+      }
     }
     const configStr = JSON.stringify(configObj);
 
@@ -279,9 +298,26 @@
             <input id="notif-smtp-host" type="text" bind:value={notifSmtpHost} placeholder="smtp.example.com" required />
           </div>
           <div class="settings-form-row">
+            <label for="notif-smtp-encryption">Encryption</label>
+            <select id="notif-smtp-encryption" bind:value={notifSmtpEncryption}>
+              <option value="starttls">STARTTLS (port 587)</option>
+              <option value="tls">Implicit TLS / SMTPS (port 465)</option>
+              <option value="none">None (plaintext, port 25)</option>
+            </select>
+            <span class="settings-form-hint">
+              {#if notifSmtpEncryption === 'none'}
+                Plaintext SMTP for LAN relays (Postfix, sendmail, mailhog). Never use over an untrusted network.
+              {:else if notifSmtpEncryption === 'tls'}
+                Implicit TLS from the start of the connection.
+              {:else}
+                Start plaintext then upgrade to TLS via STARTTLS.
+              {/if}
+            </span>
+          </div>
+          <div class="settings-form-row">
             <label for="notif-smtp-port">SMTP Port</label>
             <input id="notif-smtp-port" type="number" bind:value={notifSmtpPort} placeholder="587" min="1" max="65535" />
-            <span class="settings-form-hint">587 (STARTTLS) or 465 (SSL)</span>
+            <span class="settings-form-hint">Leave at the default for the selected encryption (587 / 465 / 25) unless your relay uses a custom port.</span>
           </div>
           <div class="settings-form-row">
             <label for="notif-smtp-user">Username</label>
@@ -306,13 +342,13 @@
       {:else}
         <div class="settings-form-row">
           <label for="notif-url">URL <span class="settings-required">*</span></label>
-          <input id="notif-url" type="url" bind:value={notifUrl} placeholder={notifChannel === 'slack' ? 'https://hooks.slack.com/services/T.../B.../xxx' : 'https://example.com/webhook'} required onblur={checkNotifUrl} oninput={checkNotifUrl} />
+          <input id="notif-url" type="url" bind:value={notifUrl} placeholder={notifEditing ? 'Leave empty to keep current' : (notifChannel === 'slack' ? 'https://hooks.slack.com/services/T.../B.../xxx' : 'https://example.com/webhook')} required={!notifEditing} onblur={checkNotifUrl} oninput={checkNotifUrl} />
           {#if notifUrlError}<span class="field-error" role="alert">{notifUrlError}</span>{/if}
         </div>
         {#if notifChannel === 'webhook'}
           <div class="settings-form-row">
             <label for="notif-auth">Authorization Header</label>
-            <input id="notif-auth" type="text" bind:value={notifAuthHeader} placeholder="Bearer your-token" onblur={checkNotifAuthHeader} oninput={checkNotifAuthHeader} />
+            <input id="notif-auth" type="text" bind:value={notifAuthHeader} placeholder={notifEditing ? 'Leave empty to keep current' : 'Bearer your-token'} onblur={checkNotifAuthHeader} oninput={checkNotifAuthHeader} />
             {#if notifAuthHeaderError}<span class="field-error" role="alert">{notifAuthHeaderError}</span>{/if}
             <span class="settings-form-hint">Optional - sent as Authorization header</span>
           </div>

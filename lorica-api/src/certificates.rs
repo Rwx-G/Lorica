@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::middleware::rate_limit::RateLimiter;
 use crate::server::AppState;
 
@@ -297,8 +298,13 @@ pub async fn create_certificate(
 
     let store = state.store.lock().await;
     store.create_certificate(&cert)?;
-    crate::cert_export::export_from_store(&store, &cert);
+    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
     drop(store);
+    // v1.5.1 audit M-9 : disk export off-loaded to spawn_blocking
+    // and dispatched AFTER the store mutex is released.
+    if let Some((settings, acls)) = export_snapshot {
+        crate::cert_export::export_after_release(settings, acls, cert.clone()).await;
+    }
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
@@ -472,8 +478,13 @@ pub async fn generate_self_signed(
 
     let store = state.store.lock().await;
     store.create_certificate(&certificate)?;
-    crate::cert_export::export_from_store(&store, &certificate);
+    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
     drop(store);
+    // v1.5.1 audit M-9 : disk export off-loaded to spawn_blocking
+    // and dispatched AFTER the store mutex is released.
+    if let Some((settings, acls)) = export_snapshot {
+        crate::cert_export::export_after_release(settings, acls, certificate.clone()).await;
+    }
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
@@ -502,8 +513,9 @@ pub struct DownloadCertificateQuery {
 /// file download. Auth-gated (this endpoint lives under
 /// `protected_routes`), rate-limited per client IP (5 downloads / 60 s,
 /// same bucket shape used for login), audited via `tracing::warn!` with
-/// the client IP, cert id, domain and selected part so a rogue export
-/// leaves a trail in the access log. The `Content-Disposition`
+/// the operator username + user_id, client IP, cert id, domain and
+/// selected part (v1.5.1 audit L-3 added the operator identity) so a
+/// rogue export leaves a complete trail in the access log. The `Content-Disposition`
 /// filename is built from the cert domain with a sanitiser that
 /// rejects path-traversal / non-ASCII sequences; a malformed domain
 /// falls back to the opaque cert id so the download never serves a
@@ -512,6 +524,7 @@ pub async fn download_certificate(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     Extension(state): Extension<AppState>,
     Extension(rate_limiter): Extension<RateLimiter>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Query(q): Query<DownloadCertificateQuery>,
 ) -> Result<Response, ApiError> {
@@ -560,7 +573,13 @@ pub async fn download_certificate(
     let safe_domain = sanitize_filename(&cert.domain).unwrap_or_else(|| cert.id.clone());
     let filename = format!("{safe_domain}-{suffix}.pem");
 
+    // v1.5.1 audit L-3 : include the operator's username in the
+    // audit line so a SOC analyst can answer "which admin pulled
+    // the prod key?" without cross-correlating session-id ->
+    // username after-the-fact.
     tracing::warn!(
+        username = %session.username,
+        user_id = %session.user_id,
         client_ip = %client_ip,
         cert_id = %cert.id,
         domain = %cert.domain,

@@ -731,7 +731,39 @@ impl ConfigStore {
         Ok(count)
     }
 
-    /// Clear all data (used before import).
+    /// Clear all importable data before applying a TOML import.
+    ///
+    /// "Importable" here means : every table whose rows are part of
+    /// the `ExportData` shape that `import_to_store` round-trips. The
+    /// import contract is "wipe + replace" against the imported set ;
+    /// that's why this function exists.
+    ///
+    /// **Tables NOT in the delete set, by intent** (audit M-25
+    /// closure - the previous absence of this list was the bug) :
+    ///
+    /// - `sessions` : operator stays logged in across an import.
+    ///   Wiping would drop the active session that just triggered
+    ///   the import, breaking the redirect-to-dashboard flow.
+    /// - `bot_pending_challenges` : ephemeral, expires on its own
+    ///   via `prune_expired` ; wiping would invalidate in-flight
+    ///   browser challenges and force every visitor to re-solve.
+    /// - `probe_configs` + `probe_results` : observability data.
+    ///   Probes are operator-local infra config (intentionally NOT
+    ///   in the TOML export shape - operators run different probe
+    ///   sets per environment) ; results are historical telemetry
+    ///   the operator pays for collecting.
+    /// - `sla_buckets` + `load_test_configs` + `load_test_results` :
+    ///   same shape as probes - environment-local config + historical
+    ///   telemetry, not part of the portable TOML.
+    /// - `cert_export_acls` : operator-local filesystem ACL
+    ///   configuration (target uid / gid live on the destination
+    ///   host, not in source-of-truth config). NOT in the TOML
+    ///   export today by design.
+    ///
+    /// `dns_providers` IS in the delete set because the TOML export
+    /// carries DNS-provider credentials (in scrubbed form per audit
+    /// L-5) ; an operator importing a previously-exported config
+    /// expects the provider list to round-trip.
     pub fn clear_all(&self) -> Result<()> {
         self.conn.execute_batch(
             "DELETE FROM route_backends;
