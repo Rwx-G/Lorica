@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod cli;
 mod health;
 mod startup;
 
@@ -319,81 +320,10 @@ fn main() {
             );
         }
         Some(Commands::RotateKey { new_key_file }) => {
-            use lorica_config::crypto::EncryptionKey;
-            use lorica_config::store::ConfigStore;
-
-            let data_dir = PathBuf::from(&cli.data_dir);
-            let key_path = data_dir.join("encryption.key");
-            let old_key = EncryptionKey::load_or_create(&key_path)
-                .expect("failed to load current encryption key");
-
-            let new_key_path = PathBuf::from(&new_key_file);
-            let new_key = EncryptionKey::load_or_create(&new_key_path)
-                .expect("failed to load/create new encryption key");
-
-            let db_path = data_dir.join("lorica.db");
-            let store =
-                ConfigStore::open(&db_path, Some(old_key)).expect("failed to open database");
-
-            let count = store
-                .rotate_encryption_key(&new_key)
-                .expect("key rotation failed");
-
-            println!("Key rotation complete: {count} secrets re-encrypted");
-            println!(
-                "IMPORTANT: Replace {} with {}",
-                key_path.display(),
-                new_key_path.display()
-            );
-            println!("  mv {} {}.backup", key_path.display(), key_path.display());
-            println!("  mv {} {}", new_key_path.display(), key_path.display());
+            cli::rotate_key::run(&cli.data_dir, &new_key_file);
         }
         Some(Commands::Unban { ip, user, password }) => {
-            let port = cli.management_port;
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(async {
-                let client = reqwest::Client::builder()
-                    .danger_accept_invalid_certs(true)
-                    .cookie_store(true)
-                    .build()
-                    .expect("HTTP client");
-
-                // Login
-                let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
-                let login_res = client
-                    .post(&login_url)
-                    .json(&serde_json::json!({ "username": user, "password": password }))
-                    .send()
-                    .await;
-                match login_res {
-                    Ok(r) if r.status().is_success() => {}
-                    Ok(r) => {
-                        eprintln!("Login failed ({}). Check credentials.", r.status());
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("Cannot connect to management API on port {port}: {e}");
-                        std::process::exit(1);
-                    }
-                }
-
-                // Unban
-                let unban_url = format!("https://127.0.0.1:{port}/api/v1/bans/{ip}");
-                match client.delete(&unban_url).send().await {
-                    Ok(r) if r.status().is_success() => {
-                        println!("IP {ip} unbanned successfully.");
-                    }
-                    Ok(r) => {
-                        let body = r.text().await.unwrap_or_default();
-                        eprintln!("Unban failed: {body}");
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("Unban request failed: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            });
+            cli::unban::run(cli.management_port, &ip, &user, &password);
         }
         None => {
             init_logging(&cli.log_level, &cli.log_format, cli.log_file.as_deref());
