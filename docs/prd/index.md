@@ -17,3 +17,6 @@
 - [Epic 3: Intelligence](./epic-3-intelligence.md)
 - [Epic 4: Production](./epic-4-production.md)
 - [Epic 5: Observability](./epic-5-observability.md)
+- [Epic 6: Route Configuration](./epic-6-route-config.md)
+- [Epic 7: HTTP Caching & DDoS Protection](./epic-7-cache-and-protection.md)
+- [Epic 8: Multi-User RBAC, AI Bot Defense & Zero-Downtime Upgrades (v1.6.0)](./epic-8-v1.6.0.md)

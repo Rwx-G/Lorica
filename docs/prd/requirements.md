@@ -85,6 +85,27 @@
 - **FR49:** Load tests shall auto-abort when backend error rate exceeds a configurable threshold.
 - **FR50:** Load test results shall be displayed in real-time in the dashboard during execution, and stored for historical comparison.
 
+**Multi-User RBAC (v1.6.0)**
+
+- **FR51:** Lorica shall support multiple operator accounts with username + password authentication, replacing the single-admin model. The legacy single-admin row shall be auto-migrated as `username = "admin", role = SuperAdmin` on first boot of v1.6.0.
+- **FR52:** Lorica shall provide three built-in roles: `SuperAdmin` (full access including user management, encryption-key rotation, and global settings), `Operator` (full CRUD on routes, backends, certs, WAF, SLA, load-tests, probes, cache, bans), and `Viewer` (read-only on everything except secrets, which are scrubbed in JSON responses).
+- **FR53:** Per-handler authorisation shall be enforced via a `require_role!(Role)` macro on every state-mutating endpoint, with `SuperAdmin`-only enforcement on settings, DNS providers, notification configs, cert-export ACL editing, and user CRUD.
+- **FR54:** Secrets (cert private keys, SMTP password, webhook URLs, DNS provider tokens) shall be scrubbed from API responses returned to `Viewer`-role sessions.
+
+**Hot Binary Upgrade (v1.6.0)**
+
+- **FR55:** Lorica shall support replacing its running binary without dropping in-flight requests, via FD inheritance through `execve` and a documented `LORICA_HOT_UPGRADE_FDS` env var. The new supervisor inherits the listening sockets, spawns its own workers, and signals the old supervisor to drain. A signature-failed or boot-panicking new binary shall trigger automatic rollback to the old supervisor without loss of service.
+
+**AI Bot Defense (v1.6.0)**
+
+- **FR56:** Lorica shall support a per-route AI/LLM crawler deny-list with three modes (`Off`, `Deny`, `Log`), backed by a curated registry of at least 12 known crawlers (GPTBot, ClaudeBot, CCBot, PerplexityBot, Bytespider, Google-Extended, Applebot-Extended, Amazonbot, FacebookBot, Diffbot, ChatGPT-User, anthropic-ai). Detection shall combine User-Agent regex matching with rDNS forward-confirmation to defeat spoofing.
+- **FR57:** Operators shall be able to define custom AI crawler entries (User-Agent pattern + optional rDNS suffix) via `/api/v1/ai-crawlers/custom` ; custom entries shall be merged with the built-in registry at request-evaluation time.
+
+**Audit & Compliance (v1.6.0)**
+
+- **FR58:** Lorica shall emit a structured audit-log entry on every state-mutating management endpoint, carrying the operator username, role, action, target, before/after payload SHA-256 hashes, source IP, and user agent. Entries shall be stored in a dedicated `audit_log` SQLite table with operator-tunable retention.
+- **FR59:** The audit log shall be tamper-evident via a per-row SHA-256 chain (`chain_hash = SHA-256(prev_chain_hash || ... || after_payload_hash)`). A `GET /api/v1/audit/verify` endpoint (SuperAdmin only) shall walk the chain from genesis (or from the retention seal when older rows have been evicted) and report any break by row id and reason.
+
 ## Non-Functional Requirements
 
 - **NFR1:** Proxy latency overhead shall be < 1ms per request under normal load (comparable to Pingora benchmarks).
@@ -97,8 +118,12 @@
 - **NFR8:** The codebase shall be fully auditable: no closed-source dependencies, no C code beyond system libraries.
 - **NFR9:** The management port shall bind exclusively to localhost (127.0.0.1 / ::1) by default with no option to change this in the dashboard.
 - **NFR10:** Lorica shall produce structured JSON logs to stdout, compatible with SIEM/XDR ingestion.
-- **NFR11:** Memory usage shall remain stable over time with no unbounded growth (no memory leaks).
+- **NFR11:** Memory usage shall remain stable over time with no unbounded growth (no memory leaks). Per-IP bot-stash entries shall be capped (default `bot_stash_per_prefix_max=100` per `/24` IPv4 or `/48` IPv6) and globally LRU-bounded (default `bot_stash_max_entries=10000`) to prevent OOM under captcha flood (v1.6.0).
 - **NFR12:** Configuration state persistence shall survive unclean shutdowns (crash-safe storage).
+- **NFR13:** Hot binary upgrades shall preserve all in-flight TCP connections and HTTP requests with zero connection errors and zero 5xx responses, measured under sustained traffic during the upgrade window (v1.6.0).
+- **NFR14:** Audit-log chain integrity verification shall complete in linear time relative to row count, with no requirement for external state. Verification of 100k entries shall complete in under one second on commodity hardware (v1.6.0).
+- **NFR15:** The management plane shall be served exclusively over TLS (rustls), with an auto-generated self-signed certificate provisioned at first boot and rotated 30 days before expiry. Operator-supplied certificates shall be supported via configuration (v1.6.0).
+- **NFR16:** The dashboard shall not require `'unsafe-inline'` in its `Content-Security-Policy` `style-src` directive ; per-request CSP3 nonces shall be generated and injected into both the served HTML and the response header (v1.6.0).
 
 ## Compatibility Requirements
 
@@ -106,3 +131,4 @@
 - **CR2: TLS Compatibility** - Lorica shall support all TLS configurations that rustls supports (TLS 1.2, TLS 1.3, standard cipher suites, ECDSA and RSA certificates).
 - **CR3: HTTP Standards Compliance** - Lorica shall comply with HTTP/1.1 (RFC 9110/9112) and HTTP/2 (RFC 9113) standards as inherited from Pingora's proxy engine.
 - **CR4: Export Format Stability** - The TOML export/import format shall be versioned. Lorica shall be able to import configurations from any prior format version.
+- **CR5: RBAC Login Backward Compatibility (v1.6.0)** - The legacy `POST /api/v1/auth/login` body shape `{password}` shall remain accepted during and after the v1.6.0 RBAC migration ; requests using the legacy shape shall be routed to `username = "admin"`. The shim ensures that pre-v1.6.0 automation, scripts, and CI pipelines continue to work without modification.
