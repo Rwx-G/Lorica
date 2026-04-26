@@ -1337,6 +1337,14 @@ fn run_supervisor(cli: Cli) {
         let sla_collector = control.sla_collector;
         let load_test_engine = control.load_test_engine;
 
+        // Load-test cron scheduler. Single-process used to be the only
+        // mode that ran this ; surfacing the asymmetry through Story 8.1
+        // shows that workers mode silently dropped scheduled load tests.
+        // Wire here so cron-scheduled runs fire under both modes.
+        let lt_scheduler_store = Arc::clone(&store);
+        let lt_scheduler_engine = Arc::clone(&load_test_engine);
+        lorica_bench::scheduler::start_scheduler(lt_scheduler_store, lt_scheduler_engine);
+
         // Reload proxy config, probe scheduler, SLA configs, and notification dispatcher on config changes
         let reload_store = Arc::clone(&store);
         let reload_config = Arc::clone(&proxy_config);
@@ -3770,20 +3778,14 @@ fn run_single_process(cli: Cli) {
             &single_task_tracker,
         )
         .await;
-        // Single-process does NOT rebuild the notify dispatcher on
-        // config reload (its reload listener only touches proxy_config /
-        // cert_resolver / probe_scheduler / sla_collector). Supervisor
-        // mode does. This asymmetry predates Story 8.1 - flagged as a
-        // follow-up.
+        let notify_dispatcher = control.notify_dispatcher;
         let notification_history = control.notification_history;
         let probe_scheduler = control.probe_scheduler;
         let sla_collector = control.sla_collector;
         let load_test_engine = control.load_test_engine;
 
-        // Single-process only: load-test cron scheduler. Supervisor mode
-        // does not call `start_scheduler` today (see Story 8.1 follow-up
-        // note in `startup/control_plane.rs`); cron-scheduled load tests
-        // only auto-fire under single-process for now.
+        // Load-test cron scheduler. Mirrors the supervisor wiring so
+        // scheduled load tests fire identically in both modes.
         let lt_scheduler_store = Arc::clone(&store);
         let lt_scheduler_engine = Arc::clone(&load_test_engine);
         lorica_bench::scheduler::start_scheduler(lt_scheduler_store, lt_scheduler_engine);
@@ -4031,6 +4033,7 @@ fn run_single_process(cli: Cli) {
         let reload_probe_scheduler = Arc::clone(&probe_scheduler);
         let reload_connection_filter = Arc::clone(&connection_filter);
         let reload_mtls_fp = Arc::clone(&mtls_installed_fingerprint);
+        let reload_notify_dispatcher = Arc::clone(&notify_dispatcher);
         let _reload_handle = tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
                 if let Err(e) = lorica::reload::reload_proxy_config_with_mtls(
@@ -4048,6 +4051,12 @@ fn run_single_process(cli: Cli) {
                 {
                     let s = reload_store.lock().await;
                     reload_sla_collector.load_configs(&s);
+                    // Rebuild notify dispatcher so dashboard edits to
+                    // notification channel configs take effect without
+                    // restart. Mirrors the supervisor reload listener.
+                    let new_dispatcher = build_notify_dispatcher(&s);
+                    let mut d = reload_notify_dispatcher.lock().await;
+                    *d = new_dispatcher;
                 }
             }
         });
