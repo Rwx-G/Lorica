@@ -115,6 +115,14 @@ services:
     depends_on:
       - lorica-workers
       - auth-svc
+    # Share the lorica-workers PID namespace + run as root so the
+    # audit C-1 regression test (worker crash + respawn must re-wire
+    # RPC endpoint) can `kill -9 <PID>` a worker child process whose
+    # PID it reads from /api/v1/workers, then assert the supervisor
+    # respawned it AND propagated a subsequent config-reload via the
+    # two-phase RPC pipe to the new worker.
+    pid: "service:lorica-workers"
+    user: root
     volumes:
       - shared-workers:/shared:ro
     environment:

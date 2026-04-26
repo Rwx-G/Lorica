@@ -487,6 +487,133 @@ else
 fi
 
 # =============================================================================
+# 8b. WORKER RESPAWN RPC RE-WIRE (audit C-1 regression test)
+# =============================================================================
+# Pre-fix bug : `restart_worker` returned only the cmd_fd ; the new
+# RPC fd (the pipelined two-phase reload channel) was never picked up
+# by the supervisor, so the respawned worker sat outside
+# `worker_rpc_endpoints`. The supervisor's reload coordinator
+# iterated over the live endpoints (only the OTHER, non-crashed
+# workers), the legacy broadcast fallback only fires when two-phase
+# reports failures, so the respawned worker NEVER received subsequent
+# config-reload commits via either path. Its ProxyConfig /
+# CertResolver / OTel / GeoIP / ASN / bot-secret state stayed frozen
+# at boot until a full process restart - meaning the v1.5.2 cert
+# hot-reload work was silently broken on any worker that had crashed
+# since boot.
+#
+# This test proves the regression : enable maintenance mode on
+# `app1.test`, kill the worker that just served traffic, wait for
+# respawn, then send N parallel requests through the proxy. With the
+# bug present, ~50% of requests land on the respawned worker (still
+# on the boot-time config = maintenance OFF) and return 200 ; with
+# the fix in place all requests honour the maintenance flag and
+# return 503.
+log "=== 8b. Worker respawn RPC re-wire (audit C-1) ==="
+
+# Reset to a known-good route shape : both backends, no maintenance.
+api_put "/api/v1/routes/$R1_ID" '{"maintenance_mode":false}' >/dev/null 2>&1 || true
+sleep 1
+
+# Capture per-worker PIDs before the kill so we can verify the
+# respawn produced a NEW pid (ruling out "the supervisor never
+# noticed and the same process kept running" false positives).
+WORKERS_BEFORE=$(api_get "/api/v1/workers")
+W0_PID_BEFORE=$(echo "$WORKERS_BEFORE" | jq -r '.data.workers[] | select(.worker_id == 0) | .pid' 2>/dev/null || echo "")
+W1_PID_BEFORE=$(echo "$WORKERS_BEFORE" | jq -r '.data.workers[] | select(.worker_id == 1) | .pid' 2>/dev/null || echo "")
+
+if [ -z "$W0_PID_BEFORE" ] || [ -z "$W1_PID_BEFORE" ] || [ "$W0_PID_BEFORE" = "null" ] || [ "$W1_PID_BEFORE" = "null" ]; then
+    fail "Worker respawn test: could not read both worker PIDs from /api/v1/workers (got w0=$W0_PID_BEFORE w1=$W1_PID_BEFORE)"
+else
+    ok "Captured worker PIDs (w0=$W0_PID_BEFORE w1=$W1_PID_BEFORE)"
+
+    # Kill worker 1 via SIGKILL. PID namespace is shared with the
+    # lorica-workers container (`pid: "service:..."`) and the test
+    # runner runs as root with CAP_KILL, so this signals the
+    # lorica-user-owned worker process directly.
+    if kill -9 "$W1_PID_BEFORE" 2>/dev/null; then
+        ok "Sent SIGKILL to worker 1 (pid $W1_PID_BEFORE)"
+    else
+        fail "Worker respawn test: kill -9 $W1_PID_BEFORE failed (cap_add KILL or pid namespace not configured)"
+    fi
+
+    # Poll /api/v1/workers until worker 1 reappears with a NEW pid.
+    # Supervisor `monitor_workers` ticks every 500 ms ; restart_worker's
+    # exponential-backoff sleep can be up to a few seconds on second-
+    # respawn. Allow up to 30 s.
+    NEW_W1_PID=""
+    for i in $(seq 1 60); do
+        SNAP=$(api_get "/api/v1/workers" 2>/dev/null || echo "{}")
+        CANDIDATE=$(echo "$SNAP" | jq -r '.data.workers[] | select(.worker_id == 1) | .pid' 2>/dev/null || echo "")
+        if [ -n "$CANDIDATE" ] && [ "$CANDIDATE" != "null" ] && [ "$CANDIDATE" != "$W1_PID_BEFORE" ]; then
+            NEW_W1_PID="$CANDIDATE"
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [ -n "$NEW_W1_PID" ]; then
+        ok "Worker 1 respawned (pid $W1_PID_BEFORE -> $NEW_W1_PID)"
+
+        # Give the respawned worker a moment to register its channels
+        # with the supervisor BEFORE we trigger the config update -
+        # otherwise the test races the registration and produces a
+        # false negative (the supervisor's reload could fan out
+        # before the respawned worker connects, and the legacy
+        # broadcast catches it on the rebound).
+        log "Waiting 2s for respawned worker to register channels..."
+        sleep 2
+
+        # Now trigger a config-reload that has an OBSERVABLE proxy-
+        # level effect. `maintenance_mode=true` makes the route
+        # serve 503 with Retry-After ; if the respawned worker missed
+        # the reload it still serves 200.
+        log "Triggering maintenance_mode=true on route $R1_ID..."
+        api_put "/api/v1/routes/$R1_ID" '{"maintenance_mode":true}' >/dev/null
+        log "Config reload triggered, waiting 3s for propagation..."
+        sleep 3
+
+        # Fan out N parallel requests. With workers using SO_REUSEPORT
+        # accept dispatch (the kernel rotates connections across
+        # listeners), N=30 is enough to land at least a few requests
+        # on each worker. `--max-time 5` keeps a single hung request
+        # from blocking the whole test.
+        log "Fanning out 30 parallel requests..."
+        STALE_HITS=0
+        MAINT_HITS=0
+        OTHER_HITS=0
+        TOTAL=30
+        for i in $(seq 1 $TOTAL); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+                -H "Host: app1.test" "$PROXY/" 2>/dev/null || echo "000")
+            if [ "$CODE" = "503" ]; then
+                MAINT_HITS=$((MAINT_HITS + 1))
+            elif [ "$CODE" = "200" ]; then
+                STALE_HITS=$((STALE_HITS + 1))
+            else
+                OTHER_HITS=$((OTHER_HITS + 1))
+            fi
+        done
+        log "Request fanout complete: $MAINT_HITS x 503, $STALE_HITS x 200, $OTHER_HITS x other"
+
+        if [ "$STALE_HITS" -eq 0 ] && [ "$MAINT_HITS" -gt 0 ]; then
+            ok "Worker respawn RPC re-wire (C-1) : all observable requests honoured the post-respawn config update ($MAINT_HITS x 503, 0 stale 200, $OTHER_HITS other)"
+        else
+            fail "Worker respawn RPC re-wire (C-1) regression : respawned worker missed the config reload - $STALE_HITS x 200 (boot-time config) vs $MAINT_HITS x 503 (post-respawn maintenance_mode), $OTHER_HITS other"
+        fi
+
+        # Cleanup : restore the route so subsequent tests see the
+        # known-good shape.
+        log "Cleanup: restoring maintenance_mode=false..."
+        api_put "/api/v1/routes/$R1_ID" '{"maintenance_mode":false}' >/dev/null 2>&1 || true
+        sleep 1
+        log "8b cleanup complete"
+    else
+        fail "Worker respawn test: worker 1 did not respawn within 30 s (supervisor monitor_workers may be blocked)"
+    fi
+fi
+
+# =============================================================================
 # 9. LOG FORWARDING IN WORKER MODE
 # =============================================================================
 log "=== 9. Log Forwarding in Worker Mode ==="
