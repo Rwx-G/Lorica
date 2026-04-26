@@ -148,11 +148,25 @@ impl CertResolver {
 
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let sni = client_hello.server_name()?.to_lowercase();
+        let sni_raw = client_hello.server_name()?;
         let inner = self.inner.load();
 
+        // Audit M-13 : every TLS handshake calls this. Avoid the
+        // `to_lowercase()` String allocation when the SNI is already
+        // lowercase (the common case ; modern clients normalise) -
+        // RFC 5890 leaves DNS labels case-insensitive but practical
+        // SNI traffic is overwhelmingly lower-case ASCII.
+        let already_lower = sni_raw.bytes().all(|b| !b.is_ascii_uppercase());
+        let sni_owned;
+        let sni: &str = if already_lower {
+            sni_raw
+        } else {
+            sni_owned = sni_raw.to_ascii_lowercase();
+            &sni_owned
+        };
+
         // 1. Exact match
-        if let Some(entries) = inner.certs.get(&sni) {
+        if let Some(entries) = inner.certs.get(sni) {
             if let Some(entry) = entries.first() {
                 return Some(Arc::clone(&entry.key));
             }
@@ -160,10 +174,23 @@ impl ResolvesServerCert for CertResolver {
 
         // 2. Wildcard match: replace first label with *
         if let Some(dot_pos) = sni.find('.') {
-            let wildcard = format!("*{}", &sni[dot_pos..]);
-            if let Some(entries) = inner.certs.get(&wildcard) {
-                if let Some(entry) = entries.first() {
-                    return Some(Arc::clone(&entry.key));
+            // Build the wildcard form into a stack-friendly buffer.
+            // DNS names are <= 253 bytes ; `*` + suffix fits in 256.
+            // Avoids the `format!` allocation on every handshake.
+            let suffix = &sni[dot_pos..];
+            let mut wildcard_buf = [0u8; 256];
+            let needed = 1 + suffix.len();
+            if needed <= wildcard_buf.len() {
+                wildcard_buf[0] = b'*';
+                wildcard_buf[1..needed].copy_from_slice(suffix.as_bytes());
+                // SAFETY: `*` is ASCII, `suffix` is a valid &str sub-
+                // slice ; the concatenation is therefore valid UTF-8.
+                let wildcard = std::str::from_utf8(&wildcard_buf[..needed])
+                    .expect("ASCII '*' + UTF-8 DNS suffix is UTF-8");
+                if let Some(entries) = inner.certs.get(wildcard) {
+                    if let Some(entry) = entries.first() {
+                        return Some(Arc::clone(&entry.key));
+                    }
                 }
             }
         }

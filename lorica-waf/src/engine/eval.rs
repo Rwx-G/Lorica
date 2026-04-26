@@ -95,12 +95,19 @@ impl WafEngine {
         // like ` or 1=`).
         for (name, value) in headers {
             let decoded = Self::url_decode_uri(value);
-            let field = format!("header:{name}");
-            if self.prefilter.matches(&decoded) {
-                self.scan_builtin_rules(&field, &decoded, now, &mut events);
-            }
-            if has_custom_rules {
-                self.scan_custom_rules(&field, &decoded, now, &mut events);
+            // Audit M-14 : defer the `format!("header:{name}")`
+            // allocation until either the prefilter actually hits
+            // OR a custom rule is loaded. Clean traffic through
+            // headers (the common case) skips the format entirely.
+            let prefilter_hit = self.prefilter.matches(&decoded);
+            if prefilter_hit || has_custom_rules {
+                let field = format!("header:{name}");
+                if prefilter_hit {
+                    self.scan_builtin_rules(&field, &decoded, now, &mut events);
+                }
+                if has_custom_rules {
+                    self.scan_custom_rules(&field, &decoded, now, &mut events);
+                }
             }
         }
 
