@@ -48,86 +48,6 @@ use tracing::{debug, info, warn};
 /// its weight is decreased by `total_weight`. This produces an interleaved distribution
 /// like A,A,B,A,C,A,A for weights 5,1,1 instead of AAAAABC.
 ///
-/// State is keyed by backend address (not position) so it works correctly when
-/// unhealthy backends are filtered out between calls.
-#[derive(Debug)]
-pub struct SmoothWrrState {
-    /// Per-backend-address current weights.
-    current_weights: parking_lot::Mutex<HashMap<String, i64>>,
-    /// Worker offset to avoid all workers selecting the same backend at startup.
-    worker_offset: usize,
-}
-
-impl Clone for SmoothWrrState {
-    fn clone(&self) -> Self {
-        Self {
-            current_weights: parking_lot::Mutex::new(self.current_weights.lock().clone()),
-            worker_offset: self.worker_offset,
-        }
-    }
-}
-
-impl SmoothWrrState {
-    pub fn new(worker_offset: usize) -> Self {
-        Self {
-            current_weights: parking_lot::Mutex::new(HashMap::new()),
-            worker_offset,
-        }
-    }
-
-    /// Select the next backend using smooth weighted round-robin.
-    /// `backends` is a slice of (address, weight) for healthy backends only.
-    /// Returns the index into the `backends` slice.
-    pub fn next(&self, backends: &[(&str, i64)]) -> usize {
-        if backends.is_empty() {
-            return 0;
-        }
-        let total: i64 = backends.iter().map(|(_, w)| *w).sum();
-        if total == 0 {
-            return 0;
-        }
-
-        let mut cw = self.current_weights.lock();
-
-        // Initialize new backends with offset-based head start.
-        // The head start is just +1 so the offset backend wins the first
-        // tie-break without skewing the overall distribution.
-        for (i, (addr, _)) in backends.iter().enumerate() {
-            cw.entry(addr.to_string()).or_insert_with(|| {
-                if i == self.worker_offset % backends.len() {
-                    1 // tiny head start to win first tie-break
-                } else {
-                    0
-                }
-            });
-        }
-
-        // Increase all current_weights by their effective weight
-        for (addr, weight) in backends {
-            *cw.entry(addr.to_string()).or_insert(0) += weight;
-        }
-
-        // Find the backend with the highest current_weight
-        let mut best_idx = 0;
-        let mut best_weight = i64::MIN;
-        for (i, (addr, _)) in backends.iter().enumerate() {
-            let w = cw.get(*addr).copied().unwrap_or(0);
-            if w > best_weight {
-                best_weight = w;
-                best_idx = i;
-            }
-        }
-
-        // Decrease the selected backend's current_weight by total_weight
-        let best_addr = backends[best_idx].0;
-        if let Some(w) = cw.get_mut(best_addr) {
-            *w -= total;
-        }
-
-        best_idx
-    }
-}
-
 /// In-memory snapshot of a route and its backends for fast lookup.
 /// Some fields are only read via the `Debug` derive (diagnostic
 /// serialisation) or by conditional code paths; `dead_code` is
@@ -628,234 +548,6 @@ impl ProxyConfig {
 ///
 pub use lorica_api::connections::BackendConnections;
 
-/// Peak EWMA latency tracker for load balancing.
-///
-/// Tracks exponentially weighted moving average of latency per backend.
-/// The decay factor ensures recent measurements count more than old ones.
-#[derive(Debug, Default)]
-pub struct EwmaTracker {
-    /// EWMA score per backend address (microseconds).
-    pub(crate) scores: Arc<parking_lot::RwLock<HashMap<String, f64>>>,
-}
-
-impl EwmaTracker {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Update the EWMA score for a backend with a new latency sample.
-    ///
-    /// Hot path: we try `get_mut` first with a write lock already held
-    /// so the common case (backend already known) avoids the
-    /// `addr.to_string()` allocation that `insert` would incur. Only
-    /// the first-seen backend per process pays for the `String`
-    /// (audit M-1).
-    pub fn record(&self, addr: &str, latency_us: f64) {
-        let alpha = 0.3;
-        let mut scores = self.scores.write();
-        if let Some(current) = scores.get_mut(addr) {
-            *current = alpha * latency_us + (1.0 - alpha) * *current;
-        } else {
-            // First-seen: seed the decay with the sample itself.
-            scores.insert(addr.to_string(), latency_us);
-        }
-    }
-
-    /// Select the backend with the lowest EWMA score.
-    /// Returns the index into the provided backends slice.
-    pub fn select_best(&self, backends: &[&Backend]) -> usize {
-        if backends.is_empty() {
-            return 0;
-        }
-        let scores = self.scores.read();
-        let mut best_idx = 0;
-        let mut best_score = f64::MAX;
-        for (i, b) in backends.iter().enumerate() {
-            let score = scores.get(&b.address).copied().unwrap_or(0.0);
-            // Tie-break: unscored backends get priority (explore)
-            if score < best_score {
-                best_score = score;
-                best_idx = i;
-            }
-        }
-        best_idx
-    }
-
-    /// Get the EWMA score for a backend (for dashboard display).
-    pub fn get_score(&self, addr: &str) -> f64 {
-        self.scores.read().get(addr).copied().unwrap_or(0.0)
-    }
-
-    /// Return a shared reference to the scores map (for passing to API state).
-    pub fn scores_ref(&self) -> Arc<parking_lot::RwLock<HashMap<String, f64>>> {
-        Arc::clone(&self.scores)
-    }
-}
-
-/// Per-(route, backend) circuit breaker.
-///
-/// Tracks consecutive failures per (route, backend) pair rather than per
-/// backend alone. This matters when several routes share the same upstream
-/// IP:port but exercise different paths on it - for example two virtual
-/// hosts both pointing at `10.0.0.1:3080` where one path always succeeds
-/// and the other structurally fails. Keying on the route prevents failures
-/// on one route from tripping the breaker for siblings that are actually
-/// healthy against the same physical backend.
-///
-/// When the failure count reaches the threshold, the circuit opens for that
-/// (route, backend) pair and traffic on that route is redirected to other
-/// backends for a cooldown period. After the cooldown, one probe request is
-/// allowed through (half-open). If it succeeds the circuit closes; if it
-/// fails the circuit re-opens.
-#[derive(Debug)]
-pub struct CircuitBreaker {
-    /// Per-(route_id, backend) state: (consecutive_failures, state, last_state_change)
-    states: dashmap::DashMap<(String, String), CircuitBreakerState>,
-    /// Number of consecutive errors before opening the circuit.
-    threshold: u32,
-    /// How long the circuit stays open before moving to half-open (seconds).
-    cooldown_s: u64,
-}
-
-#[derive(Debug, Clone)]
-struct CircuitBreakerState {
-    failures: u32,
-    state: CircuitStatus,
-    changed_at: Instant,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum CircuitStatus {
-    Closed,
-    Open,
-    HalfOpen,
-}
-
-impl CircuitBreaker {
-    pub fn new(threshold: u32, cooldown_s: u64) -> Self {
-        Self {
-            states: dashmap::DashMap::new(),
-            threshold,
-            cooldown_s,
-        }
-    }
-
-    /// Check if a backend is available for the given route (not in Open state).
-    /// Open circuits that have exceeded the cooldown move to HalfOpen.
-    pub fn is_available(&self, route_id: &str, addr: &str) -> bool {
-        let key = (route_id.to_string(), addr.to_string());
-        let mut entry = match self.states.get_mut(&key) {
-            Some(e) => e,
-            None => return true, // no state = closed = available
-        };
-        match entry.state {
-            CircuitStatus::Closed | CircuitStatus::HalfOpen => true,
-            CircuitStatus::Open => {
-                if entry.changed_at.elapsed() >= Duration::from_secs(self.cooldown_s) {
-                    entry.state = CircuitStatus::HalfOpen;
-                    entry.changed_at = Instant::now();
-                    true // allow one probe request
-                } else {
-                    false
-                }
-            }
-        }
-    }
-
-    /// Record a successful response. Resets the failure count and closes the circuit.
-    pub fn record_success(&self, route_id: &str, addr: &str) {
-        let key = (route_id.to_string(), addr.to_string());
-        if let Some(mut entry) = self.states.get_mut(&key) {
-            if entry.failures > 0 || entry.state != CircuitStatus::Closed {
-                entry.failures = 0;
-                entry.state = CircuitStatus::Closed;
-                entry.changed_at = Instant::now();
-            }
-        }
-    }
-
-    /// Record a failure. Increments the counter and opens the circuit if threshold is reached.
-    pub fn record_failure(&self, route_id: &str, addr: &str) {
-        let key = (route_id.to_string(), addr.to_string());
-        let mut entry = self.states.entry(key).or_insert(CircuitBreakerState {
-            failures: 0,
-            state: CircuitStatus::Closed,
-            changed_at: Instant::now(),
-        });
-        entry.failures += 1;
-        if entry.failures >= self.threshold && entry.state != CircuitStatus::Open {
-            entry.state = CircuitStatus::Open;
-            entry.changed_at = Instant::now();
-            tracing::warn!(
-                route_id = %route_id,
-                backend = %addr,
-                failures = entry.failures,
-                cooldown_s = self.cooldown_s,
-                "circuit breaker opened - backend removed from rotation for this route"
-            );
-        }
-    }
-}
-
-/// Compute the upstream keepalive pool size based on the number of backends.
-/// - <= 15 backends: 128 (Pingora default)
-/// - 16+ backends: 8 connections per backend, capped at 1024
-pub fn compute_pool_size(backend_count: usize) -> usize {
-    if backend_count <= 15 {
-        128
-    } else {
-        (backend_count * 8).min(1024)
-    }
-}
-
-/// Compact a client IP into a `u64` key for the shmem hashtables.
-///
-/// `lorica_shmem` pre-hashes this with its secret siphash key before
-/// slotting, so the only requirement here is a deterministic, low-cost
-/// serialisation of the IP into 64 bits. IPv4 becomes its 32-bit value;
-/// IPv6 folds the two 64-bit halves via XOR; an unparseable string
-/// falls back to a deterministic FNV-1a rollup so malformed inputs
-/// still route consistently (they should not reach this path in
-/// practice).
-pub fn ip_to_shmem_key(ip: &str) -> u64 {
-    use std::net::IpAddr;
-    match ip.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => u32::from(v4) as u64,
-        Ok(IpAddr::V6(v6)) => {
-            let o = v6.octets();
-            let high = u64::from_be_bytes([o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]]);
-            let low = u64::from_be_bytes([o[8], o[9], o[10], o[11], o[12], o[13], o[14], o[15]]);
-            high ^ low
-        }
-        Err(_) => {
-            let mut h: u64 = 0xcbf29ce484222325;
-            for b in ip.as_bytes() {
-                h ^= *b as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
-            h
-        }
-    }
-}
-
-/// Check whether an IP address matches a pattern (exact match or CIDR range).
-fn ip_matches(ip: &str, pattern: &str) -> bool {
-    if pattern.contains('/') {
-        // CIDR - parse and use proper network containment check
-        let net: std::net::IpAddr = match ip.parse() {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-        let cidr: ipnet::IpNet = match pattern.parse() {
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        cidr.contains(&net)
-    } else {
-        ip == pattern
-    }
-}
-
 // ---------------------------------------------------------------------------
 // HTTP cache infrastructure (MemCache storage + LRU eviction)
 // ---------------------------------------------------------------------------
@@ -1209,6 +901,13 @@ pub struct PendingProxyConfig {
 // RateLimitEngine moved to proxy_wiring/engines.rs to keep this
 // file below the refactor threshold. Re-exported here so
 // `lorica::proxy_wiring::BreakerEngine` (etc.) still resolves.
+//
+// Story 8.1 / E1 : load-balancing primitives (SmoothWrrState,
+// EwmaTracker, CircuitBreaker) moved to proxy_wiring/lb.rs ; same
+// re-export rationale as the engines module.
+pub mod lb;
+pub use lb::{CircuitBreaker, EwmaTracker, SmoothWrrState};
+
 pub mod bot_handlers;
 pub mod forward_auth;
 #[cfg(test)]
@@ -1231,9 +930,9 @@ pub mod helpers;
 // because they're re-exported by integration tests under `tests/`
 // (canary_e2e_test, mtls_e2e_test).
 pub(crate) use helpers::{
-    cache_vary_for_request, downstream_ssl_digest, extract_host, sanitize_html,
+    cache_vary_for_request, downstream_ssl_digest, extract_host, ip_matches, sanitize_html,
 };
-pub use helpers::{canary_bucket, evaluate_mtls};
+pub use helpers::{canary_bucket, compute_pool_size, evaluate_mtls, ip_to_shmem_key};
 #[cfg(test)]
 pub(crate) use helpers::{
     compute_cache_variance, match_header_rule_backends, pick_traffic_split_backends,

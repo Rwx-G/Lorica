@@ -379,3 +379,62 @@ pub(crate) fn compute_cache_variance(
     }
     vb.finalize()
 }
+
+/// Compute the upstream keepalive pool size based on the number of backends.
+/// - <= 15 backends: 128 (Pingora default)
+/// - 16+ backends: 8 connections per backend, capped at 1024
+pub fn compute_pool_size(backend_count: usize) -> usize {
+    if backend_count <= 15 {
+        128
+    } else {
+        (backend_count * 8).min(1024)
+    }
+}
+
+/// Compact a client IP into a `u64` key for the shmem hashtables.
+///
+/// `lorica_shmem` pre-hashes this with its secret siphash key before
+/// slotting, so the only requirement here is a deterministic, low-cost
+/// serialisation of the IP into 64 bits. IPv4 becomes its 32-bit value;
+/// IPv6 folds the two 64-bit halves via XOR; an unparseable string
+/// falls back to a deterministic FNV-1a rollup so malformed inputs
+/// still route consistently (they should not reach this path in
+/// practice).
+pub fn ip_to_shmem_key(ip: &str) -> u64 {
+    use std::net::IpAddr;
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => u32::from(v4) as u64,
+        Ok(IpAddr::V6(v6)) => {
+            let o = v6.octets();
+            let high = u64::from_be_bytes([o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]]);
+            let low = u64::from_be_bytes([o[8], o[9], o[10], o[11], o[12], o[13], o[14], o[15]]);
+            high ^ low
+        }
+        Err(_) => {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in ip.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        }
+    }
+}
+
+/// Check whether an IP address matches a pattern (exact match or CIDR range).
+pub(crate) fn ip_matches(ip: &str, pattern: &str) -> bool {
+    if pattern.contains('/') {
+        // CIDR - parse and use proper network containment check
+        let net: std::net::IpAddr = match ip.parse() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let cidr: ipnet::IpNet = match pattern.parse() {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        cidr.contains(&net)
+    } else {
+        ip == pattern
+    }
+}
