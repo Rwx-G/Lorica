@@ -62,7 +62,7 @@ pub const BODY_CAP_ACME: usize = 16 * 1024;
 /// full GlobalSettings struct including the WAF disabled rule list).
 pub const BODY_CAP_SETTINGS: usize = 64 * 1024;
 
-/// Per-bucket rate limits (per RL_WINDOW_S window).
+// Per-bucket rate limits (per RL_WINDOW_S window).
 
 /// Cert create / update / delete : ACME quotas + audit-trail clarity.
 pub const RL_CERT_CREATE: u32 = 20;

@@ -49,10 +49,11 @@ pub const BOT_POW_DIFFICULTY_MIN: u8 = 14;
 /// take seconds to solve the challenge - bad UX.
 pub const BOT_POW_DIFFICULTY_MAX: u8 = 22;
 
-/// Captcha alphabet length bounds. Below 10, the answer space is
-/// too small to be useful ; above 128, the rendered image gets
-/// unreadable.
+/// Minimum captcha alphabet length. Below 10, the answer space is
+/// too small to be useful.
 pub const BOT_CAPTCHA_ALPHABET_MIN: usize = 10;
+/// Maximum captcha alphabet length. Above 128, the rendered image
+/// gets unreadable.
 pub const BOT_CAPTCHA_ALPHABET_MAX: usize = 128;
 
 /// Maximum entries per bot-protection bypass category (paths /
