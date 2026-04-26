@@ -5435,3 +5435,6 @@ impl ProxyHttp for LoricaProxy {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cert_reload_commit_tests;
