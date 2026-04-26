@@ -770,6 +770,25 @@ fn run_supervisor(cli: Cli) {
                         + 1;
                     let report = coordinate_config_reload(&endpoints_for_reload, gen).await;
                     if !report.prepare_failed.is_empty() || !report.commit_failed.is_empty() {
+                        // Audit M-17 : when commit_failed is non-empty
+                        // AND committed is non-empty, the fleet is
+                        // transiently split (some workers serve the
+                        // new config, others still on the old) until
+                        // the legacy fallback below brings the
+                        // stragglers in line. Surface as a Prometheus
+                        // counter so operators can alert on
+                        // fleet-coherence gaps even though the system
+                        // self-heals on the next reload.
+                        if !report.commit_failed.is_empty() && !report.committed.is_empty() {
+                            warn!(
+                                seq,
+                                generation = report.generation,
+                                committed = report.committed.len(),
+                                commit_failed = report.commit_failed.len(),
+                                "two-phase config reload split fleet : some workers committed, others did not - legacy broadcast fallback will reconcile"
+                            );
+                            lorica_api::metrics::inc_config_reload_split_fleet();
+                        }
                         warn!(
                             seq,
                             generation = report.generation,

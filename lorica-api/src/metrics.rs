@@ -855,6 +855,30 @@ pub fn inc_bot_verdict_push_failed() {
     BOT_VERDICT_PUSH_FAILED_TOTAL.inc();
 }
 
+/// Counter: two-phase config reload rounds where the Commit phase
+/// partially succeeded - some workers committed, others failed
+/// (timeout / error). The supervisor coordinator falls back to the
+/// legacy broadcast which makes the failed workers re-do the work
+/// via the legacy ConfigReload handler ; in the interim the fleet
+/// is split (different workers serving different generations of the
+/// config). Audit M-17 ; non-zero values flag a real fleet-coherence
+/// gap that operators need to know about even though the system
+/// self-heals on the next reload.
+static CONFIG_RELOAD_SPLIT_FLEET_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "lorica_config_reload_split_fleet_total",
+        "Config reload commits where some workers committed and others failed (transient fleet split)",
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one config-reload split-fleet event.
+pub fn inc_config_reload_split_fleet() {
+    CONFIG_RELOAD_SPLIT_FLEET_TOTAL.inc();
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,
