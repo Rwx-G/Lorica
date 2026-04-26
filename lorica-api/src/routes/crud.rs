@@ -378,19 +378,6 @@ fn validate_rate_limit(
     Ok(rl.clone())
 }
 
-/// Validate a `redirect_hostname` input for API acceptance.
-///
-/// The proxy emits redirects as `{scheme}://{redirect_hostname}{path}{?query}`;
-/// the field is a bare DNS hostname, NOT a full URL. Operators who
-/// paste `https://example.com/foo` end up with a malformed Location
-/// header (`https://https://example.com/foo/...`). We reject those at
-/// the API boundary with a clear error so the mistake surfaces on save
-/// instead of silently on the next client request.
-///
-/// Accepts: RFC 1123-style hostnames (letters, digits, `-`, `.`), with
-/// labels 1..=63 chars and total length <= 253. The input is returned
-/// trimmed of surrounding whitespace. An empty string (after trim) is
-/// caller-policy: the two callers below treat it as "clear the field".
 /// Validate a `group_name` input for a Route or a Backend. Empty
 /// string (after trim) is accepted as "ungrouped". Non-empty must
 /// match the RFC-1035-inspired identifier alphabet
@@ -420,6 +407,118 @@ fn validate_group_name(raw: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_string())
 }
 
+/// Knobs for `validate_dns_hostname` (audit M-23 closure).
+///
+/// Two callers in this file used to hand-roll near-identical RFC-1123
+/// label loops with subtle ordering differences ; folding both into
+/// one helper means a future change ("accept IPv6 literals in
+/// brackets", "raise the label cap", "tighten the alphabet") needs a
+/// single edit instead of three.
+struct HostnameOpts<'a> {
+    /// `true` accepts a `*.example.com` leading-wildcard prefix
+    /// (cert SNI / hostname alias semantics) ; `false` rejects it
+    /// (canonical-host redirect target).
+    allow_wildcard: bool,
+    /// `true` returns `Ok(String::new())` on empty input (caller
+    /// interprets as "clear the field") ; `false` returns
+    /// `BadRequest("<field_label> must not be empty")`.
+    allow_empty: bool,
+    /// User-facing field name used in every error message so the
+    /// dashboard can highlight the right input.
+    field_label: &'a str,
+}
+
+/// RFC 1123-shaped DNS hostname validation, used by every "bare
+/// hostname" input in the API. Rejects schemes, paths, ports, query
+/// strings, fragments, userinfo, whitespace, and any per-label
+/// violation (empty / >63 chars / leading-or-trailing dash /
+/// non-alphanumeric). Accepts a leading `*.` wildcard only when
+/// `opts.allow_wildcard` is set.
+///
+/// The check order is "cheap discriminator first": URL-shape
+/// rejections fire before length / per-label checks so the operator
+/// gets the actionable "drop the http:// prefix" message instead of
+/// a cryptic "longer than 253 characters" error on a pasted URL.
+fn validate_dns_hostname(raw: &str, opts: HostnameOpts<'_>) -> Result<String, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        if opts.allow_empty {
+            return Ok(String::new());
+        }
+        return Err(ApiError::BadRequest(format!(
+            "{} must not be empty",
+            opts.field_label
+        )));
+    }
+    if trimmed.contains("://") {
+        return Err(ApiError::BadRequest(format!(
+            "{} must be a bare hostname (e.g. `example.com`) without a scheme \
+             - drop the `http://` / `https://` prefix",
+            opts.field_label
+        )));
+    }
+    if trimmed.contains('/') {
+        return Err(ApiError::BadRequest(format!(
+            "{} must be a bare hostname without a path or trailing slash \
+             - drop everything after the hostname",
+            opts.field_label
+        )));
+    }
+    // `:` rejection = no port in this field. Operators that need a
+    // non-standard port go through `redirect_to` (full URL) instead.
+    if trimmed.contains(|c: char| c.is_whitespace() || matches!(c, '?' | '#' | ':' | '@')) {
+        return Err(ApiError::BadRequest(format!(
+            "{} contains a character that is not valid in a hostname \
+             (whitespace, `?`, `#`, `:`, `@`)",
+            opts.field_label
+        )));
+    }
+    if trimmed.len() > 253 {
+        return Err(ApiError::BadRequest(format!(
+            "{} is longer than 253 characters (DNS limit)",
+            opts.field_label
+        )));
+    }
+    if trimmed.starts_with('.') || trimmed.ends_with('.') {
+        return Err(ApiError::BadRequest(format!(
+            "{} must not start or end with a dot",
+            opts.field_label
+        )));
+    }
+    let check_body = if opts.allow_wildcard {
+        trimmed.strip_prefix("*.").unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    for label in check_body.split('.') {
+        if label.is_empty() {
+            return Err(ApiError::BadRequest(format!(
+                "{} contains an empty DNS label (consecutive dots)",
+                opts.field_label
+            )));
+        }
+        if label.len() > 63 {
+            return Err(ApiError::BadRequest(format!(
+                "{} contains a DNS label longer than 63 characters",
+                opts.field_label
+            )));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(ApiError::BadRequest(format!(
+                "{} contains a DNS label that starts or ends with `-`",
+                opts.field_label
+            )));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(ApiError::BadRequest(format!(
+                "{} may only contain ASCII letters, digits, `-` and `.`",
+                opts.field_label
+            )));
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Validate a canonical-host redirect target.
 ///
 /// `redirect_hostname` is specifically for the "redirect every request
@@ -437,69 +536,14 @@ fn validate_group_name(raw: &str) -> Result<String, ApiError> {
 /// keeps the common case (canonical-host) typo-proof without forcing
 /// a full URL parser on every write path.
 fn validate_redirect_hostname(raw: &str) -> Result<String, ApiError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(String::new());
-    }
-    if trimmed.contains("://") {
-        return Err(ApiError::BadRequest(
-            "redirect_hostname must be a bare hostname (e.g. `example.com`) \
-             without a scheme - drop the `http://` / `https://` prefix"
-                .into(),
-        ));
-    }
-    if trimmed.contains('/') {
-        return Err(ApiError::BadRequest(
-            "redirect_hostname must be a bare hostname without a path or \
-             trailing slash - drop everything after the hostname"
-                .into(),
-        ));
-    }
-    // `:` rejection = no port in this field. See the module comment
-    // above: redirects to a non-standard port go through `redirect_to`
-    // with a full URL, which takes the whole authority shape.
-    if trimmed.contains(|c: char| c.is_whitespace() || matches!(c, '?' | '#' | ':' | '@')) {
-        return Err(ApiError::BadRequest(
-            "redirect_hostname contains a character that is not valid in a \
-             hostname (whitespace, `?`, `#`, `:`, `@`). If you need to \
-             redirect to a non-standard port, use `redirect_to` with a \
-             full URL like `https://target.example.com:8443` instead."
-                .into(),
-        ));
-    }
-    if trimmed.len() > 253 {
-        return Err(ApiError::BadRequest(
-            "redirect_hostname is longer than 253 characters (DNS limit)".into(),
-        ));
-    }
-    if trimmed.starts_with('.') || trimmed.ends_with('.') {
-        return Err(ApiError::BadRequest(
-            "redirect_hostname must not start or end with a dot".into(),
-        ));
-    }
-    for label in trimmed.split('.') {
-        if label.is_empty() {
-            return Err(ApiError::BadRequest(
-                "redirect_hostname contains an empty DNS label (consecutive dots)".into(),
-            ));
-        }
-        if label.len() > 63 {
-            return Err(ApiError::BadRequest(
-                "redirect_hostname contains a DNS label longer than 63 characters".into(),
-            ));
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err(ApiError::BadRequest(
-                "redirect_hostname contains a DNS label that starts or ends with `-`".into(),
-            ));
-        }
-        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(ApiError::BadRequest(
-                "redirect_hostname may only contain ASCII letters, digits, `-` and `.`".into(),
-            ));
-        }
-    }
-    Ok(trimmed.to_string())
+    validate_dns_hostname(
+        raw,
+        HostnameOpts {
+            allow_wildcard: false,
+            allow_empty: true,
+            field_label: "redirect_hostname",
+        },
+    )
 }
 
 /// Validate a `redirect_to` input. Accepts a full HTTP(S) URL and
@@ -691,67 +735,19 @@ fn validate_http_method(method: &str, field_label: &str) -> Result<(), ApiError>
 }
 
 /// Validate a single hostname alias. Same RFC 1123 shape check as
-/// `validate_redirect_hostname` but with its own field label so the
+/// `validate_redirect_hostname` but accepts a leading `*.` wildcard
+/// (legal for SNI match) and uses the caller's `field_label` so the
 /// UI can point at the right input. Returns the trimmed value on
 /// success.
 fn validate_hostname_alias(raw: &str, field_label: &str) -> Result<String, ApiError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(ApiError::BadRequest(format!(
-            "{field_label} must not be empty"
-        )));
-    }
-    if trimmed.len() > 253 {
-        return Err(ApiError::BadRequest(format!(
-            "{field_label} is longer than 253 characters"
-        )));
-    }
-    if trimmed.contains("://") || trimmed.contains('/') {
-        return Err(ApiError::BadRequest(format!(
-            "{field_label} must be a bare hostname (no scheme, no path)"
-        )));
-    }
-    if trimmed.chars().any(|c| c.is_whitespace()) {
-        return Err(ApiError::BadRequest(format!(
-            "{field_label} must not contain whitespace"
-        )));
-    }
-    if trimmed.starts_with('.') || trimmed.ends_with('.') {
-        return Err(ApiError::BadRequest(format!(
-            "{field_label} must not start or end with a dot"
-        )));
-    }
-    // Wildcards on the first label are legal for SNI match in Lorica
-    // (same rule the primary hostname field accepts). Let `*.example.com`
-    // through and validate the remaining labels normally.
-    let check_body = if let Some(rest) = trimmed.strip_prefix("*.") {
-        rest
-    } else {
-        trimmed
-    };
-    for label in check_body.split('.') {
-        if label.is_empty() {
-            return Err(ApiError::BadRequest(format!(
-                "{field_label} contains an empty DNS label"
-            )));
-        }
-        if label.len() > 63 {
-            return Err(ApiError::BadRequest(format!(
-                "{field_label} contains a DNS label longer than 63 characters"
-            )));
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err(ApiError::BadRequest(format!(
-                "{field_label} contains a DNS label that starts or ends with `-`"
-            )));
-        }
-        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(ApiError::BadRequest(format!(
-                "{field_label} may only contain ASCII letters, digits, `-` and `.`"
-            )));
-        }
-    }
-    Ok(trimmed.to_string())
+    validate_dns_hostname(
+        raw,
+        HostnameOpts {
+            allow_wildcard: true,
+            allow_empty: false,
+            field_label,
+        },
+    )
 }
 
 /// Validate an `error_page_html` body. Size cap 128 KiB - more than
