@@ -19,7 +19,14 @@ log = "0.4.21"
 lorica-error = { version = "0.1.0", path = "../lorica-error"}
 arc-swap = "1"
 ring = "0.17.12"
-rustls = "0.23.12"
+# Pin to `ring` only ; without `default-features = false` rustls
+# 0.23 pulls `aws-lc-rs` as default which would carry a parallel
+# crypto stack alongside `ring` in the binary (~2-3 MiB extra +
+# the `aws-lc-sys` C build chain : cmake, cc). Audit M-6 closure :
+# every other crate in the workspace already pins `ring` (see
+# `lorica/Cargo.toml`, `lorica-api/Cargo.toml::instant-acme`), so
+# the only remaining stack-duplication source was here.
+rustls = { version = "0.23.12", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-native-certs = "0.7.1"
 # rustls-pemfile dropped in v1.5.2 (audit L-16, RUSTSEC-2025-0134
 # unmaintained). PEM parsing now goes through `rustls-pki-types`'s
@@ -27,7 +34,8 @@ rustls-native-certs = "0.7.1"
 # replacement). Closes the only outstanding RUSTSEC chain in the
 # workspace - the runtime crate had already migrated in v1.5.0.
 rustls-pki-types = { version = "1.7.0", features = ["alloc", "std"] }
-tokio-rustls = "0.26.0"
+# Same `ring`-only pin as the rustls dep above (audit M-6).
+tokio-rustls = { version = "0.26.0", default-features = false, features = ["ring"] }
 # no_debug = "3.1.0" inlined into src/no_debug.rs in v1.3.0
 # (audit SC-L-3). The upstream single-file wrapper was flagged
 # unmaintained since 2022; inlining removes the supply-chain

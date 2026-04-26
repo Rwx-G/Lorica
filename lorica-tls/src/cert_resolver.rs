@@ -28,7 +28,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use lorica_error::{Error, ErrorType, OrErr, Result};
-use rustls::crypto::aws_lc_rs::sign::any_supported_type;
+// Pinned to `ring` to match the workspace-wide crypto stack
+// (audit M-6 : avoid carrying both ring + aws-lc-rs in the binary).
+use rustls::crypto::ring::sign::any_supported_type;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 // v1.5.1 audit L-16 : `rustls-pemfile` (RUSTSEC-2025-0134,
