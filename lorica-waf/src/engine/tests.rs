@@ -15,8 +15,6 @@
 //! Unit tests for the WAF engine. Kept in one file (mirroring the
 //! pre-split `engine.rs`) so a full behavioral sweep lives together.
 
-use std::time::Instant;
-
 use super::*;
 use crate::rules::RuleCategory;
 
@@ -550,38 +548,12 @@ fn test_blocking_mode_returns_blocked() {
     assert!(matches!(verdict, WafVerdict::Blocked(_)));
 }
 
-// --- Performance ---
-
-#[test]
-fn test_evaluation_is_fast() {
-    let e = engine();
-    let start = Instant::now();
-    for _ in 0..1000 {
-        e.evaluate(
-            WafMode::Blocking,
-            "/api/v1/users/123/profile",
-            Some("page=1&limit=20&sort=name&order=asc"),
-            &[
-                (
-                    "user-agent",
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-                ),
-                ("accept", "application/json"),
-                ("cookie", "session=abcdef123456"),
-            ],
-            "example.com",
-            "10.0.0.1",
-        );
-    }
-    let elapsed = start.elapsed();
-    let per_request_us = elapsed.as_micros() / 1000;
-    // Must be under 1000us per request (recursive URL decoding adds overhead,
-    // CI runners are slower than production hardware)
-    assert!(
-        per_request_us < 1000,
-        "WAF evaluation too slow: {per_request_us}us per request"
-    );
-}
+// Perf regression coverage lives in `benches/evaluate.rs` (criterion,
+// 3 representative request shapes, statistically robust). The previous
+// `test_evaluation_is_fast` unit test with a 1000us wall-clock threshold
+// was flaky under contended CI runners and duplicated coverage already
+// provided by the criterion bench. Run `cargo bench -p lorica-waf` to
+// catch perf regressions.
 
 // --- Rule configuration ---
 
