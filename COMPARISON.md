@@ -1,6 +1,6 @@
 # Lorica - Competitive Feature Comparison
 
-> Last updated: 2026-04-21 | Lorica v1.5.0
+> Last updated: 2026-04-26 | Lorica v1.5.2
 >
 > **Legend:** Y = Yes | N = No | P = Partial | Paid = Paid/Enterprise only | Plug = Plugin/Module (not built-in)
 >
@@ -235,7 +235,7 @@
 ### Gaps for Lorica
 
 - ~~Retry with backoff~~ - Implemented in v1.2.0 (`retry_on_methods`, `retry_attempts`, exponential backoff via the `fail_to_connect` hook).
-- **Hot binary upgrade** - Planned for v1.5.0. Pingora ships the infrastructure (SIGUSR2 fd passing); wiring is ~3-4 days.
+- **Hot binary upgrade** - Planned for v1.6.0. Pingora ships the infrastructure (SIGUSR2 fd passing); wiring is ~3-4 days.
 
 ---
 
@@ -283,7 +283,7 @@ These features are either unique to Lorica or extremely rare among competitors:
 
 ## Summary: Remaining Gaps
 
-All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.5.0 are shipped. Remaining gaps are by design or planned for future versions.
+All table-stakes features (forward auth, basic auth, mTLS, retry with backoff, custom error pages, etc.) are shipped. All major differentiators planned through v1.5.2 are shipped (v1.5.1 + v1.5.2 were audit-closure cycles : worker-mode cert hot-reload, SMTP encryption modes, security defense-in-depth pass, reactor-stall + reload pass, deps bumped). Remaining gaps are by design or planned for future versions.
 
 | Gap | Plan |
 |---|---|
