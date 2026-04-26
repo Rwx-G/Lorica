@@ -767,6 +767,36 @@ pub fn inc_ban_broadcast_lagged(worker_id: &str, count: u64) {
         .inc_by(count);
 }
 
+/// Counter: ConfigReload broadcast messages missed by a worker
+/// subscriber due to channel-capacity overflow. Same shape as
+/// `ban_broadcast_lagged_total` ; non-zero means the legacy reload
+/// broadcast (used as fallback when the two-phase RPC fails) lost
+/// reload notifications faster than the worker could consume them.
+/// The supervisor catches up by re-issuing a single ConfigReload on
+/// the next iteration so the worker reaches the latest DB state, but
+/// individual `seq` numbers are dropped on the floor (audit C-2).
+static RELOAD_BROADCAST_LAGGED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "reload_broadcast_lagged_total",
+            "ConfigReload broadcast messages missed by a worker subscriber due to channel lag"
+        )
+        .namespace("lorica"),
+        &["worker_id"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one or more ConfigReload broadcast messages lagged on a
+/// given worker's subscription.
+pub fn inc_reload_broadcast_lagged(worker_id: &str, count: u64) {
+    RELOAD_BROADCAST_LAGGED_TOTAL
+        .with_label_values(&[worker_id])
+        .inc_by(count);
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,

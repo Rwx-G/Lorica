@@ -984,8 +984,40 @@ fn run_supervisor(cli: Cli) {
                                 }
                             }
                         }
-                        // Config reload triggered by API
-                        Ok(seq) = reload_rx.recv() => {
+                        // Config reload triggered by API.
+                        //
+                        // Use an explicit `match` on `reload_rx.recv()` instead
+                        // of the convenience `Ok(seq) = ...` pattern so that a
+                        // `RecvError::Lagged(n)` is surfaced (counter + warn +
+                        // catch-up reload) instead of silently disabling the
+                        // branch for this select iteration. Without this, a
+                        // burst > the broadcast capacity (16 today) leaves the
+                        // worker on a stale config with zero log, zero metric,
+                        // zero notification (audit C-2 ; mirrors the BanIp
+                        // arm above).
+                        reload_result = reload_rx.recv() => {
+                            let seq = match reload_result {
+                                Ok(s) => s,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    warn!(
+                                        worker_id,
+                                        dropped = n,
+                                        "ConfigReload broadcast lagged ; issuing catch-up reload to bring worker to latest DB state"
+                                    );
+                                    lorica_api::metrics::inc_reload_broadcast_lagged(
+                                        &worker_id.to_string(),
+                                        n,
+                                    );
+                                    // Synthesize a single catch-up reload with
+                                    // a fresh sequence number from the per-
+                                    // worker counter so the seq stays unique
+                                    // on this command channel.
+                                    hb_seq.fetch_add(1, Ordering::Relaxed)
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
+                            };
                             let cmd = Command::new(CommandType::ConfigReload, seq);
                             if let Err(e) = channel.send(&cmd).await {
                                 warn!(worker_id, error = %e, "config reload send failed");
@@ -1619,7 +1651,25 @@ fn run_supervisor(cli: Cli) {
                                                         let _ = channel.recv::<Response>().await;
                                                     }
                                                 }
-                                                Ok(s) = rx.recv() => {
+                                                // Same lagged-aware shape as the
+                                                // initial-spawn branch (audit C-2).
+                                                reload_result = rx.recv() => {
+                                                    let s = match reload_result {
+                                                        Ok(s) => s,
+                                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                                            warn!(
+                                                                worker_id = id,
+                                                                dropped = n,
+                                                                "ConfigReload broadcast lagged on restarted worker ; issuing catch-up reload"
+                                                            );
+                                                            lorica_api::metrics::inc_reload_broadcast_lagged(
+                                                                &id.to_string(),
+                                                                n,
+                                                            );
+                                                            seq.fetch_add(1, Ordering::Relaxed)
+                                                        }
+                                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                                    };
                                                     let cmd = Command::new(CommandType::ConfigReload, s);
                                                     if channel.send(&cmd).await.is_ok() {
                                                         if let Ok(r) = channel.recv::<Response>().await {
