@@ -100,9 +100,16 @@ if [ "$SKIP_CERT_EXPORT" = false ] && [ "$EXIT_CODE" = "0" ]; then
     docker compose --profile cert-export run --rm cert-export-smoke || EXIT_CODE=$?
 fi
 
-# Cleanup unless --keep
+# Cleanup unless --keep. Profile-gated services (workers, cert-export)
+# need explicit `--profile` so their named volumes get removed too -
+# without these flags, `down -v` skips profile-only volumes and the
+# next run boots against stale data (e.g. the cert-export smoke
+# changes the admin password ; on the next run the lorica-cert-export
+# DB still has the changed password while /shared/admin_password
+# still has the original first-boot password, causing a 401 at the
+# smoke's login step). Audit-driven fix while closing Story 8.1 IV2.
 if [ "$KEEP" = false ]; then
-    docker compose down -v
+    docker compose --profile workers --profile cert-export down -v
 fi
 
 if [ "$EXIT_CODE" = "0" ]; then
