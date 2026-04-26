@@ -30,7 +30,11 @@ style-src 'self' 'unsafe-inline'; \
 img-src 'self' data:; \
 connect-src 'self' \
 ws://localhost:* ws://127.0.0.1:* ws://[::1]:* \
-wss://localhost:* wss://127.0.0.1:* wss://[::1]:*";
+wss://localhost:* wss://127.0.0.1:* wss://[::1]:*; \
+frame-ancestors 'none'; \
+form-action 'self'; \
+base-uri 'none'; \
+object-src 'none'";
 
 /// Build the dashboard router for serving embedded frontend assets.
 ///

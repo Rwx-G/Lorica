@@ -25,6 +25,13 @@ use crate::events::AlertEvent;
 pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), NotifyError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        // Disable redirect following to defend against an attacker
+        // who controls the configured webhook URL redirecting to an
+        // internal service (`http://10.0.0.5:8500/`,
+        // `http://169.254.169.254/`). Webhook bodies are operator-
+        // supplied JSON alerts ; leaking them is a soft data-leak.
+        // Trust-boundary fix, audit L-7.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| NotifyError::Webhook(format!("failed to create HTTP client: {e}")))?;
 

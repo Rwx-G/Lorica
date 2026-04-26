@@ -643,26 +643,41 @@ pub async fn test_notification(
         "Lorica test notification - if you receive this, your channel is working!",
     );
 
+    // Audit L-4 : the v1.5.1 M-12 work sanitised `ApiError::Internal`
+    // bodies but the BadRequest path still echoed verbatim
+    // `serde_json::Error` Display, which can include input bytes from
+    // the malformed JSON ("expected value at line 1 column 23"). On
+    // a dashboard toast that's surfaced to the operator's screen.
+    // Log the full inner detail at `tracing::warn!` (operator
+    // forensics trail preserved) and return a fixed user-facing
+    // string keyed to the channel kind.
     match nc.channel {
         lorica_config::models::NotificationChannel::Email => {
             let config: lorica_notify::channels::EmailConfig = serde_json::from_str(&nc.config)
-                .map_err(|e| ApiError::BadRequest(format!("invalid email config: {e}")))?;
+                .map_err(|e| {
+                    tracing::warn!(channel = "email", error = %e, "stored notification config failed JSON deserialisation");
+                    ApiError::BadRequest("stored email notification config is malformed".into())
+                })?;
             lorica_notify::channels::email::send(&config, &test_event)
                 .await
                 .map_err(|e| ApiError::Internal(format!("email send failed: {e}")))?;
         }
         lorica_config::models::NotificationChannel::Webhook => {
             let config: lorica_notify::channels::WebhookConfig =
-                serde_json::from_str(&nc.config)
-                    .map_err(|e| ApiError::BadRequest(format!("invalid webhook config: {e}")))?;
+                serde_json::from_str(&nc.config).map_err(|e| {
+                    tracing::warn!(channel = "webhook", error = %e, "stored notification config failed JSON deserialisation");
+                    ApiError::BadRequest("stored webhook notification config is malformed".into())
+                })?;
             lorica_notify::channels::webhook::send(&config, &test_event)
                 .await
                 .map_err(|e| ApiError::Internal(format!("webhook send failed: {e}")))?;
         }
         lorica_config::models::NotificationChannel::Slack => {
             let config: lorica_notify::channels::WebhookConfig =
-                serde_json::from_str(&nc.config)
-                    .map_err(|e| ApiError::BadRequest(format!("invalid slack config: {e}")))?;
+                serde_json::from_str(&nc.config).map_err(|e| {
+                    tracing::warn!(channel = "slack", error = %e, "stored notification config failed JSON deserialisation");
+                    ApiError::BadRequest("stored slack notification config is malformed".into())
+                })?;
             lorica_notify::channels::slack::send(&config, &test_event)
                 .await
                 .map_err(|e| ApiError::Internal(format!("slack send failed: {e}")))?;

@@ -107,6 +107,23 @@ async fn test_csp_header_restricts_websocket_to_loopback() {
         !csp.contains(" ws: ") && !csp.ends_with(" ws:") && !csp.contains(" ws:;"),
         "CSP must not carry a bare `ws:` token (admits any host), got: {csp}"
     );
+    // v1.5.2 audit L-5 : defense-in-depth directives.
+    assert!(
+        csp.contains("frame-ancestors 'none'"),
+        "CSP must carry `frame-ancestors 'none'` (CSP-level XFO supersede), got: {csp}"
+    );
+    assert!(
+        csp.contains("form-action 'self'"),
+        "CSP must carry `form-action 'self'` (XSS-injected form defense), got: {csp}"
+    );
+    assert!(
+        csp.contains("base-uri 'none'"),
+        "CSP must carry `base-uri 'none'` (defends against `<base href>` redirection), got: {csp}"
+    );
+    assert!(
+        csp.contains("object-src 'none'"),
+        "CSP must carry `object-src 'none'` (Flash / plugin block), got: {csp}"
+    );
 }
 
 #[tokio::test]

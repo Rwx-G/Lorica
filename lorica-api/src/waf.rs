@@ -399,8 +399,14 @@ pub async fn fetch_and_load_blocklist(
 ) -> Result<usize, String> {
     let url = lorica_waf::ip_blocklist::DEFAULT_BLOCKLIST_URL;
 
+    // Disable redirect following on the blocklist fetcher : the
+    // blocklist URL is operator-configurable (or comes from a third-
+    // party feed) ; a redirect to an internal address would let an
+    // attacker who controls the feed pivot into the supervisor's
+    // loopback. Audit L-7.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
 

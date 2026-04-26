@@ -85,9 +85,13 @@ pub async fn fetch_ocsp_response(cert_pem: &str, responder_url: &str) -> Result<
     let cert_id = build_cert_id(issuer_name_hash.as_ref(), issuer_key_hash.as_ref(), serial);
     let ocsp_request = build_ocsp_request(&cert_id);
 
-    // POST to OCSP responder
+    // POST to OCSP responder. The responder URL comes from the cert
+    // AIA extension, which an attacker-issued chain controls. Disable
+    // redirect following so we don't get steered into an internal
+    // service (`http://169.254.169.254/`). Audit L-7.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
 
