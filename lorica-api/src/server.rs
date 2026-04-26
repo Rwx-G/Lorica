@@ -87,8 +87,14 @@ pub const RL_ACME_PROVISION: u32 = 3;
 /// cache purge, dns providers, notifications, preferences,
 /// probes, loadtest, sla, waf rule toggles).
 pub const RL_DESTRUCTIVE_CUD: u32 = 60;
-/// Forensics-trail wipe (logs clear, WAF events clear). Tight cap
-/// so a stolen session cookie cannot flush the trail in one call.
+/// Forensics-trail wipe (per-endpoint : access logs clear, WAF events
+/// clear). Tight cap so a stolen session cookie cannot flush the trail
+/// in one call. Each endpoint gets its own bucket - sharing the bucket
+/// across `clear_logs` and `clear_waf_events` (the original v1.5.2
+/// shape) broke the e2e harness which clears both within the same
+/// 60s window. Per-endpoint buckets keep the per-call cap intact
+/// while letting an admin do the post-incident cleanup sequence
+/// without rate-limit drops.
 pub const RL_LOGS_CLEAR: u32 = 1;
 
 /// Type-erased metrics refresher closure (WPAR-7 pull-on-scrape).
@@ -509,7 +515,7 @@ pub fn build_router(
         .route("/api/v1/waf/events", get(crate::waf::get_waf_events))
         .route(
             "/api/v1/waf/events",
-            delete(crate::waf::clear_waf_events).layer(rl("logs_clear", RL_LOGS_CLEAR, RL_WINDOW_S)),
+            delete(crate::waf::clear_waf_events).layer(rl("waf_events_clear", RL_LOGS_CLEAR, RL_WINDOW_S)),
         )
         .route("/api/v1/waf/stats", get(crate::waf::get_waf_stats))
         .route(
