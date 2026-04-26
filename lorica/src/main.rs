@@ -2928,6 +2928,22 @@ fn run_worker(
                                     &cmd_cert_resolver,
                                 )
                                 .await;
+                                // Re-apply the per-process resolver
+                                // hooks (OTel exporter, GeoIP / ASN
+                                // updater task lifecycle, bot HMAC
+                                // secret) so the legacy fallback path
+                                // converges with the two-phase RPC
+                                // commit handler. Audit M-18 closure :
+                                // before this, falling back to the
+                                // legacy ConfigReload (e.g. when
+                                // two-phase Prepare timed out) left
+                                // GeoIP / OTel / ASN / bot-secret
+                                // state frozen even though the proxy
+                                // config swap completed.
+                                lorica::reload::apply_per_process_resolver_hooks(
+                                    &cmd_store,
+                                )
+                                .await;
                                 let resp = Response::ok(cmd.sequence);
                                 if let Err(e) = channel.send(&resp).await {
                                     warn!(error = %e, "failed to send response");

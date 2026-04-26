@@ -797,6 +797,36 @@ pub fn inc_reload_broadcast_lagged(worker_id: &str, count: u64) {
         .inc_by(count);
 }
 
+/// Counter: per-process resolver hooks (`apply_geoip` / `apply_asn`
+/// / `apply_otel` / `apply_bot_secret`) that failed to apply because
+/// the store fetch returned `Err`. Non-zero values pin the matching
+/// resolver state at whatever was last applied successfully and are
+/// only recoverable by the next successful settings read - so a
+/// transient SQLite error during a `.mmdb` autoupdate cycle would
+/// otherwise freeze the resolver for the lifetime of the process
+/// without any operator-visible signal (audit M-19).
+static RESOLVER_APPLY_FAILED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "resolver_apply_failed_total",
+            "Per-process resolver hook failed to apply settings (store fetch error)"
+        )
+        .namespace("lorica"),
+        &["kind"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one resolver-apply failure. `kind` is one of `geoip`,
+/// `asn`, `otel`, `bot_secret`.
+pub fn inc_resolver_apply_failed(kind: &str) {
+    RESOLVER_APPLY_FAILED_TOTAL
+        .with_label_values(&[kind])
+        .inc();
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,
