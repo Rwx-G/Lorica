@@ -3,7 +3,7 @@
 # GitHub Actions CI job runs).
 
 [advisories]
-# Two advisories in rustls-webpki 0.101.7 that only affect the
+# Three advisories in rustls-webpki 0.101.7 that only affect the
 # OPTIONAL `route53` feature (ACME DNS-01 via Amazon Route 53).
 # Default builds do not pull this chain.
 #
@@ -11,6 +11,13 @@
 #   incorrectly accepted"
 # - RUSTSEC-2026-0099 "Name constraints were accepted for
 #   certificates asserting a wildcard name"
+# - RUSTSEC-2026-0104 "Reachable panic in certificate revocation
+#   list parsing" (attacker-controlled CRL with empty BIT STRING
+#   extension panics BEFORE signature verification ; patched in
+#   webpki 0.103.13 for the rustls 0.23 line - the v1.5.2 audit
+#   M-6 work bumped the lorica-tls / lorica-api side to that
+#   line, but the OPTIONAL aws-smithy-http-client transitive
+#   chain still pins rustls 0.21 and pulls webpki 0.101.7).
 #
 # Dependency path: rustls-webpki 0.101.7 <- rustls 0.21.12 <-
 # tokio-rustls 0.24.1 <- hyper-rustls 0.24.2 <- aws-smithy-http-
@@ -18,7 +25,7 @@
 # <- aws-config 1.8.15 <- lorica-api (only when the `route53`
 # feature is enabled).
 #
-# Upstream status (checked 2026-04-18): aws-smithy-http-client
+# Upstream status (checked 2026-04-26): aws-smithy-http-client
 # 1.1.12 is the current stable and still pins rustls 0.21. There
 # is no published aws-sdk-* release that uses rustls 0.23 yet.
 #
@@ -27,16 +34,21 @@
 #   Batch API calls for ACME DNS-01 solving. The only peer whose
 #   certificate we validate is `route53.amazonaws.com`, which
 #   presents a well-known certificate chain with no wildcard or
-#   URI-name constraints that the two advisories could mis-classify.
-# - No user-controlled hostname or user-controlled certificate is
-#   ever validated by this chain.
-# - The vulnerability requires a specially-crafted CA that the
-#   Route 53 endpoint does not ship and cannot be induced to ship.
+#   URI-name constraints that the two name-constraint advisories
+#   could mis-classify.
+# - The CRL-parse panic (0104) requires the AWS SDK's rustls
+#   verifier to actually consume an attacker-supplied CRL. The
+#   default rustls verifier does NOT fetch CRLs ; Lorica's AWS
+#   SDK call sites never configure `webpki::CertRevocationList`,
+#   so the panic site is unreachable on the Route 53 path.
+# - No user-controlled hostname / user-controlled certificate /
+#   user-controlled CRL is ever validated by this chain.
 #
-# Revisit on every `cargo update` touching the AWS SDK: when
+# Revisit on every `cargo update` touching the AWS SDK : when
 # aws-smithy-http-client switches to rustls 0.23 (tracked upstream
-# in awslabs/smithy-rs), remove both entries.
+# in awslabs/smithy-rs), remove all three entries.
 ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
 ]
