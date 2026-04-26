@@ -9,6 +9,7 @@
     validatePosixId,
   } from '../../lib/validators';
   import { showToast } from '../../lib/toast';
+  import { formatBytes } from '../../lib/format';
   import ConfirmDialog from '../ConfirmDialog.svelte';
 
   /**
@@ -172,12 +173,6 @@
       showToast(`Orphan ${name} removed.`, 'success');
       await loadOrphans();
     }
-  }
-
-  function formatBytes(n: number): string {
-    if (n < 1024) return `${n} B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
-    return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
   }
 
   function formatTimestamp(ts: string): string {
