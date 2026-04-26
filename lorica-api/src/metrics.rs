@@ -827,6 +827,27 @@ pub fn inc_resolver_apply_failed(kind: &str) {
         .inc();
 }
 
+/// Counter: bot verdict cross-worker propagation RPCs (worker ->
+/// supervisor verdict cache push) that failed. Bot cache propagation
+/// is fire-and-forget (the local worker is already populated, so a
+/// failure only delays cross-worker sharing) but a non-zero rate
+/// flags a stuck supervisor RPC channel and was previously a silent
+/// `let _ = endpoint.request_rpc(...).await` swallow (audit L-14).
+static BOT_VERDICT_PUSH_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::new(
+        "lorica_bot_verdict_push_failed_total",
+        "Bot verdict cross-worker propagation RPCs (worker -> supervisor) that failed",
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Record one bot-verdict-push RPC failure.
+pub fn inc_bot_verdict_push_failed() {
+    BOT_VERDICT_PUSH_FAILED_TOTAL.inc();
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,

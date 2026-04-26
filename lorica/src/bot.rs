@@ -896,9 +896,18 @@ pub async fn rpc_cache_push(
                     response_headers: Vec::<lorica_command::ForwardAuthHeader>::new(),
                     ttl_ms,
                 });
-            let _ = endpoint
+            // Bot cache propagation is fire-and-forget (the local
+            // worker is already populated). Surface failures via a
+            // Prometheus counter so a stuck supervisor RPC channel
+            // doesn't go unobserved (audit L-14 - was a silent
+            // `let _ = ...` swallow).
+            if let Err(e) = endpoint
                 .request_rpc(lorica_command::CommandType::VerdictPush, payload, *timeout)
-                .await;
+                .await
+            {
+                tracing::debug!(error = %e, "bot verdict push to supervisor failed");
+                lorica_api::metrics::inc_bot_verdict_push_failed();
+            }
         }
     }
 }

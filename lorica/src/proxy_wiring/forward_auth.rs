@@ -95,20 +95,27 @@ pub(crate) fn verdict_cache_reset_for_test() {
 /// bounded-FIFO eviction policy. Returns nothing; the caller does
 /// not need to know whether an older entry was displaced.
 fn verdict_cache_insert(key: String, value: CachedVerdict) {
-    let mut order = FORWARD_AUTH_VERDICT_ORDER.lock();
-    // If we're at or over the cap, pop the oldest key until we're
-    // strictly under. In normal operation this runs at most once per
-    // insert. Under a cookie-flood it runs exactly once.
-    while order.len() >= VERDICT_CACHE_MAX_ENTRIES {
-        if let Some(old) = order.pop_front() {
-            FORWARD_AUTH_VERDICT_CACHE.remove(&old);
-        } else {
-            break;
+    // Audit L-13 closure : DashMap::insert returns the prior value
+    // on overwrite. Only push to the FIFO `order` when this insert
+    // grew the entries map, otherwise duplicate refreshes for the
+    // same key would push twice into `order` and shrink the
+    // effective cap by one per duplicate.
+    let prior = FORWARD_AUTH_VERDICT_CACHE.insert(key.clone(), value);
+    if prior.is_none() {
+        let mut order = FORWARD_AUTH_VERDICT_ORDER.lock();
+        // If we're at or over the cap, pop the oldest key until
+        // we're strictly under. In normal operation this runs at
+        // most once per insert. Under a cookie-flood it runs
+        // exactly once.
+        while order.len() >= VERDICT_CACHE_MAX_ENTRIES {
+            if let Some(old) = order.pop_front() {
+                FORWARD_AUTH_VERDICT_CACHE.remove(&old);
+            } else {
+                break;
+            }
         }
+        order.push_back(key);
     }
-    order.push_back(key.clone());
-    drop(order);
-    FORWARD_AUTH_VERDICT_CACHE.insert(key, value);
 }
 
 /// Build the verdict-cache lookup key.

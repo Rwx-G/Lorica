@@ -2004,28 +2004,38 @@ impl SupervisorVerdictCache {
         ttl_ms: u64,
     ) {
         let key = Self::key(route_id, cookie);
-        // FIFO bound: pop oldest keys until strictly under the cap.
-        // Matches `verdict_cache_insert` in proxy_wiring.rs so worker
-        // mode and single-process mode agree on memory ceiling.
-        let mut order = self.order.lock();
-        while order.len() >= SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES {
-            if let Some(old) = order.pop_front() {
-                self.entries.remove(&old);
-            } else {
-                break;
-            }
-        }
-        order.push_back(key.clone());
-        drop(order);
         let expires_at = Instant::now() + Duration::from_millis(ttl_ms);
-        self.entries.insert(
-            key,
+        let prior = self.entries.insert(
+            key.clone(),
             SupervisorVerdictCacheEntry {
                 verdict,
                 response_headers,
                 expires_at,
             },
         );
+        // Only push to the FIFO `order` when this insert actually
+        // grew the entries map. Audit L-13 closure : a duplicate
+        // verdict refresh used to push twice into `order` ; on
+        // overflow `pop_front` removed the entries row even though a
+        // logically-still-present duplicate sat further back in the
+        // queue, the next pop became a no-op, and the effective FIFO
+        // cap shrunk per duplicate. DashMap's `insert` returns the
+        // previous value on overwrite ; gate the push on `is_none()`.
+        if prior.is_none() {
+            // FIFO bound: pop oldest keys until strictly under the cap.
+            // Matches `verdict_cache_insert` in proxy_wiring.rs so
+            // worker mode and single-process mode agree on memory
+            // ceiling.
+            let mut order = self.order.lock();
+            while order.len() >= SUPERVISOR_VERDICT_CACHE_MAX_ENTRIES {
+                if let Some(old) = order.pop_front() {
+                    self.entries.remove(&old);
+                } else {
+                    break;
+                }
+            }
+            order.push_back(key);
+        }
     }
 
     #[cfg(test)]
