@@ -118,8 +118,12 @@
         notifUrl = '';
         notifAuthHeader = '';
       } else {
-        notifUrl = cfg.url || '';
-        notifAuthHeader = cfg.auth_header || '';
+        // Server scrubs `url` + `auth_header` to "********" on read
+        // (audit M-1) ; never paint the mask into the form, mirror
+        // the smtp_password convention. Operator types a new value
+        // or leaves empty + we send "********" on save to preserve.
+        notifUrl = '';
+        notifAuthHeader = '';
         notifSmtpHost = '';
         notifSmtpPort = 587;
         notifSmtpEncryption = 'starttls';
@@ -163,8 +167,14 @@
       if (notifSmtpPassword) configObj.smtp_password = notifSmtpPassword;
       else if (notifEditing) configObj.smtp_password = '********'; // preserve existing
     } else {
-      configObj = { url: notifUrl };
-      if (notifChannel === 'webhook' && notifAuthHeader) configObj.auth_header = notifAuthHeader;
+      // Match the smtp_password convention : empty form field on
+      // edit means "keep stored secret". The server side accepts
+      // the literal "********" sentinel and restores from the DB.
+      configObj = { url: notifUrl || (notifEditing ? '********' : '') };
+      if (notifChannel === 'webhook') {
+        if (notifAuthHeader) configObj.auth_header = notifAuthHeader;
+        else if (notifEditing) configObj.auth_header = '********';
+      }
     }
     const configStr = JSON.stringify(configObj);
 
@@ -332,13 +342,13 @@
       {:else}
         <div class="settings-form-row">
           <label for="notif-url">URL <span class="settings-required">*</span></label>
-          <input id="notif-url" type="url" bind:value={notifUrl} placeholder={notifChannel === 'slack' ? 'https://hooks.slack.com/services/T.../B.../xxx' : 'https://example.com/webhook'} required onblur={checkNotifUrl} oninput={checkNotifUrl} />
+          <input id="notif-url" type="url" bind:value={notifUrl} placeholder={notifEditing ? 'Leave empty to keep current' : (notifChannel === 'slack' ? 'https://hooks.slack.com/services/T.../B.../xxx' : 'https://example.com/webhook')} required={!notifEditing} onblur={checkNotifUrl} oninput={checkNotifUrl} />
           {#if notifUrlError}<span class="field-error" role="alert">{notifUrlError}</span>{/if}
         </div>
         {#if notifChannel === 'webhook'}
           <div class="settings-form-row">
             <label for="notif-auth">Authorization Header</label>
-            <input id="notif-auth" type="text" bind:value={notifAuthHeader} placeholder="Bearer your-token" onblur={checkNotifAuthHeader} oninput={checkNotifAuthHeader} />
+            <input id="notif-auth" type="text" bind:value={notifAuthHeader} placeholder={notifEditing ? 'Leave empty to keep current' : 'Bearer your-token'} onblur={checkNotifAuthHeader} oninput={checkNotifAuthHeader} />
             {#if notifAuthHeaderError}<span class="field-error" role="alert">{notifAuthHeaderError}</span>{/if}
             <span class="settings-form-hint">Optional - sent as Authorization header</span>
           </div>
