@@ -25,6 +25,8 @@ Author: Rwx-G
 
 ### Security
 
+- v1.5.2 audit M-7 : `postcss 8.5.8 -> 8.5.10` (CVE-2026-41305 / GHSA-qx2v-qp2m-jg93, XSS via unescaped `</style>` in `postcss.stringify`). Build-time only (Vite 8 -> Svelte preprocessor -> postcss) ; the XSS sink is not invoked against attacker-controlled CSS in our pipeline (we author all `.css` / `.svelte` at build time), so real exposure to a Lorica deployment is essentially zero. But `pnpm audit` flags it, the supply-chain hygiene matters, and the bump is one lockfile change. Pulled in transitively (no direct dep), so the bump goes through `pnpm.overrides` in `frontend/package.json` rather than a direct dependency declaration : `"postcss": ">=8.5.10"`. svelte-check + vitest + production build all green post-bump.
+
 - v1.5.2 audit H-1 : `rustls-webpki 0.103.12 -> 0.103.13` to close RUSTSEC-2026-0104 (reachable panic when parsing a CRL with an empty `BIT STRING` extension, BEFORE signature verification - reachable any time the proxy parses an attacker-controlled CRL on the mTLS revocation path) + RUSTSEC-2026-0099 (permitted-subtree DNS name constraints accepted certificates asserting a wildcard, weakening name-constraint enforcement on intermediates). The verifier sits behind `rustls 0.23.37` and is reachable on **every** TLS handshake - both server-side (proxy: `lorica-tls`, mTLS) and client-side (`reqwest`, `lettre`, `instant-acme`, `quinn`). SemVer-compatible patch bump, no API surface touched ; `cargo update -p rustls-webpki@0.103.12 --precise 0.103.13` only. The parallel `rustls-webpki 0.101.7` (transitive via `aws-smithy-http-client` -> `rustls 0.21`, gated behind the `route53` Cargo feature) stays on the EOL line - tracked separately for the v1.7.0 deferred dep window.
 
 ### Changed
