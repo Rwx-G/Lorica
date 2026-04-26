@@ -2916,6 +2916,7 @@ dependencies = [
  "hyper 1.9.0",
  "instant-acme",
  "ipnet",
+ "itoa",
  "lorica-bench",
  "lorica-cache",
  "lorica-config",

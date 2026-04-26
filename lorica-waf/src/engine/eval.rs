@@ -44,7 +44,12 @@ impl WafEngine {
     ) -> WafVerdict {
         let start = Instant::now();
         let mut events = Vec::new();
-        let now = chrono::Utc::now().to_rfc3339();
+        // v1.5.2 audit L-20 : defer the `chrono::Utc::now().to_rfc3339()`
+        // call (~200 ns per request) until at least one event fires.
+        // Empty `now` is stamped on every WafEvent during the scan ;
+        // the post-scan loop fills the real timestamp only when
+        // events end up non-empty.
+        let now = "";
 
         // PERF-9 + v1.5.1 audit M-4 : two-phase eval. Per-field,
         // run the cheap Aho-Corasick prefilter first ; only fall
@@ -65,20 +70,20 @@ impl WafEngine {
         // attacks.
         let decoded_path = Self::url_decode_uri(path);
         if self.prefilter.matches(&decoded_path) {
-            self.scan_builtin_rules("path", &decoded_path, &now, &mut events);
+            self.scan_builtin_rules("path", &decoded_path, now, &mut events);
         }
         if has_custom_rules {
-            self.scan_custom_rules("path", &decoded_path, &now, &mut events);
+            self.scan_custom_rules("path", &decoded_path, now, &mut events);
         }
 
         // Check query string (form-style decoding ; `+` -> space).
         if let Some(q) = query {
             let decoded = Self::url_decode_form(q);
             if self.prefilter.matches(&decoded) {
-                self.scan_builtin_rules("query", &decoded, &now, &mut events);
+                self.scan_builtin_rules("query", &decoded, now, &mut events);
             }
             if has_custom_rules {
-                self.scan_custom_rules("query", &decoded, &now, &mut events);
+                self.scan_custom_rules("query", &decoded, now, &mut events);
             }
         }
 
@@ -92,10 +97,10 @@ impl WafEngine {
             let decoded = Self::url_decode_uri(value);
             let field = format!("header:{name}");
             if self.prefilter.matches(&decoded) {
-                self.scan_builtin_rules(&field, &decoded, &now, &mut events);
+                self.scan_builtin_rules(&field, &decoded, now, &mut events);
             }
             if has_custom_rules {
-                self.scan_custom_rules(&field, &decoded, &now, &mut events);
+                self.scan_custom_rules(&field, &decoded, now, &mut events);
             }
         }
 
@@ -131,7 +136,9 @@ impl WafEngine {
                             severity: scoped.severity,
                             matched_field: format!("header:{name}"),
                             matched_value: m.as_str().to_string(),
-                            timestamp: now.clone(),
+                            // Stamped post-scan in the !events.is_empty()
+                            // branch (audit L-20 - chrono call deferred).
+                            timestamp: String::new(),
                             client_ip: String::new(),
                             route_hostname: String::new(),
                             action: String::new(),
@@ -144,9 +151,13 @@ impl WafEngine {
         let elapsed = start.elapsed();
 
         if !events.is_empty() {
-            // Stamp each event with the client IP
+            // Compute timestamp lazily : only when we know at least
+            // one event fired (v1.5.2 audit L-20).
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            // Stamp each event with the client IP + the timestamp
             for ev in &mut events {
                 ev.client_ip = client_ip.to_string();
+                ev.timestamp = timestamp.clone();
             }
             // Store events in the ring buffer
             let mut buf = self.event_buffer.lock();
@@ -222,7 +233,9 @@ impl WafEngine {
 
         let start = Instant::now();
         let mut events = Vec::new();
-        let now = chrono::Utc::now().to_rfc3339();
+        // v1.5.2 audit L-20 : defer chrono::Utc::now until events
+        // are non-empty (same fast path as `evaluate`).
+        let now = "";
 
         // URL-decode the body to catch encoded payloads. Form-style
         // (`+` -> space) is the safe default for request bodies :
@@ -234,10 +247,10 @@ impl WafEngine {
         // hits ; custom rules run unconditionally when present.
         let decoded = Self::url_decode_form(text);
         if self.prefilter.matches(&decoded) {
-            self.scan_builtin_rules("body", &decoded, &now, &mut events);
+            self.scan_builtin_rules("body", &decoded, now, &mut events);
         }
         if !self.custom_rules.read().is_empty() {
-            self.scan_custom_rules("body", &decoded, &now, &mut events);
+            self.scan_custom_rules("body", &decoded, now, &mut events);
         }
 
         let elapsed = start.elapsed();
@@ -251,9 +264,11 @@ impl WafEngine {
             return WafVerdict::Pass;
         }
 
-        // Stamp each event with the client IP
+        // Stamp each event with the client IP + the (deferred) timestamp
+        let timestamp = chrono::Utc::now().to_rfc3339();
         for ev in &mut events {
             ev.client_ip = client_ip.to_string();
+            ev.timestamp = timestamp.clone();
         }
 
         // Store events in the ring buffer

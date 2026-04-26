@@ -158,9 +158,16 @@ static SYSTEM_MEMORY_USED_BYTES: Lazy<IntGauge> = Lazy::new(|| {
 });
 
 /// Record an HTTP request in the metrics.
+///
+/// Uses `itoa::Buffer` instead of `status_code.to_string()` so the
+/// per-request hot path doesn't allocate a 3-char `String` for a
+/// label that's always `100..=599`. Mirrors the existing itoa usage
+/// in `proxy_wiring.rs` for header rule indices (audit M-15).
 pub fn record_request(route_id: &str, status_code: u16, latency_seconds: f64) {
+    let mut status_buf = itoa::Buffer::new();
+    let status_str = status_buf.format(status_code);
     HTTP_REQUESTS_TOTAL
-        .with_label_values(&[route_id, &status_code.to_string()])
+        .with_label_values(&[route_id, status_str])
         .inc();
     HTTP_REQUEST_DURATION_SECONDS
         .with_label_values(&[route_id])

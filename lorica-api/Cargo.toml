@@ -77,6 +77,10 @@ parking_lot = "0.12"
 ipnet = "2"
 strum = "0.26"
 tokio-util = { version = "0.7", features = ["rt"] }
+# Allocation-free integer formatter used on per-request hot paths
+# (e.g. `metrics::record_request` for the `status_code` Prometheus
+# label - audit M-15) instead of `to_string()`.
+itoa = "1"
 
 [features]
 # Route53 is opt-in because its dep graph drags `aws-smithy-http-client`

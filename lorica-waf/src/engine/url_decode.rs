@@ -45,6 +45,8 @@
 //!   underlying ASCII codepoint to downstream regexes - closes the
 //!   classic CRS overlong-bypass evasion path.
 
+use std::borrow::Cow;
+
 use super::WafEngine;
 
 impl WafEngine {
@@ -53,8 +55,11 @@ impl WafEngine {
     ///
     /// Decodes recursively (up to 3 passes, until stable) so that
     /// double / triple-encoded payloads (`%252e%252e` -> `%2e%2e`
-    /// -> `..`) are caught.
-    pub(super) fn url_decode_uri(input: &str) -> String {
+    /// -> `..`) are caught. Returns `Cow::Borrowed(input)` on the
+    /// no-decode fast path (clean traffic) so the WAF eval hot
+    /// path doesn't allocate a String per (field, request) when
+    /// nothing needed decoding (audit L-19).
+    pub(super) fn url_decode_uri(input: &str) -> Cow<'_, str> {
         Self::url_decode_recursive(input, false)
     }
 
@@ -62,17 +67,18 @@ impl WafEngine {
     /// suitable for query strings and form-encoded request bodies.
     ///
     /// Identical to [`Self::url_decode_uri`] except that `+` is
-    /// rewritten to a literal space.
-    pub(super) fn url_decode_form(input: &str) -> String {
+    /// rewritten to a literal space. Returns `Cow::Borrowed` on
+    /// the no-decode fast path (no `%` AND no `+`).
+    pub(super) fn url_decode_form(input: &str) -> Cow<'_, str> {
         Self::url_decode_recursive(input, true)
     }
 
-    fn url_decode_recursive(input: &str, plus_to_space: bool) -> String {
+    fn url_decode_recursive(input: &str, plus_to_space: bool) -> Cow<'_, str> {
         // Fast path: no percent-encoding and (when applicable) no
-        // `+` to rewrite -> nothing to decode.
+        // `+` to rewrite -> nothing to decode, return borrowed.
         let needs_plus = plus_to_space && input.contains('+');
         if !input.contains('%') && !needs_plus {
-            return input.to_string();
+            return Cow::Borrowed(input);
         }
         let mut current = input.to_string();
         for _ in 0..3 {
@@ -82,7 +88,7 @@ impl WafEngine {
             }
             current = decoded;
         }
-        current
+        Cow::Owned(current)
     }
 
     /// Single-pass byte-level percent decode, with optional
