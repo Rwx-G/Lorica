@@ -3055,13 +3055,30 @@ components:
             Channel-specific JSON blob (encrypted at rest when
             the store has an encryption key). For Email :
             `{"smtp_host", "smtp_port"?, "smtp_username"?,
-            "smtp_password"?, "from_address", "to_address"}`. For
-            Webhook / Slack : `{"url", "auth_header"?}`.
-            Channel secrets (`smtp_password`, `url`,
-            `auth_header`) are scrubbed to `**REDACTED**` when
-            this struct surfaces through `GET /api/v1/config/export`
-            and on read paths that do not require the live
-            credential (v1.5.1 audit H-1 + L-5).
+            "smtp_password"?, "smtp_encryption"?, "from_address",
+            "to_address"}`. `smtp_encryption` is one of
+            `"starttls"` (plaintext then STARTTLS upgrade,
+            default, typical port 587), `"tls"` (implicit TLS /
+            SMTPS, typical port 465), `"none"` (plaintext SMTP,
+            typical port 25 - LAN MTA relays only ; never use
+            over an untrusted network). When `smtp_port` is unset,
+            the sender falls back to 587 / 465 / 25 respectively
+            so the happy path is zero-config once the encryption
+            mode is picked. Pre-v1.5.2 stored configs (no
+            `smtp_encryption` field) deserialise to `"starttls"`
+            for backwards compat. Unknown encryption values are
+            rejected with a serde error (v1.5.2 SMTP encryption
+            feature). For Webhook / Slack :
+            `{"url", "auth_header"?}`. Channel secrets
+            (`smtp_password`, `url`, `auth_header`) are scrubbed
+            to `**REDACTED**` when this struct surfaces through
+            `GET /api/v1/config/export`, and to `********` on JSON
+            read paths (`GET /api/v1/notifications`) that do not
+            require the live credential (v1.5.1 audit H-1 + L-5,
+            v1.5.2 audit M-1 closes the JSON-vs-export asymmetry).
+            On `PUT /api/v1/notifications/:id`, sending the
+            `********` sentinel for any of these fields preserves
+            the previously stored value.
         alert_types:
           type: array
           items:
