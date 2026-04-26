@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod health;
+mod startup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1317,42 +1318,24 @@ fn run_supervisor(cli: Cli) {
         // calls `close(); wait().await` on its clone.
         let task_tracker = tokio_util::task::TaskTracker::new();
 
-        // Spawn IP blocklist auto-refresh in supervisor
-        let _blocklist_refresh = lorica_api::waf::spawn_blocklist_refresh(
-            Arc::clone(&waf_engine),
-            std::time::Duration::from_secs(6 * 3600),
-            &task_tracker,
-        );
-
-        // Create notification dispatcher from DB configs
-        let notify_dispatcher = {
-            let s = store.lock().await;
-            build_notify_dispatcher(&s)
-        };
-        let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
-
-        // Bridge: alert_sender (broadcast) -> NotifyDispatcher (async dispatch) + DB persistence
-        let _alert_dispatcher = spawn_persisted_alert_dispatcher(
+        // Control-plane background tasks shared with single-process mode:
+        // IP blocklist refresh, notify dispatcher, persisted alert
+        // dispatcher, active probe scheduler, SLA collector + flush task,
+        // load-test engine, and the access-log / WAF event / probe-result /
+        // SLA bucket retention sweep. See `startup/control_plane.rs`.
+        let control = startup::control_plane::spawn_control_plane_tasks(
+            &store,
+            &waf_engine,
+            &log_store,
             &alert_sender,
-            Arc::clone(&notify_dispatcher),
-            log_store.clone(),
-        );
-
-        // Bug 2 fix: Start probe scheduler in supervisor mode
-        let probe_store = Arc::clone(&store);
-        let probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
-            probe_store,
-            Some(Arc::clone(&notify_dispatcher)),
-        ));
-        probe_scheduler.reload().await;
-
-        // Bug 4 fix: Create SLA collector in supervisor and start flush task
-        let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
-        {
-            let s = store.lock().await;
-            sla_collector.load_configs(&s);
-        }
-        sla_collector.start_flush_task(Arc::clone(&store), Some(Arc::clone(&notify_dispatcher)));
+            &task_tracker,
+        )
+        .await;
+        let notify_dispatcher = control.notify_dispatcher;
+        let notification_history = control.notification_history;
+        let probe_scheduler = control.probe_scheduler;
+        let sla_collector = control.sla_collector;
+        let load_test_engine = control.load_test_engine;
 
         // Reload proxy config, probe scheduler, SLA configs, and notification dispatcher on config changes
         let reload_store = Arc::clone(&store);
@@ -1438,7 +1421,7 @@ fn run_supervisor(cli: Cli) {
                 acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::with_db_path(api_db_path)),
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
-                load_test_engine: Some(Arc::new(lorica_bench::LoadTestEngine::new())),
+                load_test_engine: Some(Arc::clone(&load_test_engine)),
                 // cache/ban are per-worker process; aggregated via command channel
                 cache_hits: None,
                 cache_misses: None,
@@ -1448,10 +1431,7 @@ fn run_supervisor(cli: Cli) {
                 backend_connections: None,
                 aggregated_metrics: Some(api_aggregated_metrics),
                 metrics_refresher: Some(api_metrics_refresher),
-                notification_history: {
-                    let d = notify_dispatcher.lock().await;
-                    Some(d.history())
-                },
+                notification_history: Some(notification_history),
                 log_store: api_log_store,
                 task_tracker: api_task_tracker,
             };
@@ -1485,39 +1465,7 @@ fn run_supervisor(cli: Cli) {
             }
         });
 
-        if let Some(ref retention_store) = log_store {
-            let retention_log_store = Arc::clone(retention_store);
-            let retention_config_store = Arc::clone(&store);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(3600));
-                let mut last_sla_purge_day: u32 = 0;
-                loop {
-                    interval.tick().await;
-                    let retention = {
-                        let s = retention_config_store.lock().await;
-                        s.get_global_settings()
-                            .map(|gs| gs.access_log_retention)
-                            .unwrap_or(100_000)
-                    };
-                    if retention > 0 {
-                        if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
-                            tracing::warn!(error = %e, "access log retention cleanup failed");
-                        }
-                    }
-                    {
-                        let s = retention_config_store.lock().await;
-                        if let Err(e) = s.purge_probe_results(1000) {
-                            tracing::warn!(error = %e, "probe result retention cleanup failed");
-                        }
-                    }
-                    if let Err(e) = retention_log_store.enforce_waf_retention(100_000) {
-                        tracing::warn!(error = %e, "WAF event retention cleanup failed");
-                    }
-                    last_sla_purge_day =
-                        run_sla_purge(&retention_config_store, last_sla_purge_day).await;
-                }
-            });
-        }
+        // (Retention sweep moved to `startup::control_plane::spawn_control_plane_tasks`.)
 
         // Worker monitoring loop (crash detection and restart with backoff)
         let manager = Arc::new(std::sync::Mutex::new(manager));
@@ -3804,47 +3752,38 @@ fn run_single_process(cli: Cli) {
         // to complete.
         let single_task_tracker = tokio_util::task::TaskTracker::new();
 
-        // Spawn IP blocklist auto-refresh (every 6 hours, matching Data-Shield update frequency)
-        let _blocklist_refresh = lorica_api::waf::spawn_blocklist_refresh(
-            Arc::clone(&waf_engine),
-            std::time::Duration::from_secs(6 * 3600),
-            &single_task_tracker,
-        );
-
-        // Create non-blocking alert sender and notification dispatcher
+        // Non-blocking alert sender created BEFORE the helper because
+        // downstream code (LoricaProxy.alert_sender, ACME spawn block)
+        // also clones it.
         let alert_sender = lorica_notify::AlertSender::new(256);
-        let notify_dispatcher = {
-            let s = store.lock().await;
-            build_notify_dispatcher(&s)
-        };
-        let notification_history = notify_dispatcher.history();
-        let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
-        let _alert_dispatcher = spawn_persisted_alert_dispatcher(
+
+        // Control-plane background tasks shared with supervisor mode:
+        // IP blocklist refresh, notify dispatcher, persisted alert
+        // dispatcher, active probe scheduler, SLA collector + flush task,
+        // load-test engine, and the access-log / WAF event / probe-result /
+        // SLA bucket retention sweep. See `startup/control_plane.rs`.
+        let control = startup::control_plane::spawn_control_plane_tasks(
+            &store,
+            &waf_engine,
+            &log_store,
             &alert_sender,
-            Arc::clone(&notify_dispatcher),
-            log_store.clone(),
-        );
+            &single_task_tracker,
+        )
+        .await;
+        // Single-process does NOT rebuild the notify dispatcher on
+        // config reload (its reload listener only touches proxy_config /
+        // cert_resolver / probe_scheduler / sla_collector). Supervisor
+        // mode does. This asymmetry predates Story 8.1 - flagged as a
+        // follow-up.
+        let notification_history = control.notification_history;
+        let probe_scheduler = control.probe_scheduler;
+        let sla_collector = control.sla_collector;
+        let load_test_engine = control.load_test_engine;
 
-        // Create SLA collector and start background flush task
-        let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
-        {
-            let s = store.lock().await;
-            sla_collector.load_configs(&s);
-        }
-        sla_collector.start_flush_task(Arc::clone(&store), Some(Arc::clone(&notify_dispatcher)));
-
-        // Start active probe scheduler
-        let probe_store = Arc::clone(&store);
-        let probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
-            probe_store,
-            Some(Arc::clone(&notify_dispatcher)),
-        ));
-        probe_scheduler.reload().await;
-
-        // Create load test engine (shared between API and scheduler)
-        let load_test_engine = Arc::new(lorica_bench::LoadTestEngine::new());
-
-        // Start load test cron scheduler
+        // Single-process only: load-test cron scheduler. Supervisor mode
+        // does not call `start_scheduler` today (see Story 8.1 follow-up
+        // note in `startup/control_plane.rs`); cron-scheduled load tests
+        // only auto-fire under single-process for now.
         let lt_scheduler_store = Arc::clone(&store);
         let lt_scheduler_engine = Arc::clone(&load_test_engine);
         lorica_bench::scheduler::start_scheduler(lt_scheduler_store, lt_scheduler_engine);
@@ -4083,39 +4022,7 @@ fn run_single_process(cli: Cli) {
             }
         });
 
-        if let Some(ref retention_store) = log_store {
-            let retention_log_store = Arc::clone(retention_store);
-            let retention_config_store = Arc::clone(&store);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(3600));
-                let mut last_sla_purge_day: u32 = 0;
-                loop {
-                    interval.tick().await;
-                    let retention = {
-                        let s = retention_config_store.lock().await;
-                        s.get_global_settings()
-                            .map(|gs| gs.access_log_retention)
-                            .unwrap_or(100_000)
-                    };
-                    if retention > 0 {
-                        if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
-                            tracing::warn!(error = %e, "access log retention cleanup failed");
-                        }
-                    }
-                    {
-                        let s = retention_config_store.lock().await;
-                        if let Err(e) = s.purge_probe_results(1000) {
-                            tracing::warn!(error = %e, "probe result retention cleanup failed");
-                        }
-                    }
-                    if let Err(e) = retention_log_store.enforce_waf_retention(100_000) {
-                        tracing::warn!(error = %e, "WAF event retention cleanup failed");
-                    }
-                    last_sla_purge_day =
-                        run_sla_purge(&retention_config_store, last_sla_purge_day).await;
-                }
-            });
-        }
+        // (Retention sweep moved to `startup::control_plane::spawn_control_plane_tasks`.)
 
         // Background task: reload proxy config, cert resolver, and probe scheduler when API signals a change
         let reload_store = Arc::clone(&store);
