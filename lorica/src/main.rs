@@ -21,7 +21,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use chrono::Datelike;
 use clap::{Parser, Subcommand};
 use lorica_api::logs::LogBuffer;
 use lorica_api::middleware::auth::SessionStore;
@@ -1165,7 +1164,7 @@ fn run_supervisor(cli: Cli) {
                     let s = reload_store.lock().await;
                     reload_sla_collector.load_configs(&s);
                     // Rebuild notification dispatcher with updated channel configs
-                    let new_dispatcher = build_notify_dispatcher(&s);
+                    let new_dispatcher = startup::notify::build_notify_dispatcher(&s);
                     let mut d = reload_notify_dispatcher.lock().await;
                     *d = new_dispatcher;
                 }
@@ -3800,7 +3799,7 @@ fn run_single_process(cli: Cli) {
                     // Rebuild notify dispatcher so dashboard edits to
                     // notification channel configs take effect without
                     // restart. Mirrors the supervisor reload listener.
-                    let new_dispatcher = build_notify_dispatcher(&s);
+                    let new_dispatcher = startup::notify::build_notify_dispatcher(&s);
                     let mut d = reload_notify_dispatcher.lock().await;
                     *d = new_dispatcher;
                 }
@@ -3860,165 +3859,6 @@ fn run_single_process(cli: Cli) {
         // never configured, so it's always safe to call.
         lorica::otel::shutdown();
     });
-}
-
-/// Try to initialise the OpenTelemetry exporter from persisted
-/// `GlobalSettings`. No-op when the `otel` Cargo feature is off, the
-/// settings row cannot be read, or `otlp_endpoint` is unset / blank.
-///
-/// Must be called from inside a Tokio runtime — the OTLP batch
-/// exporter spawns a background flush task. `role` is a free-form
-/// label (`"supervisor"`, `"worker"`, `"single-process"`) included in
-/// the startup log line so multi-process installs can tell which
-/// component finished tracing init.
-///
-/// Errors are logged at `warn!` and swallowed: observability is not
-/// a critical path, so a misconfigured endpoint never blocks startup.
-/// Build a NotifyDispatcher from database notification configs.
-/// Run the SLA data purge if enabled and the schedule matches today.
-/// Returns the day-of-month on which the last purge ran (used as guard to run once per day).
-async fn run_sla_purge(store: &Arc<Mutex<lorica_config::ConfigStore>>, last_purge_day: u32) -> u32 {
-    let today = chrono::Utc::now().day();
-    if today == last_purge_day {
-        return last_purge_day;
-    }
-    let s = store.lock().await;
-    let gs = match s.get_global_settings() {
-        Ok(gs) => gs,
-        Err(_) => return last_purge_day,
-    };
-    if !gs.sla_purge_enabled {
-        return last_purge_day;
-    }
-    let should_run = match gs.sla_purge_schedule.as_str() {
-        "daily" => true,
-        "first_of_month" => today == 1,
-        other => other.parse::<u32>().is_ok_and(|d| d == today),
-    };
-    if !should_run {
-        return last_purge_day;
-    }
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(gs.sla_purge_retention_days as i64);
-    match s.prune_sla_buckets(&cutoff) {
-        Ok(n) if n > 0 => {
-            tracing::info!(
-                count = n,
-                retention_days = gs.sla_purge_retention_days,
-                "purged old SLA buckets"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "SLA purge failed");
-        }
-        _ => {}
-    }
-    today
-}
-
-/// Spawn alert dispatcher that also persists events to the log store (SQLite).
-fn spawn_persisted_alert_dispatcher(
-    alert_sender: &lorica_notify::AlertSender,
-    dispatcher: Arc<Mutex<lorica_notify::NotifyDispatcher>>,
-    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
-) -> tokio::task::JoinHandle<()> {
-    let mut rx = alert_sender.subscribe();
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    // Dispatch via channels (email, webhook, etc.)
-                    let d = dispatcher.lock().await;
-                    d.dispatch(&event).await;
-                    drop(d);
-
-                    // Persist to log store. Both calls are sync rusqlite under
-                    // `parking_lot::Mutex<Connection>` ; running them inline
-                    // would block the alert dispatcher's async reactor (audit
-                    // H-7). Off-load both to one `spawn_blocking` so the
-                    // mutex acquisition + the SELECT COUNT(*) + DELETE pair
-                    // happen on the blocking pool, and surface retention
-                    // failures via the existing notifier-events-dropped metric
-                    // (was a silent `let _ = ...` swallow that left the table
-                    // unbounded if DELETE ever failed).
-                    if let Some(ref store) = log_store {
-                        let store = Arc::clone(store);
-                        let event_for_blocking = event.clone();
-                        let blocking_outcome = tokio::task::spawn_blocking(move || {
-                            let insert = store.insert_notification_event(&event_for_blocking);
-                            let retention = store.enforce_notification_retention(500);
-                            (insert, retention)
-                        })
-                        .await;
-                        match blocking_outcome {
-                            Ok((insert, retention)) => {
-                                if let Err(e) = insert {
-                                    tracing::warn!(error = %e, "failed to persist notification event");
-                                    lorica_api::metrics::inc_notifier_events_dropped("persist_failed", 1);
-                                }
-                                if let Err(e) = retention {
-                                    tracing::warn!(error = %e, "notification retention enforcement failed");
-                                    lorica_api::metrics::inc_notifier_events_dropped("retention_failed", 1);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "notification persistence task join failed");
-                                lorica_api::metrics::inc_notifier_events_dropped("join_failed", 1);
-                            }
-                        }
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        dropped = n,
-                        "alert dispatcher lagged, some notifications were dropped"
-                    );
-                    lorica_api::metrics::inc_notifier_events_dropped("lag", n);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    lorica_api::metrics::inc_notifier_events_dropped("closed", 1);
-                    break;
-                }
-            }
-        }
-    })
-}
-
-fn build_notify_dispatcher(store: &lorica_config::ConfigStore) -> lorica_notify::NotifyDispatcher {
-    let mut dispatcher = lorica_notify::NotifyDispatcher::new();
-    if let Ok(configs) = store.list_notification_configs() {
-        for nc in configs {
-            let config_json = &nc.config;
-            match nc.channel {
-                lorica_config::models::NotificationChannel::Email => {
-                    if let Ok(email_cfg) =
-                        serde_json::from_str::<lorica_notify::channels::EmailConfig>(config_json)
-                    {
-                        dispatcher.add_email_channel(nc.id, email_cfg, nc.alert_types, nc.enabled);
-                    }
-                }
-                lorica_config::models::NotificationChannel::Webhook => {
-                    if let Ok(webhook_cfg) =
-                        serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
-                    {
-                        dispatcher.add_webhook_channel(
-                            nc.id,
-                            webhook_cfg,
-                            nc.alert_types,
-                            nc.enabled,
-                        );
-                    }
-                }
-                lorica_config::models::NotificationChannel::Slack => {
-                    if let Ok(slack_cfg) =
-                        serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
-                    {
-                        dispatcher.add_slack_channel(nc.id, slack_cfg, nc.alert_types, nc.enabled);
-                    }
-                }
-            }
-        }
-    }
-    dispatcher
 }
 
 /// Restrict private key file permissions to owner-only read.

@@ -94,13 +94,13 @@ pub async fn spawn_control_plane_tasks(
     // Notification dispatcher built from the current settings snapshot.
     let notify_dispatcher = {
         let s = store.lock().await;
-        crate::build_notify_dispatcher(&s)
+        crate::startup::notify::build_notify_dispatcher(&s)
     };
     let notification_history = notify_dispatcher.history();
     let notify_dispatcher = Arc::new(Mutex::new(notify_dispatcher));
 
     // Bridge: alert_sender (broadcast) -> NotifyDispatcher + DB persistence.
-    let _alert_dispatcher = crate::spawn_persisted_alert_dispatcher(
+    let _alert_dispatcher = crate::startup::notify::spawn_persisted_alert_dispatcher(
         alert_sender,
         Arc::clone(&notify_dispatcher),
         log_store.clone(),
@@ -155,7 +155,7 @@ pub async fn spawn_control_plane_tasks(
                     tracing::warn!(error = %e, "WAF event retention cleanup failed");
                 }
                 last_sla_purge_day =
-                    crate::run_sla_purge(&retention_config_store, last_sla_purge_day).await;
+                    crate::startup::notify::run_sla_purge(&retention_config_store, last_sla_purge_day).await;
             }
         });
     }
