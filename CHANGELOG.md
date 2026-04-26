@@ -9,6 +9,15 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Fixed
+
+- Workers mode silently dropped scheduled load tests : `lorica_bench::scheduler::start_scheduler` was wired only by the single-process boot path, so cron-scheduled load test configs never auto-fired under `--workers N`. Surfaced by the Story 8.1 `spawn_control_plane_tasks` extraction (the asymmetry became obvious once the shared spawn surface was factored). Wired in `run_supervisor` so both modes behave identically. Same v1.5.2-style "one role missed a spawn the other roles already had" pattern as the worker-mode cert hot-reload bug. (Story 8.1 / Epic 8)
+- Single-process did not rebuild the notify dispatcher on config reload : its reload listener only refreshed proxy config, cert resolver, probe scheduler, and SLA configs. Dashboard edits to notification channel configs (email / webhook / slack) silently required a full restart to take effect. Added the dispatcher rebuild inside the existing reload listener block, mirroring the supervisor's wiring. Also surfaced by the Story 8.1 extraction. (Story 8.1 / Epic 8)
+
+### Changed
+
+- Refactor : `lorica/src/main.rs` `run_supervisor` and `run_single_process` no longer duplicate the ~75 LOC of control-plane spawn wiring (IP blocklist refresh, notify dispatcher build, persisted alert dispatcher, active probe scheduler, SLA collector + flush task, load-test engine handle, hourly retention sweep). Both call paths now go through one `spawn_control_plane_tasks` helper at `lorica/src/startup/control_plane.rs` that returns a `ControlPlaneHandles` struct. Worker mode is untouched (it runs a leaner data-plane subset that the next commit will factor separately). Behaviour-preserving extraction with two follow-up `fix(...)` commits closing pre-existing v1.5.2-style asymmetries surfaced in the process. 268 lorica unit tests, clippy `--no-deps` clean. (Story 8.1 / Epic 8)
+
 ## [1.5.3] - 2026-04-28
 
 ### Changed
