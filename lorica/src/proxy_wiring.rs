@@ -2283,167 +2283,24 @@ impl ProxyHttp for LoricaProxy {
                 return write_decision(session, &ctx.request_id, d).await;
             }
 
-            // Skip WAF evaluation entirely if not enabled or IP is whitelisted (zero overhead)
-            if is_whitelisted || !entry.route.waf_enabled {
-                return Ok(false);
-            }
-
-            // Collect headers for inspection
-            let headers: Vec<(&str, &str)> = req
-                .headers
-                .iter()
-                .filter_map(|(name, value)| {
-                    let name_str = name.as_str();
-                    // Only inspect relevant headers (skip large/binary ones)
-                    match name_str {
-                        "user-agent" | "referer" | "cookie" | "x-forwarded-for"
-                        | "content-type" | "content-length" | "authorization" | "origin"
-                        | "transfer-encoding" => value.to_str().ok().map(|v| (name_str, v)),
-                        n if n.starts_with("x-") => value.to_str().ok().map(|v| (name_str, v)),
-                        _ => None,
-                    }
-                })
-                .collect();
-
-            let waf_mode = match entry.route.waf_mode {
-                WafMode::Detection => lorica_waf::WafMode::Detection,
-                WafMode::Blocking => lorica_waf::WafMode::Blocking,
-            };
-
-            let mut verdict = self.waf_engine.evaluate(
-                waf_mode,
+            // WAF evaluation (route-aware reject ; see check_waf_request_filter).
+            // The helper short-circuits for whitelisted IPs and routes
+            // without waf_enabled. On Block returns Decision::reject ;
+            // on Detected sets ctx.waf_detected and returns None ; on
+            // Pass returns None.
+            if let Some(d) = self.check_waf_request_filter(
+                req,
+                ctx,
+                entry,
+                host,
                 path,
                 query,
-                &headers,
-                host,
-                check_ip.as_deref().unwrap_or("-"),
-            );
-
-            match verdict {
-                lorica_waf::WafVerdict::Blocked(ref mut events) => {
-                    for ev in events.iter_mut() {
-                        ev.route_hostname = host.to_string();
-                        ev.action = "blocked".to_string();
-                        lorica_api::metrics::record_waf_event(ev.category.as_str(), "blocked");
-                        self.waf_counts
-                            .entry((ev.category.as_str().to_string(), "blocked".to_string()))
-                            .or_insert_with(|| AtomicU64::new(0))
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.persist_waf_event(ev);
-                    }
-                    // Dispatch waf_alert notification
-                    if let (Some(ref sender), Some(ev)) = (&self.alert_sender, events.first()) {
-                        sender.send(
-                            lorica_notify::AlertEvent::new(
-                                lorica_notify::events::AlertType::WafAlert,
-                                format!("WAF blocked {} on {}{}", ev.category.as_str(), host, path),
-                            )
-                            .with_detail("rule_id", ev.rule_id.to_string())
-                            .with_detail("category", ev.category.as_str().to_string())
-                            .with_detail("host", host.to_string())
-                            .with_detail("path", path.to_string())
-                            .with_detail(
-                                "client_ip",
-                                check_ip.as_deref().unwrap_or("-").to_string(),
-                            ),
-                        );
-                    }
-                    ctx.waf_blocked = true;
-                    ctx.matched_host = Some(host.to_string());
-                    ctx.matched_path = Some(path.to_string());
-
-                    // WAF auto-ban counter. Two modes:
-                    //
-                    // - Multi-worker (`self.shmem.is_some()`): increment the
-                    //   cross-worker `waf_auto_ban` atomic counter. The
-                    //   supervisor reads the counter on each UDS WAF event,
-                    //   decides when the threshold is crossed, broadcasts
-                    //   `BanIp` to all workers, and resets the slot. Workers
-                    //   never issue bans directly — the supervisor is the
-                    //   sole authority so the ban is consistent across the
-                    //   pool.
-                    //
-                    // - Single-process (`self.shmem.is_none()`): fall back to
-                    //   the per-process `waf_violations` DashMap + local
-                    //   `ban_list` insertion, as before.
-                    if let Some(ref ip) = check_ip {
-                        let config = self.config.load();
-                        let threshold = config.waf_ban_threshold;
-                        if threshold > 0 {
-                            if let Some(region) = self.shmem {
-                                // Multi-worker: just bump the shmem counter.
-                                let tagged = region.tagged(ip_to_shmem_key(ip.as_str()));
-                                let _ = region.waf_auto_ban.increment(
-                                    tagged,
-                                    1,
-                                    lorica_shmem::now_ns(),
-                                );
-                            } else {
-                                let violations = self
-                                    .waf_violations
-                                    .entry(ip.to_string())
-                                    .or_insert_with(|| AtomicU64::new(0))
-                                    .fetch_add(1, Ordering::Relaxed)
-                                    + 1;
-                                if violations >= threshold as u64 {
-                                    let ban_duration = config.waf_ban_duration_s;
-                                    self.ban_list.insert(
-                                        ip.to_string(),
-                                        (Instant::now(), ban_duration as u64),
-                                    );
-                                    self.waf_violations.remove(ip.as_str());
-                                    warn!(
-                                        ip = %ip,
-                                        violations = %violations,
-                                        ban_duration_s = %ban_duration,
-                                        "IP auto-banned for repeated WAF violations (local counter)"
-                                    );
-                                    if let Some(ref sender) = self.alert_sender {
-                                        sender.send(
-                                            lorica_notify::AlertEvent::new(
-                                                lorica_notify::events::AlertType::IpBanned,
-                                                format!(
-                                                    "IP {} auto-banned for repeated WAF violations",
-                                                    ip
-                                                ),
-                                            )
-                                            .with_detail("ip", ip.to_string())
-                                            .with_detail("violations", violations.to_string())
-                                            .with_detail(
-                                                "ban_duration_s",
-                                                ban_duration.to_string(),
-                                            ),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    write_decision(
-                        session,
-                        &ctx.request_id,
-                        Decision::reject(403, "Request blocked by WAF")
-                            .with_html(entry.route.error_page_html.clone()),
-                    )
-                    .await
-                }
-                lorica_waf::WafVerdict::Detected(ref mut events) => {
-                    for ev in events.iter_mut() {
-                        ev.route_hostname = host.to_string();
-                        ev.action = "detected".to_string();
-                        lorica_api::metrics::record_waf_event(ev.category.as_str(), "detected");
-                        self.waf_counts
-                            .entry((ev.category.as_str().to_string(), "detected".to_string()))
-                            .or_insert_with(|| AtomicU64::new(0))
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.persist_waf_event(ev);
-                    }
-                    ctx.waf_detected = true;
-                    Ok(false)
-                }
-                lorica_waf::WafVerdict::Pass => Ok(false),
+                check_ip.as_deref(),
+                is_whitelisted,
+            ) {
+                return write_decision(session, &ctx.request_id, d).await;
             }
+            Ok(false)
         }
         .instrument(span)
         .await
