@@ -1374,6 +1374,112 @@ impl LoricaProxy {
                 .with_html(entry.route.error_page_html.clone()),
         )
     }
+
+    /// Per-route token-bucket rate limit (the new `RateLimit` struct
+    /// path - distinct from the legacy `rate_limit_rps` engine). Runs
+    /// after ban / blocklist + redirects so abusive clients get
+    /// rejected before WAF / mTLS / forward-auth. Whitelisted IPs
+    /// bypass.
+    fn check_token_bucket_rate_limit(
+        &self,
+        ctx: &mut RequestCtx,
+        entry: &Arc<RouteEntry>,
+        is_whitelisted: bool,
+    ) -> Option<Decision> {
+        let rl = entry.route.rate_limit.as_ref()?;
+        if is_whitelisted {
+            return None;
+        }
+        let scope_key = match rl.scope {
+            lorica_config::models::RateLimitScope::PerIp => {
+                ctx.client_ip.as_deref().unwrap_or("unknown").to_string()
+            }
+            lorica_config::models::RateLimitScope::PerRoute => "__route__".to_string(),
+        };
+        let key = format!("{}|{}", entry.route.id, scope_key);
+        let admitted =
+            self.rate_limit_buckets
+                .try_consume(&key, rl, 1, lorica_shmem::now_ns());
+        if admitted {
+            return None;
+        }
+        ctx.block_reason = Some("rate limited".to_string());
+        // Retry-After in seconds. For any configured refill rate >= 1
+        // tok/s, 1 second is the right advice (one token refills in
+        // <= 1 s). A zero refill means a one-shot bucket that never
+        // refills - advise a generous 60 s backoff instead of a tight
+        // loop.
+        let retry_after: u64 = if rl.refill_per_sec >= 1 { 1 } else { 60 };
+        Some(
+            Decision::reject(429, "Rate limit exceeded")
+                .with_html(entry.route.error_page_html.clone())
+                .with_header("Retry-After", retry_after.to_string()),
+        )
+    }
+
+    /// Per-route mTLS enforcement gate. The listener has already
+    /// validated the cert chain against the union CA bundle ; this
+    /// helper just checks presence and the per-route organisation
+    /// allowlist. Returns 495 (cert error) or 496 (cert required)
+    /// per the semi-standard Nginx mapping.
+    fn check_mtls(
+        &self,
+        session: &Session,
+        ctx: &mut RequestCtx,
+        entry: &Arc<RouteEntry>,
+    ) -> Option<Decision> {
+        let enforcer = entry.mtls_enforcer.as_ref()?;
+        let status = evaluate_mtls(enforcer, downstream_ssl_digest(session).as_deref())?;
+        ctx.block_reason = Some(format!("mtls rejected ({status})"));
+        let message = match status {
+            496 => "SSL certificate required",
+            495 => "SSL certificate error",
+            _ => "Forbidden",
+        };
+        Some(
+            Decision::reject(status, message)
+                .with_html(entry.route.error_page_html.clone()),
+        )
+    }
+
+    /// Per-route active-connection cap (`max_connections`). Increments
+    /// the counter on admission and stashes its handle in
+    /// `ctx.route_conn_counter` so the logging() hook decrements it
+    /// when the request finishes. Rejects with 503 + decrements back
+    /// when the limit is reached.
+    fn check_route_conn_limit(
+        &self,
+        ctx: &mut RequestCtx,
+        entry: &Arc<RouteEntry>,
+    ) -> Option<Decision> {
+        let max_conn = entry.route.max_connections?;
+        let counter = self
+            .route_connections
+            .entry(entry.route.id.clone())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .value()
+            .clone();
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        if current >= max_conn as u64 {
+            counter.fetch_sub(1, Ordering::Relaxed);
+            warn!(
+                route_id = %entry.route.id,
+                current_connections = current + 1,
+                max_connections = max_conn,
+                "max connections exceeded for route (503)"
+            );
+            ctx.block_reason = Some("route connection limit".to_string());
+            let custom_html = ctx
+                .route_snapshot
+                .as_ref()
+                .and_then(|r| r.error_page_html.clone());
+            return Some(
+                Decision::reject(503, "Route connection limit exceeded").with_html(custom_html),
+            );
+        }
+        ctx.route_conn_counter = Some(counter);
+        None
+    }
 }
 
 #[async_trait]
@@ -1798,44 +1904,10 @@ impl ProxyHttp for LoricaProxy {
                 }
             }
 
-            // Per-route token-bucket rate limit. Runs after ban/blocklist
-            // and redirects so that an abusive client is rejected before
-            // we touch WAF / mtls / forward_auth. See design § 6 and
-            // `lorica_limits::token_bucket::AuthoritativeBucket`.
-            //
-            // Whitelisted IPs bypass the limiter (same policy as WAF ban
-            // checks — an operator who added an IP to the whitelist has
-            // made a deliberate trust decision).
-            if let Some(ref rl) = entry.route.rate_limit {
-                if !is_whitelisted {
-                    let scope_key = match rl.scope {
-                        lorica_config::models::RateLimitScope::PerIp => {
-                            ctx.client_ip.as_deref().unwrap_or("unknown").to_string()
-                        }
-                        lorica_config::models::RateLimitScope::PerRoute => "__route__".to_string(),
-                    };
-                    let key = format!("{}|{}", entry.route.id, scope_key);
-                    let admitted =
-                        self.rate_limit_buckets
-                            .try_consume(&key, rl, 1, lorica_shmem::now_ns());
-                    if !admitted {
-                        ctx.block_reason = Some("rate limited".to_string());
-                        // Retry-After in seconds. For any configured refill
-                        // rate >= 1 tok/s, 1 second is the right advice
-                        // (one token refills in <= 1 s). A zero refill means
-                        // a one-shot bucket that never refills - advise a
-                        // generous 60 s backoff instead of a tight loop.
-                        let retry_after: u64 = if rl.refill_per_sec >= 1 { 1 } else { 60 };
-                        return write_decision(
-                            session,
-                            &ctx.request_id,
-                            Decision::reject(429, "Rate limit exceeded")
-                                .with_html(entry.route.error_page_html.clone())
-                                .with_header("Retry-After", retry_after.to_string()),
-                        )
-                        .await;
-                    }
-                }
+            // Per-route token-bucket rate limit (route-aware reject ;
+            // see check_token_bucket_rate_limit).
+            if let Some(d) = self.check_token_bucket_rate_limit(ctx, entry, is_whitelisted) {
+                return write_decision(session, &ctx.request_id, d).await;
             }
 
             // mTLS client verification: runs before forward_auth so a
@@ -1849,23 +1921,9 @@ impl ProxyHttp for LoricaProxy {
             // required" codes used by Nginx; reqwest and common clients
             // surface them as meaningful errors and they don't collide
             // with our other rejection paths.
-            if let Some(ref enforcer) = entry.mtls_enforcer {
-                let verdict = evaluate_mtls(enforcer, downstream_ssl_digest(session).as_deref());
-                if let Some(status) = verdict {
-                    ctx.block_reason = Some(format!("mtls rejected ({status})"));
-                    let message = match status {
-                        496 => "SSL certificate required",
-                        495 => "SSL certificate error",
-                        _ => "Forbidden",
-                    };
-                    return write_decision(
-                        session,
-                        &ctx.request_id,
-                        Decision::reject(status, message)
-                            .with_html(entry.route.error_page_html.clone()),
-                    )
-                    .await;
-                }
+            // mTLS enforcement (route-aware reject ; see check_mtls).
+            if let Some(d) = self.check_mtls(session, ctx, entry) {
+                return write_decision(session, &ctx.request_id, d).await;
             }
 
             // Forward authentication: gate the request on an external auth
@@ -2562,39 +2620,12 @@ impl ProxyHttp for LoricaProxy {
                 return write_decision(session, &ctx.request_id, d).await;
             }
 
-            // Per-route max connections enforcement.
-            // Tracks active connections per route using atomic counters.
-            // Returns 503 when a route exceeds its configured connection limit.
-            if let Some(max_conn) = entry.route.max_connections {
-                let counter = self
-                    .route_connections
-                    .entry(entry.route.id.clone())
-                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-                    .value()
-                    .clone();
-                let current = counter.fetch_add(1, Ordering::Relaxed);
-                if current >= max_conn as u64 {
-                    counter.fetch_sub(1, Ordering::Relaxed);
-                    warn!(
-                        route_id = %entry.route.id,
-                        current_connections = current + 1,
-                        max_connections = max_conn,
-                        "max connections exceeded for route (503)"
-                    );
-                    ctx.block_reason = Some("route connection limit".to_string());
-                    let custom_html = ctx
-                        .route_snapshot
-                        .as_ref()
-                        .and_then(|r| r.error_page_html.clone());
-                    return write_decision(
-                        session,
-                        &ctx.request_id,
-                        Decision::reject(503, "Route connection limit exceeded")
-                            .with_html(custom_html),
-                    )
-                    .await;
-                }
-                ctx.route_conn_counter = Some(counter);
+            // Per-route max-connections cap (route-aware reject ; see
+            // check_route_conn_limit). On admission the helper sets
+            // ctx.route_conn_counter so logging() decrements it on
+            // request end.
+            if let Some(d) = self.check_route_conn_limit(ctx, entry) {
+                return write_decision(session, &ctx.request_id, d).await;
             }
 
             // Request body size limit
