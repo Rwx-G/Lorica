@@ -1480,6 +1480,69 @@ impl LoricaProxy {
         ctx.route_conn_counter = Some(counter);
         None
     }
+
+    /// Resolve the client's GeoIP country (when a DB is loaded), record
+    /// it on the OTel root span for traffic analytics, and reject with
+    /// 403 when the route's `geoip` config blocks the resolved country.
+    /// Returns `(cached_country, decision)` so the caller can reuse
+    /// the resolved country for downstream bot-protection bypass
+    /// matching without paying a redundant `mmdb decode_path` call.
+    fn check_geoip(
+        &self,
+        ctx: &mut RequestCtx,
+        entry: &Arc<RouteEntry>,
+        client_ip: Option<&str>,
+    ) -> (Option<String>, Option<Decision>) {
+        let Some(ip_str) = client_ip else {
+            return (None, None);
+        };
+        let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() else {
+            return (None, None);
+        };
+        let Some(country) = self.geoip_resolver.lookup_country(ip_addr) else {
+            // DB miss / unknown range; fall through without blocking.
+            // No OTel attribute when country is unknown - omitting is
+            // semantically clearer than setting an empty string.
+            return (None, None);
+        };
+        let cached_country = country.as_str().to_string();
+        // Always stamp the country on the root tracing span -- the
+        // attribute is useful even on requests that are not blocked
+        // (traffic analytics per country, anomaly detection).
+        ctx.root_tracing_span
+            .record("client.geo.country_iso_code", country.as_str());
+
+        let Some(ref geoip_cfg) = entry.route.geoip else {
+            return (Some(cached_country), None);
+        };
+        if !geoip_cfg.blocks(country.as_str()) {
+            return (Some(cached_country), None);
+        }
+        use lorica_config::models::GeoIpMode;
+        let mode_str = match geoip_cfg.mode {
+            GeoIpMode::Allowlist => "allowlist",
+            GeoIpMode::Denylist => "denylist",
+        };
+        // Prometheus counter: bounded cardinality (routes * ~240
+        // countries * 2 modes). Use entry.route.id directly - the
+        // per-request ctx.route_id is only assigned further down the
+        // filter (after response_headers + auth checks) and would
+        // show up as "_unknown" here.
+        lorica_api::metrics::inc_geoip_block(
+            entry.route.id.as_str(),
+            country.as_str(),
+            mode_str,
+        );
+        let reason = format!("GeoIP blocked ({country} via {mode_str})");
+        ctx.block_reason = Some(reason.clone());
+        (
+            Some(cached_country),
+            Some(
+                Decision::reject(403, reason)
+                    .with_html(entry.route.error_page_html.clone()),
+            ),
+        )
+    }
 }
 
 #[async_trait]
@@ -2327,63 +2390,14 @@ impl ProxyHttp for LoricaProxy {
             // client behind a corporate NAT is never accidentally denied
             // — the operator can layer an explicit `ip_allowlist` on top
             // when they want fail-close semantics.
-            // GeoIP country resolved once and cached for both the geoip
-            // block check and the bot-protection bypass evaluator,
-            // avoiding a redundant mmdb decode_path call on the hot path.
-            let mut cached_country: Option<String> = None;
-            if let Some(ref ip_str) = check_ip {
-                if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
-                    if let Some(country) = self.geoip_resolver.lookup_country(ip_addr) {
-                        cached_country = Some(country.as_str().to_string());
-                        // Always stamp the country on the root tracing
-                        // span — the attribute is useful even on requests
-                        // that are not blocked (traffic analytics per
-                        // country, anomaly detection). The bridge
-                        // mirrors this onto the exported OTel span when
-                        // the `otel` feature is on; without the feature
-                        // it just shows up as a span field in JSON logs.
-                        ctx.root_tracing_span
-                            .record("client.geo.country_iso_code", country.as_str());
-
-                        if let Some(ref geoip_cfg) = entry.route.geoip {
-                            use lorica_config::models::GeoIpMode;
-                            if geoip_cfg.blocks(country.as_str()) {
-                                let mode_str = match geoip_cfg.mode {
-                                    GeoIpMode::Allowlist => "allowlist",
-                                    GeoIpMode::Denylist => "denylist",
-                                };
-                                // Prometheus counter: bounded cardinality
-                                // (routes * ~240 countries * 2 modes).
-                                // Use `entry.route.id` directly — the
-                                // per-request `ctx.route_id` is only
-                                // assigned further down the filter (after
-                                // response_headers + auth checks) and
-                                // would show up as "_unknown" here.
-                                lorica_api::metrics::inc_geoip_block(
-                                    entry.route.id.as_str(),
-                                    country.as_str(),
-                                    mode_str,
-                                );
-
-                                let reason = format!("GeoIP blocked ({country} via {mode_str})");
-                                ctx.block_reason = Some(reason.clone());
-                                return write_decision(
-                                    session,
-                                    &ctx.request_id,
-                                    Decision::reject(403, reason)
-                                        .with_html(entry.route.error_page_html.clone()),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    // `country` is None = DB miss / unknown range;
-                    // fall through without blocking. Operators that
-                    // want fail-close behaviour can layer
-                    // ip_allowlist on top. No OTel attribute when
-                    // country is unknown — omitting is semantically
-                    // clearer than setting an empty string.
-                }
+            // GeoIP resolution + per-route block check. Returns
+            // `(cached_country, decision)` so the bot-protection
+            // bypass evaluator below can reuse the resolved country
+            // without a redundant mmdb decode_path call.
+            let (cached_country, geoip_decision) =
+                self.check_geoip(ctx, entry, check_ip.as_deref());
+            if let Some(d) = geoip_decision {
+                return write_decision(session, &ctx.request_id, d).await;
             }
 
             // Per-route bot-protection evaluation (v1.4.0 Epic 3
