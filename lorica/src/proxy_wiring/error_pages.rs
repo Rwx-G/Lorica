@@ -351,39 +351,101 @@ fn badge(is_broken: bool) -> (&'static str, &'static str, &'static str, &'static
     }
 }
 
+/// A request_filter rejection that has not yet been written to the
+/// downstream session.
+///
+/// Returned by the `check_<name>` helpers in `request_filter` (Story
+/// 8.1 AC #5) so the top-level filter chain can stay flat :
+///
+/// ```text
+/// if let Some(d) = self.check_X(session, ctx).await? {
+///     return write_decision(session, &ctx.request_id, d).await;
+/// }
+/// ```
+///
+/// Use [`Decision::reject`] to construct the common case ; chain
+/// `with_html` / `with_header` for sites that carry a per-route
+/// custom error page or need extra response headers (e.g.
+/// `Retry-After` on rate-limit / maintenance, or `X-RateLimit-Reset`
+/// on per-route token-bucket admission failures).
+#[derive(Debug)]
+pub(crate) struct Decision {
+    pub(crate) status: u16,
+    pub(crate) reason: std::borrow::Cow<'static, str>,
+    pub(crate) error_page_html: Option<String>,
+    pub(crate) extra_headers: Vec<(&'static str, String)>,
+}
+
+impl Decision {
+    /// Construct a rejection with the given HTTP status and reason.
+    /// `reason` is the human-readable body message rendered into the
+    /// default error page (and substituted into `{{message}}` of any
+    /// per-route `error_page_html`). Pass `&'static str` literals
+    /// when the message is fixed ; pass `String` when formatting in
+    /// runtime context.
+    pub(crate) fn reject(status: u16, reason: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self {
+            status,
+            reason: reason.into(),
+            error_page_html: None,
+            extra_headers: Vec::new(),
+        }
+    }
+
+    /// Attach a per-route custom error-page HTML override. When
+    /// `Some(_)`, the rendered body uses this template (with the same
+    /// `{{status}}` / `{{message}}` substitutions as
+    /// `render_error_body`). When `None`, the default Lorica three-tier
+    /// page is rendered instead.
+    pub(crate) fn with_html(mut self, html: Option<String>) -> Self {
+        self.error_page_html = html;
+        self
+    }
+
+    /// Add one extra response header beyond the Content-Type /
+    /// Content-Length pair `write_decision` always sets. Common uses :
+    /// `("Retry-After", "1")` on rate-limit or maintenance-mode
+    /// rejections, `("X-RateLimit-Reset", "<unix_ts>")` on per-route
+    /// token-bucket failures.
+    pub(crate) fn with_header(mut self, name: &'static str, value: String) -> Self {
+        self.extra_headers.push((name, value));
+        self
+    }
+}
+
 /// Render a default-or-custom error page AND write the response back
 /// to the client in one call.
 ///
-/// Replaces the 17 inline blocks scattered through `request_filter`
-/// that all repeated the same five-step pattern :
-/// `extract_host` -> `render_error_body` -> `ResponseHeader::build`
-/// -> `insert_header` for `Content-Type` / `Content-Length` ->
-/// `write_response_header` + `write_response_body` + `Ok(true)`.
+/// Replaces the 18 inline blocks scattered through `request_filter`
+/// and `request_body_filter` that all repeated the same five-step
+/// pattern : `extract_host` -> `render_error_body` ->
+/// `ResponseHeader::build` -> `insert_header` for `Content-Type` /
+/// `Content-Length` -> `write_response_header` + `write_response_body`
+/// + `Ok(true)`.
 ///
-/// `extra_headers` is the escape hatch for sites that need additional
-/// headers beyond `Content-Type` / `Content-Length` - rate-limit
-/// rejects pass `("Retry-After", "1")` and `("X-RateLimit-Reset",
-/// reset_ts.to_string())`. Pre-extraction, only one of the seventeen
-/// sites carried `Retry-After` and only one carried
-/// `X-RateLimit-Reset` ; the rest silently dropped them. Folding the
-/// drift into a first-class parameter makes the per-site policy
-/// explicit at the call site instead of buried in five lines of
-/// boilerplate.
+/// Per-site extra headers (Retry-After, X-RateLimit-Reset) are
+/// declared at the call site via [`Decision::with_header`] - the
+/// pre-extraction state had only one site carrying Retry-After and
+/// only one carrying X-RateLimit-Reset, with the rest silently
+/// dropping them.
 ///
 /// Returns `Ok(true)` on success - the request_filter contract for
 /// "this request was handled, do not proxy upstream".
 pub(crate) async fn write_decision(
     session: &mut lorica_proxy::Session,
     request_id: &str,
-    status: u16,
-    error_page_html: Option<&str>,
-    reason: &str,
-    extra_headers: &[(&'static str, String)],
+    decision: Decision,
 ) -> lorica_error::Result<bool> {
     let host_header = super::helpers::extract_host(session.req_header()).to_string();
-    let body = render_error_body(status, request_id, &host_header, error_page_html, reason);
-    let mut header = lorica_http::ResponseHeader::build(status, None)?;
-    for (name, value) in extra_headers {
+    let body = render_error_body(
+        decision.status,
+        request_id,
+        &host_header,
+        decision.error_page_html.as_deref(),
+        &decision.reason,
+    );
+    let mut header = lorica_http::ResponseHeader::build(decision.status, None)?;
+    for (name, value) in &decision.extra_headers {
         header.insert_header(*name, value)?;
     }
     header.insert_header("Content-Type", "text/html; charset=utf-8")?;

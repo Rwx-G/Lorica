@@ -311,7 +311,7 @@ pub mod engines;
 pub use engines::{BreakerAdmission, BreakerEngine, RateLimitEngine, VerdictCacheEngine};
 
 pub mod error_pages;
-pub(crate) use error_pages::{render_error_body, write_decision};
+pub(crate) use error_pages::{render_error_body, write_decision, Decision};
 
 impl LoricaProxy {
     pub fn new(
@@ -1434,10 +1434,7 @@ impl ProxyHttp for LoricaProxy {
                     return write_decision(
                         session,
                         &ctx.request_id,
-                        503,
-                        None,
-                        "Global connection limit exceeded",
-                        &[],
+                        Decision::reject(503, "Global connection limit exceeded"),
                     )
                     .await;
                 }
@@ -1520,10 +1517,7 @@ impl ProxyHttp for LoricaProxy {
                         return write_decision(
                             session,
                             &ctx.request_id,
-                            403,
-                            None,
-                            "IP banned",
-                            &[],
+                            Decision::reject(403, "IP banned"),
                         )
                         .await;
                     }
@@ -1568,10 +1562,7 @@ impl ProxyHttp for LoricaProxy {
                         return write_decision(
                             session,
                             &ctx.request_id,
-                            403,
-                            None,
-                            "IP blocked",
-                            &[],
+                            Decision::reject(403, "IP blocked"),
                         )
                         .await;
                     }
@@ -1610,10 +1601,8 @@ impl ProxyHttp for LoricaProxy {
                         return write_decision(
                             session,
                             &ctx.request_id,
-                            403,
-                            entry.route.error_page_html.as_deref(),
-                            "WebSocket upgrades disabled on this route",
-                            &[],
+                            Decision::reject(403, "WebSocket upgrades disabled on this route")
+                                .with_html(entry.route.error_page_html.clone()),
                         )
                         .await;
                     }
@@ -1699,10 +1688,9 @@ impl ProxyHttp for LoricaProxy {
                         return write_decision(
                             session,
                             &ctx.request_id,
-                            429,
-                            entry.route.error_page_html.as_deref(),
-                            "Rate limit exceeded",
-                            &[("Retry-After", retry_after.to_string())],
+                            Decision::reject(429, "Rate limit exceeded")
+                                .with_html(entry.route.error_page_html.clone())
+                                .with_header("Retry-After", retry_after.to_string()),
                         )
                         .await;
                     }
@@ -1732,10 +1720,8 @@ impl ProxyHttp for LoricaProxy {
                     return write_decision(
                         session,
                         &ctx.request_id,
-                        status,
-                        entry.route.error_page_html.as_deref(),
-                        message,
-                        &[],
+                        Decision::reject(status, message)
+                            .with_html(entry.route.error_page_html.clone()),
                     )
                     .await;
                 }
@@ -1797,10 +1783,8 @@ impl ProxyHttp for LoricaProxy {
                         return write_decision(
                             session,
                             &ctx.request_id,
-                            503,
-                            entry.route.error_page_html.as_deref(),
-                            "Authentication service unavailable",
-                            &[],
+                            Decision::reject(503, "Authentication service unavailable")
+                                .with_html(entry.route.error_page_html.clone()),
                         )
                         .await;
                     }
@@ -1980,10 +1964,9 @@ impl ProxyHttp for LoricaProxy {
                     return write_decision(
                         session,
                         &ctx.request_id,
-                        503,
-                        route.error_page_html.as_deref(),
-                        "Service under maintenance",
-                        &[("Retry-After", "300".to_string())],
+                        Decision::reject(503, "Service under maintenance")
+                            .with_html(route.error_page_html.clone())
+                            .with_header("Retry-After", "300".to_string()),
                     )
                     .await;
                 }
@@ -2107,15 +2090,12 @@ impl ProxyHttp for LoricaProxy {
                 let error_page_html = ctx
                     .route_snapshot
                     .as_ref()
-                    .and_then(|r| r.error_page_html.as_deref())
-                    .map(|s| s.to_string());
+                    .and_then(|r| r.error_page_html.clone());
                 return write_decision(
                     session,
                     &ctx.request_id,
-                    status,
-                    error_page_html.as_deref(),
-                    &format!("return_status {status}"),
-                    &[],
+                    Decision::reject(status, format!("return_status {status}"))
+                        .with_html(error_page_html),
                 )
                 .await;
             }
@@ -2149,10 +2129,8 @@ impl ProxyHttp for LoricaProxy {
                     return write_decision(
                         session,
                         &ctx.request_id,
-                        403,
-                        entry.route.error_page_html.as_deref(),
-                        "IP not in allowlist",
-                        &[],
+                        Decision::reject(403, "IP not in allowlist")
+                            .with_html(entry.route.error_page_html.clone()),
                     )
                     .await;
                 }
@@ -2161,10 +2139,8 @@ impl ProxyHttp for LoricaProxy {
                     return write_decision(
                         session,
                         &ctx.request_id,
-                        403,
-                        entry.route.error_page_html.as_deref(),
-                        "IP in denylist",
-                        &[],
+                        Decision::reject(403, "IP in denylist")
+                            .with_html(entry.route.error_page_html.clone()),
                     )
                     .await;
                 }
@@ -2222,10 +2198,8 @@ impl ProxyHttp for LoricaProxy {
                                 return write_decision(
                                     session,
                                     &ctx.request_id,
-                                    403,
-                                    entry.route.error_page_html.as_deref(),
-                                    &reason,
-                                    &[],
+                                    Decision::reject(403, reason)
+                                        .with_html(entry.route.error_page_html.clone()),
                                 )
                                 .await;
                             }
@@ -2488,10 +2462,8 @@ impl ProxyHttp for LoricaProxy {
                     return write_decision(
                         session,
                         &ctx.request_id,
-                        408,
-                        entry.route.error_page_html.as_deref(),
-                        "Request headers took too long",
-                        &[],
+                        Decision::reject(408, "Request headers took too long")
+                            .with_html(entry.route.error_page_html.clone()),
                     )
                     .await;
                 }
@@ -2520,15 +2492,12 @@ impl ProxyHttp for LoricaProxy {
                     let custom_html = ctx
                         .route_snapshot
                         .as_ref()
-                        .and_then(|r| r.error_page_html.as_deref())
-                        .map(|s| s.to_string());
+                        .and_then(|r| r.error_page_html.clone());
                     return write_decision(
                         session,
                         &ctx.request_id,
-                        503,
-                        custom_html.as_deref(),
-                        "Route connection limit exceeded",
-                        &[],
+                        Decision::reject(503, "Route connection limit exceeded")
+                            .with_html(custom_html),
                     )
                     .await;
                 }
@@ -2673,13 +2642,10 @@ impl ProxyHttp for LoricaProxy {
                             return write_decision(
                                 session,
                                 &ctx.request_id,
-                                429,
-                                entry.route.error_page_html.as_deref(),
-                                "Rate limit exceeded",
-                                &[
-                                    ("Retry-After", "1".to_string()),
-                                    ("X-RateLimit-Reset", reset_ts.to_string()),
-                                ],
+                                Decision::reject(429, "Rate limit exceeded")
+                                    .with_html(entry.route.error_page_html.clone())
+                                    .with_header("Retry-After", "1".to_string())
+                                    .with_header("X-RateLimit-Reset", reset_ts.to_string()),
                             )
                             .await;
                         }
@@ -2827,10 +2793,8 @@ impl ProxyHttp for LoricaProxy {
                     write_decision(
                         session,
                         &ctx.request_id,
-                        403,
-                        entry.route.error_page_html.as_deref(),
-                        "Request blocked by WAF",
-                        &[],
+                        Decision::reject(403, "Request blocked by WAF")
+                            .with_html(entry.route.error_page_html.clone()),
                     )
                     .await
                 }
@@ -3076,15 +3040,12 @@ impl ProxyHttp for LoricaProxy {
                             let custom_html = ctx
                                 .route_snapshot
                                 .as_ref()
-                                .and_then(|r| r.error_page_html.as_deref())
-                                .map(|s| s.to_string());
+                                .and_then(|r| r.error_page_html.clone());
                             let _ = write_decision(
                                 session,
                                 &ctx.request_id,
-                                403,
-                                custom_html.as_deref(),
-                                "Request body blocked by WAF",
-                                &[],
+                                Decision::reject(403, "Request body blocked by WAF")
+                                    .with_html(custom_html),
                             )
                             .await?;
                             *body = None;
