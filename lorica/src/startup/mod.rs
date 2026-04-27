@@ -21,3 +21,4 @@ pub mod logging;
 pub mod notify;
 pub mod otel;
 pub mod signals;
+pub mod waf_uds;

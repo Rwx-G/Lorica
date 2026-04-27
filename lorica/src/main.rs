@@ -945,144 +945,19 @@ fn run_supervisor(cli: Cli) {
         let waf_event_buffer = waf_engine.event_buffer();
         let waf_rule_count = waf_engine.rule_count();
 
-        // UDS WAF event stream: workers forward WAF events to the supervisor
-        let waf_sock_path = data_dir.join("waf.sock");
-        let _ = std::fs::remove_file(&waf_sock_path);
-        let waf_listener = tokio::net::UnixListener::bind(&waf_sock_path)
-            .expect("failed to bind WAF socket");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&waf_sock_path, std::fs::Permissions::from_mode(0o660));
-        }
-        let waf_event_sink = Arc::clone(&waf_event_buffer);
-        let waf_alert_sender = alert_sender.clone();
-        // Cross-worker WAF auto-ban counter lives in the shmem region
-        // (see lorica-shmem::SharedRegion::waf_auto_ban). The supervisor
-        // is the sole ban-issuer: it increments on each UDS event,
-        // compares to the configured threshold, and on crossing
-        // broadcasts BanIp then resets the slot so the next round of
-        // violations starts at zero.
-        let waf_shmem = shmem_region;
-        let waf_ban_tx = ban_bc_tx.clone();
-        let waf_ban_store = Arc::clone(&store);
-        tokio::spawn(async move {
-            loop {
-                match waf_listener.accept().await {
-                    Ok((stream, _)) => {
-                        let sink = Arc::clone(&waf_event_sink);
-                        let alert_tx = waf_alert_sender.clone();
-                        let ban_tx = waf_ban_tx.clone();
-                        let ban_store = Arc::clone(&waf_ban_store);
-                        let shmem = waf_shmem;
-                        tokio::spawn(async move {
-                            let mut reader = tokio::io::BufReader::new(stream);
-                            let mut line = String::new();
-                            loop {
-                                line.clear();
-                                match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
-                                    Ok(0) => break,
-                                    Ok(_) => {
-                                        if let Ok(event) = serde_json::from_str::<lorica_waf::WafEvent>(&line) {
-                                            // Workers insert WAF events into the DB directly
-                                            // (with route_hostname and action stamped), so we
-                                            // skip the insert here to avoid duplicates.
-
-                                            // Dispatch WAF alert notification
-                                            alert_tx.send(
-                                                lorica_notify::AlertEvent::new(
-                                                    lorica_notify::events::AlertType::WafAlert,
-                                                    format!("WAF {}: {} (rule {})", event.category.as_str(), event.description, event.rule_id),
-                                                )
-                                                .with_detail("rule_id", event.rule_id.to_string())
-                                                .with_detail("category", event.category.as_str().to_string())
-                                                .with_detail("severity", event.severity.to_string()),
-                                            );
-
-                                            // Global WAF auto-ban: read the cross-worker shmem
-                                            // counter. Workers have already bumped it in their
-                                            // hot path (see proxy_wiring.rs). The supervisor
-                                            // compares against the configured threshold and,
-                                            // on the first crossing, broadcasts BanIp and
-                                            // resets the slot so the next round starts at zero.
-                                            //
-                                            // Concurrent UDS events for the same IP can race:
-                                            // task A reads shmem >= threshold, decides to ban,
-                                            // resets; task B reads (post-A's read, pre-A's
-                                            // reset) ALSO sees >= threshold and broadcasts a
-                                            // duplicate BanIp. The race is bounded by the
-                                            // burst size of WAF events for one IP within a few
-                                            // microseconds, and the duplicate broadcast is
-                                            // idempotent (DashMap insert + same duration). The
-                                            // ban_list arrives at every worker exactly the
-                                            // same way; the only effect is one extra notify
-                                            // alert dispatch. Acceptable.
-                                            if !event.client_ip.is_empty() && event.client_ip != "-" {
-                                                let s = ban_store.lock().await;
-                                                let (threshold, duration_s) = s.get_global_settings()
-                                                    .map(|gs| (gs.waf_ban_threshold as u64, gs.waf_ban_duration_s as u64))
-                                                    .unwrap_or((0, 600));
-                                                drop(s);
-
-                                                if threshold > 0 {
-                                                    let key = lorica::proxy_wiring::ip_to_shmem_key(
-                                                        &event.client_ip,
-                                                    );
-                                                    let tagged = shmem.tagged(key);
-                                                    let count = shmem
-                                                        .waf_auto_ban
-                                                        .read(tagged)
-                                                        .unwrap_or(0);
-                                                    if count >= threshold {
-                                                        // Reset slot so concurrent/future
-                                                        // violations after broadcast start
-                                                        // fresh. CAS failure is benign (another
-                                                        // event raced and we already broadcast).
-                                                        let _ = shmem
-                                                            .waf_auto_ban
-                                                            .reset(tagged);
-                                                        warn!(
-                                                            ip = %event.client_ip,
-                                                            violations = %count,
-                                                            ban_duration_s = %duration_s,
-                                                            "global WAF auto-ban: IP banned for repeated violations"
-                                                        );
-                                                        // Broadcast BanIp to all workers
-                                                        let _ = ban_tx.send((event.client_ip.clone(), duration_s));
-                                                        // Dispatch ip_banned alert
-                                                        alert_tx.send(
-                                                            lorica_notify::AlertEvent::new(
-                                                                lorica_notify::events::AlertType::IpBanned,
-                                                                format!(
-                                                                    "IP {} auto-banned for repeated WAF violations",
-                                                                    event.client_ip
-                                                                ),
-                                                            )
-                                                            .with_detail("ip", event.client_ip.clone())
-                                                            .with_detail("violations", count.to_string())
-                                                            .with_detail("ban_duration_s", duration_s.to_string()),
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            let mut buf = sink.lock();
-                                            if buf.len() >= 500 {
-                                                buf.pop_front();
-                                            }
-                                            buf.push_back(event);
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "WAF socket accept failed");
-                    }
-                }
-            }
-        });
+        // UDS WAF event stream : workers forward WafEvent JSON lines
+        // to the supervisor. The listener buffers events for the
+        // dashboard, dispatches alerts, and acts as the sole ban-issuer
+        // via the cross-worker shmem auto-ban counter.
+        // See `startup/waf_uds.rs`.
+        startup::waf_uds::spawn_waf_uds_listener(
+            &data_dir,
+            Arc::clone(&waf_event_buffer),
+            alert_sender.clone(),
+            shmem_region,
+            ban_bc_tx.clone(),
+            Arc::clone(&store),
+        );
 
         // Restore WAF state from persisted settings
         {
