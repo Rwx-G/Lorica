@@ -2272,96 +2272,16 @@ impl ProxyHttp for LoricaProxy {
                 }
             }
 
-            // Per-route rate limiting (skipped for whitelisted IPs)
-            if !is_whitelisted {
-                if let Some(rps) = entry.route.rate_limit_rps {
-                    if let Some(ref ip) = check_ip {
-                        let key = format!("{}:{}", entry.route.id, ip);
-                        self.rate_limiter.observe(&key, 1);
-                        let current_rate = self.rate_limiter.rate(&key);
-                        let mut effective_limit = match entry.route.rate_limit_burst {
-                            Some(burst) => (rps + burst) as f64,
-                            None => rps as f64,
-                        };
-
-                        // Adaptive flood defense: when global RPS exceeds the
-                        // configured threshold, halve per-IP rate limits.
-                        let threshold = config.flood_threshold_rps;
-                        if threshold > 0 {
-                            let global_rps = self.global_rate.rate(&"global");
-                            if global_rps > threshold as f64 {
-                                effective_limit *= 0.5;
-                            }
-                        }
-                        // Store rate info for response headers (even if not throttled)
-                        ctx.rate_limit_info = Some((rps, current_rate));
-
-                        if current_rate > effective_limit {
-                            warn!(
-                                route_id = %entry.route.id,
-                                client_ip = %ip,
-                                current_rate = %current_rate,
-                                limit_rps = %rps,
-                                "request rate-limited (429)"
-                            );
-
-                            // Track rate limit violations for auto-ban
-                            if let Some(ban_threshold) = entry.route.auto_ban_threshold {
-                                let violation_key = format!("violation:{}", ip);
-                                self.rate_violations.observe(&violation_key, 1);
-                                let violations = self.rate_violations.rate(&violation_key);
-                                if violations > ban_threshold as f64 {
-                                    let ban_duration = entry.route.auto_ban_duration_s;
-                                    self.ban_list.insert(
-                                        ip.to_string(),
-                                        (Instant::now(), ban_duration as u64),
-                                    );
-                                    warn!(
-                                        ip = %ip,
-                                        violations = %violations,
-                                        ban_duration_s = %ban_duration,
-                                        "IP auto-banned for rate limit abuse"
-                                    );
-                                    // Dispatch ip_banned notification
-                                    if let Some(ref sender) = self.alert_sender {
-                                        sender.send(
-                                            lorica_notify::AlertEvent::new(
-                                                lorica_notify::events::AlertType::IpBanned,
-                                                format!(
-                                                    "IP {} auto-banned for rate limit abuse",
-                                                    ip
-                                                ),
-                                            )
-                                            .with_detail("ip", ip.to_string())
-                                            .with_detail("violations", violations.to_string())
-                                            .with_detail(
-                                                "ban_duration_s",
-                                                ban_duration.to_string(),
-                                            ),
-                                        );
-                                    }
-                                }
-                            }
-
-                            let reset_ts = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs()
-                                + 1;
-                            ctx.block_reason = Some("rate limited".to_string());
-                            return write_decision(
-                                session,
-                                &ctx.request_id,
-                                Decision::reject(429, "Rate limit exceeded")
-                                    .with_html(entry.route.error_page_html.clone())
-                                    .with_header("Retry-After", "1".to_string())
-                                    .with_header("X-RateLimit-Reset", reset_ts.to_string()),
-                            )
-                            .await;
-                        }
-                    }
-                }
-            } // end if !is_whitelisted (rate limiting)
+            // Per-route legacy rate limiting (route-aware reject ; see
+            // check_legacy_rate_limit). Distinct from check_token_
+            // bucket_rate_limit which handles the newer RateLimit
+            // struct path. Both paths coexist pending backlog #29
+            // unification.
+            if let Some(d) =
+                self.check_legacy_rate_limit(ctx, entry, check_ip.as_deref(), is_whitelisted)
+            {
+                return write_decision(session, &ctx.request_id, d).await;
+            }
 
             // Skip WAF evaluation entirely if not enabled or IP is whitelisted (zero overhead)
             if is_whitelisted || !entry.route.waf_enabled {

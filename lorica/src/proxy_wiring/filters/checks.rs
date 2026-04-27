@@ -26,7 +26,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::warn;
 
@@ -419,6 +419,111 @@ impl LoricaProxy {
                 Decision::reject(403, reason)
                     .with_html(entry.route.error_page_html.clone()),
             ),
+        )
+    }
+
+    /// Legacy per-route rate limit (the `rate_limit_rps` field, distinct
+    /// from the newer `RateLimit` struct token-bucket path handled by
+    /// `check_token_bucket_rate_limit`). Tracks per-(route, client-IP)
+    /// rate via `self.rate_limiter`, applies the global flood-defense
+    /// halving when global RPS exceeds `flood_threshold_rps`, and on
+    /// throttle :
+    ///
+    /// - Bumps `self.rate_violations` for the IP and inserts into
+    ///   `self.ban_list` when the count crosses `auto_ban_threshold`
+    ///   (auto-ban escalation).
+    /// - Dispatches an `IpBanned` notification via the alert sender.
+    /// - Returns `Decision::reject(429, ...)` with `Retry-After: 1`
+    ///   and `X-RateLimit-Reset` headers.
+    ///
+    /// Whitelisted IPs and routes without `rate_limit_rps` set fall
+    /// through. Always sets `ctx.rate_limit_info` for the response
+    /// header injection downstream, even when not throttled.
+    pub(crate) fn check_legacy_rate_limit(
+        &self,
+        ctx: &mut RequestCtx,
+        entry: &Arc<RouteEntry>,
+        client_ip: Option<&str>,
+        is_whitelisted: bool,
+    ) -> Option<Decision> {
+        if is_whitelisted {
+            return None;
+        }
+        let rps = entry.route.rate_limit_rps?;
+        let ip = client_ip?;
+        let key = format!("{}:{}", entry.route.id, ip);
+        self.rate_limiter.observe(&key, 1);
+        let current_rate = self.rate_limiter.rate(&key);
+        let mut effective_limit = match entry.route.rate_limit_burst {
+            Some(burst) => (rps + burst) as f64,
+            None => rps as f64,
+        };
+
+        // Adaptive flood defense : when global RPS exceeds the
+        // configured threshold, halve per-IP rate limits.
+        let threshold = self.config.load().flood_threshold_rps;
+        if threshold > 0 {
+            let global_rps = self.global_rate.rate(&"global");
+            if global_rps > threshold as f64 {
+                effective_limit *= 0.5;
+            }
+        }
+        // Store rate info for response headers (even if not throttled).
+        ctx.rate_limit_info = Some((rps, current_rate));
+
+        if current_rate <= effective_limit {
+            return None;
+        }
+        warn!(
+            route_id = %entry.route.id,
+            client_ip = %ip,
+            current_rate = %current_rate,
+            limit_rps = %rps,
+            "request rate-limited (429)"
+        );
+
+        // Track rate-limit violations for auto-ban.
+        if let Some(ban_threshold) = entry.route.auto_ban_threshold {
+            let violation_key = format!("violation:{}", ip);
+            self.rate_violations.observe(&violation_key, 1);
+            let violations = self.rate_violations.rate(&violation_key);
+            if violations > ban_threshold as f64 {
+                let ban_duration = entry.route.auto_ban_duration_s;
+                self.ban_list.insert(
+                    ip.to_string(),
+                    (Instant::now(), ban_duration as u64),
+                );
+                warn!(
+                    ip = %ip,
+                    violations = %violations,
+                    ban_duration_s = %ban_duration,
+                    "IP auto-banned for rate limit abuse"
+                );
+                if let Some(ref sender) = self.alert_sender {
+                    sender.send(
+                        lorica_notify::AlertEvent::new(
+                            lorica_notify::events::AlertType::IpBanned,
+                            format!("IP {} auto-banned for rate limit abuse", ip),
+                        )
+                        .with_detail("ip", ip.to_string())
+                        .with_detail("violations", violations.to_string())
+                        .with_detail("ban_duration_s", ban_duration.to_string()),
+                    );
+                }
+            }
+        }
+
+        let reset_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + 1;
+        ctx.block_reason = Some("rate limited".to_string());
+        Some(
+            Decision::reject(429, "Rate limit exceeded")
+                .with_html(entry.route.error_page_html.clone())
+                .with_header("Retry-After", "1".to_string())
+                .with_header("X-RateLimit-Reset", reset_ts.to_string()),
         )
     }
 
