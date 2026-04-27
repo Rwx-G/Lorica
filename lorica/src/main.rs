@@ -417,71 +417,15 @@ fn run_supervisor(cli: Cli) {
         // trigger in place and allows the spawn.
 
         // UDS log stream: workers send access logs in real-time to the supervisor
-        let log_sock_path = data_dir.join("log.sock");
-        let _ = std::fs::remove_file(&log_sock_path); // clean stale socket
-        let log_listener = tokio::net::UnixListener::bind(&log_sock_path)
-            .expect("failed to bind log socket");
-        // Make socket writable by the lorica user (workers run as same user)
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&log_sock_path, std::fs::Permissions::from_mode(0o660));
-        }
-        let log_sink = Arc::clone(&log_buffer);
-        tokio::spawn(async move {
-            loop {
-                match log_listener.accept().await {
-                    Ok((stream, _)) => {
-                        let sink = Arc::clone(&log_sink);
-                        tokio::spawn(async move {
-                            let mut reader = tokio::io::BufReader::new(stream);
-                            let mut line = String::new();
-                            loop {
-                                line.clear();
-                                match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
-                                    Ok(0) => break, // EOF - worker disconnected
-                                    Ok(_) => {
-                                        if let Ok(entry) = serde_json::from_str::<lorica_api::logs::LogEntry>(&line) {
-                                            // Workers persist access logs directly via their own
-                                            // LogStore, so we only push to the in-memory buffer
-                                            // here (for WebSocket streaming to the dashboard).
-                                            sink.push(entry);
-                                        }
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "log socket accept failed");
-                    }
-                }
-            }
-        });
+        // Log UDS forwarder (workers -> supervisor LogBuffer for the
+        // dashboard's WebSocket log stream). See `startup/log_uds.rs`.
+        startup::log_uds::spawn_log_uds_listener(&data_dir, Arc::clone(&log_buffer));
 
-        // Shared-memory region eviction task. The supervisor is the sole
-        // evictor; workers only read and increment. See
-        // docs/architecture/worker-shared-state.md § 5.4. Cadence and
-        // staleness come from `lorica_shmem::DEFAULT_SCAN_INTERVAL` (60s)
-        // and `DEFAULT_STALE_AFTER` (5 min) respectively.
-        {
-            let region = shmem_region;
-            tokio::spawn(async move {
-                let mut tick =
-                    tokio::time::interval(lorica_shmem::DEFAULT_SCAN_INTERVAL);
-                tick.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Delay,
-                );
-                tick.tick().await; // skip the immediate tick
-                let stale_ns = lorica_shmem::DEFAULT_STALE_AFTER.as_nanos() as u64;
-                loop {
-                    tick.tick().await;
-                    let now = lorica_shmem::now_ns();
-                    let stats = lorica_shmem::evict_once(region, now, stale_ns);
-                    lorica_shmem::eviction::log_pass(stats);
-                }
-            });
-        }
+        // Shared-memory region eviction task (supervisor is the sole
+        // evictor ; workers only read + increment). See
+        // `startup/shmem_eviction.rs` and
+        // docs/architecture/worker-shared-state.md § 5.4.
+        startup::shmem_eviction::spawn_shmem_eviction_task(shmem_region);
 
         // Broadcast channel: API config changes fan out to all per-worker tasks
         let (reload_bc_tx, _) = broadcast::channel::<u64>(16);

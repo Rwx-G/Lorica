@@ -17,8 +17,10 @@
 
 pub mod control_plane;
 pub mod data_plane;
+pub mod log_uds;
 pub mod logging;
 pub mod notify;
 pub mod otel;
+pub mod shmem_eviction;
 pub mod signals;
 pub mod waf_uds;
