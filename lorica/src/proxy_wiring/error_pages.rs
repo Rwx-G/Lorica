@@ -351,6 +351,21 @@ fn badge(is_broken: bool) -> (&'static str, &'static str, &'static str, &'static
     }
 }
 
+/// What body to write after the headers. Lets `Decision` model both
+/// rejection responses (default error page) and redirect responses
+/// (no body) without the call site needing to know which is which.
+#[derive(Debug, Default)]
+pub(crate) enum DecisionBody {
+    /// Render the standard Lorica error page (or per-route
+    /// `error_page_html` override). Default.
+    #[default]
+    ErrorPage,
+    /// No response body. Used by `return_status + redirect_to`
+    /// where the response carries only a `Location` header and
+    /// terminates after the header line.
+    Empty,
+}
+
 /// A request_filter rejection that has not yet been written to the
 /// downstream session.
 ///
@@ -363,17 +378,20 @@ fn badge(is_broken: bool) -> (&'static str, &'static str, &'static str, &'static
 /// }
 /// ```
 ///
-/// Use [`Decision::reject`] to construct the common case ; chain
+/// Use [`Decision::reject`] for the common error-page case ; chain
 /// `with_html` / `with_header` for sites that carry a per-route
 /// custom error page or need extra response headers (e.g.
 /// `Retry-After` on rate-limit / maintenance, or `X-RateLimit-Reset`
-/// on per-route token-bucket admission failures).
+/// on per-route token-bucket admission failures). Use
+/// [`Decision::redirect`] for `return_status + redirect_to` where the
+/// response is a status code + `Location` header with no body.
 #[derive(Debug)]
 pub(crate) struct Decision {
     pub(crate) status: u16,
     pub(crate) reason: std::borrow::Cow<'static, str>,
     pub(crate) error_page_html: Option<String>,
     pub(crate) extra_headers: Vec<(&'static str, String)>,
+    pub(crate) body: DecisionBody,
 }
 
 impl Decision {
@@ -389,6 +407,21 @@ impl Decision {
             reason: reason.into(),
             error_page_html: None,
             extra_headers: Vec::new(),
+            body: DecisionBody::ErrorPage,
+        }
+    }
+
+    /// Construct a redirect response : the given status (typically
+    /// 301 / 302 / 307 / 308) plus a `Location: <location>` header.
+    /// No body is written. Used for `return_status + redirect_to`
+    /// and route-level `redirect_to` paths.
+    pub(crate) fn redirect(status: u16, location: String) -> Self {
+        Self {
+            status,
+            reason: std::borrow::Cow::Borrowed(""),
+            error_page_html: None,
+            extra_headers: vec![("Location", location)],
+            body: DecisionBody::Empty,
         }
     }
 
@@ -396,17 +429,17 @@ impl Decision {
     /// `Some(_)`, the rendered body uses this template (with the same
     /// `{{status}}` / `{{message}}` substitutions as
     /// `render_error_body`). When `None`, the default Lorica three-tier
-    /// page is rendered instead.
+    /// page is rendered instead. No-op for `DecisionBody::Empty`.
     pub(crate) fn with_html(mut self, html: Option<String>) -> Self {
         self.error_page_html = html;
         self
     }
 
     /// Add one extra response header beyond the Content-Type /
-    /// Content-Length pair `write_decision` always sets. Common uses :
-    /// `("Retry-After", "1")` on rate-limit or maintenance-mode
-    /// rejections, `("X-RateLimit-Reset", "<unix_ts>")` on per-route
-    /// token-bucket failures.
+    /// Content-Length pair `write_decision` always sets for the
+    /// error-page body. Common uses : `("Retry-After", "1")` on
+    /// rate-limit or maintenance-mode rejections, `("X-RateLimit-
+    /// Reset", "<unix_ts>")` on per-route token-bucket failures.
     pub(crate) fn with_header(mut self, name: &'static str, value: String) -> Self {
         self.extra_headers.push((name, value));
         self
@@ -436,27 +469,45 @@ pub(crate) async fn write_decision(
     request_id: &str,
     decision: Decision,
 ) -> lorica_error::Result<bool> {
-    let host_header = super::helpers::extract_host(session.req_header()).to_string();
-    let body = render_error_body(
-        decision.status,
-        request_id,
-        &host_header,
-        decision.error_page_html.as_deref(),
-        &decision.reason,
-    );
-    let mut header = lorica_http::ResponseHeader::build(decision.status, None)?;
-    for (name, value) in &decision.extra_headers {
-        header.insert_header(*name, value)?;
+    match decision.body {
+        DecisionBody::Empty => {
+            // Header-only response (return_status + redirect_to,
+            // route-level redirect_to). The `true` flag on
+            // write_response_header signals end of response, no body
+            // chunk follows.
+            let mut header = lorica_http::ResponseHeader::build(decision.status, None)?;
+            for (name, value) in &decision.extra_headers {
+                header.insert_header(*name, value)?;
+            }
+            session
+                .write_response_header(Box::new(header), true)
+                .await?;
+            Ok(true)
+        }
+        DecisionBody::ErrorPage => {
+            let host_header = super::helpers::extract_host(session.req_header()).to_string();
+            let body = render_error_body(
+                decision.status,
+                request_id,
+                &host_header,
+                decision.error_page_html.as_deref(),
+                &decision.reason,
+            );
+            let mut header = lorica_http::ResponseHeader::build(decision.status, None)?;
+            for (name, value) in &decision.extra_headers {
+                header.insert_header(*name, value)?;
+            }
+            header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+            header.insert_header("Content-Length", body.len().to_string())?;
+            session
+                .write_response_header(Box::new(header), false)
+                .await?;
+            session
+                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                .await?;
+            Ok(true)
+        }
     }
-    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-    header.insert_header("Content-Length", body.len().to_string())?;
-    session
-        .write_response_header(Box::new(header), false)
-        .await?;
-    session
-        .write_response_body(Some(bytes::Bytes::from(body)), true)
-        .await?;
-    Ok(true)
 }
 
 #[cfg(test)]

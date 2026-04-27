@@ -32,6 +32,7 @@ use tracing::warn;
 
 use lorica_proxy::Session;
 
+use super::super::build_redirect_location;
 use super::super::context::RequestCtx;
 use super::super::error_pages::Decision;
 use super::super::helpers::{downstream_ssl_digest, evaluate_mtls, extract_host, ip_matches};
@@ -418,6 +419,40 @@ impl LoricaProxy {
                 Decision::reject(403, reason)
                     .with_html(entry.route.error_page_html.clone()),
             ),
+        )
+    }
+
+    /// Per-route `return_status` directive : when set, the request
+    /// short-circuits with the configured status code instead of being
+    /// proxied. Two shapes :
+    ///
+    /// - `return_status` alone : direct response with the default
+    ///   Lorica error page (or per-route `error_page_html` override).
+    /// - `return_status + redirect_to` : `Location:` redirect with
+    ///   the configured status (typically 301 / 302) + no body. The
+    ///   target URL is built via `build_redirect_location` which
+    ///   honours the path-rule `literal_redirect` flag.
+    pub(crate) fn check_return_status(
+        &self,
+        req: &lorica_http::RequestHeader,
+        ctx: &mut RequestCtx,
+    ) -> Option<Decision> {
+        let route = ctx.route_snapshot.as_ref()?;
+        let status = route.return_status?;
+        ctx.block_reason = Some(format!("return_status {status}"));
+        if let Some(ref target) = route.redirect_to {
+            let location = build_redirect_location(
+                target,
+                req.uri.path(),
+                req.uri.query(),
+                ctx.path_rule_literal_redirect,
+            );
+            return Some(Decision::redirect(status, location));
+        }
+        let error_page_html = route.error_page_html.clone();
+        Some(
+            Decision::reject(status, format!("return_status {status}"))
+                .with_html(error_page_html),
         )
     }
 }

@@ -1126,7 +1126,7 @@ fn generate_request_id() -> String {
 /// trimmed. This is the documented migration-friendly behavior:
 /// pointing `old.example.com` at `https://new.example.com/` preserves
 /// every subpath.
-fn build_redirect_location(
+pub(crate) fn build_redirect_location(
     target: &str,
     req_path: &str,
     req_query: Option<&str>,
@@ -1916,47 +1916,13 @@ impl ProxyHttp for LoricaProxy {
                 }
             }
 
-            // Direct status response (return_status)
-            if let Some(status) = ctx.route_snapshot.as_ref().and_then(|r| r.return_status) {
-                ctx.block_reason = Some(format!("return_status {status}"));
-                if let Some(ref target) = ctx
-                    .route_snapshot
-                    .as_ref()
-                    .and_then(|r| r.redirect_to.clone())
-                {
-                    // return_status + redirect_to = redirect with specific status code
-                    let location = build_redirect_location(
-                        target,
-                        req.uri.path(),
-                        req.uri.query(),
-                        ctx.path_rule_literal_redirect,
-                    );
-                    let mut header = lorica_http::ResponseHeader::build(status, None)?;
-                    header.insert_header("Location", &location)?;
-                    session
-                        .write_response_header(Box::new(header), true)
-                        .await?;
-                    return Ok(true);
-                }
-                // return_status alone = direct response. Route the body
-                // through write_decision() so operators get Lorica's
-                // branded error page (or their own error_page_html when
-                // configured), consistent with every other terminal
-                // branch (403 IP / WAF / GeoIP, 429 rate limit,
-                // 502 / 504 upstream). Previously this path wrote empty
-                // headers only, which produced a blank page for
-                // return_status routes.
-                let error_page_html = ctx
-                    .route_snapshot
-                    .as_ref()
-                    .and_then(|r| r.error_page_html.clone());
-                return write_decision(
-                    session,
-                    &ctx.request_id,
-                    Decision::reject(status, format!("return_status {status}"))
-                        .with_html(error_page_html),
-                )
-                .await;
+            // Direct status response (return_status). Handles both
+            // return_status alone (renders error page via
+            // write_decision) and return_status + redirect_to
+            // (Decision::redirect, Location header + no body). See
+            // check_return_status.
+            if let Some(d) = self.check_return_status(req, ctx) {
+                return write_decision(session, &ctx.request_id, d).await;
             }
 
             // Redirect to external URL (read from snapshot, path rules may have overridden it)
