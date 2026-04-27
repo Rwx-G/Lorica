@@ -23,8 +23,6 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
 use lorica_api::logs::LogBuffer;
-use lorica_api::middleware::auth::SessionStore;
-use lorica_api::middleware::rate_limit::RateLimiter;
 use lorica_api::server::AppState;
 use lorica_api::system::SystemCache;
 use lorica_config::ConfigStore;
@@ -218,7 +216,7 @@ fn main() {
 
 fn run_supervisor(cli: Cli) {
     use lorica_command::{Command, CommandChannel, CommandType, Response};
-    use lorica_worker::manager::{WorkerConfig, WorkerEvent, WorkerManager};
+    use lorica_worker::manager::{WorkerConfig, WorkerManager};
     use std::os::fd::{IntoRawFd, RawFd};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -1025,370 +1023,79 @@ fn run_supervisor(cli: Cli) {
         // task's AppState and the shutdown drain path.
         let api_task_tracker = task_tracker.clone();
         let shutdown_task_tracker = task_tracker.clone();
-        // Clone the alert sender so the ACME renewal + cert-expiry
-        // background tasks spawned inside the API block can surface
-        // alerts through the same dispatcher the health / WAF paths
-        // already use. Single-process mode mirrors this at the matching
-        // spawn site further down (v1.5.2 fix: worker mode was missing
-        // auto-renewal entirely).
-        let api_alert_sender = alert_sender.clone();
-        let api_handle = tokio::spawn(async move {
-            let state = AppState {
-                store: api_store,
-                log_buffer: api_log_buffer,
-                system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
-                active_connections: api_active_connections,
-                started_at: Instant::now(),
-                data_dir: PathBuf::from(&cli.data_dir),
-                http_port: cli.http_port,
-                https_port: cli.https_port,
-                config_reload_tx: Some(config_reload_tx),
-                worker_metrics: Some(api_worker_metrics),
-                waf_event_buffer: Some(waf_event_buffer),
-                waf_engine: Some(waf_engine),
-                waf_rule_count: Some(waf_rule_count),
-                acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::with_db_path(api_db_path)),
-                pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
-                sla_collector: Some(Arc::clone(&sla_collector)),
-                load_test_engine: Some(Arc::clone(&load_test_engine)),
-                // cache/ban are per-worker process; aggregated via command channel
-                cache_hits: None,
-                cache_misses: None,
-                ban_list: None,
-                cache_backend: None,
-                ewma_scores: None,
-                backend_connections: None,
-                aggregated_metrics: Some(api_aggregated_metrics),
-                metrics_refresher: Some(api_metrics_refresher),
-                notification_history: Some(notification_history),
-                log_store: api_log_store,
-                task_tracker: api_task_tracker,
-            };
-            let session_store = SessionStore::new(Arc::clone(&state.store))
-                .await
-                .with_task_tracker(state.task_tracker.clone());
-            let rate_limiter = RateLimiter::new();
-
-            // Spawn ACME auto-renewal (check every 12h, renew at 30 days
-            // before expiry) and cert-expiry notifier for worker mode.
-            // Previously these tasks lived only in the single-process
-            // branch, so worker-mode installs went through cert expiry
-            // without warnings and never auto-renewed (v1.5.2 fix).
-            let _acme_renewal = lorica_api::acme::spawn_renewal_task(
-                state.clone(),
-                std::time::Duration::from_secs(12 * 3600),
-                30,
-                Some(api_alert_sender.clone()),
-            );
-            let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
-                state.clone(),
-                std::time::Duration::from_secs(12 * 3600),
-                api_alert_sender,
-            );
-
-            if let Err(e) =
-                lorica_api::server::start_server(management_port, state, session_store, rate_limiter)
-                    .await
-            {
-                error!(error = %e, "API server exited with error");
-            }
-        });
+        // Build the AppState here so `spawn_api_server` becomes a
+        // single helper call. Story 8.1 AC #1+#3 closure : moves the
+        // ~60-LOC inline tokio::spawn block (with 19 captures) out of
+        // run_supervisor. Single-process mode below uses the same
+        // helper to keep the two paths from drifting again.
+        let api_state = AppState {
+            store: api_store,
+            log_buffer: api_log_buffer,
+            system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
+            active_connections: api_active_connections,
+            started_at: Instant::now(),
+            data_dir: PathBuf::from(&cli.data_dir),
+            http_port: cli.http_port,
+            https_port: cli.https_port,
+            config_reload_tx: Some(config_reload_tx),
+            worker_metrics: Some(api_worker_metrics),
+            waf_event_buffer: Some(waf_event_buffer),
+            waf_engine: Some(waf_engine),
+            waf_rule_count: Some(waf_rule_count),
+            acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::with_db_path(api_db_path)),
+            pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
+            sla_collector: Some(Arc::clone(&sla_collector)),
+            load_test_engine: Some(Arc::clone(&load_test_engine)),
+            // cache/ban are per-worker process; aggregated via command channel
+            cache_hits: None,
+            cache_misses: None,
+            ban_list: None,
+            cache_backend: None,
+            ewma_scores: None,
+            backend_connections: None,
+            aggregated_metrics: Some(api_aggregated_metrics),
+            metrics_refresher: Some(api_metrics_refresher),
+            notification_history: Some(notification_history),
+            log_store: api_log_store,
+            task_tracker: api_task_tracker,
+        };
+        let api_handle =
+            startup::api_server::spawn_api_server(api_state, management_port, alert_sender.clone());
 
         // (Retention sweep moved to `startup::control_plane::spawn_control_plane_tasks`.)
 
-        // Worker monitoring loop (crash detection and restart with backoff)
+        // Worker monitoring loop (crash detection and restart with backoff).
+        // Story 8.1 AC #1+#3 closure : the ~260-LOC inline tokio::spawn
+        // block (with 14 captures) moved to `startup::worker_monitor`.
+        // The supervisor wraps `manager` in an Arc<std::sync::Mutex<>>
+        // here (not tokio) because `WorkerEvent` polling is sync ; the
+        // monitor briefly re-acquires the lock around each
+        // `restart_backoff` / `restart_worker` / `worker_pids` read so
+        // the lock is never held across `.await` (audit M-26 contract).
+        // `shutting_down` is the same flag the SIGTERM handler sets
+        // before `manager.shutdown_all()` ; the monitor short-circuits
+        // on it at three points (loop top, post-mutex, mid-backoff) so
+        // a shutdown-driven SIGKILL never triggers a respawn that races
+        // shutdown.
         let manager = Arc::new(std::sync::Mutex::new(manager));
-        let monitor_mgr = Arc::clone(&manager);
-        let monitor_reload_tx = reload_bc_tx.clone();
-        let monitor_ban_tx = ban_bc_tx.clone();
-        let monitor_seq = Arc::clone(&sequence);
-        let monitor_hb_metrics = Arc::clone(&worker_metrics);
-        let monitor_agg_metrics = Arc::clone(&aggregated_metrics);
-        let monitor_task_handles = Arc::clone(&worker_task_handles);
-        // Audit C-1 fix : the worker-respawn path now re-wires the
-        // RPC endpoint as well as the legacy command channel, so the
-        // supervisor's two-phase config-reload coordinator finds the
-        // restarted worker and stops silently skipping it. Cloning
-        // the deps the helper needs once at monitor scope so the
-        // crash branch can move them into `spawn_supervisor_rpc_handler`.
-        let monitor_rpc_endpoints = Arc::clone(&worker_rpc_endpoints);
-        let monitor_rl_registry = Arc::clone(&rl_registry);
-        let monitor_rl_policy = Arc::clone(&rl_policy_cache);
-        let monitor_store = Arc::clone(&store);
-        let monitor_verdict_cache = Arc::clone(&verdict_cache);
-        let monitor_breaker_registry = Arc::clone(&breaker_registry);
-        // `shutting_down` is declared above, shared with the per-worker
-        // heartbeat tasks. The monitor short-circuits on the same flag
-        // so shutdown-driven worker SIGKILLs don't trigger a respawn:
-        // `monitor_handle.abort()` alone is not enough because the
-        // monitor's loop blocks on `monitor_mgr.lock()` (a
-        // `std::sync::Mutex`, not a tokio one), so abort cannot fire
-        // while the supervisor is holding that mutex inside
-        // `manager.shutdown_all()`. The monitor would then unblock
-        // 30 s later, see the SIGKILL'd workers as crashed, and
-        // respawn them - the exact race that drove systemd to SIGKILL
-        // the whole service group past `TimeoutStopSec`.
-        let monitor_shutting_down = Arc::clone(&shutting_down);
-        let monitor_handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-
-                if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
-                    return;
-                }
-
-                let events = {
-                    let mgr = monitor_mgr.lock().unwrap_or_else(|e| {
-                        warn!("worker monitor mutex poisoned, recovering");
-                        e.into_inner()
-                    });
-                    // Re-check after acquiring the mutex: shutdown may have
-                    // grabbed the mutex while we waited (the supervisor
-                    // shutdown path holds it for the full ~30 s drain). If
-                    // we observe the flag now, the workers we are about to
-                    // see as "crashed" were actually SIGKILL'd by us and
-                    // must not be respawned.
-                    if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
-                        return;
-                    }
-                    mgr.check_workers()
-                };
-                // The std::sync::Mutex guard is dropped here on
-                // purpose. Audit M-26 closure : the per-event restart
-                // path below uses `tokio::time::sleep` for the
-                // exponential backoff, which is illegal across an
-                // .await while holding a !Send sync-Mutex guard.
-                // Re-acquire the lock briefly inside the loop for
-                // each `restart_backoff` / `restart_worker` /
-                // `worker_pids` read.
-                for event in events {
-                    let (id, log_msg) = match event {
-                        WorkerEvent::Exited { id, pid, status } => {
-                            warn!(worker_id = id, pid = pid.as_raw(), status, "worker exited");
-                            (id, "exited")
-                        }
-                        WorkerEvent::Crashed { id, pid, signal } => {
-                            error!(worker_id = id, pid = pid.as_raw(), signal = %signal, "worker crashed");
-                            (id, "crashed")
-                        }
-                    };
-
-                    // Abort the old heartbeat/reload task for this worker
-                    if let Some(old_handle) = monitor_task_handles.lock().remove(&id) {
-                        old_handle.abort();
-                        info!(worker_id = id, "aborted stale worker task");
-                    }
-
-                    // Re-check shutdown flag before respawning - a
-                    // crash detected just before SIGTERM should not
-                    // trigger a respawn that races shutdown.
-                    if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
-                        info!(worker_id = id, "shutdown in progress, skipping respawn");
-                        break;
-                    }
-
-                    // Audit M-26 closure : compute the exponential-
-                    // backoff delay, drop the mgr lock, sleep async
-                    // (was `std::thread::sleep` inside `restart_worker`
-                    // - blocked the supervisor tokio thread for up to
-                    // 30 s, starving heartbeats from peer workers and
-                    // every other tokio task on the same runtime).
-                    let backoff = {
-                        let mgr = monitor_mgr.lock().unwrap_or_else(|e| {
-                            warn!("worker monitor mutex poisoned, recovering");
-                            e.into_inner()
-                        });
-                        mgr.restart_backoff(id)
-                    };
-                    if !backoff.is_zero() {
-                        tokio::time::sleep(backoff).await;
-                        if monitor_shutting_down.load(std::sync::atomic::Ordering::Acquire) {
-                            info!(worker_id = id, "shutdown raced backoff sleep, skipping respawn");
-                            break;
-                        }
-                    }
-
-                    let (restart_result, new_pid) = {
-                        let mut mgr = monitor_mgr.lock().unwrap_or_else(|e| {
-                            warn!("worker monitor mutex poisoned, recovering");
-                            e.into_inner()
-                        });
-                        let result = mgr.restart_worker(id);
-                        let pid = mgr
-                            .worker_pids()
-                            .iter()
-                            .find(|(wid, _)| *wid == id)
-                            .map(|(_, pid)| pid.as_raw())
-                            .unwrap_or(0);
-                        (result, pid)
-                    };
-
-                    match restart_result {
-                        Ok(Some((new_cmd_fd, new_rpc_fd))) => {
-                            info!(worker_id = id, new_pid, reason = log_msg, "worker restarted, reconnecting channel");
-
-                            // Audit C-1 closure : re-spawn the
-                            // pipelined RPC handler so the supervisor's
-                            // two-phase config-reload coordinator finds
-                            // the restarted worker. Without this, the
-                            // worker silently sits outside
-                            // `worker_rpc_endpoints` and every
-                            // subsequent ConfigReloadPrepare / Commit
-                            // fan-out skips it (proxy config /
-                            // CertResolver / OTel / GeoIP / ASN /
-                            // bot-secret state stay frozen at boot
-                            // until full process restart). Same helper
-                            // the initial-spawn path uses, so a new
-                            // RPC variant added to the match arm is
-                            // wired uniformly across both paths.
-                            spawn_supervisor_rpc_handler(
-                                id,
-                                new_rpc_fd.into_raw_fd(),
-                                Arc::clone(&monitor_rl_registry),
-                                Arc::clone(&monitor_rl_policy),
-                                Arc::clone(&monitor_store),
-                                Arc::clone(&monitor_verdict_cache),
-                                Arc::clone(&monitor_breaker_registry),
-                                Arc::clone(&monitor_rpc_endpoints),
-                            );
-
-                            // SAFETY: new_cmd_fd is a fresh socketpair fd
-                            // from WorkerManager::restart_worker(),
-                            // exclusively owned here.
-                            match unsafe { CommandChannel::from_raw_fd(new_cmd_fd.into_raw_fd()) } {
-                                Ok(mut channel) => {
-                                    let mut rx = monitor_reload_tx.subscribe();
-                                    let mut ban_rx = monitor_ban_tx.subscribe();
-                                    let seq = Arc::clone(&monitor_seq);
-                                    let hb_metrics = Arc::clone(&monitor_hb_metrics);
-                                    let agg_metrics = Arc::clone(&monitor_agg_metrics);
-                                    let new_handle = tokio::spawn(async move {
-                                        info!(worker_id = id, "restarted worker channel task started");
-                                        let mut timer = tokio::time::interval(Duration::from_secs(5));
-                                        timer.tick().await;
-                                        loop {
-                                            tokio::select! {
-                                                // BanIp command from supervisor
-                                                Ok((ip, duration_s)) = ban_rx.recv() => {
-                                                    let s = seq.fetch_add(1, Ordering::Relaxed);
-                                                    let cmd = Command::ban_ip(s, &ip, duration_s);
-                                                    if channel.send(&cmd).await.is_ok() {
-                                                        let _ = channel.recv::<Response>().await;
-                                                    }
-                                                }
-                                                // Same lagged-aware shape as the
-                                                // initial-spawn branch (audit C-2).
-                                                reload_result = rx.recv() => {
-                                                    let s = match reload_result {
-                                                        Ok(s) => s,
-                                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                                            warn!(
-                                                                worker_id = id,
-                                                                dropped = n,
-                                                                "ConfigReload broadcast lagged on restarted worker ; issuing catch-up reload"
-                                                            );
-                                                            lorica_api::metrics::inc_reload_broadcast_lagged(
-                                                                &id.to_string(),
-                                                                n,
-                                                            );
-                                                            seq.fetch_add(1, Ordering::Relaxed)
-                                                        }
-                                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                                    };
-                                                    let cmd = Command::new(CommandType::ConfigReload, s);
-                                                    if channel.send(&cmd).await.is_ok() {
-                                                        if let Ok(r) = channel.recv::<Response>().await {
-                                                            match r.typed_status() {
-                                                                lorica_command::ResponseStatus::Ok => info!(worker_id = id, "restarted worker applied config reload"),
-                                                                lorica_command::ResponseStatus::Error => error!(worker_id = id, message = %r.message, "restarted worker config reload failed"),
-                                                                _ => {}
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                _ = timer.tick() => {
-                                                    let hb_s = seq.fetch_add(1, Ordering::Relaxed);
-                                                    let cmd = Command::new(CommandType::Heartbeat, hb_s);
-                                                    let start = Instant::now();
-                                                    if let Err(e) = channel.send(&cmd).await {
-                                                        warn!(worker_id = id, error = %e, "restarted worker heartbeat send failed");
-                                                        continue;
-                                                    }
-                                                    match channel.recv::<Response>().await {
-                                                        Ok(_) => {
-                                                            let latency_ms = start.elapsed().as_millis() as u64;
-                                                            hb_metrics.record_heartbeat(id, new_pid, latency_ms).await;
-
-                                                            // Request metrics
-                                                            let m_seq = seq.fetch_add(1, Ordering::Relaxed);
-                                                            let m_cmd = Command::new(CommandType::MetricsRequest, m_seq);
-                                                            if let Err(e) = channel.send(&m_cmd).await {
-                                                                warn!(worker_id = id, error = %e, "metrics request send failed");
-                                                            } else if let Ok(report) = channel.recv::<lorica_command::MetricsReport>().await {
-                                                                let _ = channel.recv::<Response>().await;
-                                                                let ewma: std::collections::HashMap<String, f64> = report
-                                                                    .ewma_entries.iter()
-                                                                    .map(|e| (e.backend_address.clone(), e.score_us))
-                                                                    .collect();
-                                                                let bans: Vec<(String, u64, u64)> = report
-                                                                    .ban_entries.iter()
-                                                                    .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
-                                                                    .collect();
-                                                                let backend_conns: std::collections::HashMap<String, u64> = report
-                                                                    .backend_conn_entries.iter()
-                                                                    .map(|e| (e.backend_address.clone(), e.connections))
-                                                                    .collect();
-                                                                let req_counts: Vec<(String, u32, u64)> = report
-                                                                    .request_entries.iter()
-                                                                    .map(|e| (e.route_id.clone(), e.status_code, e.count))
-                                                                    .collect();
-                                                                let waf_counts: Vec<(String, String, u64)> = report
-                                                                    .waf_entries.iter()
-                                                                    .map(|e| (e.category.clone(), e.action.clone(), e.count))
-                                                                    .collect();
-                                                                agg_metrics
-                                                                    .update_worker(id, report.cache_hits, report.cache_misses, report.active_connections, bans, ewma, backend_conns, req_counts, waf_counts)
-                                                                    .await;
-                                                                let gc: Vec<GenericCounterRow> =
-                                                                    report
-                                                                        .generic_counters
-                                                                        .iter()
-                                                                        .map(|e| {
-                                                                            let pairs: Vec<(String, String)> = e
-                                                                                .labels
-                                                                                .chunks_exact(2)
-                                                                                .map(|c| (c[0].clone(), c[1].clone()))
-                                                                                .collect();
-                                                                            (e.name.clone(), pairs, e.value)
-                                                                        })
-                                                                        .collect();
-                                                                lorica_api::metrics::apply_worker_generic_counters(
-                                                                    id,
-                                                                    &gc,
-                                                                );
-                                                            }
-                                                        }
-                                                        Err(e) => warn!(worker_id = id, error = %e, "restarted worker heartbeat recv failed"),
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    });
-                                    monitor_task_handles.lock().insert(id, new_handle);
-                                }
-                                Err(e) => error!(worker_id = id, error = %e, "failed to create channel for restarted worker"),
-                            }
-                        }
-                        Ok(None) => {
-                            warn!(worker_id = id, "restarted worker has no command channel");
-                        }
-                        Err(e) => {
-                            error!(worker_id = id, error = %e, "failed to restart worker");
-                        }
-                    }
-                }
-            }
-        });
+        let monitor_handle = startup::worker_monitor::spawn_worker_monitor(
+            startup::worker_monitor::WorkerMonitorDeps {
+                manager: Arc::clone(&manager),
+                reload_tx: reload_bc_tx.clone(),
+                ban_tx: ban_bc_tx.clone(),
+                sequence: Arc::clone(&sequence),
+                hb_metrics: Arc::clone(&worker_metrics),
+                agg_metrics: Arc::clone(&aggregated_metrics),
+                task_handles: Arc::clone(&worker_task_handles),
+                rpc_endpoints: Arc::clone(&worker_rpc_endpoints),
+                rl_registry: Arc::clone(&rl_registry),
+                rl_policy: Arc::clone(&rl_policy_cache),
+                store: Arc::clone(&store),
+                verdict_cache: Arc::clone(&verdict_cache),
+                breaker_registry: Arc::clone(&breaker_registry),
+                shutting_down: Arc::clone(&shutting_down),
+            },
+        );
 
         // Wait for shutdown signal
         startup::signals::shutdown_signal().await;
@@ -1455,7 +1162,7 @@ fn run_supervisor(cli: Cli) {
 /// loop for worker N" means the next RPC variant added to the match
 /// arm is wired uniformly across initial-spawn AND respawn paths.
 #[allow(clippy::too_many_arguments)]
-fn spawn_supervisor_rpc_handler(
+pub(crate) fn spawn_supervisor_rpc_handler(
     worker_id: u32,
     rpc_fd: std::os::fd::RawFd,
     rl_registry: Arc<
@@ -1660,7 +1367,7 @@ struct SupervisorVerdictCacheEntry {
     expires_at: Instant,
 }
 
-struct SupervisorVerdictCache {
+pub(crate) struct SupervisorVerdictCache {
     entries: dashmap::DashMap<String, SupervisorVerdictCacheEntry>,
     order: parking_lot::Mutex<std::collections::VecDeque<String>>,
 }
@@ -1860,7 +1567,7 @@ struct SupervisorBreakerEntry {
     consecutive_failures: u32,
 }
 
-struct SupervisorBreakerRegistry {
+pub(crate) struct SupervisorBreakerRegistry {
     /// Key: `{route_id}|{backend}`
     entries: dashmap::DashMap<String, parking_lot::Mutex<SupervisorBreakerEntry>>,
     failure_threshold: u32,
@@ -3524,69 +3231,43 @@ fn run_single_process(cli: Cli) {
         // shutdown drain path.
         let api_task_tracker = single_task_tracker.clone();
         let shutdown_task_tracker = single_task_tracker.clone();
-        let api_handle = tokio::spawn(async move {
-            let state = AppState {
-                store: api_store.clone(),
-                log_buffer: api_log_buffer,
-                system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
-                active_connections: api_active_connections,
-                started_at: Instant::now(),
-                data_dir: PathBuf::from(&cli.data_dir),
-                http_port: cli.http_port,
-                https_port: cli.https_port,
-                config_reload_tx: Some(config_reload_tx),
-                worker_metrics: None,
-                waf_event_buffer: Some(waf_event_buffer),
-                waf_engine: Some(waf_engine),
-                waf_rule_count: Some(waf_rule_count),
-                acme_challenge_store: Some(acme_challenge_store),
-                pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
-                sla_collector: Some(Arc::clone(&sla_collector)),
-                load_test_engine: Some(Arc::clone(&load_test_engine)),
-                cache_hits: Some(proxy_cache_hits),
-                cache_misses: Some(proxy_cache_misses),
-                ban_list: Some(proxy_ban_list),
-                cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
-                ewma_scores: Some(proxy_ewma_scores),
-                backend_connections: Some(backend_conns.clone()),
-                notification_history: Some(notification_history),
-                log_store: api_log_store,
-                aggregated_metrics: None, // single-process uses direct Arc references
-                metrics_refresher: None,  // pull-on-scrape only meaningful in worker mode
-                task_tracker: api_task_tracker,
-            };
-
-            // Spawn ACME certificate auto-renewal (check every 12h, renew at 30 days before expiry)
-            let _acme_renewal = lorica_api::acme::spawn_renewal_task(
-                state.clone(),
-                std::time::Duration::from_secs(12 * 3600),
-                30,
-                Some(alert_sender.clone()),
-            );
-
-            // Spawn certificate expiry check for ALL certs (ACME + manual), every 12h
-            let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
-                state.clone(),
-                std::time::Duration::from_secs(12 * 3600),
-                alert_sender.clone(),
-            );
-
-            let session_store = SessionStore::new(api_store.clone())
-                .await
-                .with_task_tracker(state.task_tracker.clone());
-            let rate_limiter = RateLimiter::new();
-
-            if let Err(e) = lorica_api::server::start_server(
-                management_port,
-                state,
-                session_store,
-                rate_limiter,
-            )
-            .await
-            {
-                error!(error = %e, "API server exited with error");
-            }
-        });
+        // Build the AppState here so `spawn_api_server` becomes a
+        // single helper call shared with run_supervisor (Story 8.1
+        // AC #1+#3 closure ; eliminates the inline tokio::spawn block
+        // + ACME renewal + cert-expiry spawn pattern that was
+        // duplicated between the two boot paths).
+        let api_state = AppState {
+            store: Arc::clone(&api_store),
+            log_buffer: api_log_buffer,
+            system_cache: Arc::new(tokio::sync::Mutex::new(SystemCache::new())),
+            active_connections: api_active_connections,
+            started_at: Instant::now(),
+            data_dir: PathBuf::from(&cli.data_dir),
+            http_port: cli.http_port,
+            https_port: cli.https_port,
+            config_reload_tx: Some(config_reload_tx),
+            worker_metrics: None,
+            waf_event_buffer: Some(waf_event_buffer),
+            waf_engine: Some(waf_engine),
+            waf_rule_count: Some(waf_rule_count),
+            acme_challenge_store: Some(acme_challenge_store),
+            pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
+            sla_collector: Some(Arc::clone(&sla_collector)),
+            load_test_engine: Some(Arc::clone(&load_test_engine)),
+            cache_hits: Some(proxy_cache_hits),
+            cache_misses: Some(proxy_cache_misses),
+            ban_list: Some(proxy_ban_list),
+            cache_backend: Some(&*lorica::proxy_wiring::CACHE_BACKEND),
+            ewma_scores: Some(proxy_ewma_scores),
+            backend_connections: Some(backend_conns.clone()),
+            notification_history: Some(notification_history),
+            log_store: api_log_store,
+            aggregated_metrics: None, // single-process uses direct Arc references
+            metrics_refresher: None,  // pull-on-scrape only meaningful in worker mode
+            task_tracker: api_task_tracker,
+        };
+        let api_handle =
+            startup::api_server::spawn_api_server(api_state, management_port, alert_sender.clone());
 
         // (Retention sweep moved to `startup::control_plane::spawn_control_plane_tasks`.)
 

@@ -15,6 +15,7 @@
 //! tasks through one entry point and prevents the v1.5.2-style asymmetry
 //! where one role silently misses a spawn that landed in the others.
 
+pub mod api_server;
 pub mod control_plane;
 pub mod data_plane;
 pub mod log_uds;
@@ -24,3 +25,4 @@ pub mod otel;
 pub mod shmem_eviction;
 pub mod signals;
 pub mod waf_uds;
+pub mod worker_monitor;
