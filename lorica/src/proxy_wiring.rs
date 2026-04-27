@@ -2490,76 +2490,14 @@ impl ProxyHttp for LoricaProxy {
         }
 
         // When the full body is received, run WAF body evaluation
+        // (route-aware reject ; see check_waf_body_filter). On Block
+        // we also drop the buffered body and exit early so the
+        // upstream never sees the malicious payload.
         if end_of_stream {
-            if let Some(ref buf) = ctx.waf_body_buffer {
-                if !buf.is_empty() {
-                    let host = ctx.matched_host.as_deref().unwrap_or("-");
-                    let client_ip = ctx.client_ip.as_deref().unwrap_or("-");
-
-                    let waf_mode = match ctx.route_snapshot.as_ref().map(|r| &r.waf_mode) {
-                        Some(WafMode::Blocking) => lorica_waf::WafMode::Blocking,
-                        _ => lorica_waf::WafMode::Detection,
-                    };
-
-                    let mut verdict = self
-                        .waf_engine
-                        .evaluate_body(waf_mode, buf, host, client_ip);
-
-                    match verdict {
-                        lorica_waf::WafVerdict::Blocked(ref mut events) => {
-                            for ev in events.iter_mut() {
-                                ev.route_hostname = host.to_string();
-                                ev.action = "blocked".to_string();
-                                lorica_api::metrics::record_waf_event(
-                                    ev.category.as_str(),
-                                    "blocked",
-                                );
-                                self.waf_counts
-                                    .entry((
-                                        ev.category.as_str().to_string(),
-                                        "blocked".to_string(),
-                                    ))
-                                    .or_insert_with(|| AtomicU64::new(0))
-                                    .fetch_add(1, Ordering::Relaxed);
-                                self.persist_waf_event(ev);
-                            }
-                            ctx.waf_blocked = true;
-                            let custom_html = ctx
-                                .route_snapshot
-                                .as_ref()
-                                .and_then(|r| r.error_page_html.clone());
-                            let _ = write_decision(
-                                session,
-                                &ctx.request_id,
-                                Decision::reject(403, "Request body blocked by WAF")
-                                    .with_html(custom_html),
-                            )
-                            .await?;
-                            *body = None;
-                            return Ok(());
-                        }
-                        lorica_waf::WafVerdict::Detected(ref mut events) => {
-                            for ev in events.iter_mut() {
-                                ev.route_hostname = host.to_string();
-                                ev.action = "detected".to_string();
-                                lorica_api::metrics::record_waf_event(
-                                    ev.category.as_str(),
-                                    "detected",
-                                );
-                                self.waf_counts
-                                    .entry((
-                                        ev.category.as_str().to_string(),
-                                        "detected".to_string(),
-                                    ))
-                                    .or_insert_with(|| AtomicU64::new(0))
-                                    .fetch_add(1, Ordering::Relaxed);
-                                self.persist_waf_event(ev);
-                            }
-                            ctx.waf_detected = true;
-                        }
-                        lorica_waf::WafVerdict::Pass => {}
-                    }
-                }
+            if let Some(d) = self.check_waf_body_filter(ctx) {
+                let _ = write_decision(session, &ctx.request_id, d).await?;
+                *body = None;
+                return Ok(());
             }
         }
 

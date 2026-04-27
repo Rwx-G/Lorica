@@ -703,6 +703,77 @@ impl LoricaProxy {
         }
     }
 
+    /// Per-route WAF body evaluation in `request_body_filter`. Runs
+    /// the WAF engine against the buffered request body once the full
+    /// stream has been received. Distinct from `check_waf_request_
+    /// filter` which evaluates headers + path/query in `request_filter`
+    /// before the body arrives. The body path has no auto-ban
+    /// escalation (auto-ban is driven by header-phase blocks where the
+    /// rule taxonomy is more discriminating).
+    ///
+    /// On `Blocked` records metrics + persists events with action=
+    /// "blocked" and returns `Decision::reject(403, "Request body
+    /// blocked by WAF")`. On `Detected` records + persists with
+    /// action="detected", sets `ctx.waf_detected`, returns None. On
+    /// `Pass` returns None.
+    ///
+    /// Returns None when the body buffer is empty / absent (no body
+    /// to scan).
+    pub(crate) fn check_waf_body_filter(&self, ctx: &mut RequestCtx) -> Option<Decision> {
+        let buf = ctx.waf_body_buffer.as_ref()?;
+        if buf.is_empty() {
+            return None;
+        }
+        let host = ctx.matched_host.as_deref().unwrap_or("-").to_string();
+        let client_ip = ctx.client_ip.as_deref().unwrap_or("-").to_string();
+        let waf_mode = match ctx.route_snapshot.as_ref().map(|r| &r.waf_mode) {
+            Some(lorica_config::models::WafMode::Blocking) => lorica_waf::WafMode::Blocking,
+            _ => lorica_waf::WafMode::Detection,
+        };
+
+        let mut verdict = self
+            .waf_engine
+            .evaluate_body(waf_mode, buf, &host, &client_ip);
+
+        match verdict {
+            lorica_waf::WafVerdict::Blocked(ref mut events) => {
+                for ev in events.iter_mut() {
+                    ev.route_hostname = host.clone();
+                    ev.action = "blocked".to_string();
+                    lorica_api::metrics::record_waf_event(ev.category.as_str(), "blocked");
+                    self.waf_counts
+                        .entry((ev.category.as_str().to_string(), "blocked".to_string()))
+                        .or_insert_with(|| AtomicU64::new(0))
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.persist_waf_event(ev);
+                }
+                ctx.waf_blocked = true;
+                let custom_html = ctx
+                    .route_snapshot
+                    .as_ref()
+                    .and_then(|r| r.error_page_html.clone());
+                Some(
+                    Decision::reject(403, "Request body blocked by WAF").with_html(custom_html),
+                )
+            }
+            lorica_waf::WafVerdict::Detected(ref mut events) => {
+                for ev in events.iter_mut() {
+                    ev.route_hostname = host.clone();
+                    ev.action = "detected".to_string();
+                    lorica_api::metrics::record_waf_event(ev.category.as_str(), "detected");
+                    self.waf_counts
+                        .entry((ev.category.as_str().to_string(), "detected".to_string()))
+                        .or_insert_with(|| AtomicU64::new(0))
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.persist_waf_event(ev);
+                }
+                ctx.waf_detected = true;
+                None
+            }
+            lorica_waf::WafVerdict::Pass => None,
+        }
+    }
+
     /// Per-route `return_status` directive : when set, the request
     /// short-circuits with the configured status code instead of being
     /// proxied. Two shapes :
