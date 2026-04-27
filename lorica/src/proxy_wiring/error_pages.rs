@@ -351,9 +351,11 @@ fn badge(is_broken: bool) -> (&'static str, &'static str, &'static str, &'static
     }
 }
 
-/// What body to write after the headers. Lets `Decision` model both
-/// rejection responses (default error page) and redirect responses
-/// (no body) without the call site needing to know which is which.
+/// What body to write after the headers. Lets `Decision` model the
+/// three response shapes the request_filter pipeline needs : the
+/// standard Lorica error page, a header-only redirect / status, or
+/// a custom passthrough body sourced from an upstream service (e.g.
+/// the forward-auth provider's own deny response).
 #[derive(Debug, Default)]
 pub(crate) enum DecisionBody {
     /// Render the standard Lorica error page (or per-route
@@ -364,6 +366,11 @@ pub(crate) enum DecisionBody {
     /// where the response carries only a `Location` header and
     /// terminates after the header line.
     Empty,
+    /// Custom body bytes. Used by forward-auth Deny passthrough where
+    /// the auth service's exact response (status + headers + body)
+    /// must reach the client verbatim. The caller is responsible for
+    /// providing the matching `extra_headers` (Content-Type etc.).
+    Custom(Vec<u8>),
 }
 
 /// A request_filter rejection that has not yet been written to the
@@ -390,7 +397,11 @@ pub(crate) struct Decision {
     pub(crate) status: u16,
     pub(crate) reason: std::borrow::Cow<'static, str>,
     pub(crate) error_page_html: Option<String>,
-    pub(crate) extra_headers: Vec<(&'static str, String)>,
+    /// Header name held as `Cow<'static, str>` so static literals
+    /// (most call sites) cost nothing while runtime-sourced names
+    /// (forward-auth passthrough headers from the auth service) can
+    /// own their string.
+    pub(crate) extra_headers: Vec<(std::borrow::Cow<'static, str>, String)>,
     pub(crate) body: DecisionBody,
 }
 
@@ -420,8 +431,32 @@ impl Decision {
             status,
             reason: std::borrow::Cow::Borrowed(""),
             error_page_html: None,
-            extra_headers: vec![("Location", location)],
+            extra_headers: vec![(std::borrow::Cow::Borrowed("Location"), location)],
             body: DecisionBody::Empty,
+        }
+    }
+
+    /// Construct a passthrough response : the upstream service's
+    /// response status + headers + body forwarded verbatim to the
+    /// client. Used by forward-auth Deny where the auth provider
+    /// returns its own login page / 403 body / 3xx redirect, and we
+    /// must not rewrite it. `headers` keys come from the auth
+    /// service so they are owned strings, not static literals.
+    pub(crate) fn passthrough(
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Self {
+        let extra_headers = headers
+            .into_iter()
+            .map(|(name, value)| (std::borrow::Cow::Owned(name), value))
+            .collect();
+        Self {
+            status,
+            reason: std::borrow::Cow::Borrowed(""),
+            error_page_html: None,
+            extra_headers,
+            body: DecisionBody::Custom(body),
         }
     }
 
@@ -441,7 +476,8 @@ impl Decision {
     /// rate-limit or maintenance-mode rejections, `("X-RateLimit-
     /// Reset", "<unix_ts>")` on per-route token-bucket failures.
     pub(crate) fn with_header(mut self, name: &'static str, value: String) -> Self {
-        self.extra_headers.push((name, value));
+        self.extra_headers
+            .push((std::borrow::Cow::Borrowed(name), value));
         self
     }
 }
@@ -477,10 +513,28 @@ pub(crate) async fn write_decision(
             // chunk follows.
             let mut header = lorica_http::ResponseHeader::build(decision.status, None)?;
             for (name, value) in &decision.extra_headers {
-                header.insert_header(*name, value)?;
+                header.insert_header(name.to_string(), value)?;
             }
             session
                 .write_response_header(Box::new(header), true)
+                .await?;
+            Ok(true)
+        }
+        DecisionBody::Custom(body) => {
+            // Passthrough response (forward-auth Deny). Headers and
+            // body come verbatim from the upstream auth service ; we
+            // do not add Content-Type / Content-Length here because
+            // the auth service is responsible for those.
+            let mut header = lorica_http::ResponseHeader::build(decision.status, None)?;
+            for (name, value) in &decision.extra_headers {
+                header.insert_header(name.to_string(), value)?;
+            }
+            header.insert_header("Content-Length", body.len().to_string())?;
+            session
+                .write_response_header(Box::new(header), false)
+                .await?;
+            session
+                .write_response_body(Some(bytes::Bytes::from(body)), true)
                 .await?;
             Ok(true)
         }
@@ -495,7 +549,7 @@ pub(crate) async fn write_decision(
             );
             let mut header = lorica_http::ResponseHeader::build(decision.status, None)?;
             for (name, value) in &decision.extra_headers {
-                header.insert_header(*name, value)?;
+                header.insert_header(name.to_string(), value)?;
             }
             header.insert_header("Content-Type", "text/html; charset=utf-8")?;
             header.insert_header("Content-Length", body.len().to_string())?;

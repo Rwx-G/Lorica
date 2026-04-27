@@ -281,9 +281,9 @@ pub mod bot_handlers;
 pub mod forward_auth;
 #[cfg(test)]
 pub(crate) use forward_auth::{
-    build_forward_auth_headers, run_forward_auth, verdict_cache_key, verdict_cache_reset_for_test,
+    build_forward_auth_headers, run_forward_auth, run_forward_auth_keyed, verdict_cache_key,
+    verdict_cache_reset_for_test, ForwardAuthOutcome,
 };
-pub(crate) use forward_auth::{run_forward_auth_keyed, ForwardAuthOutcome};
 
 pub mod mirror_rewrite;
 #[cfg(test)]
@@ -311,7 +311,7 @@ pub mod engines;
 pub use engines::{BreakerAdmission, BreakerEngine, RateLimitEngine, VerdictCacheEngine};
 
 pub mod error_pages;
-pub(crate) use error_pages::{render_error_body, write_decision, Decision};
+pub(crate) use error_pages::{render_error_body, write_decision};
 
 // Story 8.1 / AC #4 : per-stage `check_<name>` rejection helpers
 // (extracted from request_filter in AC #5) moved here so they are
@@ -1595,68 +1595,13 @@ impl ProxyHttp for LoricaProxy {
                 return write_decision(session, &ctx.request_id, d).await;
             }
 
-            // Forward authentication: gate the request on an external auth
-            // service (Authelia / Authentik / Keycloak / oauth2-proxy). Runs
-            // after route match but before header/canary/path rules so a
-            // denied request never leaks into the backend-selection phase.
-            if let Some(ref fa_cfg) = entry.route.forward_auth {
-                // Detect TLS from the downstream socket, not HTTP version:
-                // h2c (HTTP/2 over plaintext) would otherwise be reported
-                // as https to the auth service, which is misleading and
-                // may trigger redirect loops.
-                let is_tls = session
-                    .digest()
-                    .and_then(|d| d.ssl_digest.as_ref())
-                    .is_some();
-                let scheme = if is_tls { "https" } else { "http" };
-                let outcome = run_forward_auth_keyed(
-                    fa_cfg,
-                    req,
-                    ctx.client_ip.as_deref(),
-                    scheme,
-                    &entry.route.id,
-                    &self.verdict_cache,
-                )
-                .await;
-                match outcome {
-                    ForwardAuthOutcome::Allow { response_headers } => {
-                        ctx.forward_auth_inject = response_headers;
-                    }
-                    ForwardAuthOutcome::Deny {
-                        status,
-                        headers,
-                        body,
-                    } => {
-                        ctx.block_reason = Some(format!("forward auth denied ({status})"));
-                        let mut resp_header = ResponseHeader::build(status, None)?;
-                        for (name, value) in &headers {
-                            let _ = resp_header.insert_header(name.clone(), value);
-                        }
-                        let _ = resp_header.insert_header("Content-Length", body.len().to_string());
-                        session
-                            .write_response_header(Box::new(resp_header), false)
-                            .await?;
-                        session
-                            .write_response_body(Some(bytes::Bytes::from(body)), true)
-                            .await?;
-                        return Ok(true);
-                    }
-                    ForwardAuthOutcome::FailClosed { reason } => {
-                        tracing::warn!(
-                            route_id = %entry.route.id,
-                            reason = %reason,
-                            "forward auth fail-closed"
-                        );
-                        ctx.block_reason = Some(format!("forward auth error: {reason}"));
-                        return write_decision(
-                            session,
-                            &ctx.request_id,
-                            Decision::reject(503, "Authentication service unavailable")
-                                .with_html(entry.route.error_page_html.clone()),
-                        )
-                        .await;
-                    }
-                }
+            // Forward authentication (route-aware reject ; see
+            // check_forward_auth). On Allow side-effects ctx.forward_
+            // auth_inject and returns None ; on Deny passes through
+            // the auth service's status + headers + body verbatim ;
+            // on FailClosed returns 503.
+            if let Some(d) = self.check_forward_auth(session, req, ctx, entry).await {
+                return write_decision(session, &ctx.request_id, d).await;
             }
 
             // Header rule matching (first match wins; sets backend override
