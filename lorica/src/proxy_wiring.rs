@@ -1145,10 +1145,121 @@ fn escape_html(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-/// Sanitize admin-provided HTML by removing dangerous tags and attributes
-/// that could execute JavaScript (XSS). Keeps safe formatting tags intact.
-/// Precompiled regexes for HTML sanitization (compiled once, used on every
-/// error page render). Avoids ~300-500us of regex compilation per call.
+// ---------------------------------------------------------------------------
+// Story 8.1 AC #5 : `request_filter` decomposition.
+//
+// Each `check_<name>` method returns `Option<Decision>` (sync) or
+// `Result<Option<Decision>>` (async / fallible) and folds the side
+// effects of one early-return branch from the original ~1800-LOC
+// `request_filter` body. The top-level now reads as a sequence of :
+//
+//     if let Some(d) = self.check_X(...).await? {
+//         return write_decision(session, &ctx.request_id, d).await;
+//     }
+//
+// instead of 30+ nested `if`s with inline `render_error_body` blocks.
+// AC #4 (filters/* sub-modules) folds these methods into per-concern
+// files in a follow-up commit.
+// ---------------------------------------------------------------------------
+impl LoricaProxy {
+    /// Reject the request when the process-wide active-connection
+    /// counter is at or above the configured `max_global_connections`.
+    /// Returns `None` when the limit is unset (0) or the current
+    /// count is below it. Pre-route check : no per-route override is
+    /// consultable, so the default Lorica error page is rendered.
+    fn check_global_connection_limit(&self, ctx: &mut RequestCtx) -> Option<Decision> {
+        let config = self.config.load();
+        if config.max_global_connections == 0 {
+            return None;
+        }
+        let current = self.active_connections.load(Ordering::Relaxed);
+        if current >= config.max_global_connections as u64 {
+            ctx.block_reason = Some("global connection limit".to_string());
+            Some(Decision::reject(503, "Global connection limit exceeded"))
+        } else {
+            None
+        }
+    }
+
+    /// Reject when the client IP is in the auto-ban list and the
+    /// ban has not yet expired. Lazy-evicts expired bans on lookup
+    /// so the map does not grow unbounded with stale entries. Pre-
+    /// route check.
+    fn check_ip_banned(&self, ctx: &mut RequestCtx, client_ip: &str) -> Option<Decision> {
+        let banned = if let Some(entry) = self.ban_list.get(client_ip) {
+            let (banned_at, duration_s) = entry.value();
+            if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
+                drop(entry);
+                // Ban expired - lazy cleanup
+                self.ban_list.remove(client_ip);
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        if banned {
+            ctx.block_reason = Some("IP banned".to_string());
+            Some(Decision::reject(403, "IP banned"))
+        } else {
+            None
+        }
+    }
+
+    /// Reject when the client IP matches the WAF IP blocklist
+    /// (Data-Shield ~80k-entry CIDR set, refreshed every 6h). Records
+    /// a WAF event + Prometheus counter + persists to the SQLite
+    /// store on hit. Pre-route check.
+    ///
+    /// `req` is taken explicitly (rather than re-derived from
+    /// `session.req_header()` inside the helper) so the caller can
+    /// keep its outstanding immutable borrow through the call - the
+    /// outer `request_filter` body uses the same `req` reference for
+    /// XFF parsing and host extraction further down.
+    fn check_ip_blocked(
+        &self,
+        req: &lorica_http::RequestHeader,
+        ctx: &mut RequestCtx,
+        client_ip: &str,
+    ) -> Option<Decision> {
+        if !self.waf_engine.ip_blocklist().is_blocked_str(client_ip) {
+            return None;
+        }
+        warn!(
+            ip = %client_ip,
+            "request blocked by IP blocklist"
+        );
+        ctx.waf_blocked = true;
+        let path = req.uri.path();
+        let host_val = extract_host(req);
+        self.waf_engine.record_blocklist_event(client_ip, host_val, path);
+        lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
+        self.waf_counts
+            .entry(("ip_blocklist".to_string(), "blocked".to_string()))
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        let host_label = if host_val.is_empty() {
+            "-".to_string()
+        } else {
+            host_val.to_string()
+        };
+        let ev = lorica_waf::WafEvent {
+            rule_id: 0,
+            description: format!("IP {client_ip} blocked by IP blocklist"),
+            category: lorica_waf::RuleCategory::IpBlocklist,
+            severity: 5,
+            matched_field: "client_ip".to_string(),
+            matched_value: client_ip.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            client_ip: client_ip.to_string(),
+            route_hostname: host_label,
+            action: "blocked".to_string(),
+        };
+        self.persist_waf_event(&ev);
+        Some(Decision::reject(403, "IP blocked"))
+    }
+}
 
 #[async_trait]
 impl ProxyHttp for LoricaProxy {
@@ -1423,22 +1534,11 @@ impl ProxyHttp for LoricaProxy {
             // Global flood tracking (before any other processing)
             self.global_rate.observe(&"global", 1);
 
-            // Global connection limit (before any other processing)
-            let config = self.config.load();
-            if config.max_global_connections > 0 {
-                let current = self.active_connections.load(Ordering::Relaxed);
-                if current >= config.max_global_connections as u64 {
-                    ctx.block_reason = Some("global connection limit".to_string());
-                    // No route matched yet at this stage, so no per-route
-                    // override is consultable: always render the default page.
-                    return write_decision(
-                        session,
-                        &ctx.request_id,
-                        Decision::reject(503, "Global connection limit exceeded"),
-                    )
-                    .await;
-                }
+            // Global connection limit (pre-route reject ; see check_global_connection_limit).
+            if let Some(d) = self.check_global_connection_limit(ctx) {
+                return write_decision(session, &ctx.request_id, d).await;
             }
+            let config = self.config.load();
 
             // IP blocklist check (before any other processing)
             let client_ip = session
@@ -1495,76 +1595,16 @@ impl ProxyHttp for LoricaProxy {
                 }
             });
 
-            // Ban list + IP blocklist checks (skipped for whitelisted IPs)
+            // Ban list + IP blocklist checks (skipped for whitelisted IPs).
+            // Both helpers are pre-route - no per-route override is
+            // consultable. See check_ip_banned / check_ip_blocked.
             if !is_whitelisted {
                 if let Some(ref ip) = check_ip {
-                    let banned = if let Some(entry) = self.ban_list.get(ip) {
-                        let (banned_at, duration_s) = entry.value();
-                        if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
-                            drop(entry);
-                            // Ban expired - lazy cleanup
-                            self.ban_list.remove(ip);
-                            false
-                        } else {
-                            true
-                        }
-                    } else {
-                        false
-                    };
-                    if banned {
-                        ctx.block_reason = Some("IP banned".to_string());
-                        // Pre-route stage: no route override consultable.
-                        return write_decision(
-                            session,
-                            &ctx.request_id,
-                            Decision::reject(403, "IP banned"),
-                        )
-                        .await;
+                    if let Some(d) = self.check_ip_banned(ctx, ip) {
+                        return write_decision(session, &ctx.request_id, d).await;
                     }
-
-                    if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
-                        warn!(
-                            ip = %ip,
-                            "request blocked by IP blocklist"
-                        );
-                        ctx.waf_blocked = true;
-                        // Record as WAF event + Prometheus metric + persist
-                        let path = req.uri.path();
-                        let host_val = extract_host(req);
-                        self.waf_engine.record_blocklist_event(ip, host_val, path);
-                        lorica_api::metrics::record_waf_event("ip_blocklist", "blocked");
-                        self.waf_counts
-                            .entry(("ip_blocklist".to_string(), "blocked".to_string()))
-                            .or_insert_with(|| AtomicU64::new(0))
-                            .fetch_add(1, Ordering::Relaxed);
-                        let ev = lorica_waf::WafEvent {
-                            rule_id: 0,
-                            description: format!("IP {ip} blocked by IP blocklist"),
-                            category: lorica_waf::RuleCategory::IpBlocklist,
-                            severity: 5,
-                            matched_field: "client_ip".to_string(),
-                            matched_value: ip.to_string(),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                            client_ip: ip.to_string(),
-                            route_hostname: {
-                                let h = extract_host(req);
-                                if h.is_empty() {
-                                    "-"
-                                } else {
-                                    h
-                                }
-                            }
-                            .to_string(),
-                            action: "blocked".to_string(),
-                        };
-                        self.persist_waf_event(&ev);
-                        // Pre-route stage: no route override consultable.
-                        return write_decision(
-                            session,
-                            &ctx.request_id,
-                            Decision::reject(403, "IP blocked"),
-                        )
-                        .await;
+                    if let Some(d) = self.check_ip_blocked(req, ctx, ip) {
+                        return write_decision(session, &ctx.request_id, d).await;
                     }
                 }
             } // end if !is_whitelisted (ban + blocklist)
