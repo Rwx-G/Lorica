@@ -1259,6 +1259,121 @@ impl LoricaProxy {
         self.persist_waf_event(&ev);
         Some(Decision::reject(403, "IP blocked"))
     }
+
+    /// Reject WebSocket upgrade attempts when the matched route has
+    /// `websocket_enabled = false`. Returns `None` for non-upgrade
+    /// requests or when the route allows WebSocket. Route-aware check
+    /// (runs after `find_route` succeeds).
+    fn check_websocket_disabled(
+        &self,
+        req: &lorica_http::RequestHeader,
+        ctx: &mut RequestCtx,
+        entry: &Arc<RouteEntry>,
+    ) -> Option<Decision> {
+        if entry.route.websocket_enabled {
+            return None;
+        }
+        let upgrade = req.headers.get("upgrade")?;
+        if !upgrade
+            .to_str()
+            .unwrap_or("")
+            .eq_ignore_ascii_case("websocket")
+        {
+            return None;
+        }
+        ctx.block_reason = Some("WebSocket disabled".to_string());
+        Some(
+            Decision::reject(403, "WebSocket upgrades disabled on this route")
+                .with_html(entry.route.error_page_html.clone()),
+        )
+    }
+
+    /// Reject with 503 + `Retry-After: 300` when the matched route is
+    /// in `maintenance_mode`. Reads from `ctx.route_snapshot` so the
+    /// caller does not need a separate `entry` reference.
+    fn check_maintenance_mode(&self, ctx: &mut RequestCtx) -> Option<Decision> {
+        let route = ctx.route_snapshot.as_ref()?;
+        if !route.maintenance_mode {
+            return None;
+        }
+        ctx.block_reason = Some("maintenance mode".to_string());
+        Some(
+            Decision::reject(503, "Service under maintenance")
+                .with_html(route.error_page_html.clone())
+                .with_header("Retry-After", "300".to_string()),
+        )
+    }
+
+    /// Reject when the client IP fails the per-route allow / deny
+    /// list. Allowlist takes precedence : a non-empty allowlist that
+    /// the IP is NOT in returns 403. A denylist match also returns
+    /// 403. CIDR ranges + bare IPs are both supported (see
+    /// `helpers::ip_matches`).
+    fn check_ip_allow_deny(
+        &self,
+        ctx: &mut RequestCtx,
+        entry: &Arc<RouteEntry>,
+        client_ip: &str,
+    ) -> Option<Decision> {
+        if !entry.route.ip_allowlist.is_empty()
+            && !entry
+                .route
+                .ip_allowlist
+                .iter()
+                .any(|a| ip_matches(client_ip, a))
+        {
+            ctx.block_reason = Some("IP not in allowlist".to_string());
+            return Some(
+                Decision::reject(403, "IP not in allowlist")
+                    .with_html(entry.route.error_page_html.clone()),
+            );
+        }
+        if entry
+            .route
+            .ip_denylist
+            .iter()
+            .any(|d| ip_matches(client_ip, d))
+        {
+            ctx.block_reason = Some("IP in denylist".to_string());
+            return Some(
+                Decision::reject(403, "IP in denylist")
+                    .with_html(entry.route.error_page_html.clone()),
+            );
+        }
+        None
+    }
+
+    /// Reject with 408 when request headers took longer than
+    /// `route.slowloris_threshold_ms` to arrive (slow-headers attack
+    /// detection). The threshold is measured from `ctx.start_time`.
+    /// `client_ip` is logged-only ; the comparison uses ctx timing.
+    fn check_slowloris(
+        &self,
+        ctx: &mut RequestCtx,
+        entry: &Arc<RouteEntry>,
+        client_ip: Option<&str>,
+    ) -> Option<Decision> {
+        let slowloris_ms = entry.route.slowloris_threshold_ms;
+        if slowloris_ms <= 0 {
+            return None;
+        }
+        let elapsed_ms = ctx.start_time.elapsed().as_millis() as i32;
+        if elapsed_ms <= slowloris_ms {
+            return None;
+        }
+        warn!(
+            ip = %client_ip.unwrap_or("-"),
+            elapsed_ms = elapsed_ms,
+            threshold_ms = slowloris_ms,
+            route_id = %entry.route.id,
+            "slowloris detected - slow request headers"
+        );
+        ctx.block_reason = Some("slowloris detected".to_string());
+        Some(
+            Decision::reject(408, "Request headers took too long")
+                .with_html(entry.route.error_page_html.clone()),
+        )
+    }
 }
 
 #[async_trait]
@@ -1630,23 +1745,9 @@ impl ProxyHttp for LoricaProxy {
             ctx.access_log_enabled = entry.route.access_log_enabled;
 
             // Block WebSocket upgrades if disabled on this route
-            if !entry.route.websocket_enabled {
-                if let Some(upgrade) = req.headers.get("upgrade") {
-                    if upgrade
-                        .to_str()
-                        .unwrap_or("")
-                        .eq_ignore_ascii_case("websocket")
-                    {
-                        ctx.block_reason = Some("WebSocket disabled".to_string());
-                        return write_decision(
-                            session,
-                            &ctx.request_id,
-                            Decision::reject(403, "WebSocket upgrades disabled on this route")
-                                .with_html(entry.route.error_page_html.clone()),
-                        )
-                        .await;
-                    }
-                }
+            // (route-aware reject ; see check_websocket_disabled).
+            if let Some(d) = self.check_websocket_disabled(req, ctx, entry) {
+                return write_decision(session, &ctx.request_id, d).await;
             }
 
             // Force HTTPS redirect (skip for ACME challenges - must stay HTTP)
@@ -1998,18 +2099,9 @@ impl ProxyHttp for LoricaProxy {
                 }
             }
 
-            // Maintenance mode - return 503 with optional custom HTML
-            if let Some(ref route) = ctx.route_snapshot {
-                if route.maintenance_mode {
-                    return write_decision(
-                        session,
-                        &ctx.request_id,
-                        Decision::reject(503, "Service under maintenance")
-                            .with_html(route.error_page_html.clone())
-                            .with_header("Retry-After", "300".to_string()),
-                    )
-                    .await;
-                }
+            // Maintenance mode - 503 + Retry-After: 300 (see check_maintenance_mode).
+            if let Some(d) = self.check_maintenance_mode(ctx) {
+                return write_decision(session, &ctx.request_id, d).await;
             }
 
             // HTTP Basic Auth (per-route) with credential verification cache.
@@ -2160,29 +2252,11 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(true);
             }
 
-            // Per-route IP allowlist/denylist
+            // Per-route IP allow / deny list (route-aware reject ;
+            // see check_ip_allow_deny).
             if let Some(ref ip) = check_ip {
-                if !entry.route.ip_allowlist.is_empty()
-                    && !entry.route.ip_allowlist.iter().any(|a| ip_matches(ip, a))
-                {
-                    ctx.block_reason = Some("IP not in allowlist".to_string());
-                    return write_decision(
-                        session,
-                        &ctx.request_id,
-                        Decision::reject(403, "IP not in allowlist")
-                            .with_html(entry.route.error_page_html.clone()),
-                    )
-                    .await;
-                }
-                if entry.route.ip_denylist.iter().any(|d| ip_matches(ip, d)) {
-                    ctx.block_reason = Some("IP in denylist".to_string());
-                    return write_decision(
-                        session,
-                        &ctx.request_id,
-                        Decision::reject(403, "IP in denylist")
-                            .with_html(entry.route.error_page_html.clone()),
-                    )
-                    .await;
+                if let Some(d) = self.check_ip_allow_deny(ctx, entry, ip) {
+                    return write_decision(session, &ctx.request_id, d).await;
                 }
             }
 
@@ -2483,30 +2557,9 @@ impl ProxyHttp for LoricaProxy {
                 }
             }
 
-            // Slowloris detection: reject requests where headers took too long to arrive.
-            // If the time from connection start to request_filter exceeds the threshold,
-            // the client is likely performing a slowloris attack (sending headers very slowly).
-            let slowloris_ms = entry.route.slowloris_threshold_ms;
-            if slowloris_ms > 0 {
-                let elapsed_ms = ctx.start_time.elapsed().as_millis() as i32;
-                if elapsed_ms > slowloris_ms {
-                    let client_ip_str = check_ip.as_deref().unwrap_or("-");
-                    warn!(
-                        ip = %client_ip_str,
-                        elapsed_ms = elapsed_ms,
-                        threshold_ms = slowloris_ms,
-                        route_id = %entry.route.id,
-                        "slowloris detected - slow request headers"
-                    );
-                    ctx.block_reason = Some("slowloris detected".to_string());
-                    return write_decision(
-                        session,
-                        &ctx.request_id,
-                        Decision::reject(408, "Request headers took too long")
-                            .with_html(entry.route.error_page_html.clone()),
-                    )
-                    .await;
-                }
+            // Slowloris detection (route-aware reject ; see check_slowloris).
+            if let Some(d) = self.check_slowloris(ctx, entry, check_ip.as_deref()) {
+                return write_decision(session, &ctx.request_id, d).await;
             }
 
             // Per-route max connections enforcement.
