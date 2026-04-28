@@ -114,6 +114,72 @@ pub fn load_platform_certs_incl_env_into_store(ca_certs: &mut RootCertStore) -> 
     Ok(())
 }
 
+/// Verify that a PEM-encoded certificate chain and private key form a
+/// matching pair *and* are in a shape the worker can serve from. Both
+/// must parse, the leaf certificate's `SubjectPublicKeyInfo` must match
+/// the public key derived from the private key (rustls'
+/// `CertifiedKey::keys_match`), and the resulting key must be acceptable
+/// to the rustls signing stack.
+///
+/// The API uses this on every cert upload so a bundle whose cert and
+/// key come from two different key pairs is rejected at the boundary
+/// rather than landing in the database and surfacing later as a
+/// `DecryptError` TLS alert during the handshake : the leaf cert
+/// presents one public key while the worker signs `CertificateVerify`
+/// with another, and clients refuse the signature with no further
+/// diagnostic on the server side.
+pub fn validate_certificate_bundle(cert_pem: &str, key_pem: &str) -> Result<()> {
+    let ck = crate::cert_resolver::build_certified_key(cert_pem, key_pem, None)?;
+    ck.keys_match()
+        .or_err(ErrorType::InvalidCert, "certificate and private key do not form a matching pair (SubjectPublicKeyInfo mismatch)")?;
+    Ok(())
+}
+
+/// Parse the first PEM-encoded private key from `pem` accepting
+/// PKCS#8 (`-----BEGIN PRIVATE KEY-----`), PKCS#1
+/// (`-----BEGIN RSA PRIVATE KEY-----`), and SEC1
+/// (`-----BEGIN EC PRIVATE KEY-----`).
+///
+/// `PrivateKeyDer::from_pem_slice` already accepts all three on
+/// well-formed input ; this wrapper falls back to the per-format
+/// filters when the enum dispatch fails, so an operator-supplied
+/// bundle with an unusual ordering, a stray non-key block, or a
+/// minor encoding artefact still loads. The fallback is also a
+/// belt-and-braces against any future regression in upstream's
+/// section-kind matching.
+///
+/// The returned diagnostic includes the first PEM `BEGIN` line
+/// found in the input so the operator can tell at a glance
+/// whether the file claims to be a key and which format.
+pub fn load_first_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
+    use rustls_pki_types::{PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
+
+    if let Ok(key) = PrivateKeyDer::from_pem_slice(pem) {
+        return Ok(key);
+    }
+    if let Ok(k) = PrivatePkcs8KeyDer::from_pem_slice(pem) {
+        return Ok(PrivateKeyDer::from(k));
+    }
+    if let Ok(k) = PrivatePkcs1KeyDer::from_pem_slice(pem) {
+        return Ok(PrivateKeyDer::from(k));
+    }
+    if let Ok(k) = PrivateSec1KeyDer::from_pem_slice(pem) {
+        return Ok(PrivateKeyDer::from(k));
+    }
+
+    let header = pem
+        .split(|&b| b == b'\n')
+        .find(|line| line.starts_with(b"-----BEGIN"))
+        .map(|line| String::from_utf8_lossy(line).trim().to_string())
+        .unwrap_or_else(|| "<no PEM BEGIN line>".to_string());
+    Error::e_explain(
+        ErrorType::InvalidCert,
+        format!(
+            "no supported private key found in PEM (expected PKCS#8, PKCS#1 or SEC1 ; first BEGIN line was {header:?})"
+        ),
+    )
+}
+
 /// Load the certificates and private key files
 pub fn load_certs_and_key_files(
     cert: &str,
@@ -132,13 +198,7 @@ pub fn load_certs_and_key_files(
         .map(|c| c.into_owned())
         .collect();
 
-    // `PrivateKeyDer::from_pem_slice` returns the first supported
-    // key block (PKCS1 / PKCS8 / SEC1) and is `Err` on malformed
-    // PEM. We treat "no key" / "unsupported key" as None to match
-    // the previous Option semantics.
-    let private_key_opt = PrivateKeyDer::from_pem_slice(&key_bytes)
-        .ok()
-        .map(|k| k.clone_key());
+    let private_key_opt = load_first_private_key(&key_bytes).ok();
 
     if let (Some(private_key), false) = (private_key_opt, certs.is_empty()) {
         Ok(Some((certs, private_key)))
@@ -159,13 +219,12 @@ pub fn load_pem_file_ca(path: &String) -> Result<Vec<u8>> {
 
 pub fn load_pem_file_private_key(path: &String) -> Result<Vec<u8>> {
     let bytes = read_file(path)?;
-    match PrivateKeyDer::from_pem_slice(&bytes) {
-        Ok(key) => Ok(key.secret_der().to_vec()),
-        // Mirror the previous behaviour : a missing / unsupported
-        // key returns an empty Vec rather than an error so the
-        // caller can decide what "no key here" means in context.
-        Err(_) => Ok(Vec::new()),
-    }
+    // Mirror the previous behaviour : a missing / unsupported
+    // key returns an empty Vec rather than an error so the
+    // caller can decide what "no key here" means in context.
+    Ok(load_first_private_key(&bytes)
+        .map(|k| k.secret_der().to_vec())
+        .unwrap_or_default())
 }
 
 /// Load CRLs from a PEM or DER file. Supports files containing multiple CRLs.

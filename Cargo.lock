@@ -2922,6 +2922,7 @@ dependencies = [
  "lorica-config",
  "lorica-dashboard",
  "lorica-notify",
+ "lorica-tls",
  "lorica-waf",
  "nix",
  "once_cell",

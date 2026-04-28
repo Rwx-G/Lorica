@@ -14,6 +14,16 @@ lorica-dashboard = { version = "1.5.2", path = "../lorica-dashboard" }
 lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
 lorica-notify = { version = "0.1.0", path = "../lorica-notify" }
 lorica-bench = { version = "1.5.2", path = "../lorica-bench" }
+# Used in `certificates.rs::validate_certificate_bundle` to gate
+# every cert upload (POST /certificates, PUT /certificates/{id},
+# POST /config/import) with the exact loader the worker uses :
+# `lorica_tls::validate_certificate_bundle` builds a rustls
+# `CertifiedKey` and calls `keys_match()` for SPKI consistency.
+# Sharing this dep is deliberate (no API/worker parser drift) but
+# it pulls rustls 0.23 server-side (`CertifiedKey` + signing stack
+# + `rustls-pki-types`) into the `lorica-api` binary, not just the
+# PEM parser.
+lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
 axum = { version = "0.7", features = ["multipart", "ws"] }
 futures-util = "0.3"
 tower = "0.4"

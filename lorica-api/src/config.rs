@@ -63,6 +63,24 @@ pub async fn import_config(
     let import_data = lorica_config::import::parse_toml(&body.toml_content)
         .map_err(|e| ApiError::BadRequest(format!("invalid TOML: {e}")))?;
 
+    // Validate every cert+key bundle with the worker's loader before
+    // touching the store so a single bad row in a bulk import cannot
+    // land in the database and poison subsequent
+    // `cert_resolver.reload(...)` batches at runtime, *and* so an
+    // import where the cert and key come from two different keypairs
+    // is rejected at the boundary rather than surfacing as a TLS
+    // `DecryptError` alert at handshake time. Same invariant as
+    // POST/PUT /certificates.
+    for cert in &import_data.certificates {
+        crate::certificates::validate_certificate_bundle(&cert.cert_pem, &cert.key_pem)
+            .map_err(|e| match e {
+                ApiError::BadRequest(msg) => {
+                    ApiError::BadRequest(format!("certificate {:?}: {}", cert.domain, msg))
+                }
+                other => other,
+            })?;
+    }
+
     let store = state.store.lock().await;
     lorica_config::import::import_to_store(&store, &import_data)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
