@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-04-28
+
 ### Changed
 
 - **v1.5.3 behavior change at the certificate-API boundary** : every cert-storing endpoint (`POST /api/v1/certificates`, `PUT /api/v1/certificates/{id}`, `POST /api/v1/config/import`) now validates the `(cert_pem, key_pem)` bundle with `lorica_tls::validate_certificate_bundle` before persisting. Bundles that previously succeeded but silently broke at handshake time (cert and key from two different keypairs - the v1.5.2 incident shape) now reject with HTTP 400 carrying the rustls SPKI-mismatch diagnostic, AND bundles whose `cert_pem` or `key_pem` cannot be parsed at all (the original v1.5.2 incident's first-pass shape - non-PEM payload pasted into `key_pem`) reject with HTTP 400 carrying the offending `BEGIN` line in the diagnostic. This is strictly stricter than v1.5.2 ; an upgrade from v1.5.2 to v1.5.3 cannot break a production workload because the only newly-rejected uploads are the ones that already would have failed at TLS handshake time, but a CI pipeline that scripted cert uploads with bogus PEMs (some test harnesses do) will now see 400 where v1.5.2 returned 201. The rejection metric (`lorica_certificates_invalid_bundle_total{source="upload"}`) stays at 0 in steady state on a well-behaved deployment ; non-zero is informational (a paste error caught at the boundary, no fleet impact). The companion `source="reload"` increment flags a pre-existing broken row that was tolerated by the worker resolver - that one IS alertable.
