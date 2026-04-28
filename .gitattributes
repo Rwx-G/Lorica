@@ -4,3 +4,9 @@ entrypoint* text eol=lf
 Dockerfile* text eol=lf
 # RPM spec files must use LF (rpmbuild fails on CRLF)
 *.spec text eol=lf
+# PEM fixtures (test certs / keys) must stay byte-stable LF across
+# platforms : substring assertions in `cert_resolver` tests rely on
+# exact `BEGIN ... KEY` markers, and git autocrlf on Windows would
+# rewrite the working copy to CRLF and silently change the embedded
+# bytes that `include_str!` ships into the test binary.
+*.pem text eol=lf

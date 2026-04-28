@@ -140,6 +140,36 @@ struct ParsedCertInfo {
     fingerprint: String,
 }
 
+/// Reject a bundle the worker would silently fail to serve. Validates
+/// three invariants against the exact code path the runtime uses :
+/// (1) the cert PEM contains at least one X.509 leaf, (2) the key PEM
+/// is loadable as PKCS#8 / PKCS#1 / SEC1, and (3) the leaf's
+/// `SubjectPublicKeyInfo` matches the key (rustls'
+/// `CertifiedKey::keys_match`). Closes both silent-corruption classes
+/// seen in v1.5.2 prod : a bad paste landing a non-key block (CSR,
+/// public key…) in `key_pem`, *and* a re-upload landing a cert and a
+/// key from two distinct keypairs in the same row. The latter passes
+/// per-field PEM parsing but breaks `CertificateVerify` at handshake
+/// time and surfaces as a TLS `DecryptError` alert on the client side
+/// with no usable diagnostic on the server side.
+pub(crate) fn validate_certificate_bundle(
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(), ApiError> {
+    if cert_pem.trim().is_empty() {
+        crate::metrics::inc_certificates_invalid_bundle("upload");
+        return Err(ApiError::BadRequest("cert_pem is empty".into()));
+    }
+    if key_pem.trim().is_empty() {
+        crate::metrics::inc_certificates_invalid_bundle("upload");
+        return Err(ApiError::BadRequest("key_pem is empty".into()));
+    }
+    lorica_tls::validate_certificate_bundle(cert_pem, key_pem).map_err(|e| {
+        crate::metrics::inc_certificates_invalid_bundle("upload");
+        ApiError::BadRequest(format!("invalid certificate bundle : {e}"))
+    })
+}
+
 /// Parse X.509 metadata from a PEM certificate string.
 /// Falls back to defaults if parsing fails (so uploads always succeed).
 fn parse_cert_pem(cert_pem: &str) -> ParsedCertInfo {
@@ -274,6 +304,7 @@ pub async fn create_certificate(
             "cert_pem and key_pem are required".into(),
         ));
     }
+    validate_certificate_bundle(&body.cert_pem, &body.key_pem)?;
 
     let parsed = parse_cert_pem(&body.cert_pem);
     let now = Utc::now();
@@ -364,6 +395,15 @@ pub async fn update_certificate(
 
     if let Some(domain) = body.domain {
         cert.domain = domain;
+    }
+    // If either PEM is being replaced, re-validate the full bundle
+    // (existing field + incoming field) so an UPDATE that touches
+    // only `cert_pem` or only `key_pem` cannot end up with a row
+    // whose cert and key come from two different keypairs.
+    if body.cert_pem.is_some() || body.key_pem.is_some() {
+        let candidate_cert = body.cert_pem.as_deref().unwrap_or(&cert.cert_pem);
+        let candidate_key = body.key_pem.as_deref().unwrap_or(&cert.key_pem);
+        validate_certificate_bundle(candidate_cert, candidate_key)?;
     }
     if let Some(cert_pem) = body.cert_pem {
         let parsed = parse_cert_pem(&cert_pem);

@@ -2918,14 +2918,23 @@ fn run_worker(
                     ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
                 })
                 .collect();
-            if let Err(e) = cert_resolver.reload(cert_data) {
-                warn!(error = %e, "worker failed to load certificates into resolver");
-            } else {
-                info!(
-                    worker_id = id,
-                    domains = cert_resolver.domain_count(),
-                    "worker loaded TLS certificates"
-                );
+            match cert_resolver.reload(cert_data) {
+                Ok(stats) => {
+                    if stats.skipped > 0 {
+                        lorica_api::metrics::inc_certificates_invalid_bundle_by(
+                            "reload",
+                            stats.skipped as u64,
+                        );
+                    }
+                    info!(
+                        worker_id = id,
+                        domains = cert_resolver.domain_count(),
+                        skipped = stats.skipped,
+                        total = stats.total,
+                        "worker loaded TLS certificates"
+                    );
+                }
+                Err(e) => warn!(error = %e, "worker failed to load certificates into resolver"),
             }
         }
     });
@@ -3729,13 +3738,22 @@ fn run_single_process(cli: Cli) {
                         ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
                     })
                     .collect();
-                if let Err(e) = cert_resolver.reload(cert_data) {
-                    warn!(error = %e, "failed to load certificates into resolver");
-                } else {
-                    info!(
-                        domains = cert_resolver.domain_count(),
-                        "loaded certificates into SNI resolver"
-                    );
+                match cert_resolver.reload(cert_data) {
+                    Ok(stats) => {
+                        if stats.skipped > 0 {
+                            lorica_api::metrics::inc_certificates_invalid_bundle_by(
+                                "reload",
+                                stats.skipped as u64,
+                            );
+                        }
+                        info!(
+                            domains = cert_resolver.domain_count(),
+                            skipped = stats.skipped,
+                            total = stats.total,
+                            "loaded certificates into SNI resolver"
+                        );
+                    }
+                    Err(e) => warn!(error = %e, "failed to load certificates into resolver"),
                 }
             }
         }

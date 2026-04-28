@@ -855,6 +855,63 @@ pub fn inc_bot_verdict_push_failed() {
     BOT_VERDICT_PUSH_FAILED_TOTAL.inc();
 }
 
+/// Counter: certificate bundles rejected as invalid (v1.5.3).
+///
+/// Bumped when a cert+key bundle fails the `CertifiedKey::keys_match`
+/// SPKI-consistency check or fails to parse altogether. Two label
+/// values exposed so operators can alert on each independently :
+///
+/// - `source="upload"` : the API gate (`POST /certificates`,
+///   `PUT /certificates/{id}`, `POST /config/import`) rejected an
+///   incoming bundle. Steady-state 0 ; non-zero is informational
+///   (someone tried a paste error and the API caught it - no fleet
+///   impact, no row in the DB).
+///
+/// - `source="reload"` : the worker-side `cert_resolver::reload`
+///   skipped a row that was already in the DB (legacy v1.5.2 row,
+///   row written outside the API gate, or a row that stopped
+///   loading after a future schema change). Non-zero is alertable :
+///   that domain is currently NOT served by TLS termination on the
+///   affected worker, the `journalctl` per-row WARN names the
+///   specific domain.
+///
+/// Bounded cardinality : two label values, no operator-controlled
+/// or user-controlled string in the label set.
+static CERTIFICATES_INVALID_BUNDLE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "certificates_invalid_bundle_total",
+            "Certificate bundles rejected as invalid (source=upload|reload)"
+        )
+        .namespace("lorica"),
+        &["source"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Bump the invalid-bundle counter by one. `source` must be either
+/// `"upload"` (API gate rejection) or `"reload"` (worker resolver
+/// skipped a row). Other values are accepted but waste cardinality.
+pub fn inc_certificates_invalid_bundle(source: &str) {
+    CERTIFICATES_INVALID_BUNDLE_TOTAL
+        .with_label_values(&[source])
+        .inc();
+}
+
+/// Bump the invalid-bundle counter by `count` for a given source.
+/// Used by the worker boot / reload path which reports the skipped
+/// total for one batch in a single call rather than N inc's.
+pub fn inc_certificates_invalid_bundle_by(source: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    CERTIFICATES_INVALID_BUNDLE_TOTAL
+        .with_label_values(&[source])
+        .inc_by(count);
+}
+
 /// Counter: two-phase config reload rounds where the Commit phase
 /// partially succeeded - some workers committed, others failed
 /// (timeout / error). The supervisor coordinator falls back to the

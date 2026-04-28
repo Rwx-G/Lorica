@@ -27,6 +27,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use log::warn;
 use lorica_error::{Error, ErrorType, OrErr, Result};
 // Pinned to `ring` to match the workspace-wide crypto stack
 // (audit M-6 : avoid carrying both ring + aws-lc-rs in the binary).
@@ -40,6 +41,8 @@ use rustls::sign::CertifiedKey;
 // per-call pattern.
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+use crate::load_first_private_key;
 
 /// Data needed to load a certificate into the resolver.
 #[derive(Clone)]
@@ -94,6 +97,27 @@ impl Default for CertResolver {
     }
 }
 
+/// Outcome counts for one [`CertResolver::reload`] call.
+///
+/// Exposed so the caller (in `lorica`) can bump
+/// `lorica_certificates_invalid_bundle_total{source="reload"}` per
+/// skipped cert without `lorica-tls` having to depend on
+/// `lorica-api`. `domains` is the count of distinct primary-domain
+/// entries the swap published (SAN registrations re-use the same
+/// `CertEntry` and don't add to this number). `skipped_domains`
+/// carries the originating `domain` of every skipped row so the
+/// caller can build a structured log without having to grep the
+/// per-row WARN ; this also makes the partial-tolerance regression
+/// test directly assert that the right domain was skipped instead
+/// of inferring it from a count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadStats {
+    pub total: usize,
+    pub skipped: usize,
+    pub domains: usize,
+    pub skipped_domains: Vec<String>,
+}
+
 impl CertResolver {
     /// Create an empty resolver.
     pub fn new() -> Self {
@@ -108,15 +132,39 @@ impl CertResolver {
     ///
     /// Builds a new lookup table from the provided certificates and swaps it in.
     /// Existing TLS connections continue using their already-negotiated certificates.
-    pub fn reload(&self, certs: Vec<CertData>) -> Result<()> {
+    ///
+    /// Per-cert build failures are logged and skipped rather than aborting the
+    /// whole reload : a single misconfigured row in the database (truncated
+    /// key, encoded-with-the-wrong-encryption-key blob, mismatched cert/key
+    /// pair…) must not poison every other vhost on the resolver. The caller
+    /// can detect a fully-empty result via [`Self::domain_count`] and the
+    /// per-row skip count via the returned [`ReloadStats::skipped`] - the
+    /// latter is what `lorica` feeds into the
+    /// `lorica_certificates_invalid_bundle_total{source="reload"}`
+    /// Prometheus counter.
+    pub fn reload(&self, certs: Vec<CertData>) -> Result<ReloadStats> {
         let mut map: HashMap<String, Vec<CertEntry>> = HashMap::new();
+        let total = certs.len();
+        let mut skipped_domains: Vec<String> = Vec::new();
 
         for cert_data in certs {
-            let certified_key = build_certified_key(
+            let certified_key = match build_certified_key(
                 &cert_data.cert_pem,
                 &cert_data.key_pem,
                 cert_data.ocsp_response.clone(),
-            )?;
+            ) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!(
+                        "cert resolver: skipping cert for domain {:?} ({} SAN) : {}",
+                        cert_data.domain,
+                        cert_data.san_domains.len(),
+                        e
+                    );
+                    skipped_domains.push(cert_data.domain.clone());
+                    continue;
+                }
+            };
             let entry = CertEntry {
                 key: Arc::new(certified_key),
                 not_after_epoch: cert_data.not_after_epoch,
@@ -138,8 +186,21 @@ impl CertResolver {
             entries.sort_by_key(|e| std::cmp::Reverse(e.not_after_epoch));
         }
 
+        let skipped = skipped_domains.len();
+        if skipped > 0 {
+            warn!(
+                "cert resolver: {skipped}/{total} certificate(s) skipped due to load errors"
+            );
+        }
+
+        let domains = map.len();
         self.inner.store(Arc::new(CertResolverInner { certs: map }));
-        Ok(())
+        Ok(ReloadStats {
+            total,
+            skipped,
+            domains,
+            skipped_domains,
+        })
     }
 
     /// Number of unique domains currently registered.
@@ -203,7 +264,7 @@ impl ResolvesServerCert for CertResolver {
 
 /// Parse PEM strings and build a rustls `CertifiedKey`, optionally with an
 /// OCSP staple response.
-fn build_certified_key(
+pub fn build_certified_key(
     cert_pem: &str,
     key_pem: &str,
     ocsp_response: Option<Vec<u8>>,
@@ -235,12 +296,13 @@ fn parse_certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn parse_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
-    // `PrivateKeyDer::from_pem_slice` returns the first supported
-    // key block (PKCS1 / PKCS8 / SEC1) and is `Err` when none is
-    // present or the PEM is malformed - matches the previous
-    // "iterate Items, return first key, fail otherwise" semantics.
-    PrivateKeyDer::from_pem_slice(pem.as_bytes())
-        .or_err(ErrorType::InvalidCert, "no private key found in PEM")
+    // Accept PKCS#8, PKCS#1 (RSA), and SEC1 (EC) section kinds with
+    // an explicit per-format fallback : a misconfigured upstream
+    // PEM with mixed sections, an unusual ordering, or a stray
+    // non-key block still yields a key when one is present in any
+    // supported encoding. See `crate::load_first_private_key` for
+    // the diagnostics produced on total failure.
+    load_first_private_key(pem.as_bytes())
 }
 
 #[cfg(test)]
@@ -393,5 +455,210 @@ mod tests {
 
         // Stored as lowercase
         assert_eq!(resolver.domain_count(), 1);
+    }
+
+    /// PEM private-key loader must accept the three encodings that
+    /// any RFC-7468-compatible operator-supplied bundle could carry :
+    /// PKCS#8 (`-----BEGIN PRIVATE KEY-----`), PKCS#1
+    /// (`-----BEGIN RSA PRIVATE KEY-----`, the openssl-genrsa default
+    /// before 3.0 and still produced by `openssl genrsa -traditional`),
+    /// and SEC1 (`-----BEGIN EC PRIVATE KEY-----`). Pre-existing
+    /// `test-key.pem` covers SEC1 ; the two RSA fixtures cover the
+    /// other two and use a single key material so they round-trip
+    /// against the same RSA self-signed cert.
+    #[test]
+    fn loads_pkcs8_rsa_private_key() {
+        let cert_pem = include_str!("../tests/test-cert-rsa.pem");
+        let key_pem = include_str!("../tests/test-key-rsa-pkcs8.pem");
+        assert!(key_pem.contains("BEGIN PRIVATE KEY"));
+
+        let resolver = CertResolver::new();
+        resolver
+            .reload(vec![CertData {
+                domain: "test.example.com".to_string(),
+                san_domains: vec![],
+                cert_pem: cert_pem.to_string(),
+                key_pem: key_pem.to_string(),
+                not_after_epoch: 9999999999,
+                ocsp_response: None,
+            }])
+            .expect("PKCS#8 RSA key must load");
+        assert_eq!(resolver.domain_count(), 1);
+    }
+
+    #[test]
+    fn loads_pkcs1_rsa_private_key() {
+        let cert_pem = include_str!("../tests/test-cert-rsa.pem");
+        let key_pem = include_str!("../tests/test-key-rsa-pkcs1.pem");
+        assert!(key_pem.contains("BEGIN RSA PRIVATE KEY"));
+
+        let resolver = CertResolver::new();
+        resolver
+            .reload(vec![CertData {
+                domain: "test.example.com".to_string(),
+                san_domains: vec![],
+                cert_pem: cert_pem.to_string(),
+                key_pem: key_pem.to_string(),
+                not_after_epoch: 9999999999,
+                ocsp_response: None,
+            }])
+            .expect("PKCS#1 RSA key must load");
+        assert_eq!(resolver.domain_count(), 1);
+    }
+
+    #[test]
+    fn loads_sec1_ec_private_key() {
+        let cert_pem = include_str!("../tests/test-cert.pem");
+        let key_pem = include_str!("../tests/test-key.pem");
+        assert!(key_pem.contains("BEGIN EC PRIVATE KEY"));
+
+        let resolver = CertResolver::new();
+        resolver
+            .reload(vec![CertData {
+                domain: "test.example.com".to_string(),
+                san_domains: vec![],
+                cert_pem: cert_pem.to_string(),
+                key_pem: key_pem.to_string(),
+                not_after_epoch: 9999999999,
+                ocsp_response: None,
+            }])
+            .expect("SEC1 EC key must load");
+        assert_eq!(resolver.domain_count(), 1);
+    }
+
+    /// `validate_certificate_bundle` must reject a row whose `cert_pem`
+    /// and `key_pem` are individually well-formed but come from two
+    /// different keypairs. Without this, the upload lands cleanly in
+    /// the database, every PEM parser is happy, but the worker signs
+    /// `CertificateVerify` with a key that does not match the
+    /// presented leaf : the client closes the handshake with a TLS
+    /// `DecryptError` alert (alert code 51) and the server has no
+    /// usable diagnostic. This was the second-pass failure mode in
+    /// the v1.5.2 prod incident, after the initial PEM-parse failure
+    /// was worked around.
+    #[test]
+    fn validate_bundle_rejects_cert_and_key_from_different_keypairs() {
+        let cert_pem = include_str!("../tests/test-cert-rsa.pem");
+        let mismatched_key = include_str!("../tests/test-key-rsa-pkcs1-other.pem");
+
+        let err = crate::validate_certificate_bundle(cert_pem, mismatched_key)
+            .expect_err("mismatched bundle must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("matching")
+                || msg.to_lowercase().contains("mismatch")
+                || msg.to_lowercase().contains("subjectpublickeyinfo"),
+            "expected SPKI-mismatch diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_bundle_accepts_matching_pair() {
+        let cert_pem = include_str!("../tests/test-cert-rsa.pem");
+        let key_pem = include_str!("../tests/test-key-rsa-pkcs1.pem");
+        crate::validate_certificate_bundle(cert_pem, key_pem)
+            .expect("matching bundle must validate");
+    }
+
+    /// A single corrupted row in the database (truncated key blob,
+    /// rotated encryption key, mismatched cert/key pair…) must not
+    /// poison the whole batch : every other vhost on the resolver
+    /// has to keep working. This mirrors a v1.5.2 prod incident in
+    /// which a single bad row left the entire resolver empty and
+    /// brought every TLS-terminated vhost down at once.
+    ///
+    /// The test asserts on `ReloadStats::skipped_domains` directly,
+    /// not just `domain_count`, so a future refactor that keeps the
+    /// skip behaviour but loses the per-row diagnostic (the
+    /// originating `domain` carried in the WARN line and now in the
+    /// stats) fails this case with a named regression. The whole
+    /// operational value of the v1.5.3 fix is the operator's ability
+    /// to identify the offending vhost without grepping logs.
+    #[test]
+    fn reload_skips_bad_certs_and_keeps_the_good_ones() {
+        let good_cert = include_str!("../tests/test-cert-rsa.pem").to_string();
+        let good_key = include_str!("../tests/test-key-rsa-pkcs1.pem").to_string();
+
+        let resolver = CertResolver::new();
+        let stats = resolver
+            .reload(vec![
+                CertData {
+                    domain: "broken.example.com".to_string(),
+                    san_domains: vec![],
+                    cert_pem: good_cert.clone(),
+                    key_pem: "this is not a PEM key".to_string(),
+                    not_after_epoch: 9999999999,
+                    ocsp_response: None,
+                },
+                CertData {
+                    domain: "good.example.com".to_string(),
+                    san_domains: vec![],
+                    cert_pem: good_cert,
+                    key_pem: good_key,
+                    not_after_epoch: 9999999999,
+                    ocsp_response: None,
+                },
+            ])
+            .expect("reload must succeed even with a broken row in the batch");
+
+        // Only the good vhost is registered ; the broken one was
+        // skipped and the stats carry its originating domain.
+        assert_eq!(resolver.domain_count(), 1);
+        assert_eq!(stats.total, 2, "stats.total must count input rows");
+        assert_eq!(stats.skipped, 1, "exactly one row must have been skipped");
+        assert_eq!(
+            stats.skipped_domains,
+            vec!["broken.example.com".to_string()],
+            "the skipped row's originating domain must be reported \
+             so the operator can identify which vhost is missing - \
+             pinning this prevents a future refactor from dropping \
+             the per-row diagnostic"
+        );
+        assert_eq!(stats.domains, 1, "exactly one domain must be served");
+    }
+
+    /// All rows skipped : the resolver MUST end up empty (not stale)
+    /// and the stats must list every originating domain so the
+    /// operator can tell at a glance that nothing is being served.
+    /// Pre-fix, a fully-broken batch would have failed the whole
+    /// reload with `?` and left the previous resolver state in place,
+    /// which is the worst possible failure mode for an operator
+    /// rotating credentials.
+    #[test]
+    fn reload_with_all_bad_rows_publishes_empty_resolver() {
+        let good_cert = include_str!("../tests/test-cert-rsa.pem").to_string();
+
+        let resolver = CertResolver::new();
+        let stats = resolver
+            .reload(vec![
+                CertData {
+                    domain: "first.example.com".to_string(),
+                    san_domains: vec![],
+                    cert_pem: good_cert.clone(),
+                    key_pem: "not a PEM key".to_string(),
+                    not_after_epoch: 9999999999,
+                    ocsp_response: None,
+                },
+                CertData {
+                    domain: "second.example.com".to_string(),
+                    san_domains: vec![],
+                    cert_pem: good_cert,
+                    key_pem: "also not a PEM key".to_string(),
+                    not_after_epoch: 9999999999,
+                    ocsp_response: None,
+                },
+            ])
+            .expect("reload must succeed even when every row is broken");
+
+        assert_eq!(resolver.domain_count(), 0);
+        assert_eq!(stats.skipped, 2);
+        assert_eq!(
+            stats.skipped_domains,
+            vec![
+                "first.example.com".to_string(),
+                "second.example.com".to_string(),
+            ],
+            "both rows' originating domains must be reported"
+        );
     }
 }

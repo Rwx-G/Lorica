@@ -14,6 +14,20 @@ use crate::server::{build_router, AppState};
 use crate::system::SystemCache;
 use crate::workers::WorkerMetrics;
 
+// Real PEM fixtures shared with `lorica-tls`. Since v1.5.3 every
+// cert-storing endpoint validates `cert_pem`/`key_pem` with the same
+// loader the worker uses (`lorica_tls::validate_certificate_bundle`),
+// so dummy `BEGIN CERTIFICATE\ntest\nEND CERTIFICATE` strings are now
+// rejected at the boundary. We point at the existing fixtures rather
+// than duplicate them : keypair A (RSA) and keypair B (EC SEC1) give
+// us two SPKI-valid bundles, which is enough to also exercise the
+// PUT path that swaps both fields atomically and expects the
+// fingerprint to change.
+const TEST_CERT_RSA_PEM: &str = include_str!("../../lorica-tls/tests/test-cert-rsa.pem");
+const TEST_KEY_RSA_PEM: &str = include_str!("../../lorica-tls/tests/test-key-rsa-pkcs1.pem");
+const TEST_CERT_EC_PEM: &str = include_str!("../../lorica-tls/tests/test-cert.pem");
+const TEST_KEY_EC_PEM: &str = include_str!("../../lorica-tls/tests/test-key.pem");
+
 async fn test_state() -> (AppState, SessionStore, RateLimiter) {
     let store = lorica_config::ConfigStore::open_in_memory().expect("test setup");
     let store = Arc::new(Mutex::new(store));
@@ -602,8 +616,8 @@ async fn test_certificates_crud() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({
         "domain": "example.com",
-        "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----",
-        "key_pem": "-----BEGIN PRIVATE KEY-----\nMIIBtest\n-----END PRIVATE KEY-----"
+        "cert_pem": TEST_CERT_RSA_PEM,
+        "key_pem": TEST_KEY_RSA_PEM
     });
 
     let req = Request::builder()
@@ -681,8 +695,8 @@ async fn test_certificate_delete_blocked_by_route() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({
         "domain": "example.com",
-        "cert_pem": "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
-        "key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"
+        "cert_pem": TEST_CERT_RSA_PEM,
+        "key_pem": TEST_KEY_RSA_PEM
     });
 
     let req = Request::builder()
@@ -926,8 +940,8 @@ async fn test_certificate_update() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({
         "domain": "example.com",
-        "cert_pem": "-----BEGIN CERTIFICATE-----\noriginal\n-----END CERTIFICATE-----",
-        "key_pem": "-----BEGIN PRIVATE KEY-----\noriginal\n-----END PRIVATE KEY-----"
+        "cert_pem": TEST_CERT_RSA_PEM,
+        "key_pem": TEST_KEY_RSA_PEM
     });
 
     let req = Request::builder()
@@ -952,11 +966,17 @@ async fn test_certificate_update() {
         .expect("test setup")
         .to_string();
 
-    // Update certificate with new PEM
+    // Update both cert_pem and key_pem to a different keypair so the
+    // resulting bundle still satisfies the v1.5.3 SPKI-match invariant
+    // (same loader the worker uses), while the leaf fingerprint
+    // changes - swapping only one field of a valid bundle would
+    // legitimately fail validation, which is the bug the invariant
+    // was added to catch.
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({
         "domain": "updated.com",
-        "cert_pem": "-----BEGIN CERTIFICATE-----\nupdated\n-----END CERTIFICATE-----"
+        "cert_pem": TEST_CERT_EC_PEM,
+        "key_pem": TEST_KEY_EC_PEM
     });
 
     let req = Request::builder()
@@ -979,6 +999,217 @@ async fn test_certificate_update() {
     assert_ne!(
         json["data"]["fingerprint"].as_str().expect("test setup"),
         original_fingerprint
+    );
+}
+
+/// PUT /certificates/{id} that updates ONLY `cert_pem` must
+/// re-validate the resulting `(new cert, existing key)` pair, NOT
+/// just the new field on its own. Pre-v1.5.3 the API silently
+/// landed an invalid bundle in the DB whenever an operator
+/// renewed only one half ; the v1.5.3 work re-reads the existing
+/// field from the store and validates the merged candidate. This
+/// pin makes a future "stop reading the existing field" refactor
+/// surface as a named regression instead of as a TLS DecryptError
+/// alert weeks later in production.
+#[tokio::test]
+async fn test_certificate_update_cert_only_with_mismatched_keypair_returns_400() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Seed with a valid RSA bundle (keypair A).
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "domain": "example.com",
+        "cert_pem": TEST_CERT_RSA_PEM,
+        "key_pem": TEST_KEY_RSA_PEM
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let cert_id = json["data"]["id"].as_str().expect("test setup").to_string();
+
+    // PUT only `cert_pem` with a cert from a different keypair (the
+    // EC SEC1 fixture). The existing key is RSA, so the merged
+    // candidate (EC cert + RSA key) is SPKI-mismatched and must be
+    // rejected with 400.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "cert_pem": TEST_CERT_EC_PEM
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/certificates/{cert_id}"))
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let msg = json["error"]["message"]
+        .as_str()
+        .expect("test setup")
+        .to_lowercase();
+    assert!(
+        msg.contains("matching") || msg.contains("mismatch") || msg.contains("subjectpublickeyinfo"),
+        "expected SPKI-mismatch diagnostic, got: {msg}"
+    );
+}
+
+/// Same shape as `..._cert_only_...`, but the operator submits only
+/// the new `key_pem` instead. The merged candidate `(existing cert,
+/// new key)` is also SPKI-mismatched and must be rejected with 400.
+#[tokio::test]
+async fn test_certificate_update_key_only_with_mismatched_keypair_returns_400() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Seed with the RSA bundle (keypair A).
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "domain": "example.com",
+        "cert_pem": TEST_CERT_RSA_PEM,
+        "key_pem": TEST_KEY_RSA_PEM
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/certificates")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let cert_id = json["data"]["id"].as_str().expect("test setup").to_string();
+
+    // PUT only the EC key against the existing RSA cert.
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "key_pem": TEST_KEY_EC_PEM
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/certificates/{cert_id}"))
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `POST /api/v1/config/import` validates every `[[certificates]]`
+/// row with the same loader the worker uses. A bulk import that
+/// carries even one mismatched bundle must be rejected with 400
+/// before any row touches the store, AND the error message must
+/// name the offending domain so the operator can fix the source
+/// TOML without bisecting the file. This pins the per-row error
+/// prefix added in `lorica-api/src/config.rs::import_config`.
+#[tokio::test]
+async fn test_config_import_with_mismatched_cert_bundle_returns_400() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Wrap PEMs in TOML triple-quoted strings so newlines round-trip
+    // verbatim ; the loader needs the BEGIN/END framing intact.
+    // The mismatched row pairs the RSA cert with the OTHER RSA key
+    // (different keypair) - exactly the v1.5.3 incident shape.
+    let toml_content = format!(
+        r#"version = 1
+
+[global_settings]
+management_port = 9443
+log_level = "info"
+default_health_check_interval_s = 10
+
+[[certificates]]
+id = "cert-mismatched"
+domain = "mismatched.example.com"
+san_domains = []
+fingerprint = "deadbeef"
+cert_pem = """
+{cert}"""
+key_pem = """
+{key}"""
+issuer = "test"
+not_before = "2025-01-01T00:00:00Z"
+not_after = "2030-01-01T00:00:00Z"
+is_acme = false
+acme_auto_renew = false
+created_at = "2025-01-01T00:00:00Z"
+"#,
+        cert = TEST_CERT_RSA_PEM,
+        // Second RSA-2048 keypair - parses cleanly but does not
+        // match `TEST_CERT_RSA_PEM`'s SPKI.
+        key = include_str!("../../lorica-tls/tests/test-key-rsa-pkcs1-other.pem"),
+    );
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "toml_content": toml_content });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/config/import")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let msg = json["error"]["message"]
+        .as_str()
+        .expect("test setup")
+        .to_string();
+    // The per-row prefix MUST surface the originating domain so the
+    // operator can fix the TOML without bisecting the file.
+    assert!(
+        msg.contains("mismatched.example.com"),
+        "import error must name the offending domain ; got: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("matching")
+            || msg.to_lowercase().contains("mismatch")
+            || msg.to_lowercase().contains("subjectpublickeyinfo"),
+        "import error must carry the SPKI-mismatch diagnostic ; got: {msg}"
+    );
+
+    // No row should have landed in the store - the gate is supposed
+    // to fire before `import_to_store`.
+    let store = state.store.lock().await;
+    let certs = store.list_certificates().expect("list_certificates");
+    assert!(
+        certs.iter().all(|c| c.domain != "mismatched.example.com"),
+        "rejected import must not have written the cert row : {certs:?}"
     );
 }
 
@@ -3504,8 +3735,8 @@ async fn test_status_counts_with_data() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({
         "domain": "example.com",
-        "cert_pem": "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
-        "key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"
+        "cert_pem": TEST_CERT_RSA_PEM,
+        "key_pem": TEST_KEY_RSA_PEM
     });
     let req = Request::builder()
         .method("POST")

@@ -853,10 +853,20 @@ pub async fn reload_cert_resolver(
         .collect();
 
     match cert_resolver.reload(cert_data) {
-        Ok(()) => info!(
-            domains = cert_resolver.domain_count(),
-            "TLS certificate resolver reloaded"
-        ),
+        Ok(stats) => {
+            if stats.skipped > 0 {
+                lorica_api::metrics::inc_certificates_invalid_bundle_by(
+                    "reload",
+                    stats.skipped as u64,
+                );
+            }
+            info!(
+                domains = cert_resolver.domain_count(),
+                skipped = stats.skipped,
+                total = stats.total,
+                "TLS certificate resolver reloaded"
+            );
+        }
         Err(e) => warn!(error = %e, "failed to reload TLS certificate resolver"),
     }
 }
