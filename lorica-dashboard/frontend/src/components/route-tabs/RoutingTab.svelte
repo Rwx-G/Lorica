@@ -2,6 +2,7 @@
   import type { RouteFormState } from '../../lib/route-form';
   import type { BackendResponse, CertificateResponse } from '../../lib/api';
   import { ROUTE_DEFAULTS } from '../../lib/route-form';
+  import { findUncoveredHostnames } from '../../lib/cert-san-match';
   import SubsectionHeader from '../SubsectionHeader.svelte';
   import FieldHelpButton from '../FieldHelpButton.svelte';
   import HelpModal from '../HelpModal.svelte';
@@ -69,6 +70,26 @@
   // outside the canary bucket their IP was assigned to.
   // (Resolves UXUI.md finding #25.)
   let stickyVsSplitClash = $derived(form.sticky_session && form.traffic_splits.length > 0);
+
+  // Cross-check the selected certificate's SAN list against the
+  // route's hostname + aliases (RFC 6125 strict matching, the same
+  // rules browsers enforce on the live handshake). A mismatch here
+  // predicts a real TLS handshake error in production - flagged as
+  // a non-blocking warning so a wildcard or multi-SAN cert that the
+  // operator knows covers the host can still be saved without
+  // friction. Resolves issue #11.
+  let selectedCert = $derived<CertificateResponse | undefined>(
+    form.certificate_id ? certificates.find((c) => c.id === form.certificate_id) : undefined,
+  );
+  let routeHostnames = $derived(
+    [
+      form.hostname,
+      ...form.hostname_aliases.split(/[,\n]/).map((s) => s.trim()),
+    ].filter((s) => s.length > 0),
+  );
+  let uncoveredByCert = $derived(
+    selectedCert ? findUncoveredHostnames(routeHostnames, selectedCert.san_domains) : [],
+  );
 </script>
 
 <div class="tab-content">
@@ -125,6 +146,19 @@
           {/each}
         </select>
         <span class="hint">TLS certificate presented to clients on port 443 for this hostname.</span>
+        {#if selectedCert && uncoveredByCert.length > 0}
+          <div class="warn-banner" role="note">
+            <strong>
+              Certificate does not cover {uncoveredByCert.length === 1 ? 'this hostname' : 'these hostnames'}:
+            </strong>
+            {uncoveredByCert.join(', ')}.
+            Clients reaching the route over HTTPS will see a TLS
+            handshake error (SAN mismatch). Pick a cert whose SAN list
+            includes the hostname (or a wildcard that covers it).
+            Cert SAN list:
+            {selectedCert.san_domains.length > 0 ? selectedCert.san_domains.join(', ') : '(empty)'}.
+          </div>
+        {/if}
       </div>
 
       <div class="form-group" class:modified={isModified('load_balancing')}>
