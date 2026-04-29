@@ -1,0 +1,46 @@
+schema: 1
+story: "8.1"
+story_title: "Foundation Module Split (proxy_wiring.rs + main.rs)"
+gate: PASS
+status_reason: "All 8 acceptance criteria marked Done with verified evidence. Module split delivered as documented (main.rs 4329->3566 LOC, proxy_wiring.rs ~5440->3690 LOC, exceeding the PRD's ~4350 target). 16 check_<name> helpers + write_decision sink + per-concern filters/ submodules + cli/ + startup/ + WorkerMonitorDeps + ControlPlaneHandles all present. AC #8 parity counts re-verified (persist_waf_event 7, record_waf_event 6, AlertType::IpBanned 3 - match CHANGELOG verbatim). M-22 cert-hot-reload regression suite shipped (proxy_wiring/cert_reload_commit_tests.rs). Three v1.5.2-style asymmetries closed in passing (workers-mode load-test scheduler, single-process notify reload, Retry-After consistency). No TODO / FIXME / dbg! / unimplemented! in new code. AC #8 verification method (source-level call-site parity + dispatch order) is now mechanically pinned via the new dispatch_order_locked test in proxy_wiring/tests.rs - any future reorder, drop, rename, or addition of a check_<name> helper fails CI with a named regression message. The earlier VERIFY-001 concern (one-shot review-time check) is closed by this test. Remaining DOCS-001 (no docs/stories/ file for the story) is informational only - the story is fully traceable through the PRD + backlog + CHANGELOG."
+reviewer: "Quinn (Test Architect)"
+updated: "2026-04-29T00:00:00Z"
+
+waiver: { active: false }
+
+top_issues: []
+
+quality_score: 100
+expires: "2026-05-13T00:00:00Z"
+
+evidence:
+  tests_reviewed: 269
+  risks_identified: 0
+  trace:
+    ac_covered: [1, 2, 3, 4, 5, 6, 7, 8]
+    ac_gaps: []
+    ac_gap_reason: ""
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: "Pure refactor - no new public API surface, no auth path change, no encryption-key handling change. Filter chain dispatch order preserved verbatim across the extraction (15 check_<name> calls in request_filter fire in the same sequence as the bd4219b inline checks: global_connection_limit -> ip_banned -> ip_blocked -> websocket_disabled -> token_bucket_rate_limit -> mtls -> forward_auth -> maintenance_mode -> return_status -> ip_allow_deny -> geoip -> slowloris -> route_conn_limit -> legacy_rate_limit -> waf_request_filter; check_waf_body_filter fires in request_body_filter exactly as evaluate_body did inline). Order is now mechanically locked via the dispatch_order_locked regression test - any future reorder fails CI before merge. Three security-adjacent asymmetries closed in passing: Retry-After + X-RateLimit-Reset are now uniformly attached at every rate-limit reject and at the maintenance-mode 503 (was conditional pre-extraction); the workers-mode load-test scheduler asymmetry that would have masked a similar pattern is closed. AC #8 source-level parity grep confirms no production-side persist_waf_event / record_waf_event / AlertType::IpBanned / AlertType::WafAlert / rate_limiter.observe / forward_auth_inject / ip_blocklist.is_blocked_str / record_blocklist_event call site was added or removed by the extraction (counts: 7=7, 6=6, 1=1, 3=3, 2=2, 1=1, 1=1, 1=1, 1=1)."
+  performance:
+    status: PASS
+    notes: "Refactor is structural - same hot-path code, just relocated. Decision struct adds two `Cow` allocations per error response (header name + body), which dominates over the previous five inline write_response_header calls only in the error path - not on the proxy fast path. write_decision is async and end-of-request; no measurable hot-path change. arc-swap consumers unchanged. The new dispatch_order_locked test runs at compile time via include_str! so it adds zero runtime cost to non-test builds."
+  reliability:
+    status: PASS
+    notes: "Three v1.5.2-style asymmetries closed during the extraction: workers-mode load-test scheduler missing (silently dropped scheduled load tests under --workers N); single-process notify dispatcher reload missing (dashboard notification edits required full restart); Retry-After + X-RateLimit-Reset header drift across rate-limit reject sites. The shared spawn_control_plane_tasks + init_data_plane_handles + spawn_data_plane_pruners helpers force every new spawn to declare which roles need it explicitly, structurally preventing the v1.5.2 worker-mode cert hot-reload bug pattern. M-22 regression suite (proxy_wiring/cert_reload_commit_tests.rs) pins the cert-hot-reload behaviour with three white-box tests. dispatch_order_locked pins the request_filter / request_body_filter pipeline order against future drift."
+  maintainability:
+    status: PASS
+    notes: "Substantial maintainability gain: main.rs -763 LOC, proxy_wiring.rs -1750 LOC; redistributed across 11 startup/ + 3 cli/ + 7 filters/ + 4 proxy_wiring/ submodules with focused use-sets per file. request_filter decomposed from a 1664-LOC inline pipeline into a flat sequence of 15 check_<name> calls (each returning Option<Decision> sync or Result<Option<Decision>> async) with one shared write_decision sink for every error-response site. Decision builder API (Decision::reject().with_html().with_header()) replaces the previous five-step inline write_response_header pattern at 18 sites. WorkerMonitorDeps struct bundles the 14 supervisor-owned handles the monitor needs into one parameter so the public spawn_worker_monitor signature stays readable. AC #1 / #4 rebalance from the prescribed layout is documented with rationale. 0 TODO / FIXME / dbg! / unimplemented! markers in new code. 3 #[allow(dead_code)] are pre-existing or struct-field reflection. dispatch_order_locked self-documents the canonical 16-helper order at the test site (failure message tells the maintainer what to update if the change is intentional)."
+
+recommendations:
+  immediate: []
+  future:
+    - action: "Run a final `cargo test --workspace` + `cargo clippy --tests -- -D warnings` + `cargo audit` + `pnpm lint` + `pnpm exec svelte-check` pass at HEAD before opening the v1.6.0 PR to main, to confirm the 268+1 = 269-test claim still holds after the v1.5.4 merge from main and the new dispatch_order_locked test."
+      refs: ["lorica/", "lorica-dashboard/frontend/", ".cargo/audit.toml"]
+    - action: "Consider scaffolding docs/stories/story-8.1-foundation-module-split.md retroactively if Stories 8.2..8.12 will follow the docs/stories/ convention - having a baseline story file referenced by future stories smooths the BMad QA workflow. Informational only, not blocking."
+      refs: ["docs/stories/", "docs/prd/epic-8-v1.6.0.md"]
+    - action: "On the next epic that touches the request_filter dispatch chain, codify AC #8 verification method (source-level call-site parity + dispatch order + mechanically-locked test like dispatch_order_locked) in the BMad task templates so the cargo-expand byte-equality alternative is no longer prescribed by default."
+      refs: ["docs/prd/epic-8-v1.6.0.md", ".bmad-core/tasks/review-story.md"]

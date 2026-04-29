@@ -3266,3 +3266,79 @@ fn redirect_location_path_rule_literal_ignores_query_too() {
     let loc = build_redirect_location("https://example.com/final", "/src", Some("utm=x"), true);
     assert_eq!(loc, "https://example.com/final");
 }
+
+/// Story 8.1 AC #8 dispatch order regression pin.
+///
+/// Locks the `request_filter` -> `request_body_filter` call sequence
+/// across the 16 `self.check_<name>(...)` sites in `proxy_wiring.rs`.
+/// A future refactor that reorders, drops, or renames a helper fails
+/// this test with a clear message naming the regression.
+///
+/// Closes the QA review VERIFY-001 concern : the source-level parity
+/// check used at Story 8.1 closure becomes a mechanical CI gate
+/// instead of a one-shot review artifact.
+///
+/// If you intentionally change the order (e.g. to fix a security
+/// ordering bug), update `EXPECTED` below in the same commit and
+/// document the rationale in CHANGELOG.md `[Unreleased]`.
+#[test]
+fn dispatch_order_locked() {
+    const SOURCE: &str = include_str!("../proxy_wiring.rs");
+
+    // Canonical dispatch order. The first 15 fire in `request_filter`
+    // (top-down), `waf_body_filter` fires in `request_body_filter`.
+    // Order matches the Story 8.1 epic PRD (AC #8) and the CHANGELOG
+    // `[Unreleased]` AC #8 verification entry.
+    const EXPECTED: &[&str] = &[
+        "global_connection_limit",
+        "ip_banned",
+        "ip_blocked",
+        "websocket_disabled",
+        "token_bucket_rate_limit",
+        "mtls",
+        "forward_auth",
+        "maintenance_mode",
+        "return_status",
+        "ip_allow_deny",
+        "geoip",
+        "slowloris",
+        "route_conn_limit",
+        "legacy_rate_limit",
+        "waf_request_filter",
+        "waf_body_filter",
+    ];
+
+    let actual: Vec<&str> = SOURCE
+        .lines()
+        .filter_map(|line| {
+            let idx = line.find("self.check_")?;
+            // Skip comment lines that mention `self.check_X` in prose.
+            if line[..idx].trim_start().starts_with("//") {
+                return None;
+            }
+            let after = &line[idx + "self.check_".len()..];
+            // Identifier ends at the first non-`[A-Za-z0-9_]` char.
+            let end = after
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            // Reject if the identifier is not immediately followed by
+            // an opening paren (filters out documentation references
+            // like "the check_foo helper" and trait-object field
+            // accesses if any sneak in later).
+            if !after[end..].starts_with('(') {
+                return None;
+            }
+            Some(&after[..end])
+        })
+        .collect();
+
+    assert_eq!(
+        actual, EXPECTED,
+        "Story 8.1 AC #8 dispatch order regression : the request_filter / \
+         request_body_filter pipeline in proxy_wiring.rs reordered, dropped, \
+         renamed, or added a check_<name> helper. Expected : {EXPECTED:?}. \
+         Actual : {actual:?}. If the change is intentional, update EXPECTED \
+         in this test in the same commit and document the rationale in \
+         CHANGELOG.md [Unreleased]."
+    );
+}
