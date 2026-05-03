@@ -467,6 +467,9 @@ fn test_route_with_path_rule_overrides_applies_some_fields() {
         geoip: None,
         bot_protection: None,
         group_name: String::new(),
+        ai_bot_policy: None,
+        ai_bot_spoofed_fallback: None,
+        serve_robots_txt: false,
         created_at: now,
         updated_at: now,
     };
@@ -612,6 +615,9 @@ fn example_route_for_serde() -> Route {
         geoip: None,
         bot_protection: None,
         group_name: String::new(),
+        ai_bot_policy: None,
+        ai_bot_spoofed_fallback: None,
+        serve_robots_txt: false,
         created_at: now,
         updated_at: now,
     }

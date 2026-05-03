@@ -245,6 +245,36 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
             // migration on a bisect build.
             row.get::<_, String>(65).unwrap_or_default()
         },
+        ai_bot_policy: {
+            // Column index 66 (Story 8.2 migration V39). Stored as
+            // lowercase enum string ("off" / "deny" / "log") or NULL.
+            // `unwrap_or(None)` covers pre-V39 rows on a bisect build.
+            row.get::<_, Option<String>>(66)
+                .unwrap_or(None)
+                .and_then(|s| match s.as_str() {
+                    "off" => Some(AiBotPolicy::Off),
+                    "deny" => Some(AiBotPolicy::Deny),
+                    "log" => Some(AiBotPolicy::Log),
+                    _ => None,
+                })
+        },
+        ai_bot_spoofed_fallback: {
+            // Column index 67 (Story 8.2 migration V39).
+            row.get::<_, Option<String>>(67)
+                .unwrap_or(None)
+                .and_then(|s| match s.as_str() {
+                    "deny" => Some(SpoofedFallback::Deny),
+                    "log" => Some(SpoofedFallback::Log),
+                    "allow" => Some(SpoofedFallback::Allow),
+                    _ => None,
+                })
+        },
+        serve_robots_txt: {
+            // Column index 68 (Story 8.2 migration V41). 0 = false
+            // (default, passthrough to backend), 1 = true (Lorica
+            // intercepts and serves a registry-driven body).
+            row.get::<_, i32>(68).unwrap_or(0) != 0
+        },
         created_at: parse_datetime(&row.get::<_, String>(43)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(44)?)?,
     })

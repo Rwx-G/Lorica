@@ -34,9 +34,10 @@ pub use notification::NotificationConfig;
 pub use preferences::{AdminUser, UserPreference};
 pub use probes::{ProbeConfig, ProbeResultRow};
 pub use route::{
-    BotBypassRules, BotProtectionConfig, BotProtectionMode, ForwardAuthConfig, GeoIpConfig,
-    GeoIpMode, HeaderRule, MirrorConfig, MtlsConfig, PathRule, RateLimit, RateLimitScope,
-    ResponseRewriteConfig, ResponseRewriteRule, Route, TrafficSplit,
+    AiBotPolicy, BotBypassRules, BotProtectionConfig, BotProtectionMode, ForwardAuthConfig,
+    GeoIpConfig, GeoIpMode, HeaderRule, MirrorConfig, MtlsConfig, PathRule, RateLimit,
+    RateLimitScope, ResponseRewriteConfig, ResponseRewriteRule, Route, SpoofedFallback,
+    TrafficSplit,
 };
 pub use settings::{
     builtin_security_presets, resolve_security_preset, GlobalSettings, SecurityHeaderPreset,

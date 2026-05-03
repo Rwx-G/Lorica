@@ -659,6 +659,62 @@ impl ConfigStore {
             );",
         );
 
+        // V39: per-route AI / LLM crawler deny-list policy (Story
+        // 8.2 AC #2 + #3). `ai_bot_policy` is one of the
+        // serde-rendered enum strings ("off" / "deny" / "log") or
+        // NULL for the absent / Off semantic. `ai_bot_spoofed_fallback`
+        // is one of "deny" / "log" / "allow" or NULL to defer to the
+        // global `GlobalSettings.ai_bot_treat_spoofed_as` (default
+        // "deny"). CHECK constraint enforced at the API boundary
+        // via serde-derive parsing of the enum (the validation-split
+        // convention documented at the top of this file).
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN ai_bot_policy TEXT DEFAULT NULL",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN ai_bot_spoofed_fallback TEXT DEFAULT NULL",
+            [],
+        );
+
+        // V40: custom AI-crawler registry (Story 8.2 AC #6). One row
+        // = one operator-defined entry merged with the built-in
+        // BUILTIN_CRAWLERS list at request-evaluation time
+        // (custom-wins-on-conflict per `name`). `verification_kind`
+        // is one of 'rdns' | 'ip_ranges' | 'ua_only' ;
+        // `verification_data` carries a JSON blob :
+        //   {"suffixes": [".x.com", ...]}     for 'rdns'
+        //   {"cidrs": ["1.2.3.0/24", ...]}    for 'ip_ranges'
+        //   NULL                               for 'ua_only'
+        // JSON-blob convention mirrors `routes.aliases_json` /
+        // `routes.path_rules` rather than a comma-separated TEXT
+        // (avoids the comma-in-suffix edge case).
+        let _ = self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ai_crawlers_custom (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                user_agent_pattern TEXT NOT NULL,
+                verification_kind TEXT NOT NULL,
+                verification_data TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        );
+
+        // V41: per-route auto-served /robots.txt opt-in (Story 8.2
+        // AC #10). Default 0 (false) preserves backward compat -
+        // existing deployments keep passthrough to backend. When 1
+        // (true), Lorica intercepts GET /robots.txt for this route
+        // and serves a registry-driven body filtered to crawlers
+        // with `ai_bot_policy != Off` on this route. No global
+        // toggle by design (avoids silent default-behaviour change
+        // on upgrade).
+        let _ = self.conn.execute(
+            "ALTER TABLE routes ADD COLUMN serve_robots_txt INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
         Ok(())
     }
 

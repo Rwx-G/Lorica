@@ -742,6 +742,34 @@ pub struct Route {
     /// `None` = filter disabled for this route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_protection: Option<BotProtectionConfig>,
+    /// Per-route AI / LLM crawler deny-list policy (Story 8.2 AC #2).
+    /// `None` and `Some(AiBotPolicy::Off)` are equivalent at the
+    /// request-filter layer (no behaviour change). When `Some(Deny)`,
+    /// matched AI crawlers receive 403 + `Retry-After: 86400` + the
+    /// route's `error_page_html` (if set, else a hardcoded plain-text
+    /// fallback). When `Some(Log)`, matches are allowed but counter +
+    /// structured-log entries fire so operators can size up bot
+    /// traffic before flipping to `Deny`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_bot_policy: Option<AiBotPolicy>,
+    /// Per-route override for the global `ai_bot_treat_spoofed_as`
+    /// setting (Story 8.2 AC #3). Applies only when the matched
+    /// crawler's verification is `Rdns` or `IpRanges` and the
+    /// verification fails (rDNS suffix mismatch / IP outside vendor
+    /// CIDR list). `UaOnly` crawlers have no spoof signal and skip
+    /// this fallback. `None` defers to the global setting (default
+    /// `Deny`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_bot_spoofed_fallback: Option<SpoofedFallback>,
+    /// Per-route opt-in to Lorica auto-serving `/robots.txt` (Story
+    /// 8.2 AC #10). Default `false` preserves backward compatibility
+    /// (existing deployments keep passthrough to backend). When
+    /// `true`, GET `/robots.txt` is intercepted on this route and
+    /// served from the merged crawler registry (built-in + custom
+    /// enabled-on-this-route, filtered to entries with
+    /// `ai_bot_policy != Off`).
+    #[serde(default)]
+    pub serve_robots_txt: bool,
     /// Free-form classification label so an operator can filter /
     /// group routes in the dashboard (e.g. `prod`, `staging`,
     /// `homelab`, `legacy`). Mirrors the `group_name` convention on
@@ -756,6 +784,53 @@ pub struct Route {
     pub created_at: DateTime<Utc>,
     /// Last-write timestamp (refreshed on every UPDATE).
     pub updated_at: DateTime<Utc>,
+}
+
+/// Per-route AI / LLM crawler deny-list policy (Story 8.2 AC #2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiBotPolicy {
+    /// Disabled : no behaviour change, the AI-bot filter is a
+    /// no-op for this route. Matches the absent-field semantic.
+    #[default]
+    Off,
+    /// Reject matched AI crawlers with HTTP 403 + `Retry-After:
+    /// 86400` + the route's `error_page_html` (if set, else a
+    /// hardcoded plain-text fallback).
+    Deny,
+    /// Allow matched AI crawlers but increment the
+    /// `lorica_ai_bot_total{action="log"}` counter and emit a
+    /// structured log entry. Useful for sizing up bot traffic
+    /// before flipping to `Deny`.
+    Log,
+}
+
+/// Spoofed-bot fallback policy applied when a `Verification::Rdns`
+/// or `Verification::IpRanges` crawler's verification fails (rDNS
+/// suffix mismatch / IP outside vendor CIDR list). `UaOnly`
+/// crawlers have no spoof signal and skip this fallback.
+///
+/// Used by both `GlobalSettings.ai_bot_treat_spoofed_as` (default
+/// `Deny`) and per-route `Route.ai_bot_spoofed_fallback` override
+/// (`None` defers to the global). Story 8.2 AC #3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpoofedFallback {
+    /// Reject the request with the same 403 / `Retry-After`
+    /// shape as the matched-crawler `Deny` path. Default global
+    /// value : the typical operator deploying Story 8.2 wants to
+    /// block spoofers.
+    #[default]
+    Deny,
+    /// Allow the request but increment
+    /// `lorica_ai_bot_total{action="spoofed"}` for visibility.
+    Log,
+    /// Allow the request silently (no Decision, no counter
+    /// increment with `action="spoofed"`). Useful for
+    /// high-noise environments where vendor IP-list staleness
+    /// between Lorica patch releases generates frequent
+    /// false-positives.
+    Allow,
 }
 
 /// Mode for the per-route GeoIP filter.
