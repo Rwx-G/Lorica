@@ -1,0 +1,8 @@
+source_url: https://claude.com/crawling/bots.json
+fetched: 2026-05-03
+upstream_creation_time: 2026-05-01T20:46:04Z
+notes:
+  Single Anthropic JSON file covers ClaudeBot + Claude-User + Claude-SearchBot
+  + anthropic-ai (legacy alias) per Anthropic docs at
+  https://support.claude.com/en/articles/8896518.
+  Normalized into flat array of CIDR strings.

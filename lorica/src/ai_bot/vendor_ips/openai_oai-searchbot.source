@@ -1,0 +1,5 @@
+source_url: https://openai.com/searchbot.json
+fetched: 2026-05-03
+upstream_creation_time: 2026-01-02T11:00:00.000000
+notes:
+  Normalized into flat array of CIDR strings.
