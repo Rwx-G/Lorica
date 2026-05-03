@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::route::SpoofedFallback;
+
 // --- Security Header Presets ---
 
 /// A named collection of HTTP security headers that can be applied to routes.
@@ -288,6 +290,24 @@ pub struct GlobalSettings {
     /// startup populates it via `secret::generate` + persist.
     #[serde(default)]
     pub bot_hmac_secret_hex: String,
+
+    /// Global default applied when an AI-bot crawler's verification
+    /// (`Verification::Rdns` or `Verification::IpRanges`) fails on
+    /// a request. Per-route `Route.ai_bot_spoofed_fallback` overrides
+    /// this value when set. Default `Deny` reflects the typical
+    /// operator stance ("a request claiming to be GPTBot from outside
+    /// OpenAI's CIDRs is a malicious spoofer"). Story 8.2 AC #3.
+    #[serde(default)]
+    pub ai_bot_treat_spoofed_as: SpoofedFallback,
+
+    /// Inject `X-Lorica-Verified-Bot` + `X-Lorica-Bot-Verification`
+    /// headers upstream when an AI-bot crawler's verification
+    /// confirms (Cloudflare-style verified-bot signaling).
+    /// Default `true` lets backends consume the verification level
+    /// (rate-limit differential, audit-log enrichment, bot-only
+    /// response cache). Story 8.2 AC #11.
+    #[serde(default = "default_ai_bot_inject_headers")]
+    pub ai_bot_inject_headers: bool,
 }
 
 fn default_waf_ban_threshold() -> i32 {
@@ -362,6 +382,10 @@ fn default_cert_export_dir_mode() -> u32 {
     0o750
 }
 
+fn default_ai_bot_inject_headers() -> bool {
+    true
+}
+
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
@@ -404,6 +428,8 @@ impl Default for GlobalSettings {
             cert_export_group_gid: None,
             cert_export_file_mode: default_cert_export_file_mode(),
             cert_export_dir_mode: default_cert_export_dir_mode(),
+            ai_bot_treat_spoofed_as: SpoofedFallback::default(),
+            ai_bot_inject_headers: default_ai_bot_inject_headers(),
         }
     }
 }

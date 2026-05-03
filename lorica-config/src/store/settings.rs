@@ -184,6 +184,24 @@ impl ConfigStore {
                 "health_max_concurrent_probes" => {
                     settings.health_max_concurrent_probes = value.parse().unwrap_or(32);
                 }
+                "ai_bot_treat_spoofed_as" => {
+                    // Story 8.2 AC #3. Lowercase serde tag matching
+                    // SpoofedFallback's `rename_all = "lowercase"`.
+                    // Unrecognised value silently degrades to the
+                    // default (Deny) - the API boundary already
+                    // validates via serde-derive parsing on
+                    // update_settings, so a foreign value at this
+                    // point indicates a hand-edited DB row.
+                    settings.ai_bot_treat_spoofed_as = match value.as_str() {
+                        "deny" => SpoofedFallback::Deny,
+                        "log" => SpoofedFallback::Log,
+                        "allow" => SpoofedFallback::Allow,
+                        _ => SpoofedFallback::default(),
+                    };
+                }
+                "ai_bot_inject_headers" => {
+                    settings.ai_bot_inject_headers = value == "true" || value == "1";
+                }
                 _ => {}
             }
         }
@@ -368,6 +386,22 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_export_dir_mode', ?1)",
             params![settings.cert_export_dir_mode.to_string()],
+        )?;
+        // Story 8.2 AC #3 + AC #11. Lowercase enum tag matches the
+        // serde `rename_all = "lowercase"` shape, so the round-trip
+        // through `get_global_settings` re-installs the same value.
+        let spoofed_str: &'static str = match settings.ai_bot_treat_spoofed_as {
+            SpoofedFallback::Deny => "deny",
+            SpoofedFallback::Log => "log",
+            SpoofedFallback::Allow => "allow",
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('ai_bot_treat_spoofed_as', ?1)",
+            params![spoofed_str],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('ai_bot_inject_headers', ?1)",
+            params![settings.ai_bot_inject_headers.to_string()],
         )?;
         Ok(())
     }

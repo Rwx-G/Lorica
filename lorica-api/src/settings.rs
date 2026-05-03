@@ -114,6 +114,14 @@ pub struct UpdateSettingsRequest {
     pub cert_export_file_mode: Option<u32>,
     /// Octal directory mode for the export root + per-hostname dirs.
     pub cert_export_dir_mode: Option<u32>,
+    /// Story 8.2 AC #3. Default applied when an AI-bot crawler's
+    /// verification (Rdns / IpRanges) fails. Per-route override
+    /// available via `Route.ai_bot_spoofed_fallback`.
+    pub ai_bot_treat_spoofed_as: Option<lorica_config::models::SpoofedFallback>,
+    /// Story 8.2 AC #11. Inject `X-Lorica-Verified-Bot` +
+    /// `X-Lorica-Bot-Verification` headers upstream on
+    /// verification-confirmed AI-bot requests.
+    pub ai_bot_inject_headers: Option<bool>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -278,6 +286,14 @@ pub async fn update_settings(
             &mut settings.cert_export_dir_mode,
             "cert_export_dir_mode",
         )?;
+        // Story 8.2 AC #3 + AC #11. Serde-derive parsing on
+        // `body.ai_bot_treat_spoofed_as` already validates the enum
+        // tag ("deny" | "log" | "allow"), so both are passthrough.
+        apply_plain(
+            body.ai_bot_treat_spoofed_as,
+            &mut settings.ai_bot_treat_spoofed_as,
+        );
+        apply_plain(body.ai_bot_inject_headers, &mut settings.ai_bot_inject_headers);
 
         store.update_global_settings(&settings)?;
         Ok::<_, ApiError>(settings)
