@@ -115,6 +115,97 @@ static WAF_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     counter
 });
 
+/// AI-bot evaluation counter (Story 8.2 AC #4). Labels: crawler,
+/// route_id, action. `action` is one of `deny | log | spoofed |
+/// ua_only_match`. Cardinality bound: crawler_count *
+/// route_count * 4. The 12+ built-in BUILTIN_CRAWLERS plus the
+/// AC #6 server-side cap of 256 custom crawlers gives a worst-case
+/// crawler-label dimension of ~268 ; multiplied by routes and 4
+/// actions, this stays comfortably below the per-process metric
+/// budget. Operator visibility for AI-crawler hits surfaces here.
+static AI_BOT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "ai_bot_total",
+            "Total AI / LLM crawler evaluations (deny / log / spoofed / ua_only_match)"
+        )
+        .namespace("lorica"),
+        &["crawler", "route_id", "action"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// AI-bot rDNS resolver fail-open counter (Story 8.2 AC #4). No
+/// labels: surfaces operator visibility for the path where
+/// `bot_rdns::handle()` returns `None` (rDNS disabled at startup,
+/// e.g. missing /etc/resolv.conf), so the rDNS verification flow
+/// degrades to Allow. Hit count tells the operator how many
+/// requests landed on the no-rDNS-substrate path.
+static AI_BOT_RDNS_UNAVAILABLE_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::with_opts(
+        prometheus::Opts::new(
+            "ai_bot_rdns_unavailable_total",
+            "AI-bot evaluations that hit the rDNS-resolver-unavailable fail-open path",
+        )
+        .namespace("lorica"),
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Counter for custom crawlers skipped on reload (Story 8.2 AC #8
+/// tampered-row defense). Labels: reason ("regex_compile" |
+/// "json_parse"). Surfaces operator visibility for the
+/// skip-with-warn path so a corrupt SQLite row never silently
+/// disappears from the merged registry.
+static AI_BOT_SKIPPED_CUSTOM_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "ai_bot_skipped_custom_total",
+            "Custom AI crawlers skipped on reload due to malformed regex or verification_data"
+        )
+        .namespace("lorica"),
+        &["reason"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Increment the `lorica_ai_bot_total{crawler, route_id, action}`
+/// counter. Called from the request-filter helpers in
+/// `lorica/src/proxy_wiring/filters/ai_bot.rs` at the decision
+/// point. `action` MUST be one of the four documented strings
+/// (`deny | log | spoofed | ua_only_match`) ; the counter API
+/// itself does not constrain that, so the call site enforces.
+pub fn record_ai_bot(crawler: &str, route_id: &str, action: &str) {
+    AI_BOT_TOTAL
+        .with_label_values(&[crawler, route_id, action])
+        .inc();
+}
+
+/// Increment the `lorica_ai_bot_rdns_unavailable_total` counter.
+/// Called when `bot_rdns::handle()` returns `None` on a request
+/// that would otherwise have walked the Rdns verification path.
+pub fn record_ai_bot_rdns_unavailable() {
+    AI_BOT_RDNS_UNAVAILABLE_TOTAL.inc();
+}
+
+/// Increment the `lorica_ai_bot_skipped_custom_total{reason}`
+/// counter. Called inside the merged-registry rebuild whenever a
+/// custom-crawler row's pattern fails to compile or its
+/// `verification_data` blob fails to parse - the row is dropped
+/// and the counter ticks ; valid rows + the entire built-in
+/// registry stay operational.
+pub fn record_ai_bot_skipped_custom(reason: &str) {
+    AI_BOT_SKIPPED_CUSTOM_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
 /// EWMA latency score per backend (microseconds). Labels: backend_address.
 static EWMA_SCORE: Lazy<GaugeVec> = Lazy::new(|| {
     let gauge = GaugeVec::new(
