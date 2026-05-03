@@ -2,6 +2,7 @@
 //! consumers. Grouped into per-entity submodules and re-exported here
 //! so that `lorica_config::models::<Type>` paths keep working.
 
+mod ai_crawler;
 mod backend;
 mod cert_export_acl;
 mod certificate;
@@ -17,6 +18,9 @@ mod sla;
 #[cfg(test)]
 mod tests;
 
+pub use ai_crawler::{
+    CustomCrawler, CustomVerification, CUSTOM_CRAWLER_MAX_CIDRS, CUSTOM_CRAWLER_MAX_COUNT,
+};
 pub use backend::{Backend, RouteBackend};
 pub use cert_export_acl::{
     pattern_matches, resolve as resolve_cert_export_acl, specificity, CertExportAcl,

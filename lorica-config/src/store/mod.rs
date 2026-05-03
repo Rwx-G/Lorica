@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::crypto::EncryptionKey;
 use crate::error::{ConfigError, Result};
 
+mod ai_crawlers;
 mod backends;
 pub mod bot_stash;
 mod cert_export_acls;
