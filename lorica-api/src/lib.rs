@@ -13,6 +13,7 @@
 //! [`AppState`]: crate::server::AppState
 
 pub mod acme;
+pub mod ai_crawlers;
 pub mod auth;
 pub mod backends;
 pub mod cache;

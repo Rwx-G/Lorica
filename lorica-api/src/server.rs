@@ -498,6 +498,25 @@ pub fn build_router(
                 .layer(bl(BODY_CAP_CONFIG_IMPORT))
                 .layer(rl("config_import", RL_CONFIG_IMPORT, RL_WINDOW_S)),
         )
+        .route(
+            "/api/v1/ai-crawlers/custom",
+            get(crate::ai_crawlers::list_custom_crawlers),
+        )
+        .route(
+            "/api/v1/ai-crawlers/custom",
+            post(crate::ai_crawlers::create_custom_crawler)
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/ai-crawlers/custom/:id",
+            put(crate::ai_crawlers::update_custom_crawler)
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/ai-crawlers/custom/:id",
+            delete(crate::ai_crawlers::delete_custom_crawler)
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
         .route("/api/v1/settings", get(crate::settings::get_settings))
         .route(
             "/api/v1/settings",
