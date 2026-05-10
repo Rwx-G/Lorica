@@ -31,6 +31,13 @@ lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = f
 lorica-http = { version = "0.1.0", path = "../lorica-http" }
 lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }
 lorica-lb = { version = "0.1.0", path = "../lorica-lb", optional = true, default-features = false }
+# Ketama consistent-hash ring used by the `ConsistentHash`
+# load-balancing strategy in `proxy_wiring::upstream_peer`.
+# Pulled in unconditionally (no feature gate) - the selection
+# match is always compiled, and lorica-lb already pulls
+# lorica-ketama transitively, so the direct dep just makes the
+# call site explicit.
+lorica-ketama = { version = "0.1.0", path = "../lorica-ketama" }
 lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, default-features = false }
 lorica-config = { version = "1.5.5", path = "../lorica-config" }
 lorica-api = { version = "1.5.5", path = "../lorica-api" }

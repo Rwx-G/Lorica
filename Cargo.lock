@@ -2863,6 +2863,7 @@ dependencies = [
  "lorica-error",
  "lorica-geoip",
  "lorica-http",
+ "lorica-ketama",
  "lorica-lb",
  "lorica-limits",
  "lorica-notify",
