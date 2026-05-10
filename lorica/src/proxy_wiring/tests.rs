@@ -2084,6 +2084,73 @@ fn test_should_rewrite_response_case_insensitive_content_type() {
     assert!(should_rewrite_response(&cfg, "Text/Plain", ""));
 }
 
+// Regression pin (v1.5.5): stream-by-design content-types are
+// unconditionally bypassed by `should_rewrite_response`, even when
+// the operator's prefix list (or the empty-list `text/` default) would
+// otherwise match. Buffering an SSE long-poll holds every chunk hostage
+// until upstream closes - on a never-closing event stream, the client
+// receives nothing. Same shape for multipart server-push (MJPEG) and
+// gRPC framing where rewrites would corrupt the wire format outright.
+#[test]
+fn test_should_rewrite_response_skips_sse_with_default_text_prefix() {
+    // Default empty prefix list expands to `["text/"]` which matches
+    // `text/event-stream`. The hard bypass must override that match.
+    let cfg = rewrite_cfg(vec![]);
+    assert!(!should_rewrite_response(&cfg, "text/event-stream", ""));
+    assert!(!should_rewrite_response(
+        &cfg,
+        "text/event-stream; charset=utf-8",
+        ""
+    ));
+    assert!(!should_rewrite_response(&cfg, "TEXT/EVENT-STREAM", ""));
+}
+
+#[test]
+fn test_should_rewrite_response_skips_sse_even_when_operator_opts_in() {
+    // Defence in depth: if an operator explicitly lists
+    // `text/event-stream` (e.g. as part of a `text/` family), the
+    // bypass still wins. Opt-in to a protocol-breaking bug is not
+    // a feature we offer.
+    let cfg = rewrite_cfg(vec!["text/event-stream"]);
+    assert!(!should_rewrite_response(&cfg, "text/event-stream", ""));
+}
+
+#[test]
+fn test_should_rewrite_response_skips_multipart_x_mixed_replace() {
+    let cfg = rewrite_cfg(vec![]);
+    assert!(!should_rewrite_response(
+        &cfg,
+        "multipart/x-mixed-replace",
+        ""
+    ));
+    assert!(!should_rewrite_response(
+        &cfg,
+        "multipart/x-mixed-replace; boundary=frame",
+        ""
+    ));
+}
+
+#[test]
+fn test_should_rewrite_response_skips_grpc_family() {
+    // Operator-configured `application/` prefix would otherwise match
+    // `application/grpc` and corrupt the length-prefixed framing.
+    let cfg = rewrite_cfg(vec!["application/"]);
+    assert!(!should_rewrite_response(&cfg, "application/grpc", ""));
+    assert!(!should_rewrite_response(&cfg, "application/grpc-web", ""));
+    assert!(!should_rewrite_response(
+        &cfg,
+        "application/grpc-web-text",
+        ""
+    ));
+    assert!(!should_rewrite_response(
+        &cfg,
+        "application/grpc+proto",
+        ""
+    ));
+    // Regular JSON on the same prefix list is still rewritten.
+    assert!(should_rewrite_response(&cfg, "application/json", ""));
+}
+
 // ---- Request mirroring ----
 
 #[test]

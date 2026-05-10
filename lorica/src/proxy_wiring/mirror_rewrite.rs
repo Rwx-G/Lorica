@@ -167,11 +167,37 @@ pub(crate) fn apply_response_rewrites(
     out.into_owned()
 }
 
+/// Content-Type prefixes that are stream-by-design and MUST NEVER be
+/// buffered, regardless of operator configuration. Buffering a stream
+/// of indefinite length would hold every chunk hostage until upstream
+/// closes the connection - on a long-poll or open subscription, that
+/// is "forever" - and the client receives nothing. Rewrite rules also
+/// have no semantically correct application to these wire formats:
+/// SSE event boundaries, multipart boundaries, and gRPC length-prefixed
+/// frames are protocol framing, not body content.
+///
+/// The list is intentionally hard-coded: operators cannot opt back in,
+/// because any opt-in would re-enable a protocol-breaking bug.
+const STREAM_CONTENT_TYPE_PREFIXES: &[&str] = &[
+    // Server-Sent Events (HTML Living Standard / RFC 8895). Event-stream
+    // bodies are open-ended by design; clients consume incrementally.
+    "text/event-stream",
+    // Multipart server-push (MJPEG, real-time image feeds). The body
+    // streams parts until the connection closes.
+    "multipart/x-mixed-replace",
+    // gRPC over HTTP/2 + gRPC-Web variants. Length-prefixed binary
+    // framing; rewriting would corrupt the framing immediately.
+    "application/grpc",
+];
+
 /// Decide whether a given response should be rewritten. Returns true
 /// when:
 ///   - the route has a rewrite config
 ///   - the response is not compressed (Content-Encoding is absent,
 ///     empty, or explicitly "identity")
+///   - the Content-Type is not a stream-by-design type
+///     (`text/event-stream`, `multipart/x-mixed-replace`,
+///     `application/grpc[-web[-text]]`)
 ///   - the Content-Type matches one of the configured prefixes
 ///     (case-insensitive), or defaults to "text/" when the list is empty
 pub(crate) fn should_rewrite_response(
@@ -184,10 +210,20 @@ pub(crate) fn should_rewrite_response(
     if !enc.is_empty() && !enc.eq_ignore_ascii_case("identity") {
         return false;
     }
+    let lower_ct = content_type.to_ascii_lowercase();
+    // Hard bypass for stream-by-design wire formats. Buffering them is
+    // a protocol-breaking bug (SSE long-poll never delivers a chunk;
+    // gRPC framing is corrupted), so the operator's prefix list cannot
+    // opt back in.
+    if STREAM_CONTENT_TYPE_PREFIXES
+        .iter()
+        .any(|p| lower_ct.starts_with(p))
+    {
+        return false;
+    }
     // Default to text/* when the operator list is empty. A typo-proof
     // defensive default: operators who enable rewriting almost always
     // mean "for HTML/text responses".
-    let lower_ct = content_type.to_ascii_lowercase();
     let allowed_list: Vec<String> = if cfg.content_type_prefixes.is_empty() {
         vec!["text/".into()]
     } else {
