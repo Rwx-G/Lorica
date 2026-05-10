@@ -764,3 +764,162 @@ async fn rewrite_multiple_rules_compose_in_declaration_order() {
         "one bird, two bird, crow, blue bird"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stream-by-design content-types must bypass the buffer (v1.5.5 fix).
+// ---------------------------------------------------------------------------
+
+/// Stream-emitting origin: writes SSE-shaped HTTP/1.1 chunked frames
+/// with a configurable inter-chunk delay so the client side can observe
+/// real-time delivery. Pre-fix, response_rewrite buffered the body until
+/// `end_of_stream` and the client saw nothing until the connection
+/// closed; post-fix, chunks are forwarded as the upstream emits them.
+async fn spawn_streaming_origin(
+    content_type: &'static str,
+    chunks: Vec<Vec<u8>>,
+    between: Duration,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let chunks = chunks.clone();
+            tokio::spawn(async move {
+                let mut buf: Vec<u8> = Vec::with_capacity(4096);
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match stream.read(&mut tmp).await {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                            if buf.len() > 64 * 1024 {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: {content_type}\r\n\
+                     Cache-Control: no-cache\r\n\
+                     Transfer-Encoding: chunked\r\n\
+                     Connection: close\r\n\
+                     \r\n"
+                );
+                if stream.write_all(header.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+                let n = chunks.len();
+                for (i, c) in chunks.into_iter().enumerate() {
+                    let line = format!("{:x}\r\n", c.len());
+                    if stream.write_all(line.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(&c).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(b"\r\n").await.is_err() {
+                        return;
+                    }
+                    let _ = stream.flush().await;
+                    if i + 1 < n {
+                        tokio::time::sleep(between).await;
+                    }
+                }
+                let _ = stream.write_all(b"0\r\n\r\n").await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewrite_does_not_buffer_sse_event_stream() {
+    // v1.5.5 regression pin. With response_rewrite enabled on the
+    // route, an SSE upstream (text/event-stream) emitting chunks with
+    // an inter-chunk delay must deliver each chunk to the client in
+    // near-real time. Pre-fix, `should_rewrite_response` matched
+    // `text/event-stream` against the default `text/` prefix and
+    // suppressed every chunk in `response_body_filter` until
+    // `end_of_stream` - which on a long-poll never arrives, leaving
+    // the client starved.
+    let between = Duration::from_millis(300);
+    let origin = spawn_streaming_origin(
+        "text/event-stream",
+        vec![
+            b"event: ping\ndata: 1\n\n".to_vec(),
+            b"event: ping\ndata: 2\n\n".to_vec(),
+            b"event: ping\ndata: 3\n\n".to_vec(),
+        ],
+        between,
+    )
+    .await;
+
+    // The literal pattern is irrelevant - it must not match the SSE
+    // payload, but its mere presence proves the route has rewrite
+    // configured (the surface that triggered the bug).
+    let route = test_route(Some(simple_cfg(vec![literal("never-matches", "X")])));
+    let backends = vec![test_backend("b1", origin)];
+    let links = vec![("r-rw".into(), "b1".into())];
+    let config = ProxyConfig::from_store(
+        vec![route],
+        backends,
+        vec![],
+        links,
+        ProxyConfigGlobals::default(),
+    );
+    let harness = ProxyHarness::start(Arc::new(ArcSwap::from_pointee(config))).await;
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let mut resp = client.get(harness.url()).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "Content-Type must be preserved end-to-end, got {ct:?}"
+    );
+
+    // Read the first chunk and record arrival time. Pre-fix this
+    // would block until upstream closes (~600ms after first emit);
+    // post-fix it arrives within tens of ms.
+    let first = resp
+        .chunk()
+        .await
+        .unwrap()
+        .expect("first SSE chunk must arrive");
+    let first_arrival = start.elapsed();
+    assert!(
+        first_arrival < between,
+        "first SSE chunk arrived after {first_arrival:?}, expected < {between:?} (proxy is buffering)"
+    );
+
+    // Drain remaining chunks and confirm body byte-for-byte preservation.
+    let mut all: Vec<u8> = first.to_vec();
+    while let Some(c) = resp.chunk().await.unwrap() {
+        all.extend_from_slice(&c);
+    }
+    let body = String::from_utf8(all).unwrap();
+    assert!(
+        body.contains("data: 1") && body.contains("data: 2") && body.contains("data: 3"),
+        "SSE body must contain all three events, got {body:?}"
+    );
+}

@@ -147,6 +147,19 @@ pub struct ResponseRewriteRule {
 /// `Content-Type` starts with one of `content_type_prefixes` (e.g.
 /// `text/`, `application/json`). Empty list defaults to `["text/"]`.
 ///
+/// # Stream-by-design content-types are unconditionally bypassed
+///
+/// Regardless of `content_type_prefixes`, responses whose `Content-Type`
+/// is `text/event-stream` (SSE), `multipart/x-mixed-replace`
+/// (multipart server-push / MJPEG), or any `application/grpc` flavour
+/// (gRPC, gRPC-Web, gRPC-Web-Text) are NEVER buffered for rewriting.
+/// Buffering an indefinite-length stream would hold every chunk
+/// hostage until upstream closes the connection (forever, on a
+/// long-poll), and rewrite rules have no semantically correct
+/// application to these wire formats. The bypass overrides any
+/// operator opt-in. See
+/// `lorica/src/proxy_wiring/mirror_rewrite.rs::STREAM_CONTENT_TYPE_PREFIXES`.
+///
 /// Responses whose body exceeds `max_body_bytes` stream through
 /// verbatim (no partial rewrite) - a half-rewritten body would be
 /// worse than none. Matches the mirror-body-overflow stance.
