@@ -1,6 +1,6 @@
 [package]
 name = "lorica"
-version = "1.5.5"
+version = "1.5.6"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"
@@ -31,22 +31,29 @@ lorica-core = { version = "0.1.0", path = "../lorica-core", default-features = f
 lorica-http = { version = "0.1.0", path = "../lorica-http" }
 lorica-timeout = { version = "0.1.0", path = "../lorica-timeout" }
 lorica-lb = { version = "0.1.0", path = "../lorica-lb", optional = true, default-features = false }
+# Ketama consistent-hash ring used by the `ConsistentHash`
+# load-balancing strategy in `proxy_wiring::upstream_peer`.
+# Pulled in unconditionally (no feature gate) - the selection
+# match is always compiled, and lorica-lb already pulls
+# lorica-ketama transitively, so the direct dep just makes the
+# call site explicit.
+lorica-ketama = { version = "0.1.0", path = "../lorica-ketama" }
 lorica-proxy = { version = "0.1.0", path = "../lorica-proxy", optional = true, default-features = false }
-lorica-config = { version = "1.5.5", path = "../lorica-config" }
-lorica-api = { version = "1.5.5", path = "../lorica-api" }
+lorica-config = { version = "1.5.6", path = "../lorica-config" }
+lorica-api = { version = "1.5.6", path = "../lorica-api" }
 lorica-error = { version = "0.1.0", path = "../lorica-error" }
 lorica-tls = { version = "0.1.0", path = "../lorica-tls" }
-lorica-worker = { version = "1.5.5", path = "../lorica-worker" }
-lorica-command = { version = "1.5.5", path = "../lorica-command" }
-lorica-shmem = { version = "1.5.5", path = "../lorica-shmem" }
+lorica-worker = { version = "1.5.6", path = "../lorica-worker" }
+lorica-command = { version = "1.5.6", path = "../lorica-command" }
+lorica-shmem = { version = "1.5.6", path = "../lorica-shmem" }
 lorica-waf = { version = "0.1.0", path = "../lorica-waf" }
 lorica-notify = { version = "0.1.0", path = "../lorica-notify" }
 lorica-limits = { version = "0.1.0", path = "../lorica-limits" }
 lorica-cache = { version = "0.1.0", path = "../lorica-cache" }
-lorica-geoip = { version = "1.5.5", path = "../lorica-geoip" }
-lorica-challenge = { version = "1.5.5", path = "../lorica-challenge" }
+lorica-geoip = { version = "1.5.6", path = "../lorica-geoip" }
+lorica-challenge = { version = "1.5.6", path = "../lorica-challenge" }
 once_cell = { workspace = true }
-lorica-bench = { version = "1.5.5", path = "../lorica-bench" }
+lorica-bench = { version = "1.5.6", path = "../lorica-bench" }
 regex = "1"
 # HTML sanitization for operator-supplied error_page_html (v1.5.0
 # audit finding HIGH-1). Whitelist-based parser replaces the

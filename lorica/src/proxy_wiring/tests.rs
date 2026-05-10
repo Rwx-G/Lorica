@@ -486,6 +486,82 @@ fn test_least_conn_with_equal_connections() {
     assert_eq!(idx, 0, "Equal connections should select first backend");
 }
 
+// ---- pick_consistent_hash ----
+
+#[test]
+fn test_pick_consistent_hash_is_sticky_for_same_client() {
+    let backends: [(&str, i32); 3] = [
+        ("10.0.0.1:8080", 1),
+        ("10.0.0.2:8080", 1),
+        ("10.0.0.3:8080", 1),
+    ];
+    let a = pick_consistent_hash(&backends, Some("203.0.113.5")).unwrap();
+    let b = pick_consistent_hash(&backends, Some("203.0.113.5")).unwrap();
+    assert_eq!(a, b, "same client IP must hash to the same backend");
+}
+
+#[test]
+fn test_pick_consistent_hash_spreads_distinct_clients() {
+    let backends: [(&str, i32); 3] = [
+        ("10.0.0.1:8080", 1),
+        ("10.0.0.2:8080", 1),
+        ("10.0.0.3:8080", 1),
+    ];
+    // Probe a wide spread of IPs; at least two distinct backends must be
+    // hit. (We do not assert uniform 1/3 because ketama is not uniform on
+    // tiny samples, but a single-bucket-only outcome would mean the ring
+    // collapsed to one node.)
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for i in 0..100u32 {
+        let ip: String = format!("203.0.113.{}", i % 254 + 1);
+        seen.insert(pick_consistent_hash(&backends, Some(&ip)).unwrap());
+    }
+    assert!(
+        seen.len() >= 2,
+        "consistent hash collapsed to a single bucket: {seen:?}",
+    );
+}
+
+#[test]
+fn test_pick_consistent_hash_returns_none_without_client_ip() {
+    let backends: [(&str, i32); 2] = [("10.0.0.1:8080", 1), ("10.0.0.2:8080", 1)];
+    assert!(pick_consistent_hash(&backends, None).is_none());
+    assert!(pick_consistent_hash(&backends, Some("")).is_none());
+}
+
+#[test]
+fn test_pick_consistent_hash_returns_none_for_uds_only_pool() {
+    // UDS addresses do not parse as `SocketAddr`; the helper signals the
+    // caller (via `None`) that it must fall back to weighted round-robin.
+    let backends: [(&str, i32); 2] = [("unix:/run/a.sock", 1), ("unix:/run/b.sock", 1)];
+    assert!(pick_consistent_hash(&backends, Some("203.0.113.5")).is_none());
+}
+
+#[test]
+fn test_pick_consistent_hash_stable_when_unselected_backend_removed() {
+    let full: [(&str, i32); 3] = [
+        ("10.0.0.1:8080", 1),
+        ("10.0.0.2:8080", 1),
+        ("10.0.0.3:8080", 1),
+    ];
+    let client: &str = "203.0.113.42";
+    let picked: usize = pick_consistent_hash(&full, Some(client)).unwrap();
+    let picked_addr: &str = full[picked].0;
+
+    // Drop a different backend than the one picked. The chosen address
+    // must still be picked - that is the whole point of consistent
+    // hashing vs hash-modulo-N.
+    let other_idx: usize = (0..3).find(|i| *i != picked).expect("3 buckets");
+    let reduced: Vec<(&str, i32)> = full
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != other_idx)
+        .map(|(_, b)| *b)
+        .collect();
+    let picked_after: usize = pick_consistent_hash(&reduced, Some(client)).unwrap();
+    assert_eq!(reduced[picked_after].0, picked_addr);
+}
+
 #[test]
 fn test_proxy_config_default_is_empty() {
     let config = ProxyConfig::default();

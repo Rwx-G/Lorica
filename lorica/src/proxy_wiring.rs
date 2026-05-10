@@ -1231,7 +1231,8 @@ pub mod helpers;
 // because they're re-exported by integration tests under `tests/`
 // (canary_e2e_test, mtls_e2e_test).
 pub(crate) use helpers::{
-    cache_vary_for_request, downstream_ssl_digest, extract_host, sanitize_html,
+    cache_vary_for_request, downstream_ssl_digest, extract_host, pick_consistent_hash,
+    sanitize_html,
 };
 pub use helpers::{canary_bucket, evaluate_mtls};
 #[cfg(test)]
@@ -4660,9 +4661,32 @@ impl ProxyHttp for LoricaProxy {
                         .map(|(i, _)| i)
                         .unwrap_or(0)
                 }
+                LoadBalancing::ConsistentHash => {
+                    // Ketama hash ring keyed by client IP. `ctx.client_ip`
+                    // is populated in `request_filter` and already honors
+                    // X-Forwarded-For when the immediate peer is in
+                    // `trusted_proxies`, so the same key is used whether
+                    // Lorica sits at the edge or behind another proxy.
+                    //
+                    // Falls back to smooth weighted round-robin when the
+                    // helper returns `None` (no client IP, or no healthy
+                    // backend parses as an Inet `SocketAddr` - ketama
+                    // does not support Unix-domain backends).
+                    let pairs: Vec<(&str, i32)> = healthy_backends
+                        .iter()
+                        .map(|b| (b.address.as_str(), b.weight))
+                        .collect();
+                    pick_consistent_hash(&pairs, ctx.client_ip.as_deref()).unwrap_or_else(|| {
+                        let bw: Vec<(&str, i64)> = healthy_backends
+                            .iter()
+                            .map(|b| (b.address.as_str(), b.weight.max(1) as i64))
+                            .collect();
+                        entry.wrr_state.next(&bw)
+                    })
+                }
                 _ => {
-                    // Smooth weighted round-robin (Nginx algorithm) - covers
-                    // RoundRobin and ConsistentHash
+                    // Smooth weighted round-robin (Nginx algorithm) for
+                    // RoundRobin. ConsistentHash is handled above.
                     let bw: Vec<(&str, i64)> = healthy_backends
                         .iter()
                         .map(|b| (b.address.as_str(), b.weight.max(1) as i64))

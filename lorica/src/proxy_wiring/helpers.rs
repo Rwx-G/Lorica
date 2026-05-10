@@ -128,6 +128,49 @@ pub(crate) fn extract_host(req: &lorica_http::RequestHeader) -> &str {
         .unwrap_or("")
 }
 
+/// Pick a backend index using the Ketama consistent-hash ring keyed
+/// by `client_ip`. Each input is a `(address, weight)` pair extracted
+/// from the route's healthy backends, in the order the caller wants
+/// indices to refer to.
+///
+/// Returns `None` when:
+///   - `client_ip` is `None` or empty (no key to hash on),
+///   - no input parses as `SocketAddr` (e.g. all backends are on
+///     Unix-domain sockets; ketama only handles Inet addresses).
+///
+/// The caller must fall back to another strategy (round-robin) in
+/// either case so the request is not stalled.
+pub(crate) fn pick_consistent_hash(
+    backends: &[(&str, i32)],
+    client_ip: Option<&str>,
+) -> Option<usize> {
+    use lorica_ketama::{Bucket, Continuum};
+    use std::net::SocketAddr;
+
+    let key: &str = client_ip.filter(|s| !s.is_empty())?;
+
+    let mut buckets: Vec<Bucket> = Vec::with_capacity(backends.len());
+    let mut addr_to_idx: HashMap<SocketAddr, usize> = HashMap::with_capacity(backends.len());
+    for (i, (addr_str, weight)) in backends.iter().enumerate() {
+        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+            let w: u32 = u32::try_from((*weight).max(1)).unwrap_or(1);
+            buckets.push(Bucket::new(addr, w));
+            // The first parse for a given address wins; duplicate
+            // addresses across backends never reach this helper
+            // (the route store enforces uniqueness), but be
+            // defensive about it.
+            addr_to_idx.entry(addr).or_insert(i);
+        }
+    }
+    if buckets.is_empty() {
+        return None;
+    }
+
+    let ring: Continuum = Continuum::new(&buckets);
+    ring.node(key.as_bytes())
+        .and_then(|addr| addr_to_idx.get(&addr).copied())
+}
+
 /// Evaluate header-based routing rules against a request's headers.
 /// Returns pre-resolved backends from the first rule that matches and
 /// carries an override. A rule with an empty `backend_ids` ("match but
