@@ -2721,9 +2721,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "lettre"
-version = "0.11.20"
+version = "0.11.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "471816f3e24b85e820dee02cde962379ea1a669e5242f19c61bcbcffedf4c4fb"
+checksum = "0da65617f6cb926332d039cb578aad56178da86e128db6a1b09f4c94fa5b3349"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2835,7 +2835,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lorica"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "ammonia",
  "arc-swap",
@@ -2902,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-api"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2955,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-bench"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "chrono",
  "lorica-config",
@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-challenge"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-command"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "nix",
  "prost 0.13.5",
@@ -3036,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-config"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3112,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-dashboard"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "axum",
  "hyper 1.9.0",
@@ -3129,7 +3129,7 @@ version = "0.1.0"
 
 [[package]]
 name = "lorica-geoip"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-shmem"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "nix",
  "rand 0.9.4",
@@ -3366,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-worker"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "nix",
  "socket2 0.5.10",

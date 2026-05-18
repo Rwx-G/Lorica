@@ -1,7 +1,7 @@
 {
   "name": "frontend",
   "private": true,
-  "version": "1.5.6",
+  "version": "1.5.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,28 +13,23 @@
     "test:watch": "vitest"
   },
   "devDependencies": {
-    "@eslint/js": "^9.24.0",
-    "@sveltejs/vite-plugin-svelte": "^7.0.0",
+    "@eslint/js": "^9.39.4",
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/svelte": "^5.3.1",
     "@tsconfig/svelte": "^5.0.8",
-    "@types/node": "^24.12.0",
-    "@typescript-eslint/parser": "^8.30.0",
-    "@vitest/coverage-v8": "^4.1.2",
-    "eslint": "^9.24.0",
-    "eslint-plugin-svelte": "^3.8.0",
-    "globals": "^16.0.0",
-    "jsdom": "^29.0.1",
-    "svelte": "^5.53.12",
-    "svelte-check": "^4.4.5",
-    "svelte-eslint-parser": "^1.1.1",
+    "@types/node": "^24.12.4",
+    "@typescript-eslint/parser": "^8.59.3",
+    "@vitest/coverage-v8": "^4.1.6",
+    "eslint": "^9.39.4",
+    "eslint-plugin-svelte": "^3.17.1",
+    "globals": "^16.5.0",
+    "jsdom": "^29.1.1",
+    "svelte": "^5.55.7",
+    "svelte-check": "^4.4.8",
+    "svelte-eslint-parser": "^1.6.1",
     "typescript": "~5.9.3",
-    "vite": "^8.0.8",
-    "vitest": "^4.1.2"
-  },
-  "pnpm": {
-    "overrides": {
-      "postcss": ">=8.5.10"
-    }
+    "vite": "^8.0.13",
+    "vitest": "^4.1.6"
   }
 }
