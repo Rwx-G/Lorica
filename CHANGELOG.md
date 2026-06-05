@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [1.5.8] - 2026-06-05
+
 ### Fixed
 
 - Active health checks now probe backends concurrently instead of one at a time. The loop ran `for backend in &backends { probe.await }`, so a single slow or timing-out backend (up to the 5s TCP-connect timeout) delayed every other backend's probe and could overrun the check interval - one permanently-down backend silently halved the effective probe rate. Each round also re-acquired the `ConfigStore` mutex once per status write. The loop is now three phases: drain monitoring (sequential), concurrent probing bounded by a new operator-tunable `health_max_concurrent_probes` global setting (default 32, range 1..=512, editable in Settings -> Global Configuration), then a single sequential hysteresis pass whose confirmed flips are written under one store lock. Round time drops from `interval + sum(probes)` to `interval + max(probe)`, and lock acquisitions per round from N to one. The flip-hysteresis behaviour is unchanged.
