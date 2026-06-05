@@ -24,4 +24,3 @@ lorica-error = { version = "0.1.0", path = "../lorica-error" }
 
 [features]
 default = []
-patched_http1 = []

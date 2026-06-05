@@ -158,7 +158,6 @@ connection_filter = [
 ]
 
 any_tls = []
-patched_http1 = ["lorica-core/patched_http1"]
 prometheus = ["lorica-core/prometheus"]
 
 # Distributed tracing via OTLP export. Off by default.

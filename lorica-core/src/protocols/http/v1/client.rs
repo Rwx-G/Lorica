@@ -1125,19 +1125,6 @@ mod tests_stream {
         assert_eq!(http_stream.get_header("Server").unwrap(), "lorica");
     }
 
-    #[cfg(feature = "patched_http1")]
-    #[tokio::test]
-    async fn read_resp_header_with_utf8() {
-        init_log();
-        let input = "HTTP/1.1 200 OK\r\nServer👍: lorica\r\n\r\n".as_bytes();
-        let mock_io = Builder::new().read(input).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let resp = http_stream.read_resp_header_parts().await.unwrap();
-        assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
-        assert_eq!(http_stream.get_header("Server👍").unwrap(), "lorica");
-        assert_eq!(resp.headers.get("Server👍").unwrap(), "lorica");
-    }
-
     #[tokio::test]
     #[should_panic(expected = "There is still data left to read.")]
     async fn read_timeout() {
@@ -1370,21 +1357,6 @@ mod tests_stream {
             .unwrap();
         let res = http_stream.write_body(body).await;
         assert_eq!(res.unwrap_err().etype(), &WriteTimedout);
-    }
-
-    #[cfg(feature = "patched_http1")]
-    #[tokio::test]
-    async fn write_invalid_path() {
-        let wire = b"GET /\x01\xF0\x90\x80 HTTP/1.1\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().write(wire).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let mut new_request = RequestHeader::build("GET", b"/\x01\xF0\x90\x80", None).unwrap();
-        new_request.insert_header("Foo", "Bar").unwrap();
-        let n = http_stream
-            .write_request_header(Box::new(new_request))
-            .await
-            .unwrap();
-        assert_eq!(wire.len(), n);
     }
 
     #[tokio::test]
@@ -1872,19 +1844,6 @@ mod tests_stream {
             http_stream.get_header("Server").unwrap(),
             "lorica  \t  Fizz: Buzz"
         );
-    }
-
-    #[cfg(feature = "patched_http1")]
-    #[tokio::test]
-    async fn read_headers_skip_invalid_line() {
-        init_log();
-        let input = b"HTTP/1.1 200 OK\r\n;\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let res = http_stream.read_response().await;
-        assert_eq!(input.len(), res.unwrap());
-        assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
-        assert_eq!(http_stream.get_header("Foo").unwrap(), "Bar");
     }
 
     #[tokio::test]
