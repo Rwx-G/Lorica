@@ -9,6 +9,19 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Security
+
+- Bounded default HTTP/2 server limits to mitigate memory exhaustion (port of upstream Pingora `d193c8d`, shipped in Pingora `0.8.1`). The H2 server handshake previously fell back to `h2::server::Builder::default()` when no explicit `H2Options` were supplied, which leaves `max_header_list_size` and `max_concurrent_streams` unbounded. A remote peer could open an unbounded number of concurrent streams or send an oversized decoded header list, forcing the server to allocate without limit (DoS via memory exhaustion). `lorica-core::protocols::http::v2::server` now exposes `default_h2_options()` applying a 64 KiB decoded header-list cap and a 100 concurrent-stream cap, and `handshake()` uses these bounded defaults when `options` is `None`. Callers that pass explicit `H2Options` are unaffected; to keep the new floors when customizing, start from `default_h2_options()` instead of `H2Options::default()`. Three unit tests pin the advertised SETTINGS (bounded default, caller override, and rejection of an oversized header list with `431 Request Header Fields Too Large`).
+- Refreshed all in-range workspace dependencies as part of the v1.5.8 security cycle. The one actionable advisory was RUSTSEC-2026-0097 (`rand` unsoundness: aliased `&mut` / UB under Stacked Borrows when a custom logger calls `rand::rng()` during reseed; severity informational/unsound, narrow trigger): bumped `rand` 0.8.5 -> 0.8.6 (the 0.9/0.10 lines were already on the fixed 0.9.4 / 0.10.1), which drops the `cargo audit` warning count 3 -> 2. Also took the latest in-range patches for the security-sensitive surface: `rustls` 0.23.40, `h2` 0.4.14, `hyper` 1.10.1, `hickory-resolver` 0.26.1, `rcgen` 0.14.8, `aws-lc-rs` 1.17.0 / `aws-lc-sys` 0.41.0, `brotli` 8.0.3 + `brotli-decompressor` 5.0.1, plus `rustls-pki-types` / `rustls-native-certs` / `hyper-rustls` / `tokio` / `libz-ng-sys` patch bumps. `Cargo.lock` only; no manifest version constraints changed. Full workspace compiles and unit tests pass; `cargo audit` clean (2 remaining allowed warnings: `derivative` RUSTSEC-2024-0388 and `rustls-pemfile` RUSTSEC-2025-0134, both unmaintained transitive deps with no in-range fix, tracked for v1.6.0).
+
+### Removed
+
+- Removed the non-functional `patched_http1` Cargo feature from `lorica-core`, `lorica-http`, and the top-level `lorica` crate. It was inherited from upstream Pingora but was never compilable in this fork: its only runtime-distinct path called `httparse::Request::parse_unchecked`, a method that exists solely in Cloudflare's patched fork of `httparse`, while Lorica depends on stock `httparse` from crates.io. The feature was off by default and would fail to compile when enabled (e.g. under `cargo build --all-features` or `cargo clippy --all-features`), and all of its gated code lived in test modules. Removed the three feature declarations, the dead `parse_unchecked` helper branch (the stock `httparse::Request::parse` path is now unconditional and is exactly what shipped before, since the feature was always off), the `lorica-core` crate-doc line advertising it, and the six test cases that only exercised the patched parser. No runtime behaviour change.
+
+### Changed
+
+- Aligned a `lorica-http` test fixture with upstream Pingora `0.8.1` (no runtime impact): the header-serialization tests (`test_single_header`, `test_multiple_header`) now build requests with a valid `/` request target instead of the invalid `\` (port of upstream `45dbece`).
+
 ## [1.5.7] - 2026-05-18
 
 ### Changed
