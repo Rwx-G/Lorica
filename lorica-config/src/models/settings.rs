@@ -105,6 +105,9 @@ pub struct GlobalSettings {
     /// Cap on concurrent synthetic probes running at once.
     #[serde(default = "default_max_active_probes")]
     pub max_active_probes: i32,
+    /// Cap on concurrent backend health-check probes running at once.
+    #[serde(default = "default_health_max_concurrent_probes")]
+    pub health_max_concurrent_probes: i32,
     /// Load-test : max concurrent virtual users per run.
     #[serde(default = "default_loadtest_max_concurrency")]
     pub loadtest_max_concurrency: i32,
@@ -307,6 +310,10 @@ fn default_max_active_probes() -> i32 {
     50
 }
 
+fn default_health_max_concurrent_probes() -> i32 {
+    32
+}
+
 fn default_loadtest_max_concurrency() -> i32 {
     100
 }
@@ -364,6 +371,7 @@ impl Default for GlobalSettings {
             cert_warning_days: 30,
             cert_critical_days: 7,
             max_active_probes: 50,
+            health_max_concurrent_probes: 32,
             loadtest_max_concurrency: 100,
             loadtest_max_duration_s: 60,
             loadtest_max_rps: 1000,

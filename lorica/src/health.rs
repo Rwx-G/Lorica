@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use lorica_config::models::{HealthStatus, LifecycleState};
+use lorica_config::models::{Backend, HealthStatus, LifecycleState};
 use lorica_config::ConfigStore;
 use once_cell::sync::Lazy;
+use futures_util::stream::StreamExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -128,8 +129,11 @@ pub async fn health_check_loop(
 
         let mut changed = false;
 
+        // --- Phase 0: drain monitoring (sequential) ---
+        // Closing backends may transition to Closed; non-Closing backends just
+        // clear stale drain / flip tracking. This is cheap and rare, so it
+        // stays sequential.
         for backend in &backends {
-            // --- Drain monitoring for Closing backends ---
             if backend.lifecycle_state == LifecycleState::Closing {
                 let start = drain_start
                     .entry(backend.id.clone())
@@ -174,79 +178,108 @@ pub async fn health_check_loop(
                 continue;
             }
 
-            // Clean up drain tracking for non-Closing backends
+            // Clean up drain tracking for non-Closing backends.
             drain_start.remove(&backend.id);
-
-            // --- Health checks for Normal backends ---
+            // A backend that is not health-checked keeps no flip streak.
             if !backend.health_check_enabled {
                 pending_health.remove(&backend.id);
-                continue;
             }
+        }
 
-            // Run active probes (HTTP if path set, else TCP)
-            let probe = if let Some(ref path) = backend.health_check_path {
-                let scheme = if backend.tls_upstream {
-                    "https"
+        // --- Phase A: probe eligible backends concurrently ---
+        // One slow or timing-out backend must not delay every other backend's
+        // probe or overrun the loop interval. Bound concurrency with the
+        // operator-tunable `health_max_concurrent_probes` (default 32).
+        let max_concurrent = {
+            let store = store.lock().await;
+            store
+                .get_global_settings()
+                .map(|s| s.health_max_concurrent_probes.clamp(1, 512) as usize)
+                .unwrap_or(32)
+        };
+        // Clone the eligible backends so each probe future owns its data; this
+        // keeps the spawned `health_check_loop` future free of borrows that the
+        // stream combinators cannot prove `Send` across the await points.
+        let eligible: Vec<Backend> = backends
+            .iter()
+            .filter(|b| {
+                b.lifecycle_state != LifecycleState::Closing && b.health_check_enabled
+            })
+            .cloned()
+            .collect();
+        let probe_results: Vec<(Backend, HealthStatus)> = futures_util::stream::iter(eligible)
+            .map(|backend| async move {
+                let probe = if let Some(ref path) = backend.health_check_path {
+                    let scheme = if backend.tls_upstream { "https" } else { "http" };
+                    let url = format!("{scheme}://{}{path}", backend.address);
+                    http_probe(&url).await
                 } else {
-                    "http"
+                    tcp_probe(&backend.address).await
                 };
-                let url = format!("{scheme}://{}{path}", backend.address);
-                http_probe(&url).await
-            } else {
-                tcp_probe(&backend.address).await
-            };
-            let new_status = probe.to_health_status();
+                (backend, probe.to_health_status())
+            })
+            .buffer_unordered(max_concurrent)
+            .collect()
+            .await;
 
-            // Hysteresis: only commit a status flip once the new status has
-            // been observed HEALTH_FLIP_THRESHOLD consecutive times. A single
-            // transient probe failure (or a brief latency spike) must not yank
-            // a healthy backend out of rotation - that previously marked it
-            // Down for a full interval and 502'd every request until the next
-            // successful probe.
-            if !confirm_status_flip(
+        // --- Phase B: apply flip hysteresis (sequential) ---
+        // `pending_health` is single-threaded loop state, so the decision runs
+        // sequentially over the collected probe outcomes. Only confirmed flips
+        // (the new status observed HEALTH_FLIP_THRESHOLD times in a row) are
+        // carried forward; a transient probe blip is absorbed.
+        let mut commits: Vec<(Backend, HealthStatus)> = Vec::new();
+        for (backend, new_status) in probe_results {
+            if confirm_status_flip(
                 &mut pending_health,
                 &backend.id,
                 &backend.health_status,
                 &new_status,
                 HEALTH_FLIP_THRESHOLD,
             ) {
-                continue;
+                commits.push((backend, new_status));
             }
+        }
 
-            debug!(
-                backend = %backend.address,
-                old = backend.health_status.as_str(),
-                new = new_status.as_str(),
-                "backend health status changed"
-            );
-
-            let mut updated = backend.clone();
-            updated.health_status = new_status.clone();
-
-            // Dispatch backend_down notification on transition to Down
-            if new_status == HealthStatus::Down {
-                if let Some(ref sender) = alert_sender {
-                    sender.send(
-                        lorica_notify::AlertEvent::new(
-                            lorica_notify::events::AlertType::BackendDown,
-                            format!("Backend {} is down", backend.address),
-                        )
-                        .with_detail("backend_id", backend.id.clone())
-                        .with_detail("address", backend.address.clone())
-                        .with_detail("name", backend.name.clone()),
-                    );
-                }
-            }
-
+        // --- Phase C: persist confirmed flips under a single lock ---
+        if !commits.is_empty() {
             let store = store.lock().await;
-            if let Err(e) = store.update_backend(&updated) {
-                warn!(
+            for (backend, new_status) in &commits {
+                debug!(
                     backend = %backend.address,
-                    error = %e,
-                    "failed to update backend health status"
+                    old = backend.health_status.as_str(),
+                    new = new_status.as_str(),
+                    "backend health status changed"
                 );
-            } else {
-                changed = true;
+
+                let mut updated = backend.clone();
+                updated.health_status = new_status.clone();
+
+                // Dispatch backend_down notification on a confirmed transition
+                // to Down (not on a transient blip - the hysteresis already
+                // filtered those out).
+                if *new_status == HealthStatus::Down {
+                    if let Some(ref sender) = alert_sender {
+                        sender.send(
+                            lorica_notify::AlertEvent::new(
+                                lorica_notify::events::AlertType::BackendDown,
+                                format!("Backend {} is down", backend.address),
+                            )
+                            .with_detail("backend_id", backend.id.clone())
+                            .with_detail("address", backend.address.clone())
+                            .with_detail("name", backend.name.clone()),
+                        );
+                    }
+                }
+
+                if let Err(e) = store.update_backend(&updated) {
+                    warn!(
+                        backend = %backend.address,
+                        error = %e,
+                        "failed to update backend health status"
+                    );
+                } else {
+                    changed = true;
+                }
             }
         }
 

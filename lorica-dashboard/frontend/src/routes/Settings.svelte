@@ -29,6 +29,7 @@
     management_port: 9443,
     log_level: 'info',
     default_health_check_interval_s: 10,
+    health_max_concurrent_probes: 32,
     cert_warning_days: 30,
     cert_critical_days: 7,
     max_global_connections: 0,
