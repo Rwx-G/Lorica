@@ -351,14 +351,19 @@ fn main() {
             let port = cli.management_port;
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
+                // The management API is served over plaintext HTTP (see
+                // lorica-api `server.rs`: `axum::serve` over a plain
+                // `TcpListener`). When TLS on the management port lands
+                // (backlog #20), switch the scheme below back to https and
+                // restore `danger_accept_invalid_certs(true)` for the
+                // self-signed startup cert.
                 let client = reqwest::Client::builder()
-                    .danger_accept_invalid_certs(true)
                     .cookie_store(true)
                     .build()
                     .expect("HTTP client");
 
                 // Login
-                let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
+                let login_url = format!("http://127.0.0.1:{port}/api/v1/auth/login");
                 let login_res = client
                     .post(&login_url)
                     .json(&serde_json::json!({ "username": user, "password": password }))
@@ -377,7 +382,7 @@ fn main() {
                 }
 
                 // Unban
-                let unban_url = format!("https://127.0.0.1:{port}/api/v1/bans/{ip}");
+                let unban_url = format!("http://127.0.0.1:{port}/api/v1/bans/{ip}");
                 match client.delete(&unban_url).send().await {
                     Ok(r) if r.status().is_success() => {
                         println!("IP {ip} unbanned successfully.");

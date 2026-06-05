@@ -3,6 +3,7 @@
     management_port: number;
     log_level: string;
     default_health_check_interval_s: number;
+    health_max_concurrent_probes: number;
     cert_warning_days: number;
     cert_critical_days: number;
     max_global_connections: number;
@@ -46,6 +47,7 @@
     return null;
   }
   let hcIntervalErr = $state<string | null>(null);
+  let healthProbesErr = $state<string | null>(null);
   let certWarnErr = $state<string | null>(null);
   let certCritErr = $state<string | null>(null);
   let maxGlobalErr = $state<string | null>(null);
@@ -55,6 +57,7 @@
   let logRetErr = $state<string | null>(null);
   let slaPurgeErr = $state<string | null>(null);
   function checkHcInterval() { hcIntervalErr = numErr(settingsForm.default_health_check_interval_s, 1, 3600); }
+  function checkHealthProbes() { healthProbesErr = numErr(settingsForm.health_max_concurrent_probes, 1, 512); }
   function checkCertWarn() { certWarnErr = numErr(settingsForm.cert_warning_days, 1, 365); }
   function checkCertCrit() { certCritErr = numErr(settingsForm.cert_critical_days, 1, 365); }
   function checkMaxGlobal() { maxGlobalErr = numErr(settingsForm.max_global_connections, 1, 10_000_000); }
@@ -91,6 +94,11 @@
         <label for="hc-interval">Default Health Check Interval (s)</label>
         <input id="hc-interval" type="number" bind:value={settingsForm.default_health_check_interval_s} min="1" max="3600" onblur={checkHcInterval} oninput={checkHcInterval} />
         {#if hcIntervalErr}<span class="field-error" role="alert">{hcIntervalErr}</span>{/if}
+      </div>
+      <div class="settings-form-row">
+        <label for="health-max-probes">Max Concurrent Health Probes</label>
+        <input id="health-max-probes" type="number" bind:value={settingsForm.health_max_concurrent_probes} min="1" max="512" onblur={checkHealthProbes} oninput={checkHealthProbes} />
+        {#if healthProbesErr}<span class="field-error" role="alert">{healthProbesErr}</span>{/if}
       </div>
       <div class="settings-form-row">
         <label for="cert-warn">Certificate Warning Threshold (days)</label>

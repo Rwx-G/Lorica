@@ -632,6 +632,7 @@ export interface GlobalSettingsResponse {
   management_port: number;
   log_level: string;
   default_health_check_interval_s: number;
+  health_max_concurrent_probes: number;
   cert_warning_days: number;
   cert_critical_days: number;
   max_global_connections: number;
@@ -670,6 +671,7 @@ export interface UpdateSettingsRequest {
   management_port?: number;
   log_level?: string;
   default_health_check_interval_s?: number;
+  health_max_concurrent_probes?: number;
   cert_warning_days?: number;
   cert_critical_days?: number;
   max_global_connections?: number;

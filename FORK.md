@@ -9,7 +9,7 @@ Lorica is a fork of [Cloudflare Pingora](https://github.com/cloudflare/pingora),
 | Upstream repository | <https://github.com/cloudflare/pingora> |
 | Upstream license | Apache-2.0 |
 | Fork date | 2026-03-29 |
-| Upstream version at fork | 0.4.x (commit range up to `0.4.0` release) |
+| Upstream version at fork | `0.8.0` baseline (upstream `main` as of the fork date: after the `0.8.0` release of 2026-03-02, before `0.8.1`) |
 | Git remote | `upstream` - `https://github.com/cloudflare/pingora.git` |
 
 ## Renaming Rules

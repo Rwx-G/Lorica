@@ -771,7 +771,7 @@ mod tests {
 
     #[test]
     fn test_single_header() {
-        let mut req = RequestHeader::build("GET", b"\\", None).unwrap();
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
         req.insert_header("foo", "bar").unwrap();
         req.insert_header("FoO", "Bar").unwrap();
         let mut buf: Vec<u8> = vec![];
@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_multiple_header() {
-        let mut req = RequestHeader::build("GET", b"\\", None).unwrap();
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
         req.append_header("FoO", "Bar").unwrap();
         req.append_header("fOO", "bar").unwrap();
         req.append_header("BAZ", "baR").unwrap();
@@ -910,29 +910,6 @@ mod tests {
                 _ => panic!("too many headers"),
             }
         });
-    }
-
-    #[cfg(feature = "patched_http1")]
-    #[test]
-    fn test_invalid_path() {
-        let raw_path = b"Hello\xF0\x90\x80World";
-        let req = RequestHeader::build("GET", &raw_path[..], None).unwrap();
-        assert_eq!("Hello�World", req.uri.path_and_query().unwrap());
-        assert_eq!(raw_path, req.raw_path());
-    }
-
-    #[cfg(feature = "patched_http1")]
-    #[test]
-    fn test_override_invalid_path() {
-        let raw_path = b"Hello\xF0\x90\x80World";
-        let mut req = RequestHeader::build("GET", &raw_path[..], None).unwrap();
-        assert_eq!("Hello�World", req.uri.path_and_query().unwrap());
-        assert_eq!(raw_path, req.raw_path());
-
-        let new_path = "/HelloWorld";
-        req.set_uri(Uri::builder().path_and_query(new_path).build().unwrap());
-        assert_eq!(new_path, req.uri.path_and_query().unwrap());
-        assert_eq!(new_path.as_bytes(), req.raw_path());
     }
 
     #[test]

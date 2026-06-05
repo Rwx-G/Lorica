@@ -181,6 +181,9 @@ impl ConfigStore {
                 "cert_export_dir_mode" => {
                     settings.cert_export_dir_mode = value.parse().unwrap_or(0o750);
                 }
+                "health_max_concurrent_probes" => {
+                    settings.health_max_concurrent_probes = value.parse().unwrap_or(32);
+                }
                 _ => {}
             }
         }
@@ -200,6 +203,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('default_health_check_interval_s', ?1)",
             params![settings.default_health_check_interval_s.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('health_max_concurrent_probes', ?1)",
+            params![settings.health_max_concurrent_probes.to_string()],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('cert_warning_days', ?1)",

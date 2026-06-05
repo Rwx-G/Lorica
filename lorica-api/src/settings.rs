@@ -56,6 +56,8 @@ pub struct UpdateSettingsRequest {
     pub log_level: Option<String>,
     /// Fallback health-check interval (s).
     pub default_health_check_interval_s: Option<i32>,
+    /// Cap on concurrent backend health-check probes.
+    pub health_max_concurrent_probes: Option<i32>,
     /// Cert expiry warning threshold (days).
     pub cert_warning_days: Option<i32>,
     /// Cert expiry critical threshold (days).
@@ -143,6 +145,14 @@ pub async fn update_settings(
             ));
         }
         settings.default_health_check_interval_s = interval;
+    }
+    if let Some(max_probes) = body.health_max_concurrent_probes {
+        if !(1..=512).contains(&max_probes) {
+            return Err(ApiError::BadRequest(
+                "health_max_concurrent_probes must be in 1..=512".into(),
+            ));
+        }
+        settings.health_max_concurrent_probes = max_probes;
     }
     if let Some(days) = body.cert_warning_days {
         if days < 1 {

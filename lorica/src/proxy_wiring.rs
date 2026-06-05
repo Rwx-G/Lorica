@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -628,6 +628,11 @@ impl ProxyConfig {
 ///
 pub use lorica_api::connections::BackendConnections;
 
+/// One call in `EXPLORE_EVERY` to [`EwmaTracker::select_best`] explores a
+/// not-yet-scored backend instead of exploiting the lowest score, so a cold
+/// backend acquires its first latency sample without being stampeded.
+const EXPLORE_EVERY: usize = 10;
+
 /// Peak EWMA latency tracker for load balancing.
 ///
 /// Tracks exponentially weighted moving average of latency per backend.
@@ -636,6 +641,10 @@ pub use lorica_api::connections::BackendConnections;
 pub struct EwmaTracker {
     /// EWMA score per backend address (microseconds).
     pub(crate) scores: Arc<parking_lot::RwLock<HashMap<String, f64>>>,
+    /// Monotonic selection ticket. Drives the bounded explore/exploit split
+    /// and round-robin tie-breaking, and (via `fetch_add`) hands each
+    /// concurrent caller a distinct value so they spread instead of stampeding.
+    next: AtomicUsize,
 }
 
 impl EwmaTracker {
@@ -661,22 +670,61 @@ impl EwmaTracker {
         }
     }
 
-    /// Select the backend with the lowest EWMA score.
-    /// Returns the index into the provided backends slice.
+    /// Select a backend index, balancing exploit (lowest EWMA score) against
+    /// bounded exploration of not-yet-scored backends.
+    ///
+    /// This is a plain latency EWMA: a backend's score does not rise under
+    /// load, so treating an unscored backend as the minimum (the previous
+    /// `unwrap_or(0.0)`) made it the best by default - every concurrent request
+    /// then stampeded the same cold backend (a thundering herd). Instead:
+    ///
+    /// - roughly one call in [`EXPLORE_EVERY`] picks an unscored backend
+    ///   (round-robin, so warm-up traffic is bounded and spread across
+    ///   concurrent callers);
+    /// - the rest exploit the lowest finite score, treating unscored backends
+    ///   as `+inf` so they are never stampeded;
+    /// - at a cold start (nothing scored yet) selection round-robins across all
+    ///   backends rather than always returning index 0.
+    ///
+    /// A backend leaves the unscored set as soon as [`Self::record`] lands its
+    /// first sample, after which it competes on real latency.
     pub fn select_best(&self, backends: &[&Backend]) -> usize {
         if backends.is_empty() {
             return 0;
         }
+        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
         let scores = self.scores.read();
-        let mut best_idx = 0;
-        let mut best_score = f64::MAX;
-        for (i, b) in backends.iter().enumerate() {
-            let score = scores.get(&b.address).copied().unwrap_or(0.0);
-            // Tie-break: unscored backends get priority (explore)
-            if score < best_score {
-                best_score = score;
-                best_idx = i;
+
+        // Explore: bounded, round-robin over not-yet-scored backends.
+        if ticket % EXPLORE_EVERY == 0 {
+            let unscored: Vec<usize> = backends
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| !scores.contains_key(&b.address))
+                .map(|(i, _)| i)
+                .collect();
+            if !unscored.is_empty() {
+                return unscored[(ticket / EXPLORE_EVERY) % unscored.len()];
             }
+        }
+
+        // Exploit: lowest scored backend. Unscored backends are ignored here
+        // (treated as +inf); they receive traffic only via the explore path.
+        let mut best_idx = 0;
+        let mut best_score = f64::INFINITY;
+        let mut any_scored = false;
+        for (i, b) in backends.iter().enumerate() {
+            if let Some(&score) = scores.get(&b.address) {
+                any_scored = true;
+                if score < best_score {
+                    best_score = score;
+                    best_idx = i;
+                }
+            }
+        }
+        if !any_scored {
+            // Cold start: nothing scored yet, spread round-robin.
+            return ticket % backends.len();
         }
         best_idx
     }
@@ -5367,23 +5415,35 @@ impl ProxyHttp for LoricaProxy {
             self.active_connections.fetch_sub(1, Ordering::Relaxed);
             self.backend_connections.decrement(addr);
 
-            // Update circuit breaker: 5xx or connection error = failure, else success.
-            // Keyed by (route_id, backend) so a failing route does not punish
-            // sibling routes that share the same upstream IP:port. In
-            // worker mode the supervisor owns the state machine and
-            // `record(...)` issues an RPC; `was_probe` is derived from
-            // `ctx.breaker_probe_backend` so a HalfOpen probe can
-            // transition the breaker back to Closed on success.
+            // Update circuit breaker: an upstream error or a 5xx response is a
+            // failure, a completed sub-500 response is a success. Keyed by
+            // (route_id, backend) so a failing route does not punish sibling
+            // routes that share the same upstream IP:port. In worker mode the
+            // supervisor owns the state machine and `record(...)` issues an
+            // RPC; `was_probe` is derived from `ctx.breaker_probe_backend` so a
+            // HalfOpen probe can transition the breaker back to Closed on
+            // success.
+            //
+            // A downstream-origin error (client navigated away, reset the
+            // stream, or dropped the connection mid-flight) carries no signal
+            // about backend health and must NOT feed the breaker: otherwise a
+            // burst of client cancels during a slow page load trips the breaker
+            // and 502s a perfectly healthy backend for the cooldown window.
             if let Some(ref route_id) = ctx.route_id {
-                let success = e.is_none() && status < 500;
-                let was_probe = ctx
-                    .breaker_probe_backend
-                    .as_deref()
-                    .map(|probe_addr| probe_addr == addr.as_str())
+                let client_aborted = e
+                    .map(|err| err.esource() == &ErrorSource::Downstream)
                     .unwrap_or(false);
-                self.circuit_breaker_engine
-                    .record(route_id, addr, success, was_probe)
-                    .await;
+                if !client_aborted {
+                    let success = e.is_none() && status < 500;
+                    let was_probe = ctx
+                        .breaker_probe_backend
+                        .as_deref()
+                        .map(|probe_addr| probe_addr == addr.as_str())
+                        .unwrap_or(false);
+                    self.circuit_breaker_engine
+                        .record(route_id, addr, success, was_probe)
+                        .await;
+                }
             }
         }
 

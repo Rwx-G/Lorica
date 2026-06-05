@@ -80,9 +80,9 @@ These RUSTSEC advisories are visible to `cargo audit` but hit only through forke
 | ID | Crate | Surface in Lorica-native code | Path |
 |----|-------|-------------------------------|------|
 | RUSTSEC-2025-0134 | `rustls-pemfile 2.2.0` (unmaintained) | None : direct usage swapped to `rustls-pki-types::pem_slice_iter` in the `lorica` runtime crate (v1.5.0) and the forked `lorica-tls` crate (v1.5.2 audit L-16) | Transitive via `lorica-tls` → `rustls-native-certs 0.7.x` only. Closes when `lorica-tls` bumps `rustls-native-certs` to `0.8` (which itself dropped the dep) - tracked in `docs/backlog.md` deps batch (audit L-15) |
-| RUSTSEC-2026-0097 | `rand 0.8.5` (unsound with custom logger) | None after v1.5.0 bump (direct call sites migrated to `rand 0.9` ; `0.10` was considered but the surrounding ecosystem `argon2 0.5` + `rand_chacha 0.9` has not caught up with the rand-core 0.10 migration) | Transitive via `captcha`, forked `lorica-runtime`/`lorica-limits` |
+| RUSTSEC-2026-0097 | `rand 0.8.6` (was `0.8.5`; unsound with custom logger) | **Cleared in v1.5.8**: the transitive `0.8` line was bumped `0.8.5 -> 0.8.6` via `cargo update`, so `cargo audit` no longer flags it. Native call sites had already moved to `rand 0.9` in v1.5.0 | Was transitive via `captcha`, forked `lorica-runtime`/`lorica-limits` |
 
-The forked crates eventually inherit the upstream fix when Pingora migrates. Until then, mitigation is scope limitation (Lorica-native code does not call the affected APIs directly) plus the fact that both advisories require conditions we do not create (unmaintained-but-functional parser on a known PEM format ; custom logger + `rand::rng()` combo, while Lorica uses the stock `tracing` subscriber).
+`RUSTSEC-2026-0097` is resolved as of v1.5.8 (bumped to the fixed `rand 0.8.6`). `RUSTSEC-2025-0134` (`rustls-pemfile`) remains the one live transitive advisory: the forked crates inherit the upstream fix when Pingora migrates, and until then the mitigation is scope limitation (Lorica-native code does not call the affected API directly) plus the fact that it requires a condition we do not create (an unmaintained-but-functional parser on a known PEM format).
 
 ### T6: Operational
 

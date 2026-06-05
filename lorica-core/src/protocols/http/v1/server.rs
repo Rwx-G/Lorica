@@ -1318,12 +1318,6 @@ fn parse_req_buffer<'buf>(
 ) -> HeaderParseState {
     use httparse::Result;
 
-    #[cfg(feature = "patched_http1")]
-    fn parse<'buf>(req: &mut httparse::Request<'_, 'buf>, buf: &'buf [u8]) -> Result<usize> {
-        req.parse_unchecked(buf)
-    }
-
-    #[cfg(not(feature = "patched_http1"))]
     fn parse<'buf>(req: &mut httparse::Request<'_, 'buf>, buf: &'buf [u8]) -> Result<usize> {
         req.parse(buf)
     }
@@ -1395,19 +1389,6 @@ mod tests_stream {
         let res = http_stream.read_request().await;
         assert_eq!(input.len(), res.unwrap().unwrap());
         assert_eq!(0, http_stream.req_header().headers.len());
-    }
-
-    #[cfg(feature = "patched_http1")]
-    #[tokio::test]
-    async fn read_invalid_path() {
-        init_log();
-        let input = b"GET /\x01\xF0\x90\x80 HTTP/1.1\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let res = http_stream.read_request().await;
-        assert_eq!(input.len(), res.unwrap().unwrap());
-        assert_eq!(0, http_stream.req_header().headers.len());
-        assert_eq!(b"/\x01\xF0\x90\x80", http_stream.get_path());
     }
 
     #[tokio::test]

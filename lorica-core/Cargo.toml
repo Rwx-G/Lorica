@@ -105,7 +105,6 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("openssl"
 default = []
 integration-tests = []
 rustls = ["lorica-tls", "any_tls", "dep:x509-parser", "ouroboros"]
-patched_http1 = ["lorica-http/patched_http1"]
 any_tls = []
 connection_filter = []
 prometheus = ["dep:prometheus"]

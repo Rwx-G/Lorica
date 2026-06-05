@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use lorica_config::models::{HealthStatus, LifecycleState};
+use lorica_config::models::{Backend, HealthStatus, LifecycleState};
 use lorica_config::ConfigStore;
 use once_cell::sync::Lazy;
+use futures_util::stream::StreamExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -64,6 +65,13 @@ const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Latency threshold above which a backend is considered degraded (ms).
 const DEGRADED_THRESHOLD_MS: u128 = 2000;
 
+/// Consecutive probes reporting the same new status required before the health
+/// loop commits a backend status flip. Prevents a single transient probe
+/// failure (or a brief latency spike) from yanking a backend out of rotation
+/// for a full interval. The absolute confirmation time is this value times the
+/// operator's `health_check_interval_s`.
+const HEALTH_FLIP_THRESHOLD: u32 = 3;
+
 /// Result of a single TCP health check probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
@@ -100,6 +108,10 @@ pub async fn health_check_loop(
     let interval = Duration::from_secs(default_interval_s.max(5));
     // Track when each backend entered Closing state for drain timeout
     let mut drain_start: HashMap<String, Instant> = HashMap::new();
+    // Track an in-progress health-status flip per backend (candidate status +
+    // consecutive-confirmation count) so a transient probe blip does not flip
+    // the stored status. See `confirm_status_flip` / `HEALTH_FLIP_THRESHOLD`.
+    let mut pending_health: HashMap<String, (HealthStatus, u32)> = HashMap::new();
 
     loop {
         tokio::time::sleep(interval).await;
@@ -117,8 +129,11 @@ pub async fn health_check_loop(
 
         let mut changed = false;
 
+        // --- Phase 0: drain monitoring (sequential) ---
+        // Closing backends may transition to Closed; non-Closing backends just
+        // clear stale drain / flip tracking. This is cheap and rare, so it
+        // stays sequential.
         for backend in &backends {
-            // --- Drain monitoring for Closing backends ---
             if backend.lifecycle_state == LifecycleState::Closing {
                 let start = drain_start
                     .entry(backend.id.clone())
@@ -163,29 +178,72 @@ pub async fn health_check_loop(
                 continue;
             }
 
-            // Clean up drain tracking for non-Closing backends
+            // Clean up drain tracking for non-Closing backends.
             drain_start.remove(&backend.id);
-
-            // --- Health checks for Normal backends ---
+            // A backend that is not health-checked keeps no flip streak.
             if !backend.health_check_enabled {
-                continue;
+                pending_health.remove(&backend.id);
             }
+        }
 
-            // Run active probes (HTTP if path set, else TCP)
-            let probe = if let Some(ref path) = backend.health_check_path {
-                let scheme = if backend.tls_upstream {
-                    "https"
+        // --- Phase A: probe eligible backends concurrently ---
+        // One slow or timing-out backend must not delay every other backend's
+        // probe or overrun the loop interval. Bound concurrency with the
+        // operator-tunable `health_max_concurrent_probes` (default 32).
+        let max_concurrent = {
+            let store = store.lock().await;
+            store
+                .get_global_settings()
+                .map(|s| s.health_max_concurrent_probes.clamp(1, 512) as usize)
+                .unwrap_or(32)
+        };
+        // Clone the eligible backends so each probe future owns its data; this
+        // keeps the spawned `health_check_loop` future free of borrows that the
+        // stream combinators cannot prove `Send` across the await points.
+        let eligible: Vec<Backend> = backends
+            .iter()
+            .filter(|b| {
+                b.lifecycle_state != LifecycleState::Closing && b.health_check_enabled
+            })
+            .cloned()
+            .collect();
+        let probe_results: Vec<(Backend, HealthStatus)> = futures_util::stream::iter(eligible)
+            .map(|backend| async move {
+                let probe = if let Some(ref path) = backend.health_check_path {
+                    let scheme = if backend.tls_upstream { "https" } else { "http" };
+                    let url = format!("{scheme}://{}{path}", backend.address);
+                    http_probe(&url).await
                 } else {
-                    "http"
+                    tcp_probe(&backend.address).await
                 };
-                let url = format!("{scheme}://{}{path}", backend.address);
-                http_probe(&url).await
-            } else {
-                tcp_probe(&backend.address).await
-            };
-            let new_status = probe.to_health_status();
+                (backend, probe.to_health_status())
+            })
+            .buffer_unordered(max_concurrent)
+            .collect()
+            .await;
 
-            if new_status != backend.health_status {
+        // --- Phase B: apply flip hysteresis (sequential) ---
+        // `pending_health` is single-threaded loop state, so the decision runs
+        // sequentially over the collected probe outcomes. Only confirmed flips
+        // (the new status observed HEALTH_FLIP_THRESHOLD times in a row) are
+        // carried forward; a transient probe blip is absorbed.
+        let mut commits: Vec<(Backend, HealthStatus)> = Vec::new();
+        for (backend, new_status) in probe_results {
+            if confirm_status_flip(
+                &mut pending_health,
+                &backend.id,
+                &backend.health_status,
+                &new_status,
+                HEALTH_FLIP_THRESHOLD,
+            ) {
+                commits.push((backend, new_status));
+            }
+        }
+
+        // --- Phase C: persist confirmed flips under a single lock ---
+        if !commits.is_empty() {
+            let store = store.lock().await;
+            for (backend, new_status) in &commits {
                 debug!(
                     backend = %backend.address,
                     old = backend.health_status.as_str(),
@@ -196,8 +254,10 @@ pub async fn health_check_loop(
                 let mut updated = backend.clone();
                 updated.health_status = new_status.clone();
 
-                // Dispatch backend_down notification on transition to Down
-                if new_status == HealthStatus::Down {
+                // Dispatch backend_down notification on a confirmed transition
+                // to Down (not on a transient blip - the hysteresis already
+                // filtered those out).
+                if *new_status == HealthStatus::Down {
                     if let Some(ref sender) = alert_sender {
                         sender.send(
                             lorica_notify::AlertEvent::new(
@@ -211,7 +271,6 @@ pub async fn health_check_loop(
                     }
                 }
 
-                let store = store.lock().await;
                 if let Err(e) = store.update_backend(&updated) {
                     warn!(
                         backend = %backend.address,
@@ -305,6 +364,41 @@ async fn http_probe(url: &str) -> ProbeResult {
     }
 }
 
+/// Apply flip hysteresis for a single backend probe.
+///
+/// Returns `true` when `new` differs from `current` and has now been observed
+/// `threshold` consecutive times, meaning the status flip should be committed.
+/// Otherwise it records the in-progress streak in `pending` and returns
+/// `false`. A probe whose result matches `current` clears any pending streak.
+fn confirm_status_flip(
+    pending: &mut HashMap<String, (HealthStatus, u32)>,
+    backend_id: &str,
+    current: &HealthStatus,
+    new: &HealthStatus,
+    threshold: u32,
+) -> bool {
+    if new == current {
+        pending.remove(backend_id);
+        return false;
+    }
+    let streak = match pending.get_mut(backend_id) {
+        Some((candidate, count)) if candidate == new => {
+            *count += 1;
+            *count
+        }
+        _ => {
+            pending.insert(backend_id.to_string(), (new.clone(), 1));
+            1
+        }
+    };
+    if streak >= threshold {
+        pending.remove(backend_id);
+        true
+    } else {
+        false
+    }
+}
+
 /// Determine probe result from a latency value (for testing).
 #[cfg(test)]
 fn classify_latency(connected: bool, latency_ms: u128) -> ProbeResult {
@@ -388,5 +482,111 @@ mod tests {
     async fn test_http_probe_invalid_url() {
         let result = http_probe("not-a-url").await;
         assert_eq!(result, ProbeResult::Down);
+    }
+
+    // ---- Flip hysteresis ----
+
+    #[test]
+    fn flip_requires_consecutive_confirmations() {
+        let mut pending = HashMap::new();
+        // Two failures under the threshold of 3 do not flip.
+        assert!(!confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Down,
+            3
+        ));
+        assert!(!confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Down,
+            3
+        ));
+        // Third consecutive failure commits the flip and clears the streak.
+        assert!(confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Down,
+            3
+        ));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn flip_streak_resets_when_probe_matches_current() {
+        let mut pending = HashMap::new();
+        assert!(!confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Down,
+            3
+        ));
+        // A probe back at the current status clears the pending Down streak.
+        assert!(!confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Healthy,
+            3
+        ));
+        assert!(pending.is_empty());
+        // The next Down therefore starts over: one failure must not flip.
+        assert!(!confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Down,
+            3
+        ));
+    }
+
+    #[test]
+    fn flip_streak_resets_when_candidate_changes() {
+        let mut pending = HashMap::new();
+        assert!(!confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Down,
+            3
+        ));
+        // Candidate changes Down -> Degraded: streak restarts at 1.
+        assert!(!confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Degraded,
+            3
+        ));
+        assert!(!confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Degraded,
+            3
+        ));
+        assert!(confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Degraded,
+            3
+        ));
+    }
+
+    #[test]
+    fn flip_threshold_of_one_is_immediate() {
+        let mut pending = HashMap::new();
+        assert!(confirm_status_flip(
+            &mut pending,
+            "b",
+            &HealthStatus::Healthy,
+            &HealthStatus::Down,
+            1
+        ));
     }
 }

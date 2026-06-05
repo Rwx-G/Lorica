@@ -633,21 +633,44 @@ fn test_ewma_tracker_selects_lowest_score() {
 }
 
 #[test]
-fn test_ewma_tracker_prefers_unscored() {
+fn test_ewma_tracker_explores_unscored_bounded() {
+    // Backend 1 scored (slow); backend 2 left unscored. Exploit must keep
+    // picking the only scored backend; the unscored one is only *explored*
+    // ~1 call in EXPLORE_EVERY, never stampeded.
     let tracker = EwmaTracker::new();
-    // Only score backend 1 (high latency)
     tracker.record("10.0.0.1:8080", 5000.0);
-    // Backend 2 is unscored (score = 0.0, exploration priority)
 
     let b1 = make_backend("b1", "10.0.0.1:8080");
     let b2 = make_backend("b2", "10.0.0.2:8080");
     let backends = vec![&b1, &b2];
 
-    let selected = tracker.select_best(&backends);
-    assert_eq!(
-        selected, 1,
-        "Should prefer unscored backend for exploration"
-    );
+    let mut picks = [0usize; 2];
+    for _ in 0..20 {
+        picks[tracker.select_best(&backends)] += 1;
+    }
+    // Tickets 0 and 10 explore the unscored backend (index 1); the other 18
+    // exploit the only scored backend (index 0).
+    assert_eq!(picks[1], 2, "unscored backend explored on exactly 2 of 20 calls");
+    assert_eq!(picks[0], 18, "exploit picks the scored backend the rest");
+}
+
+#[test]
+fn test_ewma_tracker_cold_start_spreads() {
+    // Nothing scored yet: selection must spread across all backends rather
+    // than stampeding index 0 (the old unwrap_or(0.0) thundering herd).
+    let tracker = EwmaTracker::new();
+    let b0 = make_backend("b0", "10.0.0.1:8080");
+    let b1 = make_backend("b1", "10.0.0.2:8080");
+    let b2 = make_backend("b2", "10.0.0.3:8080");
+    let backends = vec![&b0, &b1, &b2];
+
+    let mut picks = [0usize; 3];
+    for _ in 0..30 {
+        picks[tracker.select_best(&backends)] += 1;
+    }
+    for (i, &p) in picks.iter().enumerate() {
+        assert!(p >= 8, "backend {i} under-served at cold start: {p}/30");
+    }
 }
 
 #[test]

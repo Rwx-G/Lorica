@@ -43,7 +43,6 @@
 //! - `connection_filter`: Enable early TCP connection filtering before TLS handshake.
 //!   This allows implementing custom logic to accept/reject connections based on peer address
 //!   with zero overhead when disabled.
-//! - `patched_http1`: Enable patched HTTP/1 parser
 //!
 //! # Connection Filtering
 //!
