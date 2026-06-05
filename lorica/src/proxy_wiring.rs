@@ -5367,23 +5367,35 @@ impl ProxyHttp for LoricaProxy {
             self.active_connections.fetch_sub(1, Ordering::Relaxed);
             self.backend_connections.decrement(addr);
 
-            // Update circuit breaker: 5xx or connection error = failure, else success.
-            // Keyed by (route_id, backend) so a failing route does not punish
-            // sibling routes that share the same upstream IP:port. In
-            // worker mode the supervisor owns the state machine and
-            // `record(...)` issues an RPC; `was_probe` is derived from
-            // `ctx.breaker_probe_backend` so a HalfOpen probe can
-            // transition the breaker back to Closed on success.
+            // Update circuit breaker: an upstream error or a 5xx response is a
+            // failure, a completed sub-500 response is a success. Keyed by
+            // (route_id, backend) so a failing route does not punish sibling
+            // routes that share the same upstream IP:port. In worker mode the
+            // supervisor owns the state machine and `record(...)` issues an
+            // RPC; `was_probe` is derived from `ctx.breaker_probe_backend` so a
+            // HalfOpen probe can transition the breaker back to Closed on
+            // success.
+            //
+            // A downstream-origin error (client navigated away, reset the
+            // stream, or dropped the connection mid-flight) carries no signal
+            // about backend health and must NOT feed the breaker: otherwise a
+            // burst of client cancels during a slow page load trips the breaker
+            // and 502s a perfectly healthy backend for the cooldown window.
             if let Some(ref route_id) = ctx.route_id {
-                let success = e.is_none() && status < 500;
-                let was_probe = ctx
-                    .breaker_probe_backend
-                    .as_deref()
-                    .map(|probe_addr| probe_addr == addr.as_str())
+                let client_aborted = e
+                    .map(|err| err.esource() == &ErrorSource::Downstream)
                     .unwrap_or(false);
-                self.circuit_breaker_engine
-                    .record(route_id, addr, success, was_probe)
-                    .await;
+                if !client_aborted {
+                    let success = e.is_none() && status < 500;
+                    let was_probe = ctx
+                        .breaker_probe_backend
+                        .as_deref()
+                        .map(|probe_addr| probe_addr == addr.as_str())
+                        .unwrap_or(false);
+                    self.circuit_breaker_engine
+                        .record(route_id, addr, success, was_probe)
+                        .await;
+                }
             }
         }
 
