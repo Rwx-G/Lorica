@@ -766,13 +766,20 @@ if [ -n "$SESSION" ]; then
     FO_ROUTE_ID=$(echo "$FO_ROUTE" | jq -r '.data.id')
     ok "Failover route created with 1 dead + 1 healthy backend"
 
-    # Wait for at least one health check cycle to mark the dead backend down
+    # Wait for the health check to mark the dead backend down. Since
+    # v1.5.8 a status flip needs HEALTH_FLIP_THRESHOLD (3) consecutive
+    # probes at the default 10s interval, so detection takes up to
+    # ~30s depending on probe phase; poll instead of a fixed sleep.
     log "    Waiting for health check to detect dead backend..."
-    sleep 15
-
-    # Verify the dead backend is marked as down
-    DEAD_STATUS=$(api_get "/api/v1/backends/$DEAD_B_ID")
-    DEAD_HEALTH=$(echo "$DEAD_STATUS" | jq -r '.data.health_status' 2>/dev/null || echo "unknown")
+    DEAD_HEALTH="unknown"
+    for i in $(seq 1 15); do
+        DEAD_STATUS=$(api_get "/api/v1/backends/$DEAD_B_ID")
+        DEAD_HEALTH=$(echo "$DEAD_STATUS" | jq -r '.data.health_status' 2>/dev/null || echo "unknown")
+        if [ "$DEAD_HEALTH" = "down" ]; then
+            break
+        fi
+        sleep 3
+    done
     if [ "$DEAD_HEALTH" = "down" ]; then
         ok "Dead backend marked as down by health check"
     else
