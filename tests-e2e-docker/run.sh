@@ -32,6 +32,12 @@ if [ -n "$BUILD_FLAG" ]; then
     docker compose build
 fi
 
+# Profile-gated services need explicit --profile flags on teardown or
+# `down -v` skips their containers and named volumes; the next run then
+# boots against stale data (e.g. the cert-export smoke rotates the
+# admin password, and a stale volume 401s the next run's login).
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns"
+
 # ---- Phase 1: Single-process tests ----
 echo "=== Lorica E2E Tests (single-process) ==="
 echo ""
@@ -47,7 +53,7 @@ for i in $(seq 1 60); do
     if [ "$i" = "60" ]; then
         echo "ERROR: Lorica did not start within 120s"
         docker compose logs lorica | tail -20
-        docker compose down -v
+        docker compose $ALL_PROFILES down -v
         exit 1
     fi
     sleep 2
@@ -109,7 +115,7 @@ fi
 
 # Cleanup unless --keep
 if [ "$KEEP" = false ]; then
-    docker compose down -v
+    docker compose $ALL_PROFILES down -v
 fi
 
 if [ "$EXIT_CODE" = "0" ]; then

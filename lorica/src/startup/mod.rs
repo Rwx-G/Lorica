@@ -122,6 +122,22 @@ pub(crate) async fn start_alerting_stack(
     }
 }
 
+/// Create the load-test engine and start its cron scheduler.
+///
+/// One helper for both API-serving modes (Epic 8 Story 8.1 asymmetry,
+/// fixed in v1.5.11): supervisor mode used to create a `LoadTestEngine`
+/// for `AppState` but never called `start_scheduler`, so cron-scheduled
+/// load tests silently never ran outside single-process mode. Going
+/// through this helper makes "engine without scheduler" unrepresentable
+/// at the call sites.
+pub(crate) fn start_load_test_engine(
+    store: &Arc<Mutex<ConfigStore>>,
+) -> Arc<lorica_bench::LoadTestEngine> {
+    let engine = Arc::new(lorica_bench::LoadTestEngine::new());
+    lorica_bench::scheduler::start_scheduler(Arc::clone(store), Arc::clone(&engine));
+    engine
+}
+
 /// Run the shared API-server tail: session store, ACME auto-renewal,
 /// cert-expiry notifier, then the blocking `start_server` loop
 /// (audit H-9 dedup).
