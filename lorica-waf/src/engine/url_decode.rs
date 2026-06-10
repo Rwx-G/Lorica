@@ -127,7 +127,11 @@ impl WafEngine {
                 i += 1;
             }
         }
-        String::from_utf8_lossy(&out).into_owned()
+        // Avoid the copy when the decoded bytes are already valid UTF-8
+        // (the common case): `from_utf8` reuses the buffer in place.
+        // Only the invalid path (overlong forms, stray bytes) reallocates
+        // through the lossy replacement, preserving the U+FFFD policy.
+        String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
     }
 }
 
