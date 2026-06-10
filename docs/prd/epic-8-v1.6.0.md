@@ -10,10 +10,11 @@
 > 1.5.x patches in the meantime: Story 8.1 is closed (v1.5.10 +
 > v1.5.11), Story 8.6 shipped (v1.5.8 + v1.5.10), Story 8.7 shipped
 > (v1.5.10), and the `update_settings` part of Story 8.10 shipped
-> (v1.5.10). The original branch is archived as
-> `feat/v1.6.0-legacy`; the Story 8.2 work-in-progress was salvaged
-> onto this branch with its proxy wiring rewritten against the
-> v1.5.10 `proxy_wiring/filters.rs` layout.
+> (v1.5.10). The Story 8.2 work-in-progress was salvaged onto this
+> branch with its proxy wiring rewritten against the v1.5.10
+> `proxy_wiring/filters.rs` layout; the original branch was deleted
+> after the salvage (2026-06-10, `origin/feat/v1.6.0` force-pushed
+> to the rebuilt history).
 
 **Epic Goal:** Land the v1.6.0 release cycle: three headline features (AI-crawler deny-list as a first-class protection layer, hot binary upgrade for zero-downtime restarts, team settings with multi-user RBAC), the long-standing module split of `proxy_wiring.rs` + `main.rs`, and the open audit-closure backlog (cert-resolver reliability, health-check parallelism, SQLite reactor-stall pass, management plane TLS, defense-in-depth, settings cleanup, observability gap, supply-chain vendoring of `captcha`).
 
@@ -27,7 +28,7 @@
 
 The split shipped on `main` through the 1.5.x patch cycle instead of
 this branch, with an independent implementation that supersedes the
-one archived on `feat/v1.6.0-legacy`:
+one from the original (now deleted) May 2026 branch:
 
 - v1.5.10: `main.rs` 4329 -> 70 LOC (`cli.rs` + `startup/{supervisor,
   worker, single, mod}.rs` with shared per-cluster spawn helpers,
@@ -55,6 +56,24 @@ taken and are decision points for this cycle:
    Optional taste split if the file keeps growing.
 
 ## Story 8.2: AI-Crawler (LLM) Deny-List
+
+**Status:** InProgress (~60%, rebuilt branch state as of 2026-06-10).
+The salvage + wiring rewrite landed AC #1 (registry, with the design
+revised per the story file: `Verification::{Rdns, IpRanges, UaOnly}`
+plus bundled SHA-256-pinned vendor IP-lists - only 2/12 vendors
+publish rDNS), AC #2 (route fields + V39-V41 migrations), AC #3
+(per-variant evaluation + spoofed fallback, per-route override of the
+global), AC #4 (counters, plus the story's `ua_only_match` action),
+AC #9 (`docs/ai-crawlers.md`), and the story-level additions AC #10
+(`/robots.txt` auto-serve) and AC #11 (verified-bot header
+injection). AC #6/#7 are partial: the `ai_crawlers_custom` store +
+CRUD endpoints (with regex/baseline-UA/cap validation) exist, but
+the request-evaluation path still consults the built-in registry
+only (merged registry pending), the Settings UI is absent, and the
+stats / test / robots-preview endpoints + OpenAPI are not written.
+Remaining: merged registry + AC #8 hot-reload, AC #5 dashboard,
+AC #7 remainder, and the `ai-bot-smoke` e2e profile (IV3). Full
+task-level state in `docs/stories/story-8.2-ai-crawler-deny-list.md`.
 
 As an infrastructure engineer,
 I want a first-class deny-list for AI / LLM crawlers (GPTBot, ClaudeBot, CCBot, PerplexityBot, Bytespider, ...) with User-Agent matching and rDNS forward-confirmation,
