@@ -1613,6 +1613,52 @@ impl LoricaProxy {
         self.persist_waf_event(&ev);
     }
 
+    /// Write a terminal HTML error response and end the request (audit H-10
+    /// dedup).
+    ///
+    /// Renders the branded error page via [`render_error_body`] (per-route
+    /// `error_page_html` override when provided, default Lorica page
+    /// otherwise), sets `Content-Type` / `Content-Length`, writes the
+    /// response header and body, and returns `Ok(true)` so `request_filter`
+    /// call sites can `return` the call directly to stop the proxy pipeline.
+    /// Write failures propagate as `Err`, exactly like the inline blocks
+    /// this helper replaced.
+    ///
+    /// The host header shown on the error page is always derived from the
+    /// downstream request via `extract_host`, which is what every former
+    /// inline block did.
+    ///
+    /// `extra_headers` are inserted BEFORE `Content-Type`, preserving the
+    /// exact wire order of the rate-limit 429 sites (`Retry-After`,
+    /// `X-RateLimit-Reset`) that the e2e suites pin. Pass `&[]` when no
+    /// extra headers are needed.
+    async fn write_error_response(
+        &self,
+        session: &mut Session,
+        status: u16,
+        request_id: &str,
+        error_page_html: Option<&str>,
+        reason: &str,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<bool> {
+        let host_header: String = extract_host(session.req_header()).to_string();
+        let body: String =
+            render_error_body(status, request_id, &host_header, error_page_html, reason);
+        let mut header = lorica_http::ResponseHeader::build(status, None)?;
+        for (name, value) in extra_headers {
+            header.insert_header(*name, value.as_str())?;
+        }
+        header.insert_header("Content-Type", "text/html; charset=utf-8")?;
+        header.insert_header("Content-Length", body.len().to_string())?;
+        session
+            .write_response_header(Box::new(header), false)
+            .await?;
+        session
+            .write_response_body(Some(bytes::Bytes::from(body)), true)
+            .await?;
+        Ok(true)
+    }
+
     /// Spawn the worker-side pipelined RPC listener that handles
     /// supervisor-initiated commands on the shared RPC channel
     /// (`ConfigReloadPrepare`, `ConfigReloadCommit`, `MetricsRequest`).
@@ -2422,24 +2468,16 @@ impl ProxyHttp for LoricaProxy {
                     ctx.block_reason = Some("global connection limit".to_string());
                     // No route matched yet at this stage, so no per-route
                     // override is consultable: always render the default page.
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        503,
-                        &ctx.request_id,
-                        &host_header,
-                        None,
-                        "Global connection limit exceeded",
-                    );
-                    let mut header = lorica_http::ResponseHeader::build(503, None)?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
+                    return self
+                        .write_error_response(
+                            session,
+                            503,
+                            &ctx.request_id,
+                            None,
+                            "Global connection limit exceeded",
+                            &[],
+                        )
+                        .await;
                 }
             }
 
@@ -2521,24 +2559,16 @@ impl ProxyHttp for LoricaProxy {
                     if banned {
                         ctx.block_reason = Some("IP banned".to_string());
                         // Pre-route stage: no route override consultable.
-                        let host_header = extract_host(session.req_header()).to_string();
-                        let body = render_error_body(
-                            403,
-                            &ctx.request_id,
-                            &host_header,
-                            None,
-                            "IP banned",
-                        );
-                        let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                        header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                        header.insert_header("Content-Length", body.len().to_string())?;
-                        session
-                            .write_response_header(Box::new(header), false)
-                            .await?;
-                        session
-                            .write_response_body(Some(bytes::Bytes::from(body)), true)
-                            .await?;
-                        return Ok(true);
+                        return self
+                            .write_error_response(
+                                session,
+                                403,
+                                &ctx.request_id,
+                                None,
+                                "IP banned",
+                                &[],
+                            )
+                            .await;
                     }
 
                     let blocklisted = ctx
@@ -2582,24 +2612,16 @@ impl ProxyHttp for LoricaProxy {
                         };
                         self.persist_waf_event(&ev);
                         // Pre-route stage: no route override consultable.
-                        let host_header = extract_host(session.req_header()).to_string();
-                        let body = render_error_body(
-                            403,
-                            &ctx.request_id,
-                            &host_header,
-                            None,
-                            "IP blocked",
-                        );
-                        let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                        header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                        header.insert_header("Content-Length", body.len().to_string())?;
-                        session
-                            .write_response_header(Box::new(header), false)
-                            .await?;
-                        session
-                            .write_response_body(Some(bytes::Bytes::from(body)), true)
-                            .await?;
-                        return Ok(true);
+                        return self
+                            .write_error_response(
+                                session,
+                                403,
+                                &ctx.request_id,
+                                None,
+                                "IP blocked",
+                                &[],
+                            )
+                            .await;
                     }
                 }
             } // end if !is_whitelisted (ban + blocklist)
@@ -2633,24 +2655,16 @@ impl ProxyHttp for LoricaProxy {
                         .eq_ignore_ascii_case("websocket")
                     {
                         ctx.block_reason = Some("WebSocket disabled".to_string());
-                        let host_header = extract_host(session.req_header()).to_string();
-                        let body = render_error_body(
-                            403,
-                            &ctx.request_id,
-                            &host_header,
-                            entry.route.error_page_html.as_deref(),
-                            "WebSocket upgrades disabled on this route",
-                        );
-                        let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                        header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                        header.insert_header("Content-Length", body.len().to_string())?;
-                        session
-                            .write_response_header(Box::new(header), false)
-                            .await?;
-                        session
-                            .write_response_body(Some(bytes::Bytes::from(body)), true)
-                            .await?;
-                        return Ok(true);
+                        return self
+                            .write_error_response(
+                                session,
+                                403,
+                                &ctx.request_id,
+                                entry.route.error_page_html.as_deref(),
+                                "WebSocket upgrades disabled on this route",
+                                &[],
+                            )
+                            .await;
                     }
                 }
             }
@@ -2725,31 +2739,22 @@ impl ProxyHttp for LoricaProxy {
                             .try_consume(&key, rl, 1, lorica_shmem::now_ns());
                     if !admitted {
                         ctx.block_reason = Some("rate limited".to_string());
-                        let host_header = extract_host(session.req_header()).to_string();
-                        let body = render_error_body(
-                            429,
-                            &ctx.request_id,
-                            &host_header,
-                            entry.route.error_page_html.as_deref(),
-                            "Rate limit exceeded",
-                        );
-                        let mut header = lorica_http::ResponseHeader::build(429, None)?;
                         // Retry-After in seconds. For any configured refill
                         // rate >= 1 tok/s, 1 second is the right advice
                         // (one token refills in <= 1 s). A zero refill means
                         // a one-shot bucket that never refills - advise a
                         // generous 60 s backoff instead of a tight loop.
                         let retry_after: u64 = if rl.refill_per_sec >= 1 { 1 } else { 60 };
-                        header.insert_header("Retry-After", retry_after.to_string())?;
-                        header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                        header.insert_header("Content-Length", body.len().to_string())?;
-                        session
-                            .write_response_header(Box::new(header), false)
-                            .await?;
-                        session
-                            .write_response_body(Some(bytes::Bytes::from(body)), true)
-                            .await?;
-                        return Ok(true);
+                        return self
+                            .write_error_response(
+                                session,
+                                429,
+                                &ctx.request_id,
+                                entry.route.error_page_html.as_deref(),
+                                "Rate limit exceeded",
+                                &[("Retry-After", retry_after.to_string())],
+                            )
+                            .await;
                     }
                 }
             }
@@ -2774,24 +2779,16 @@ impl ProxyHttp for LoricaProxy {
                         495 => "SSL certificate error",
                         _ => "Forbidden",
                     };
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        status,
-                        &ctx.request_id,
-                        &host_header,
-                        entry.route.error_page_html.as_deref(),
-                        message,
-                    );
-                    let mut resp_header = ResponseHeader::build(status, None)?;
-                    resp_header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    resp_header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(resp_header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
+                    return self
+                        .write_error_response(
+                            session,
+                            status,
+                            &ctx.request_id,
+                            entry.route.error_page_html.as_deref(),
+                            message,
+                            &[],
+                        )
+                        .await;
                 }
             }
 
@@ -2848,24 +2845,16 @@ impl ProxyHttp for LoricaProxy {
                             "forward auth fail-closed"
                         );
                         ctx.block_reason = Some(format!("forward auth error: {reason}"));
-                        let host_header = extract_host(session.req_header()).to_string();
-                        let body = render_error_body(
-                            503,
-                            &ctx.request_id,
-                            &host_header,
-                            entry.route.error_page_html.as_deref(),
-                            "Authentication service unavailable",
-                        );
-                        let mut resp_header = ResponseHeader::build(503, None)?;
-                        resp_header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                        resp_header.insert_header("Content-Length", body.len().to_string())?;
-                        session
-                            .write_response_header(Box::new(resp_header), false)
-                            .await?;
-                        session
-                            .write_response_body(Some(bytes::Bytes::from(body)), true)
-                            .await?;
-                        return Ok(true);
+                        return self
+                            .write_error_response(
+                                session,
+                                503,
+                                &ctx.request_id,
+                                entry.route.error_page_html.as_deref(),
+                                "Authentication service unavailable",
+                                &[],
+                            )
+                            .await;
                     }
                 }
             }
@@ -3176,28 +3165,20 @@ impl ProxyHttp for LoricaProxy {
                     // 502 / 504 upstream). Previously this path wrote empty
                     // headers only, which produced a blank page for
                     // return_status routes.
-                    let host_header = extract_host(session.req_header()).to_string();
                     let error_page_html = ctx
                         .route_snapshot
                         .as_ref()
                         .and_then(|r| r.error_page_html.as_deref())
                         .map(|s| s.to_string());
-                    let body = render_error_body(
+                    self.write_error_response(
+                        session,
                         status,
                         &ctx.request_id,
-                        &host_header,
                         error_page_html.as_deref(),
                         &format!("return_status {status}"),
-                    );
-                    let mut header = lorica_http::ResponseHeader::build(status, None)?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
+                        &[],
+                    )
+                    .await?;
                 }
                 return Ok(true);
             }
@@ -3228,45 +3209,29 @@ impl ProxyHttp for LoricaProxy {
                     && !entry.route.ip_allowlist.iter().any(|a| ip_matches(ip, a))
                 {
                     ctx.block_reason = Some("IP not in allowlist".to_string());
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        403,
-                        &ctx.request_id,
-                        &host_header,
-                        entry.route.error_page_html.as_deref(),
-                        "IP not in allowlist",
-                    );
-                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
+                    return self
+                        .write_error_response(
+                            session,
+                            403,
+                            &ctx.request_id,
+                            entry.route.error_page_html.as_deref(),
+                            "IP not in allowlist",
+                            &[],
+                        )
+                        .await;
                 }
                 if entry.route.ip_denylist.iter().any(|d| ip_matches(ip, d)) {
                     ctx.block_reason = Some("IP in denylist".to_string());
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        403,
-                        &ctx.request_id,
-                        &host_header,
-                        entry.route.error_page_html.as_deref(),
-                        "IP in denylist",
-                    );
-                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
+                    return self
+                        .write_error_response(
+                            session,
+                            403,
+                            &ctx.request_id,
+                            entry.route.error_page_html.as_deref(),
+                            "IP in denylist",
+                            &[],
+                        )
+                        .await;
                 }
             }
 
@@ -3319,24 +3284,16 @@ impl ProxyHttp for LoricaProxy {
 
                                 let reason = format!("GeoIP blocked ({country} via {mode_str})");
                                 ctx.block_reason = Some(reason.clone());
-                                let host_header = extract_host(session.req_header()).to_string();
-                                let body = render_error_body(
-                                    403,
-                                    &ctx.request_id,
-                                    &host_header,
-                                    entry.route.error_page_html.as_deref(),
-                                    &reason,
-                                );
-                                let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                                header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                                header.insert_header("Content-Length", body.len().to_string())?;
-                                session
-                                    .write_response_header(Box::new(header), false)
-                                    .await?;
-                                session
-                                    .write_response_body(Some(bytes::Bytes::from(body)), true)
-                                    .await?;
-                                return Ok(true);
+                                return self
+                                    .write_error_response(
+                                        session,
+                                        403,
+                                        &ctx.request_id,
+                                        entry.route.error_page_html.as_deref(),
+                                        &reason,
+                                        &[],
+                                    )
+                                    .await;
                             }
                         }
                     }
@@ -3594,24 +3551,16 @@ impl ProxyHttp for LoricaProxy {
                         "slowloris detected - slow request headers"
                     );
                     ctx.block_reason = Some("slowloris detected".to_string());
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        408,
-                        &ctx.request_id,
-                        &host_header,
-                        entry.route.error_page_html.as_deref(),
-                        "Request headers took too long",
-                    );
-                    let mut header = lorica_http::ResponseHeader::build(408, None)?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
+                    return self
+                        .write_error_response(
+                            session,
+                            408,
+                            &ctx.request_id,
+                            entry.route.error_page_html.as_deref(),
+                            "Request headers took too long",
+                            &[],
+                        )
+                        .await;
                 }
             }
 
@@ -3635,26 +3584,21 @@ impl ProxyHttp for LoricaProxy {
                         "max connections exceeded for route (503)"
                     );
                     ctx.block_reason = Some("route connection limit".to_string());
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
-                        503,
-                        &ctx.request_id,
-                        &host_header,
-                        ctx.route_snapshot
-                            .as_ref()
-                            .and_then(|r| r.error_page_html.as_deref()),
-                        "Route connection limit exceeded",
-                    );
-                    let mut header = lorica_http::ResponseHeader::build(503, None)?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    return Ok(true);
+                    let error_page_html = ctx
+                        .route_snapshot
+                        .as_ref()
+                        .and_then(|r| r.error_page_html.as_deref())
+                        .map(|s| s.to_string());
+                    return self
+                        .write_error_response(
+                            session,
+                            503,
+                            &ctx.request_id,
+                            error_page_html.as_deref(),
+                            "Route connection limit exceeded",
+                            &[],
+                        )
+                        .await;
                 }
                 ctx.route_conn_counter = Some(counter);
             }
@@ -3794,26 +3738,19 @@ impl ProxyHttp for LoricaProxy {
                                 .as_secs()
                                 + 1;
                             ctx.block_reason = Some("rate limited".to_string());
-                            let host_header = extract_host(session.req_header()).to_string();
-                            let body = render_error_body(
-                                429,
-                                &ctx.request_id,
-                                &host_header,
-                                entry.route.error_page_html.as_deref(),
-                                "Rate limit exceeded",
-                            );
-                            let mut header = lorica_http::ResponseHeader::build(429, None)?;
-                            header.insert_header("Retry-After", "1")?;
-                            header.insert_header("X-RateLimit-Reset", reset_ts.to_string())?;
-                            header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                            header.insert_header("Content-Length", body.len().to_string())?;
-                            session
-                                .write_response_header(Box::new(header), false)
-                                .await?;
-                            session
-                                .write_response_body(Some(bytes::Bytes::from(body)), true)
-                                .await?;
-                            return Ok(true);
+                            return self
+                                .write_error_response(
+                                    session,
+                                    429,
+                                    &ctx.request_id,
+                                    entry.route.error_page_html.as_deref(),
+                                    "Rate limit exceeded",
+                                    &[
+                                        ("Retry-After", "1".to_string()),
+                                        ("X-RateLimit-Reset", reset_ts.to_string()),
+                                    ],
+                                )
+                                .await;
                         }
                     }
                 }
@@ -3953,24 +3890,15 @@ impl ProxyHttp for LoricaProxy {
                         }
                     }
 
-                    let host_header = extract_host(session.req_header()).to_string();
-                    let body = render_error_body(
+                    self.write_error_response(
+                        session,
                         403,
                         &ctx.request_id,
-                        &host_header,
                         entry.route.error_page_html.as_deref(),
                         "Request blocked by WAF",
-                    );
-                    let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                    header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    header.insert_header("Content-Length", body.len().to_string())?;
-                    session
-                        .write_response_header(Box::new(header), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(body)), true)
-                        .await?;
-                    Ok(true)
+                        &[],
+                    )
+                    .await
                 }
                 lorica_waf::WafVerdict::Detected(ref mut events) => {
                     for ev in events.iter_mut() {
@@ -4215,27 +4143,20 @@ impl ProxyHttp for LoricaProxy {
                                 self.persist_waf_event(ev);
                             }
                             ctx.waf_blocked = true;
-                            let host_header = extract_host(session.req_header()).to_string();
                             let custom_html = ctx
                                 .route_snapshot
                                 .as_ref()
-                                .and_then(|r| r.error_page_html.as_deref());
-                            let body_html = render_error_body(
+                                .and_then(|r| r.error_page_html.as_deref())
+                                .map(|s| s.to_string());
+                            self.write_error_response(
+                                session,
                                 403,
                                 &ctx.request_id,
-                                &host_header,
-                                custom_html,
+                                custom_html.as_deref(),
                                 "Request body blocked by WAF",
-                            );
-                            let mut header = lorica_http::ResponseHeader::build(403, None)?;
-                            header.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                            header.insert_header("Content-Length", body_html.len().to_string())?;
-                            session
-                                .write_response_header(Box::new(header), false)
-                                .await?;
-                            session
-                                .write_response_body(Some(bytes::Bytes::from(body_html)), true)
-                                .await?;
+                                &[],
+                            )
+                            .await?;
                             *body = None;
                             return Ok(());
                         }
