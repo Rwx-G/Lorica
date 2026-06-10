@@ -117,6 +117,12 @@ pub struct UpdateSettingsRequest {
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
+///
+/// Field application order matters: it matches the historical inline
+/// sequence so any future cross-field validation keeps seeing earlier
+/// assignments. Bound inconsistencies inherited from that inline era
+/// are kept on purpose (normalising them is a behaviour change) and
+/// flagged with `// NOTE: bound drift` comments for the next audit.
 pub async fn update_settings(
     Extension(state): Extension<AppState>,
     Json(body): Json<UpdateSettingsRequest>,
@@ -127,336 +133,151 @@ pub async fn update_settings(
     let settings = db_blocking(&state.store, move |store| {
         let mut settings = store.get_global_settings()?;
 
-        if let Some(port) = body.management_port {
-            settings.management_port = port;
-        }
-        if let Some(ref level) = body.log_level {
-            let valid = ["trace", "debug", "info", "warn", "error"];
-            if !valid.contains(&level.as_str()) {
-                return Err(ApiError::BadRequest(format!(
-                    "invalid log_level: {level}. Must be one of: {valid:?}"
-                )));
-            }
-            settings.log_level = level.clone();
-        }
-        if let Some(interval) = body.default_health_check_interval_s {
-            if interval < 1 {
-                return Err(ApiError::BadRequest(
-                    "default_health_check_interval_s must be >= 1".into(),
-                ));
-            }
-            settings.default_health_check_interval_s = interval;
-        }
-        if let Some(max_probes) = body.health_max_concurrent_probes {
-            if !(1..=512).contains(&max_probes) {
-                return Err(ApiError::BadRequest(
-                    "health_max_concurrent_probes must be in 1..=512".into(),
-                ));
-            }
-            settings.health_max_concurrent_probes = max_probes;
-        }
-        if let Some(days) = body.cert_warning_days {
-            if days < 1 {
-                return Err(ApiError::BadRequest(
-                    "cert_warning_days must be >= 1".into(),
-                ));
-            }
-            settings.cert_warning_days = days;
-        }
-        if let Some(days) = body.cert_critical_days {
-            if days < 1 {
-                return Err(ApiError::BadRequest(
-                    "cert_critical_days must be >= 1".into(),
-                ));
-            }
-            settings.cert_critical_days = days;
-        }
-        if let Some(max_conn) = body.max_global_connections {
-            if max_conn < 0 {
-                return Err(ApiError::BadRequest(
-                    "max_global_connections must be >= 0".into(),
-                ));
-            }
-            settings.max_global_connections = max_conn;
-        }
-        if let Some(threshold) = body.flood_threshold_rps {
-            if threshold < 0 {
-                return Err(ApiError::BadRequest(
-                    "flood_threshold_rps must be >= 0".into(),
-                ));
-            }
-            settings.flood_threshold_rps = threshold;
-        }
-        if let Some(threshold) = body.waf_ban_threshold {
-            if threshold < 0 {
-                return Err(ApiError::BadRequest(
-                    "waf_ban_threshold must be >= 0".into(),
-                ));
-            }
-            settings.waf_ban_threshold = threshold;
-        }
-        if let Some(duration) = body.waf_ban_duration_s {
-            if duration < 0 {
-                return Err(ApiError::BadRequest(
-                    "waf_ban_duration_s must be >= 0".into(),
-                ));
-            }
-            settings.waf_ban_duration_s = duration;
-        }
-        if let Some(retention) = body.access_log_retention {
-            if retention < 0 {
-                return Err(ApiError::BadRequest(
-                    "access_log_retention must be >= 0".into(),
-                ));
-            }
-            settings.access_log_retention = retention;
-        }
-        if let Some(enabled) = body.sla_purge_enabled {
-            settings.sla_purge_enabled = enabled;
-        }
-        if let Some(days) = body.sla_purge_retention_days {
-            if !(1..=3650).contains(&days) {
-                return Err(ApiError::BadRequest(
-                    "sla_purge_retention_days must be in 1..=3650 (10 years)".into(),
-                ));
-            }
-            settings.sla_purge_retention_days = days;
-        }
-        if let Some(ref schedule) = body.sla_purge_schedule {
-            let valid = matches!(schedule.as_str(), "first_of_month" | "daily")
-                || schedule.parse::<i32>().is_ok_and(|d| (1..=28).contains(&d));
-            if !valid {
-                return Err(ApiError::BadRequest(
-                    "sla_purge_schedule must be 'first_of_month', 'daily', or a day number (1-28)"
-                        .into(),
-                ));
-            }
-            settings.sla_purge_schedule = schedule.clone();
-        }
-        if let Some(presets) = body.custom_security_presets {
-            settings.custom_security_presets = presets;
-        }
-        if let Some(ref proxies) = body.trusted_proxies {
-            // Validate each entry is a valid CIDR or IP address
-            for entry in proxies {
-                let trimmed = entry.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                // Accept both bare IPs (1.2.3.4) and CIDR notation (1.2.3.0/24)
-                if trimmed.parse::<std::net::IpAddr>().is_err()
-                    && trimmed.parse::<ipnet::IpNet>().is_err()
-                {
-                    return Err(ApiError::BadRequest(format!(
-                        "invalid trusted proxy CIDR or IP: {trimmed}"
-                    )));
-                }
-            }
-            settings.trusted_proxies = proxies.clone();
-        }
-        if let Some(ref ips) = body.waf_whitelist_ips {
-            for entry in ips {
-                let trimmed = entry.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if trimmed.parse::<std::net::IpAddr>().is_err()
-                    && trimmed.parse::<ipnet::IpNet>().is_err()
-                {
-                    return Err(ApiError::BadRequest(format!(
-                        "invalid WAF whitelist CIDR or IP: {trimmed}"
-                    )));
-                }
-            }
-            settings.waf_whitelist_ips = ips.clone();
-        }
-        if let Some(ref cidrs) = body.connection_deny_cidrs {
-            validate_cidr_list(cidrs, "connection_deny_cidrs")?;
-            settings.connection_deny_cidrs = cidrs.clone();
-        }
-        if let Some(ref cidrs) = body.connection_allow_cidrs {
-            validate_cidr_list(cidrs, "connection_allow_cidrs")?;
-            settings.connection_allow_cidrs = cidrs.clone();
-        }
-        if let Some(ref endpoint) = body.otlp_endpoint {
-            let trimmed = endpoint.trim();
-            if trimmed.is_empty() {
-                settings.otlp_endpoint = None;
-            } else {
-                // Validate scheme + host to reject malformed input.
-                // RFC-1918 / loopback targets are NOT blocked because
-                // internal collectors (docker-compose, k8s sidecar) are
-                // the primary deployment pattern and the API is auth-gated.
-                let is_https = trimmed.starts_with("https://");
-                let is_http = trimmed.starts_with("http://");
-                if !is_http && !is_https {
-                    return Err(ApiError::BadRequest(
-                        "otlp_endpoint must start with http:// or https://".into(),
-                    ));
-                }
-                let after_scheme = if is_https {
-                    &trimmed[8..]
-                } else {
-                    &trimmed[7..]
-                };
-                if after_scheme.is_empty()
-                    || after_scheme.starts_with('/')
-                    || after_scheme.starts_with(':')
-                {
-                    return Err(ApiError::BadRequest(
-                        "otlp_endpoint must contain a hostname after the scheme".into(),
-                    ));
-                }
-                if trimmed.len() > 2048 {
-                    return Err(ApiError::BadRequest(
-                        "otlp_endpoint too long (> 2048 chars)".into(),
-                    ));
-                }
-                if is_http {
-                    tracing::warn!(
-                        endpoint = %trimmed,
-                        "OTLP endpoint uses plaintext HTTP; trace data \
-                         (URLs, IPs, error messages) will transit in cleartext. \
-                         Use https:// in production."
-                    );
-                }
-                settings.otlp_endpoint = Some(trimmed.to_string());
-            }
-        }
-        if let Some(ref protocol) = body.otlp_protocol {
-            let valid = ["grpc", "http-proto", "http-json"];
-            if !valid.contains(&protocol.as_str()) {
-                return Err(ApiError::BadRequest(format!(
-                    "invalid otlp_protocol: {protocol}. Must be one of: {valid:?}"
-                )));
-            }
-            settings.otlp_protocol = protocol.clone();
-        }
-        if let Some(ref name) = body.otlp_service_name {
-            let trimmed = name.trim();
-            if trimmed.is_empty() || trimmed.len() > 256 {
-                return Err(ApiError::BadRequest(
-                    "otlp_service_name must be 1-256 characters".into(),
-                ));
-            }
-            if trimmed.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
-                return Err(ApiError::BadRequest(
-                    "otlp_service_name must not contain control characters".into(),
-                ));
-            }
-            settings.otlp_service_name = trimmed.to_string();
-        }
-        if let Some(ratio) = body.otlp_sampling_ratio {
-            if !(0.0..=1.0).contains(&ratio) || !ratio.is_finite() {
-                return Err(ApiError::BadRequest(
-                    "otlp_sampling_ratio must be a finite number in 0.0..=1.0".into(),
-                ));
-            }
-            settings.otlp_sampling_ratio = ratio;
-        }
-        if let Some(ref path) = body.geoip_db_path {
-            let trimmed = path.trim();
-            if trimmed.is_empty() {
-                settings.geoip_db_path = None;
-            } else {
-                if !trimmed.starts_with('/') {
-                    return Err(ApiError::BadRequest(
-                        "geoip_db_path must be an absolute path (starting with '/')".into(),
-                    ));
-                }
-                if trimmed.len() > 4096 {
-                    return Err(ApiError::BadRequest(
-                        "geoip_db_path too long (> 4096 chars)".into(),
-                    ));
-                }
-                // Reject path traversal components. The path is operator-
-                // supplied via the authenticated API, but defence-in-depth
-                // prevents accidentally writing outside /var/lib/lorica.
-                if trimmed.contains("/../") || trimmed.ends_with("/..") {
-                    return Err(ApiError::BadRequest(
-                        "geoip_db_path must not contain path traversal (../)".into(),
-                    ));
-                }
-                settings.geoip_db_path = Some(trimmed.to_string());
-            }
-        }
-        if let Some(auto_update) = body.geoip_auto_update_enabled {
-            settings.geoip_auto_update_enabled = auto_update;
-        }
-        if let Some(ref path) = body.asn_db_path {
-            let trimmed = path.trim();
-            if trimmed.is_empty() {
-                settings.asn_db_path = None;
-            } else {
-                if !trimmed.starts_with('/') {
-                    return Err(ApiError::BadRequest(
-                        "asn_db_path must be an absolute path (starting with '/')".into(),
-                    ));
-                }
-                if trimmed.len() > 4096 {
-                    return Err(ApiError::BadRequest(
-                        "asn_db_path too long (> 4096 chars)".into(),
-                    ));
-                }
-                if trimmed.contains("/../") || trimmed.ends_with("/..") {
-                    return Err(ApiError::BadRequest(
-                        "asn_db_path must not contain path traversal (../)".into(),
-                    ));
-                }
-                settings.asn_db_path = Some(trimmed.to_string());
-            }
-        }
-        if let Some(auto_update) = body.asn_auto_update_enabled {
-            settings.asn_auto_update_enabled = auto_update;
-        }
-        if let Some(enabled) = body.cert_export_enabled {
-            settings.cert_export_enabled = enabled;
-        }
-        if let Some(ref dir) = body.cert_export_dir {
-            let trimmed = dir.trim();
-            if trimmed.is_empty() {
-                settings.cert_export_dir = None;
-            } else {
-                if !trimmed.starts_with('/') {
-                    return Err(ApiError::BadRequest(
-                        "cert_export_dir must be an absolute path (starting with '/')".into(),
-                    ));
-                }
-                if trimmed.len() > 4096 {
-                    return Err(ApiError::BadRequest(
-                        "cert_export_dir too long (> 4096 chars)".into(),
-                    ));
-                }
-                if trimmed.contains("/../") || trimmed.ends_with("/..") {
-                    return Err(ApiError::BadRequest(
-                        "cert_export_dir must not contain path traversal (../)".into(),
-                    ));
-                }
-                settings.cert_export_dir = Some(trimmed.to_string());
-            }
-        }
-        if let Some(uid) = body.cert_export_owner_uid {
-            settings.cert_export_owner_uid = Some(uid);
-        }
-        if let Some(gid) = body.cert_export_group_gid {
-            settings.cert_export_group_gid = Some(gid);
-        }
-        if let Some(mode) = body.cert_export_file_mode {
-            if mode > 0o777 {
-                return Err(ApiError::BadRequest(
-                    "cert_export_file_mode must fit in 9 permission bits (<= 0o777)".into(),
-                ));
-            }
-            settings.cert_export_file_mode = mode;
-        }
-        if let Some(mode) = body.cert_export_dir_mode {
-            if mode > 0o777 {
-                return Err(ApiError::BadRequest(
-                    "cert_export_dir_mode must fit in 9 permission bits (<= 0o777)".into(),
-                ));
-            }
-            settings.cert_export_dir_mode = mode;
-        }
+        // NOTE: bound drift - no validation; port 0 is accepted.
+        apply_plain(body.management_port, &mut settings.management_port);
+        apply_string_choice(
+            body.log_level,
+            &mut settings.log_level,
+            &["trace", "debug", "info", "warn", "error"],
+            "log_level",
+        )?;
+        // NOTE: bound drift - lower bound only, no upper cap unlike
+        // health_max_concurrent_probes.
+        apply_min_i32(
+            body.default_health_check_interval_s,
+            &mut settings.default_health_check_interval_s,
+            1,
+            "default_health_check_interval_s",
+        )?;
+        apply_ranged_i32(
+            body.health_max_concurrent_probes,
+            &mut settings.health_max_concurrent_probes,
+            1..=512,
+            "health_max_concurrent_probes must be in 1..=512",
+        )?;
+        // NOTE: bound drift - cert thresholds have no upper bound and
+        // no warning > critical cross-check.
+        apply_min_i32(
+            body.cert_warning_days,
+            &mut settings.cert_warning_days,
+            1,
+            "cert_warning_days",
+        )?;
+        apply_min_i32(
+            body.cert_critical_days,
+            &mut settings.cert_critical_days,
+            1,
+            "cert_critical_days",
+        )?;
+        apply_min_i32(
+            body.max_global_connections,
+            &mut settings.max_global_connections,
+            0,
+            "max_global_connections",
+        )?;
+        apply_min_i32(
+            body.flood_threshold_rps,
+            &mut settings.flood_threshold_rps,
+            0,
+            "flood_threshold_rps",
+        )?;
+        apply_min_i32(
+            body.waf_ban_threshold,
+            &mut settings.waf_ban_threshold,
+            0,
+            "waf_ban_threshold",
+        )?;
+        // NOTE: bound drift - 0 accepted (zero-duration ban), while the
+        // interval fields above require >= 1.
+        apply_min_i32(
+            body.waf_ban_duration_s,
+            &mut settings.waf_ban_duration_s,
+            0,
+            "waf_ban_duration_s",
+        )?;
+        apply_min_i64(
+            body.access_log_retention,
+            &mut settings.access_log_retention,
+            0,
+            "access_log_retention",
+        )?;
+        apply_plain(body.sla_purge_enabled, &mut settings.sla_purge_enabled);
+        apply_ranged_i32(
+            body.sla_purge_retention_days,
+            &mut settings.sla_purge_retention_days,
+            1..=3650,
+            "sla_purge_retention_days must be in 1..=3650 (10 years)",
+        )?;
+        apply_sla_purge_schedule(body.sla_purge_schedule, &mut settings.sla_purge_schedule)?;
+        apply_plain(
+            body.custom_security_presets,
+            &mut settings.custom_security_presets,
+        );
+        apply_cidr_list(
+            body.trusted_proxies,
+            &mut settings.trusted_proxies,
+            "trusted proxy",
+        )?;
+        apply_cidr_list(
+            body.waf_whitelist_ips,
+            &mut settings.waf_whitelist_ips,
+            "WAF whitelist",
+        )?;
+        apply_cidr_list(
+            body.connection_deny_cidrs,
+            &mut settings.connection_deny_cidrs,
+            "connection_deny_cidrs",
+        )?;
+        apply_cidr_list(
+            body.connection_allow_cidrs,
+            &mut settings.connection_allow_cidrs,
+            "connection_allow_cidrs",
+        )?;
+        apply_otlp_endpoint(body.otlp_endpoint, &mut settings.otlp_endpoint)?;
+        apply_string_choice(
+            body.otlp_protocol,
+            &mut settings.otlp_protocol,
+            &["grpc", "http-proto", "http-json"],
+            "otlp_protocol",
+        )?;
+        apply_otlp_service_name(body.otlp_service_name, &mut settings.otlp_service_name)?;
+        apply_otlp_sampling_ratio(body.otlp_sampling_ratio, &mut settings.otlp_sampling_ratio)?;
+        apply_optional_abs_path(body.geoip_db_path, &mut settings.geoip_db_path, "geoip_db_path")?;
+        apply_plain(
+            body.geoip_auto_update_enabled,
+            &mut settings.geoip_auto_update_enabled,
+        );
+        apply_optional_abs_path(body.asn_db_path, &mut settings.asn_db_path, "asn_db_path")?;
+        apply_plain(
+            body.asn_auto_update_enabled,
+            &mut settings.asn_auto_update_enabled,
+        );
+        apply_plain(body.cert_export_enabled, &mut settings.cert_export_enabled);
+        apply_optional_abs_path(
+            body.cert_export_dir,
+            &mut settings.cert_export_dir,
+            "cert_export_dir",
+        )?;
+        // NOTE: bound drift - uid/gid persisted without any range or
+        // existence check.
+        apply_plain(
+            body.cert_export_owner_uid.map(Some),
+            &mut settings.cert_export_owner_uid,
+        );
+        apply_plain(
+            body.cert_export_group_gid.map(Some),
+            &mut settings.cert_export_group_gid,
+        );
+        apply_mode_u32(
+            body.cert_export_file_mode,
+            &mut settings.cert_export_file_mode,
+            "cert_export_file_mode",
+        )?;
+        apply_mode_u32(
+            body.cert_export_dir_mode,
+            &mut settings.cert_export_dir_mode,
+            "cert_export_dir_mode",
+        )?;
 
         store.update_global_settings(&settings)?;
         Ok::<_, ApiError>(settings)
@@ -464,6 +285,272 @@ pub async fn update_settings(
     .await?;
     state.notify_config_changed();
     Ok(json_data(settings))
+}
+
+// ---- update_settings field-application helpers ----
+//
+// Each helper implements one shape of the historical inline
+// `if let Some(x) = body.x { <check>; settings.x = x; }` blocks.
+// `None` always means "field absent from the PATCH body, leave the
+// stored value untouched". Error messages are byte-identical to the
+// pre-refactor inline strings; several are pinned by integration
+// tests in `tests.rs`.
+
+/// Assign `value` to `target` when present. No validation.
+fn apply_plain<T>(value: Option<T>, target: &mut T) {
+    if let Some(v) = value {
+        *target = v;
+    }
+}
+
+/// Assign an `i32` field when present, rejecting values below `min`
+/// with `400 "<label> must be >= <min>"`.
+fn apply_min_i32(
+    value: Option<i32>,
+    target: &mut i32,
+    min: i32,
+    label: &str,
+) -> Result<(), ApiError> {
+    if let Some(v) = value {
+        if v < min {
+            return Err(ApiError::BadRequest(format!("{label} must be >= {min}")));
+        }
+        *target = v;
+    }
+    Ok(())
+}
+
+/// `i64` variant of [`apply_min_i32`].
+fn apply_min_i64(
+    value: Option<i64>,
+    target: &mut i64,
+    min: i64,
+    label: &str,
+) -> Result<(), ApiError> {
+    if let Some(v) = value {
+        if v < min {
+            return Err(ApiError::BadRequest(format!("{label} must be >= {min}")));
+        }
+        *target = v;
+    }
+    Ok(())
+}
+
+/// Assign an `i32` field when present, rejecting values outside
+/// `range` with `400` and the caller-supplied `error_msg`. The full
+/// message is passed in (rather than built from a label) because the
+/// historical strings carry field-specific suffixes, e.g.
+/// `"(10 years)"`.
+fn apply_ranged_i32(
+    value: Option<i32>,
+    target: &mut i32,
+    range: std::ops::RangeInclusive<i32>,
+    error_msg: &str,
+) -> Result<(), ApiError> {
+    if let Some(v) = value {
+        if !range.contains(&v) {
+            return Err(ApiError::BadRequest(error_msg.to_string()));
+        }
+        *target = v;
+    }
+    Ok(())
+}
+
+/// Assign a string field when present, rejecting values not in
+/// `valid` with `400 "invalid <label>: <value>. Must be one of:
+/// <valid:?>"`.
+fn apply_string_choice(
+    value: Option<String>,
+    target: &mut String,
+    valid: &[&str],
+    label: &str,
+) -> Result<(), ApiError> {
+    if let Some(v) = value {
+        if !valid.contains(&v.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "invalid {label}: {v}. Must be one of: {valid:?}"
+            )));
+        }
+        *target = v;
+    }
+    Ok(())
+}
+
+/// Assign a CIDR/IP list field when present. Every non-empty entry
+/// must parse as a bare IP (1.2.3.4) or CIDR (1.2.3.0/24); the first
+/// invalid entry yields `400 "invalid <label> CIDR or IP: <entry>"`.
+fn apply_cidr_list(
+    value: Option<Vec<String>>,
+    target: &mut Vec<String>,
+    label: &str,
+) -> Result<(), ApiError> {
+    if let Some(cidrs) = value {
+        validate_cidr_list(&cidrs, label)?;
+        *target = cidrs;
+    }
+    Ok(())
+}
+
+/// Assign a Unix permission mode field when present, rejecting values
+/// above `0o777` with `400 "<label> must fit in 9 permission bits
+/// (<= 0o777)"`.
+fn apply_mode_u32(value: Option<u32>, target: &mut u32, label: &str) -> Result<(), ApiError> {
+    if let Some(mode) = value {
+        if mode > 0o777 {
+            return Err(ApiError::BadRequest(format!(
+                "{label} must fit in 9 permission bits (<= 0o777)"
+            )));
+        }
+        *target = mode;
+    }
+    Ok(())
+}
+
+/// Assign an optional absolute-filesystem-path field when present.
+/// An empty (after trim) value clears the field to `None`; otherwise
+/// the path must start with `/`, be at most 4096 chars, and contain
+/// no `..` traversal component.
+fn apply_optional_abs_path(
+    value: Option<String>,
+    target: &mut Option<String>,
+    label: &str,
+) -> Result<(), ApiError> {
+    let Some(path) = value else {
+        return Ok(());
+    };
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        *target = None;
+        return Ok(());
+    }
+    if !trimmed.starts_with('/') {
+        return Err(ApiError::BadRequest(format!(
+            "{label} must be an absolute path (starting with '/')"
+        )));
+    }
+    if trimmed.len() > 4096 {
+        return Err(ApiError::BadRequest(format!(
+            "{label} too long (> 4096 chars)"
+        )));
+    }
+    // Reject path traversal components. The path is operator-
+    // supplied via the authenticated API, but defence-in-depth
+    // prevents accidentally writing outside /var/lib/lorica.
+    if trimmed.contains("/../") || trimmed.ends_with("/..") {
+        return Err(ApiError::BadRequest(format!(
+            "{label} must not contain path traversal (../)"
+        )));
+    }
+    *target = Some(trimmed.to_string());
+    Ok(())
+}
+
+/// Assign `sla_purge_schedule` when present. Accepts
+/// `"first_of_month"`, `"daily"`, or a day number `1..=28`.
+fn apply_sla_purge_schedule(value: Option<String>, target: &mut String) -> Result<(), ApiError> {
+    let Some(schedule) = value else {
+        return Ok(());
+    };
+    let valid = matches!(schedule.as_str(), "first_of_month" | "daily")
+        || schedule.parse::<i32>().is_ok_and(|d| (1..=28).contains(&d));
+    if !valid {
+        return Err(ApiError::BadRequest(
+            "sla_purge_schedule must be 'first_of_month', 'daily', or a day number (1-28)".into(),
+        ));
+    }
+    *target = schedule;
+    Ok(())
+}
+
+/// Assign `otlp_endpoint` when present. An empty (after trim) value
+/// clears the field to `None`; otherwise the URL must carry an
+/// `http://` / `https://` scheme, a hostname, and at most 2048
+/// chars. A plaintext `http://` endpoint is accepted but logged at
+/// `warn` level (side effect kept from the inline block).
+fn apply_otlp_endpoint(
+    value: Option<String>,
+    target: &mut Option<String>,
+) -> Result<(), ApiError> {
+    let Some(endpoint) = value else {
+        return Ok(());
+    };
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        *target = None;
+        return Ok(());
+    }
+    // Validate scheme + host to reject malformed input.
+    // RFC-1918 / loopback targets are NOT blocked because
+    // internal collectors (docker-compose, k8s sidecar) are
+    // the primary deployment pattern and the API is auth-gated.
+    let is_https = trimmed.starts_with("https://");
+    let is_http = trimmed.starts_with("http://");
+    if !is_http && !is_https {
+        return Err(ApiError::BadRequest(
+            "otlp_endpoint must start with http:// or https://".into(),
+        ));
+    }
+    let after_scheme = if is_https {
+        &trimmed[8..]
+    } else {
+        &trimmed[7..]
+    };
+    if after_scheme.is_empty() || after_scheme.starts_with('/') || after_scheme.starts_with(':') {
+        return Err(ApiError::BadRequest(
+            "otlp_endpoint must contain a hostname after the scheme".into(),
+        ));
+    }
+    if trimmed.len() > 2048 {
+        return Err(ApiError::BadRequest(
+            "otlp_endpoint too long (> 2048 chars)".into(),
+        ));
+    }
+    if is_http {
+        tracing::warn!(
+            endpoint = %trimmed,
+            "OTLP endpoint uses plaintext HTTP; trace data \
+             (URLs, IPs, error messages) will transit in cleartext. \
+             Use https:// in production."
+        );
+    }
+    *target = Some(trimmed.to_string());
+    Ok(())
+}
+
+/// Assign `otlp_service_name` when present. The trimmed value must be
+/// 1-256 chars and free of ASCII control characters (including DEL).
+fn apply_otlp_service_name(value: Option<String>, target: &mut String) -> Result<(), ApiError> {
+    let Some(name) = value else {
+        return Ok(());
+    };
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 {
+        return Err(ApiError::BadRequest(
+            "otlp_service_name must be 1-256 characters".into(),
+        ));
+    }
+    if trimmed.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
+        return Err(ApiError::BadRequest(
+            "otlp_service_name must not contain control characters".into(),
+        ));
+    }
+    *target = trimmed.to_string();
+    Ok(())
+}
+
+/// Assign `otlp_sampling_ratio` when present. The value must be a
+/// finite number in `0.0..=1.0` (NaN and infinities rejected).
+fn apply_otlp_sampling_ratio(value: Option<f64>, target: &mut f64) -> Result<(), ApiError> {
+    let Some(ratio) = value else {
+        return Ok(());
+    };
+    if !(0.0..=1.0).contains(&ratio) || !ratio.is_finite() {
+        return Err(ApiError::BadRequest(
+            "otlp_sampling_ratio must be a finite number in 0.0..=1.0".into(),
+        ));
+    }
+    *target = ratio;
+    Ok(())
 }
 
 /// POST /api/v1/settings/otel/test - probe the currently-persisted
