@@ -1,0 +1,456 @@
+// Copyright 2026 Rwx-G (Lorica)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Shared startup helpers for the three process modes (audit H-9).
+//!
+//! `run_supervisor`, `run_worker`, and `run_single_process` used to
+//! duplicate several background-task clusters inline. The v1.5.2
+//! worker-mode cert-hotswap bug came from exactly that duplication: a
+//! spawn added to one mode was missed in another. Every helper in this
+//! module is the single source of truth for one such cluster;
+//! mode-specific differences are explicit parameters, never copies.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+use chrono::Datelike;
+use lorica_api::middleware::auth::SessionStore;
+use lorica_api::middleware::rate_limit::RateLimiter;
+use lorica_api::server::AppState;
+use lorica_config::ConfigStore;
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
+
+use lorica::proxy_wiring::{BackendConnections, ProxyConfig};
+
+/// Handles produced by [`start_alerting_stack`] that the calling mode
+/// still needs after the shared spawns are done.
+pub(crate) struct AlertingStack {
+    /// Dispatcher behind a mutex so the supervisor's config-reload
+    /// task can rebuild it when notification channels change.
+    pub(crate) notify_dispatcher: Arc<Mutex<lorica_notify::NotifyDispatcher>>,
+    /// Shared notification history ring, captured before the
+    /// dispatcher is wrapped. Single-process mode hands it straight to
+    /// `AppState`; supervisor mode re-reads it via
+    /// `notify_dispatcher.lock().await.history()` at AppState build.
+    pub(crate) notification_history:
+        Arc<parking_lot::Mutex<VecDeque<lorica_notify::AlertEvent>>>,
+    /// Active probe scheduler, already loaded via `reload()`.
+    pub(crate) probe_scheduler: Arc<lorica_bench::ProbeScheduler>,
+    /// SLA collector with its flush task already started.
+    pub(crate) sla_collector: Arc<lorica_bench::SlaCollector>,
+}
+
+/// Start the alerting + probing + SLA cluster shared by supervisor and
+/// single-process modes (audit H-9 dedup).
+///
+/// Covers: notification dispatcher built from DB configs, the
+/// persisted alert-dispatcher bridge, the active probe scheduler
+/// (with its initial `reload()`), and the SLA collector with its
+/// flush task.
+///
+/// The `AlertSender` is created at the call site, not here: the
+/// supervisor needs it well before this cluster runs (the health-check
+/// loop and the WAF UDS listener both clone it first). Single-process
+/// mode additionally starts the load-test scheduler right after this
+/// cluster; that stays at its single call site.
+///
+/// Mode notes:
+/// - Before extraction the supervisor created the probe scheduler
+///   before the SLA collector and single-process mode did the reverse.
+///   The two are independent (no shared state besides the store mutex,
+///   locked at distinct points), so this helper fixes one order:
+///   probe scheduler first, then SLA collector.
+/// - The alert-dispatcher `JoinHandle` was discarded at both original
+///   call sites (`let _alert_dispatcher = ...`), so it is dropped
+///   here; dropping a `JoinHandle` detaches the task.
+pub(crate) async fn start_alerting_stack(
+    store: &Arc<Mutex<ConfigStore>>,
+    alert_sender: &lorica_notify::AlertSender,
+    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+) -> AlertingStack {
+    // Create notification dispatcher from DB configs
+    let notify_dispatcher = {
+        let s = store.lock().await;
+        build_notify_dispatcher(&s)
+    };
+    let notification_history = notify_dispatcher.history();
+    let notify_dispatcher = Arc::new(Mutex::new(notify_dispatcher));
+
+    // Bridge: alert_sender (broadcast) -> NotifyDispatcher (async dispatch) + DB persistence
+    let _alert_dispatcher =
+        spawn_persisted_alert_dispatcher(alert_sender, Arc::clone(&notify_dispatcher), log_store);
+
+    // Start active probe scheduler
+    let probe_store = Arc::clone(store);
+    let probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
+        probe_store,
+        Some(Arc::clone(&notify_dispatcher)),
+    ));
+    probe_scheduler.reload().await;
+
+    // Create SLA collector and start background flush task
+    let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
+    {
+        let s = store.lock().await;
+        sla_collector.load_configs(&s);
+    }
+    sla_collector.start_flush_task(Arc::clone(store), Some(Arc::clone(&notify_dispatcher)));
+
+    AlertingStack {
+        notify_dispatcher,
+        notification_history,
+        probe_scheduler,
+        sla_collector,
+    }
+}
+
+/// Run the shared API-server tail: session store, ACME auto-renewal,
+/// cert-expiry notifier, then the blocking `start_server` loop
+/// (audit H-9 dedup).
+///
+/// The mode-specific `AppState` is built at the call site, inside the
+/// `tokio::spawn` that owns `api_handle` (aborted at shutdown in both
+/// modes); everything after the state exists is identical across
+/// supervisor and single-process modes and lives here. The ACME
+/// renewal + cert-expiry spawns are the exact pair whose absence in
+/// worker mode caused the v1.5.2 cert-hotswap bug; keeping them in one
+/// place prevents the modes from drifting again.
+///
+/// Mode notes:
+/// - Before extraction the supervisor built the session store before
+///   spawning the ACME tasks and single-process mode did the reverse.
+///   The steps are independent until `start_server`, so this helper
+///   fixes one order: session store + rate limiter first.
+/// - Renewal checks every 12 h and renews at 30 days before expiry;
+///   the expiry notifier also runs every 12 h. Both alert through
+///   `alert_sender`.
+pub(crate) async fn run_api_server(
+    management_port: u16,
+    state: AppState,
+    alert_sender: lorica_notify::AlertSender,
+) {
+    let session_store = SessionStore::new(Arc::clone(&state.store))
+        .await
+        .with_task_tracker(state.task_tracker.clone());
+    let rate_limiter = RateLimiter::new();
+
+    let _acme_renewal = lorica_api::acme::spawn_renewal_task(
+        state.clone(),
+        std::time::Duration::from_secs(12 * 3600),
+        30,
+        Some(alert_sender.clone()),
+    );
+    let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
+        state.clone(),
+        std::time::Duration::from_secs(12 * 3600),
+        alert_sender,
+    );
+
+    if let Err(e) =
+        lorica_api::server::start_server(management_port, state, session_store, rate_limiter).await
+    {
+        error!(error = %e, "API server exited with error");
+    }
+}
+
+/// Spawn the hourly retention loop shared by supervisor and
+/// single-process modes (audit H-9 dedup): access-log retention, probe
+/// result purge (keep 1000), WAF event retention (keep 100 000), and
+/// the daily SLA bucket purge.
+///
+/// No-op when the access-log store failed to open (`log_store` is
+/// `None`), exactly like the original `if let Some(...)` guard at both
+/// call sites. The `JoinHandle` was discarded at both original call
+/// sites, so it is not returned. Must be called from within a tokio
+/// runtime context.
+pub(crate) fn spawn_retention_loop(
+    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    config_store: Arc<Mutex<ConfigStore>>,
+) {
+    let Some(retention_log_store) = log_store else {
+        return;
+    };
+    let retention_config_store = config_store;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        let mut last_sla_purge_day: u32 = 0;
+        loop {
+            interval.tick().await;
+            let retention = {
+                let s = retention_config_store.lock().await;
+                s.get_global_settings()
+                    .map(|gs| gs.access_log_retention)
+                    .unwrap_or(100_000)
+            };
+            if retention > 0 {
+                if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
+                    tracing::warn!(error = %e, "access log retention cleanup failed");
+                }
+            }
+            {
+                let s = retention_config_store.lock().await;
+                if let Err(e) = s.purge_probe_results(1000) {
+                    tracing::warn!(error = %e, "probe result retention cleanup failed");
+                }
+            }
+            if let Err(e) = retention_log_store.enforce_waf_retention(100_000) {
+                tracing::warn!(error = %e, "WAF event retention cleanup failed");
+            }
+            last_sla_purge_day =
+                run_sla_purge(&retention_config_store, last_sla_purge_day).await;
+        }
+    });
+}
+
+/// Spawn the backend health-check loop (audit H-9 dedup).
+///
+/// Reads `default_health_check_interval_s` from `GlobalSettings`
+/// (default 10 s) and spawns `health::health_check_loop`.
+///
+/// Mode differences are explicit parameters:
+/// - `backend_connections`: `Some` in single-process mode (direct
+///   drain monitoring); `None` in supervisor mode where drain
+///   monitoring is per-worker.
+/// - `config_reload_tx`: `Some` in supervisor mode so a health-status
+///   flip triggers a worker config reload; `None` in single-process
+///   mode (no workers to notify).
+///
+/// Returns the `JoinHandle` so the caller can abort it at shutdown
+/// (both modes keep it bound as `health_handle`).
+pub(crate) async fn spawn_health_check_loop(
+    store: &Arc<Mutex<ConfigStore>>,
+    proxy_config: &Arc<ArcSwap<ProxyConfig>>,
+    backend_connections: Option<Arc<BackendConnections>>,
+    alert_sender: lorica_notify::AlertSender,
+    config_reload_tx: Option<tokio::sync::broadcast::Sender<u64>>,
+) -> tokio::task::JoinHandle<()> {
+    let health_store = Arc::clone(store);
+    let health_config = Arc::clone(proxy_config);
+    let health_interval = {
+        let s = store.lock().await;
+        s.get_global_settings()
+            .map(|gs| gs.default_health_check_interval_s as u64)
+            .unwrap_or(10)
+    };
+    tokio::spawn(async move {
+        crate::health::health_check_loop(
+            health_store,
+            health_config,
+            health_interval,
+            backend_connections,
+            Some(alert_sender),
+            config_reload_tx,
+        )
+        .await;
+    })
+}
+
+/// Register the process-wide GeoIP / ASN resolver handles, and
+/// optionally the rDNS resolver (audit H-9 dedup; all three process
+/// modes call this).
+///
+/// `rdns_log_prefix` controls the rDNS half:
+/// - `None` (supervisor): skip rDNS entirely - the supervisor never
+///   evaluates bot-protection bypasses, it only keeps the on-disk
+///   `.mmdb` files fresh.
+/// - `Some(prefix)` (worker passes `"worker: "`, single-process passes
+///   `""`): build the resolver from the system resolv.conf and
+///   register it. The prefix keeps the original per-mode log lines
+///   byte-identical.
+///
+/// Synchronous on purpose: `RdnsResolver::from_system_conf` latches
+/// onto the *current* tokio runtime at construction, so worker mode
+/// calls this from inside an `rt.enter()` guard (no async context
+/// exists there). A failure to build the rDNS resolver is non-fatal -
+/// it just disables the `bot_protection.bypass.rdns` category for this
+/// process (other bot-protection categories keep working).
+pub(crate) fn init_geo_resolver_handles(
+    geoip: &Arc<lorica_geoip::GeoIpResolver>,
+    asn: &Arc<lorica_geoip::AsnResolver>,
+    rdns_log_prefix: Option<&str>,
+) {
+    lorica::geoip::set_handle(Arc::clone(geoip));
+    lorica::geoip::set_asn_handle(Arc::clone(asn));
+    let Some(prefix) = rdns_log_prefix else {
+        return;
+    };
+    match lorica::bot_rdns::RdnsResolver::from_system_conf() {
+        Ok(r) => {
+            lorica::bot_rdns::set_handle(Arc::new(r));
+            info!("{prefix}rDNS resolver initialised from system resolv.conf");
+        }
+        Err(e) => warn!(
+            error = %e,
+            "{prefix}rDNS resolver init failed; bot_protection.bypass.rdns will be a silent no-op"
+        ),
+    }
+}
+
+/// Run the SLA data purge if enabled and the schedule matches today.
+/// Returns the day-of-month on which the last purge ran (used as guard to run once per day).
+async fn run_sla_purge(store: &Arc<Mutex<ConfigStore>>, last_purge_day: u32) -> u32 {
+    let today = chrono::Utc::now().day();
+    if today == last_purge_day {
+        return last_purge_day;
+    }
+    let s = store.lock().await;
+    let gs = match s.get_global_settings() {
+        Ok(gs) => gs,
+        Err(_) => return last_purge_day,
+    };
+    if !gs.sla_purge_enabled {
+        return last_purge_day;
+    }
+    let should_run = match gs.sla_purge_schedule.as_str() {
+        "daily" => true,
+        "first_of_month" => today == 1,
+        other => other.parse::<u32>().is_ok_and(|d| d == today),
+    };
+    if !should_run {
+        return last_purge_day;
+    }
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(gs.sla_purge_retention_days as i64);
+    match s.prune_sla_buckets(&cutoff) {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                count = n,
+                retention_days = gs.sla_purge_retention_days,
+                "purged old SLA buckets"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "SLA purge failed");
+        }
+        _ => {}
+    }
+    today
+}
+
+/// Spawn alert dispatcher that also persists events to the log store (SQLite).
+fn spawn_persisted_alert_dispatcher(
+    alert_sender: &lorica_notify::AlertSender,
+    dispatcher: Arc<Mutex<lorica_notify::NotifyDispatcher>>,
+    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = alert_sender.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    // Dispatch via channels (email, webhook, etc.)
+                    let d = dispatcher.lock().await;
+                    d.dispatch(&event).await;
+                    drop(d);
+
+                    // Persist to log store. Both calls are sync rusqlite under
+                    // `parking_lot::Mutex<Connection>` ; running them inline
+                    // would block the alert dispatcher's async reactor (audit
+                    // H-7). Off-load both to one `spawn_blocking` so the
+                    // mutex acquisition + the SELECT COUNT(*) + DELETE pair
+                    // happen on the blocking pool, and surface retention
+                    // failures via the existing notifier-events-dropped metric
+                    // (was a silent `let _ = ...` swallow that left the table
+                    // unbounded if DELETE ever failed).
+                    if let Some(ref store) = log_store {
+                        let store = Arc::clone(store);
+                        let event_for_blocking = event.clone();
+                        let blocking_outcome = tokio::task::spawn_blocking(move || {
+                            let insert = store.insert_notification_event(&event_for_blocking);
+                            let retention = store.enforce_notification_retention(500);
+                            (insert, retention)
+                        })
+                        .await;
+                        match blocking_outcome {
+                            Ok((insert, retention)) => {
+                                if let Err(e) = insert {
+                                    tracing::warn!(error = %e, "failed to persist notification event");
+                                    lorica_api::metrics::inc_notifier_events_dropped(
+                                        "persist_failed",
+                                        1,
+                                    );
+                                }
+                                if let Err(e) = retention {
+                                    tracing::warn!(error = %e, "notification retention enforcement failed");
+                                    lorica_api::metrics::inc_notifier_events_dropped(
+                                        "retention_failed",
+                                        1,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "notification persistence task join failed");
+                                lorica_api::metrics::inc_notifier_events_dropped("join_failed", 1);
+                            }
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        dropped = n,
+                        "alert dispatcher lagged, some notifications were dropped"
+                    );
+                    lorica_api::metrics::inc_notifier_events_dropped("lag", n);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    lorica_api::metrics::inc_notifier_events_dropped("closed", 1);
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Build a NotifyDispatcher from database notification configs.
+pub(crate) fn build_notify_dispatcher(
+    store: &lorica_config::ConfigStore,
+) -> lorica_notify::NotifyDispatcher {
+    let mut dispatcher = lorica_notify::NotifyDispatcher::new();
+    if let Ok(configs) = store.list_notification_configs() {
+        for nc in configs {
+            let config_json = &nc.config;
+            match nc.channel {
+                lorica_config::models::NotificationChannel::Email => {
+                    if let Ok(email_cfg) =
+                        serde_json::from_str::<lorica_notify::channels::EmailConfig>(config_json)
+                    {
+                        dispatcher.add_email_channel(nc.id, email_cfg, nc.alert_types, nc.enabled);
+                    }
+                }
+                lorica_config::models::NotificationChannel::Webhook => {
+                    if let Ok(webhook_cfg) =
+                        serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
+                    {
+                        dispatcher.add_webhook_channel(
+                            nc.id,
+                            webhook_cfg,
+                            nc.alert_types,
+                            nc.enabled,
+                        );
+                    }
+                }
+                lorica_config::models::NotificationChannel::Slack => {
+                    if let Ok(slack_cfg) =
+                        serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
+                    {
+                        dispatcher.add_slack_channel(nc.id, slack_cfg, nc.alert_types, nc.enabled);
+                    }
+                }
+            }
+        }
+    }
+    dispatcher
+}

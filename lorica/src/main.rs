@@ -13,17 +13,15 @@
 // limitations under the License.
 
 mod health;
+mod startup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use chrono::Datelike;
 use clap::{Parser, Subcommand};
 use lorica_api::logs::LogBuffer;
-use lorica_api::middleware::auth::SessionStore;
-use lorica_api::middleware::rate_limit::RateLimiter;
 use lorica_api::server::AppState;
 use lorica_api::system::SystemCache;
 use lorica_config::ConfigStore;
@@ -629,8 +627,11 @@ fn run_supervisor(cli: Cli) {
         // two can never drift.
         let supervisor_geoip = std::sync::Arc::new(lorica_geoip::GeoIpResolver::empty());
         let supervisor_asn = std::sync::Arc::new(lorica_geoip::AsnResolver::empty());
-        lorica::geoip::set_handle(std::sync::Arc::clone(&supervisor_geoip));
-        lorica::geoip::set_asn_handle(std::sync::Arc::clone(&supervisor_asn));
+        // Handle registration shared with worker / single-process
+        // modes (audit H-9, see `startup::init_geo_resolver_handles`).
+        // No rDNS in the supervisor: it never evaluates
+        // bot-protection bypasses.
+        startup::init_geo_resolver_handles(&supervisor_geoip, &supervisor_asn, None);
         // `apply_supervisor_settings_from_store` boot call happens
         // below, AFTER `register_supervisor_reload_trigger`, so the
         // "is_supervisor" guard in `apply_auto_update_flip` sees the
@@ -1142,21 +1143,18 @@ fn run_supervisor(cli: Cli) {
         // Create non-blocking alert sender (broadcast channel for proxy/health/acme -> dispatcher)
         let alert_sender = lorica_notify::AlertSender::new(256);
 
-        // Start health check background task (runs in supervisor, not workers)
-        let health_alert_sender = alert_sender.clone();
-        let health_store = Arc::clone(&store);
-        let health_config = Arc::clone(&proxy_config);
-        let health_reload_tx = reload_bc_tx.clone();
-        let health_interval = {
-            let s = store.lock().await;
-            s.get_global_settings()
-                .map(|gs| gs.default_health_check_interval_s as u64)
-                .unwrap_or(10)
-        };
-        let health_handle = tokio::spawn(async move {
-            // No backend_connections in supervisor - drain monitoring is per-worker
-            health::health_check_loop(health_store, health_config, health_interval, None, Some(health_alert_sender), Some(health_reload_tx)).await;
-        });
+        // Start health check background task (runs in supervisor, not
+        // workers). No backend_connections in supervisor - drain
+        // monitoring is per-worker. Spawn shared with single-process
+        // mode (audit H-9, see `startup::spawn_health_check_loop`).
+        let health_handle = startup::spawn_health_check_loop(
+            &store,
+            &proxy_config,
+            None,
+            alert_sender.clone(),
+            Some(reload_bc_tx.clone()),
+        )
+        .await;
 
         // Create WAF engine in supervisor for API access (rules listing,
         // blocklist toggle, events). Workers have their own engines for
@@ -1347,35 +1345,17 @@ fn run_supervisor(cli: Cli) {
             &task_tracker,
         );
 
-        // Create notification dispatcher from DB configs
-        let notify_dispatcher = {
-            let s = store.lock().await;
-            build_notify_dispatcher(&s)
-        };
-        let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
-
-        // Bridge: alert_sender (broadcast) -> NotifyDispatcher (async dispatch) + DB persistence
-        let _alert_dispatcher = spawn_persisted_alert_dispatcher(
-            &alert_sender,
-            Arc::clone(&notify_dispatcher),
-            log_store.clone(),
-        );
-
-        // Bug 2 fix: Start probe scheduler in supervisor mode
-        let probe_store = Arc::clone(&store);
-        let probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
-            probe_store,
-            Some(Arc::clone(&notify_dispatcher)),
-        ));
-        probe_scheduler.reload().await;
-
-        // Bug 4 fix: Create SLA collector in supervisor and start flush task
-        let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
-        {
-            let s = store.lock().await;
-            sla_collector.load_configs(&s);
-        }
-        sla_collector.start_flush_task(Arc::clone(&store), Some(Arc::clone(&notify_dispatcher)));
+        // Notification dispatcher + alert bridge + probe scheduler +
+        // SLA collector cluster, shared with single-process mode
+        // (audit H-9, see `startup::start_alerting_stack`). The
+        // notification history is re-read from the dispatcher at
+        // AppState build below, so the handle is discarded here.
+        let startup::AlertingStack {
+            notify_dispatcher,
+            notification_history: _,
+            probe_scheduler,
+            sla_collector,
+        } = startup::start_alerting_stack(&store, &alert_sender, log_store.clone()).await;
 
         // Reload proxy config, probe scheduler, SLA configs, and notification dispatcher on config changes
         let reload_store = Arc::clone(&store);
@@ -1394,7 +1374,7 @@ fn run_supervisor(cli: Cli) {
                     let s = reload_store.lock().await;
                     reload_sla_collector.load_configs(&s);
                     // Rebuild notification dispatcher with updated channel configs
-                    let new_dispatcher = build_notify_dispatcher(&s);
+                    let new_dispatcher = startup::build_notify_dispatcher(&s);
                     let mut d = reload_notify_dispatcher.lock().await;
                     *d = new_dispatcher;
                 }
@@ -1437,11 +1417,11 @@ fn run_supervisor(cli: Cli) {
         let api_task_tracker = task_tracker.clone();
         let shutdown_task_tracker = task_tracker.clone();
         // Clone the alert sender so the ACME renewal + cert-expiry
-        // background tasks spawned inside the API block can surface
+        // background tasks spawned inside the API tail can surface
         // alerts through the same dispatcher the health / WAF paths
-        // already use. Single-process mode mirrors this at the matching
-        // spawn site further down (v1.5.2 fix: worker mode was missing
-        // auto-renewal entirely).
+        // already use. The tail itself is shared with single-process
+        // mode (audit H-9, see `startup::run_api_server`; v1.5.2 fix:
+        // worker mode was missing auto-renewal entirely).
         let api_alert_sender = alert_sender.clone();
         let api_handle = tokio::spawn(async move {
             let state = AppState {
@@ -1478,69 +1458,17 @@ fn run_supervisor(cli: Cli) {
                 log_store: api_log_store,
                 task_tracker: api_task_tracker,
             };
-            let session_store = SessionStore::new(Arc::clone(&state.store))
-                .await
-                .with_task_tracker(state.task_tracker.clone());
-            let rate_limiter = RateLimiter::new();
-
-            // Spawn ACME auto-renewal (check every 12h, renew at 30 days
-            // before expiry) and cert-expiry notifier for worker mode.
-            // Previously these tasks lived only in the single-process
-            // branch, so worker-mode installs went through cert expiry
-            // without warnings and never auto-renewed (v1.5.2 fix).
-            let _acme_renewal = lorica_api::acme::spawn_renewal_task(
-                state.clone(),
-                std::time::Duration::from_secs(12 * 3600),
-                30,
-                Some(api_alert_sender.clone()),
-            );
-            let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
-                state.clone(),
-                std::time::Duration::from_secs(12 * 3600),
-                api_alert_sender,
-            );
-
-            if let Err(e) =
-                lorica_api::server::start_server(management_port, state, session_store, rate_limiter)
-                    .await
-            {
-                error!(error = %e, "API server exited with error");
-            }
+            // Session store + ACME auto-renewal + cert-expiry notifier
+            // + server loop, shared with single-process mode (audit
+            // H-9, see `startup::run_api_server`).
+            startup::run_api_server(management_port, state, api_alert_sender).await;
         });
 
-        if let Some(ref retention_store) = log_store {
-            let retention_log_store = Arc::clone(retention_store);
-            let retention_config_store = Arc::clone(&store);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(3600));
-                let mut last_sla_purge_day: u32 = 0;
-                loop {
-                    interval.tick().await;
-                    let retention = {
-                        let s = retention_config_store.lock().await;
-                        s.get_global_settings()
-                            .map(|gs| gs.access_log_retention)
-                            .unwrap_or(100_000)
-                    };
-                    if retention > 0 {
-                        if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
-                            tracing::warn!(error = %e, "access log retention cleanup failed");
-                        }
-                    }
-                    {
-                        let s = retention_config_store.lock().await;
-                        if let Err(e) = s.purge_probe_results(1000) {
-                            tracing::warn!(error = %e, "probe result retention cleanup failed");
-                        }
-                    }
-                    if let Err(e) = retention_log_store.enforce_waf_retention(100_000) {
-                        tracing::warn!(error = %e, "WAF event retention cleanup failed");
-                    }
-                    last_sla_purge_day =
-                        run_sla_purge(&retention_config_store, last_sla_purge_day).await;
-                }
-            });
-        }
+        // Hourly retention loop (access logs, probe results, WAF
+        // events, SLA buckets), shared across modes (audit H-9, see
+        // `startup::spawn_retention_loop`). No-op when the access-log
+        // store failed to open.
+        startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
 
         // Worker monitoring loop (crash detection and restart with backoff)
         let manager = Arc::new(std::sync::Mutex::new(manager));
@@ -3422,24 +3350,19 @@ fn run_worker(
     // the DB on setting change, and a periodic 24-hour reload task
     // below picks up updater-written files on disk. Silent no-op
     // when the path is unset.
-    lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
-    lorica::geoip::set_asn_handle(Arc::clone(&lorica_proxy.asn_resolver));
-    // rDNS resolver (v1.4.0 follow-up). Must be built inside the
+    // Handle registration + rDNS init are shared across all three
+    // modes (audit H-9, see `startup::init_geo_resolver_handles`).
+    // The rDNS resolver (v1.4.0 follow-up) must be built inside the
     // worker's tokio runtime because hickory-resolver's
     // TokioAsyncResolver latches onto the current runtime at
     // construction. `rt.enter()` gives us that context.
     {
         let _rt_guard = rt.enter();
-        match lorica::bot_rdns::RdnsResolver::from_system_conf() {
-            Ok(r) => {
-                lorica::bot_rdns::set_handle(Arc::new(r));
-                info!("worker: rDNS resolver initialised from system resolv.conf");
-            }
-            Err(e) => warn!(
-                error = %e,
-                "worker: rDNS resolver init failed; bot_protection.bypass.rdns will be a silent no-op"
-            ),
-        }
+        startup::init_geo_resolver_handles(
+            &lorica_proxy.geoip_resolver,
+            &lorica_proxy.asn_resolver,
+            Some("worker: "),
+        );
     }
     {
         let s = store.blocking_lock();
@@ -3845,35 +3768,19 @@ fn run_single_process(cli: Cli) {
             &single_task_tracker,
         );
 
-        // Create non-blocking alert sender and notification dispatcher
+        // Create non-blocking alert sender, then the notification
+        // dispatcher + alert bridge + probe scheduler + SLA collector
+        // cluster shared with supervisor mode (audit H-9, see
+        // `startup::start_alerting_stack`). The dispatcher handle is
+        // discarded: single-process mode never rebuilds it at runtime
+        // and AppState only needs the history ring.
         let alert_sender = lorica_notify::AlertSender::new(256);
-        let notify_dispatcher = {
-            let s = store.lock().await;
-            build_notify_dispatcher(&s)
-        };
-        let notification_history = notify_dispatcher.history();
-        let notify_dispatcher = Arc::new(tokio::sync::Mutex::new(notify_dispatcher));
-        let _alert_dispatcher = spawn_persisted_alert_dispatcher(
-            &alert_sender,
-            Arc::clone(&notify_dispatcher),
-            log_store.clone(),
-        );
-
-        // Create SLA collector and start background flush task
-        let sla_collector = Arc::new(lorica_bench::SlaCollector::new());
-        {
-            let s = store.lock().await;
-            sla_collector.load_configs(&s);
-        }
-        sla_collector.start_flush_task(Arc::clone(&store), Some(Arc::clone(&notify_dispatcher)));
-
-        // Start active probe scheduler
-        let probe_store = Arc::clone(&store);
-        let probe_scheduler = Arc::new(lorica_bench::ProbeScheduler::new(
-            probe_store,
-            Some(Arc::clone(&notify_dispatcher)),
-        ));
-        probe_scheduler.reload().await;
+        let startup::AlertingStack {
+            notify_dispatcher: _,
+            notification_history,
+            probe_scheduler,
+            sla_collector,
+        } = startup::start_alerting_stack(&store, &alert_sender, log_store.clone()).await;
 
         // Create load test engine (shared between API and scheduler)
         let load_test_engine = Arc::new(lorica_bench::LoadTestEngine::new());
@@ -3913,23 +3820,17 @@ fn run_single_process(cli: Cli) {
         // static so `reload::apply_geoip_settings_from_store` can
         // hot-swap the DB when the dashboard changes the path,
         // without forcing a restart.
-        lorica::geoip::set_handle(Arc::clone(&lorica_proxy.geoip_resolver));
-        lorica::geoip::set_asn_handle(Arc::clone(&lorica_proxy.asn_resolver));
-        // rDNS resolver for bot-protection's rdns bypass (v1.4.0
-        // follow-up). Built from the system resolv.conf — a
-        // missing / broken file is not fatal, it just disables
+        // Handle registration + rDNS init for bot-protection's rdns
+        // bypass (v1.4.0 follow-up) are shared across all three modes
+        // (audit H-9, see `startup::init_geo_resolver_handles`). A
+        // missing / broken resolv.conf is not fatal, it just disables
         // the rDNS bypass category for this process (other
         // bot-protection categories keep working).
-        match lorica::bot_rdns::RdnsResolver::from_system_conf() {
-            Ok(r) => {
-                lorica::bot_rdns::set_handle(Arc::new(r));
-                info!("rDNS resolver initialised from system resolv.conf");
-            }
-            Err(e) => warn!(
-                error = %e,
-                "rDNS resolver init failed; bot_protection.bypass.rdns will be a silent no-op"
-            ),
-        }
+        startup::init_geo_resolver_handles(
+            &lorica_proxy.geoip_resolver,
+            &lorica_proxy.asn_resolver,
+            Some(""),
+        );
         // Load + auto-update spawn are handled by
         // `apply_supervisor_settings_from_store` further down, after
         // `register_supervisor_reload_trigger`. That call does the
@@ -4090,71 +3991,17 @@ fn run_single_process(cli: Cli) {
                 task_tracker: api_task_tracker,
             };
 
-            // Spawn ACME certificate auto-renewal (check every 12h, renew at 30 days before expiry)
-            let _acme_renewal = lorica_api::acme::spawn_renewal_task(
-                state.clone(),
-                std::time::Duration::from_secs(12 * 3600),
-                30,
-                Some(alert_sender.clone()),
-            );
-
-            // Spawn certificate expiry check for ALL certs (ACME + manual), every 12h
-            let _cert_expiry_check = lorica_api::acme::spawn_cert_expiry_check_task(
-                state.clone(),
-                std::time::Duration::from_secs(12 * 3600),
-                alert_sender.clone(),
-            );
-
-            let session_store = SessionStore::new(api_store.clone())
-                .await
-                .with_task_tracker(state.task_tracker.clone());
-            let rate_limiter = RateLimiter::new();
-
-            if let Err(e) = lorica_api::server::start_server(
-                management_port,
-                state,
-                session_store,
-                rate_limiter,
-            )
-            .await
-            {
-                error!(error = %e, "API server exited with error");
-            }
+            // Session store + ACME auto-renewal + cert-expiry notifier
+            // + server loop, shared with supervisor mode (audit H-9,
+            // see `startup::run_api_server`).
+            startup::run_api_server(management_port, state, alert_sender).await;
         });
 
-        if let Some(ref retention_store) = log_store {
-            let retention_log_store = Arc::clone(retention_store);
-            let retention_config_store = Arc::clone(&store);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(3600));
-                let mut last_sla_purge_day: u32 = 0;
-                loop {
-                    interval.tick().await;
-                    let retention = {
-                        let s = retention_config_store.lock().await;
-                        s.get_global_settings()
-                            .map(|gs| gs.access_log_retention)
-                            .unwrap_or(100_000)
-                    };
-                    if retention > 0 {
-                        if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
-                            tracing::warn!(error = %e, "access log retention cleanup failed");
-                        }
-                    }
-                    {
-                        let s = retention_config_store.lock().await;
-                        if let Err(e) = s.purge_probe_results(1000) {
-                            tracing::warn!(error = %e, "probe result retention cleanup failed");
-                        }
-                    }
-                    if let Err(e) = retention_log_store.enforce_waf_retention(100_000) {
-                        tracing::warn!(error = %e, "WAF event retention cleanup failed");
-                    }
-                    last_sla_purge_day =
-                        run_sla_purge(&retention_config_store, last_sla_purge_day).await;
-                }
-            });
-        }
+        // Hourly retention loop (access logs, probe results, WAF
+        // events, SLA buckets), shared across modes (audit H-9, see
+        // `startup::spawn_retention_loop`). No-op when the access-log
+        // store failed to open.
+        startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
 
         // Background task: reload proxy config, cert resolver, and probe scheduler when API signals a change
         let reload_store = Arc::clone(&store);
@@ -4184,26 +4031,19 @@ fn run_single_process(cli: Cli) {
             }
         });
 
-        // Start health check background task
-        let health_store = Arc::clone(&store);
-        let health_config = Arc::clone(&proxy_config);
-        let health_interval = {
-            let s = store.lock().await;
-            s.get_global_settings()
-                .map(|gs| gs.default_health_check_interval_s as u64)
-                .unwrap_or(10)
-        };
-        let health_handle = tokio::spawn(async move {
-            health::health_check_loop(
-                health_store,
-                health_config,
-                health_interval,
-                Some(health_backend_conns),
-                Some(health_alert_sender2),
-                None, // single-process mode, no workers to notify
-            )
-            .await;
-        });
+        // Start health check background task. Spawn shared with
+        // supervisor mode (audit H-9, see
+        // `startup::spawn_health_check_loop`). Single-process mode
+        // passes direct backend-connection handles for drain
+        // monitoring and has no workers to notify on a status flip.
+        let health_handle = startup::spawn_health_check_loop(
+            &store,
+            &proxy_config,
+            Some(health_backend_conns),
+            health_alert_sender2,
+            None,
+        )
+        .await;
 
         // Run the proxy engine in a dedicated thread
         let _proxy_thread = std::thread::spawn(move || {
@@ -4287,159 +4127,6 @@ async fn try_init_otel_from_settings(store: &Arc<Mutex<lorica_config::ConfigStor
             "OpenTelemetry init failed; tracing disabled (startup continues)"
         ),
     }
-}
-
-/// Build a NotifyDispatcher from database notification configs.
-/// Run the SLA data purge if enabled and the schedule matches today.
-/// Returns the day-of-month on which the last purge ran (used as guard to run once per day).
-async fn run_sla_purge(store: &Arc<Mutex<lorica_config::ConfigStore>>, last_purge_day: u32) -> u32 {
-    let today = chrono::Utc::now().day();
-    if today == last_purge_day {
-        return last_purge_day;
-    }
-    let s = store.lock().await;
-    let gs = match s.get_global_settings() {
-        Ok(gs) => gs,
-        Err(_) => return last_purge_day,
-    };
-    if !gs.sla_purge_enabled {
-        return last_purge_day;
-    }
-    let should_run = match gs.sla_purge_schedule.as_str() {
-        "daily" => true,
-        "first_of_month" => today == 1,
-        other => other.parse::<u32>().is_ok_and(|d| d == today),
-    };
-    if !should_run {
-        return last_purge_day;
-    }
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(gs.sla_purge_retention_days as i64);
-    match s.prune_sla_buckets(&cutoff) {
-        Ok(n) if n > 0 => {
-            tracing::info!(
-                count = n,
-                retention_days = gs.sla_purge_retention_days,
-                "purged old SLA buckets"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "SLA purge failed");
-        }
-        _ => {}
-    }
-    today
-}
-
-/// Spawn alert dispatcher that also persists events to the log store (SQLite).
-fn spawn_persisted_alert_dispatcher(
-    alert_sender: &lorica_notify::AlertSender,
-    dispatcher: Arc<Mutex<lorica_notify::NotifyDispatcher>>,
-    log_store: Option<Arc<lorica_api::log_store::LogStore>>,
-) -> tokio::task::JoinHandle<()> {
-    let mut rx = alert_sender.subscribe();
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    // Dispatch via channels (email, webhook, etc.)
-                    let d = dispatcher.lock().await;
-                    d.dispatch(&event).await;
-                    drop(d);
-
-                    // Persist to log store. Both calls are sync rusqlite under
-                    // `parking_lot::Mutex<Connection>` ; running them inline
-                    // would block the alert dispatcher's async reactor (audit
-                    // H-7). Off-load both to one `spawn_blocking` so the
-                    // mutex acquisition + the SELECT COUNT(*) + DELETE pair
-                    // happen on the blocking pool, and surface retention
-                    // failures via the existing notifier-events-dropped metric
-                    // (was a silent `let _ = ...` swallow that left the table
-                    // unbounded if DELETE ever failed).
-                    if let Some(ref store) = log_store {
-                        let store = Arc::clone(store);
-                        let event_for_blocking = event.clone();
-                        let blocking_outcome = tokio::task::spawn_blocking(move || {
-                            let insert = store.insert_notification_event(&event_for_blocking);
-                            let retention = store.enforce_notification_retention(500);
-                            (insert, retention)
-                        })
-                        .await;
-                        match blocking_outcome {
-                            Ok((insert, retention)) => {
-                                if let Err(e) = insert {
-                                    tracing::warn!(error = %e, "failed to persist notification event");
-                                    lorica_api::metrics::inc_notifier_events_dropped(
-                                        "persist_failed",
-                                        1,
-                                    );
-                                }
-                                if let Err(e) = retention {
-                                    tracing::warn!(error = %e, "notification retention enforcement failed");
-                                    lorica_api::metrics::inc_notifier_events_dropped(
-                                        "retention_failed",
-                                        1,
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "notification persistence task join failed");
-                                lorica_api::metrics::inc_notifier_events_dropped("join_failed", 1);
-                            }
-                        }
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        dropped = n,
-                        "alert dispatcher lagged, some notifications were dropped"
-                    );
-                    lorica_api::metrics::inc_notifier_events_dropped("lag", n);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    lorica_api::metrics::inc_notifier_events_dropped("closed", 1);
-                    break;
-                }
-            }
-        }
-    })
-}
-
-fn build_notify_dispatcher(store: &lorica_config::ConfigStore) -> lorica_notify::NotifyDispatcher {
-    let mut dispatcher = lorica_notify::NotifyDispatcher::new();
-    if let Ok(configs) = store.list_notification_configs() {
-        for nc in configs {
-            let config_json = &nc.config;
-            match nc.channel {
-                lorica_config::models::NotificationChannel::Email => {
-                    if let Ok(email_cfg) =
-                        serde_json::from_str::<lorica_notify::channels::EmailConfig>(config_json)
-                    {
-                        dispatcher.add_email_channel(nc.id, email_cfg, nc.alert_types, nc.enabled);
-                    }
-                }
-                lorica_config::models::NotificationChannel::Webhook => {
-                    if let Ok(webhook_cfg) =
-                        serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
-                    {
-                        dispatcher.add_webhook_channel(
-                            nc.id,
-                            webhook_cfg,
-                            nc.alert_types,
-                            nc.enabled,
-                        );
-                    }
-                }
-                lorica_config::models::NotificationChannel::Slack => {
-                    if let Ok(slack_cfg) =
-                        serde_json::from_str::<lorica_notify::channels::WebhookConfig>(config_json)
-                    {
-                        dispatcher.add_slack_channel(nc.id, slack_cfg, nc.alert_types, nc.enabled);
-                    }
-                }
-            }
-        }
-    }
-    dispatcher
 }
 
 /// Restrict private key file permissions to owner-only read.
