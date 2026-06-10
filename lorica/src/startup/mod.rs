@@ -21,6 +21,10 @@
 //! module is the single source of truth for one such cluster;
 //! mode-specific differences are explicit parameters, never copies.
 
+pub(crate) mod single;
+pub(crate) mod supervisor;
+pub(crate) mod worker;
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -453,4 +457,113 @@ pub(crate) fn build_notify_dispatcher(
         }
     }
     dispatcher
+}
+
+/// Try to initialise the OpenTelemetry exporter from persisted
+/// `GlobalSettings`. No-op when the `otel` Cargo feature is off, the
+/// settings row cannot be read, or `otlp_endpoint` is unset / blank.
+///
+/// Must be called from inside a Tokio runtime — the OTLP batch
+/// exporter spawns a background flush task. `role` is a free-form
+/// label (`"supervisor"`, `"worker"`, `"single-process"`) included in
+/// the startup log line so multi-process installs can tell which
+/// component finished tracing init.
+///
+/// Errors are logged at `warn!` and swallowed: observability is not
+/// a critical path, so a misconfigured endpoint never blocks startup.
+pub(crate) async fn try_init_otel_from_settings(
+    store: &Arc<Mutex<lorica_config::ConfigStore>>,
+    role: &str,
+) {
+    let s = store.lock().await;
+    let gs = match s.get_global_settings() {
+        Ok(gs) => gs,
+        Err(e) => {
+            warn!(error = %e, "failed to read global settings for OTel init");
+            return;
+        }
+    };
+    drop(s);
+
+    let Some(endpoint) = gs.otlp_endpoint.as_ref().filter(|e| !e.trim().is_empty()) else {
+        return;
+    };
+
+    let otel_cfg = lorica::otel::OtelConfig {
+        endpoint: endpoint.clone(),
+        protocol: lorica::otel::OtlpProtocol::from_settings(&gs.otlp_protocol),
+        service_name: gs.otlp_service_name.clone(),
+        sampling_ratio: gs.otlp_sampling_ratio,
+    };
+    match lorica::otel::init(&otel_cfg) {
+        Ok(()) => info!(
+            role = role,
+            endpoint = %otel_cfg.endpoint,
+            protocol = otel_cfg.protocol.as_str(),
+            service_name = %otel_cfg.service_name,
+            sampling_ratio = otel_cfg.sampling_ratio,
+            "OpenTelemetry tracing enabled"
+        ),
+        Err(e) => warn!(
+            role = role,
+            error = %e,
+            "OpenTelemetry init failed; tracing disabled (startup continues)"
+        ),
+    }
+}
+
+/// Restrict private key file permissions to owner-only read.
+pub(crate) fn restrict_key_permissions(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        warn!(error = %e, path = %path.display(), "failed to restrict key file permissions");
+        return false;
+    }
+    true
+}
+
+/// Persist the first-run admin password to a 0600 file under the data
+/// directory and return its path.
+///
+/// The bootstrap credential must not reach stdout, because systemd runs
+/// the service with `StandardOutput=journal`: the password would then
+/// persist in `/var/log/journal`, readable by the `systemd-journal`
+/// group long after the one-time login. Writing it to a service-owned
+/// file with mode 0600 keeps it off the journal (audit M, CWE-532).
+/// `must_change_password=true` still forces rotation on first login,
+/// after which the operator deletes the file.
+pub(crate) fn persist_initial_password(
+    data_dir: &std::path::Path,
+    password: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let path = data_dir.join("initial-admin-password");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    // `mode` only applies on creation; force 0600 in case the file
+    // pre-existed (a previous run that crashed after writing it).
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    writeln!(file, "{password}")?;
+    Ok(path)
+}
+
+pub(crate) async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+
+    tokio::select! {
+        _ = sigterm.recv() => {
+            warn!("Received SIGTERM");
+        }
+        _ = sigint.recv() => {
+            warn!("Received SIGINT");
+        }
+    }
 }
