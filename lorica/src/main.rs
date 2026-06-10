@@ -563,16 +563,34 @@ fn run_supervisor(cli: Cli) {
         restrict_key_permissions(&db_path);
 
         match lorica_api::auth::ensure_admin_user(&store) {
-            Ok(Some(password)) => {
-                println!();
-                println!("  ===================================================");
-                println!("  Initial admin password: {password}");
-                println!("  Login at http://localhost:{}/", cli.management_port);
-                println!("  You will be asked to change it on first login.");
-                println!("  ===================================================");
-                println!();
-                info!("admin user created (first run)");
-            }
+            Ok(Some(password)) => match persist_initial_password(&data_dir, &password) {
+                Ok(path) => {
+                    println!();
+                    println!("  ===================================================");
+                    println!("  Initial admin password written to (mode 0600):");
+                    println!("    {}", path.display());
+                    println!("  Read it with:  sudo cat {}", path.display());
+                    println!("  Login at http://localhost:{}/", cli.management_port);
+                    println!("  You will be asked to change it on first login,");
+                    println!("  after which you can delete that file.");
+                    println!("  ===================================================");
+                    println!();
+                    info!(path = %path.display(), "admin user created (first run); password written to 0600 file");
+                }
+                Err(e) => {
+                    // Last resort: never lose the only copy of the
+                    // bootstrap credential. Fall back to stdout (journal)
+                    // with a warning so the operator can still log in.
+                    warn!(error = %e, "failed to write initial password file; printing to stdout as fallback");
+                    println!();
+                    println!("  ===================================================");
+                    println!("  Initial admin password: {password}");
+                    println!("  Login at http://localhost:{}/", cli.management_port);
+                    println!("  You will be asked to change it on first login.");
+                    println!("  ===================================================");
+                    println!();
+                }
+            },
             Ok(None) => {}
             Err(e) => {
                 error!(error = %e, "failed to ensure admin user");
@@ -3687,16 +3705,34 @@ fn run_single_process(cli: Cli) {
 
         // Ensure an admin user exists (first-run password generation)
         match lorica_api::auth::ensure_admin_user(&store) {
-            Ok(Some(password)) => {
-                println!();
-                println!("  ===================================================");
-                println!("  Initial admin password: {password}");
-                println!("  Login at http://localhost:{}/", cli.management_port);
-                println!("  You will be asked to change it on first login.");
-                println!("  ===================================================");
-                println!();
-                info!("admin user created (first run)");
-            }
+            Ok(Some(password)) => match persist_initial_password(&data_dir, &password) {
+                Ok(path) => {
+                    println!();
+                    println!("  ===================================================");
+                    println!("  Initial admin password written to (mode 0600):");
+                    println!("    {}", path.display());
+                    println!("  Read it with:  sudo cat {}", path.display());
+                    println!("  Login at http://localhost:{}/", cli.management_port);
+                    println!("  You will be asked to change it on first login,");
+                    println!("  after which you can delete that file.");
+                    println!("  ===================================================");
+                    println!();
+                    info!(path = %path.display(), "admin user created (first run); password written to 0600 file");
+                }
+                Err(e) => {
+                    // Last resort: never lose the only copy of the
+                    // bootstrap credential. Fall back to stdout (journal)
+                    // with a warning so the operator can still log in.
+                    warn!(error = %e, "failed to write initial password file; printing to stdout as fallback");
+                    println!();
+                    println!("  ===================================================");
+                    println!("  Initial admin password: {password}");
+                    println!("  Login at http://localhost:{}/", cli.management_port);
+                    println!("  You will be asked to change it on first login.");
+                    println!("  ===================================================");
+                    println!();
+                }
+            },
             Ok(None) => {}
             Err(e) => {
                 error!(error = %e, "failed to ensure admin user");
@@ -4410,6 +4446,36 @@ fn restrict_key_permissions(path: &std::path::Path) -> bool {
         return false;
     }
     true
+}
+
+/// Persist the first-run admin password to a 0600 file under the data
+/// directory and return its path.
+///
+/// The bootstrap credential must not reach stdout, because systemd runs
+/// the service with `StandardOutput=journal`: the password would then
+/// persist in `/var/log/journal`, readable by the `systemd-journal`
+/// group long after the one-time login. Writing it to a service-owned
+/// file with mode 0600 keeps it off the journal (audit M, CWE-532).
+/// `must_change_password=true` still forces rotation on first login,
+/// after which the operator deletes the file.
+fn persist_initial_password(
+    data_dir: &std::path::Path,
+    password: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let path = data_dir.join("initial-admin-password");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    // `mode` only applies on creation; force 0600 in case the file
+    // pre-existed (a previous run that crashed after writing it).
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    writeln!(file, "{password}")?;
+    Ok(path)
 }
 
 async fn shutdown_signal() {
