@@ -9,6 +9,13 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Fixed
+
+- `DELETE /api/v1/logs` and `DELETE /api/v1/waf/events` no longer share one `logs_clear` rate-limit bucket: clearing both forensics surfaces within a minute used to 429 the second wipe silently. Each endpoint keeps its own 1/min cap, so the L-6 protection (a stolen session cookie cannot flush a trail faster than once a minute) is unchanged per trail.
+- The forensics wipes are strongly consistent with the new background log writer: both clear endpoints drain the writer queue through a flush barrier before the `DELETE`, so rows that were in flight at wipe time can no longer be persisted right after it and resurrect pre-wipe traffic.
+- Restored the `pnpm.overrides` postcss security floor (`>=8.5.10`) in `lorica-dashboard/frontend/package.json`; its absence (the lockfile still carried it) made `pnpm install --frozen-lockfile` fail under pnpm 10 and broke every e2e image rebuild.
+- The e2e Docker suite is runnable again (entrypoints read the v1.5.9 password file instead of parsing stdout, `run.sh --build` rebuilds the runner images, the failover test polls through the v1.5.8 flip-hysteresis window). Full suite green: 340/340 single-process, worker isolation, cert-export smoke.
+
 ### Changed
 
 - `lorica/src/main.rs` (4329 LOC) is split into `cli.rs` + `startup/{mod, supervisor, worker, single}.rs` with `main()` reduced to ~70 LOC of dispatch (backlog #8). Before the split, the duplicated background-task wiring across `run_supervisor` / `run_worker` / `run_single_process` was deduplicated into shared `startup` helpers (alerting + SLA + probes stack, API-server tail including the ACME renewal and cert-expiry spawns, retention loop, health check, GeoIP/ASN/rDNS handle init), so a future mode cannot silently miss a spawn the way the v1.5.2 worker-mode cert-hotswap bug did (audit H-9).
