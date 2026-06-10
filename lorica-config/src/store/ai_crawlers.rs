@@ -167,29 +167,24 @@ fn row_to_custom_crawler(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Cus
     let enabled: i32 = row.get(5)?;
     let created_at_s: String = row.get(6)?;
     let updated_at_s: String = row.get(7)?;
-    Ok(decode_custom_crawler(
-        id,
-        name,
-        user_agent_pattern,
-        kind,
-        data,
-        enabled,
-        created_at_s,
-        updated_at_s,
-    ))
+    let built = decode_verification(id, &kind, data.as_deref()).and_then(|verification| {
+        let created_at: DateTime<Utc> = parse_dt(&created_at_s)?;
+        let updated_at: DateTime<Utc> = parse_dt(&updated_at_s)?;
+        Ok(CustomCrawler {
+            id,
+            name,
+            user_agent_pattern,
+            verification,
+            enabled: enabled != 0,
+            created_at,
+            updated_at,
+        })
+    });
+    Ok(built)
 }
 
-fn decode_custom_crawler(
-    id: i64,
-    name: String,
-    user_agent_pattern: String,
-    kind: String,
-    data: Option<String>,
-    enabled: i32,
-    created_at_s: String,
-    updated_at_s: String,
-) -> Result<CustomCrawler> {
-    let verification = match (kind.as_str(), data.as_deref()) {
+fn decode_verification(id: i64, kind: &str, data: Option<&str>) -> Result<CustomVerification> {
+    let verification = match (kind, data) {
         ("ua_only", _) => CustomVerification::UaOnly,
         ("rdns", Some(json)) => {
             #[derive(serde::Deserialize)]
@@ -221,17 +216,7 @@ fn decode_custom_crawler(
             )));
         }
     };
-    let created_at: DateTime<Utc> = parse_dt(&created_at_s)?;
-    let updated_at: DateTime<Utc> = parse_dt(&updated_at_s)?;
-    Ok(CustomCrawler {
-        id,
-        name,
-        user_agent_pattern,
-        verification,
-        enabled: enabled != 0,
-        created_at,
-        updated_at,
-    })
+    Ok(verification)
 }
 
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
