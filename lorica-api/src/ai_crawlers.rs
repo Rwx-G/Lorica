@@ -16,8 +16,8 @@
 //!   `dfa_size_limit(1 << 21)` ; on `Err` return HTTP 400 with the
 //!   regex error message.
 //! - The regex is then matched against a hardcoded baseline UA
-//!   corpus (Chrome / Firefox / Safari / Edge / Opera + curl + wget
-//!   + 7 search-bot UAs) ; if any baseline UA matches, reject with
+//!   corpus (Chrome / Firefox / Safari / Edge / Opera, curl, wget,
+//!   and 7 search-bot UAs) ; if any baseline UA matches, reject with
 //!   HTTP 400 ("Pattern would match legitimate browser/crawler UA
 //!   <example>"). Closes the admin-`(?i).*` privilege escalation.
 //! - For `IpRanges`, every CIDR string is parsed via
