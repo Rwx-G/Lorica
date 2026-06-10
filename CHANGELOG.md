@@ -15,6 +15,7 @@ Author: Rwx-G
 
 - Cron-scheduled load tests now run in supervisor/worker mode: the supervisor created a `LoadTestEngine` for the management API but never started the cron scheduler, so scheduled load tests silently never executed outside single-process mode. Both API-serving modes now go through one shared `startup::start_load_test_engine` helper that creates the engine and starts the scheduler together, making the asymmetry unrepresentable (Epic 8 Story 8.1 finding).
 - Notification-channel edits hot-reload in single-process mode: the config-reload listener now rebuilds the notification dispatcher from the persisted channel configs on every reload signal, mirroring supervisor mode. Previously single-process deployments kept dispatching alerts to the boot-time channel list until restart (Epic 8 Story 8.1 finding).
+- The e2e suite teardown now passes every compose profile to `down -v`, so profile-gated containers and volumes (workers, cert-export, smoke profiles) no longer survive a run and leak stale state into the next one (Epic 8 Story 8.1 finding, extended to all seven current profiles).
 
 ## [1.5.10] - 2026-06-10
 
