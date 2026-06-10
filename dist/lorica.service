@@ -41,6 +41,12 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+# Block syslog(2) and /proc/kmsg, /dev/kmsg reads so a post-RCE
+# process cannot harvest kernel log lines (KASLR offsets, pointer
+# leaks) to chain a local privilege escalation. ProcSubset=pid +
+# ProtectProc=invisible already hide /proc/kmsg, but this also
+# closes the syslog(2) syscall and /dev/kmsg directly.
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictNamespaces=yes

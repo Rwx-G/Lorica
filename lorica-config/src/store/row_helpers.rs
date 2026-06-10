@@ -56,6 +56,28 @@ pub(super) fn parse_optional_datetime(s: Option<String>) -> Result<Option<DateTi
     }
 }
 
+/// Decode an optional JSON-encoded column into a typed value.
+///
+/// `None` (SQL NULL, or a column absent on a pre-migration bisect
+/// build) yields `Ok(None)`. A present-but-malformed blob yields an
+/// error rather than silently degrading to `None`. The distinction
+/// matters for security-bearing fields (mTLS, rate limit, geoip,
+/// bot protection): a silent downgrade to `None` would disable the
+/// protection on a route meant to enforce it. A load error is caught
+/// by the two-phase config reload, which keeps the previously
+/// committed config active instead of serving the route unprotected.
+pub(super) fn parse_optional_json_field<T: serde::de::DeserializeOwned>(
+    raw: Option<String>,
+    field: &str,
+) -> Result<Option<T>> {
+    match raw {
+        Some(s) => serde_json::from_str(&s)
+            .map(Some)
+            .map_err(|e| ConfigError::Validation(format!("invalid {field} JSON: {e}"))),
+        None => Ok(None),
+    }
+}
+
 pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
     let hostname_aliases_json: String = row.get(11)?;
     let hostname_aliases: Vec<String> = serde_json::from_str(&hostname_aliases_json)
@@ -181,41 +203,41 @@ pub(super) fn row_to_route(row: &rusqlite::Row<'_>) -> Result<Route> {
                 .unwrap_or_else(|_| "[]".to_string());
             serde_json::from_str(&json).unwrap_or_default()
         },
-        forward_auth: {
-            let raw: Option<String> = row.get::<_, Option<String>>(58).unwrap_or(None);
-            raw.and_then(|s| serde_json::from_str(&s).ok())
-        },
-        mirror: {
-            let raw: Option<String> = row.get::<_, Option<String>>(59).unwrap_or(None);
-            raw.and_then(|s| serde_json::from_str(&s).ok())
-        },
-        response_rewrite: {
-            let raw: Option<String> = row.get::<_, Option<String>>(60).unwrap_or(None);
-            raw.and_then(|s| serde_json::from_str(&s).ok())
-        },
-        mtls: {
-            let raw: Option<String> = row.get::<_, Option<String>>(61).unwrap_or(None);
-            raw.and_then(|s| serde_json::from_str(&s).ok())
-        },
-        rate_limit: {
-            let raw: Option<String> = row.get::<_, Option<String>>(62).unwrap_or(None);
-            raw.and_then(|s| serde_json::from_str(&s).ok())
-        },
-        geoip: {
-            // Column index 63 (v1.4.0 story 2.2 migration V34). Stored
-            // as JSON or NULL; a parse failure downgrades silently to
-            // `None` so a hand-edited bad row cannot crash the proxy.
-            let raw: Option<String> = row.get::<_, Option<String>>(63).unwrap_or(None);
-            raw.and_then(|s| serde_json::from_str(&s).ok())
-        },
-        bot_protection: {
-            // Column index 64 (v1.4.0 story 3.3 migration V35). Same
-            // forgiving parse policy as geoip above — a corrupt JSON
-            // blob on one row degrades the feature to off for that
-            // route but does not take the proxy down.
-            let raw: Option<String> = row.get::<_, Option<String>>(64).unwrap_or(None);
-            raw.and_then(|s| serde_json::from_str(&s).ok())
-        },
+        // Columns 58-64 are optional JSON blobs added by later
+        // migrations. `row.get(...).unwrap_or(None)` tolerates the
+        // column being absent on a pre-migration bisect build, but a
+        // present-but-corrupt blob is a hard error (see
+        // `parse_optional_json_field`): a silent downgrade to `None`
+        // would disable a security feature on a route meant to enforce
+        // it. The two-phase reload keeps the prior config on error.
+        forward_auth: parse_optional_json_field(
+            row.get::<_, Option<String>>(58).unwrap_or(None),
+            "forward_auth",
+        )?,
+        mirror: parse_optional_json_field(
+            row.get::<_, Option<String>>(59).unwrap_or(None),
+            "mirror",
+        )?,
+        response_rewrite: parse_optional_json_field(
+            row.get::<_, Option<String>>(60).unwrap_or(None),
+            "response_rewrite",
+        )?,
+        mtls: parse_optional_json_field(
+            row.get::<_, Option<String>>(61).unwrap_or(None),
+            "mtls",
+        )?,
+        rate_limit: parse_optional_json_field(
+            row.get::<_, Option<String>>(62).unwrap_or(None),
+            "rate_limit",
+        )?,
+        geoip: parse_optional_json_field(
+            row.get::<_, Option<String>>(63).unwrap_or(None),
+            "geoip",
+        )?,
+        bot_protection: parse_optional_json_field(
+            row.get::<_, Option<String>>(64).unwrap_or(None),
+            "bot_protection",
+        )?,
         group_name: {
             // Column index 65 (v1.4.1 migration V37). Free-form
             // operator-supplied classification string, empty = ungrouped.
@@ -412,6 +434,31 @@ pub(super) fn row_to_sla_bucket(row: &rusqlite::Row<'_>) -> rusqlite::Result<Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_optional_json_field_absent_is_none() {
+        let parsed: Option<Vec<String>> =
+            parse_optional_json_field(None, "field").expect("absent is a valid state");
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn parse_optional_json_field_valid_parses() {
+        let parsed: Option<Vec<String>> =
+            parse_optional_json_field(Some(r#"["a","b"]"#.to_string()), "field")
+                .expect("valid JSON parses");
+        assert_eq!(parsed, Some(vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn parse_optional_json_field_corrupt_fails_closed() {
+        let parsed: Result<Option<Vec<String>>> =
+            parse_optional_json_field(Some("{not valid json".to_string()), "mtls");
+        assert!(
+            parsed.is_err(),
+            "a corrupt security blob must fail closed, not silently degrade to None"
+        );
+    }
 
     #[test]
     fn parse_datetime_rfc3339_z() {

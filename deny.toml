@@ -4,7 +4,17 @@ targets = [{ triple = "x86_64-unknown-linux-gnu" }]
 [advisories]
 # RUSTSEC advisories
 version = 2
-ignore = []
+# Mirror of `.cargo/audit.toml` (the authoritative source for the
+# rationale). `cargo deny check` reads this file independently of
+# `cargo audit`, so the route53-only rustls-webpki 0.101.7 advisories
+# must be ignored here too or `cargo deny` fails on advisories that
+# `cargo audit` correctly passes. See `.cargo/audit.toml` for the full
+# dep-chain / exposure / revisit-trigger paragraph.
+ignore = [
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+]
 
 [licenses]
 version = 2

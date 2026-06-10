@@ -205,11 +205,9 @@ impl WafEngine {
                 }
             }
         } else {
-            info!(
-                host = host,
-                latency_us = elapsed.as_micros() as u64,
-                "WAF evaluation passed"
-            );
+            // No per-request log on the clean path: at info level this
+            // fired for every passing request on the hot path with no
+            // operator value (latency is already a Prometheus metric).
             WafVerdict::Pass
         }
     }

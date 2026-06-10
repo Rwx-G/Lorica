@@ -1,5 +1,5 @@
 Name:           lorica
-Version:        1.5.8
+Version:        1.5.9
 Release:        1%{?dist}
 Summary:        Modern reverse proxy with built-in dashboard
 License:        Apache-2.0
@@ -53,8 +53,9 @@ echo "  Dashboard: https://localhost:9443"
 echo "    (listens on localhost only - not reachable"
 echo "     from other machines)"
 echo "  "
-echo "  The admin password will be in the journal:"
-echo "    journalctl -u lorica -n 20"
+echo "  The initial admin password is written to a 0600 file:"
+echo "    sudo cat /var/lib/lorica/initial-admin-password"
+echo "    (delete it after your first login)"
 echo "  "
 echo "  Customize with: systemctl edit lorica"
 echo "    Add an [Service] override with ExecStart= to"

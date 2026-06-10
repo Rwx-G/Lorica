@@ -10,9 +10,7 @@ use dashmap::DashMap;
 use axum::middleware;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use http::Method;
 use tokio::sync::{watch, Mutex};
-use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::logs::LogBuffer;
@@ -673,20 +671,14 @@ pub fn build_router(
         .merge(metrics_routes)
         .merge(protected_routes)
         .merge(dashboard_routes)
-        .layer(
-            CorsLayer::new()
-                // Dashboard is served from the same origin as the API
-                // (same port, same host). Restrict CORS to same-origin
-                // requests only. AllowOrigin::mirror_request reflects
-                // the Origin header back so browsers allow the call
-                // from any scheme://host:port that can reach the API
-                // (typically https://localhost:9443 or the operator's
-                // custom domain). This is tighter than Any because it
-                // only applies when an Origin is actually sent.
-                .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
-                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-                .allow_headers(Any),
-        )
+        // No CORS layer by design. The dashboard SPA is served from the
+        // same origin as the API (same host, same port) and the API
+        // binds to loopback only, so cross-origin requests are never
+        // part of normal operation. Omitting the layer makes the browser
+        // default-deny any cross-origin call, instead of the previous
+        // `AllowOrigin::mirror_request()` which reflected an arbitrary
+        // Origin back (permissive CORS, CWE-942). Same-origin requests
+        // are unaffected: the CORS policy does not apply to them.
         // Global body-size ceiling : 1 MiB (v1.5.0 audit finding
         // MEDIUM, tightened from the previous 10 MiB). Endpoints that
         // legitimately need more (config import, cert PEM upload, route

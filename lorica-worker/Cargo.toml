@@ -1,6 +1,6 @@
 [package]
 name = "lorica-worker"
-version = "1.5.8"
+version = "1.5.9"
 authors = ["Rwx-G"]
 license = "Apache-2.0"
 edition = "2021"

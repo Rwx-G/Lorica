@@ -3806,21 +3806,18 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(false);
             }
 
-            // Collect headers for inspection
+            // Collect headers for inspection. Every header carrying a valid
+            // UTF-8 value is scanned; non-UTF-8 (binary) values are skipped
+            // by `to_str().ok()`. A fixed name allowlist was a WAF bypass:
+            // any header a backend trusts but that was not on the list
+            // (`Forwarded`, `True-Client-IP`, app-specific headers, ...)
+            // carried injection payloads straight upstream with no event.
+            // The Aho-Corasick prefilter short-circuits clean values cheaply,
+            // so scanning every header is affordable on the hot path.
             let headers: Vec<(&str, &str)> = req
                 .headers
                 .iter()
-                .filter_map(|(name, value)| {
-                    let name_str = name.as_str();
-                    // Only inspect relevant headers (skip large/binary ones)
-                    match name_str {
-                        "user-agent" | "referer" | "cookie" | "x-forwarded-for"
-                        | "content-type" | "content-length" | "authorization" | "origin"
-                        | "transfer-encoding" => value.to_str().ok().map(|v| (name_str, v)),
-                        n if n.starts_with("x-") => value.to_str().ok().map(|v| (name_str, v)),
-                        _ => None,
-                    }
-                })
+                .filter_map(|(name, value)| value.to_str().ok().map(|v| (name.as_str(), v)))
                 .collect();
 
             let waf_mode = match entry.route.waf_mode {
