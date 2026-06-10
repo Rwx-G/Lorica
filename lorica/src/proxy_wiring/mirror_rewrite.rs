@@ -223,16 +223,15 @@ pub(crate) fn should_rewrite_response(
     }
     // Default to text/* when the operator list is empty. A typo-proof
     // defensive default: operators who enable rewriting almost always
-    // mean "for HTML/text responses".
-    let allowed_list: Vec<String> = if cfg.content_type_prefixes.is_empty() {
-        vec!["text/".into()]
-    } else {
-        cfg.content_type_prefixes
-            .iter()
-            .map(|p| p.to_ascii_lowercase())
-            .collect()
-    };
-    allowed_list.iter().any(|p| lower_ct.starts_with(p))
+    // mean "for HTML/text responses". The empty case (common) compares
+    // against a static prefix with no allocation; the configured case
+    // lowercases each prefix on the fly rather than collecting a Vec.
+    if cfg.content_type_prefixes.is_empty() {
+        return lower_ct.starts_with("text/");
+    }
+    cfg.content_type_prefixes
+        .iter()
+        .any(|p| lower_ct.starts_with(&p.to_ascii_lowercase()))
 }
 
 /// Build the fixed forward-header set for a mirror sub-request: the
