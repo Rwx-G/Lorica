@@ -20,8 +20,8 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::RwLock;
 
+use parking_lot::RwLock;
 use tracing::info;
 
 /// Default blocklist URL (Data-Shield IPv4 Blocklist - updated every 6 hours).
@@ -50,34 +50,19 @@ impl IpBlocklist {
 
     /// Check if an IP address is blocked.
     pub fn is_blocked(&self, ip: &IpAddr) -> bool {
-        if !*self
-            .enabled
-            .read()
-            .expect("RwLock poisoned (no panicking writer holds this guard)")
-        {
+        if !*self.enabled.read() {
             return false;
         }
-        self.ips
-            .read()
-            .expect("RwLock poisoned (no panicking writer holds this guard)")
-            .contains(ip)
+        self.ips.read().contains(ip)
     }
 
     /// Check if an IP string is blocked (parses the string first).
     pub fn is_blocked_str(&self, ip_str: &str) -> bool {
-        if !*self
-            .enabled
-            .read()
-            .expect("RwLock poisoned (no panicking writer holds this guard)")
-        {
+        if !*self.enabled.read() {
             return false;
         }
         match ip_str.parse::<IpAddr>() {
-            Ok(ip) => self
-                .ips
-                .read()
-                .expect("RwLock poisoned (no panicking writer holds this guard)")
-                .contains(&ip),
+            Ok(ip) => self.ips.read().contains(&ip),
             Err(_) => false,
         }
     }
@@ -105,60 +90,36 @@ impl IpBlocklist {
             }
         }
         let count = set.len();
-        *self
-            .ips
-            .write()
-            .expect("RwLock poisoned (no panicking writer holds this guard)") = set;
-        *self
-            .enabled
-            .write()
-            .expect("RwLock poisoned (no panicking writer holds this guard)") = true;
+        *self.ips.write() = set;
+        *self.enabled.write() = true;
         info!(count = count, "IP blocklist loaded");
         count
     }
 
     /// Enable or disable the blocklist.
     pub fn set_enabled(&self, enabled: bool) {
-        *self
-            .enabled
-            .write()
-            .expect("RwLock poisoned (no panicking writer holds this guard)") = enabled;
+        *self.enabled.write() = enabled;
     }
 
     /// Return whether the blocklist is enabled.
     pub fn is_enabled(&self) -> bool {
-        *self
-            .enabled
-            .read()
-            .expect("RwLock poisoned (no panicking writer holds this guard)")
+        *self.enabled.read()
     }
 
     /// Return the number of IPs in the blocklist.
     pub fn len(&self) -> usize {
-        self.ips
-            .read()
-            .expect("RwLock poisoned (no panicking writer holds this guard)")
-            .len()
+        self.ips.read().len()
     }
 
     /// Return true if the blocklist is empty.
     pub fn is_empty(&self) -> bool {
-        self.ips
-            .read()
-            .expect("RwLock poisoned (no panicking writer holds this guard)")
-            .is_empty()
+        self.ips.read().is_empty()
     }
 
     /// Clear the blocklist and disable it.
     pub fn clear(&self) {
-        self.ips
-            .write()
-            .expect("RwLock poisoned (no panicking writer holds this guard)")
-            .clear();
-        *self
-            .enabled
-            .write()
-            .expect("RwLock poisoned (no panicking writer holds this guard)") = false;
+        self.ips.write().clear();
+        *self.enabled.write() = false;
     }
 }
 
