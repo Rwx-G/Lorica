@@ -223,23 +223,21 @@ pub(crate) fn run_single_process(cli: Cli) {
         // dispatcher + alert bridge + probe scheduler + SLA collector
         // cluster shared with supervisor mode (audit H-9, see
         // `startup::start_alerting_stack`). The dispatcher handle is
-        // discarded: single-process mode never rebuilds it at runtime
-        // and AppState only needs the history ring.
+        // kept: the config-reload listener below rebuilds it when
+        // notification channels change (Story 8.1 asymmetry, fixed in
+        // v1.5.11: edits used to be ignored until restart in
+        // single-process mode while supervisor mode hot-reloaded them).
         let alert_sender = lorica_notify::AlertSender::new(256);
         let startup::AlertingStack {
-            notify_dispatcher: _,
+            notify_dispatcher,
             notification_history,
             probe_scheduler,
             sla_collector,
         } = startup::start_alerting_stack(&store, &alert_sender, log_store.clone()).await;
 
-        // Create load test engine (shared between API and scheduler)
-        let load_test_engine = Arc::new(lorica_bench::LoadTestEngine::new());
-
-        // Start load test cron scheduler
-        let lt_scheduler_store = Arc::clone(&store);
-        let lt_scheduler_engine = Arc::clone(&load_test_engine);
-        lorica_bench::scheduler::start_scheduler(lt_scheduler_store, lt_scheduler_engine);
+        // Load-test engine + cron scheduler (shared helper, see
+        // `startup::start_load_test_engine`)
+        let load_test_engine = startup::start_load_test_engine(&store);
 
         // Create shared ACME challenge store backed by SQLite for cross-process access
         let acme_challenge_store =
@@ -465,6 +463,7 @@ pub(crate) fn run_single_process(cli: Cli) {
         let reload_probe_scheduler = Arc::clone(&probe_scheduler);
         let reload_connection_filter = Arc::clone(&connection_filter);
         let reload_mtls_fp = Arc::clone(&mtls_installed_fingerprint);
+        let reload_notify_dispatcher = Arc::clone(&notify_dispatcher);
         let _reload_handle = tokio::spawn(async move {
             while config_reload_rx.changed().await.is_ok() {
                 if let Err(e) = lorica::reload::reload_proxy_config_with_mtls(
@@ -482,6 +481,12 @@ pub(crate) fn run_single_process(cli: Cli) {
                 {
                     let s = reload_store.lock().await;
                     reload_sla_collector.load_configs(&s);
+                    // Rebuild notification dispatcher with updated
+                    // channel configs, mirroring supervisor mode
+                    // (Story 8.1 asymmetry, fixed in v1.5.11).
+                    let new_dispatcher = startup::build_notify_dispatcher(&s);
+                    let mut d = reload_notify_dispatcher.lock().await;
+                    *d = new_dispatcher;
                 }
             }
         });

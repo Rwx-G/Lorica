@@ -1049,6 +1049,12 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // mode (audit H-9, see `startup::run_api_server`; v1.5.2 fix:
         // worker mode was missing auto-renewal entirely).
         let api_alert_sender = alert_sender.clone();
+        // Load-test engine + cron scheduler (shared helper, see
+        // `startup::start_load_test_engine`). Story 8.1 asymmetry,
+        // fixed in v1.5.11: supervisor mode used to create the engine
+        // for AppState without ever starting the scheduler, so
+        // cron-scheduled load tests silently never ran in worker mode.
+        let load_test_engine = startup::start_load_test_engine(&store);
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -1067,7 +1073,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 acme_challenge_store: Some(lorica_api::acme::AcmeChallengeStore::with_db_path(api_db_path)),
                 pending_dns_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
                 sla_collector: Some(Arc::clone(&sla_collector)),
-                load_test_engine: Some(Arc::new(lorica_bench::LoadTestEngine::new())),
+                load_test_engine: Some(load_test_engine),
                 // cache/ban are per-worker process; aggregated via command channel
                 cache_hits: None,
                 cache_misses: None,
