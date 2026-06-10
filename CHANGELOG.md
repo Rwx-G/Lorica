@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [1.5.10] - 2026-06-10
+
 ### Fixed
 
 - `DELETE /api/v1/logs` and `DELETE /api/v1/waf/events` no longer share one `logs_clear` rate-limit bucket: clearing both forensics surfaces within a minute used to 429 the second wipe silently. Each endpoint keeps its own 1/min cap, so the L-6 protection (a stolen session cookie cannot flush a trail faster than once a minute) is unchanged per trail.
