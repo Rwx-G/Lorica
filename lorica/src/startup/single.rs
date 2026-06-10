@@ -257,10 +257,13 @@ pub(crate) fn run_single_process(cli: Cli) {
         lorica_proxy.alert_sender = Some(alert_sender.clone());
         // Hand the proxy a producer handle for the background log
         // writer (batched access-log + WAF-event persistence,
-        // backlog #24) instead of a direct LogStore reference.
-        lorica_proxy.log_writer = log_store
+        // backlog #24) instead of a direct LogStore reference. A
+        // clone also goes into AppState so the clear endpoints can
+        // flush in-flight writes before wiping.
+        let log_writer = log_store
             .as_ref()
             .map(|s| lorica_api::log_writer::spawn_log_writer(Arc::clone(s)));
+        lorica_proxy.log_writer = log_writer.clone();
 
         // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so
         // the request_filter can resolve client IPs. If auto-update is
@@ -437,6 +440,7 @@ pub(crate) fn run_single_process(cli: Cli) {
                 backend_connections: Some(backend_conns.clone()),
                 notification_history: Some(notification_history),
                 log_store: api_log_store,
+                log_writer: log_writer.clone(),
                 aggregated_metrics: None, // single-process uses direct Arc references
                 metrics_refresher: None,  // pull-on-scrape only meaningful in worker mode
                 task_tracker: api_task_tracker,

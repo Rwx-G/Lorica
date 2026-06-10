@@ -225,6 +225,11 @@ pub async fn clear_waf_events(
         buf.clear();
     }
     if let Some(ref store) = state.log_store {
+        // Drain queued WAF events before the wipe so in-flight rows
+        // cannot land right after the DELETE (backlog #24 barrier).
+        if let Some(ref writer) = state.log_writer {
+            let _ = writer.flush().await;
+        }
         log_db_blocking(store, |s| {
             s.clear_waf_events()
                 .map_err(|e| format!("failed to clear WAF events: {e}"))

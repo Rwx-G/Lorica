@@ -41,6 +41,11 @@ enum LogWrite {
     Access(LogEntry),
     /// WAF event row (`waf_events` table).
     Waf(lorica_waf::WafEvent),
+    /// Flush barrier: when the writer reaches it, every write enqueued
+    /// before it has been persisted, and the ack fires. Used by the
+    /// clear endpoints so a forensics wipe cannot be trailed by stale
+    /// in-flight rows re-appearing right after the DELETE.
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 /// Cloneable, non-blocking producer handle for the log writer queue.
@@ -66,6 +71,23 @@ impl LogWriteHandle {
             crate::metrics::inc_log_write_dropped("waf");
         }
     }
+
+    /// Wait until every write enqueued before this call is persisted.
+    ///
+    /// Unlike the enqueue methods this one applies backpressure
+    /// (`send().await`) instead of dropping on a full queue: it is
+    /// called from rate-limited management endpoints (logs / WAF event
+    /// clear), never from the request hot path, and the wipe must not
+    /// silently skip the barrier. Returns `Err(())` when the writer
+    /// thread is gone; callers treat that as "nothing left to flush".
+    pub async fn flush(&self) -> Result<(), ()> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(LogWrite::Barrier(ack_tx))
+            .await
+            .map_err(|_| ())?;
+        ack_rx.await.map_err(|_| ())
+    }
 }
 
 /// Spawn the dedicated writer thread and return the producer handle.
@@ -82,13 +104,14 @@ pub fn spawn_log_writer(store: Arc<LogStore>) -> LogWriteHandle {
         .spawn(move || {
             let mut accesses: Vec<LogEntry> = Vec::with_capacity(BATCH_MAX);
             let mut wafs: Vec<lorica_waf::WafEvent> = Vec::new();
+            let mut barriers: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
             while let Some(first) = rx.blocking_recv() {
                 let mut taken = 1usize;
-                stash(first, &mut accesses, &mut wafs);
+                stash(first, &mut accesses, &mut wafs, &mut barriers);
                 while taken < BATCH_MAX {
                     match rx.try_recv() {
                         Ok(w) => {
-                            stash(w, &mut accesses, &mut wafs);
+                            stash(w, &mut accesses, &mut wafs, &mut barriers);
                             taken += 1;
                         }
                         Err(_) => break,
@@ -107,6 +130,11 @@ pub fn spawn_log_writer(store: Arc<LogStore>) -> LogWriteHandle {
                 }
                 accesses.clear();
                 wafs.clear();
+                // Ack barriers only after the batch they rode in with is
+                // on disk. Dropped receivers (caller gave up) are fine.
+                for barrier in barriers.drain(..) {
+                    let _ = barrier.send(());
+                }
             }
         });
     if let Err(e) = spawned {
@@ -118,10 +146,16 @@ pub fn spawn_log_writer(store: Arc<LogStore>) -> LogWriteHandle {
     LogWriteHandle { tx }
 }
 
-fn stash(write: LogWrite, accesses: &mut Vec<LogEntry>, wafs: &mut Vec<lorica_waf::WafEvent>) {
+fn stash(
+    write: LogWrite,
+    accesses: &mut Vec<LogEntry>,
+    wafs: &mut Vec<lorica_waf::WafEvent>,
+    barriers: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+) {
     match write {
         LogWrite::Access(entry) => accesses.push(entry),
         LogWrite::Waf(event) => wafs.push(event),
+        LogWrite::Barrier(ack) => barriers.push(ack),
     }
 }
 

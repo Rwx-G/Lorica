@@ -505,6 +505,7 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         backend_connections: None,
         notification_history: None,
         log_store: None,
+        log_writer: None,
         aggregated_metrics: None,
         metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),

@@ -162,6 +162,12 @@ pub struct AppState {
     pub notification_history: Option<Arc<parking_lot::Mutex<VecDeque<lorica_notify::AlertEvent>>>>,
     /// Persistent access log store (SQLite). `None` in tests or worker mode.
     pub log_store: Option<Arc<crate::log_store::LogStore>>,
+    /// Producer handle of the background log writer feeding
+    /// `log_store`. `None` when no proxy-side writer runs in this
+    /// process (tests; supervisor mode, whose API path inserts
+    /// directly). The clear endpoints flush it before wiping so a
+    /// forensics wipe cannot be trailed by stale in-flight rows.
+    pub log_writer: Option<crate::log_writer::LogWriteHandle>,
     /// Aggregated proxy metrics from worker processes. `None` in single-process mode.
     pub aggregated_metrics: Option<Arc<crate::workers::AggregatedMetrics>>,
     /// Pipelined metrics refresh closure (WPAR-7 pull-on-scrape).
@@ -600,10 +606,16 @@ pub fn build_router(
             )),
         )
         .route("/api/v1/waf/events", get(crate::waf::get_waf_events))
+        // Own bucket, same 1/min cap: sharing "logs_clear" with
+        // DELETE /api/v1/logs meant an operator clearing both
+        // forensics surfaces within a minute got a silent 429 on the
+        // second wipe. Separate buckets keep each wipe individually
+        // capped (a stolen cookie still cannot flush either trail
+        // faster than once a minute).
         .route(
             "/api/v1/waf/events",
             delete(crate::waf::clear_waf_events).layer(rl(
-                "logs_clear",
+                "waf_events_clear",
                 RL_LOGS_CLEAR,
                 RL_WINDOW_S,
             )),

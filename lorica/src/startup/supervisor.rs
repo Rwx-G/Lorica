@@ -1082,6 +1082,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     Some(d.history())
                 },
                 log_store: api_log_store,
+                log_writer: None,
                 task_tracker: api_task_tracker,
             };
             // Session store + ACME auto-renewal + cert-expiry notifier

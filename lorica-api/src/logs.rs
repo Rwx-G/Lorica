@@ -492,6 +492,13 @@ pub async fn clear_logs(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.log_buffer.clear();
     if let Some(ref store) = state.log_store {
+        // Drain the background log writer first: rows still queued at
+        // wipe time would otherwise be persisted right after the
+        // DELETE and "resurrect" pre-wipe traffic (backlog #24
+        // barrier). A gone writer means nothing left to flush.
+        if let Some(ref writer) = state.log_writer {
+            let _ = writer.flush().await;
+        }
         // `DELETE FROM access_logs` rewrites the WAL and can take a
         // few seconds on a busy DB - off the tokio worker.
         log_db_blocking(store, |s| s.clear()).await?;
