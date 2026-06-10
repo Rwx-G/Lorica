@@ -22,8 +22,8 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    Registry, TextEncoder,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry,
+    TextEncoder,
 };
 
 use crate::server::AppState;
@@ -491,6 +491,12 @@ pub fn snapshot_per_worker_counters() -> Vec<GenericCounterTuple> {
 
     let mut out = Vec::new();
     for (name, vec) in vecs {
+        // `Collector::collect()` returns an owned one-element
+        // `Vec<MetricFamily>` by API contract (prometheus 0.14
+        // `vec![self.v.collect()]`); the vec internals are
+        // pub(crate), so there is no buffer-reuse readback path.
+        // The 7 small Vec allocations per tick live inside the
+        // prometheus crate and cannot be hoisted out (backlog #41g).
         let families = vec.collect();
         for mf in families {
             for m in mf.get_metric() {
@@ -555,39 +561,30 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
         values.join("\0")
     }
 
-    let mut map = SUPERVISOR_GENERIC_SNAPSHOT.write();
-    let worker_state = map.entry(worker_id).or_default();
+    /// One wire entry fully resolved before the snapshot lock is
+    /// taken: owned key strings plus the target supervisor-side vec.
+    struct PreparedEntry {
+        metric_name: String,
+        label_key: String,
+        positional: Vec<String>,
+        value: u64,
+        vec: &'static IntCounterVec,
+    }
 
+    // Phase 1 - no lock held. Resolve the label order, build the
+    // positional values and the snapshot key, and bind the target
+    // vec for every wire entry. All string allocation happens here
+    // so the write lock below covers hashmap delta math only,
+    // instead of the whole apply loop. Holding the global lock
+    // across the full loop serialized every apply, and /metrics
+    // scrapes funnel through apply via the pull-on-scrape
+    // refresher, so they stalled behind it too (backlog #41g).
+    let mut prepared: Vec<PreparedEntry> = Vec::with_capacity(entries.len());
     for (name, label_pairs, value) in entries {
         let Some(order) = label_names(name) else {
             continue;
         };
-        // Reorder name=value pairs into positional values matching
-        // the registered order. Missing names get an empty string
-        // (the registered vec never accepts empty labels, so this
-        // will fail the `get_metric_with_label_values` check and
-        // be skipped — safe default).
-        let mut positional: Vec<String> = Vec::with_capacity(order.len());
-        for expected in order {
-            let v = label_pairs
-                .iter()
-                .find(|(n, _)| n.as_str() == *expected)
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default();
-            positional.push(v);
-        }
-
-        let lbl_key = key_from_positional(&positional);
-        let metric_state = worker_state.entry(name.clone()).or_default();
-        let prev = metric_state.get(&lbl_key).copied().unwrap_or(0);
-        if *value <= prev {
-            continue;
-        }
-        let delta = *value - prev;
-        metric_state.insert(lbl_key, *value);
-
-        let label_refs: Vec<&str> = positional.iter().map(|s| s.as_str()).collect();
-        let vec: &IntCounterVec = match name.as_str() {
+        let vec: &'static IntCounterVec = match name.as_str() {
             "lorica_cache_predictor_bypass_total" => &CACHE_PREDICTOR_BYPASS_TOTAL,
             "lorica_header_rule_match_total" => &HEADER_RULE_MATCH_TOTAL,
             "lorica_canary_split_selected_total" => &CANARY_SPLIT_SELECTED_TOTAL,
@@ -597,6 +594,60 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
             "lorica_bot_challenge_total" => &BOT_CHALLENGE_TOTAL,
             _ => continue,
         };
+        // Reorder name=value pairs into positional values matching
+        // the registered order. Missing names get an empty string
+        // (the registered vec never accepts empty labels, so this
+        // will fail the `get_metric_with_label_values` check in
+        // phase 3 and be skipped - safe default).
+        let mut positional: Vec<String> = Vec::with_capacity(order.len());
+        for expected in order {
+            let v = label_pairs
+                .iter()
+                .find(|(n, _)| n.as_str() == *expected)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            positional.push(v);
+        }
+        let label_key = key_from_positional(&positional);
+        prepared.push(PreparedEntry {
+            metric_name: name.clone(),
+            label_key,
+            positional,
+            value: *value,
+            vec,
+        });
+    }
+
+    // Phase 2 - tight critical section. Compute per-label deltas
+    // against the worker's last-known snapshot and record the new
+    // values: HashMap moves and u64 math only, no string building
+    // and no prometheus calls under the lock. Note this MERGES
+    // into the existing worker state rather than swapping it out
+    // wholesale - a label combo absent from this report keeps its
+    // previous value, otherwise the next report carrying it again
+    // would re-apply the full count as a fresh delta.
+    let mut to_apply: Vec<(&'static IntCounterVec, Vec<String>, u64)> =
+        Vec::with_capacity(prepared.len());
+    {
+        let mut map = SUPERVISOR_GENERIC_SNAPSHOT.write();
+        let worker_state = map.entry(worker_id).or_default();
+        for entry in prepared {
+            let metric_state = worker_state.entry(entry.metric_name).or_default();
+            let prev = metric_state.get(&entry.label_key).copied().unwrap_or(0);
+            if entry.value <= prev {
+                continue;
+            }
+            let delta = entry.value - prev;
+            metric_state.insert(entry.label_key, entry.value);
+            to_apply.push((entry.vec, entry.positional, delta));
+        }
+    }
+
+    // Phase 3 - no lock held. Counter increments are atomic and the
+    // deltas were computed atomically in phase 2, so interleaving
+    // with a concurrent apply still converges to the same sums.
+    for (vec, positional, delta) in to_apply {
+        let label_refs: Vec<&str> = positional.iter().map(|s| s.as_str()).collect();
         if vec.get_metric_with_label_values(&label_refs).is_ok() {
             vec.with_label_values(&label_refs).inc_by(delta);
         }
@@ -640,6 +691,29 @@ pub fn inc_notifier_events_dropped(reason: &str, count: u64) {
     NOTIFIER_EVENTS_DROPPED_TOTAL
         .with_label_values(&[reason])
         .inc_by(count);
+}
+
+/// Counter: log writes dropped because the background log writer
+/// queue was full (backlog #24). Non-zero values mean the SQLite
+/// writer cannot keep up with sustained request volume; the proxy
+/// keeps serving and sheds forensics rows instead of latency.
+static LOG_WRITE_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "log_write_dropped_total",
+            "Access-log entries and WAF events dropped on log-writer queue overflow (kind=access|waf)"
+        )
+        .namespace("lorica"),
+        &["kind"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Bump the dropped-log-write counter for `kind` (`"access"` or `"waf"`).
+pub fn inc_log_write_dropped(kind: &str) {
+    LOG_WRITE_DROPPED_TOTAL.with_label_values(&[kind]).inc();
 }
 
 /// Counter: log-stream WebSocket entries dropped because a
@@ -829,9 +903,7 @@ static RESOLVER_APPLY_FAILED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// Record one resolver-apply failure. `kind` is one of `geoip`,
 /// `asn`, `otel`, `bot_secret`.
 pub fn inc_resolver_apply_failed(kind: &str) {
-    RESOLVER_APPLY_FAILED_TOTAL
-        .with_label_values(&[kind])
-        .inc();
+    RESOLVER_APPLY_FAILED_TOTAL.with_label_values(&[kind]).inc();
 }
 
 /// Counter: bot verdict cross-worker propagation RPCs (worker ->
