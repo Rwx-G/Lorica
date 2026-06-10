@@ -13,6 +13,7 @@ use lorica_config::models::CertExportAcl;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
 
@@ -113,9 +114,11 @@ pub async fn create_acl(
         allowed_gid: body.allowed_gid,
         created_at: Utc::now(),
     };
-    let store = state.store.lock().await;
-    store.create_cert_export_acl(&acl)?;
-    drop(store);
+    let acl = db_blocking(&state.store, move |store| {
+        store.create_cert_export_acl(&acl)?;
+        Ok::<_, lorica_config::ConfigError>(acl)
+    })
+    .await?;
     Ok(json_data_with_status(
         StatusCode::CREATED,
         AclResponse {
@@ -132,8 +135,7 @@ pub async fn create_acl(
 pub async fn list_acls(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let acls = store.list_cert_export_acls()?;
+    let acls = db_blocking(&state.store, move |store| store.list_cert_export_acls()).await?;
     let items: Vec<AclResponse> = acls
         .into_iter()
         .map(|a| AclResponse {
@@ -152,9 +154,11 @@ pub async fn delete_acl(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    store.delete_cert_export_acl(&id)?;
-    drop(store);
+    let id = db_blocking(&state.store, move |store| {
+        store.delete_cert_export_acl(&id)?;
+        Ok::<_, lorica_config::ConfigError>(id)
+    })
+    .await?;
     Ok(json_data(serde_json::json!({ "deleted": id })))
 }
 
@@ -166,11 +170,13 @@ pub async fn delete_acl(
 pub async fn reapply(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let settings = store.get_global_settings()?;
-    let acls = store.list_cert_export_acls().unwrap_or_default();
-    let certs = store.list_certificates()?;
-    drop(store);
+    let (settings, acls, certs) = db_blocking(&state.store, move |store| {
+        let settings = store.get_global_settings()?;
+        let acls = store.list_cert_export_acls().unwrap_or_default();
+        let certs = store.list_certificates()?;
+        Ok::<_, lorica_config::ConfigError>((settings, acls, certs))
+    })
+    .await?;
     let (ok, err, skipped) = crate::cert_export::reexport_all(&settings, &acls, &certs).await;
     Ok(json_data(serde_json::json!({
         "enabled": settings.cert_export_enabled,
@@ -202,10 +208,12 @@ pub struct OrphanResponse {
 pub async fn list_orphans(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let settings = store.get_global_settings()?;
-    let certs = store.list_certificates()?;
-    drop(store);
+    let (settings, certs) = db_blocking(&state.store, move |store| {
+        let settings = store.get_global_settings()?;
+        let certs = store.list_certificates()?;
+        Ok::<_, lorica_config::ConfigError>((settings, certs))
+    })
+    .await?;
     let orphans = crate::cert_export::scan_orphans(&settings, &certs)
         .map_err(|e| ApiError::Internal(format!("cert-export orphan scan failed: {e}")))?;
     let items: Vec<OrphanResponse> = orphans
@@ -230,10 +238,12 @@ pub async fn delete_orphan(
     Extension(state): Extension<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let settings = store.get_global_settings()?;
-    let certs = store.list_certificates()?;
-    drop(store);
+    let (settings, certs) = db_blocking(&state.store, move |store| {
+        let settings = store.get_global_settings()?;
+        let certs = store.list_certificates()?;
+        Ok::<_, lorica_config::ConfigError>((settings, certs))
+    })
+    .await?;
     let removed =
         crate::cert_export::delete_orphan(&settings, &certs, &name).map_err(|e| match e {
             crate::cert_export::ExportError::InvalidHostname(_) => {

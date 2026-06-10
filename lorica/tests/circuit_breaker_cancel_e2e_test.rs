@@ -27,7 +27,7 @@
 #![cfg(unix)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,6 +89,10 @@ async fn abort_inflight_request(port: u16) {
     // Let the proxy select the backend, dial the (slow) origin, and enter the
     // duplex loop, so the abort lands strictly mid-flight.
     tokio::time::sleep(Duration::from_millis(120)).await;
+    // Tokio deprecated set_linger because SO_LINGER can block the thread
+    // on drop; a 0-second linger never blocks, and the RST it forces on
+    // drop is exactly the client-abort signal this test simulates.
+    #[allow(deprecated)]
     let _ = stream.set_linger(Some(Duration::from_secs(0)));
     drop(stream);
     // Small gap so the proxy finishes its failure bookkeeping before the next

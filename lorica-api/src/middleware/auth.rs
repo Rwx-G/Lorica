@@ -122,16 +122,19 @@ impl SessionStore {
             expires_at: now + Duration::minutes(SESSION_TIMEOUT_MINUTES),
         };
 
-        // Persist to SQLite
+        // Persist to SQLite (blocking pool: a contended WAL must not
+        // stall the reactor, audit H-3 / backlog #31)
         {
-            let store = self.db.lock().await;
-            if let Err(e) = store.save_session(
-                &session_id,
-                &user_id,
-                &username,
-                &session.created_at,
-                &session.expires_at,
-            ) {
+            let sid = session_id.clone();
+            let uid = user_id.clone();
+            let uname = username.clone();
+            let created_at = session.created_at;
+            let expires_at = session.expires_at;
+            let persisted = crate::db::db_blocking(&self.db, move |store| {
+                store.save_session(&sid, &uid, &uname, &created_at, &expires_at)
+            })
+            .await;
+            if let Err(e) = persisted {
                 tracing::warn!(error = %e, "failed to persist session to database");
             }
         }
@@ -158,17 +161,18 @@ impl SessionStore {
                 let db = self.db.clone();
                 let sid = session_id.to_string();
                 self.task_tracker.spawn(async move {
-                    let store = db.lock().await;
-                    let _ = store.delete_session(&sid);
+                    let _ =
+                        crate::db::db_blocking(&db, move |store| store.delete_session(&sid)).await;
                 });
                 return None;
             }
         }
 
-        // Fallback: check database
-        let session = {
-            let store = self.db.lock().await;
-            match store.get_session(session_id) {
+        // Fallback: check database (blocking pool; a DB error or join
+        // failure reads as "no session", same as before)
+        let sid = session_id.to_string();
+        let session = crate::db::db_blocking(&self.db, move |store| {
+            Ok::<_, ApiError>(match store.get_session(&sid) {
                 Ok(Some((user_id, username, created_at, expires_at))) => {
                     if expires_at > Utc::now() {
                         Some(Session {
@@ -178,13 +182,16 @@ impl SessionStore {
                             expires_at,
                         })
                     } else {
-                        let _ = store.delete_session(session_id);
+                        let _ = store.delete_session(&sid);
                         None
                     }
                 }
                 _ => None,
-            }
-        };
+            })
+        })
+        .await
+        .ok()
+        .flatten();
 
         // Populate cache if found in DB
         if let Some(ref s) = session {
@@ -200,8 +207,8 @@ impl SessionStore {
     /// Remove a session.
     pub async fn remove(&self, session_id: &str) {
         self.sessions.lock().await.remove(session_id);
-        let store = self.db.lock().await;
-        let _ = store.delete_session(session_id);
+        let sid = session_id.to_string();
+        let _ = crate::db::db_blocking(&self.db, move |store| store.delete_session(&sid)).await;
     }
 
     /// Renew a session's expiry (sliding window).
@@ -214,8 +221,10 @@ impl SessionStore {
             let db = self.db.clone();
             let sid = session_id.to_string();
             self.task_tracker.spawn(async move {
-                let store = db.lock().await;
-                let _ = store.update_session_expiry(&sid, &new_expiry);
+                let _ = crate::db::db_blocking(&db, move |store| {
+                    store.update_session_expiry(&sid, &new_expiry)
+                })
+                .await;
             });
         }
     }
@@ -238,8 +247,10 @@ impl SessionStore {
         let uid = user_id.to_string();
         let keep = keep_session_id.to_string();
         self.task_tracker.spawn(async move {
-            let store = db.lock().await;
-            let _ = store.delete_sessions_for_user_except(&uid, &keep);
+            let _ = crate::db::db_blocking(&db, move |store| {
+                store.delete_sessions_for_user_except(&uid, &keep)
+            })
+            .await;
         });
     }
 
@@ -250,7 +261,7 @@ impl SessionStore {
     /// `create(...)` to mint a fresh session + `Set-Cookie` on
     /// the response so the legitimate user stays logged in.
     ///
-    /// The DB purge runs **synchronously** here, not spawned, so
+    /// The DB purge is **awaited** here, not fire-and-forget, so
     /// an immediate follow-up `get(old_session_id)` call cannot
     /// re-hydrate the deleted row from the DB fallback path.
     /// Latency impact: one SQLite DELETE (~1 ms on a warm page
@@ -260,8 +271,11 @@ impl SessionStore {
             let mut sessions = self.sessions.lock().await;
             sessions.retain(|_sid, session| session.user_id != user_id);
         }
-        let store = self.db.lock().await;
-        let _ = store.delete_all_sessions_for_user(user_id);
+        let uid = user_id.to_string();
+        let _ = crate::db::db_blocking(&self.db, move |store| {
+            store.delete_all_sessions_for_user(&uid)
+        })
+        .await;
     }
 
     /// Remove all expired sessions from memory and database.
@@ -275,8 +289,7 @@ impl SessionStore {
         if purged > 0 {
             let db = self.db.clone();
             self.task_tracker.spawn(async move {
-                let store = db.lock().await;
-                let _ = store.cleanup_expired_sessions();
+                let _ = crate::db::db_blocking(&db, |store| store.cleanup_expired_sessions()).await;
             });
         }
 

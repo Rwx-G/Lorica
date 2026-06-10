@@ -19,6 +19,7 @@ use axum::Json;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
@@ -195,10 +196,9 @@ pub(super) async fn provision_with_acme(
     }
 
     if ready_status != OrderStatus::Ready {
-        return Err(format!(
-            "ACME challenge validation did not reach Ready: {ready_status:?}"
-        )
-        .into());
+        return Err(
+            format!("ACME challenge validation did not reach Ready: {ready_status:?}").into(),
+        );
     }
 
     // Generate CSR with all domains as SANs and finalize order.
@@ -252,10 +252,12 @@ pub(super) async fn provision_with_acme(
         acme_dns_provider_id: None,
     };
 
-    let store = state.store.lock().await;
-    store.create_certificate(&cert)?;
-    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
-    drop(store);
+    let (cert, export_snapshot) = db_blocking(&state.store, move |store| {
+        store.create_certificate(&cert)?;
+        let snapshot = crate::cert_export::snapshot_export_inputs(store);
+        Ok::<_, ApiError>((cert, snapshot))
+    })
+    .await?;
     // v1.5.1 audit M-9 : disk export off-loaded to spawn_blocking
     // and dispatched AFTER the store mutex is released.
     if let Some((settings, acls)) = export_snapshot {

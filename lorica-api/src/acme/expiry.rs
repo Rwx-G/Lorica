@@ -16,6 +16,8 @@
 
 use tracing::{info, warn};
 
+use crate::db::db_blocking;
+use crate::error::ApiError;
 use crate::server::AppState;
 
 /// Check all certificates for upcoming expiration and dispatch alerts.
@@ -24,23 +26,32 @@ use crate::server::AppState;
 /// It reads `cert_warning_days` and `cert_critical_days` from `GlobalSettings`
 /// and sends `CertExpiring` alerts for every certificate within those thresholds.
 pub async fn check_cert_expiry(state: &AppState, alert_sender: &lorica_notify::AlertSender) {
-    let (certs, settings) = {
-        let store = state.store.lock().await;
-        let certs = match store.list_certificates() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, "cert expiry check: failed to list certificates");
-                return;
-            }
-        };
-        let settings = match store.get_global_settings() {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "cert expiry check: failed to load global settings");
-                return;
-            }
-        };
-        (certs, settings)
+    // Single store acquisition for both reads, as before; the inner
+    // Results come back out so each failure keeps its own log line.
+    let (certs_result, settings_result) = match db_blocking(&state.store, |store| {
+        Ok::<_, ApiError>((store.list_certificates(), store.get_global_settings()))
+    })
+    .await
+    {
+        Ok(results) => results,
+        Err(e) => {
+            warn!(error = %e, "cert expiry check: store access failed");
+            return;
+        }
+    };
+    let certs = match certs_result {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "cert expiry check: failed to list certificates");
+            return;
+        }
+    };
+    let settings = match settings_result {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "cert expiry check: failed to load global settings");
+            return;
+        }
     };
 
     let warning_days = i64::from(settings.cert_warning_days);

@@ -19,6 +19,7 @@ use axum::Json;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
@@ -68,12 +69,14 @@ pub async fn provision_certificate_dns(
     // Resolve DNS config: either from a global provider or inline credentials
     let (dns_config, dns_provider_id) = if let Some(ref provider_id) = body.dns_provider_id {
         // New approach: look up global DNS provider
-        let store = state.store.lock().await;
-        let provider = store
-            .get_dns_provider(provider_id)
-            .map_err(|e| ApiError::Internal(format!("failed to fetch DNS provider: {e}")))?
-            .ok_or_else(|| ApiError::NotFound(format!("dns_provider {provider_id}")))?;
-        drop(store);
+        let pid = provider_id.clone();
+        let provider = db_blocking(&state.store, move |store| {
+            store
+                .get_dns_provider(&pid)
+                .map_err(|e| ApiError::Internal(format!("failed to fetch DNS provider: {e}")))?
+                .ok_or_else(|| ApiError::NotFound(format!("dns_provider {pid}")))
+        })
+        .await?;
         let config: DnsChallengeConfig = serde_json::from_str(&provider.config)
             .map_err(|e| ApiError::Internal(format!("invalid DNS provider config: {e}")))?;
         (config, Some(provider_id.clone()))
@@ -282,10 +285,9 @@ pub(super) async fn provision_with_acme_dns(
 
     let ready_status = ready_status?;
     if ready_status != OrderStatus::Ready {
-        return Err(format!(
-            "DNS-01 challenge validation did not reach Ready: {ready_status:?}"
-        )
-        .into());
+        return Err(
+            format!("DNS-01 challenge validation did not reach Ready: {ready_status:?}").into(),
+        );
     }
 
     // (TXT-record cleanup already happened just before the
@@ -339,10 +341,12 @@ pub(super) async fn provision_with_acme_dns(
         acme_dns_provider_id: dns_provider_id,
     };
 
-    let store = state.store.lock().await;
-    store.create_certificate(&cert)?;
-    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
-    drop(store);
+    let (cert, export_snapshot) = db_blocking(&state.store, move |store| {
+        store.create_certificate(&cert)?;
+        let snapshot = crate::cert_export::snapshot_export_inputs(store);
+        Ok::<_, ApiError>((cert, snapshot))
+    })
+    .await?;
     // v1.5.1 audit M-9 : run the disk export in `spawn_blocking`
     // AFTER releasing the store mutex so concurrent API handlers
     // do not block on the cross-mount EXDEV `copy + fsync + rename`

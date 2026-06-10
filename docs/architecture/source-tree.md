@@ -1,239 +1,68 @@
 # Source Tree
 
-> **Status: HISTORICAL (v1.0 baseline) — partially out of date as of v1.5.2.**
->
-> This document was authored against the v1.0 workspace layout and has
-> drifted in several places (audit M-24, v1.5.2). Rather than chase a
-> moving target by re-flowing the entire tree on every release, treat
-> this file as a high-level orientation map ; for the **canonical
-> current layout** consult the workspace itself :
->
-> - **Native crates** : `ls lorica*/src/` shows the actual module
->   layout (notably `lorica-config/src/store/` is now a 17-module
->   directory, not a single file ; `lorica/src/proxy_wiring/` is a
->   sub-tree of helpers ; `lorica-api/src/acme/` is a 9-file directory
->   including `dns_challengers/`).
-> - **Migrations** : `lorica-config/src/migrations/` carries 19 files
->   today (001 through 019), not the 6 listed below.
-> - **Frontend** : `lorica-dashboard/frontend/src/lib/api.ts` exposes
->   ~78 distinct paths / 104 operations as of v1.5.2 (cross-checked
->   against `lorica-api/openapi.yaml`) ; the per-section breakdown
->   below was a v1.0 snapshot.
-> - **Notification channels** : `lorica-notify/src/channels/` includes
->   `slack.rs` since v1.4.0 (in addition to `stdout`, `email`, and
->   `webhook`).
->
-> A full rewrite is `feat`-shaped (touches a 200-line doc with
-> hand-walked file paths) and tracked in `docs/backlog.md` as a
-> v1.6.0 candidate ; for now, prefer reading the actual `tree`
-> output, the `BUMP-CHECKLIST.md` (which lists every versionable
-> file), and the `CHANGELOG.md` (which calls out architectural moves
-> per release). The high-level "what crate does what" intent below is
-> still a useful first read.
+Crate-responsibility map for the Lorica workspace. This document
+deliberately stops at crate / top-level-module granularity: per-file
+enumerations drift on every release (the v1.0 version of this file
+was flagged stale by two audits). For the exact current layout,
+`ls <crate>/src/` is authoritative; `docs/BUMP-CHECKLIST.md` lists
+every file that pins the product version; `CHANGELOG.md` records
+architectural moves per release.
 
-## Workspace Structure
+## Product crates (follow the product version)
 
-```
-lorica/
-  Cargo.toml                    # Workspace root
-  NOTICE                        # Cloudflare Pingora attribution
-  LICENSE                       # Apache-2.0
-  CHANGELOG.md
-  README.md
+| Crate | Responsibility |
+|-------|----------------|
+| `lorica` | The binary. `main.rs` is ~70 LOC of dispatch; `cli.rs` holds the clap surface + rotate-key / unban subcommands; `startup/` holds the three run modes (`supervisor.rs`, `worker.rs`, `single.rs`) plus the shared background-task helpers (`mod.rs`, audit H-9: one source of truth per spawn cluster); `proxy_wiring.rs` + `proxy_wiring/` hold the data plane (see below); `health.rs` the prober; `reload.rs` config/cert hot-reload; `bot.rs`/`bot_rdns.rs` bot-protection stash + rDNS; `connection_filter.rs`, `geoip.rs`, `mtls.rs`, `otel.rs` what their names say. |
+| `lorica-config` | SQLite `ConfigStore` (per-entity submodules under `src/store/`, migrations under `src/migrations/`), config models, encryption-at-rest helpers. Sole DB access point for configuration. |
+| `lorica-api` | Management plane: axum router + `AppState` (`server.rs`), per-domain handler modules, `middleware/` (sessions, rate limit), `acme/` (issuance / renewal / challengers), `db.rs` (blocking-pool store access, audit H-3), `log_store.rs` + `log_writer.rs` (persistent access/WAF logs + batched background writer, backlog #24), `metrics.rs` (Prometheus registry). |
+| `lorica-waf` | WAF engine: rule set, evaluation (`engine/`), IP blocklist, event types. |
+| `lorica-notify` | Alert events + notification channels (stdout, email, webhook, slack). |
+| `lorica-bench` | Passive SLA collection, active probes, load-test engine + scheduler. |
+| `lorica-dashboard` | Svelte 5 frontend (`frontend/`) embedded into the binary via `build.rs` + rust-embed; serves the SPA and the CSP header. |
+| `lorica-challenge` | Bot challenges: PoW + image captcha generation, verdict cookie HMAC. |
+| `lorica-geoip` | GeoIP / ASN MMDB resolvers with hot-swappable process-wide handles. |
+| `lorica-shmem` | Cross-worker shared-memory region (WAF auto-ban counters, rate-limit buckets). |
 
-  lorica/                       # Main binary crate
-    Cargo.toml
-    src/
-      main.rs                   # Entry point, CLI, orchestration
-      proxy.rs                  # ProxyHttp trait implementation
-      signals.rs                # Signal handling (SIGTERM, SIGQUIT, SIGINT)
+## `lorica/src/proxy_wiring/` (data plane, backlog #7 layout)
 
-  lorica-core/                  # Fork of pingora-core
-    Cargo.toml
-    src/                        # (preserved Pingora structure)
-      server/
-      protocols/
-      connectors/
-      listeners/
-      apps/
-      services/
-      modules/
-      upstreams/
+| Module | Responsibility |
+|--------|----------------|
+| `proxy_wiring.rs` (root) | `LoricaProxy` struct, spawn helpers, cache statics, the `ProxyHttp` trait impl (request_filter orchestration, upstream_peer, response filters, logging), public re-exports. |
+| `config.rs` | `ProxyConfig` / `RouteEntry` / smooth-WRR state, route-table construction, `find_route`. |
+| `filters.rs` | The request_filter stage methods (`check_*`, audit H-8) + `write_error_response` (audit H-10) + WAF event persistence hand-off. |
+| `lb.rs` | Peak-EWMA tracker, per-(route, backend) circuit breaker. |
+| `context.rs` | Per-request `RequestCtx`. |
+| `worker_rpc.rs` | Worker-side RPC: two-phase config reload, metrics report. |
+| `engines.rs` | Mode-switching engines (local vs supervisor-RPC: rate limit, verdict cache, breaker). |
+| `helpers.rs`, `error_pages.rs`, `forward_auth.rs`, `mirror_rewrite.rs`, `bot_handlers.rs` | Shared pure helpers, error-page rendering, forward-auth client, request mirroring + response rewriting, bot solve/captcha handlers. |
+| `tests.rs`, `cert_reload_commit_tests.rs` | Unit + regression tests for the above. |
 
-  lorica-proxy/                 # Fork of pingora-proxy
-  lorica-http/                  # Fork of pingora-http
-  lorica-error/                 # Fork of pingora-error
-  lorica-pool/                  # Fork of pingora-pool
-  lorica-runtime/               # Fork of pingora-runtime
-  lorica-timeout/               # Fork of pingora-timeout
-  lorica-tls/                   # Fork of pingora-rustls (sole TLS backend)
-  lorica-lb/                    # Fork of pingora-load-balancing
-  lorica-ketama/                # Fork of pingora-ketama
-  lorica-limits/                # Fork of pingora-limits
-  lorica-header-serde/          # Fork of pingora-header-serde
+## Forked crates (Pingora forks, pinned at 0.1.0)
 
-  lorica-cache/                 # Fork of pingora-cache (HTTP response caching)
-  lorica-memory-cache/          # Fork of pingora-memory-cache
-  lorica-lru/                   # Fork of pingora-lru
-  tinyufo/                      # Cache eviction algorithm (upstream)
+`lorica-core`, `lorica-proxy`, `lorica-http`, `lorica-error`,
+`lorica-tls`, `lorica-lb`, `lorica-cache`, `lorica-memory-cache`,
+`lorica-lru`, `lorica-ketama`, `lorica-limits`, `lorica-timeout`,
+`lorica-pool`, `lorica-runtime`, `lorica-header-serde`, `tinyufo`
+preserve upstream Pingora structure to stay rebaseable. `lorica-tls`
+additionally carries the native cert resolver + OCSP stapling;
+`lorica-worker`, `lorica-command` are first-party process/IPC crates
+that live at 0.1.0 alongside the forks (see backlog #42d for the
+version-tier cleanup).
 
-  lorica-config/                # NEW - Config state & persistence
-    Cargo.toml
-    src/
-      lib.rs
-      models.rs                 # Route, Backend, Certificate, SLA, Probe, LoadTest models
-      store.rs                  # ConfigStore - CRUD operations
-      crypto.rs                 # AES-256-GCM encryption for private keys
-      diff.rs                   # ConfigDiff - minimal changeset generation
-      export.rs                 # TOML export
-      import.rs                 # TOML import + validation
-      error.rs                  # ConfigError types
-      migrations/               # SQL migration files
-        001_initial.sql
-        002_add_health_check_path.sql
-        003_sla_metrics.sql
-        004_probe_configs.sql
-        005_load_tests.sql
-        006_sla_bucket_config_snapshot.sql
+## Tests
 
-  lorica-api/                   # NEW - REST API
-    Cargo.toml
-    src/
-      lib.rs
-      server.rs                 # axum server setup, management listener
-      auth.rs                   # Login, sessions, password management
-      routes.rs                 # /api/v1/routes endpoints
-      backends.rs               # /api/v1/backends endpoints
-      certificates.rs           # /api/v1/certificates endpoints
-      status.rs                 # /api/v1/status
-      system.rs                 # /api/v1/system (CPU, RAM, disk)
-      logs.rs                   # /api/v1/logs endpoint + WebSocket
-      config.rs                 # /api/v1/config/export, import
-      settings.rs               # /api/v1/settings, notifications, preferences
-      waf.rs                    # /api/v1/waf (events, rules, blocklist, custom rules)
-      acme.rs                   # /api/v1/acme (Let's Encrypt HTTP-01 + DNS-01)
-      metrics.rs                # /metrics (Prometheus exposition)
-      workers.rs                # /api/v1/workers (worker heartbeat status)
-      sla.rs                    # /api/v1/sla (passive/active SLA monitoring)
-      probes.rs                 # /api/v1/probes (active health probes)
-      loadtest.rs               # /api/v1/loadtest (load test engine + SSE)
-      error.rs                  # ApiError types, JSON envelope helpers
-      middleware/
-        auth.rs                 # Session validation middleware
-        rate_limit.rs           # Rate limiting for login
+Test files mirror the source tree: unit tests live in
+`#[cfg(test)]` modules beside the code (or sibling `*_tests.rs`
+files for large regression suites), integration tests in each
+crate's `tests/`, end-to-end Docker suites in `tests-e2e-docker/`,
+frontend tests beside their components (`Foo.svelte` /
+`Foo.test.ts`). A new test goes in the same directory layout as the
+code under test.
 
-  lorica-dashboard/             # NEW - Embedded frontend
-    Cargo.toml
-    src/
-      lib.rs                    # rust-embed setup, asset serving
-    frontend/                   # Svelte 5 + TypeScript dashboard
-      package.json
-      index.html
-      vite.config.ts
-      src/
-        main.ts                 # App entry point
-        App.svelte              # Root with session check and theme loader
-        app.css                 # Design system (tokens, themes, shared styles)
-        lib/
-          api.ts                # Typed API client (76 endpoints)
-          auth.ts               # Auth state store
-          router.ts             # Hash-based routing
-        components/
-          Nav.svelte            # Sidebar navigation (11 entries)
-          Card.svelte           # Metric card with color variants
-          StatusBadge.svelte    # Health status dot + label
-          CertExpiryBadge.svelte # Certificate expiry countdown
-          ConfirmDialog.svelte  # Delete confirmation modal
-          ShieldIcon.svelte     # Brand icon
-        routes/
-          Login.svelte          # Authentication
-          PasswordChange.svelte # Forced password change
-          Dashboard.svelte      # Layout + routing
-          Overview.svelte       # Status cards summary
-          Routes.svelte         # Route CRUD with backend/cert/WAF config
-          Backends.svelte       # Backend CRUD with health checks
-          Certificates.svelte   # Cert CRUD + self-signed + ACME provisioning
-          Security.svelte       # WAF events/rules/custom rules/IP blocklist
-          Sla.svelte            # Passive/active SLA comparison + config + export
-          Probes.svelte         # Active probe CRUD
-          LoadTest.svelte       # Load test config/run/SSE streaming/results
-          Logs.svelte           # Real-time WebSocket access logs
-          System.svelte         # CPU/RAM/disk gauges + workers
-          Settings.svelte       # Config, notifications, preferences, import/export
-          Placeholder.svelte    # 404 fallback
-      dist/                     # Build output - embedded by rust-embed
+## Packaging
 
-  lorica-command/               # NEW (Phase 2) - Command channel
-    Cargo.toml
-    src/
-      lib.rs
-      channel.rs                # Unix socket channel with protobuf framing
-      messages.rs               # Protobuf message definitions
-      proto/
-        command.proto           # Protobuf schema
-
-  lorica-worker/                # NEW (Phase 2) - Process isolation
-    Cargo.toml
-    src/
-      lib.rs
-      manager.rs                # WorkerManager - fork, monitor, restart
-      fd_passing.rs             # SCM_RIGHTS FD transfer
-
-  lorica-waf/                   # NEW - WAF engine
-    Cargo.toml
-    src/
-      lib.rs
-      engine.rs                 # Rule evaluation engine with custom rule support
-      rules.rs                  # 49 OWASP-inspired regex rules (46 general + 3 header-scoped)
-      ip_blocklist.rs           # IPv4 blocklist (~80k IPs from Data-Shield)
-
-  lorica-bench/                 # NEW - SLA monitoring & load testing
-    Cargo.toml
-    src/
-      lib.rs
-      passive_sla.rs            # Lock-free metrics collection from real traffic
-      active_probes.rs          # Synthetic probe scheduler and executor
-      load_test.rs              # Load test engine with safe limits and CPU circuit breaker
-      results.rs                # SLA time-window queries
-      scheduler.rs              # Cron-based load test scheduling
-
-  lorica-notify/                # NEW - Notification channels
-    Cargo.toml
-    src/
-      lib.rs
-      events.rs                 # AlertEvent types
-      channels/
-        stdout.rs               # JSON structured log events
-        email.rs                # SMTP notifications
-        webhook.rs              # HTTP webhook notifications
-
-  dist/                         # Distribution files
-    lorica.service              # systemd unit file
-    debian/                     # .deb package config
-    rpm/                        # RPM package config
-    build-deb.sh                # Debian package build script
-    build-rpm.sh                # RPM package build script
-
-  fuzz/                         # Fuzz testing targets
-    fuzz_targets/               # cargo-fuzz entry points
-
-  tests-e2e-docker/             # End-to-end tests (Docker Compose)
-    docker-compose.yml          # Service definitions
-    Dockerfile                  # Multi-stage Lorica build
-    run.sh                      # Test orchestrator (--keep, --build, --skip-workers)
-    test-runner/
-      run-tests.sh              # 26-section single-process test suite
-      run-tests-workers.sh      # 6-section worker isolation tests
-    backend/                    # Python mock backend for testing
-
-  docs/                         # Project documentation
-    security/
-      threat-model.md           # Threat categories and mitigations
-      hardening-guide.md        # Production deployment security guide
-```
-
-## Integration Guidelines
-
-- **File Naming:** snake_case for all Rust files, matching Pingora convention. Frontend follows its framework's convention.
-- **Folder Organization:** Each concern in its own crate. Forked crates preserve Pingora's internal structure. New crates follow Rust module conventions.
-- **Import/Export Patterns:** All inter-crate dependencies via Cargo.toml. No circular dependencies. Forked crates depend on other forked crates. New crates depend on forked crates but not vice versa (product layer wraps engine, engine doesn't know about product).
+`dist/` holds the `.deb` build script (`build-deb.sh`), the RPM spec
+(`rpm/lorica.spec`), and the hardened systemd unit
+(`lorica.service`). `Dockerfile` (release) and `Dockerfile.dev`
+must list every workspace member; a missing `COPY` breaks
+`cargo build --workspace` in Docker.

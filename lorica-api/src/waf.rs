@@ -14,12 +14,11 @@
 
 //! WAF security events API for the management dashboard.
 
-use std::sync::Arc;
-
 use axum::extract::{Extension, Query};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::db::{db_blocking, log_db_blocking};
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 use lorica_waf::WafEvent;
@@ -68,12 +67,11 @@ pub async fn get_waf_events(
     // post-query for the in-memory fallback.
     let events = if let Some(ref store) = state.log_store {
         // Off the tokio worker (audit M-7 / backlog #23).
-        let store = Arc::clone(store);
         let category = params.category.clone();
-        tokio::task::spawn_blocking(move || store.list_waf_events(limit, category.as_deref()))
-            .await
-            .map_err(|e| ApiError::Internal(format!("waf event query join failed: {e}")))?
-            .map_err(|e| ApiError::Internal(format!("waf event query failed: {e}")))?
+        log_db_blocking(store, move |s| {
+            s.list_waf_events(limit, category.as_deref())
+        })
+        .await?
     } else if let Some(ref waf_buffer) = state.waf_event_buffer {
         let buf = waf_buffer.lock();
         let iter = buf.iter().rev();
@@ -115,10 +113,10 @@ pub async fn get_waf_stats(
         // Off the tokio worker. COUNT(*) + GROUP BY can scan the
         // whole waf_events table under retention (up to 100 000
         // rows by default).
-        let store = Arc::clone(store);
-        let stats = tokio::task::spawn_blocking(move || store.waf_event_stats())
-            .await
-            .map_err(|e| ApiError::Internal(format!("waf stats join failed: {e}")))?;
+        // The query Result is passed through untouched so a query
+        // error still falls back to empty stats below; only a join
+        // failure is a hard error, as before.
+        let stats = log_db_blocking(store, move |s| Ok(s.waf_event_stats())).await?;
         match stats {
             Ok((total, cats)) => {
                 let by_cat = cats
@@ -201,11 +199,14 @@ pub async fn toggle_waf_rule(
         return Err(ApiError::NotFound(format!("rule {rule_id} not found")));
     }
 
-    // Persist disabled rules so they survive restarts
+    // Persist disabled rules so they survive restarts (best-effort,
+    // as before: a store error does not fail the toggle)
     {
         let disabled_ids = engine.disabled_rule_ids();
-        let store = state.store.lock().await;
-        let _ = store.save_waf_disabled_rules(&disabled_ids);
+        let _ = db_blocking(&state.store, move |store| {
+            store.save_waf_disabled_rules(&disabled_ids)
+        })
+        .await;
     }
 
     state.notify_config_changed();
@@ -224,9 +225,16 @@ pub async fn clear_waf_events(
         buf.clear();
     }
     if let Some(ref store) = state.log_store {
-        store
-            .clear_waf_events()
-            .map_err(|e| ApiError::Internal(format!("failed to clear WAF events: {e}")))?;
+        // Drain queued WAF events before the wipe so in-flight rows
+        // cannot land right after the DELETE (backlog #24 barrier).
+        if let Some(ref writer) = state.log_writer {
+            let _ = writer.flush().await;
+        }
+        log_db_blocking(store, |s| {
+            s.clear_waf_events()
+                .map_err(|e| format!("failed to clear WAF events: {e}"))
+        })
+        .await?;
     }
     Ok(json_data(serde_json::json!({"cleared": true})))
 }
@@ -273,23 +281,26 @@ pub async fn create_custom_rule(
         )
         .map_err(ApiError::BadRequest)?;
 
-    // Persist custom rule to DB
-    {
-        let store = state.store.lock().await;
-        let _ = store.save_waf_custom_rule(
+    // Persist custom rule to DB (best-effort, as before). `body`
+    // moves into the closure; the response fields are kept first.
+    let rule_id = body.id;
+    let description = body.description.clone();
+    let _ = db_blocking(&state.store, move |store| {
+        store.save_waf_custom_rule(
             body.id,
             &body.description,
             &body.category,
             &body.pattern,
             body.severity.unwrap_or(3),
             true,
-        );
-    }
+        )
+    })
+    .await;
 
     state.notify_config_changed();
     Ok(json_data(serde_json::json!({
-        "id": body.id,
-        "description": body.description,
+        "id": rule_id,
+        "description": description,
         "created": true,
     })))
 }
@@ -321,11 +332,11 @@ pub async fn delete_custom_rule(
         .ok_or_else(|| ApiError::BadRequest("WAF engine not initialized".into()))?;
 
     if engine.remove_custom_rule(rule_id) {
-        // Remove from DB
-        {
-            let store = state.store.lock().await;
-            let _ = store.delete_waf_custom_rule(rule_id);
-        }
+        // Remove from DB (best-effort, as before)
+        let _ = db_blocking(&state.store, move |store| {
+            store.delete_waf_custom_rule(rule_id)
+        })
+        .await;
         state.notify_config_changed();
         Ok(json_data(
             serde_json::json!({"deleted": true, "id": rule_id}),
@@ -374,14 +385,17 @@ pub async fn toggle_blocklist(
     engine.ip_blocklist().set_enabled(body.enabled);
     let count = engine.ip_blocklist().len();
 
-    // Persist blocklist state so it survives restarts
-    {
-        let store = state.store.lock().await;
+    // Persist blocklist state so it survives restarts (best-effort,
+    // as before: store errors do not fail the toggle)
+    let enabled = body.enabled;
+    let _ = db_blocking(&state.store, move |store| {
         if let Ok(mut settings) = store.get_global_settings() {
-            settings.ip_blocklist_enabled = body.enabled;
+            settings.ip_blocklist_enabled = enabled;
             let _ = store.update_global_settings(&settings);
         }
-    }
+        Ok::<_, ApiError>(())
+    })
+    .await;
 
     // Notify workers so they apply the new blocklist state
     state.notify_config_changed();

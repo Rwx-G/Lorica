@@ -30,6 +30,7 @@ use lorica_config::store::new_id;
 use serde::Deserialize;
 use std::time::Duration;
 
+use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
 
@@ -37,10 +38,12 @@ use crate::server::AppState;
 pub async fn list_configs(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let configs = store
-        .list_load_test_configs()
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let configs = db_blocking(&state.store, move |store| {
+        store
+            .list_load_test_configs()
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
     Ok(json_data(configs))
 }
 
@@ -118,7 +121,11 @@ fn validate_target_url(
     // Effective port : explicit > scheme default. If neither yields
     // a parseable u16, fall back to the proxy's own listener for the
     // scheme so the operator's "no port" shorthand stays valid.
-    let effective_port = port.unwrap_or(if scheme_is_https { https_port } else { http_port });
+    let effective_port = port.unwrap_or(if scheme_is_https {
+        https_port
+    } else {
+        http_port
+    });
 
     if effective_port != http_port && effective_port != https_port {
         return Err(ApiError::BadRequest(format!(
@@ -164,9 +171,13 @@ pub async fn create_config(
     Extension(state): Extension<AppState>,
     Json(body): Json<CreateLoadTestConfig>,
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
-    let store = state.store.lock().await;
-    validate_target_url(&body.target_url, &store, state.http_port, state.https_port)?;
-    drop(store);
+    let target_url = body.target_url.clone();
+    let http_port = state.http_port;
+    let https_port = state.https_port;
+    db_blocking(&state.store, move |store| {
+        validate_target_url(&target_url, store, http_port, https_port)
+    })
+    .await?;
 
     let now = Utc::now();
     let config = LoadTestConfig {
@@ -186,10 +197,13 @@ pub async fn create_config(
         updated_at: now,
     };
 
-    let store = state.store.lock().await;
-    store
-        .create_load_test_config(&config)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let config = db_blocking(&state.store, move |store| {
+        store
+            .create_load_test_config(&config)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok::<_, ApiError>(config)
+    })
+    .await?;
 
     Ok(json_data_with_status(
         axum::http::StatusCode::CREATED,
@@ -230,53 +244,59 @@ pub async fn update_config(
     Path(id): Path<String>,
     Json(body): Json<UpdateLoadTestConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    if let Some(ref url) = body.target_url {
-        validate_target_url(url, &store, state.http_port, state.https_port)?;
-    }
-    let mut config = store
-        .get_load_test_config(&id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound(format!("load test config {id}")))?;
+    let http_port = state.http_port;
+    let https_port = state.https_port;
+    let config = db_blocking(&state.store, move |store| {
+        if let Some(ref url) = body.target_url {
+            validate_target_url(url, store, http_port, https_port)?;
+        }
+        let mut config = store
+            .get_load_test_config(&id)
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .ok_or_else(|| ApiError::NotFound(format!("load test config {id}")))?;
 
-    if let Some(v) = body.name {
-        config.name = v;
-    }
-    if let Some(v) = body.target_url {
-        config.target_url = v;
-    }
-    if let Some(v) = body.method {
-        config.method = v;
-    }
-    if let Some(v) = body.headers {
-        config.headers = v;
-    }
-    if let Some(v) = body.body {
-        config.body = Some(v);
-    }
-    if let Some(v) = body.concurrency {
-        config.concurrency = v;
-    }
-    if let Some(v) = body.requests_per_second {
-        config.requests_per_second = v;
-    }
-    if let Some(v) = body.duration_s {
-        config.duration_s = v;
-    }
-    if let Some(v) = body.error_threshold_pct {
-        config.error_threshold_pct = v;
-    }
-    if let Some(v) = body.schedule_cron {
-        config.schedule_cron = Some(v);
-    }
-    if let Some(v) = body.enabled {
-        config.enabled = v;
-    }
-    config.updated_at = Utc::now();
+        if let Some(v) = body.name {
+            config.name = v;
+        }
+        if let Some(v) = body.target_url {
+            config.target_url = v;
+        }
+        if let Some(v) = body.method {
+            config.method = v;
+        }
+        if let Some(v) = body.headers {
+            config.headers = v;
+        }
+        if let Some(v) = body.body {
+            config.body = Some(v);
+        }
+        if let Some(v) = body.concurrency {
+            config.concurrency = v;
+        }
+        if let Some(v) = body.requests_per_second {
+            config.requests_per_second = v;
+        }
+        if let Some(v) = body.duration_s {
+            config.duration_s = v;
+        }
+        if let Some(v) = body.error_threshold_pct {
+            config.error_threshold_pct = v;
+        }
+        if let Some(v) = body.schedule_cron {
+            config.schedule_cron = Some(v);
+        }
+        if let Some(v) = body.enabled {
+            config.enabled = v;
+        }
+        config.updated_at = Utc::now();
 
-    store
-        .update_load_test_config(&config)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        store
+            .update_load_test_config(&config)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        Ok::<_, ApiError>(config)
+    })
+    .await?;
 
     Ok(json_data(config))
 }
@@ -286,10 +306,13 @@ pub async fn delete_config(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    store
-        .delete_load_test_config(&id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let id = db_blocking(&state.store, move |store| {
+        store
+            .delete_load_test_config(&id)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok::<_, ApiError>(id)
+    })
+    .await?;
     Ok(json_data(serde_json::json!({"deleted": id})))
 }
 
@@ -298,16 +321,17 @@ pub async fn start_test(
     Extension(state): Extension<AppState>,
     Path(config_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (config, limits) = {
-        let store = state.store.lock().await;
+    let lookup_id = config_id.clone();
+    let (config, limits) = db_blocking(&state.store, move |store| {
         let config = store
-            .get_load_test_config(&config_id)
+            .get_load_test_config(&lookup_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::NotFound(format!("load test config {config_id}")))?;
+            .ok_or_else(|| ApiError::NotFound(format!("load test config {lookup_id}")))?;
         let settings = store.get_global_settings().unwrap_or_default();
         let limits = load_test::SafeLimits::from_settings(&settings);
-        (config, limits)
-    };
+        Ok::<_, ApiError>((config, limits))
+    })
+    .await?;
 
     let engine = state
         .load_test_engine
@@ -348,13 +372,14 @@ pub async fn start_test_confirmed(
     Extension(state): Extension<AppState>,
     Path(config_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = {
-        let store = state.store.lock().await;
+    let lookup_id = config_id.clone();
+    let config = db_blocking(&state.store, move |store| {
         store
-            .get_load_test_config(&config_id)
+            .get_load_test_config(&lookup_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::NotFound(format!("load test config {config_id}")))?
-    };
+            .ok_or_else(|| ApiError::NotFound(format!("load test config {lookup_id}")))
+    })
+    .await?;
 
     let engine = state
         .load_test_engine
@@ -414,10 +439,12 @@ pub async fn get_results(
     Extension(state): Extension<AppState>,
     Path(config_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let results = store
-        .list_load_test_results(&config_id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let results = db_blocking(&state.store, move |store| {
+        store
+            .list_load_test_results(&config_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
     Ok(json_data(results))
 }
 
@@ -426,10 +453,13 @@ pub async fn compare_results(
     Extension(state): Extension<AppState>,
     Path(config_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let results = store
-        .list_load_test_results(&config_id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let lookup_id = config_id.clone();
+    let results = db_blocking(&state.store, move |store| {
+        store
+            .list_load_test_results(&lookup_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
 
     if results.is_empty() {
         return Err(ApiError::NotFound(format!(
@@ -510,11 +540,13 @@ pub async fn clone_config(
     Path(id): Path<String>,
     Json(body): Json<CloneConfig>,
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
-    let store = state.store.lock().await;
-    let new_name = body.name.unwrap_or_else(|| format!("Copy of {id}"));
-    let cloned = store
-        .clone_load_test_config(&id, &new_name)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let cloned = db_blocking(&state.store, move |store| {
+        let new_name = body.name.unwrap_or_else(|| format!("Copy of {id}"));
+        store
+            .clone_load_test_config(&id, &new_name)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
     Ok(json_data_with_status(
         axum::http::StatusCode::CREATED,
         cloned,
@@ -537,27 +569,87 @@ mod tests {
     #[test]
     fn validate_target_url_allows_localhost() {
         let store = test_store();
-        assert!(validate_target_url("http://127.0.0.1:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok());
-        assert!(validate_target_url("https://127.0.0.1:8443/health", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok());
-        assert!(validate_target_url("http://localhost:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok());
-        assert!(validate_target_url("https://localhost:8443/path", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok());
-        assert!(validate_target_url("http://[::1]:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok());
+        assert!(validate_target_url(
+            "http://127.0.0.1:8080/",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_ok());
+        assert!(validate_target_url(
+            "https://127.0.0.1:8443/health",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_ok());
+        assert!(validate_target_url(
+            "http://localhost:8080/",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_ok());
+        assert!(validate_target_url(
+            "https://localhost:8443/path",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_ok());
+        assert!(validate_target_url(
+            "http://[::1]:8080/",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_ok());
     }
 
     #[test]
     fn validate_target_url_rejects_external() {
         let store = test_store();
-        assert!(validate_target_url("http://10.0.0.1:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
-        assert!(validate_target_url("https://example.com:8443/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
-        assert!(validate_target_url("http://192.168.1.1:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
-        assert!(validate_target_url("http://0.0.0.0:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
+        assert!(validate_target_url(
+            "http://10.0.0.1:8080/",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
+        assert!(validate_target_url(
+            "https://example.com:8443/",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
+        assert!(validate_target_url(
+            "http://192.168.1.1:8080/",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
+        assert!(validate_target_url(
+            "http://0.0.0.0:8080/",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
     }
 
     #[test]
     fn validate_target_url_rejects_bad_scheme() {
         let store = test_store();
-        assert!(validate_target_url("ftp://127.0.0.1/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
-        assert!(validate_target_url("127.0.0.1:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err());
+        assert!(
+            validate_target_url("ftp://127.0.0.1/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT)
+                .is_err()
+        );
+        assert!(
+            validate_target_url("127.0.0.1:8080/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT)
+                .is_err()
+        );
     }
 
     // v1.5.2 audit L-2 : port + path constraints.
@@ -567,37 +659,65 @@ mod tests {
         let store = test_store();
         // Port 6379 (Redis) on a localhost target must be rejected
         // even though the host is loopback.
-        assert!(
-            validate_target_url("http://127.0.0.1:6379/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
-        );
+        assert!(validate_target_url(
+            "http://127.0.0.1:6379/",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
         // Port 22 (SSH) similar.
-        assert!(
-            validate_target_url("http://localhost:22/", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
-        );
+        assert!(validate_target_url(
+            "http://localhost:22/",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
     }
 
     #[test]
     fn validate_target_url_rejects_management_paths() {
         let store = test_store();
         // /api/ is the management plane prefix.
-        assert!(
-            validate_target_url("http://127.0.0.1:8080/api/v1/auth/login", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
-        );
+        assert!(validate_target_url(
+            "http://127.0.0.1:8080/api/v1/auth/login",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
         // /metrics is the unauth Prometheus endpoint (cf. backlog #20).
-        assert!(
-            validate_target_url("http://127.0.0.1:8080/metrics", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
-        );
+        assert!(validate_target_url(
+            "http://127.0.0.1:8080/metrics",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
         // /lorica/ + /.well-known/ are reserved.
-        assert!(
-            validate_target_url("http://127.0.0.1:8080/lorica/bot/solve", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
-        );
-        assert!(
-            validate_target_url("http://127.0.0.1:8080/.well-known/acme-challenge/x", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
-        );
+        assert!(validate_target_url(
+            "http://127.0.0.1:8080/lorica/bot/solve",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
+        assert!(validate_target_url(
+            "http://127.0.0.1:8080/.well-known/acme-challenge/x",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
         // Non-management paths still pass.
-        assert!(
-            validate_target_url("http://127.0.0.1:8080/healthz", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_ok()
-        );
+        assert!(validate_target_url(
+            "http://127.0.0.1:8080/healthz",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_ok());
     }
 
     #[test]
@@ -606,11 +726,19 @@ mod tests {
         // be rejected ; the proxy normalises case at routing time so
         // the load tester must too.
         let store = test_store();
-        assert!(
-            validate_target_url("http://127.0.0.1:8080/API/foo", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
-        );
-        assert!(
-            validate_target_url("http://127.0.0.1:8080/Lorica/bot/solve", &store, TEST_HTTP_PORT, TEST_HTTPS_PORT).is_err()
-        );
+        assert!(validate_target_url(
+            "http://127.0.0.1:8080/API/foo",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
+        assert!(validate_target_url(
+            "http://127.0.0.1:8080/Lorica/bot/solve",
+            &store,
+            TEST_HTTP_PORT,
+            TEST_HTTPS_PORT
+        )
+        .is_err());
     }
 }

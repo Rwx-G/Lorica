@@ -190,6 +190,15 @@ const STREAM_CONTENT_TYPE_PREFIXES: &[&str] = &[
     "application/grpc",
 ];
 
+/// ASCII case-insensitive `starts_with`, allocation-free. Replaces the
+/// previous `to_ascii_lowercase()` of the Content-Type plus a per-prefix
+/// lowercase of the configured list on every response (audit #41e);
+/// media types are ASCII per RFC 9110 so ASCII folding is exact.
+fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    haystack.len() >= prefix.len()
+        && haystack.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
 /// Decide whether a given response should be rewritten. Returns true
 /// when:
 ///   - the route has a rewrite config
@@ -210,28 +219,26 @@ pub(crate) fn should_rewrite_response(
     if !enc.is_empty() && !enc.eq_ignore_ascii_case("identity") {
         return false;
     }
-    let lower_ct = content_type.to_ascii_lowercase();
     // Hard bypass for stream-by-design wire formats. Buffering them is
     // a protocol-breaking bug (SSE long-poll never delivers a chunk;
     // gRPC framing is corrupted), so the operator's prefix list cannot
     // opt back in.
     if STREAM_CONTENT_TYPE_PREFIXES
         .iter()
-        .any(|p| lower_ct.starts_with(p))
+        .any(|p| starts_with_ignore_ascii_case(content_type, p))
     {
         return false;
     }
     // Default to text/* when the operator list is empty. A typo-proof
     // defensive default: operators who enable rewriting almost always
-    // mean "for HTML/text responses". The empty case (common) compares
-    // against a static prefix with no allocation; the configured case
-    // lowercases each prefix on the fly rather than collecting a Vec.
+    // mean "for HTML/text responses". Both branches are allocation-free
+    // via the case-insensitive prefix compare.
     if cfg.content_type_prefixes.is_empty() {
-        return lower_ct.starts_with("text/");
+        return starts_with_ignore_ascii_case(content_type, "text/");
     }
     cfg.content_type_prefixes
         .iter()
-        .any(|p| lower_ct.starts_with(&p.to_ascii_lowercase()))
+        .any(|p| starts_with_ignore_ascii_case(content_type, p))
 }
 
 /// Build the fixed forward-header set for a mirror sub-request: the

@@ -150,6 +150,52 @@ impl LogStore {
         Ok(())
     }
 
+    /// Append a batch of access log entries in one transaction.
+    ///
+    /// One commit (and thus one WAL fsync) per batch instead of one
+    /// per request. Called by the background log writer
+    /// (`crate::log_writer`), never from the request path (backlog
+    /// #24). A failed batch is reported as a whole; individual rows
+    /// are not retried.
+    pub fn insert_batch(&self, entries: &[LogEntry]) -> Result<(), String> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to open access log transaction: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO access_logs (timestamp, method, path, host, status, latency_ms, backend, error, client_ip, is_xff, xff_proxy_ip, source, request_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                )
+                .map_err(|e| format!("failed to prepare access log insert: {e}"))?;
+            for entry in entries {
+                stmt.execute(params![
+                    entry.timestamp,
+                    entry.method,
+                    entry.path,
+                    entry.host,
+                    entry.status,
+                    entry.latency_ms,
+                    entry.backend,
+                    entry.error,
+                    entry.client_ip,
+                    entry.is_xff as i64,
+                    entry.xff_proxy_ip,
+                    entry.source,
+                    entry.request_id,
+                ])
+                .map_err(|e| format!("failed to insert access log entry: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("failed to commit access log batch: {e}"))?;
+        Ok(())
+    }
+
     /// Query entries with filtering. Returns newest first.
     /// Query log entries with pagination and filters; returns `(rows, total_match_count)`.
     pub fn query(&self, params: &LogsQuery) -> Result<(Vec<LogEntry>, usize), String> {
@@ -437,6 +483,49 @@ impl LogStore {
             ],
         )
         .map_err(|e| format!("failed to insert WAF event: {e}"))?;
+        Ok(())
+    }
+
+    /// Persist a batch of WAF events in one transaction.
+    ///
+    /// Same shape as [`Self::insert_batch`]: one commit per batch,
+    /// called only by the background log writer. Also covers the
+    /// multi-rule case (one blocked request tripping 3-4 CRS rules)
+    /// with a single mutex acquisition instead of one per event
+    /// (supersedes audit M-8).
+    pub fn insert_waf_events_batch(&self, events: &[lorica_waf::WafEvent]) -> Result<(), String> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to open WAF event transaction: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO waf_events (rule_id, description, category, severity, matched_field, matched_value, timestamp, client_ip, route_hostname, action)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                )
+                .map_err(|e| format!("failed to prepare WAF event insert: {e}"))?;
+            for event in events {
+                stmt.execute(params![
+                    event.rule_id as i64,
+                    event.description,
+                    event.category.as_str(),
+                    event.severity as i64,
+                    event.matched_field,
+                    event.matched_value,
+                    event.timestamp,
+                    event.client_ip,
+                    event.route_hostname,
+                    event.action,
+                ])
+                .map_err(|e| format!("failed to insert WAF event: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("failed to commit WAF event batch: {e}"))?;
         Ok(())
     }
 

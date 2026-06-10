@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
-use super::{WafEngine, WafEvent, WafMode, WafVerdict};
+use super::{CustomRule, WafEngine, WafEvent, WafMode, WafVerdict};
 
 impl WafEngine {
     /// Evaluate a request against the WAF ruleset.
@@ -62,7 +62,14 @@ impl WafEngine {
         // every field, turning every clean request into an
         // O(rules x fields) regex scan and amplifying admin
         // misconfiguration into a DoS vector.
-        let has_custom_rules = !self.custom_rules.read().is_empty();
+        //
+        // Backlog #41-d : the read guard is taken ONCE here and
+        // threaded through every `scan_custom_rules` call instead
+        // of re-locking inside the helper (previously N+1 lock
+        // acquisitions per request). Admin CRUD writes are rare,
+        // so holding the read lock across the scan is harmless.
+        let custom_rules = self.custom_rules.read();
+        let has_custom_rules = !custom_rules.is_empty();
 
         // Check path (URI percent-decoding ; `+` is a literal in
         // paths per RFC 3986, do not rewrite to space). Decoding
@@ -73,7 +80,7 @@ impl WafEngine {
             self.scan_builtin_rules("path", &decoded_path, now, &mut events);
         }
         if has_custom_rules {
-            self.scan_custom_rules("path", &decoded_path, now, &mut events);
+            Self::scan_custom_rules("path", &decoded_path, now, &custom_rules, &mut events);
         }
 
         // Check query string (form-style decoding ; `+` -> space).
@@ -83,7 +90,7 @@ impl WafEngine {
                 self.scan_builtin_rules("query", &decoded, now, &mut events);
             }
             if has_custom_rules {
-                self.scan_custom_rules("query", &decoded, now, &mut events);
+                Self::scan_custom_rules("query", &decoded, now, &custom_rules, &mut events);
             }
         }
 
@@ -106,10 +113,13 @@ impl WafEngine {
                     self.scan_builtin_rules(&field, &decoded, now, &mut events);
                 }
                 if has_custom_rules {
-                    self.scan_custom_rules(&field, &decoded, now, &mut events);
+                    Self::scan_custom_rules(&field, &decoded, now, &custom_rules, &mut events);
                 }
             }
         }
+        // Last custom-rule scan is done ; release the read guard
+        // before the header-scoped pass and the ring-buffer lock.
+        drop(custom_rules);
 
         // Header-scoped rules (v1.5.1 audit H-3). Dispatched on
         // header NAME and matched against the URL-decoded VALUE.
@@ -166,14 +176,20 @@ impl WafEngine {
                 ev.client_ip = client_ip.to_string();
                 ev.timestamp = timestamp.clone();
             }
-            // Store events in the ring buffer
+            // Store events in the ring buffer. Backlog #41-c : clone
+            // outside the critical section (WafEvent clones allocate
+            // heap Strings) so the lock only covers the pop/push
+            // pointer work. Same capacity and drop-oldest order as
+            // the previous clone-under-lock loop.
+            let cloned: Vec<WafEvent> = events.clone();
             let mut buf = self.event_buffer.lock();
-            for event in &events {
+            for event in cloned {
                 if buf.len() >= self.max_events {
                     buf.pop_front();
                 }
-                buf.push_back(event.clone());
+                buf.push_back(event);
             }
+            drop(buf);
 
             let rule_ids: Vec<u32> = events.iter().map(|e| e.rule_id).collect();
             let categories: Vec<&str> = events.iter().map(|e| e.category.as_str()).collect();
@@ -254,8 +270,13 @@ impl WafEngine {
         if self.prefilter.matches(&decoded) {
             self.scan_builtin_rules("body", &decoded, now, &mut events);
         }
-        if !self.custom_rules.read().is_empty() {
-            self.scan_custom_rules("body", &decoded, now, &mut events);
+        // Backlog #41-d : single read acquisition, guard released as
+        // soon as the scan is done.
+        {
+            let custom_rules = self.custom_rules.read();
+            if !custom_rules.is_empty() {
+                Self::scan_custom_rules("body", &decoded, now, &custom_rules, &mut events);
+            }
         }
 
         let elapsed = start.elapsed();
@@ -276,13 +297,15 @@ impl WafEngine {
             ev.timestamp = timestamp.clone();
         }
 
-        // Store events in the ring buffer
+        // Store events in the ring buffer. Backlog #41-c : clone
+        // outside the critical section, same as `evaluate`.
+        let cloned: Vec<WafEvent> = events.clone();
         let mut buf = self.event_buffer.lock();
-        for event in &events {
+        for event in cloned {
             if buf.len() >= self.max_events {
                 buf.pop_front();
             }
-            buf.push_back(event.clone());
+            buf.push_back(event);
         }
         drop(buf);
 
@@ -370,14 +393,18 @@ impl WafEngine {
     /// presence of a single (possibly broad) custom rule no longer
     /// disables the prefilter shortcut for the 49 built-in rules
     /// on every field of every request.
+    ///
+    /// Takes the already-locked rule slice instead of re-acquiring
+    /// the `custom_rules` read lock internally (backlog #41-d) :
+    /// callers lock once per request and thread the guard through
+    /// every per-field call.
     fn scan_custom_rules(
-        &self,
         field: &str,
         value: &str,
         timestamp: &str,
+        custom: &[(CustomRule, regex::Regex)],
         events: &mut Vec<WafEvent>,
     ) {
-        let custom = self.custom_rules.read();
         for (rule, regex) in custom.iter() {
             if !rule.enabled {
                 continue;

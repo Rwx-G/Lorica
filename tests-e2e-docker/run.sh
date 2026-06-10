@@ -25,6 +25,13 @@ done
 
 EXIT_CODE=0
 
+# `docker compose run` never rebuilds an existing image, so a stale
+# test-runner would silently run old assertions. With --build, build
+# every service (runner images included) up front.
+if [ -n "$BUILD_FLAG" ]; then
+    docker compose build
+fi
+
 # ---- Phase 1: Single-process tests ----
 echo "=== Lorica E2E Tests (single-process) ==="
 echo ""
