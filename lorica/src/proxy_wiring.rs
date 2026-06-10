@@ -92,19 +92,28 @@ impl SmoothWrrState {
         // Initialize new backends with offset-based head start.
         // The head start is just +1 so the offset backend wins the first
         // tie-break without skewing the overall distribution.
+        // `contains_key` first so the steady state (all backends known)
+        // does zero `String` allocations inside the mutex; only a
+        // first-seen backend pays for the owned key (audit #41a, was
+        // 2N allocations per request via `entry(addr.to_string())`).
         for (i, (addr, _)) in backends.iter().enumerate() {
-            cw.entry(addr.to_string()).or_insert_with(|| {
-                if i == self.worker_offset % backends.len() {
+            if !cw.contains_key(*addr) {
+                let head_start = if i == self.worker_offset % backends.len() {
                     1 // tiny head start to win first tie-break
                 } else {
                     0
-                }
-            });
+                };
+                cw.insert((*addr).to_string(), head_start);
+            }
         }
 
-        // Increase all current_weights by their effective weight
+        // Increase all current_weights by their effective weight.
+        // Every address was ensured present just above, so the lookup
+        // never misses.
         for (addr, weight) in backends {
-            *cw.entry(addr.to_string()).or_insert(0) += weight;
+            if let Some(w) = cw.get_mut(*addr) {
+                *w += weight;
+            }
         }
 
         // Find the backend with the highest current_weight
@@ -639,8 +648,11 @@ const EXPLORE_EVERY: usize = 10;
 /// The decay factor ensures recent measurements count more than old ones.
 #[derive(Debug, Default)]
 pub struct EwmaTracker {
-    /// EWMA score per backend address (microseconds).
-    pub(crate) scores: Arc<parking_lot::RwLock<HashMap<String, f64>>>,
+    /// EWMA score per backend address (microseconds). Sharded map so
+    /// concurrent `record` calls (one per upstream response, plus the
+    /// health-prober's samples) contend per shard instead of
+    /// serialising on a single global write lock (audit L-17).
+    pub(crate) scores: Arc<dashmap::DashMap<String, f64>>,
     /// Monotonic selection ticket. Drives the bounded explore/exploit split
     /// and round-robin tie-breaking, and (via `fetch_add`) hands each
     /// concurrent caller a distinct value so they spread instead of stampeding.
@@ -654,20 +666,22 @@ impl EwmaTracker {
 
     /// Update the EWMA score for a backend with a new latency sample.
     ///
-    /// Hot path: we try `get_mut` first with a write lock already held
-    /// so the common case (backend already known) avoids the
-    /// `addr.to_string()` allocation that `insert` would incur. Only
-    /// the first-seen backend per process pays for the `String`
-    /// (audit M-1).
+    /// Hot path: we try `get_mut` first so the common case (backend
+    /// already known) avoids the `addr.to_string()` allocation that
+    /// `insert` would incur; only the first-seen backend per process
+    /// pays for the `String` (audit M-1). The guard must be dropped
+    /// before the `insert` fallback: holding a DashMap shard ref while
+    /// inserting into the same shard deadlocks.
     pub fn record(&self, addr: &str, latency_us: f64) {
         let alpha = 0.3;
-        let mut scores = self.scores.write();
-        if let Some(current) = scores.get_mut(addr) {
+        if let Some(mut current) = self.scores.get_mut(addr) {
             *current = alpha * latency_us + (1.0 - alpha) * *current;
-        } else {
-            // First-seen: seed the decay with the sample itself.
-            scores.insert(addr.to_string(), latency_us);
+            return;
         }
+        // First-seen: seed the decay with the sample itself. Two racing
+        // first samples both land here; last write wins, which is an
+        // acceptable seed either way.
+        self.scores.insert(addr.to_string(), latency_us);
     }
 
     /// Select a backend index, balancing exploit (lowest EWMA score) against
@@ -693,14 +707,13 @@ impl EwmaTracker {
             return 0;
         }
         let ticket = self.next.fetch_add(1, Ordering::Relaxed);
-        let scores = self.scores.read();
 
         // Explore: bounded, round-robin over not-yet-scored backends.
-        if ticket % EXPLORE_EVERY == 0 {
+        if ticket.is_multiple_of(EXPLORE_EVERY) {
             let unscored: Vec<usize> = backends
                 .iter()
                 .enumerate()
-                .filter(|(_, b)| !scores.contains_key(&b.address))
+                .filter(|(_, b)| !self.scores.contains_key(&b.address))
                 .map(|(i, _)| i)
                 .collect();
             if !unscored.is_empty() {
@@ -710,14 +723,17 @@ impl EwmaTracker {
 
         // Exploit: lowest scored backend. Unscored backends are ignored here
         // (treated as +inf); they receive traffic only via the explore path.
+        // Per-key shard reads instead of one map-wide read lock: a sample
+        // landing between two lookups can shift the winner by one sample,
+        // which is within EWMA noise.
         let mut best_idx = 0;
         let mut best_score = f64::INFINITY;
         let mut any_scored = false;
         for (i, b) in backends.iter().enumerate() {
-            if let Some(&score) = scores.get(&b.address) {
+            if let Some(score) = self.scores.get(&b.address) {
                 any_scored = true;
-                if score < best_score {
-                    best_score = score;
+                if *score < best_score {
+                    best_score = *score;
                     best_idx = i;
                 }
             }
@@ -731,11 +747,11 @@ impl EwmaTracker {
 
     /// Get the EWMA score for a backend (for dashboard display).
     pub fn get_score(&self, addr: &str) -> f64 {
-        self.scores.read().get(addr).copied().unwrap_or(0.0)
+        self.scores.get(addr).map(|s| *s).unwrap_or(0.0)
     }
 
     /// Return a shared reference to the scores map (for passing to API state).
-    pub fn scores_ref(&self) -> Arc<parking_lot::RwLock<HashMap<String, f64>>> {
+    pub fn scores_ref(&self) -> Arc<dashmap::DashMap<String, f64>> {
         Arc::clone(&self.scores)
     }
 }
@@ -1021,6 +1037,11 @@ pub struct RequestCtx {
     pub access_log_enabled: bool,
     /// Client IP address (from socket or X-Forwarded-For).
     pub client_ip: Option<String>,
+    /// Parsed form of `client_ip`, resolved once per request so the
+    /// whitelist / blocklist / GeoIP / bot-protection checks reuse it
+    /// instead of re-parsing the string (audit #41f). `None` when
+    /// `client_ip` is absent or not a valid IP literal.
+    pub client_ip_addr: Option<std::net::IpAddr>,
     /// Whether the client IP was extracted from X-Forwarded-For header.
     pub is_xff: bool,
     /// The direct TCP peer IP when XFF is used (the forwarding proxy's IP).
@@ -1168,8 +1189,9 @@ pub struct LoricaProxy {
     pub acme_challenge_store: Option<lorica_api::acme::AcmeChallengeStore>,
     /// Non-blocking alert sender for notification dispatch.
     pub alert_sender: Option<lorica_notify::AlertSender>,
-    /// Persistent access log store (SQLite).
-    pub log_store: Option<Arc<lorica_api::log_store::LogStore>>,
+    /// Producer handle for the background log writer (access logs +
+    /// WAF events, batched SQLite persistence; backlog #24).
+    pub log_writer: Option<lorica_api::log_writer::LogWriteHandle>,
     /// Per-backend circuit breaker engine. Single-process deployments
     /// hold the state machine in-process (`BreakerEngine::Local`);
     /// worker-mode deployments delegate admission and outcome
@@ -1321,7 +1343,7 @@ impl LoricaProxy {
             waf_counts: Arc::new(DashMap::new()),
             acme_challenge_store: None,
             alert_sender: None,
-            log_store: None,
+            log_writer: None,
             circuit_breaker_engine: BreakerEngine::local(5, 10),
             basic_auth_cache: Arc::new(DashMap::new()),
             shmem: None,
@@ -1520,28 +1542,19 @@ impl LoricaProxy {
 
     /// Persist a `WafEvent` to the SQLite-backed `LogStore`.
     ///
-    /// No-op when no log store is configured (worker mode +
-    /// supervisor-only persistence ; the workers ship events back via
-    /// the metrics-pull RPC instead). Errors are logged at `warn!`
-    /// with the underlying message + the event's rule id + category,
-    /// and bump `lorica_waf_event_persist_failed_total` so an operator
-    /// can alert on a stalled persistence path (full disk, corrupted
-    /// DB, schema drift) - v1.5.1 audit L-6 closed the silent
-    /// `let _ = ...` swallow at six call sites in this file. The
-    /// proxy keeps serving regardless ; the in-memory ring buffer +
+    /// No-op when no log writer is configured. The event is handed to
+    /// the background log writer queue (backlog #24): the hot path
+    /// never touches SQLite. Persistence failures surface from the
+    /// writer thread as a `warn!` per batch plus
+    /// `lorica_waf_event_persist_failed_total` (keeping the v1.5.1
+    /// audit L-6 guarantee that the trail never breaks silently);
+    /// queue overflow bumps `lorica_log_write_dropped_total{kind="waf"}`.
+    /// The proxy keeps serving regardless ; the in-memory ring buffer +
     /// Prometheus category counters still surface the events, only
-    /// the persistent forensics trail is broken.
+    /// the persistent forensics trail is shed.
     fn persist_waf_event(&self, ev: &lorica_waf::WafEvent) {
-        if let Some(ref store) = self.log_store {
-            if let Err(e) = store.insert_waf_event(ev) {
-                tracing::warn!(
-                    error = %e,
-                    rule_id = ev.rule_id,
-                    category = ev.category.as_str(),
-                    "WAF event persistence failed"
-                );
-                lorica_api::metrics::inc_waf_event_persist_failed();
-            }
+        if let Some(ref writer) = self.log_writer {
+            writer.enqueue_waf(ev.clone());
         }
     }
 
@@ -1579,10 +1592,7 @@ impl LoricaProxy {
 
         lorica_api::metrics::record_waf_event("protocol_violation", "detected");
         self.waf_counts
-            .entry((
-                "protocol_violation".to_string(),
-                "detected".to_string(),
-            ))
+            .entry(("protocol_violation".to_string(), "detected".to_string()))
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
 
@@ -1708,7 +1718,7 @@ impl LoricaProxy {
 #[derive(Clone)]
 struct WorkerMetricsCtx {
     ban_list: Arc<DashMap<String, (Instant, u64)>>,
-    ewma_scores: Arc<parking_lot::RwLock<std::collections::HashMap<String, f64>>>,
+    ewma_scores: Arc<dashmap::DashMap<String, f64>>,
     backend_connections: Arc<BackendConnections>,
     request_counts: Arc<DashMap<(String, u16), AtomicU64>>,
     waf_counts: Arc<DashMap<(String, String), AtomicU64>>,
@@ -1753,11 +1763,10 @@ async fn handle_metrics_request(
 
     let ewma_entries: Vec<EwmaReportEntry> = ctx
         .ewma_scores
-        .read()
         .iter()
-        .map(|(addr, score)| EwmaReportEntry {
-            backend_address: addr.clone(),
-            score_us: *score,
+        .map(|entry| EwmaReportEntry {
+            backend_address: entry.key().clone(),
+            score_us: *entry.value(),
         })
         .collect();
 
@@ -2161,6 +2170,7 @@ impl ProxyHttp for LoricaProxy {
             request_id: generate_request_id(),
             access_log_enabled: true,
             client_ip: None,
+            client_ip_addr: None,
             is_xff: false,
             xff_proxy_ip: None,
             source: String::new(),
@@ -2467,8 +2477,15 @@ impl ProxyHttp for LoricaProxy {
                 client_ip
             };
 
-            // Store client IP and source in context for access logging
+            // Store client IP and source in context for access logging.
+            // Parse the string form once; every later per-request
+            // consumer (whitelist, blocklist, GeoIP, bot protection)
+            // reuses `ctx.client_ip_addr` instead of re-parsing
+            // (audit #41f).
             ctx.client_ip = check_ip.clone();
+            ctx.client_ip_addr = check_ip
+                .as_deref()
+                .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
             ctx.is_xff = xff_used && check_ip.is_some();
             ctx.xff_proxy_ip = if ctx.is_xff { direct_ip } else { None };
             ctx.source = req
@@ -2480,13 +2497,10 @@ impl ProxyHttp for LoricaProxy {
 
             // Global WAF whitelist: IPs in this list bypass ban checks, IP blocklist,
             // rate limiting, and WAF evaluation entirely.
-            let is_whitelisted = check_ip.as_ref().is_some_and(|ip| {
-                if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                    config.waf_whitelist.iter().any(|net| net.contains(&addr))
-                } else {
-                    false
-                }
-            });
+            let is_whitelisted = ctx
+                .client_ip_addr
+                .as_ref()
+                .is_some_and(|addr| config.waf_whitelist.iter().any(|net| net.contains(addr)));
 
             // Ban list + IP blocklist checks (skipped for whitelisted IPs)
             if !is_whitelisted {
@@ -2527,7 +2541,11 @@ impl ProxyHttp for LoricaProxy {
                         return Ok(true);
                     }
 
-                    if self.waf_engine.ip_blocklist().is_blocked_str(ip) {
+                    let blocklisted = ctx
+                        .client_ip_addr
+                        .as_ref()
+                        .is_some_and(|addr| self.waf_engine.ip_blocklist().is_blocked(addr));
+                    if blocklisted {
                         warn!(
                             ip = %ip,
                             "request blocked by IP blocklist"
@@ -3265,8 +3283,8 @@ impl ProxyHttp for LoricaProxy {
             // block check and the bot-protection bypass evaluator,
             // avoiding a redundant mmdb decode_path call on the hot path.
             let mut cached_country: Option<String> = None;
-            if let Some(ref ip_str) = check_ip {
-                if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
+            {
+                if let Some(ip_addr) = ctx.client_ip_addr {
                     if let Some(country) = self.geoip_resolver.lookup_country(ip_addr) {
                         cached_country = Some(country.as_str().to_string());
                         // Always stamp the country on the root tracing
@@ -3339,8 +3357,8 @@ impl ProxyHttp for LoricaProxy {
             // request-path enters this block; `POST /lorica/bot/solve`
             // and the captcha image GET are intercepted earlier.
             if let Some(ref bot_cfg) = entry.route.bot_protection {
-                if let Some(ref ip_str) = check_ip {
-                    if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
+                {
+                    if let Some(ip_addr) = ctx.client_ip_addr {
                         // Reuse the country resolved in the GeoIP block
                         // above (cached_country) to avoid a redundant
                         // mmdb decode_path call on every request.
@@ -4039,10 +4057,14 @@ impl ProxyHttp for LoricaProxy {
             // dropped post-cap bytes from the scan while still
             // forwarding them upstream, so a 1 MiB padding prefix
             // slipped past every signature.
-            let cap_meta = ctx
-                .route_snapshot
-                .as_ref()
-                .map(|r| (r.waf_enabled, r.waf_mode.clone(), r.id.clone(), r.hostname.clone()));
+            let cap_meta = ctx.route_snapshot.as_ref().map(|r| {
+                (
+                    r.waf_enabled,
+                    r.waf_mode.clone(),
+                    r.id.clone(),
+                    r.hostname.clone(),
+                )
+            });
             if let Some((waf_enabled, waf_mode, route_id, route_hostname)) = cap_meta {
                 if waf_enabled && ctx.body_bytes_received > WAF_BODY_SCAN_MAX as u64 {
                     match waf_mode {
@@ -5462,10 +5484,11 @@ impl ProxyHttp for LoricaProxy {
                 source: ctx.source.clone(),
                 request_id: ctx.request_id.clone(),
             };
-            if let Some(ref store) = self.log_store {
-                if let Err(e) = store.insert(&entry) {
-                    tracing::warn!(error = %e, "failed to persist access log entry");
-                }
+            // Non-blocking hand-off to the background log writer
+            // (backlog #24); the entry clone is far cheaper than the
+            // synchronous INSERT it replaces.
+            if let Some(ref writer) = self.log_writer {
+                writer.enqueue_access(entry.clone());
             }
             self.log_buffer.push(entry);
         }

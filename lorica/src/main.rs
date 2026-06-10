@@ -1917,33 +1917,26 @@ fn spawn_supervisor_rpc_handler(
         // SAFETY: rpc_fd is a fresh socketpair end from
         // WorkerManager::spawn_worker / restart_worker, exclusively
         // owned by this task.
-        let (endpoint, mut incoming) = match unsafe {
-            lorica_command::RpcEndpoint::from_raw_fd(rpc_fd)
-        } {
-            Ok(pair) => pair,
-            Err(e) => {
-                error!(
-                    worker_id,
-                    error = %e,
-                    "failed to create supervisor RpcEndpoint"
-                );
-                return;
-            }
-        };
+        let (endpoint, mut incoming) =
+            match unsafe { lorica_command::RpcEndpoint::from_raw_fd(rpc_fd) } {
+                Ok(pair) => pair,
+                Err(e) => {
+                    error!(
+                        worker_id,
+                        error = %e,
+                        "failed to create supervisor RpcEndpoint"
+                    );
+                    return;
+                }
+            };
         // Register for supervisor-initiated RPCs (config reload
         // coordinator, metrics pull, breaker queries).
         worker_rpc_endpoints.insert(worker_id, endpoint);
         while let Some(inc) = incoming.recv().await {
             match inc.command_type() {
                 lorica_command::CommandType::RateLimitDelta => {
-                    handle_rate_limit_delta(
-                        inc,
-                        &rl_registry,
-                        &rl_policy_cache,
-                        &store,
-                        worker_id,
-                    )
-                    .await;
+                    handle_rate_limit_delta(inc, &rl_registry, &rl_policy_cache, &store, worker_id)
+                        .await;
                 }
                 lorica_command::CommandType::VerdictLookup => {
                     handle_verdict_lookup(inc, &verdict_cache).await;
@@ -3174,11 +3167,10 @@ fn run_worker(
 
                         // Collect EWMA scores
                         let ewma_entries: Vec<EwmaReportEntry> = cmd_ewma
-                            .read()
                             .iter()
-                            .map(|(addr, score): (&String, &f64)| EwmaReportEntry {
-                                backend_address: addr.clone(),
-                                score_us: *score,
+                            .map(|entry| EwmaReportEntry {
+                                backend_address: entry.key().clone(),
+                                score_us: *entry.value(),
                             })
                             .collect();
 
@@ -3576,9 +3568,10 @@ fn run_worker(
     drop(_rt_guard);
     // Open a LogStore so the worker can persist WAF events directly (with
     // route_hostname and action stamped). SQLite WAL mode allows concurrent
-    // writes from multiple worker processes.
-    lorica_proxy.log_store = match lorica_api::log_store::LogStore::open(&data_dir) {
-        Ok(s) => Some(Arc::new(s)),
+    // writes from multiple worker processes. Writes go through the
+    // per-worker background log writer (backlog #24).
+    lorica_proxy.log_writer = match lorica_api::log_store::LogStore::open(&data_dir) {
+        Ok(s) => Some(lorica_api::log_writer::spawn_log_writer(Arc::new(s))),
         Err(e) => {
             warn!(error = %e, "worker: failed to open log store, WAF event persistence disabled");
             None
@@ -3904,7 +3897,12 @@ fn run_single_process(cli: Cli) {
         lorica_proxy.waf_engine = Arc::clone(&waf_engine);
         lorica_proxy.acme_challenge_store = Some(acme_challenge_store.clone());
         lorica_proxy.alert_sender = Some(alert_sender.clone());
-        lorica_proxy.log_store = log_store.clone();
+        // Hand the proxy a producer handle for the background log
+        // writer (batched access-log + WAF-event persistence,
+        // backlog #24) instead of a direct LogStore reference.
+        lorica_proxy.log_writer = log_store
+            .as_ref()
+            .map(|s| lorica_api::log_writer::spawn_log_writer(Arc::clone(s)));
 
         // GeoIP: load the DB from `GlobalSettings.geoip_db_path` so
         // the request_filter can resolve client IPs. If auto-update is
@@ -4370,11 +4368,17 @@ fn spawn_persisted_alert_dispatcher(
                             Ok((insert, retention)) => {
                                 if let Err(e) = insert {
                                     tracing::warn!(error = %e, "failed to persist notification event");
-                                    lorica_api::metrics::inc_notifier_events_dropped("persist_failed", 1);
+                                    lorica_api::metrics::inc_notifier_events_dropped(
+                                        "persist_failed",
+                                        1,
+                                    );
                                 }
                                 if let Err(e) = retention {
                                     tracing::warn!(error = %e, "notification retention enforcement failed");
-                                    lorica_api::metrics::inc_notifier_events_dropped("retention_failed", 1);
+                                    lorica_api::metrics::inc_notifier_events_dropped(
+                                        "retention_failed",
+                                        1,
+                                    );
                                 }
                             }
                             Err(e) => {
