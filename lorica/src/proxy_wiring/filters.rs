@@ -17,12 +17,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use lorica_config::models::WafMode;
+use lorica_config::models::{AiBotPolicy, SpoofedFallback, WafMode};
 use lorica_error::Result;
 use lorica_http::ResponseHeader;
 use lorica_proxy::Session;
 use tracing::{debug, warn};
 
+use crate::ai_bot::{
+    build_robots_txt, ip_in_vendor_ranges, match_user_agent, AiCrawler, Verification,
+    BUILTIN_CRAWLERS,
+};
 use super::{
     bot_handlers, build_mirror_forward_headers, canary_bucket, downstream_ssl_digest,
     evaluate_mtls, extract_host, mirror_sample_hit, render_error_body, request_has_body,
@@ -222,6 +226,46 @@ impl LoricaProxy {
             .write_response_body(Some(bytes::Bytes::from(body)), true)
             .await?;
         Ok(true)
+    }
+}
+
+/// Verdict produced by `check_ai_bot`'s per-Verification dispatch
+/// step, then mapped to a terminal response (or a fall-through)
+/// based on the per-route policy and the spoofed-fallback chain.
+enum AiBotVerdict {
+    /// Verification confirmed (or not applicable for `UaOnly`) -
+    /// apply the per-route `ai_bot_policy`.
+    ApplyPolicy,
+    /// Verification failed (rDNS suffix mismatch / IP outside the
+    /// vendor CIDR list) - apply the spoofed-fallback.
+    Spoofed,
+}
+
+/// Stage `X-Lorica-Verified-Bot` + `X-Lorica-Bot-Verification`
+/// headers for the upstream-injection loop (Story 8.2 AC #11).
+/// Gated by the global `ai_bot_inject_headers` setting. The UaOnly
+/// path stages only the kind header (no `X-Lorica-Verified-Bot`)
+/// so backends can distinguish trust levels.
+fn stage_verified_bot_headers(
+    ctx: &mut RequestCtx,
+    crawler: &'static AiCrawler,
+    config: &ProxyConfig,
+) {
+    if !config.ai_bot_inject_headers {
+        return;
+    }
+    let kind = crawler.verification.kind_str();
+    match crawler.verification {
+        Verification::UaOnly => {
+            ctx.ai_bot_inject
+                .push(("X-Lorica-Bot-Verification".to_string(), kind.to_string()));
+        }
+        _ => {
+            ctx.ai_bot_inject
+                .push(("X-Lorica-Verified-Bot".to_string(), crawler.name.to_string()));
+            ctx.ai_bot_inject
+                .push(("X-Lorica-Bot-Verification".to_string(), kind.to_string()));
+        }
     }
 }
 
@@ -1160,6 +1204,53 @@ impl LoricaProxy {
         Ok(None)
     }
 
+    /// Stage: auto-served `/robots.txt` for routes that opted in via
+    /// `Route.serve_robots_txt = true` (Story 8.2 AC #10). Triggers
+    /// on GET `/robots.txt` only; everything else falls through to
+    /// the backend (RFC 9309 advisory layer; the backend's own
+    /// `/robots.txt` stays authoritative when the operator has not
+    /// opted in). Terminal: 200 with the registry-driven body.
+    ///
+    /// Body shape per [`build_robots_txt`]: header comment + one
+    /// `User-agent / Disallow: /` block per crawler when the route's
+    /// `ai_bot_policy != Off`, or the `User-agent: *\nAllow: /\n`
+    /// fallback when no crawlers are active. v1.6.0 consults the
+    /// built-in registry only; the merged registry (built-in +
+    /// custom) wires through Story 8.2 AC #6 / #8 in a follow-up.
+    pub(super) async fn check_robots_txt(
+        &self,
+        session: &mut Session,
+        entry: &RouteEntry,
+    ) -> Result<Option<bool>> {
+        if !entry.route.serve_robots_txt {
+            return Ok(None);
+        }
+        {
+            let req = session.req_header();
+            if req.uri.path() != "/robots.txt" || req.method.as_str() != "GET" {
+                return Ok(None);
+            }
+        }
+        let policy = entry.route.ai_bot_policy.unwrap_or(AiBotPolicy::Off);
+        let active: Vec<&AiCrawler> = if policy == AiBotPolicy::Off {
+            Vec::new()
+        } else {
+            BUILTIN_CRAWLERS.iter().collect()
+        };
+        let body: String = build_robots_txt(&active);
+        let mut header = lorica_http::ResponseHeader::build(200, None)?;
+        header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+        header.insert_header("Cache-Control", "public, max-age=3600")?;
+        header.insert_header("Content-Length", body.len().to_string())?;
+        session
+            .write_response_header(Box::new(header), false)
+            .await?;
+        session
+            .write_response_body(Some(bytes::Bytes::from(body)), true)
+            .await?;
+        Ok(Some(true))
+    }
+
     /// Stage: per-route IP allowlist / denylist. Triggers when the
     /// route has a non-empty allowlist that does not match the client
     /// IP, or a denylist entry that does. Terminal: 403 (both
@@ -1202,6 +1293,171 @@ impl LoricaProxy {
                 .map(Some);
         }
         Ok(None)
+    }
+
+    /// Stage: AI / LLM crawler deny-list (Story 8.2 AC #1 + #3).
+    ///
+    /// Flow:
+    /// 1. Per-route policy gate: `Route.ai_bot_policy.unwrap_or(Off)
+    ///    == Off` -> fall through (no decision).
+    /// 2. UA match against the built-in registry: no match -> fall
+    ///    through (not an AI bot).
+    /// 3. Dispatch on `crawler.verification`:
+    ///    - `Rdns(suffixes)` -> cache-only forward-confirmed lookup
+    ///      via `bot_rdns::handle()`. Cache hit + suffix match ->
+    ///      `ApplyPolicy`. Cache hit + suffix mismatch -> `Spoofed`.
+    ///      Cache miss -> fire-and-forget resolve, fail-open (the
+    ///      next request from the same IP lands on a hit). Resolver
+    ///      `None` -> `record_ai_bot_rdns_unavailable`, fail-open.
+    ///    - `IpRanges(vendor_key)` -> post-trust-boundary peer IP
+    ///      CIDR scan against the bundled list. In-range ->
+    ///      `ApplyPolicy`, out-of-range -> `Spoofed`.
+    ///    - `UaOnly` -> `ua_only_match` counter, `ApplyPolicy` (no
+    ///      spoof signal possible).
+    /// 4. Map the verdict: `ApplyPolicy + Deny` -> 403 with
+    ///    `Retry-After: 86400` + the route's `error_page_html`;
+    ///    `ApplyPolicy + Log` -> `log` counter, stage AC #11 headers,
+    ///    fall through; `Spoofed` -> per-route
+    ///    `ai_bot_spoofed_fallback` (global
+    ///    `ai_bot_treat_spoofed_as` when unset) with the
+    ///    `action="spoofed"` counter on Deny / Log.
+    ///
+    /// Terminal: 403 (Deny verdicts only).
+    pub(super) async fn check_ai_bot(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        entry: &RouteEntry,
+        check_ip: Option<&str>,
+        config: &ProxyConfig,
+    ) -> Result<Option<bool>> {
+        let policy = entry.route.ai_bot_policy.unwrap_or(AiBotPolicy::Off);
+        if policy == AiBotPolicy::Off {
+            return Ok(None);
+        }
+        let crawler: &'static AiCrawler = {
+            let req = session.req_header();
+            let ua = req
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok());
+            match ua.and_then(match_user_agent) {
+                Some(c) => c,
+                None => return Ok(None),
+            }
+        };
+        let route_id = entry.route.id.as_str();
+
+        let verdict = match crawler.verification {
+            Verification::UaOnly => {
+                lorica_api::metrics::record_ai_bot(crawler.name, route_id, "ua_only_match");
+                AiBotVerdict::ApplyPolicy
+            }
+            Verification::IpRanges(vendor_key) => {
+                let parsed_ip = check_ip.and_then(|s| s.parse::<std::net::IpAddr>().ok());
+                match parsed_ip {
+                    Some(ip) if ip_in_vendor_ranges(ip, vendor_key) => AiBotVerdict::ApplyPolicy,
+                    _ => AiBotVerdict::Spoofed,
+                }
+            }
+            Verification::Rdns(suffixes) => self.evaluate_ai_bot_rdns(check_ip, suffixes),
+        };
+
+        match verdict {
+            AiBotVerdict::ApplyPolicy => match policy {
+                AiBotPolicy::Off => Ok(None),
+                AiBotPolicy::Deny => {
+                    lorica_api::metrics::record_ai_bot(crawler.name, route_id, "deny");
+                    ctx.block_reason = Some(format!("ai_bot deny {}", crawler.name));
+                    self.write_error_response(
+                        session,
+                        403,
+                        &ctx.request_id,
+                        entry.route.error_page_html.as_deref(),
+                        "AI crawler denied",
+                        &[("Retry-After", "86400".to_string())],
+                    )
+                    .await
+                    .map(Some)
+                }
+                AiBotPolicy::Log => {
+                    lorica_api::metrics::record_ai_bot(crawler.name, route_id, "log");
+                    stage_verified_bot_headers(ctx, crawler, config);
+                    Ok(None)
+                }
+            },
+            AiBotVerdict::Spoofed => {
+                let fallback = entry
+                    .route
+                    .ai_bot_spoofed_fallback
+                    .unwrap_or(config.ai_bot_treat_spoofed_as);
+                match fallback {
+                    SpoofedFallback::Deny => {
+                        lorica_api::metrics::record_ai_bot(crawler.name, route_id, "spoofed");
+                        ctx.block_reason = Some(format!("ai_bot spoofed {}", crawler.name));
+                        self.write_error_response(
+                            session,
+                            403,
+                            &ctx.request_id,
+                            entry.route.error_page_html.as_deref(),
+                            "AI crawler denied",
+                            &[("Retry-After", "86400".to_string())],
+                        )
+                        .await
+                        .map(Some)
+                    }
+                    SpoofedFallback::Log => {
+                        lorica_api::metrics::record_ai_bot(crawler.name, route_id, "spoofed");
+                        Ok(None)
+                    }
+                    SpoofedFallback::Allow => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// rDNS verification helper for `check_ai_bot`. Cache-only hot
+    /// path: a miss does not block; we fire-and-forget a resolve so
+    /// the next request from the same IP lands on a hit. Resolver
+    /// `None` (rDNS disabled at startup) increments
+    /// `lorica_ai_bot_rdns_unavailable_total` and falls open.
+    fn evaluate_ai_bot_rdns(
+        &self,
+        check_ip: Option<&str>,
+        suffixes: &'static [&'static str],
+    ) -> AiBotVerdict {
+        let parsed_ip = match check_ip.and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
+            Some(ip) => ip,
+            // Without a peer IP we cannot verify; fail-open (same
+            // semantic as a cache miss).
+            None => return AiBotVerdict::ApplyPolicy,
+        };
+        let resolver = match crate::bot_rdns::handle() {
+            Some(r) => r,
+            None => {
+                lorica_api::metrics::record_ai_bot_rdns_unavailable();
+                return AiBotVerdict::ApplyPolicy;
+            }
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        match resolver.cache_check(parsed_ip, now) {
+            Some(Some(name)) => {
+                let suffix_owned: Vec<String> = suffixes.iter().map(|s| s.to_string()).collect();
+                if crate::bot_rdns::suffix_matches(&name, &suffix_owned) {
+                    AiBotVerdict::ApplyPolicy
+                } else {
+                    AiBotVerdict::Spoofed
+                }
+            }
+            Some(None) => AiBotVerdict::Spoofed,
+            None => {
+                resolver.try_spawn_resolve(parsed_ip);
+                AiBotVerdict::ApplyPolicy
+            }
+        }
     }
 
     /// Stage: per-route GeoIP country filter (v1.4.0 Epic 2 story 2.4).

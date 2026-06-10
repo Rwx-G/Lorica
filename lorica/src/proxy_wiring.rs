@@ -617,6 +617,7 @@ impl ProxyHttp for LoricaProxy {
             waf_body_truncated: false,
             sticky_backend_id: None,
             forward_auth_inject: Vec::new(),
+            ai_bot_inject: Vec::new(),
             mirror_pending: None,
             mirror_body_state: None,
             breaker_probe_backend: None,
@@ -872,11 +873,34 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(handled);
             }
 
+            // Story 8.2 AC #10. Auto-served /robots.txt for routes
+            // that opted in via `Route.serve_robots_txt = true`.
+            // Lands BETWEEN return_status and ip_allow_deny so a
+            // decommissioned route (return_status=410) keeps
+            // returning 410 for /robots.txt too, while ip_allow_deny
+            // stays an access-policy gate that would over-block the
+            // public /robots.txt endpoint per RFC 9309.
+            if let Some(handled) = self.check_robots_txt(session, entry).await? {
+                return Ok(handled);
+            }
+
             // Per-route IP allowlist/denylist
             if let Some(ref ip) = check_ip {
                 if let Some(handled) = self.check_ip_allow_deny(session, ctx, entry, ip).await? {
                     return Ok(handled);
                 }
+            }
+
+            // Story 8.2 AC #1 + #3. AI / LLM crawler deny-list.
+            // Lands AFTER ip_allow_deny so a manually-allowlisted IP
+            // bypasses AI policy too, and BEFORE geoip so deny
+            // verdicts don't pay for the mmdb decode_path lookup
+            // unnecessarily.
+            if let Some(handled) = self
+                .check_ai_bot(session, ctx, entry, check_ip.as_deref(), &config)
+                .await?
+            {
+                return Ok(handled);
             }
 
             // Per-route GeoIP country filter; resolves the country once
@@ -1918,6 +1942,17 @@ impl ProxyHttp for LoricaProxy {
         // surprised if their basic `X-User: static` overrode the
         // authenticated user's identity).
         for (name, value) in &ctx.forward_auth_inject {
+            let _ = upstream_request.insert_header(name.clone(), value);
+        }
+
+        // Story 8.2 AC #11. Drain the AI-bot verified header buffer.
+        // MUST use insert_header (overwrite), NOT append_header: a
+        // switch to append would let a client pre-supply
+        // `X-Lorica-Verified-Bot: GPTBot` and have it forwarded
+        // verbatim alongside our own value (header trust-laundering).
+        // For non-bot requests `ctx.ai_bot_inject` is empty and the
+        // loop is zero-cost.
+        for (name, value) in &ctx.ai_bot_inject {
             let _ = upstream_request.insert_header(name.clone(), value);
         }
 

@@ -98,6 +98,13 @@ pub struct RequestCtx {
     /// Headers harvested from a successful forward-auth response, to be
     /// injected into the upstream request (e.g. Remote-User).
     pub forward_auth_inject: Vec<(String, String)>,
+    /// Headers to inject upstream when an AI-bot crawler's
+    /// verification confirms (Story 8.2 AC #11). Drained by the
+    /// upstream-injection loop alongside `forward_auth_inject`,
+    /// using `insert_header` (overwrite) so a client-supplied
+    /// `X-Lorica-Verified-Bot` value is replaced by ours, never
+    /// appended (trust-laundering defense).
+    pub ai_bot_inject: Vec<(String, String)>,
     /// Response-body rewrite state. `Some(Active(buf))` while we're
     /// buffering the upstream response to rewrite it at end-of-stream;
     /// `Some(Overflowed)` if the body exceeded `max_body_bytes` (we

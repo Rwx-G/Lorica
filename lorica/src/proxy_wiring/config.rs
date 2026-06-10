@@ -208,6 +208,14 @@ pub struct ProxyConfig {
     pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Parsed CIDR ranges of IPs that bypass WAF, rate limiting, and auto-ban.
     pub waf_whitelist: Vec<ipnet::IpNet>,
+    /// Story 8.2 AC #3 - global default applied when an AI-bot
+    /// crawler's verification (Rdns / IpRanges) fails. Per-route
+    /// `Route.ai_bot_spoofed_fallback` overrides this.
+    pub ai_bot_treat_spoofed_as: lorica_config::models::SpoofedFallback,
+    /// Story 8.2 AC #11 - inject `X-Lorica-Verified-Bot` +
+    /// `X-Lorica-Bot-Verification` headers upstream when verification
+    /// confirms.
+    pub ai_bot_inject_headers: bool,
 }
 
 /// Global settings extracted from the config store for ProxyConfig construction.
@@ -220,6 +228,11 @@ pub struct ProxyConfigGlobals {
     pub waf_ban_duration_s: u32,
     pub trusted_proxy_cidrs: Vec<String>,
     pub waf_whitelist_cidrs: Vec<String>,
+    /// Story 8.2 AC #3 / #11. Both fields plumbed at config-load
+    /// time and exposed read-only on `ProxyConfig` for filter-chain
+    /// consumption (no hot-path settings lookup).
+    pub ai_bot_treat_spoofed_as: lorica_config::models::SpoofedFallback,
+    pub ai_bot_inject_headers: bool,
 }
 
 impl ProxyConfig {
@@ -243,6 +256,8 @@ impl ProxyConfig {
             waf_ban_duration_s,
             trusted_proxy_cidrs,
             waf_whitelist_cidrs,
+            ai_bot_treat_spoofed_as,
+            ai_bot_inject_headers,
         } = globals;
         let backend_map: HashMap<String, Backend> = backends
             .into_iter()
@@ -568,6 +583,8 @@ impl ProxyConfig {
             waf_ban_duration_s,
             trusted_proxies,
             waf_whitelist,
+            ai_bot_treat_spoofed_as,
+            ai_bot_inject_headers,
         }
     }
 

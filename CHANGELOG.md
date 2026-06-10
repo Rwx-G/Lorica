@@ -9,6 +9,10 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+### Added
+
+- AI / LLM crawler deny-list (Epic 8 Story 8.2): a curated built-in registry of AI crawler User-Agents with per-vendor verification (forward-confirmed rDNS, vendor-published IP ranges, or UA-only), enforced in the request filter between the IP allow/deny and GeoIP stages. Per-route `ai_bot_policy` (off / deny / log) and `serve_robots_txt` (auto-served `/robots.txt` advertising the active deny-list per RFC 9309); spoofed verdicts (UA claims a bot but verification fails) follow the global `ai_bot_treat_spoofed_as` policy with a per-route `ai_bot_spoofed_fallback` override. Verified crawlers on the log path can inject `X-Lorica-Verified-Bot` / `X-Lorica-Bot-Verification` headers upstream (`ai_bot_inject_headers`, overwrite-only to block client header spoofing). Custom crawler entries manageable via `/api/v1/ai-crawlers/custom` CRUD; matches surface in the `lorica_ai_bot_total{crawler,route,action}` and `lorica_ai_bot_rdns_unavailable_total` Prometheus counters.
+
 ## [1.5.13] - 2026-07-08
 
 ### Fixed

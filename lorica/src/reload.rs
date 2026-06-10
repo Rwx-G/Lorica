@@ -687,6 +687,17 @@ async fn build_proxy_config_inner(
         .as_ref()
         .map(|s| s.connection_deny_cidrs.clone())
         .unwrap_or_default();
+    // Story 8.2 AC #3 / #11. Plumbed at config-load time so the
+    // filter-chain helpers read a stable snapshot, no SettingsStore
+    // lookup on the hot path.
+    let ai_bot_treat_spoofed_as = settings
+        .as_ref()
+        .map(|s| s.ai_bot_treat_spoofed_as)
+        .unwrap_or_default();
+    let ai_bot_inject_headers = settings
+        .as_ref()
+        .map(|s| s.ai_bot_inject_headers)
+        .unwrap_or(true);
 
     let links: Vec<(String, String)> = route_backends
         .into_iter()
@@ -706,6 +717,8 @@ async fn build_proxy_config_inner(
             waf_ban_duration_s,
             trusted_proxy_cidrs: trusted_proxies,
             waf_whitelist_cidrs: waf_whitelist_ips,
+            ai_bot_treat_spoofed_as,
+            ai_bot_inject_headers,
         },
     );
 
