@@ -5,6 +5,7 @@ use axum::extract::Extension;
 use axum::Json;
 use serde::Serialize;
 
+use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
@@ -31,10 +32,13 @@ pub struct StatusResponse {
 pub async fn get_status(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let routes = store.list_routes()?;
-    let backends = store.list_backends()?;
-    let certs = store.list_certificates()?;
+    let (routes, backends, certs) = db_blocking(&state.store, move |store| {
+        let routes = store.list_routes()?;
+        let backends = store.list_backends()?;
+        let certs = store.list_certificates()?;
+        Ok::<_, ApiError>((routes, backends, certs))
+    })
+    .await?;
 
     let now = chrono::Utc::now();
     let expiry_threshold = now + chrono::Duration::days(30);

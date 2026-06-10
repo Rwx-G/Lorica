@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 
+use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
@@ -27,9 +28,11 @@ pub async fn export_config(
     ),
     ApiError,
 > {
-    let store = state.store.lock().await;
-    let toml_content = lorica_config::export::export_to_toml(&store)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let toml_content = db_blocking(&state.store, move |store| {
+        lorica_config::export::export_to_toml(&*store)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
 
     Ok((
         StatusCode::OK,
@@ -72,19 +75,21 @@ pub async fn import_config(
     // `DecryptError` alert at handshake time. Same invariant as
     // POST/PUT /certificates.
     for cert in &import_data.certificates {
-        crate::certificates::validate_certificate_bundle(&cert.cert_pem, &cert.key_pem)
-            .map_err(|e| match e {
+        crate::certificates::validate_certificate_bundle(&cert.cert_pem, &cert.key_pem).map_err(
+            |e| match e {
                 ApiError::BadRequest(msg) => {
                     ApiError::BadRequest(format!("certificate {:?}: {}", cert.domain, msg))
                 }
                 other => other,
-            })?;
+            },
+        )?;
     }
 
-    let store = state.store.lock().await;
-    lorica_config::import::import_to_store(&store, &import_data)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    drop(store);
+    db_blocking(&state.store, move |store| {
+        lorica_config::import::import_to_store(&*store, &import_data)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
     state.notify_config_changed();
 
     Ok(json_data(
@@ -108,9 +113,11 @@ pub async fn import_preview(
     let import_data = lorica_config::import::parse_toml_for_preview(&body.toml_content)
         .map_err(|e| ApiError::BadRequest(format!("invalid TOML: {e}")))?;
 
-    let store = state.store.lock().await;
-    let diff = lorica_config::diff::compute_diff(&store, &import_data)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let diff = db_blocking(&state.store, move |store| {
+        lorica_config::diff::compute_diff(&*store, &import_data)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
 
     Ok(json_data(diff))
 }

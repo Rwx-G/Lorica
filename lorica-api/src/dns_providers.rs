@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
 
@@ -35,8 +36,7 @@ fn provider_to_response(p: &lorica_config::models::DnsProvider) -> DnsProviderRe
 pub async fn list_dns_providers(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let providers = store.list_dns_providers()?;
+    let providers = db_blocking(&state.store, |store| store.list_dns_providers()).await?;
     let responses: Vec<DnsProviderResponse> = providers.iter().map(provider_to_response).collect();
     Ok(json_data(serde_json::json!({ "dns_providers": responses })))
 }
@@ -164,8 +164,11 @@ pub async fn create_dns_provider(
         created_at: chrono::Utc::now(),
     };
 
-    let store = state.store.lock().await;
-    store.create_dns_provider(&provider)?;
+    let provider = db_blocking(&state.store, move |store| {
+        store.create_dns_provider(&provider)?;
+        Ok::<_, lorica_config::ConfigError>(provider)
+    })
+    .await?;
     Ok(json_data_with_status(
         StatusCode::CREATED,
         provider_to_response(&provider),
@@ -185,20 +188,24 @@ pub async fn update_dns_provider(
 
     let config_json = body.config.to_dns_challenge_json(&body.provider_type)?;
 
-    let store = state.store.lock().await;
-    let existing = store
-        .get_dns_provider(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("dns_provider {id}")))?;
+    let provider_type = body.provider_type;
+    let provider = db_blocking(&state.store, move |store| {
+        let existing = store
+            .get_dns_provider(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("dns_provider {id}")))?;
 
-    let provider = lorica_config::models::DnsProvider {
-        id: existing.id,
-        name,
-        provider_type: body.provider_type,
-        config: config_json,
-        created_at: existing.created_at,
-    };
+        let provider = lorica_config::models::DnsProvider {
+            id: existing.id,
+            name,
+            provider_type,
+            config: config_json,
+            created_at: existing.created_at,
+        };
 
-    store.update_dns_provider(&provider)?;
+        store.update_dns_provider(&provider)?;
+        Ok::<_, ApiError>(provider)
+    })
+    .await?;
     Ok(json_data(provider_to_response(&provider)))
 }
 
@@ -207,16 +214,18 @@ pub async fn delete_dns_provider(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
+    db_blocking(&state.store, move |store| {
+        // Check if any certificates reference this provider
+        if store.dns_provider_in_use(&id)? {
+            return Err(ApiError::Conflict(
+                "cannot delete DNS provider: referenced by one or more certificates".into(),
+            ));
+        }
 
-    // Check if any certificates reference this provider
-    if store.dns_provider_in_use(&id)? {
-        return Err(ApiError::Conflict(
-            "cannot delete DNS provider: referenced by one or more certificates".into(),
-        ));
-    }
-
-    store.delete_dns_provider(&id)?;
+        store.delete_dns_provider(&id)?;
+        Ok(())
+    })
+    .await?;
     Ok(json_data(serde_json::json!({
         "message": "DNS provider deleted"
     })))
@@ -227,11 +236,14 @@ pub async fn test_dns_provider(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let provider = store
-        .get_dns_provider(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("dns_provider {id}")))?;
-    drop(store);
+    // Fetch the provider on the blocking pool, then run the async
+    // challenger test with the store lock released.
+    let provider = db_blocking(&state.store, move |store| {
+        store
+            .get_dns_provider(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("dns_provider {id}")))
+    })
+    .await?;
 
     let dns_config: crate::acme::DnsChallengeConfig = serde_json::from_str(&provider.config)
         .map_err(|e| ApiError::Internal(format!("invalid DNS provider config: {e}")))?;

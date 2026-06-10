@@ -18,6 +18,7 @@ use axum::extract::{Extension, Path};
 use axum::Json;
 use tracing::{error, info, warn};
 
+use crate::db::db_blocking;
 use crate::error::ApiError;
 use crate::server::AppState;
 
@@ -73,14 +74,11 @@ pub fn spawn_renewal_task(
         loop {
             tokio::time::sleep(check_interval).await;
 
-            let certs = {
-                let store = state.store.lock().await;
-                match store.list_certificates() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!(error = %e, "ACME renewal: failed to list certificates");
-                        continue;
-                    }
+            let certs = match db_blocking(&state.store, |store| store.list_certificates()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "ACME renewal: failed to list certificates");
+                    continue;
                 }
             };
 
@@ -152,18 +150,30 @@ pub fn spawn_renewal_task(
                 }
                 match renew_with_method(&state, cert, &config, &all_domains).await {
                     Ok(new_cert_id) => {
-                        // Reassign routes from old cert to new cert
-                        let store = state.store.lock().await;
-                        if let Ok(reassigned) = store.reassign_certificate(&cert.id, &new_cert_id) {
-                            if reassigned > 0 {
-                                info!(old_id = %cert.id, new_id = %new_cert_id, routes = reassigned, "routes reassigned to renewed certificate");
+                        // Reassign routes from old cert to new cert,
+                        // then delete the old certificate (single
+                        // store acquisition, same granularity as the
+                        // former lock scope).
+                        let old_id = cert.id.clone();
+                        let renewed_id = new_cert_id.clone();
+                        if let Err(e) = db_blocking(&state.store, move |store| {
+                            if let Ok(reassigned) =
+                                store.reassign_certificate(&old_id, &renewed_id)
+                            {
+                                if reassigned > 0 {
+                                    info!(old_id = %old_id, new_id = %renewed_id, routes = reassigned, "routes reassigned to renewed certificate");
+                                }
                             }
+                            // Delete old certificate
+                            if let Err(e) = store.delete_certificate(&old_id) {
+                                warn!(old_id = %old_id, error = %e, "failed to delete old certificate after renewal");
+                            }
+                            Ok::<_, ApiError>(())
+                        })
+                        .await
+                        {
+                            warn!(old_id = %cert.id, error = %e, "store access failed after renewal");
                         }
-                        // Delete old certificate
-                        if let Err(e) = store.delete_certificate(&cert.id) {
-                            warn!(old_id = %cert.id, error = %e, "failed to delete old certificate after renewal");
-                        }
-                        drop(store);
                         state.rotate_bot_hmac_on_cert_event().await;
                         state.notify_config_changed();
                         info!(
@@ -194,12 +204,12 @@ pub async fn renew_certificate(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let cert = {
-        let store = state.store.lock().await;
+    let cert = db_blocking(&state.store, move |store| {
         store
             .get_certificate(&id)?
-            .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?
-    };
+            .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))
+    })
+    .await?;
 
     if !cert.is_acme {
         return Err(ApiError::BadRequest(
@@ -226,15 +236,20 @@ pub async fn renew_certificate(
 
     // Reassign routes and delete old cert
     {
-        let store = state.store.lock().await;
-        if let Ok(reassigned) = store.reassign_certificate(&cert.id, &new_cert_id) {
-            if reassigned > 0 {
-                tracing::info!(old_id = %cert.id, new_id = %new_cert_id, routes = reassigned, "routes reassigned to renewed certificate");
+        let old_id = cert.id.clone();
+        let renewed_id = new_cert_id.clone();
+        db_blocking(&state.store, move |store| {
+            if let Ok(reassigned) = store.reassign_certificate(&old_id, &renewed_id) {
+                if reassigned > 0 {
+                    tracing::info!(old_id = %old_id, new_id = %renewed_id, routes = reassigned, "routes reassigned to renewed certificate");
+                }
             }
-        }
-        if let Err(e) = store.delete_certificate(&cert.id) {
-            tracing::warn!(old_id = %cert.id, error = %e, "failed to delete old certificate after renewal");
-        }
+            if let Err(e) = store.delete_certificate(&old_id) {
+                tracing::warn!(old_id = %old_id, error = %e, "failed to delete old certificate after renewal");
+            }
+            Ok::<_, ApiError>(())
+        })
+        .await?;
     }
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
@@ -278,11 +293,15 @@ async fn renew_with_method(
 
             // Try new approach first: global DNS provider reference
             let (dns_config, dns_provider_id) = if let Some(ref pid) = cert.acme_dns_provider_id {
-                let store = state.store.lock().await;
-                let dp = store
-                    .get_dns_provider(pid)
-                    .map_err(|e| format!("failed to fetch DNS provider '{pid}': {e}"))?;
-                drop(store);
+                let pid_owned = pid.clone();
+                let dp = db_blocking(&state.store, move |store| {
+                    store.get_dns_provider(&pid_owned).map_err(|e| {
+                        ApiError::Internal(format!(
+                            "failed to fetch DNS provider '{pid_owned}': {e}"
+                        ))
+                    })
+                })
+                .await?;
                 let dp = dp.ok_or_else(|| {
                     format!(
                         "certificate references DNS provider '{pid}' which no longer exists - \

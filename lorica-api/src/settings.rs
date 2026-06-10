@@ -1,12 +1,11 @@
 //! Global settings, notification channels, and per-user UI preferences endpoints.
 
-use std::sync::Arc;
-
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 
+use crate::db::{db_blocking, log_db_blocking};
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
 
@@ -35,8 +34,7 @@ use crate::server::AppState;
 pub async fn get_settings(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let mut settings = store.get_global_settings()?;
+    let mut settings = db_blocking(&state.store, move |store| store.get_global_settings()).await?;
     settings.bot_hmac_secret_hex = if settings.bot_hmac_secret_hex.is_empty() {
         String::new()
     } else {
@@ -123,342 +121,347 @@ pub async fn update_settings(
     Extension(state): Extension<AppState>,
     Json(body): Json<UpdateSettingsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let mut settings = store.get_global_settings()?;
+    // The whole get -> validate/assign -> update sequence is sync and
+    // runs in one closure on the blocking pool; the store mutex hold
+    // window is unchanged.
+    let settings = db_blocking(&state.store, move |store| {
+        let mut settings = store.get_global_settings()?;
 
-    if let Some(port) = body.management_port {
-        settings.management_port = port;
-    }
-    if let Some(ref level) = body.log_level {
-        let valid = ["trace", "debug", "info", "warn", "error"];
-        if !valid.contains(&level.as_str()) {
-            return Err(ApiError::BadRequest(format!(
-                "invalid log_level: {level}. Must be one of: {valid:?}"
-            )));
+        if let Some(port) = body.management_port {
+            settings.management_port = port;
         }
-        settings.log_level = level.clone();
-    }
-    if let Some(interval) = body.default_health_check_interval_s {
-        if interval < 1 {
-            return Err(ApiError::BadRequest(
-                "default_health_check_interval_s must be >= 1".into(),
-            ));
-        }
-        settings.default_health_check_interval_s = interval;
-    }
-    if let Some(max_probes) = body.health_max_concurrent_probes {
-        if !(1..=512).contains(&max_probes) {
-            return Err(ApiError::BadRequest(
-                "health_max_concurrent_probes must be in 1..=512".into(),
-            ));
-        }
-        settings.health_max_concurrent_probes = max_probes;
-    }
-    if let Some(days) = body.cert_warning_days {
-        if days < 1 {
-            return Err(ApiError::BadRequest(
-                "cert_warning_days must be >= 1".into(),
-            ));
-        }
-        settings.cert_warning_days = days;
-    }
-    if let Some(days) = body.cert_critical_days {
-        if days < 1 {
-            return Err(ApiError::BadRequest(
-                "cert_critical_days must be >= 1".into(),
-            ));
-        }
-        settings.cert_critical_days = days;
-    }
-    if let Some(max_conn) = body.max_global_connections {
-        if max_conn < 0 {
-            return Err(ApiError::BadRequest(
-                "max_global_connections must be >= 0".into(),
-            ));
-        }
-        settings.max_global_connections = max_conn;
-    }
-    if let Some(threshold) = body.flood_threshold_rps {
-        if threshold < 0 {
-            return Err(ApiError::BadRequest(
-                "flood_threshold_rps must be >= 0".into(),
-            ));
-        }
-        settings.flood_threshold_rps = threshold;
-    }
-    if let Some(threshold) = body.waf_ban_threshold {
-        if threshold < 0 {
-            return Err(ApiError::BadRequest(
-                "waf_ban_threshold must be >= 0".into(),
-            ));
-        }
-        settings.waf_ban_threshold = threshold;
-    }
-    if let Some(duration) = body.waf_ban_duration_s {
-        if duration < 0 {
-            return Err(ApiError::BadRequest(
-                "waf_ban_duration_s must be >= 0".into(),
-            ));
-        }
-        settings.waf_ban_duration_s = duration;
-    }
-    if let Some(retention) = body.access_log_retention {
-        if retention < 0 {
-            return Err(ApiError::BadRequest(
-                "access_log_retention must be >= 0".into(),
-            ));
-        }
-        settings.access_log_retention = retention;
-    }
-    if let Some(enabled) = body.sla_purge_enabled {
-        settings.sla_purge_enabled = enabled;
-    }
-    if let Some(days) = body.sla_purge_retention_days {
-        if !(1..=3650).contains(&days) {
-            return Err(ApiError::BadRequest(
-                "sla_purge_retention_days must be in 1..=3650 (10 years)".into(),
-            ));
-        }
-        settings.sla_purge_retention_days = days;
-    }
-    if let Some(ref schedule) = body.sla_purge_schedule {
-        let valid = matches!(schedule.as_str(), "first_of_month" | "daily")
-            || schedule.parse::<i32>().is_ok_and(|d| (1..=28).contains(&d));
-        if !valid {
-            return Err(ApiError::BadRequest(
-                "sla_purge_schedule must be 'first_of_month', 'daily', or a day number (1-28)"
-                    .into(),
-            ));
-        }
-        settings.sla_purge_schedule = schedule.clone();
-    }
-    if let Some(presets) = body.custom_security_presets {
-        settings.custom_security_presets = presets;
-    }
-    if let Some(ref proxies) = body.trusted_proxies {
-        // Validate each entry is a valid CIDR or IP address
-        for entry in proxies {
-            let trimmed = entry.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Accept both bare IPs (1.2.3.4) and CIDR notation (1.2.3.0/24)
-            if trimmed.parse::<std::net::IpAddr>().is_err()
-                && trimmed.parse::<ipnet::IpNet>().is_err()
-            {
+        if let Some(ref level) = body.log_level {
+            let valid = ["trace", "debug", "info", "warn", "error"];
+            if !valid.contains(&level.as_str()) {
                 return Err(ApiError::BadRequest(format!(
-                    "invalid trusted proxy CIDR or IP: {trimmed}"
+                    "invalid log_level: {level}. Must be one of: {valid:?}"
                 )));
             }
+            settings.log_level = level.clone();
         }
-        settings.trusted_proxies = proxies.clone();
-    }
-    if let Some(ref ips) = body.waf_whitelist_ips {
-        for entry in ips {
-            let trimmed = entry.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.parse::<std::net::IpAddr>().is_err()
-                && trimmed.parse::<ipnet::IpNet>().is_err()
-            {
-                return Err(ApiError::BadRequest(format!(
-                    "invalid WAF whitelist CIDR or IP: {trimmed}"
-                )));
-            }
-        }
-        settings.waf_whitelist_ips = ips.clone();
-    }
-    if let Some(ref cidrs) = body.connection_deny_cidrs {
-        validate_cidr_list(cidrs, "connection_deny_cidrs")?;
-        settings.connection_deny_cidrs = cidrs.clone();
-    }
-    if let Some(ref cidrs) = body.connection_allow_cidrs {
-        validate_cidr_list(cidrs, "connection_allow_cidrs")?;
-        settings.connection_allow_cidrs = cidrs.clone();
-    }
-    if let Some(ref endpoint) = body.otlp_endpoint {
-        let trimmed = endpoint.trim();
-        if trimmed.is_empty() {
-            settings.otlp_endpoint = None;
-        } else {
-            // Validate scheme + host to reject malformed input.
-            // RFC-1918 / loopback targets are NOT blocked because
-            // internal collectors (docker-compose, k8s sidecar) are
-            // the primary deployment pattern and the API is auth-gated.
-            let is_https = trimmed.starts_with("https://");
-            let is_http = trimmed.starts_with("http://");
-            if !is_http && !is_https {
+        if let Some(interval) = body.default_health_check_interval_s {
+            if interval < 1 {
                 return Err(ApiError::BadRequest(
-                    "otlp_endpoint must start with http:// or https://".into(),
+                    "default_health_check_interval_s must be >= 1".into(),
                 ));
             }
-            let after_scheme = if is_https {
-                &trimmed[8..]
+            settings.default_health_check_interval_s = interval;
+        }
+        if let Some(max_probes) = body.health_max_concurrent_probes {
+            if !(1..=512).contains(&max_probes) {
+                return Err(ApiError::BadRequest(
+                    "health_max_concurrent_probes must be in 1..=512".into(),
+                ));
+            }
+            settings.health_max_concurrent_probes = max_probes;
+        }
+        if let Some(days) = body.cert_warning_days {
+            if days < 1 {
+                return Err(ApiError::BadRequest(
+                    "cert_warning_days must be >= 1".into(),
+                ));
+            }
+            settings.cert_warning_days = days;
+        }
+        if let Some(days) = body.cert_critical_days {
+            if days < 1 {
+                return Err(ApiError::BadRequest(
+                    "cert_critical_days must be >= 1".into(),
+                ));
+            }
+            settings.cert_critical_days = days;
+        }
+        if let Some(max_conn) = body.max_global_connections {
+            if max_conn < 0 {
+                return Err(ApiError::BadRequest(
+                    "max_global_connections must be >= 0".into(),
+                ));
+            }
+            settings.max_global_connections = max_conn;
+        }
+        if let Some(threshold) = body.flood_threshold_rps {
+            if threshold < 0 {
+                return Err(ApiError::BadRequest(
+                    "flood_threshold_rps must be >= 0".into(),
+                ));
+            }
+            settings.flood_threshold_rps = threshold;
+        }
+        if let Some(threshold) = body.waf_ban_threshold {
+            if threshold < 0 {
+                return Err(ApiError::BadRequest(
+                    "waf_ban_threshold must be >= 0".into(),
+                ));
+            }
+            settings.waf_ban_threshold = threshold;
+        }
+        if let Some(duration) = body.waf_ban_duration_s {
+            if duration < 0 {
+                return Err(ApiError::BadRequest(
+                    "waf_ban_duration_s must be >= 0".into(),
+                ));
+            }
+            settings.waf_ban_duration_s = duration;
+        }
+        if let Some(retention) = body.access_log_retention {
+            if retention < 0 {
+                return Err(ApiError::BadRequest(
+                    "access_log_retention must be >= 0".into(),
+                ));
+            }
+            settings.access_log_retention = retention;
+        }
+        if let Some(enabled) = body.sla_purge_enabled {
+            settings.sla_purge_enabled = enabled;
+        }
+        if let Some(days) = body.sla_purge_retention_days {
+            if !(1..=3650).contains(&days) {
+                return Err(ApiError::BadRequest(
+                    "sla_purge_retention_days must be in 1..=3650 (10 years)".into(),
+                ));
+            }
+            settings.sla_purge_retention_days = days;
+        }
+        if let Some(ref schedule) = body.sla_purge_schedule {
+            let valid = matches!(schedule.as_str(), "first_of_month" | "daily")
+                || schedule.parse::<i32>().is_ok_and(|d| (1..=28).contains(&d));
+            if !valid {
+                return Err(ApiError::BadRequest(
+                    "sla_purge_schedule must be 'first_of_month', 'daily', or a day number (1-28)"
+                        .into(),
+                ));
+            }
+            settings.sla_purge_schedule = schedule.clone();
+        }
+        if let Some(presets) = body.custom_security_presets {
+            settings.custom_security_presets = presets;
+        }
+        if let Some(ref proxies) = body.trusted_proxies {
+            // Validate each entry is a valid CIDR or IP address
+            for entry in proxies {
+                let trimmed = entry.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // Accept both bare IPs (1.2.3.4) and CIDR notation (1.2.3.0/24)
+                if trimmed.parse::<std::net::IpAddr>().is_err()
+                    && trimmed.parse::<ipnet::IpNet>().is_err()
+                {
+                    return Err(ApiError::BadRequest(format!(
+                        "invalid trusted proxy CIDR or IP: {trimmed}"
+                    )));
+                }
+            }
+            settings.trusted_proxies = proxies.clone();
+        }
+        if let Some(ref ips) = body.waf_whitelist_ips {
+            for entry in ips {
+                let trimmed = entry.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.parse::<std::net::IpAddr>().is_err()
+                    && trimmed.parse::<ipnet::IpNet>().is_err()
+                {
+                    return Err(ApiError::BadRequest(format!(
+                        "invalid WAF whitelist CIDR or IP: {trimmed}"
+                    )));
+                }
+            }
+            settings.waf_whitelist_ips = ips.clone();
+        }
+        if let Some(ref cidrs) = body.connection_deny_cidrs {
+            validate_cidr_list(cidrs, "connection_deny_cidrs")?;
+            settings.connection_deny_cidrs = cidrs.clone();
+        }
+        if let Some(ref cidrs) = body.connection_allow_cidrs {
+            validate_cidr_list(cidrs, "connection_allow_cidrs")?;
+            settings.connection_allow_cidrs = cidrs.clone();
+        }
+        if let Some(ref endpoint) = body.otlp_endpoint {
+            let trimmed = endpoint.trim();
+            if trimmed.is_empty() {
+                settings.otlp_endpoint = None;
             } else {
-                &trimmed[7..]
-            };
-            if after_scheme.is_empty()
-                || after_scheme.starts_with('/')
-                || after_scheme.starts_with(':')
-            {
-                return Err(ApiError::BadRequest(
-                    "otlp_endpoint must contain a hostname after the scheme".into(),
-                ));
+                // Validate scheme + host to reject malformed input.
+                // RFC-1918 / loopback targets are NOT blocked because
+                // internal collectors (docker-compose, k8s sidecar) are
+                // the primary deployment pattern and the API is auth-gated.
+                let is_https = trimmed.starts_with("https://");
+                let is_http = trimmed.starts_with("http://");
+                if !is_http && !is_https {
+                    return Err(ApiError::BadRequest(
+                        "otlp_endpoint must start with http:// or https://".into(),
+                    ));
+                }
+                let after_scheme = if is_https {
+                    &trimmed[8..]
+                } else {
+                    &trimmed[7..]
+                };
+                if after_scheme.is_empty()
+                    || after_scheme.starts_with('/')
+                    || after_scheme.starts_with(':')
+                {
+                    return Err(ApiError::BadRequest(
+                        "otlp_endpoint must contain a hostname after the scheme".into(),
+                    ));
+                }
+                if trimmed.len() > 2048 {
+                    return Err(ApiError::BadRequest(
+                        "otlp_endpoint too long (> 2048 chars)".into(),
+                    ));
+                }
+                if is_http {
+                    tracing::warn!(
+                        endpoint = %trimmed,
+                        "OTLP endpoint uses plaintext HTTP; trace data \
+                         (URLs, IPs, error messages) will transit in cleartext. \
+                         Use https:// in production."
+                    );
+                }
+                settings.otlp_endpoint = Some(trimmed.to_string());
             }
-            if trimmed.len() > 2048 {
-                return Err(ApiError::BadRequest(
-                    "otlp_endpoint too long (> 2048 chars)".into(),
-                ));
-            }
-            if is_http {
-                tracing::warn!(
-                    endpoint = %trimmed,
-                    "OTLP endpoint uses plaintext HTTP; trace data \
-                     (URLs, IPs, error messages) will transit in cleartext. \
-                     Use https:// in production."
-                );
-            }
-            settings.otlp_endpoint = Some(trimmed.to_string());
         }
-    }
-    if let Some(ref protocol) = body.otlp_protocol {
-        let valid = ["grpc", "http-proto", "http-json"];
-        if !valid.contains(&protocol.as_str()) {
-            return Err(ApiError::BadRequest(format!(
-                "invalid otlp_protocol: {protocol}. Must be one of: {valid:?}"
-            )));
+        if let Some(ref protocol) = body.otlp_protocol {
+            let valid = ["grpc", "http-proto", "http-json"];
+            if !valid.contains(&protocol.as_str()) {
+                return Err(ApiError::BadRequest(format!(
+                    "invalid otlp_protocol: {protocol}. Must be one of: {valid:?}"
+                )));
+            }
+            settings.otlp_protocol = protocol.clone();
         }
-        settings.otlp_protocol = protocol.clone();
-    }
-    if let Some(ref name) = body.otlp_service_name {
-        let trimmed = name.trim();
-        if trimmed.is_empty() || trimmed.len() > 256 {
-            return Err(ApiError::BadRequest(
-                "otlp_service_name must be 1-256 characters".into(),
-            ));
-        }
-        if trimmed.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
-            return Err(ApiError::BadRequest(
-                "otlp_service_name must not contain control characters".into(),
-            ));
-        }
-        settings.otlp_service_name = trimmed.to_string();
-    }
-    if let Some(ratio) = body.otlp_sampling_ratio {
-        if !(0.0..=1.0).contains(&ratio) || !ratio.is_finite() {
-            return Err(ApiError::BadRequest(
-                "otlp_sampling_ratio must be a finite number in 0.0..=1.0".into(),
-            ));
-        }
-        settings.otlp_sampling_ratio = ratio;
-    }
-    if let Some(ref path) = body.geoip_db_path {
-        let trimmed = path.trim();
-        if trimmed.is_empty() {
-            settings.geoip_db_path = None;
-        } else {
-            if !trimmed.starts_with('/') {
+        if let Some(ref name) = body.otlp_service_name {
+            let trimmed = name.trim();
+            if trimmed.is_empty() || trimmed.len() > 256 {
                 return Err(ApiError::BadRequest(
-                    "geoip_db_path must be an absolute path (starting with '/')".into(),
+                    "otlp_service_name must be 1-256 characters".into(),
                 ));
             }
-            if trimmed.len() > 4096 {
+            if trimmed.chars().any(|c| (c as u32) < 0x20 || c == '\u{7f}') {
                 return Err(ApiError::BadRequest(
-                    "geoip_db_path too long (> 4096 chars)".into(),
+                    "otlp_service_name must not contain control characters".into(),
                 ));
             }
-            // Reject path traversal components. The path is operator-
-            // supplied via the authenticated API, but defence-in-depth
-            // prevents accidentally writing outside /var/lib/lorica.
-            if trimmed.contains("/../") || trimmed.ends_with("/..") {
-                return Err(ApiError::BadRequest(
-                    "geoip_db_path must not contain path traversal (../)".into(),
-                ));
-            }
-            settings.geoip_db_path = Some(trimmed.to_string());
+            settings.otlp_service_name = trimmed.to_string();
         }
-    }
-    if let Some(auto_update) = body.geoip_auto_update_enabled {
-        settings.geoip_auto_update_enabled = auto_update;
-    }
-    if let Some(ref path) = body.asn_db_path {
-        let trimmed = path.trim();
-        if trimmed.is_empty() {
-            settings.asn_db_path = None;
-        } else {
-            if !trimmed.starts_with('/') {
+        if let Some(ratio) = body.otlp_sampling_ratio {
+            if !(0.0..=1.0).contains(&ratio) || !ratio.is_finite() {
                 return Err(ApiError::BadRequest(
-                    "asn_db_path must be an absolute path (starting with '/')".into(),
+                    "otlp_sampling_ratio must be a finite number in 0.0..=1.0".into(),
                 ));
             }
-            if trimmed.len() > 4096 {
-                return Err(ApiError::BadRequest(
-                    "asn_db_path too long (> 4096 chars)".into(),
-                ));
-            }
-            if trimmed.contains("/../") || trimmed.ends_with("/..") {
-                return Err(ApiError::BadRequest(
-                    "asn_db_path must not contain path traversal (../)".into(),
-                ));
-            }
-            settings.asn_db_path = Some(trimmed.to_string());
+            settings.otlp_sampling_ratio = ratio;
         }
-    }
-    if let Some(auto_update) = body.asn_auto_update_enabled {
-        settings.asn_auto_update_enabled = auto_update;
-    }
-    if let Some(enabled) = body.cert_export_enabled {
-        settings.cert_export_enabled = enabled;
-    }
-    if let Some(ref dir) = body.cert_export_dir {
-        let trimmed = dir.trim();
-        if trimmed.is_empty() {
-            settings.cert_export_dir = None;
-        } else {
-            if !trimmed.starts_with('/') {
+        if let Some(ref path) = body.geoip_db_path {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                settings.geoip_db_path = None;
+            } else {
+                if !trimmed.starts_with('/') {
+                    return Err(ApiError::BadRequest(
+                        "geoip_db_path must be an absolute path (starting with '/')".into(),
+                    ));
+                }
+                if trimmed.len() > 4096 {
+                    return Err(ApiError::BadRequest(
+                        "geoip_db_path too long (> 4096 chars)".into(),
+                    ));
+                }
+                // Reject path traversal components. The path is operator-
+                // supplied via the authenticated API, but defence-in-depth
+                // prevents accidentally writing outside /var/lib/lorica.
+                if trimmed.contains("/../") || trimmed.ends_with("/..") {
+                    return Err(ApiError::BadRequest(
+                        "geoip_db_path must not contain path traversal (../)".into(),
+                    ));
+                }
+                settings.geoip_db_path = Some(trimmed.to_string());
+            }
+        }
+        if let Some(auto_update) = body.geoip_auto_update_enabled {
+            settings.geoip_auto_update_enabled = auto_update;
+        }
+        if let Some(ref path) = body.asn_db_path {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                settings.asn_db_path = None;
+            } else {
+                if !trimmed.starts_with('/') {
+                    return Err(ApiError::BadRequest(
+                        "asn_db_path must be an absolute path (starting with '/')".into(),
+                    ));
+                }
+                if trimmed.len() > 4096 {
+                    return Err(ApiError::BadRequest(
+                        "asn_db_path too long (> 4096 chars)".into(),
+                    ));
+                }
+                if trimmed.contains("/../") || trimmed.ends_with("/..") {
+                    return Err(ApiError::BadRequest(
+                        "asn_db_path must not contain path traversal (../)".into(),
+                    ));
+                }
+                settings.asn_db_path = Some(trimmed.to_string());
+            }
+        }
+        if let Some(auto_update) = body.asn_auto_update_enabled {
+            settings.asn_auto_update_enabled = auto_update;
+        }
+        if let Some(enabled) = body.cert_export_enabled {
+            settings.cert_export_enabled = enabled;
+        }
+        if let Some(ref dir) = body.cert_export_dir {
+            let trimmed = dir.trim();
+            if trimmed.is_empty() {
+                settings.cert_export_dir = None;
+            } else {
+                if !trimmed.starts_with('/') {
+                    return Err(ApiError::BadRequest(
+                        "cert_export_dir must be an absolute path (starting with '/')".into(),
+                    ));
+                }
+                if trimmed.len() > 4096 {
+                    return Err(ApiError::BadRequest(
+                        "cert_export_dir too long (> 4096 chars)".into(),
+                    ));
+                }
+                if trimmed.contains("/../") || trimmed.ends_with("/..") {
+                    return Err(ApiError::BadRequest(
+                        "cert_export_dir must not contain path traversal (../)".into(),
+                    ));
+                }
+                settings.cert_export_dir = Some(trimmed.to_string());
+            }
+        }
+        if let Some(uid) = body.cert_export_owner_uid {
+            settings.cert_export_owner_uid = Some(uid);
+        }
+        if let Some(gid) = body.cert_export_group_gid {
+            settings.cert_export_group_gid = Some(gid);
+        }
+        if let Some(mode) = body.cert_export_file_mode {
+            if mode > 0o777 {
                 return Err(ApiError::BadRequest(
-                    "cert_export_dir must be an absolute path (starting with '/')".into(),
+                    "cert_export_file_mode must fit in 9 permission bits (<= 0o777)".into(),
                 ));
             }
-            if trimmed.len() > 4096 {
+            settings.cert_export_file_mode = mode;
+        }
+        if let Some(mode) = body.cert_export_dir_mode {
+            if mode > 0o777 {
                 return Err(ApiError::BadRequest(
-                    "cert_export_dir too long (> 4096 chars)".into(),
+                    "cert_export_dir_mode must fit in 9 permission bits (<= 0o777)".into(),
                 ));
             }
-            if trimmed.contains("/../") || trimmed.ends_with("/..") {
-                return Err(ApiError::BadRequest(
-                    "cert_export_dir must not contain path traversal (../)".into(),
-                ));
-            }
-            settings.cert_export_dir = Some(trimmed.to_string());
+            settings.cert_export_dir_mode = mode;
         }
-    }
-    if let Some(uid) = body.cert_export_owner_uid {
-        settings.cert_export_owner_uid = Some(uid);
-    }
-    if let Some(gid) = body.cert_export_group_gid {
-        settings.cert_export_group_gid = Some(gid);
-    }
-    if let Some(mode) = body.cert_export_file_mode {
-        if mode > 0o777 {
-            return Err(ApiError::BadRequest(
-                "cert_export_file_mode must fit in 9 permission bits (<= 0o777)".into(),
-            ));
-        }
-        settings.cert_export_file_mode = mode;
-    }
-    if let Some(mode) = body.cert_export_dir_mode {
-        if mode > 0o777 {
-            return Err(ApiError::BadRequest(
-                "cert_export_dir_mode must fit in 9 permission bits (<= 0o777)".into(),
-            ));
-        }
-        settings.cert_export_dir_mode = mode;
-    }
 
-    store.update_global_settings(&settings)?;
-    drop(store);
+        store.update_global_settings(&settings)?;
+        Ok::<_, ApiError>(settings)
+    })
+    .await?;
     state.notify_config_changed();
     Ok(json_data(settings))
 }
@@ -481,9 +484,7 @@ pub async fn test_otel_connection(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use std::time::{Duration, Instant};
 
-    let store = state.store.lock().await;
-    let settings = store.get_global_settings()?;
-    drop(store);
+    let settings = db_blocking(&state.store, move |store| store.get_global_settings()).await?;
 
     let endpoint = settings
         .otlp_endpoint
@@ -589,11 +590,14 @@ fn validate_cidr_list(entries: &[String], field: &str) -> Result<(), ApiError> {
 pub async fn list_notifications(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let mut configs = store.list_notification_configs()?;
-    for nc in &mut configs {
-        nc.config = mask_sensitive_config(&nc.channel, &nc.config);
-    }
+    let configs = db_blocking(&state.store, move |store| {
+        let mut configs = store.list_notification_configs()?;
+        for nc in &mut configs {
+            nc.config = mask_sensitive_config(&nc.channel, &nc.config);
+        }
+        Ok::<_, ApiError>(configs)
+    })
+    .await?;
     Ok(json_data(serde_json::json!({ "notifications": configs })))
 }
 
@@ -630,10 +634,13 @@ pub async fn create_notification(
         alert_types: body.alert_types,
     };
 
-    let store = state.store.lock().await;
-    store.create_notification_config(&nc)?;
-    let mut masked = nc;
-    masked.config = mask_sensitive_config(&masked.channel, &masked.config);
+    let masked = db_blocking(&state.store, move |store| {
+        store.create_notification_config(&nc)?;
+        let mut masked = nc;
+        masked.config = mask_sensitive_config(&masked.channel, &masked.config);
+        Ok::<_, ApiError>(masked)
+    })
+    .await?;
     Ok(json_data_with_status(StatusCode::CREATED, masked))
 }
 
@@ -642,11 +649,12 @@ pub async fn test_notification(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let nc = store
-        .get_notification_config(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("notification_config {id}")))?;
-    drop(store);
+    let nc = db_blocking(&state.store, move |store| {
+        store
+            .get_notification_config(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("notification_config {id}")))
+    })
+    .await?;
 
     let test_event = lorica_notify::events::AlertEvent::new(
         lorica_notify::events::AlertType::ConfigChanged,
@@ -716,15 +724,12 @@ pub async fn notification_history(
     // hit the SQLite WAL via `Mutex<Connection>` and an unrelated
     // proxy-side write would otherwise stall the reactor.
     if let Some(ref log_store) = state.log_store {
-        let store = Arc::clone(log_store);
-        let (events, total) = tokio::task::spawn_blocking(move || {
+        let (events, total) = log_db_blocking(log_store, move |store| {
             let events = store.list_notification_history(200)?;
             let total = store.notification_history_count()?;
-            Ok::<_, String>((events, total))
+            Ok((events, total))
         })
-        .await
-        .map_err(|e| ApiError::Internal(format!("notification history join failed: {e}")))?
-        .map_err(ApiError::Internal)?;
+        .await?;
         return Ok(json_data(serde_json::json!({
             "events": events,
             "total": total,
@@ -819,35 +824,40 @@ pub async fn update_notification(
                     .is_some_and(|v| v.as_str() == Some("********"))
             });
             if needs_restore {
-                let store = state.store.lock().await;
-                let existing = store.get_notification_config(&id)?.ok_or_else(|| {
-                    ApiError::BadRequest(
-                        "cannot restore masked secret: no existing config for this channel".into(),
-                    )
-                })?;
-                let existing_val: serde_json::Value =
-                    serde_json::from_str(&existing.config).map_err(|e| {
-                        ApiError::BadRequest(format!(
-                            "existing notification config is corrupt; cannot restore secrets: {e}"
-                        ))
+                let lookup_id = id.clone();
+                config = db_blocking(&state.store, move |store| {
+                    let existing = store.get_notification_config(&lookup_id)?.ok_or_else(|| {
+                        ApiError::BadRequest(
+                            "cannot restore masked secret: no existing config for this channel"
+                                .into(),
+                        )
                     })?;
-                for field in restore_fields {
-                    if new_val
-                        .get(*field)
-                        .is_some_and(|v| v.as_str() == Some("********"))
-                    {
-                        let v = existing_val.get(*field).ok_or_else(|| {
+                    let existing_val: serde_json::Value = serde_json::from_str(&existing.config)
+                        .map_err(|e| {
                             ApiError::BadRequest(format!(
-                                "existing config has no `{field}` to restore"
+                                "existing notification config is corrupt; cannot restore secrets: {e}"
                             ))
                         })?;
-                        new_val[*field] = v.clone();
+                    for field in restore_fields {
+                        if new_val
+                            .get(*field)
+                            .is_some_and(|v| v.as_str() == Some("********"))
+                        {
+                            let v = existing_val.get(*field).ok_or_else(|| {
+                                ApiError::BadRequest(format!(
+                                    "existing config has no `{field}` to restore"
+                                ))
+                            })?;
+                            new_val[*field] = v.clone();
+                        }
                     }
-                }
-                config = serde_json::to_string(&new_val).map_err(|e| {
-                    ApiError::BadRequest(format!("failed to re-serialize notification config: {e}"))
-                })?;
-                drop(store);
+                    serde_json::to_string(&new_val).map_err(|e| {
+                        ApiError::BadRequest(format!(
+                            "failed to re-serialize notification config: {e}"
+                        ))
+                    })
+                })
+                .await?;
             }
         }
     }
@@ -860,10 +870,13 @@ pub async fn update_notification(
         alert_types: body.alert_types,
     };
 
-    let store = state.store.lock().await;
-    store.update_notification_config(&nc)?;
-    let mut masked = nc;
-    masked.config = mask_sensitive_config(&masked.channel, &masked.config);
+    let masked = db_blocking(&state.store, move |store| {
+        store.update_notification_config(&nc)?;
+        let mut masked = nc;
+        masked.config = mask_sensitive_config(&masked.channel, &masked.config);
+        Ok::<_, ApiError>(masked)
+    })
+    .await?;
     Ok(json_data(masked))
 }
 
@@ -872,8 +885,10 @@ pub async fn delete_notification(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    store.delete_notification_config(&id)?;
+    db_blocking(&state.store, move |store| {
+        store.delete_notification_config(&id)
+    })
+    .await?;
     Ok(json_data(
         serde_json::json!({"message": "notification config deleted"}),
     ))
@@ -885,8 +900,7 @@ pub async fn delete_notification(
 pub async fn list_preferences(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let prefs = store.list_user_preferences()?;
+    let prefs = db_blocking(&state.store, move |store| store.list_user_preferences()).await?;
     Ok(json_data(serde_json::json!({ "preferences": prefs })))
 }
 
@@ -909,18 +923,21 @@ pub async fn update_preference(
         .parse()
         .map_err(|e: strum::ParseError| ApiError::BadRequest(e.to_string()))?;
 
-    let store = state.store.lock().await;
-    let existing = store
-        .get_user_preference(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("preference {id}")))?;
+    let updated = db_blocking(&state.store, move |store| {
+        let existing = store
+            .get_user_preference(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("preference {id}")))?;
 
-    let updated = lorica_config::models::UserPreference {
-        value,
-        updated_at: chrono::Utc::now(),
-        ..existing
-    };
+        let updated = lorica_config::models::UserPreference {
+            value,
+            updated_at: chrono::Utc::now(),
+            ..existing
+        };
 
-    store.update_user_preference(&updated)?;
+        store.update_user_preference(&updated)?;
+        Ok::<_, ApiError>(updated)
+    })
+    .await?;
     Ok(json_data(updated))
 }
 
@@ -929,8 +946,7 @@ pub async fn delete_preference(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    store.delete_user_preference(&id)?;
+    db_blocking(&state.store, move |store| store.delete_user_preference(&id)).await?;
     Ok(json_data(
         serde_json::json!({"message": "preference deleted"}),
     ))

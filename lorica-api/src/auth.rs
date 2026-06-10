@@ -13,6 +13,7 @@ use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::middleware::auth::{clear_session_cookie, session_cookie, Session, SessionStore};
 use crate::middleware::rate_limit::RateLimiter;
@@ -90,27 +91,32 @@ pub async fn login(
         return Err(ApiError::RateLimited(60));
     }
 
-    let store = state.store.lock().await;
-    let user = store
-        .get_admin_user_by_username(&body.username)
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| ApiError::Unauthorized("invalid credentials".into()))?;
+    // Credential check + last_login update run on the blocking pool ;
+    // the Argon2 verification previously executed under the store
+    // guard, so it stays inside the closure.
+    let user = db_blocking(&state.store, move |store| {
+        let user = store
+            .get_admin_user_by_username(&body.username)
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .ok_or_else(|| ApiError::Unauthorized("invalid credentials".into()))?;
 
-    let parsed_hash = argon2::PasswordHash::new(&user.password_hash)
-        .map_err(|e| ApiError::Internal(format!("invalid stored password hash: {e}")))?;
+        let parsed_hash = argon2::PasswordHash::new(&user.password_hash)
+            .map_err(|e| ApiError::Internal(format!("invalid stored password hash: {e}")))?;
 
-    use argon2::PasswordVerifier;
-    argon2_hasher()
-        .verify_password(body.password.as_bytes(), &parsed_hash)
-        .map_err(|_| ApiError::Unauthorized("invalid credentials".into()))?;
+        use argon2::PasswordVerifier;
+        argon2_hasher()
+            .verify_password(body.password.as_bytes(), &parsed_hash)
+            .map_err(|_| ApiError::Unauthorized("invalid credentials".into()))?;
 
-    // Update last_login
-    let mut updated_user = user.clone();
-    updated_user.last_login = Some(Utc::now());
-    store
-        .update_admin_user(&updated_user)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    drop(store);
+        // Update last_login
+        let mut updated_user = user.clone();
+        updated_user.last_login = Some(Utc::now());
+        store
+            .update_admin_user(&updated_user)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok::<_, ApiError>(user)
+    })
+    .await?;
 
     let session_id = session_store
         .create(user.id.clone(), user.username.clone())
@@ -181,15 +187,17 @@ pub async fn change_password(
         ));
     }
 
-    // Verify current password + persist new hash. We scope the
-    // ConfigStore Mutex guard so it drops BEFORE calling
+    // Verify current password + persist new hash. The ConfigStore
+    // Mutex guard lives inside `db_blocking` and drops BEFORE calling
     // `session_store.create(...)` below : `SessionStore::create`
     // re-acquires the same `ConfigStore` Mutex to persist the new
-    // session row, and holding both would deadlock.
-    {
-        let store = state.store.lock().await;
+    // session row, and holding both would deadlock. The Argon2
+    // verify + re-hash previously ran under the guard, so they stay
+    // inside the closure (on the blocking pool).
+    let user_id = session.user_id.clone();
+    db_blocking(&state.store, move |store| {
         let user = store
-            .get_admin_user(&session.user_id)
+            .get_admin_user(&user_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
 
@@ -207,8 +215,9 @@ pub async fn change_password(
         updated_user.must_change_password = false;
         store
             .update_admin_user(&updated_user)
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-    }
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
 
     // Invalidate EVERY session for this user (including the
     // currently active one) so a stolen cookie cannot outlive a

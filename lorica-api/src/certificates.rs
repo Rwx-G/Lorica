@@ -9,6 +9,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
+use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::middleware::auth::Session;
 use crate::middleware::rate_limit::RateLimiter;
@@ -152,10 +153,7 @@ struct ParsedCertInfo {
 /// per-field PEM parsing but breaks `CertificateVerify` at handshake
 /// time and surfaces as a TLS `DecryptError` alert on the client side
 /// with no usable diagnostic on the server side.
-pub(crate) fn validate_certificate_bundle(
-    cert_pem: &str,
-    key_pem: &str,
-) -> Result<(), ApiError> {
+pub(crate) fn validate_certificate_bundle(cert_pem: &str, key_pem: &str) -> Result<(), ApiError> {
     if cert_pem.trim().is_empty() {
         crate::metrics::inc_certificates_invalid_bundle("upload");
         return Err(ApiError::BadRequest("cert_pem is empty".into()));
@@ -285,8 +283,7 @@ fn compute_fingerprint_from_pem(cert_pem: &str) -> String {
 pub async fn list_certificates(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let certs = store.list_certificates()?;
+    let certs = db_blocking(&state.store, move |store| store.list_certificates()).await?;
     let responses: Vec<_> = certs.iter().map(cert_to_response).collect();
     Ok(json_data(serde_json::json!({ "certificates": responses })))
 }
@@ -327,10 +324,12 @@ pub async fn create_certificate(
         acme_dns_provider_id: None,
     };
 
-    let store = state.store.lock().await;
-    store.create_certificate(&cert)?;
-    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
-    drop(store);
+    let (cert, export_snapshot) = db_blocking(&state.store, move |store| {
+        store.create_certificate(&cert)?;
+        let export_snapshot = crate::cert_export::snapshot_export_inputs(&*store);
+        Ok::<_, ApiError>((cert, export_snapshot))
+    })
+    .await?;
     // v1.5.1 audit M-9 : disk export off-loaded to spawn_blocking
     // and dispatched AFTER the store mutex is released.
     if let Some((settings, acls)) = export_snapshot {
@@ -350,18 +349,21 @@ pub async fn get_certificate(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let cert = store
-        .get_certificate(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
+    let (cert, associated_routes) = db_blocking(&state.store, move |store| {
+        let cert = store
+            .get_certificate(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
 
-    // Find routes that reference this certificate
-    let routes = store.list_routes()?;
-    let associated_routes: Vec<String> = routes
-        .iter()
-        .filter(|r| r.certificate_id.as_deref() == Some(&id))
-        .map(|r| r.id.clone())
-        .collect();
+        // Find routes that reference this certificate
+        let routes = store.list_routes()?;
+        let associated_routes: Vec<String> = routes
+            .iter()
+            .filter(|r| r.certificate_id.as_deref() == Some(&id))
+            .map(|r| r.id.clone())
+            .collect();
+        Ok::<_, ApiError>((cert, associated_routes))
+    })
+    .await?;
 
     let response = CertificateDetailResponse {
         id: cert.id.clone(),
@@ -388,55 +390,57 @@ pub async fn update_certificate(
     Path(id): Path<String>,
     Json(body): Json<UpdateCertificateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let mut cert = store
-        .get_certificate(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
+    let cert = db_blocking(&state.store, move |store| {
+        let mut cert = store
+            .get_certificate(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
 
-    if let Some(domain) = body.domain {
-        cert.domain = domain;
-    }
-    // If either PEM is being replaced, re-validate the full bundle
-    // (existing field + incoming field) so an UPDATE that touches
-    // only `cert_pem` or only `key_pem` cannot end up with a row
-    // whose cert and key come from two different keypairs.
-    if body.cert_pem.is_some() || body.key_pem.is_some() {
-        let candidate_cert = body.cert_pem.as_deref().unwrap_or(&cert.cert_pem);
-        let candidate_key = body.key_pem.as_deref().unwrap_or(&cert.key_pem);
-        validate_certificate_bundle(candidate_cert, candidate_key)?;
-    }
-    if let Some(cert_pem) = body.cert_pem {
-        let parsed = parse_cert_pem(&cert_pem);
-        cert.fingerprint = parsed.fingerprint;
-        cert.issuer = parsed.issuer;
-        cert.not_before = parsed.not_before;
-        cert.not_after = parsed.not_after;
-        cert.san_domains = parsed.san_domains;
-        cert.cert_pem = cert_pem;
-    }
-    if let Some(key_pem) = body.key_pem {
-        cert.key_pem = key_pem;
-    }
-    if let Some(method) = body.acme_method {
-        cert.acme_method = if method.is_empty() {
-            None
-        } else {
-            Some(method)
-        };
-    }
-    if let Some(provider_id) = body.acme_dns_provider_id {
-        cert.acme_dns_provider_id = if provider_id.is_empty() {
-            None
-        } else {
-            Some(provider_id)
-        };
-    }
-    if let Some(auto_renew) = body.acme_auto_renew {
-        cert.acme_auto_renew = auto_renew;
-    }
+        if let Some(domain) = body.domain {
+            cert.domain = domain;
+        }
+        // If either PEM is being replaced, re-validate the full bundle
+        // (existing field + incoming field) so an UPDATE that touches
+        // only `cert_pem` or only `key_pem` cannot end up with a row
+        // whose cert and key come from two different keypairs.
+        if body.cert_pem.is_some() || body.key_pem.is_some() {
+            let candidate_cert = body.cert_pem.as_deref().unwrap_or(&cert.cert_pem);
+            let candidate_key = body.key_pem.as_deref().unwrap_or(&cert.key_pem);
+            validate_certificate_bundle(candidate_cert, candidate_key)?;
+        }
+        if let Some(cert_pem) = body.cert_pem {
+            let parsed = parse_cert_pem(&cert_pem);
+            cert.fingerprint = parsed.fingerprint;
+            cert.issuer = parsed.issuer;
+            cert.not_before = parsed.not_before;
+            cert.not_after = parsed.not_after;
+            cert.san_domains = parsed.san_domains;
+            cert.cert_pem = cert_pem;
+        }
+        if let Some(key_pem) = body.key_pem {
+            cert.key_pem = key_pem;
+        }
+        if let Some(method) = body.acme_method {
+            cert.acme_method = if method.is_empty() {
+                None
+            } else {
+                Some(method)
+            };
+        }
+        if let Some(provider_id) = body.acme_dns_provider_id {
+            cert.acme_dns_provider_id = if provider_id.is_empty() {
+                None
+            } else {
+                Some(provider_id)
+            };
+        }
+        if let Some(auto_renew) = body.acme_auto_renew {
+            cert.acme_auto_renew = auto_renew;
+        }
 
-    store.update_certificate(&cert)?;
-    drop(store);
+        store.update_certificate(&cert)?;
+        Ok::<_, ApiError>(cert)
+    })
+    .await?;
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
     Ok(json_data(cert_to_response(&cert)))
@@ -447,25 +451,26 @@ pub async fn delete_certificate(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
+    db_blocking(&state.store, move |store| {
+        // Check if any routes reference this certificate
+        let routes = store.list_routes()?;
+        let referencing: Vec<&str> = routes
+            .iter()
+            .filter(|r| r.certificate_id.as_deref() == Some(id.as_str()))
+            .map(|r| r.id.as_str())
+            .collect();
 
-    // Check if any routes reference this certificate
-    let routes = store.list_routes()?;
-    let referencing: Vec<&str> = routes
-        .iter()
-        .filter(|r| r.certificate_id.as_deref() == Some(id.as_str()))
-        .map(|r| r.id.as_str())
-        .collect();
+        if !referencing.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "certificate is referenced by routes: {}",
+                referencing.join(", ")
+            )));
+        }
 
-    if !referencing.is_empty() {
-        return Err(ApiError::Conflict(format!(
-            "certificate is referenced by routes: {}",
-            referencing.join(", ")
-        )));
-    }
-
-    store.delete_certificate(&id)?;
-    drop(store);
+        store.delete_certificate(&id)?;
+        Ok::<_, ApiError>(())
+    })
+    .await?;
     state.notify_config_changed();
     Ok(json_data(
         serde_json::json!({"message": "certificate deleted"}),
@@ -516,10 +521,12 @@ pub async fn generate_self_signed(
         acme_dns_provider_id: None,
     };
 
-    let store = state.store.lock().await;
-    store.create_certificate(&certificate)?;
-    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
-    drop(store);
+    let (certificate, export_snapshot) = db_blocking(&state.store, move |store| {
+        store.create_certificate(&certificate)?;
+        let export_snapshot = crate::cert_export::snapshot_export_inputs(&*store);
+        Ok::<_, ApiError>((certificate, export_snapshot))
+    })
+    .await?;
     // v1.5.1 audit M-9 : disk export off-loaded to spawn_blocking
     // and dispatched AFTER the store mutex is released.
     if let Some((settings, acls)) = export_snapshot {
@@ -585,10 +592,12 @@ pub async fn download_certificate(
         return Err(ApiError::RateLimited(retry_after));
     }
 
-    let store = state.store.lock().await;
-    let cert = store
-        .get_certificate(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
+    let cert = db_blocking(&state.store, move |store| {
+        store
+            .get_certificate(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))
+    })
+    .await?;
 
     let part = q.part.as_deref().unwrap_or("bundle");
     let (body, suffix) = match part {

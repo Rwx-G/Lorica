@@ -3,8 +3,6 @@
 //! Reads from the persistent SQLite-backed [`crate::log_store::LogStore`] when
 //! present and falls back to the in-process [`LogBuffer`] otherwise.
 
-use std::sync::Arc;
-
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, Query};
 use axum::response::IntoResponse;
@@ -14,6 +12,7 @@ use http::header;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use crate::db::log_db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
@@ -200,12 +199,7 @@ pub async fn get_logs(
         // a contended WAL write can block the connection mutex for up
         // to `busy_timeout` (5 s), which would otherwise stall the
         // entire reactor for the duration.
-        let store = Arc::clone(store);
-        let params_owned = params.clone();
-        let (entries, total) = tokio::task::spawn_blocking(move || store.query(&params_owned))
-            .await
-            .map_err(|e| ApiError::Internal(format!("log query join failed: {e}")))?
-            .map_err(|e| ApiError::Internal(format!("log query failed: {e}")))?;
+        let (entries, total) = log_db_blocking(store, move |s| s.query(&params)).await?;
         return Ok(json_data(LogsResponse { entries, total }));
     }
 
@@ -377,12 +371,10 @@ pub async fn export_logs(
     let entries: Vec<LogEntry> = if let Some(ref store) = state.log_store {
         // Off the tokio worker - the export query can scan up to
         // EXPORT_MAX_ENTRIES (10 000) rows under WAL contention.
-        let store = Arc::clone(store);
-        let q = logs_query.clone();
-        tokio::task::spawn_blocking(move || store.query_export(&q, EXPORT_MAX_ENTRIES))
-            .await
-            .map_err(|e| ApiError::Internal(format!("log export join failed: {e}")))?
-            .map_err(|e| ApiError::Internal(format!("log export query failed: {e}")))?
+        log_db_blocking(store, move |s| {
+            s.query_export(&logs_query, EXPORT_MAX_ENTRIES)
+        })
+        .await?
     } else {
         // Fallback: filter in-memory buffer (same logic as get_logs but without limit).
         let all = state.log_buffer.snapshot();
@@ -502,11 +494,7 @@ pub async fn clear_logs(
     if let Some(ref store) = state.log_store {
         // `DELETE FROM access_logs` rewrites the WAL and can take a
         // few seconds on a busy DB - off the tokio worker.
-        let store = Arc::clone(store);
-        tokio::task::spawn_blocking(move || store.clear())
-            .await
-            .map_err(|e| ApiError::Internal(format!("log clear join failed: {e}")))?
-            .map_err(|e| ApiError::Internal(format!("log clear failed: {e}")))?;
+        log_db_blocking(store, |s| s.clear()).await?;
     }
     Ok(json_data(serde_json::json!({ "message": "logs cleared" })))
 }

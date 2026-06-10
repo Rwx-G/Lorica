@@ -20,6 +20,7 @@ pub mod cert_export;
 pub mod certificates;
 pub mod config;
 pub mod connections;
+pub mod db;
 pub mod dns_providers;
 pub mod error;
 pub mod loadtest;

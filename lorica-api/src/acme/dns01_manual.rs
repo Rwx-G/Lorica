@@ -21,6 +21,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
@@ -154,8 +155,8 @@ pub async fn provision_dns_manual(
 
     let mut authorizations = order.authorizations();
     while let Some(result) = authorizations.next().await {
-        let mut authz = result
-            .map_err(|e| ApiError::Internal(format!("failed to get authorization: {e}")))?;
+        let mut authz =
+            result.map_err(|e| ApiError::Internal(format!("failed to get authorization: {e}")))?;
         if matches!(authz.status, AuthorizationStatus::Valid) {
             continue;
         }
@@ -518,12 +519,14 @@ pub async fn provision_dns_manual_confirm(
         acme_dns_provider_id: None,
     };
 
-    let store = state.store.lock().await;
-    store
-        .create_certificate(&cert)
-        .map_err(|e| ApiError::Internal(format!("failed to store certificate: {e}")))?;
-    let export_snapshot = crate::cert_export::snapshot_export_inputs(&store);
-    drop(store);
+    let (cert, export_snapshot) = db_blocking(&state.store, move |store| {
+        store
+            .create_certificate(&cert)
+            .map_err(|e| ApiError::Internal(format!("failed to store certificate: {e}")))?;
+        let snapshot = crate::cert_export::snapshot_export_inputs(store);
+        Ok::<_, ApiError>((cert, snapshot))
+    })
+    .await?;
     // v1.5.1 audit M-9 : disk export off-loaded to spawn_blocking
     // and dispatched AFTER the store mutex is released.
     if let Some((settings, acls)) = export_snapshot {

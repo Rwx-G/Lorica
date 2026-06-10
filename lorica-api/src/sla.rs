@@ -21,6 +21,7 @@ use axum::Json;
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 
+use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::server::AppState;
 
@@ -29,15 +30,16 @@ pub async fn get_route_sla(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
+    let summaries = db_blocking(&state.store, move |store| {
+        // Verify route exists
+        store
+            .get_route(&route_id)?
+            .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
 
-    // Verify route exists
-    store
-        .get_route(&route_id)?
-        .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
-
-    let summaries = lorica_bench::results::compute_all_windows(&store, &route_id, "passive")
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        lorica_bench::results::compute_all_windows(store, &route_id, "passive")
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
 
     Ok(json_data(summaries))
 }
@@ -59,12 +61,6 @@ pub async fn get_route_sla_buckets(
     Path(route_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<BucketQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-
-    store
-        .get_route(&route_id)?
-        .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
-
     let now = Utc::now();
     let from = query
         .from
@@ -78,11 +74,18 @@ pub async fn get_route_sla_buckets(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or(now);
-    let source = query.source.as_deref().unwrap_or("passive");
+    let source = query.source.unwrap_or_else(|| "passive".to_string());
 
-    let buckets = store
-        .query_sla_buckets(&route_id, &from, &to, source)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let buckets = db_blocking(&state.store, move |store| {
+        store
+            .get_route(&route_id)?
+            .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
+
+        store
+            .query_sla_buckets(&route_id, &from, &to, &source)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
 
     Ok(json_data(buckets))
 }
@@ -92,15 +95,16 @@ pub async fn get_sla_config(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
+    let config = db_blocking(&state.store, move |store| {
+        store
+            .get_route(&route_id)?
+            .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
 
-    store
-        .get_route(&route_id)?
-        .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
-
-    let config = store
-        .get_sla_config(&route_id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        store
+            .get_sla_config(&route_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
 
     Ok(json_data(config))
 }
@@ -124,43 +128,47 @@ pub async fn update_sla_config(
     Path(route_id): Path<String>,
     Json(body): Json<UpdateSlaConfig>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
+    let db_route_id = route_id.clone();
+    let config = db_blocking(&state.store, move |store| {
+        store
+            .get_route(&db_route_id)?
+            .ok_or_else(|| ApiError::NotFound(format!("route {db_route_id}")))?;
 
-    store
-        .get_route(&route_id)?
-        .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
+        let mut config = store
+            .get_sla_config(&db_route_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    let mut config = store
-        .get_sla_config(&route_id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    if let Some(target) = body.target_pct {
-        if !(0.0..=100.0).contains(&target) {
-            return Err(ApiError::BadRequest(
-                "target_pct must be between 0 and 100".into(),
-            ));
+        if let Some(target) = body.target_pct {
+            if !(0.0..=100.0).contains(&target) {
+                return Err(ApiError::BadRequest(
+                    "target_pct must be between 0 and 100".into(),
+                ));
+            }
+            config.target_pct = target;
         }
-        config.target_pct = target;
-    }
-    if let Some(latency) = body.max_latency_ms {
-        if latency <= 0 {
-            return Err(ApiError::BadRequest(
-                "max_latency_ms must be positive".into(),
-            ));
+        if let Some(latency) = body.max_latency_ms {
+            if latency <= 0 {
+                return Err(ApiError::BadRequest(
+                    "max_latency_ms must be positive".into(),
+                ));
+            }
+            config.max_latency_ms = latency;
         }
-        config.max_latency_ms = latency;
-    }
-    if let Some(min) = body.success_status_min {
-        config.success_status_min = min;
-    }
-    if let Some(max) = body.success_status_max {
-        config.success_status_max = max;
-    }
-    config.updated_at = Utc::now();
+        if let Some(min) = body.success_status_min {
+            config.success_status_min = min;
+        }
+        if let Some(max) = body.success_status_max {
+            config.success_status_max = max;
+        }
+        config.updated_at = Utc::now();
 
-    store
-        .upsert_sla_config(&config)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        store
+            .upsert_sla_config(&config)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        Ok(config)
+    })
+    .await?;
 
     // Update the in-memory collector cache
     if let Some(ref collector) = state.sla_collector {
@@ -204,17 +212,7 @@ pub async fn export_sla_data(
     Path(route_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<ExportQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    let store = state.store.lock().await;
-
-    store
-        .get_route(&route_id)?
-        .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
-
     let (from, to) = parse_export_range(&query);
-
-    let buckets = store
-        .query_sla_buckets(&route_id, &from, &to, "passive")
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let is_csv = query
         .format
@@ -222,7 +220,42 @@ pub async fn export_sla_data(
         .map(|f| f.eq_ignore_ascii_case("csv"))
         .unwrap_or(false);
 
-    if is_csv {
+    let db_route_id = route_id.clone();
+    let (buckets, config) = db_blocking(&state.store, move |store| {
+        store
+            .get_route(&db_route_id)?
+            .ok_or_else(|| ApiError::NotFound(format!("route {db_route_id}")))?;
+
+        let buckets = store
+            .query_sla_buckets(&db_route_id, &from, &to, "passive")
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        // The JSON export embeds the SLA config; CSV does not need it.
+        let config = if is_csv {
+            None
+        } else {
+            Some(
+                store
+                    .get_sla_config(&db_route_id)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?,
+            )
+        };
+
+        Ok::<_, ApiError>((buckets, config))
+    })
+    .await?;
+
+    // `config` is `Some` exactly when the JSON export was requested.
+    if let Some(config) = config {
+        let export = serde_json::json!({
+            "route_id": route_id,
+            "from": from.to_rfc3339(),
+            "to": to.to_rfc3339(),
+            "config": config,
+            "buckets": buckets,
+        });
+        Ok(Json(serde_json::json!({ "data": export })).into_response())
+    } else {
         let mut csv = String::from(
             "bucket_start,request_count,success_count,error_count,\
              latency_sum_ms,latency_min_ms,latency_max_ms,\
@@ -251,18 +284,6 @@ pub async fn export_sla_data(
             )
             .body(axum::body::Body::from(csv))
             .expect("CSV response builder"))
-    } else {
-        let config = store
-            .get_sla_config(&route_id)
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let export = serde_json::json!({
-            "route_id": route_id,
-            "from": from.to_rfc3339(),
-            "to": to.to_rfc3339(),
-            "config": config,
-            "buckets": buckets,
-        });
-        Ok(Json(serde_json::json!({ "data": export })).into_response())
     }
 }
 
@@ -271,15 +292,17 @@ pub async fn clear_route_sla(
     Extension(state): Extension<AppState>,
     Path(route_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
+    let db_route_id = route_id.clone();
+    let deleted = db_blocking(&state.store, move |store| {
+        store
+            .get_route(&db_route_id)?
+            .ok_or_else(|| ApiError::NotFound(format!("route {db_route_id}")))?;
 
-    store
-        .get_route(&route_id)?
-        .ok_or_else(|| ApiError::NotFound(format!("route {route_id}")))?;
-
-    let deleted = store
-        .delete_sla_buckets_for_route(&route_id)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        store
+            .delete_sla_buckets_for_route(&db_route_id)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    })
+    .await?;
 
     // Clear in-memory buckets for this route
     if let Some(ref collector) = state.sla_collector {
@@ -296,25 +319,32 @@ pub async fn clear_route_sla(
 pub async fn get_sla_overview(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let routes = store
-        .list_routes()
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let now = Utc::now();
-    let from = now - Duration::hours(24);
+    // One store acquisition for the whole overview, as before the
+    // blocking-pool migration: every per-route summary runs inside a
+    // single closure.
+    let overview = db_blocking(&state.store, move |store| {
+        let routes = store
+            .list_routes()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let now = Utc::now();
+        let from = now - Duration::hours(24);
 
-    let mut overview = Vec::new();
-    let from_1h = now - Duration::hours(1);
-    for route in &routes {
-        let summary_1h = store
-            .compute_sla_summary(&route.id, &from_1h, &now, "1h", "passive")
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        overview.push(summary_1h);
-        let summary_24h = store
-            .compute_sla_summary(&route.id, &from, &now, "24h", "passive")
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        overview.push(summary_24h);
-    }
+        let mut overview = Vec::new();
+        let from_1h = now - Duration::hours(1);
+        for route in &routes {
+            let summary_1h = store
+                .compute_sla_summary(&route.id, &from_1h, &now, "1h", "passive")
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            overview.push(summary_1h);
+            let summary_24h = store
+                .compute_sla_summary(&route.id, &from, &now, "24h", "passive")
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            overview.push(summary_24h);
+        }
+
+        Ok::<_, ApiError>(overview)
+    })
+    .await?;
 
     Ok(json_data(overview))
 }

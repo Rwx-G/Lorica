@@ -6,6 +6,7 @@ use axum::Json;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
 
@@ -155,7 +156,7 @@ async fn get_ewma_score_async(state: &crate::server::AppState, addr: &str) -> f6
     if let Some(score) = state
         .ewma_scores
         .as_ref()
-        .and_then(|scores| scores.read().get(addr).copied())
+        .and_then(|scores| scores.get(addr).map(|s| *s))
     {
         return score;
     }
@@ -172,8 +173,7 @@ async fn get_ewma_score_async(state: &crate::server::AppState, addr: &str) -> f6
 pub async fn list_backends(
     Extension(state): Extension<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let backends = store.list_backends()?;
+    let backends = db_blocking(&state.store, move |store| store.list_backends()).await?;
     let mut responses = Vec::with_capacity(backends.len());
     for b in &backends {
         let score = get_ewma_score_async(&state, &b.address).await;
@@ -213,9 +213,11 @@ pub async fn create_backend(
         updated_at: now,
     };
 
-    let store = state.store.lock().await;
-    store.create_backend(&backend)?;
-    drop(store);
+    let backend = db_blocking(&state.store, move |store| {
+        store.create_backend(&backend)?;
+        Ok::<_, ApiError>(backend)
+    })
+    .await?;
     state.notify_config_changed();
 
     Ok(json_data_with_status(
@@ -229,10 +231,12 @@ pub async fn get_backend(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let backend = store
-        .get_backend(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    let backend = db_blocking(&state.store, move |store| {
+        store
+            .get_backend(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))
+    })
+    .await?;
     let score = get_ewma_score_async(&state, &backend.address).await;
     let conns = get_backend_connections_async(&state, &backend.address).await;
     Ok(json_data(backend_to_response(&backend, score, conns)))
@@ -244,55 +248,57 @@ pub async fn update_backend(
     Path(id): Path<String>,
     Json(body): Json<UpdateBackendRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let mut backend = store
-        .get_backend(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    let backend = db_blocking(&state.store, move |store| {
+        let mut backend = store
+            .get_backend(&id)?
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
 
-    if let Some(address) = body.address {
-        backend.address = address;
-    }
-    if let Some(name) = body.name {
-        backend.name = name;
-    }
-    if let Some(group_name) = body.group_name {
-        backend.group_name = group_name;
-    }
-    if let Some(weight) = body.weight {
-        backend.weight = weight;
-    }
-    if let Some(hc) = body.health_check_enabled {
-        backend.health_check_enabled = hc;
-        if !hc {
-            backend.health_status = lorica_config::models::HealthStatus::Unknown;
+        if let Some(address) = body.address {
+            backend.address = address;
         }
-    }
-    if let Some(interval) = body.health_check_interval_s {
-        backend.health_check_interval_s = interval;
-    }
-    if let Some(path) = body.health_check_path {
-        if path.is_empty() {
-            backend.health_check_path = None;
-        } else {
-            backend.health_check_path = Some(path);
+        if let Some(name) = body.name {
+            backend.name = name;
         }
-    }
-    if let Some(tls) = body.tls_upstream {
-        backend.tls_upstream = tls;
-    }
-    if let Some(skip) = body.tls_skip_verify {
-        backend.tls_skip_verify = skip;
-    }
-    if let Some(sni) = body.tls_sni {
-        backend.tls_sni = if sni.is_empty() { None } else { Some(sni) };
-    }
-    if let Some(h2) = body.h2_upstream {
-        backend.h2_upstream = h2;
-    }
-    backend.updated_at = Utc::now();
+        if let Some(group_name) = body.group_name {
+            backend.group_name = group_name;
+        }
+        if let Some(weight) = body.weight {
+            backend.weight = weight;
+        }
+        if let Some(hc) = body.health_check_enabled {
+            backend.health_check_enabled = hc;
+            if !hc {
+                backend.health_status = lorica_config::models::HealthStatus::Unknown;
+            }
+        }
+        if let Some(interval) = body.health_check_interval_s {
+            backend.health_check_interval_s = interval;
+        }
+        if let Some(path) = body.health_check_path {
+            if path.is_empty() {
+                backend.health_check_path = None;
+            } else {
+                backend.health_check_path = Some(path);
+            }
+        }
+        if let Some(tls) = body.tls_upstream {
+            backend.tls_upstream = tls;
+        }
+        if let Some(skip) = body.tls_skip_verify {
+            backend.tls_skip_verify = skip;
+        }
+        if let Some(sni) = body.tls_sni {
+            backend.tls_sni = if sni.is_empty() { None } else { Some(sni) };
+        }
+        if let Some(h2) = body.h2_upstream {
+            backend.h2_upstream = h2;
+        }
+        backend.updated_at = Utc::now();
 
-    store.update_backend(&backend)?;
-    drop(store);
+        store.update_backend(&backend)?;
+        Ok::<_, ApiError>(backend)
+    })
+    .await?;
     state.notify_config_changed();
     let score = get_ewma_score_async(&state, &backend.address).await;
     let conns = get_backend_connections_async(&state, &backend.address).await;
@@ -309,25 +315,30 @@ pub async fn delete_backend(
     Extension(state): Extension<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = state.store.lock().await;
-    let mut backend = store
-        .get_backend(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("backend {id}")))?;
+    let id_db = id.clone();
+    let (backend, force_deleted) = db_blocking(&state.store, move |store| {
+        let mut backend = store
+            .get_backend(&id_db)?
+            .ok_or_else(|| ApiError::NotFound(format!("backend {id_db}")))?;
 
-    // If already closing/closed, force delete immediately
-    if backend.lifecycle_state != lorica_config::models::LifecycleState::Normal {
-        store.delete_backend(&id)?;
-        drop(store);
-        state.notify_config_changed();
+        // If already closing/closed, force delete immediately
+        if backend.lifecycle_state != lorica_config::models::LifecycleState::Normal {
+            store.delete_backend(&id_db)?;
+            return Ok((backend, true));
+        }
+
+        // Transition to Closing - proxy stops routing new requests to this backend
+        backend.lifecycle_state = lorica_config::models::LifecycleState::Closing;
+        backend.updated_at = Utc::now();
+        store.update_backend(&backend)?;
+        Ok::<_, ApiError>((backend, false))
+    })
+    .await?;
+    state.notify_config_changed();
+
+    if force_deleted {
         return Ok(json_data(serde_json::json!({"message": "backend deleted"})));
     }
-
-    // Transition to Closing - proxy stops routing new requests to this backend
-    backend.lifecycle_state = lorica_config::models::LifecycleState::Closing;
-    backend.updated_at = Utc::now();
-    store.update_backend(&backend)?;
-    drop(store);
-    state.notify_config_changed();
 
     // Spawn background drain task under the shared tracker so
     // shutdown waits (up to the supervisor drain timeout) for any
@@ -358,12 +369,16 @@ pub async fn delete_backend(
             tokio::time::sleep(POLL_INTERVAL).await;
         }
 
-        // Delete from DB
-        let store = drain_state.store.lock().await;
-        if let Err(e) = store.delete_backend(&drain_id) {
+        // Delete from DB (blocking pool ; this task is plain
+        // `tokio::spawn`, so log the error instead of propagating).
+        let delete_id = drain_id.clone();
+        let deleted = db_blocking(&drain_state.store, move |store| {
+            store.delete_backend(&delete_id)
+        })
+        .await;
+        if let Err(e) = deleted {
             tracing::warn!(backend_id = %drain_id, error = %e, "failed to delete drained backend");
         }
-        drop(store);
         drain_state.notify_config_changed();
     });
 
