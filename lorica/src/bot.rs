@@ -141,14 +141,35 @@ pub enum StashBackend {
 /// Pending-challenge stash.
 ///
 /// `insert` / `take` / `captcha_image` / `prune_expired` / `len` all
-/// dispatch on the backend. The public API is synchronous even when
-/// the underlying store is async (SQLite calls under
-/// `tokio::sync::Mutex`) by using `blocking_lock()` — acceptable
-/// here because the lock hold time is bounded at a single SQL
-/// statement (microseconds under WAL) and every hot-path caller
-/// already runs inside a tokio runtime.
+/// dispatch on the backend. SQLite-backed operations run on the
+/// blocking thread pool via [`stash_blocking`]; the in-memory backend
+/// completes synchronously under a `parking_lot` mutex.
 pub struct BotEngine {
     backend: StashBackend,
+}
+
+/// Run a closure against the shared `ConfigStore` on the blocking
+/// thread pool (audit H-2, backlog #30). Under bot flood the stash
+/// insert/take rate equals the WAF-block rate; running the SQL inline
+/// would stall the tokio reactor for up to `busy_timeout` (5 s) on a
+/// contended WAL. The owned guard keeps the cross-task queueing
+/// semantics identical to the previous inline `lock().await`.
+///
+/// Returns `None` when the blocking task itself fails (runtime
+/// shutdown / closure panic); callers treat that as a stash miss.
+async fn stash_blocking<T, F>(store: &Arc<tokio::sync::Mutex<ConfigStore>>, f: F) -> Option<T>
+where
+    F: FnOnce(&ConfigStore) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let guard = Arc::clone(store).lock_owned().await;
+    match tokio::task::spawn_blocking(move || f(&guard)).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(error = %e, "bot-stash blocking task failed");
+            None
+        }
+    }
 }
 
 impl BotEngine {
@@ -206,10 +227,12 @@ impl BotEngine {
             }
             StashBackend::Sqlite(store) => {
                 let stash = to_stash(&nonce, &entry);
-                let g = store.lock().await;
-                if let Err(e) = g.bot_stash_insert(&stash) {
-                    tracing::warn!(error = %e, nonce = %nonce, "bot_stash_insert failed");
-                }
+                stash_blocking(store, move |g| {
+                    if let Err(e) = g.bot_stash_insert(&stash) {
+                        tracing::warn!(error = %e, nonce = %nonce, "bot_stash_insert failed");
+                    }
+                })
+                .await;
             }
         }
     }
@@ -234,15 +257,17 @@ impl BotEngine {
                 }
             }
             StashBackend::Sqlite(store) => {
-                let g = store.lock().await;
-                match g.bot_stash_take(nonce, now) {
+                let nonce = nonce.to_string();
+                stash_blocking(store, move |g| match g.bot_stash_take(&nonce, now) {
                     Ok(Some(stash)) => from_stash(&stash),
                     Ok(None) => None,
                     Err(e) => {
                         tracing::warn!(error = %e, nonce = %nonce, "bot_stash_take failed");
                         None
                     }
-                }
+                })
+                .await
+                .flatten()
             }
         }
     }
@@ -260,8 +285,12 @@ impl BotEngine {
                 }
             }
             StashBackend::Sqlite(store) => {
-                let g = store.lock().await;
-                g.bot_stash_captcha_image(nonce).ok().flatten()
+                let nonce = nonce.to_string();
+                stash_blocking(store, move |g| {
+                    g.bot_stash_captcha_image(&nonce).ok().flatten()
+                })
+                .await
+                .flatten()
             }
         }
     }
@@ -275,10 +304,12 @@ impl BotEngine {
                 mx.lock().retain(|_, e| e.expires_at > now);
             }
             StashBackend::Sqlite(store) => {
-                let g = store.lock().await;
-                if let Err(e) = g.bot_stash_prune_expired(now) {
-                    tracing::warn!(error = %e, "bot_stash_prune_expired failed");
-                }
+                stash_blocking(store, move |g| {
+                    if let Err(e) = g.bot_stash_prune_expired(now) {
+                        tracing::warn!(error = %e, "bot_stash_prune_expired failed");
+                    }
+                })
+                .await;
             }
         }
     }
@@ -288,8 +319,9 @@ impl BotEngine {
         match &self.backend {
             StashBackend::InMemory(mx) => mx.lock().len(),
             StashBackend::Sqlite(store) => {
-                let g = store.lock().await;
-                g.bot_stash_len().unwrap_or(0)
+                stash_blocking(store, |g| g.bot_stash_len().unwrap_or(0))
+                    .await
+                    .unwrap_or(0)
             }
         }
     }
