@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [1.5.11] - 2026-06-10
+
 ### Fixed
 
 - Cron-scheduled load tests now run in supervisor/worker mode: the supervisor created a `LoadTestEngine` for the management API but never started the cron scheduler, so scheduled load tests silently never executed outside single-process mode. Both API-serving modes now go through one shared `startup::start_load_test_engine` helper that creates the engine and starts the scheduler together, making the asymmetry unrepresentable (Epic 8 Story 8.1 finding).
