@@ -753,6 +753,288 @@ fn should_auto_renew_accepts_already_expired() {
     assert!(should_auto_renew(&cert, now, 30));
 }
 
+// --- is_bound (AC2) ---
+//
+// The renewal loop renews only route-bound certs. The pure
+// predicate pins that an unbound cert is skipped regardless of its
+// expiry, which is the 2026-06-16 incident root cause.
+
+use std::collections::HashSet;
+
+use super::renewal::is_bound;
+
+#[test]
+fn is_bound_true_when_referenced_by_a_route() {
+    let bound: HashSet<String> = ["cert-a".to_string(), "cert-b".to_string()]
+        .into_iter()
+        .collect();
+    assert!(is_bound("cert-a", &bound));
+}
+
+#[test]
+fn is_bound_false_when_not_referenced() {
+    let bound: HashSet<String> = ["cert-a".to_string()].into_iter().collect();
+    assert!(
+        !is_bound("cert-orphan", &bound),
+        "an unbound cert must never be picked up by the renewal loop"
+    );
+}
+
+#[test]
+fn is_bound_false_for_empty_set() {
+    let bound: HashSet<String> = HashSet::new();
+    assert!(!is_bound("cert-a", &bound));
+}
+
+// --- cooldown_from_error (AC3) ---
+//
+// Classifies a Let's Encrypt rate-limit error and extracts the
+// retry-after instant so the loop stops re-attempting before the
+// quota window reopens. Non-rate-limit errors return None.
+
+use super::renewal::cooldown_from_error;
+
+#[test]
+fn cooldown_from_error_parses_real_rate_limit_message() {
+    let now = chrono::Utc::now();
+    let msg = "too many certificates (5) already issued for this exact set of identifiers \
+               in the last 168h0m0s, retry after 2026-06-11 06:19:40 UTC: see \
+               https://letsencrypt.org/docs/rate-limits/ \
+               (urn:ietf:params:acme:error:rateLimited)";
+    let cooldown = cooldown_from_error(msg, now).expect("rate-limit error must yield a cooldown");
+    let expected = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        chrono::NaiveDateTime::parse_from_str("2026-06-11 06:19:40", "%Y-%m-%d %H:%M:%S")
+            .expect("test stamp parses"),
+        chrono::Utc,
+    );
+    assert_eq!(cooldown, expected);
+}
+
+#[test]
+fn cooldown_from_error_falls_back_to_24h_without_stamp() {
+    let now = chrono::Utc::now();
+    // Rate-limit URN present but no parseable retry-after stamp.
+    let msg = "rateLimited: too many certificates already issued";
+    let cooldown =
+        cooldown_from_error(msg, now).expect("rate-limit error must yield a cooldown");
+    assert_eq!(cooldown, now + chrono::Duration::hours(24));
+}
+
+#[test]
+fn cooldown_from_error_returns_none_for_non_rate_limit_error() {
+    let now = chrono::Utc::now();
+    let msg = "certificate poll failed: connection reset by peer";
+    assert!(
+        cooldown_from_error(msg, now).is_none(),
+        "a non-rate-limit error must not record a cooldown"
+    );
+}
+
+#[test]
+fn cooldown_from_error_clamps_far_future_stamp_to_seven_days() {
+    let now = chrono::Utc::now();
+    // A hostile or buggy ACME endpoint returns a retry-after years out;
+    // the cooldown must be clamped to the 7 day quota window so it
+    // cannot suspend auto-renewal long enough to let the cert expire.
+    let msg = "too many certificates, retry after 2099-01-01 00:00:00 UTC: \
+               (urn:ietf:params:acme:error:rateLimited)";
+    let cooldown = cooldown_from_error(msg, now).expect("rate-limit error must yield a cooldown");
+    assert_eq!(cooldown, now + chrono::Duration::days(7));
+}
+
+#[test]
+fn cooldown_from_error_falls_back_when_stamp_is_garbage() {
+    let now = chrono::Utc::now();
+    // `retry after` is present but the stamp does not parse; the safe
+    // 24h default applies rather than silently dropping the cooldown.
+    let msg = "rateLimited: too many certificates, retry after soon: see docs";
+    let cooldown = cooldown_from_error(msg, now).expect("rate-limit error must yield a cooldown");
+    assert_eq!(cooldown, now + chrono::Duration::hours(24));
+}
+
+// --- in_cooldown (AC3) ---
+//
+// The loop skips a cert whose cooldown is still in the future. The
+// pure predicate pins future -> skip, past -> attempt, absent ->
+// attempt, the integrated rate-limit-respect behavior the loop relies
+// on (the loop sweeps expired entries before calling this).
+
+use std::collections::HashMap;
+
+use super::renewal::in_cooldown;
+
+#[test]
+fn in_cooldown_true_for_future_entry() {
+    let now = chrono::Utc::now();
+    let mut map: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+    map.insert("cert-a".into(), now + chrono::Duration::hours(1));
+    assert!(in_cooldown(&map, "cert-a", now));
+}
+
+#[test]
+fn in_cooldown_false_for_expired_entry() {
+    let now = chrono::Utc::now();
+    let mut map: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+    map.insert("cert-a".into(), now - chrono::Duration::hours(1));
+    assert!(
+        !in_cooldown(&map, "cert-a", now),
+        "an expired cooldown must not suppress a renewal attempt"
+    );
+}
+
+#[test]
+fn in_cooldown_false_when_absent() {
+    let now = chrono::Utc::now();
+    let map: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+    assert!(!in_cooldown(&map, "cert-a", now));
+}
+
+// --- superseded_orphans (AC4) ---
+//
+// Selects ACME certs that are both unbound and superseded by a
+// newer sibling for the same identifier set. Unique unbound certs
+// and the newest of a duplicate group are kept.
+
+use super::superseded_orphans;
+
+fn orphan_cert_fixture(
+    id: &str,
+    domain: &str,
+    sans: &[&str],
+    not_after_days: i64,
+) -> lorica_config::models::Certificate {
+    let now = chrono::Utc::now();
+    lorica_config::models::Certificate {
+        id: id.into(),
+        domain: domain.into(),
+        san_domains: sans.iter().map(|s| (*s).to_string()).collect(),
+        fingerprint: "fp".into(),
+        cert_pem: "---CERT---".into(),
+        key_pem: "---KEY---".into(),
+        issuer: "Let's Encrypt".into(),
+        not_before: now - chrono::Duration::days(1),
+        not_after: now + chrono::Duration::days(not_after_days),
+        is_acme: true,
+        acme_auto_renew: true,
+        created_at: now - chrono::Duration::days(1),
+        acme_method: Some("http01".into()),
+        acme_dns_provider_id: None,
+    }
+}
+
+#[test]
+fn superseded_orphans_purges_older_unbound_duplicate() {
+    // Two unbound certs for the same identity ; only the strictly
+    // older one is superseded and must be purged.
+    let old = orphan_cert_fixture("cert-old", "mail.example.com", &["mail.example.com"], 10);
+    let new = orphan_cert_fixture("cert-new", "mail.example.com", &["mail.example.com"], 80);
+    let bound: HashSet<String> = HashSet::new();
+
+    let purge = superseded_orphans(&[old, new], &bound);
+    assert_eq!(purge, vec!["cert-old".to_string()]);
+}
+
+#[test]
+fn superseded_orphans_keeps_bound_cert_even_if_superseded() {
+    // The older cert is bound to a route, so it must be kept even
+    // though a newer sibling exists.
+    let old = orphan_cert_fixture("cert-old", "mail.example.com", &["mail.example.com"], 10);
+    let new = orphan_cert_fixture("cert-new", "mail.example.com", &["mail.example.com"], 80);
+    let bound: HashSet<String> = ["cert-old".to_string()].into_iter().collect();
+
+    let purge = superseded_orphans(&[old, new], &bound);
+    assert!(
+        purge.is_empty(),
+        "a route-bound cert must never be purged, even when superseded"
+    );
+}
+
+#[test]
+fn superseded_orphans_keeps_unique_unbound_cert() {
+    // A lone unbound cert has no newer sibling, so an operator may
+    // still bind it ; it must be kept.
+    let lone = orphan_cert_fixture("cert-lone", "solo.example.com", &["solo.example.com"], 10);
+    let bound: HashSet<String> = HashSet::new();
+
+    let purge = superseded_orphans(&[lone], &bound);
+    assert!(purge.is_empty());
+}
+
+#[test]
+fn superseded_orphans_keeps_newest_of_duplicate_group() {
+    // Nothing supersedes the newest cert, so it is not an orphan.
+    let old = orphan_cert_fixture("cert-old", "mail.example.com", &["mail.example.com"], 10);
+    let new = orphan_cert_fixture("cert-new", "mail.example.com", &["mail.example.com"], 80);
+    let bound: HashSet<String> = HashSet::new();
+
+    let purge = superseded_orphans(&[old, new], &bound);
+    assert!(!purge.contains(&"cert-new".to_string()));
+}
+
+#[test]
+fn superseded_orphans_matches_identity_ignoring_san_order() {
+    // Same identifier set in a different SAN order must still match,
+    // so the older dup is purged.
+    let old = orphan_cert_fixture(
+        "cert-old",
+        "example.com",
+        &["www.example.com", "example.com"],
+        10,
+    );
+    let new = orphan_cert_fixture(
+        "cert-new",
+        "example.com",
+        &["example.com", "www.example.com"],
+        80,
+    );
+    let bound: HashSet<String> = HashSet::new();
+
+    let purge = superseded_orphans(&[old, new], &bound);
+    assert_eq!(purge, vec!["cert-old".to_string()]);
+}
+
+#[test]
+fn superseded_orphans_matches_when_primary_absent_from_san_list() {
+    // An ACME cert lists the primary inside its SAN set; an uploaded
+    // twin omits the primary from its SANs. Both cover the same names,
+    // so the union-based identity must match and the older one purge.
+    let acme = orphan_cert_fixture(
+        "cert-acme",
+        "mail.example.com",
+        &["mail.example.com", "autodiscover.example.com"],
+        10,
+    );
+    let uploaded = orphan_cert_fixture(
+        "cert-uploaded",
+        "mail.example.com",
+        &["autodiscover.example.com"],
+        80,
+    );
+    let bound: HashSet<String> = HashSet::new();
+
+    let purge = superseded_orphans(&[acme, uploaded], &bound);
+    assert_eq!(purge, vec!["cert-acme".to_string()]);
+}
+
+#[test]
+fn superseded_orphans_keeps_both_on_not_after_tie() {
+    // Two unbound certs for the same identity with the EXACT same
+    // not_after supersede neither (strict comparison), so both stay.
+    let mut a = orphan_cert_fixture("cert-a", "mail.example.com", &["mail.example.com"], 30);
+    let mut b = orphan_cert_fixture("cert-b", "mail.example.com", &["mail.example.com"], 30);
+    // The fixtures capture `now` independently, so force an exact tie.
+    let shared = chrono::Utc::now() + chrono::Duration::days(30);
+    a.not_after = shared;
+    b.not_after = shared;
+    let bound: HashSet<String> = HashSet::new();
+
+    let purge = superseded_orphans(&[a, b], &bound);
+    assert!(
+        purge.is_empty(),
+        "certs tied on not_after supersede neither, so both are kept"
+    );
+}
+
 // --- DNS challenger HTTP coverage via wiremock ---
 //
 // These tests replace the provider's API with a local mock server,

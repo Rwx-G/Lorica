@@ -120,6 +120,7 @@ pub async fn provision_certificate_dns(
         challenger.as_ref(),
         &acme_method,
         dns_provider_id,
+        None,
     )
     .await;
 
@@ -157,6 +158,11 @@ pub(super) fn acme_dns_base_domain(domain: &str) -> &str {
 /// `acme_method` is stored on the certificate (e.g. "dns01-cloudflare").
 /// `encrypted_dns_config` is the encrypted JSON of the DNS credentials (legacy).
 /// `dns_provider_id` references a global DNS provider (new approach).
+///
+/// When `existing_cert_id` is `Some`, the freshly issued leaf is
+/// persisted in place on that row via `update_certificate` (same id,
+/// route bindings untouched); when `None`, a new row is inserted with
+/// a fresh UUID. The returned id is the id that now carries the leaf.
 pub(super) async fn provision_with_acme_dns(
     state: &AppState,
     config: &AcmeConfig,
@@ -164,6 +170,7 @@ pub(super) async fn provision_with_acme_dns(
     challenger: &dyn DnsChallenger,
     acme_method: &str,
     dns_provider_id: Option<String>,
+    existing_cert_id: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
         Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
@@ -314,9 +321,13 @@ pub(super) async fn provision_with_acme_dns(
 
     let key_pem = private_key.serialize_pem();
 
-    // Store certificate in database
+    // Store certificate in database. On renewal (`existing_cert_id`
+    // is `Some`) update the row in place so the id and every route
+    // binding survive ; on first issuance insert a fresh row.
     let now = chrono::Utc::now();
-    let cert_id = uuid::Uuid::new_v4().to_string();
+    let is_renewal = existing_cert_id.is_some();
+    let cert_id = existing_cert_id
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
     let fingerprint = format!("acme-dns:{}", domains.join(","));
 
     let cert = lorica_config::models::Certificate {
@@ -335,6 +346,8 @@ pub(super) async fn provision_with_acme_dns(
         not_after: now + chrono::Duration::days(90),
         is_acme: true,
         acme_auto_renew: true,
+        // `update_certificate` does not touch `created_at`, so the
+        // original insert timestamp is preserved on a renewal.
         created_at: now,
         acme_method: Some(acme_method.to_string()),
 
@@ -342,7 +355,11 @@ pub(super) async fn provision_with_acme_dns(
     };
 
     let (cert, export_snapshot) = db_blocking(&state.store, move |store| {
-        store.create_certificate(&cert)?;
+        if is_renewal {
+            store.update_certificate(&cert)?;
+        } else {
+            store.create_certificate(&cert)?;
+        }
         let snapshot = crate::cert_export::snapshot_export_inputs(store);
         Ok::<_, ApiError>((cert, snapshot))
     })

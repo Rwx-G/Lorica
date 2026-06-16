@@ -446,6 +446,79 @@ mod tests {
             .is_none());
     }
 
+    // ---- In-place ACME renewal (fix 1.5.12) ----
+
+    #[test]
+    fn test_acme_renewal_in_place_keeps_id_and_route_binding() {
+        // Models the renewal-store mutation: an ACME cert bound to a
+        // route is renewed in place via `update_certificate` (same id,
+        // new leaf + validity). The id must survive, the route must
+        // still reference it, the cert count must not grow, and
+        // `created_at` must be preserved.
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+
+        let mut cert = make_certificate();
+        cert.is_acme = true;
+        cert.acme_auto_renew = true;
+        cert.acme_method = Some("http01".into());
+        let original_id = cert.id.clone();
+        let original_created_at = cert.created_at;
+        store
+            .create_certificate(&cert)
+            .expect("test setup: certificate inserts");
+
+        let mut route = make_route();
+        route.certificate_id = Some(original_id.clone());
+        store
+            .create_route(&route)
+            .expect("test setup: route inserts");
+
+        // Renew in place: same id, fresh leaf and a later not_after.
+        let renewed = Certificate {
+            cert_pem: "-----BEGIN CERTIFICATE-----\nrenewed\n-----END CERTIFICATE-----".into(),
+            key_pem: "-----BEGIN PRIVATE KEY-----\nrenewed\n-----END PRIVATE KEY-----".into(),
+            not_after: cert.not_after + chrono::Duration::days(90),
+            // A renewal call would carry a fresh `created_at`, but
+            // `update_certificate` does not write that column.
+            created_at: Utc::now() + chrono::Duration::days(1),
+            ..cert.clone()
+        };
+        store
+            .update_certificate(&renewed)
+            .expect("test setup: certificate updates in place");
+
+        // Cert count did not grow (no orphan row).
+        let certs = store
+            .list_certificates()
+            .expect("test setup: certificates listed");
+        assert_eq!(certs.len(), 1, "in-place renewal must not insert a new row");
+
+        let fetched = store
+            .get_certificate(&original_id)
+            .expect("test setup: certificate fetch")
+            .expect("test setup: value present");
+        assert_eq!(fetched.id, original_id, "renewal must keep the same id");
+        assert!(
+            fetched.cert_pem.contains("renewed"),
+            "renewal must persist the new leaf"
+        );
+        assert_eq!(
+            fetched.created_at, original_created_at,
+            "update_certificate must preserve created_at"
+        );
+
+        // The route still points at the same cert id.
+        let fetched_route = store
+            .get_route(&route.id)
+            .expect("test setup: route fetch")
+            .expect("test setup: value present");
+        assert_eq!(
+            fetched_route.certificate_id,
+            Some(original_id),
+            "route binding must survive an in-place renewal"
+        );
+    }
+
     // ---- NotificationConfig CRUD ----
 
     #[test]
