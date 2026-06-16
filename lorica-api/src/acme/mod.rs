@@ -59,6 +59,6 @@ pub use dns_challengers::{
 };
 pub use expiry::{check_cert_expiry, spawn_cert_expiry_check_task};
 pub use http01::{provision_certificate, serve_challenge, AcmeProvisionRequest};
-pub use renewal::{renew_certificate, spawn_renewal_task};
+pub use renewal::{renew_certificate, spawn_renewal_task, superseded_orphans};
 pub use store::AcmeChallengeStore;
 pub use types::{PendingDnsChallenge, PendingDnsChallenges};

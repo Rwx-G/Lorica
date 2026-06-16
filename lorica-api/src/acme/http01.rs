@@ -72,7 +72,7 @@ pub async fn provision_certificate(
         "starting ACME certificate provisioning"
     );
 
-    let result = provision_with_acme(&state, &config, &domains).await;
+    let result = provision_with_acme(&state, &config, &domains, None).await;
 
     match result {
         Ok(cert_id) => {
@@ -115,10 +115,17 @@ pub async fn serve_challenge(
 
 /// Internal ACME provisioning logic using instant-acme.
 /// Supports multi-domain SAN certificates (one order, N challenges).
+///
+/// When `existing_cert_id` is `Some`, the freshly issued leaf is
+/// persisted in place on that row via `update_certificate` (same id,
+/// route bindings untouched); when `None`, a new row is inserted with
+/// a fresh UUID. The returned id is the id that now carries the leaf:
+/// the existing id on renewal, the fresh UUID on first issuance.
 pub(super) async fn provision_with_acme(
     state: &AppState,
     config: &AcmeConfig,
     domains: &[String],
+    existing_cert_id: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use instant_acme::{
         Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
@@ -224,9 +231,13 @@ pub(super) async fn provision_with_acme(
 
     let key_pem = private_key.serialize_pem();
 
-    // Store certificate in database
+    // Store certificate in database. On renewal (`existing_cert_id`
+    // is `Some`) update the row in place so the id and every route
+    // binding survive ; on first issuance insert a fresh row.
     let now = chrono::Utc::now();
-    let cert_id = uuid::Uuid::new_v4().to_string();
+    let is_renewal = existing_cert_id.is_some();
+    let cert_id = existing_cert_id
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), ToString::to_string);
     let san_domains: Vec<String> = domains.to_vec();
     let fingerprint = format!("acme:{}", domains.join(","));
 
@@ -246,6 +257,8 @@ pub(super) async fn provision_with_acme(
         not_after: now + chrono::Duration::days(90),
         is_acme: true,
         acme_auto_renew: true,
+        // `update_certificate` does not touch `created_at`, so the
+        // original insert timestamp is preserved on a renewal.
         created_at: now,
         acme_method: Some("http01".into()),
 
@@ -253,7 +266,11 @@ pub(super) async fn provision_with_acme(
     };
 
     let (cert, export_snapshot) = db_blocking(&state.store, move |store| {
-        store.create_certificate(&cert)?;
+        if is_renewal {
+            store.update_certificate(&cert)?;
+        } else {
+            store.create_certificate(&cert)?;
+        }
         let snapshot = crate::cert_export::snapshot_export_inputs(store);
         Ok::<_, ApiError>((cert, snapshot))
     })

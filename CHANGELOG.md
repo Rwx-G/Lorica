@@ -9,6 +9,19 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [1.5.12] - 2026-06-16
+
+### Fixed
+
+- ACME certificate auto-renewal now updates the existing certificate in place (same id) instead of issuing a new certificate, reassigning routes, then deleting the old one. The previous insert-then-reassign design could leave the renewed certificate unbound while the route kept pointing at the old certificate, so the same domain was re-requested every cycle until Let's Encrypt rate-limited the account ("too many certificates already issued for this exact set of identifiers"). Route bindings now survive a renewal untouched, aligning with how Caddy, Traefik and certbot replace a certificate in place (2026-06-16 mail.kaliaops.com incident).
+- The auto-renewal loop no longer renews certificates that are not referenced by any route, so orphaned or duplicate certificates can no longer consume Let's Encrypt issuance quota and snowball into a rate-limit.
+- On startup, superseded orphan ACME certificates (unbound and replaced by a newer certificate for the same identifier set) are purged, clearing the duplicate rows the old renewal path accumulated. Bound and unique certificates are never touched.
+- The renewal loop now backs off on a Let's Encrypt `rateLimited` error until the returned `retry after` time instead of re-attempting every cycle.
+
+### Security
+
+- The cooldown parsed from a Let's Encrypt `retry after` response is clamped to a 7 day maximum, so a malformed or hostile ACME response cannot suspend auto-renewal long enough for the live certificate to expire.
+
 ## [1.5.11] - 2026-06-10
 
 ### Fixed

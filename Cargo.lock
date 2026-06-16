@@ -2907,7 +2907,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lorica"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
  "ammonia",
  "arc-swap",
@@ -2974,7 +2974,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-api"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-bench"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
  "chrono",
  "lorica-config",
@@ -3079,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-challenge"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-command"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
  "nix",
  "prost 0.13.5",
@@ -3108,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-config"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3184,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-dashboard"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
  "axum",
  "hyper 1.10.1",
@@ -3201,7 +3201,7 @@ version = "0.1.0"
 
 [[package]]
 name = "lorica-geoip"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -3385,7 +3385,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-shmem"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
  "nix",
  "rand 0.9.4",
@@ -3438,7 +3438,7 @@ dependencies = [
 
 [[package]]
 name = "lorica-worker"
-version = "1.5.11"
+version = "1.5.12"
 dependencies = [
  "nix",
  "socket2 0.5.10",

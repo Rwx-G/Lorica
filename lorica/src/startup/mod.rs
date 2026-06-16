@@ -168,6 +168,11 @@ pub(crate) async fn run_api_server(
         .with_task_tracker(state.task_tracker.clone());
     let rate_limiter = RateLimiter::new();
 
+    // One-shot startup purge of superseded orphan ACME certs (fix
+    // 1.5.12). Shared by both modes here so single-process and
+    // supervisor cannot drift, exactly like the renewal spawn below.
+    purge_superseded_acme_orphans(&state.store).await;
+
     let _acme_renewal = lorica_api::acme::spawn_renewal_task(
         state.clone(),
         std::time::Duration::from_secs(12 * 3600),
@@ -185,6 +190,55 @@ pub(crate) async fn run_api_server(
     {
         error!(error = %e, "API server exited with error");
     }
+}
+
+/// Purge superseded orphan ACME certificates left over by the old
+/// insert-then-reassign renewal (fix 1.5.12). An orphan is an ACME
+/// cert that is unreferenced by any route AND has a sibling for the
+/// same identifier set with a later `not_after`. Unique unbound certs
+/// are kept (an operator may bind them); the decision lives in the
+/// pure `superseded_orphans` selector so it is unit-tested in
+/// `lorica-api`.
+///
+/// Best-effort and non-fatal: a store error is logged and startup
+/// continues, since a failed purge never blocks serving traffic.
+async fn purge_superseded_acme_orphans(store: &Arc<Mutex<ConfigStore>>) {
+    let s = store.lock().await;
+
+    let certs = match s.list_certificates() {
+        Ok(certs) => certs,
+        Err(e) => {
+            warn!(error = %e, "startup orphan purge: failed to list certificates");
+            return;
+        }
+    };
+    let bound_ids: std::collections::HashSet<String> = match s.list_routes() {
+        Ok(routes) => routes
+            .iter()
+            .filter_map(|r| r.certificate_id.clone())
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "startup orphan purge: failed to list routes");
+            return;
+        }
+    };
+
+    let orphan_ids = lorica_api::acme::superseded_orphans(&certs, &bound_ids);
+    if orphan_ids.is_empty() {
+        return;
+    }
+
+    for id in &orphan_ids {
+        if let Err(e) = s.delete_certificate(id) {
+            warn!(cert_id = %id, error = %e, "startup orphan purge: failed to delete orphan certificate");
+        }
+    }
+
+    info!(
+        count = orphan_ids.len(),
+        ids = ?orphan_ids,
+        "purged superseded orphan ACME certificates at startup"
+    );
 }
 
 /// Spawn the hourly retention loop shared by supervisor and
