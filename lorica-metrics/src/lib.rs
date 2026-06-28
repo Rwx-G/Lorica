@@ -381,6 +381,14 @@ pub fn reset_generic_counter_snapshot_for_test() {
 mod tests {
     use super::*;
 
+    // The two aggregation tests below each reset the process-global
+    // SUPERVISOR_GENERIC_SNAPSHOT. Rust runs tests in parallel, so without
+    // serialization one test's reset wipes the other's mid-accumulation and
+    // the delta math breaks (order-dependent flake). This guard serializes
+    // them; a poisoned lock (a prior test panicked) is recovered so the
+    // surviving test still runs.
+    static SNAPSHOT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn register_helpers_apply_namespace_and_register() {
         // The helper must prepend the `lorica` namespace and register
@@ -403,6 +411,7 @@ mod tests {
 
     #[test]
     fn snapshot_then_apply_aggregates_and_is_delta_based() {
+        let _guard = SNAPSHOT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset_generic_counter_snapshot_for_test();
 
         // A labelled counter owned "by the caller" - here a local
@@ -455,6 +464,7 @@ mod tests {
 
     #[test]
     fn apply_handles_label_less_scalar() {
+        let _guard = SNAPSHOT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset_generic_counter_snapshot_for_test();
 
         static TEST_SCALAR: Lazy<IntCounter> =
