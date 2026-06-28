@@ -19,6 +19,10 @@ message Command {
   // Legacy BanIp fields (only set when command_type == BAN_IP).
   string ban_ip = 4;
   uint64 ban_duration_s = 5;
+  // Why the IP is being banned (encodes lorica_api::ban::BanReason).
+  // Only set when command_type == BAN_IP. A legacy receiver that
+  // ignores this field treats every broadcast ban as it did before.
+  int32 ban_reason = 6;
 
   // Typed RPC payload (only set when command_type >= RATE_LIMIT_QUERY).
   // Legacy receivers ignore the unknown oneof; new receivers dispatch
@@ -130,6 +134,16 @@ message VerdictResult {
   repeated ForwardAuthHeader response_headers = 4;
 }
 message BreakerResult { BreakerDecision decision = 1; }
+
+// One banned IP entry inside a MetricsReport. `reason` encodes
+// lorica_api::ban::BanReason; a legacy reader that ignores it keeps
+// the prior (reason-less) behaviour.
+message BanReportEntry {
+  string ip = 1;
+  uint64 remaining_seconds = 2;
+  uint64 ban_duration_seconds = 3;
+  int32 reason = 4;
+}
 message RateLimitResult { bool allowed = 1; uint32 remaining = 2; }
 
 enum Verdict {

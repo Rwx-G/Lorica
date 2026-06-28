@@ -927,11 +927,15 @@ paths:
                           properties:
                             ip:
                               type: string
-                            banned_at:
-                              type: string
-                              format: date-time
-                            duration_s:
+                            banned_seconds_ago:
                               type: integer
+                            remaining_seconds:
+                              type: integer
+                            reason:
+                              type: string
+                              enum: [rate_limit, waf_flood, waf_critical_rule, manual]
+                      total:
+                        type: integer
         "401":
           $ref: "#/components/responses/Unauthorized"
 

@@ -149,8 +149,9 @@ pub struct AppState {
     pub cache_hits: Option<Arc<AtomicU64>>,
     /// Cache miss counter shared with the proxy engine.
     pub cache_misses: Option<Arc<AtomicU64>>,
-    /// Ban list shared with the proxy engine: IP -> (ban timestamp, ban duration in seconds).
-    pub ban_list: Option<Arc<DashMap<String, (std::time::Instant, u64)>>>,
+    /// Ban list shared with the proxy engine: IP -> (ban timestamp, ban
+    /// duration in seconds, ban reason).
+    pub ban_list: Option<Arc<crate::ban::BanMap>>,
     /// Cache backend for purging cached entries.
     pub cache_backend: Option<&'static lorica_cache::MemCache>,
     /// EWMA scores per backend address (microseconds). Shared with the proxy engine.

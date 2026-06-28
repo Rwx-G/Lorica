@@ -137,7 +137,7 @@ impl LoricaProxy {
 /// its own handle without holding the whole `LoricaProxy`.
 #[derive(Clone)]
 struct WorkerMetricsCtx {
-    ban_list: Arc<DashMap<String, (Instant, u64)>>,
+    ban_list: Arc<lorica_api::ban::BanMap>,
     ewma_scores: Arc<dashmap::DashMap<String, f64>>,
     backend_connections: Arc<BackendConnections>,
     request_counts: Arc<DashMap<(String, u16), AtomicU64>>,
@@ -168,7 +168,7 @@ async fn handle_metrics_request(
         .ban_list
         .iter()
         .filter_map(|entry| {
-            let (ip, (banned_at, duration_s)) = (entry.key(), entry.value());
+            let (ip, (banned_at, duration_s, reason)) = (entry.key(), entry.value());
             let elapsed = banned_at.elapsed().as_secs();
             if elapsed >= *duration_s {
                 return None;
@@ -177,6 +177,7 @@ async fn handle_metrics_request(
                 ip: ip.clone(),
                 remaining_seconds: duration_s - elapsed,
                 ban_duration_seconds: *duration_s,
+                reason: reason.as_i32(),
             })
         })
         .collect();

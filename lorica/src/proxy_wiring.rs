@@ -145,9 +145,10 @@ pub struct LoricaProxy {
     pub sla_collector: Arc<SlaCollector>,
     /// Per-route rate limiter (keyed by "route_id:client_ip").
     pub rate_limiter: Arc<lorica_limits::rate::Rate>,
-    /// Ban list: maps banned IP addresses to (ban timestamp, ban duration in seconds).
-    /// Bans expire after the route-specific `auto_ban_duration_s`.
-    pub ban_list: Arc<DashMap<String, (Instant, u64)>>,
+    /// Ban list: maps banned IP addresses to (ban timestamp, ban
+    /// duration in seconds, ban reason). Bans expire after the
+    /// route-specific `auto_ban_duration_s`.
+    pub ban_list: Arc<lorica_api::ban::BanMap>,
     /// Rate limit violation counter (per minute) for auto-ban decisions.
     pub rate_violations: Arc<lorica_limits::rate::Rate>,
     /// Cumulative WAF block counter per IP for WAF auto-ban (single-process fallback).

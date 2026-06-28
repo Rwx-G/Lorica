@@ -4700,3 +4700,26 @@ async fn test_update_route_cache_ttl_zero_is_accepted() {
     assert_eq!(json["data"]["cache_ttl_s"], 0);
     assert_eq!(json["data"]["cache_max_bytes"], 0);
 }
+
+#[tokio::test]
+async fn list_bans_includes_reason() {
+    let (mut state, _session_store, _rate_limiter) = test_state().await;
+    let bans = Arc::new(dashmap::DashMap::new());
+    bans.insert(
+        "10.0.0.7".to_string(),
+        (
+            Instant::now(),
+            600u64,
+            crate::ban::BanReason::WafFlood,
+        ),
+    );
+    state.ban_list = Some(bans);
+
+    let response = crate::cache::list_bans(axum::Extension(state))
+        .await
+        .expect("list_bans");
+    let body = response.0;
+    assert_eq!(body["data"]["total"], 1);
+    assert_eq!(body["data"]["bans"][0]["ip"], "10.0.0.7");
+    assert_eq!(body["data"]["bans"][0]["reason"], "waf_flood");
+}

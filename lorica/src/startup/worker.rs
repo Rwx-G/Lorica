@@ -187,8 +187,7 @@ pub(crate) fn run_worker(
     // Pre-create metric Arcs so the command thread can read them
     let worker_cache_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let worker_cache_misses = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let worker_ban_list: Arc<dashmap::DashMap<String, (std::time::Instant, u64)>> =
-        Arc::new(dashmap::DashMap::new());
+    let worker_ban_list: Arc<lorica_api::ban::BanMap> = Arc::new(dashmap::DashMap::new());
     let worker_ewma = Arc::new(lorica::proxy_wiring::EwmaTracker::new());
     let worker_backend_conns = Arc::new(lorica::proxy_wiring::BackendConnections::new());
     let worker_request_counts: Arc<dashmap::DashMap<(String, u16), std::sync::atomic::AtomicU64>> =
@@ -382,7 +381,8 @@ pub(crate) fn run_worker(
                         let ban_entries: Vec<BanReportEntry> = cmd_ban_list
                             .iter()
                             .filter_map(|entry| {
-                                let (ip, (banned_at, duration_s)) = (entry.key(), entry.value());
+                                let (ip, (banned_at, duration_s, reason)) =
+                                    (entry.key(), entry.value());
                                 let elapsed = banned_at.elapsed().as_secs();
                                 if elapsed >= *duration_s {
                                     return None; // expired
@@ -391,6 +391,7 @@ pub(crate) fn run_worker(
                                     ip: ip.clone(),
                                     remaining_seconds: duration_s - elapsed,
                                     ban_duration_seconds: *duration_s,
+                                    reason: reason.as_i32(),
                                 })
                             })
                             .collect();
@@ -458,8 +459,14 @@ pub(crate) fn run_worker(
                     CommandType::BanIp => {
                         let ip = cmd.ban_ip.clone();
                         let duration_s = cmd.ban_duration_s;
+                        // The supervisor only broadcasts WAF critical-rule
+                        // auto-bans today; an unrecognized wire value
+                        // (e.g. a future reason from a newer supervisor)
+                        // falls back to that rather than mislabeling.
+                        let reason = lorica_api::ban::BanReason::from_i32(cmd.ban_reason)
+                            .unwrap_or(lorica_api::ban::BanReason::WafCriticalRule);
                         if !ip.is_empty() {
-                            cmd_ban_list.insert(ip.clone(), (Instant::now(), duration_s));
+                            cmd_ban_list.insert(ip.clone(), (Instant::now(), duration_s, reason));
                             info!(
                                 worker_id = id,
                                 ip = %ip,

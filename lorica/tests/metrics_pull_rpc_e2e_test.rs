@@ -49,6 +49,7 @@ fn fixture_report(worker_id: u32) -> MetricsReport {
         ip: "10.0.0.1".into(),
         remaining_seconds: 120,
         ban_duration_seconds: 600,
+        reason: lorica_api::ban::BanReason::WafCriticalRule.as_i32(),
     }];
     r.ewma_entries = vec![EwmaReportEntry {
         backend_address: "10.0.0.2:8080".into(),

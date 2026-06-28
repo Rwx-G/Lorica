@@ -558,7 +558,12 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             match ban_result {
                                 Ok((ip, duration_s)) => {
                                     let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
-                                    let cmd = Command::ban_ip(seq, &ip, duration_s);
+                                    let cmd = Command::ban_ip(
+                                        seq,
+                                        &ip,
+                                        duration_s,
+                                        lorica_api::ban::BanReason::WafCriticalRule.as_i32(),
+                                    );
                                     if let Err(e) = channel.send(&cmd).await {
                                         warn!(worker_id, error = %e, "BanIp send failed");
                                         continue;
@@ -685,10 +690,10 @@ pub(crate) fn run_supervisor(cli: Cli) {
                                             .iter()
                                             .map(|e| (e.backend_address.clone(), e.score_us))
                                             .collect();
-                                        let bans: Vec<(String, u64, u64)> = report
+                                        let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
                                             .ban_entries
                                             .iter()
-                                            .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
+                                            .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds, lorica_api::ban::BanReason::from_i32(b.reason).unwrap_or(lorica_api::ban::BanReason::WafCriticalRule)))
                                             .collect();
                                         let backend_conns: std::collections::HashMap<String, u64> = report
                                             .backend_conn_entries
@@ -1278,7 +1283,13 @@ pub(crate) fn run_supervisor(cli: Cli) {
                                                 // BanIp command from supervisor
                                                 Ok((ip, duration_s)) = ban_rx.recv() => {
                                                     let s = seq.fetch_add(1, Ordering::Relaxed);
-                                                    let cmd = Command::ban_ip(s, &ip, duration_s);
+                                                    let cmd = Command::ban_ip(
+                                                        s,
+                                                        &ip,
+                                                        duration_s,
+                                                        lorica_api::ban::BanReason::WafCriticalRule
+                                                            .as_i32(),
+                                                    );
                                                     if channel.send(&cmd).await.is_ok() {
                                                         let _ = channel.recv::<Response>().await;
                                                     }
@@ -1337,9 +1348,9 @@ pub(crate) fn run_supervisor(cli: Cli) {
                                                                     .ewma_entries.iter()
                                                                     .map(|e| (e.backend_address.clone(), e.score_us))
                                                                     .collect();
-                                                                let bans: Vec<(String, u64, u64)> = report
+                                                                let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
                                                                     .ban_entries.iter()
-                                                                    .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
+                                                                    .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds, lorica_api::ban::BanReason::from_i32(b.reason).unwrap_or(lorica_api::ban::BanReason::WafCriticalRule)))
                                                                     .collect();
                                                                 let backend_conns: std::collections::HashMap<String, u64> = report
                                                                     .backend_conn_entries.iter()
@@ -2280,10 +2291,10 @@ async fn pull_all_metrics_via_rpc(
                         .iter()
                         .map(|e| (e.backend_address.clone(), e.score_us))
                         .collect();
-                    let bans: Vec<(String, u64, u64)> = report
+                    let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
                         .ban_entries
                         .iter()
-                        .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds))
+                        .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds, lorica_api::ban::BanReason::from_i32(b.reason).unwrap_or(lorica_api::ban::BanReason::WafCriticalRule)))
                         .collect();
                     let backend_conns: std::collections::HashMap<String, u64> = report
                         .backend_conn_entries
