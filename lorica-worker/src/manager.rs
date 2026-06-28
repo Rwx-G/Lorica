@@ -135,6 +135,16 @@ pub struct WorkerManager {
     /// sent to each worker alongside the listener FDs. `None` when
     /// shared-memory state is disabled (single-process mode or tests).
     shmem_fd: Option<RawFd>,
+    /// Long-lived `dup`s of the proxy listening sockets, kept open for
+    /// the whole supervisor lifetime so a hot upgrade (Story 8.4) can
+    /// hand them to a freshly exec'd new supervisor via SCM_RIGHTS.
+    ///
+    /// These are dups of the SAME kernel listening sockets the workers
+    /// accept on (one open file description, shared accept queue). The
+    /// supervisor never calls `accept` on them, so holding them does not
+    /// steal connections from the workers; their only purpose is to keep
+    /// the file descriptions alive and transferable at upgrade time.
+    handoff_fds: Vec<(String, OwnedFd)>,
 }
 
 impl WorkerManager {
@@ -146,6 +156,7 @@ impl WorkerManager {
             listen_fds: Vec::new(),
             listen_addrs: Vec::new(),
             shmem_fd: None,
+            handoff_fds: Vec::new(),
         }
     }
 
@@ -162,6 +173,42 @@ impl WorkerManager {
     /// because `fork()` in a multi-threaded process only preserves the calling thread.
     pub fn start(&mut self) -> Result<(), WorkerError> {
         self.create_listen_sockets()?;
+        self.spawn_and_close(0)
+    }
+
+    /// Start workers from listening sockets inherited from an outgoing
+    /// supervisor during a hot upgrade (Story 8.4), instead of binding
+    /// fresh ones.
+    ///
+    /// `listeners` are raw FDs received over the upgrade transfer socket
+    /// (via `lorica_core`'s `Fds` SCM_RIGHTS machinery): the SAME kernel
+    /// listening sockets the OLD process's workers accept on. Reusing them
+    /// (rather than binding new `SO_REUSEPORT` sockets) is what guarantees
+    /// a single shared accept queue across the overlap, so the kernel
+    /// always has an acceptor and zero connections are dropped. Ownership
+    /// of each FD transfers into the manager; on the worker fork they are
+    /// dup'd to the new workers via SCM_RIGHTS exactly like the bind path.
+    pub fn start_with_inherited_listeners(
+        &mut self,
+        listeners: Vec<(String, RawFd)>,
+    ) -> Result<(), WorkerError> {
+        for (addr, fd) in listeners {
+            info!(addr = %addr, fd = fd, "adopted inherited listener from outgoing supervisor");
+            self.listen_addrs.push(addr);
+            self.listen_fds.push(fd);
+        }
+        self.spawn_and_close(0)
+    }
+
+    /// Shared tail of [`Self::start`] and
+    /// [`Self::start_with_inherited_listeners`]: capture the long-lived
+    /// handoff dups, fork every worker, then close the supervisor's own
+    /// copies of the listening sockets so the kernel never routes a
+    /// connection to the (non-accepting) supervisor.
+    fn spawn_and_close(&mut self, base_restart_count: u32) -> Result<(), WorkerError> {
+        // Capture handoff dups BEFORE closing the originals so a future
+        // hot upgrade can re-pass these listening sockets.
+        self.capture_handoff_fds()?;
 
         info!(
             worker_count = self.config.worker_count,
@@ -170,13 +217,15 @@ impl WorkerManager {
         );
 
         for id in 0..self.config.worker_count {
-            self.spawn_worker(id as u32, 0)?;
+            self.spawn_worker(id as u32, base_restart_count)?;
         }
 
         // Close the supervisor's copies of the listening sockets. With
         // SO_REUSEPORT, the kernel would otherwise distribute connections
         // to the supervisor (which has no proxy service), causing requests
-        // to hang. Workers have their own copies via SCM_RIGHTS.
+        // to hang. Workers have their own copies via SCM_RIGHTS, and the
+        // long-lived handoff dups (which the supervisor never accepts on)
+        // keep the file descriptions alive for the next upgrade.
         // For respawn, we recreate sockets via create_listen_sockets().
         for &fd in &self.listen_fds {
             unsafe { fd_passing::close_fd(fd) };
@@ -184,6 +233,30 @@ impl WorkerManager {
         self.listen_fds.clear();
 
         Ok(())
+    }
+
+    /// Replace [`Self::handoff_fds`] with fresh CLOEXEC dups of the
+    /// currently-open listening sockets. Called once per (re)start before
+    /// the supervisor closes its own listener copies.
+    fn capture_handoff_fds(&mut self) -> Result<(), WorkerError> {
+        let mut captured: Vec<(String, OwnedFd)> = Vec::with_capacity(self.listen_fds.len());
+        for (fd, addr) in self.listen_fds.iter().zip(self.listen_addrs.iter()) {
+            let dup: OwnedFd = fd_passing::dup_cloexec(*fd)?;
+            captured.push((addr.clone(), dup));
+        }
+        self.handoff_fds = captured;
+        Ok(())
+    }
+
+    /// Bind-address -> raw FD map of the listening sockets to hand to a
+    /// new supervisor on a hot upgrade. The FDs stay owned by the manager
+    /// (`handoff_fds`); callers must not close them. Empty until the
+    /// manager has started.
+    pub fn handoff_listen_fds(&self) -> Vec<(String, RawFd)> {
+        self.handoff_fds
+            .iter()
+            .map(|(addr, fd)| (addr.clone(), fd.as_raw_fd()))
+            .collect()
     }
 
     /// Create TCP listening sockets for HTTP (and optionally HTTPS).
@@ -475,7 +548,21 @@ impl WorkerManager {
         self.shutdown_all_with_timeout(Duration::from_secs(30));
     }
 
-    fn shutdown_all_with_timeout(&self, drain_timeout: Duration) {
+    /// Drain workers for a hot upgrade and report whether the drain
+    /// finished cleanly within the timeout.
+    ///
+    /// Same SIGTERM-then-wait-then-SIGKILL sequence as [`Self::shutdown_all`]
+    /// but returns `true` when every worker exited on its own (all
+    /// in-flight connections completed) and `false` when the drain window
+    /// elapsed and stragglers were force-killed. The supervisor's
+    /// handoff success path records `lorica_hot_upgrade_total{outcome=
+    /// "drain_timeout"}` on `false` and observes the elapsed time into
+    /// `lorica_hot_upgrade_drain_seconds` regardless.
+    pub fn drain_for_handoff(&self) -> bool {
+        self.shutdown_all_with_timeout(Duration::from_secs(30))
+    }
+
+    fn shutdown_all_with_timeout(&self, drain_timeout: Duration) -> bool {
         info!(
             "sending SIGTERM to all workers (drain timeout: {}s)",
             drain_timeout.as_secs()
@@ -498,7 +585,7 @@ impl WorkerManager {
                 .all(|h| signal::kill(h.pid, None).is_err());
             if all_dead {
                 info!("all workers exited after draining connections");
-                return;
+                return true;
             }
             if Instant::now() >= deadline {
                 break;
@@ -514,6 +601,7 @@ impl WorkerManager {
                 warn!(worker_id = handle.id, "SIGKILL sent to worker");
             }
         }
+        false
     }
 
     /// Number of currently tracked workers.

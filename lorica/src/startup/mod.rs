@@ -21,6 +21,7 @@
 //! module is the single source of truth for one such cluster;
 //! mode-specific differences are explicit parameters, never copies.
 
+pub(crate) mod hot_upgrade;
 pub(crate) mod single;
 pub(crate) mod supervisor;
 pub(crate) mod worker;
@@ -162,6 +163,7 @@ pub(crate) async fn run_api_server(
     management_port: u16,
     state: AppState,
     alert_sender: lorica_notify::AlertSender,
+    inherited_listener: Option<std::net::TcpListener>,
 ) {
     let session_store = SessionStore::new(Arc::clone(&state.store))
         .await
@@ -185,8 +187,14 @@ pub(crate) async fn run_api_server(
         alert_sender,
     );
 
-    if let Err(e) =
-        lorica_api::server::start_server(management_port, state, session_store, rate_limiter).await
+    if let Err(e) = lorica_api::server::start_server(
+        management_port,
+        state,
+        session_store,
+        rate_limiter,
+        inherited_listener,
+    )
+    .await
     {
         error!(error = %e, "API server exited with error");
     }

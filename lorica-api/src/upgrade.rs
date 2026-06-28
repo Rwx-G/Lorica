@@ -171,14 +171,52 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Seam for Story 8.4 chunk 2: hand the staged binary off to the
-/// zero-downtime restart (execve + listening-socket FD passing +
-/// connection drain). This chunk verifies + stages only, so the body
-/// is intentionally empty; chunk 2 fills it in. Kept as a named no-op
-/// so the staging path has an explicit wiring point rather than a
-/// buried TODO.
-pub fn trigger_handoff(_staged_path: &Path) {
-    // TODO(8.4 chunk2): execve + FD handoff + drain. No-op until then.
+/// Hand the staged binary off to the supervisor's zero-downtime restart
+/// (Story 8.4 chunk 2): execve of the new binary, listening-socket FD
+/// passing, connection drain.
+///
+/// The verify+stage path runs inside the API server, which has no access
+/// to the listening sockets or the worker manager; those live in the
+/// supervisor process that owns this API task. So rather than perform the
+/// handoff here, we signal the supervisor over the
+/// [`AppState::upgrade_trigger`] channel with the staged path and let its
+/// main control loop drive the fork/exec/drain/rollback state machine.
+///
+/// In single-process mode (and tests) `upgrade_trigger` is `None`: there
+/// is no supervisor to fork a replacement, so the binary is staged only
+/// and a warning is logged. The HTTP response is unchanged either way -
+/// staging succeeded - so the operator always learns the binary is in
+/// place; only the live swap is conditional on running under a
+/// supervisor.
+pub async fn trigger_handoff(state: &AppState, staged_path: &Path) {
+    match &state.upgrade_trigger {
+        Some(trigger) => match trigger.try_send(staged_path.to_path_buf()) {
+            Ok(()) => {
+                tracing::info!(
+                    staged_path = %staged_path.display(),
+                    "hot upgrade staged; signalled supervisor to begin handoff"
+                );
+            }
+            Err(e) => {
+                // A full/closed channel means a handoff is already in
+                // flight or the supervisor is gone. Surface it; the
+                // binary is staged and the operator can retry.
+                tracing::error!(
+                    error = %e,
+                    staged_path = %staged_path.display(),
+                    "hot upgrade staged but the handoff signal could not be delivered \
+                     (a handoff may already be in progress); binary left staged"
+                );
+            }
+        },
+        None => {
+            tracing::warn!(
+                staged_path = %staged_path.display(),
+                "hot upgrade staged but no handoff trigger is wired (single-process mode); \
+                 the binary is staged only and will take effect on the next restart"
+            );
+        }
+    }
 }
 
 /// Stage `binary` at `<data_dir>/upgrade/lorica.new` with mode 0755,
@@ -308,13 +346,16 @@ pub async fn upgrade_binary(
     let staged_path: PathBuf = stage_binary(&state.data_dir, &binary)
         .map_err(|e| ApiError::Internal(format!("failed to stage uploaded binary: {e}")))?;
 
-    // TODO(8.4 chunk2): trigger_handoff() - this chunk verifies + stages
-    // only. The call is a no-op today; chunk 2 implements the execve +
-    // FD handoff + drain inside trigger_handoff. The seam is wired here
-    // so the next chunk has one named call site to fill in.
-    trigger_handoff(&staged_path);
-
     record_hot_upgrade("ok");
+
+    // Stage succeeded: signal the supervisor to begin the zero-downtime
+    // handoff (fork the staged binary, pass listening sockets, drain).
+    // The "ok" outcome above records a successful verify+stage; the
+    // handoff's own terminal outcome ("exec_failed" / "drain_timeout" on
+    // rollback) is recorded by the supervisor. Signalling AFTER building
+    // the success response below would race the supervisor's drain
+    // against this task being torn down, so we signal here and return.
+    trigger_handoff(&state, &staged_path).await;
 
     Ok(json_data(serde_json::json!({
         "staged_path": staged_path.display().to_string(),

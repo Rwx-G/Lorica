@@ -69,6 +69,13 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0)]
     pub(crate) workers: usize,
 
+    /// Internal: set only when an outgoing supervisor exec's this process
+    /// during a hot upgrade (Story 8.4). Adopts the inherited listening
+    /// sockets from the upgrade transfer socket instead of binding fresh
+    /// ones. Operators never pass this directly; it is hidden from help.
+    #[arg(long, hide = true)]
+    pub(crate) hot_upgrade: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -119,6 +126,26 @@ pub(crate) enum Commands {
     Unban {
         /// IP address to unban
         ip: String,
+
+        /// Admin username
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// Admin password
+        #[arg(long)]
+        password: String,
+    },
+    /// Upload a new signed `lorica` binary to the running instance and
+    /// trigger a zero-downtime hot upgrade (Story 8.4).
+    Upgrade {
+        /// Path to the new `lorica` executable to install.
+        #[arg(long)]
+        binary: String,
+
+        /// Path to the detached Ed25519 signature (128 hex chars).
+        /// Defaults to `<binary>.sig`.
+        #[arg(long)]
+        signature: Option<String>,
 
         /// Admin username
         #[arg(long, default_value = "admin")]
@@ -350,6 +377,121 @@ pub(crate) fn run_unban(port: u16, ip: String, user: String, password: String) {
             }
             Err(e) => {
                 eprintln!("Unban request failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
+}
+
+/// Implementation of the `upgrade` subcommand: uploads a new signed
+/// `lorica` binary plus its detached Ed25519 signature to the running
+/// instance's management API, which verifies, stages, and (in supervisor
+/// mode) triggers the zero-downtime hot upgrade (Story 8.4).
+///
+/// The multipart body is assembled by hand rather than via reqwest's
+/// `multipart` feature so no extra cargo feature (and its transitive
+/// deps) is pulled in just for one upload. Mirrors `run_unban`'s
+/// login-then-call flow against the localhost management API.
+pub(crate) fn run_upgrade(
+    port: u16,
+    binary: String,
+    signature: Option<String>,
+    user: String,
+    password: String,
+) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let signature_path: String = signature.unwrap_or_else(|| format!("{binary}.sig"));
+
+        let binary_bytes: Vec<u8> = match std::fs::read(&binary) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Cannot read binary {binary}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let signature_hex: String = match std::fs::read_to_string(&signature_path) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                eprintln!("Cannot read signature {signature_path}: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let client = reqwest::Client::builder()
+            .cookie_store(true)
+            .build()
+            .expect("HTTP client");
+
+        // Login (the upgrade endpoint is behind require_auth).
+        let login_url = format!("http://127.0.0.1:{port}/api/v1/auth/login");
+        match client
+            .post(&login_url)
+            .json(&serde_json::json!({ "username": user, "password": password }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                eprintln!("Login failed ({}). Check credentials.", r.status());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Cannot connect to management API on port {port}: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        // Hand-rolled multipart/form-data body: `binary` (raw bytes) +
+        // `signature` (hex text), matching the axum Multipart extractor.
+        let boundary = "----loricahotupgradeboundary7f3a";
+        let mut body: Vec<u8> = Vec::with_capacity(binary_bytes.len() + 512);
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"binary\"; \
+                 filename=\"lorica\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&binary_bytes);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"signature\"\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(signature_hex.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        println!("Uploading {} ({} bytes) for hot upgrade...", binary, binary_bytes.len());
+        let upgrade_url = format!("http://127.0.0.1:{port}/api/v1/system/upgrade");
+        match client
+            .post(&upgrade_url)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                let body = r.text().await.unwrap_or_default();
+                println!("Upgrade accepted: {body}");
+                println!(
+                    "The binary is verified and staged; the supervisor is performing \
+                     the zero-downtime handoff. Watch the journal for the drain/rollback result."
+                );
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                eprintln!("Upgrade rejected ({status}): {body}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Upgrade request failed: {e}");
                 std::process::exit(1);
             }
         }

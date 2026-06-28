@@ -442,12 +442,16 @@ pub(crate) fn run_single_process(cli: Cli) {
                 aggregated_metrics: None, // single-process uses direct Arc references
                 metrics_refresher: None,  // pull-on-scrape only meaningful in worker mode
                 task_tracker: api_task_tracker,
+                // Single-process mode has no supervisor to fork a
+                // replacement, so the hot-upgrade endpoint stages only.
+                upgrade_trigger: None,
             };
 
             // Session store + ACME auto-renewal + cert-expiry notifier
             // + server loop, shared with supervisor mode (audit H-9,
-            // see `startup::run_api_server`).
-            startup::run_api_server(management_port, state, alert_sender).await;
+            // see `startup::run_api_server`). No inherited listener:
+            // single-process binds the management port fresh.
+            startup::run_api_server(management_port, state, alert_sender, None).await;
         });
 
         // Hourly retention loop (access logs, probe results, WAF

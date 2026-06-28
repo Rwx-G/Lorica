@@ -109,6 +109,17 @@ pub const RL_LOGS_CLEAR: u32 = 1;
 pub type MetricsRefresher =
     Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
 
+/// Channel the `POST /api/v1/system/upgrade` handler uses to signal the
+/// supervisor that a verified binary has been staged and the
+/// zero-downtime handoff (Story 8.4) should begin. The payload is the
+/// staged binary path (`<data_dir>/upgrade/lorica.new`).
+///
+/// `None` in single-process mode and tests, where there is no supervisor
+/// to fork a replacement; the upload then stages only. Bounded capacity
+/// (1): a concurrent second upgrade attempt while a handoff is in flight
+/// is shed rather than queued.
+pub type UpgradeTrigger = tokio::sync::mpsc::Sender<std::path::PathBuf>;
+
 /// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]
 pub struct AppState {
@@ -195,6 +206,12 @@ pub struct AppState {
     /// in-flight work completes rather than being dropped mid-step.
     /// Cheap to clone (internal `Arc`).
     pub task_tracker: tokio_util::task::TaskTracker,
+    /// Channel to the supervisor's hot-upgrade orchestration (Story 8.4).
+    /// `Some` only in worker/supervisor mode; the `POST
+    /// /api/v1/system/upgrade` handler sends the staged binary path here
+    /// after a successful verify+stage to start the zero-downtime
+    /// handoff. `None` in single-process mode and tests (stage only).
+    pub upgrade_trigger: Option<UpgradeTrigger>,
 }
 
 impl AppState {
@@ -907,19 +924,38 @@ pub fn build_router(
 }
 
 /// Start the API server on localhost only.
+///
+/// When `inherited_listener` is `Some`, the server serves on that
+/// pre-bound socket instead of binding a fresh one. The hot-upgrade
+/// handoff (Story 8.4) uses this so the management port is served on the
+/// SAME kernel listening socket the outgoing supervisor handed over, with
+/// no rebind gap. The listener must already be in non-blocking mode (the
+/// caller sets it before `from_std`). `None` binds `127.0.0.1:port`
+/// fresh, the normal single-process / first-boot path.
 pub async fn start_server(
     port: u16,
     state: AppState,
     session_store: SessionStore,
     rate_limiter: RateLimiter,
+    inherited_listener: Option<std::net::TcpListener>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = build_router(state, session_store, rate_limiter)
         .into_make_service_with_connect_info::<SocketAddr>();
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
-    info!(port = port, "API server listening on localhost only");
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener: tokio::net::TcpListener = match inherited_listener {
+        Some(std_listener) => {
+            info!(
+                port = port,
+                "API server adopting inherited management listener (hot upgrade)"
+            );
+            tokio::net::TcpListener::from_std(std_listener)?
+        }
+        None => {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            info!(port = port, "API server listening on localhost only");
+            tokio::net::TcpListener::bind(addr).await?
+        }
+    };
     axum::serve(listener, app).await?;
 
     Ok(())

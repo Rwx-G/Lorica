@@ -23,7 +23,7 @@ use axum::response::IntoResponse;
 use lorica_metrics::REGISTRY;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
     TextEncoder,
 };
 
@@ -1126,6 +1126,33 @@ static HOT_UPGRADE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// API does not constrain it, so the call site enforces.
 pub fn record_hot_upgrade(outcome: &str) {
     HOT_UPGRADE_TOTAL.with_label_values(&[outcome]).inc();
+}
+
+/// Worker connection-drain duration during a successful hot upgrade.
+///
+/// Observed once per successful handoff: the seconds spent in
+/// `WorkerManager::shutdown_all` (SIGTERM the old workers, wait for
+/// in-flight connections to finish) on the outgoing supervisor, just
+/// before it exits. Buckets span the configurable drain window (default
+/// 30 s) so an operator can alert on drains creeping toward the timeout.
+static HOT_UPGRADE_DRAIN_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    let histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "hot_upgrade_drain_seconds",
+            "Worker connection-drain duration on a successful hot upgrade, in seconds",
+        )
+        .namespace("lorica")
+        .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0]),
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(histogram.clone())).ok();
+    histogram
+});
+
+/// Observe one successful-upgrade drain duration in seconds. Called by
+/// the supervisor's handoff success path after `shutdown_all` returns.
+pub fn observe_hot_upgrade_drain(seconds: f64) {
+    HOT_UPGRADE_DRAIN_SECONDS.observe(seconds);
 }
 
 /// GET /metrics - Prometheus scrape endpoint.

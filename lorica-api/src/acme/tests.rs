@@ -509,6 +509,7 @@ async fn test_check_cert_expiry_dispatches_alerts() {
         aggregated_metrics: None,
         metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        upgrade_trigger: None,
     };
 
     let alert_sender = lorica_notify::AlertSender::new(64);

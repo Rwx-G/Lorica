@@ -67,10 +67,39 @@ fn decode_ban_report_entry(
 pub(crate) fn run_supervisor(cli: Cli) {
     use lorica_command::{Command, CommandChannel, CommandType, Response};
     use lorica_worker::manager::{WorkerConfig, WorkerEvent, WorkerManager};
-    use std::os::fd::{IntoRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use tokio::sync::broadcast;
+
+    use crate::startup::hot_upgrade;
+
+    let data_dir_path = PathBuf::from(&cli.data_dir);
+
+    // Hot upgrade (Story 8.4), NEW supervisor side: pull the inherited
+    // listening sockets from the outgoing supervisor's transfer socket
+    // BEFORE any other startup work, so we bind/adopt the transfer socket
+    // well within the old side's connect-retry budget. The pulled FDs are
+    // the SAME kernel listening sockets the old workers accept on, so the
+    // overlap never drops a connection.
+    let inherited: Option<hot_upgrade::InheritedListeners> = if cli.hot_upgrade {
+        match hot_upgrade::pull_inherited_listeners(&data_dir_path, cli.management_port) {
+            Ok(i) => {
+                info!(
+                    proxy_listeners = i.proxy.len(),
+                    has_management = i.management.is_some(),
+                    "hot upgrade: pulled inherited listeners from outgoing supervisor"
+                );
+                Some(i)
+            }
+            Err(e) => {
+                error!(error = %e, "hot upgrade: failed to pull inherited listeners; aborting");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let worker_count = if cli.workers == 0 {
         WorkerConfig::default_worker_count()
@@ -144,17 +173,64 @@ pub(crate) fn run_supervisor(cli: Cli) {
         use std::os::fd::AsRawFd;
         manager.set_shmem_fd(Some(shmem_fd.as_raw_fd()));
     }
-    if let Err(e) = manager.start() {
+    // On a hot upgrade, build workers from the inherited listening
+    // sockets (same kernel sockets the old workers accept on); otherwise
+    // bind fresh ones. Either path captures long-lived handoff dups so
+    // THIS supervisor can itself be upgraded later.
+    let manager_start = match inherited {
+        Some(ref inh) => manager.start_with_inherited_listeners(inh.proxy.clone()),
+        None => manager.start(),
+    };
+    if let Err(e) = manager_start {
         error!(error = %e, "failed to start worker processes");
         std::process::exit(1);
     }
     // The supervisor keeps the fd alive (via `shmem_fd`) for the
     // eviction task and any later supervisor-side reads/writes.
 
+    // Capture the proxy listening sockets to hand over on a future hot
+    // upgrade. These raw FDs stay owned by the manager for its lifetime.
+    let handoff_proxy_fds: Vec<(String, RawFd)> = manager.handoff_listen_fds();
+
     info!(
         worker_count = manager.worker_count(),
         "all workers spawned, starting supervisor services"
     );
+
+    // Pre-bind (or adopt) the management-API listening socket in the
+    // supervisor itself so it can be handed over on a hot upgrade with no
+    // rebind gap. On the new side we adopt the inherited management FD; on
+    // a fresh start we bind 127.0.0.1:<port>. We keep a long-lived dup
+    // (`mgmt_handoff_listener`) for the next upgrade and pass the original
+    // to the API task.
+    let mgmt_listener: std::net::TcpListener = match inherited.as_ref().and_then(|i| i.management) {
+        Some(fd) => {
+            // SAFETY: `fd` was just received via SCM_RIGHTS in
+            // `pull_inherited_listeners` and is owned exclusively here; it
+            // refers to the same kernel listening socket the old API served
+            // on, so adopting it avoids a rebind gap on the management port.
+            unsafe { std::net::TcpListener::from_raw_fd(fd) }
+        }
+        None => match std::net::TcpListener::bind(("127.0.0.1", cli.management_port)) {
+            Ok(l) => l,
+            Err(e) => {
+                error!(error = %e, port = cli.management_port, "failed to bind management listener");
+                std::process::exit(1);
+            }
+        },
+    };
+    if let Err(e) = mgmt_listener.set_nonblocking(true) {
+        error!(error = %e, "failed to set management listener non-blocking");
+        std::process::exit(1);
+    }
+    let mgmt_handoff_listener: std::net::TcpListener = match mgmt_listener.try_clone() {
+        Ok(l) => l,
+        Err(e) => {
+            error!(error = %e, "failed to duplicate management listener for handoff");
+            std::process::exit(1);
+        }
+    };
+    let mgmt_handoff_fd: RawFd = mgmt_handoff_listener.as_raw_fd();
 
     // Extract raw FDs from worker handles before entering the tokio runtime.
     // CommandChannel::from_raw_fd requires a tokio runtime, so we take the raw FDs
@@ -1082,6 +1158,27 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // for AppState without ever starting the scheduler, so
         // cron-scheduled load tests silently never ran in worker mode.
         let load_test_engine = startup::start_load_test_engine(&store);
+        // Snapshot the CLI fields the hot-upgrade control loop needs, as
+        // the API task's `async move` below moves `cli` into itself.
+        // `management_port`, `worker_count`, and `data_dir_path` are
+        // already independent locals; these are the remaining non-Copy
+        // fields the handoff's `child_argv` (and the new-side ready
+        // signal) reference.
+        let hu_hot_upgrade: bool = cli.hot_upgrade;
+        let hu_data_dir: String = cli.data_dir.clone();
+        let hu_http_port: u16 = cli.http_port;
+        let hu_https_port: u16 = cli.https_port;
+        let hu_log_level: String = cli.log_level.clone();
+        let hu_log_format: String = cli.log_format.clone();
+        let hu_log_file: Option<String> = cli.log_file.clone();
+        let hu_crl: Option<String> = cli.upstream_crl_file.clone();
+        // Hot-upgrade trigger channel (Story 8.4). The API's
+        // `POST /api/v1/system/upgrade` handler sends the staged binary
+        // path here after a successful verify+stage; the supervisor's
+        // control loop (below) receives it and drives the handoff.
+        // Capacity 1: a second upgrade while one is in flight is shed.
+        let (upgrade_tx, mut upgrade_rx) =
+            tokio::sync::mpsc::channel::<PathBuf>(1);
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -1117,11 +1214,15 @@ pub(crate) fn run_supervisor(cli: Cli) {
                 log_store: api_log_store,
                 log_writer: None,
                 task_tracker: api_task_tracker,
+                upgrade_trigger: Some(upgrade_tx),
             };
             // Session store + ACME auto-renewal + cert-expiry notifier
             // + server loop, shared with single-process mode (audit
-            // H-9, see `startup::run_api_server`).
-            startup::run_api_server(management_port, state, api_alert_sender).await;
+            // H-9, see `startup::run_api_server`). The management listener
+            // is pre-bound (or adopted from the outgoing supervisor) so it
+            // can be handed over on the next hot upgrade without a gap.
+            startup::run_api_server(management_port, state, api_alert_sender, Some(mgmt_listener))
+                .await;
         });
 
         // Hourly retention loop (access logs, probe results, WAF
@@ -1430,55 +1531,201 @@ pub(crate) fn run_supervisor(cli: Cli) {
             }
         });
 
-        // Wait for shutdown signal
-        shutdown_signal().await;
-
-        info!("supervisor shutting down");
-        // CRITICAL ordering: stop the worker monitor BEFORE telling
-        // workers to drain. The monitor's job is to detect crashed
-        // workers and respawn them; during shutdown the SIGKILL we
-        // send to stragglers (drain timeout exceeded) shows up as a
-        // crash and triggers a respawn-into-shutdown race - the
-        // freshly forked worker gets SIGTERM ~ms later, can't drain
-        // in time, and systemd ends up SIGKILL'ing the whole service
-        // group past TimeoutStopSec.
-        //
-        // Two-step stop is required because the monitor blocks on a
-        // std::sync::Mutex (the same one shutdown_all needs), so a
-        // bare `monitor_handle.abort()` cannot fire while the
-        // supervisor is inside shutdown_all (sync code, no .await).
-        // The atomic flag is the primary defence: the monitor checks
-        // it both before and after acquiring the mutex and returns
-        // early when set. The abort is the belt-and-braces backstop.
-        shutting_down.store(true, std::sync::atomic::Ordering::Release);
-        monitor_handle.abort();
-        // Explicit SIGTERM to all workers before exiting
-        manager
-            .lock()
-            .unwrap_or_else(|e| {
-                warn!("worker manager mutex poisoned during shutdown, recovering");
-                e.into_inner()
-            })
-            .shutdown_all();
-        // Drain tracked background tasks (ACME polling, session-store
-        // writes, WAF refresh, backend drain watchdog). Bounded to 10 s
-        // so a hung task cannot delay shutdown indefinitely; systemd
-        // TimeoutStopSec will SIGKILL us past that anyway.
-        shutdown_task_tracker.close();
-        if tokio::time::timeout(Duration::from_secs(10), shutdown_task_tracker.wait())
-            .await
-            .is_err()
-        {
-            warn!("some background tasks did not finish within drain timeout; aborting");
+        // Hot upgrade (Story 8.4), NEW supervisor side: now that workers
+        // are forked from the inherited sockets and the API task is
+        // running on the inherited management socket, tell the outgoing
+        // supervisor (and systemd) we are up. The shared listening
+        // sockets mean the old process is still accepting until it
+        // drains, so an early "ready" here is safe.
+        if hu_hot_upgrade {
+            let self_pid: i32 = std::process::id() as i32;
+            match hot_upgrade::signal_ready_to_old(&data_dir_path) {
+                Ok(()) => info!("hot upgrade: signalled readiness to outgoing supervisor"),
+                Err(e) => warn!(
+                    error = %e,
+                    "hot upgrade: readiness signal failed; outgoing supervisor will fall back to liveness check"
+                ),
+            }
+            match hot_upgrade::sd_notify_ready(self_pid) {
+                Ok(true) => info!(pid = self_pid, "hot upgrade: sent sd_notify READY + MAINPID"),
+                Ok(false) => info!("hot upgrade: NOTIFY_SOCKET unset, skipping sd_notify"),
+                Err(e) => warn!(error = %e, "hot upgrade: sd_notify failed"),
+            }
         }
-        api_handle.abort();
-        health_handle.abort();
 
-        // Flush the OTel batch exporter before the runtime drops so
-        // supervisor-side spans (API requests, health checks) reach
-        // the collector on clean shutdown. No-op when the `otel`
-        // feature is off or the endpoint was never configured.
-        lorica::otel::shutdown();
+        // Main control loop: serve until either a shutdown signal or a
+        // hot-upgrade trigger arrives. A rollback resumes the loop
+        // (keeps serving); a successful handoff or a shutdown breaks out.
+        loop {
+            tokio::select! {
+                _ = shutdown_signal() => {
+                    info!("supervisor shutting down");
+                    // CRITICAL ordering: stop the worker monitor BEFORE
+                    // telling workers to drain. The monitor respawns
+                    // crashed workers; during shutdown the SIGKILL we
+                    // send to stragglers shows up as a crash and would
+                    // trigger a respawn-into-shutdown race. The atomic
+                    // flag is the primary defence (the monitor checks it
+                    // around its std::sync::Mutex acquire); abort is the
+                    // backstop.
+                    shutting_down.store(true, std::sync::atomic::Ordering::Release);
+                    monitor_handle.abort();
+                    manager
+                        .lock()
+                        .unwrap_or_else(|e| {
+                            warn!("worker manager mutex poisoned during shutdown, recovering");
+                            e.into_inner()
+                        })
+                        .shutdown_all();
+                    // Drain tracked background tasks, bounded to 10 s.
+                    shutdown_task_tracker.close();
+                    if tokio::time::timeout(Duration::from_secs(10), shutdown_task_tracker.wait())
+                        .await
+                        .is_err()
+                    {
+                        warn!("some background tasks did not finish within drain timeout; aborting");
+                    }
+                    api_handle.abort();
+                    health_handle.abort();
+                    lorica::otel::shutdown();
+                    break;
+                }
+                staged = upgrade_rx.recv() => {
+                    let Some(staged_path) = staged else {
+                        // All senders dropped (API task gone): nothing
+                        // more can trigger an upgrade. Keep serving until
+                        // a shutdown signal arrives.
+                        continue;
+                    };
+                    info!(
+                        staged = %staged_path.display(),
+                        "hot upgrade triggered; beginning handoff to new supervisor"
+                    );
+
+                    // Build the new binary's argv from this process's CLI.
+                    let staged_str: String = staged_path.to_string_lossy().into_owned();
+                    let mut child_argv: Vec<String> = vec![
+                        staged_str,
+                        "--hot-upgrade".to_string(),
+                        "--data-dir".to_string(),
+                        hu_data_dir.clone(),
+                        "--management-port".to_string(),
+                        management_port.to_string(),
+                        "--http-port".to_string(),
+                        hu_http_port.to_string(),
+                        "--https-port".to_string(),
+                        hu_https_port.to_string(),
+                        "--workers".to_string(),
+                        worker_count.to_string(),
+                        "--log-level".to_string(),
+                        hu_log_level.clone(),
+                        "--log-format".to_string(),
+                        hu_log_format.clone(),
+                    ];
+                    if let Some(ref lf) = hu_log_file {
+                        child_argv.push("--log-file".to_string());
+                        child_argv.push(lf.clone());
+                    }
+                    if let Some(ref crl) = hu_crl {
+                        child_argv.push("--upstream-crl-file".to_string());
+                        child_argv.push(crl.clone());
+                    }
+
+                    let run = hot_upgrade::run_old_side_handoff(hot_upgrade::HandoffArgs {
+                        data_dir: data_dir_path.clone(),
+                        staged_binary: staged_path.clone(),
+                        proxy_fds: handoff_proxy_fds.clone(),
+                        management_fd: mgmt_handoff_fd,
+                        management_port,
+                        child_argv,
+                    })
+                    .await;
+
+                    match run.decision {
+                        hot_upgrade::HandoffDecision::Drain => {
+                            info!("hot upgrade: new supervisor is up; draining old workers");
+                            // Stop the monitor so a drained worker is not
+                            // seen as a crash and respawned.
+                            shutting_down.store(true, std::sync::atomic::Ordering::Release);
+                            monitor_handle.abort();
+                            // Drain in-flight connections, timing it for
+                            // the histogram. Only after this completes do
+                            // the old listening sockets close (the manager
+                            // drops at process exit); until then both old
+                            // and new accept from the shared queue, so no
+                            // connection is dropped.
+                            let drain_start = Instant::now();
+                            let clean = manager
+                                .lock()
+                                .unwrap_or_else(|e| {
+                                    warn!("worker manager mutex poisoned during handoff, recovering");
+                                    e.into_inner()
+                                })
+                                .drain_for_handoff();
+                            let drain_secs = drain_start.elapsed().as_secs_f64();
+                            lorica_api::metrics::observe_hot_upgrade_drain(drain_secs);
+                            if !clean {
+                                lorica_api::metrics::record_hot_upgrade(
+                                    hot_upgrade::RollbackReason::DrainTimeout.metric_outcome(),
+                                );
+                                warn!(
+                                    drain_secs,
+                                    "hot upgrade: drain exceeded the window, stragglers were force-killed"
+                                );
+                            }
+                            shutdown_task_tracker.close();
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                shutdown_task_tracker.wait(),
+                            )
+                            .await;
+                            api_handle.abort();
+                            health_handle.abort();
+                            lorica::otel::shutdown();
+                            info!(
+                                drain_secs,
+                                "hot upgrade complete; exiting so the new supervisor takes over"
+                            );
+                            std::process::exit(0);
+                        }
+                        hot_upgrade::HandoffDecision::Rollback(reason) => {
+                            // The new process never came up. The old one
+                            // never stopped accepting, so this is seamless.
+                            if let Some(child) = run.child {
+                                lorica_worker::hot_upgrade::kill_and_reap(child);
+                            }
+                            run.serve_task.abort();
+                            let unix_ts: u64 = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            match hot_upgrade::quarantine_failed_binary(
+                                &data_dir_path,
+                                &staged_path,
+                                unix_ts,
+                            ) {
+                                Ok(dest) => info!(
+                                    quarantined = %dest.display(),
+                                    "hot upgrade: staged binary quarantined after failed handoff"
+                                ),
+                                Err(e) => warn!(
+                                    error = %e,
+                                    "hot upgrade: failed to quarantine staged binary"
+                                ),
+                            }
+                            let _ = std::fs::remove_file(hot_upgrade::transfer_sock_path(&data_dir_path));
+                            let _ = std::fs::remove_file(hot_upgrade::ready_sock_path(&data_dir_path));
+                            lorica_api::metrics::record_hot_upgrade(reason.metric_outcome());
+                            error!(
+                                reason = reason.metric_outcome(),
+                                "hot upgrade rolled back; resuming normal operation"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
     });
 }
 

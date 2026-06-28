@@ -61,6 +61,7 @@ async fn test_state() -> (AppState, SessionStore, RateLimiter) {
         aggregated_metrics: None,
         metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        upgrade_trigger: None,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -3811,6 +3812,7 @@ async fn test_state_with_waf() -> (AppState, SessionStore, RateLimiter) {
         aggregated_metrics: None,
         metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        upgrade_trigger: None,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -3850,6 +3852,7 @@ async fn test_state_with_workers() -> (AppState, SessionStore, RateLimiter) {
         aggregated_metrics: None,
         metrics_refresher: None,
         task_tracker: tokio_util::task::TaskTracker::new(),
+        upgrade_trigger: None,
     };
     let session_store = SessionStore::new(store).await;
     let rate_limiter = RateLimiter::new();
@@ -4828,7 +4831,7 @@ async fn upgrade_endpoint_valid_signature_stages_and_200s() {
     assert_eq!(std::fs::read(&staged).expect("read staged"), binary);
 
     assert!(
-        hot_upgrade_counter("ok") >= before + 1,
+        hot_upgrade_counter("ok") > before,
         "the ok outcome counter must increment on a successful stage"
     );
 }
@@ -4875,7 +4878,7 @@ async fn upgrade_endpoint_bad_signature_400s_and_increments_counter() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     assert!(
-        hot_upgrade_counter("signature_failed") >= before + 1,
+        hot_upgrade_counter("signature_failed") > before,
         "the signature_failed outcome counter must increment on a bad signature"
     );
 

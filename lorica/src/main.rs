@@ -18,7 +18,9 @@ mod startup;
 
 use clap::Parser;
 
-use crate::cli::{init_logging, run_rotate_key, run_unban, startup_banner, Cli, Commands};
+use crate::cli::{
+    init_logging, run_rotate_key, run_unban, run_upgrade, startup_banner, Cli, Commands,
+};
 
 fn main() {
     // Explicitly set ring as the default TLS crypto provider. Ignore the
@@ -53,6 +55,14 @@ fn main() {
         }
         Some(Commands::Unban { ip, user, password }) => {
             run_unban(cli.management_port, ip, user, password);
+        }
+        Some(Commands::Upgrade {
+            binary,
+            signature,
+            user,
+            password,
+        }) => {
+            run_upgrade(cli.management_port, binary, signature, user, password);
         }
         None => {
             init_logging(&cli.log_level, &cli.log_format, cli.log_file.as_deref());
