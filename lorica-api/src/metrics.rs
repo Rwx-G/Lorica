@@ -1237,6 +1237,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn per_worker_counter_resolver_matches_registered_arity() {
+        // Guards the two-sources-of-truth split between each counter's
+        // `IntCounterVec::new(opts, &[..labels..])` constructor and
+        // `resolve_per_worker_counter`'s hand-written label slice. The
+        // two are synced only by a comment: a rename or reorder at the
+        // constructor that is not mirrored in the resolver would write
+        // to the wrong positional slot or silently drop the entry, with
+        // no compile error. For every name in PER_WORKER_COUNTERS this
+        // asserts (1) the resolver returns Some, and (2) its label
+        // arity matches the live registered counter - a labelled vec
+        // accepts a label set of exactly the resolved length (prometheus
+        // rejects a wrong cardinality with Err), a scalar resolves to an
+        // empty slice.
+        use lorica_metrics::CounterTarget;
+        for name in PER_WORKER_COUNTERS {
+            let Some((labels, target)) = resolve_per_worker_counter(name) else {
+                panic!("{name} listed in PER_WORKER_COUNTERS but missing from resolver");
+            };
+            match target {
+                CounterTarget::Vec(counter) => {
+                    let probe: Vec<&str> = vec!["x"; labels.len()];
+                    assert!(
+                        counter.get_metric_with_label_values(&probe).is_ok(),
+                        "{name}: resolver arity {} disagrees with the registered counter's label set",
+                        labels.len()
+                    );
+                }
+                CounterTarget::Scalar(_) => {
+                    assert!(
+                        labels.is_empty(),
+                        "{name}: label-less scalar must resolve to an empty label slice"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_record_request() {
         record_request("route-1", 200, 0.05);
         record_request("route-1", 200, 0.1);
