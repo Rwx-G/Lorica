@@ -123,6 +123,14 @@ static WAF_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// crawler-label dimension of ~268 ; multiplied by routes and 4
 /// actions, this stays comfortably below the per-process metric
 /// budget. Operator visibility for AI-crawler hits surfaces here.
+///
+/// `ua_only_match` is an ADDITIONAL signal, not a mutually-exclusive
+/// action: for a `UaOnly` crawler it is emitted alongside the policy
+/// action, so a single UaOnly request increments BOTH `ua_only_match`
+/// AND the policy bucket (`deny` or `log`). The double-count is
+/// intentional - it lets an operator see how much of the deny/log
+/// volume rests on the unverifiable UA-only signal. Do not sum the
+/// four actions expecting the request total.
 static AI_BOT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let counter = IntCounterVec::new(
         prometheus::opts!(

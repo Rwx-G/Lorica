@@ -20,11 +20,13 @@
 //! - Regex compiles via `RegexBuilder` with `size_limit(1 << 20)` +
 //!   `dfa_size_limit(1 << 21)` ; on `Err` return HTTP 400 with the
 //!   regex error message.
-//! - The regex is then matched against a hardcoded baseline UA
-//!   corpus (Chrome / Firefox / Safari / Edge / Opera, curl, wget,
-//!   and 7 search-bot UAs) ; if any baseline UA matches, reject with
-//!   HTTP 400 ("Pattern would match legitimate browser/crawler UA
-//!   <example>"). Closes the admin-`(?i).*` privilege escalation.
+//! - The regex is then matched against a shared baseline UA corpus
+//!   (Chrome / Firefox / Safari / Edge / Opera plus version-wildcard
+//!   majors and Chromium forks, curl, wget, and search-bot UAs) ; if
+//!   any baseline UA matches, reject with HTTP 400 ("Pattern would
+//!   match legitimate browser/crawler UA <example>"). Best-effort
+//!   heuristic against the most common over-broad patterns ; not a
+//!   complete guarantee.
 //! - For `IpRanges`, every CIDR string is parsed via
 //!   `ipnet::IpNet::from_str` ; first invalid entry returns HTTP 400.
 //!   The list MUST have `len <= CUSTOM_CRAWLER_MAX_CIDRS`.
@@ -32,13 +34,14 @@
 //! - The total custom-crawler row count MUST stay below
 //!   `CUSTOM_CRAWLER_MAX_COUNT` on insert.
 
-use std::fmt::Write as _;
-
 use axum::extract::{Extension, Path, Query};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use ipnet::IpNet;
+use lorica_config::ai_crawler_registry::{
+    build_robots_txt_from_names, BASELINE_UAS, BUILTIN_CRAWLER_DESCRIPTORS,
+};
 use lorica_config::models::{
     AiBotPolicy, CustomCrawler, CustomVerification, Route, CUSTOM_CRAWLER_MAX_CIDRS,
     CUSTOM_CRAWLER_MAX_COUNT,
@@ -48,33 +51,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{json_data, json_data_with_status, ApiError};
 use crate::server::AppState;
-
-/// 20-entry baseline corpus matched against custom regexes at
-/// validation time (AC #6 baseline-UA smoke test). Fixture lives
-/// here rather than re-importing from `lorica/src/ai_bot.rs` to
-/// avoid a backwards dep ; the two corpuses MUST stay in sync.
-const BASELINE_UAS: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; rv:120.0) Gecko/20100101 Firefox/120.0",
-    "Mozilla/5.0 (Android 13; Mobile; rv:120.0) Gecko/120.0 Firefox/120.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 OPR/106.0.0.0",
-    "curl/8.4.0",
-    "Wget/1.21.4",
-    "PostmanRuntime/7.36.0",
-    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-    "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
-    "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
-    "Mozilla/5.0 (compatible; DuckDuckBot/1.1; +http://duckduckgo.com/duckduckbot.html)",
-    "Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)",
-    "Mozilla/5.0 (compatible; Twitterbot/1.0)",
-    "Mozilla/5.0 (compatible; LinkedInBot/1.0; +http://www.linkedin.com)",
-    "Mozilla/5.0 (compatible; SemrushBot/7~bl; +http://www.semrush.com/bot.html)",
-    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-];
 
 /// Body shape for POST / PUT.
 #[derive(Debug, Deserialize)]
@@ -137,7 +113,7 @@ pub async fn list_custom_crawlers(
         crawlers.into_iter().map(CustomCrawlerResponse::from).collect();
     Ok(json_data(serde_json::json!({
         "entries": entries,
-        "built_in_count": 16,
+        "built_in_count": BUILTIN_CRAWLER_DESCRIPTORS.len(),
         "max_count": CUSTOM_CRAWLER_MAX_COUNT,
     })))
 }
@@ -210,136 +186,11 @@ pub async fn delete_custom_crawler(
     Ok(json_data(serde_json::json!({ "deleted": id })))
 }
 
-/// One built-in AI-crawler descriptor exposed by the read
-/// endpoints (`/builtin`, `/test`, `/robots-preview`).
-///
-/// This is a deliberate small mirror of the authoritative
-/// `lorica/src/ai_bot.rs::BUILTIN_CRAWLERS` registry. The binary
-/// crate `lorica` depends on `lorica-api`, so `lorica-api` cannot
-/// call back into the registry ; the duplication is the same
-/// accepted pattern as the [`BASELINE_UAS`] copy above. The
-/// `descriptor_count_matches_builtin_registry` unit test pins the
-/// length at 16 as a drift tripwire - when a crawler is added to
-/// `BUILTIN_CRAWLERS`, that test fails until this table is updated.
-struct BuiltinDescriptor {
-    /// Stable crawler label (matches the registry `name`).
-    name: &'static str,
-    /// Word-boundary-anchored, case-insensitive regex source.
-    user_agent_pattern: &'static str,
-    /// Verification kind label: `rdns | ip_ranges | ua_only`.
-    verification_kind: &'static str,
-    /// Short human-facing vendor label.
-    source: &'static str,
-}
-
-/// Built-in descriptor table mirroring
-/// `lorica/src/ai_bot.rs::BUILTIN_CRAWLERS` (snapshot 2026-05-03).
-/// Source of truth lives in the binary crate ; keep the two in
-/// sync (the count tripwire test guards the size only).
-const BUILTIN_DESCRIPTORS: &[BuiltinDescriptor] = &[
-    BuiltinDescriptor {
-        name: "GPTBot",
-        user_agent_pattern: r"(?i)\bGPTBot\b",
-        verification_kind: "ip_ranges",
-        source: "OpenAI",
-    },
-    BuiltinDescriptor {
-        name: "ChatGPT-User",
-        user_agent_pattern: r"(?i)\bChatGPT-User\b",
-        verification_kind: "ip_ranges",
-        source: "OpenAI",
-    },
-    BuiltinDescriptor {
-        name: "OAI-SearchBot",
-        user_agent_pattern: r"(?i)\bOAI-SearchBot\b",
-        verification_kind: "ip_ranges",
-        source: "OpenAI",
-    },
-    BuiltinDescriptor {
-        name: "ClaudeBot",
-        user_agent_pattern: r"(?i)\bClaudeBot\b",
-        verification_kind: "ip_ranges",
-        source: "Anthropic",
-    },
-    BuiltinDescriptor {
-        name: "Claude-User",
-        user_agent_pattern: r"(?i)\bClaude-User\b",
-        verification_kind: "ip_ranges",
-        source: "Anthropic",
-    },
-    BuiltinDescriptor {
-        name: "Claude-SearchBot",
-        user_agent_pattern: r"(?i)\bClaude-SearchBot\b",
-        verification_kind: "ip_ranges",
-        source: "Anthropic",
-    },
-    BuiltinDescriptor {
-        name: "anthropic-ai",
-        user_agent_pattern: r"(?i)\banthropic-ai\b",
-        verification_kind: "ip_ranges",
-        source: "Anthropic",
-    },
-    BuiltinDescriptor {
-        name: "CCBot",
-        user_agent_pattern: r"(?i)\bCCBot/\d",
-        verification_kind: "rdns",
-        source: "Common Crawl",
-    },
-    BuiltinDescriptor {
-        name: "PerplexityBot",
-        user_agent_pattern: r"(?i)\bPerplexityBot/\d",
-        verification_kind: "ip_ranges",
-        source: "Perplexity",
-    },
-    BuiltinDescriptor {
-        name: "Perplexity-User",
-        user_agent_pattern: r"(?i)\bPerplexity-User/\d",
-        verification_kind: "ip_ranges",
-        source: "Perplexity",
-    },
-    BuiltinDescriptor {
-        name: "Bytespider",
-        user_agent_pattern: r"(?i)\bBytespider\b",
-        verification_kind: "ua_only",
-        source: "ByteDance",
-    },
-    BuiltinDescriptor {
-        name: "Google-Extended",
-        user_agent_pattern: r"(?i)\bGoogle-Extended\b",
-        verification_kind: "ua_only",
-        source: "Google",
-    },
-    BuiltinDescriptor {
-        name: "Applebot",
-        user_agent_pattern: r"(?i)\bApplebot(?:-Extended)?\b",
-        verification_kind: "rdns",
-        source: "Apple",
-    },
-    BuiltinDescriptor {
-        name: "Amazonbot",
-        user_agent_pattern: r"(?i)\b(?:Amazonbot|Amzn-SearchBot|Amzn-User)\b",
-        verification_kind: "ip_ranges",
-        source: "Amazon",
-    },
-    BuiltinDescriptor {
-        name: "FacebookBot",
-        user_agent_pattern: r"(?i)\b(?:FacebookBot|facebookexternalhit|meta-externalagent)\b",
-        verification_kind: "ip_ranges",
-        source: "Meta",
-    },
-    BuiltinDescriptor {
-        name: "Diffbot",
-        user_agent_pattern: r"(?i)\bDiffbot\b",
-        verification_kind: "ua_only",
-        source: "Diffbot",
-    },
-];
-
 /// `GET /api/v1/ai-crawlers/builtin` - list the 16 built-in
 /// descriptors (name + UA pattern + verification kind + vendor).
 /// Read-only, no store access.
 pub async fn list_builtin_crawlers() -> Json<serde_json::Value> {
-    let entries: Vec<serde_json::Value> = BUILTIN_DESCRIPTORS
+    let entries: Vec<serde_json::Value> = BUILTIN_CRAWLER_DESCRIPTORS
         .iter()
         .map(|d| {
             serde_json::json!({
@@ -375,7 +226,7 @@ fn custom_kind_str(v: &CustomVerification) -> &'static str {
 /// then enabled custom rows overlaid by name (custom wins on a name
 /// conflict, replacing the built-in in place ; new names append).
 fn build_merged_registry(customs: &[CustomCrawler]) -> Vec<MergedEntry> {
-    let mut merged: Vec<MergedEntry> = BUILTIN_DESCRIPTORS
+    let mut merged: Vec<MergedEntry> = BUILTIN_CRAWLER_DESCRIPTORS
         .iter()
         .map(|d| MergedEntry {
             name: d.name.to_string(),
@@ -502,7 +353,7 @@ fn active_crawler_names(route: &Route, customs: &[CustomCrawler]) -> Vec<String>
     if route.ai_bot_policy.unwrap_or(AiBotPolicy::Off) == AiBotPolicy::Off {
         return Vec::new();
     }
-    let mut names: Vec<String> = BUILTIN_DESCRIPTORS.iter().map(|d| d.name.to_string()).collect();
+    let mut names: Vec<String> = BUILTIN_CRAWLER_DESCRIPTORS.iter().map(|d| d.name.to_string()).collect();
     for c in customs.iter().filter(|c| c.enabled) {
         if !names.iter().any(|n| n == &c.name) {
             names.push(c.name.clone());
@@ -511,29 +362,17 @@ fn active_crawler_names(route: &Route, customs: &[CustomCrawler]) -> Vec<String>
     names
 }
 
-/// Build the `/robots.txt` body for the preview endpoint. Mirrors
-/// `lorica/src/ai_bot.rs::build_robots_txt_from_names` byte-for-byte
-/// (header comment block, one `User-agent: <name>\nDisallow: /\n\n`
-/// block per active name, or the allow-all fallback, trailing single
-/// `\n`). Keep this in sync with that function ; duplication is
-/// accepted because `lorica-api` cannot depend on the binary crate.
+/// Build the `/robots.txt` body for the preview endpoint. Delegates
+/// to the shared
+/// [`lorica_config::ai_crawler_registry::build_robots_txt_from_names`]
+/// builder - the same function the live proxy filter (via
+/// `lorica::ai_bot::build_robots_txt_from_names`) calls - so the
+/// preview is byte-for-byte identical to what `check_robots_txt`
+/// would emit. The crate package version is passed in so the header
+/// carries the product release.
 fn build_robots_preview(active_names: &[String]) -> String {
-    let mut out = String::with_capacity(64 + active_names.len() * 48);
-    let _ = writeln!(out, "# Generated by Lorica v{}", env!("CARGO_PKG_VERSION"));
-    let _ = writeln!(out, "# Source: ai-robots-txt/ai.robots.txt @ snapshot 2026-05-03");
-    out.push('\n');
-    if active_names.is_empty() {
-        out.push_str("User-agent: *\nAllow: /\n");
-        return out;
-    }
-    for name in active_names {
-        let _ = writeln!(out, "User-agent: {name}");
-        out.push_str("Disallow: /\n\n");
-    }
-    while out.ends_with("\n\n") {
-        out.pop();
-    }
-    out
+    let names: Vec<&str> = active_names.iter().map(String::as_str).collect();
+    build_robots_txt_from_names(&names, env!("CARGO_PKG_VERSION"))
 }
 
 /// Query params for `GET /api/v1/ai-crawlers/robots-preview`.
@@ -692,7 +531,7 @@ fn reject_builtin_verification_downgrade(
     if !matches!(verification, CustomVerification::UaOnly) {
         return Ok(());
     }
-    if let Some(descriptor) = BUILTIN_DESCRIPTORS
+    if let Some(descriptor) = BUILTIN_CRAWLER_DESCRIPTORS
         .iter()
         .find(|d| d.name.eq_ignore_ascii_case(name))
     {
@@ -930,17 +769,19 @@ mod tests {
 
     #[test]
     fn descriptor_count_matches_builtin_registry() {
-        // Drift tripwire : the source of truth is
-        // `lorica/src/ai_bot.rs::BUILTIN_CRAWLERS` (16 entries).
-        // `lorica-api` cannot import it (back-dep), so this pins
-        // the mirrored table size. If BUILTIN_CRAWLERS grows, this
-        // fails until BUILTIN_DESCRIPTORS is updated to match.
-        assert_eq!(BUILTIN_DESCRIPTORS.len(), 16);
+        // The shared `BUILTIN_CRAWLER_DESCRIPTORS` (lorica-config) is
+        // now the single source of truth this endpoint reads. The
+        // content drift tripwire against the richer
+        // `lorica::ai_bot::BUILTIN_CRAWLERS` registry lives in that
+        // crate's `builtin_registry_matches_shared_descriptors` test
+        // (name + pattern + verification_kind, in order). This keeps
+        // a simple size assertion as a fast local sanity check.
+        assert_eq!(BUILTIN_CRAWLER_DESCRIPTORS.len(), 16);
     }
 
     #[test]
     fn descriptor_kinds_are_valid_labels() {
-        for d in BUILTIN_DESCRIPTORS {
+        for d in BUILTIN_CRAWLER_DESCRIPTORS {
             assert!(
                 matches!(d.verification_kind, "rdns" | "ip_ranges" | "ua_only"),
                 "{} has invalid kind {}",
@@ -973,7 +814,7 @@ mod tests {
         let customs = vec![custom("GPTBot", r"(?i)\bMyGptbotClone\b", true)];
         let merged = build_merged_registry(&customs);
         // Count is unchanged (replace in place, not append).
-        assert_eq!(merged.len(), BUILTIN_DESCRIPTORS.len());
+        assert_eq!(merged.len(), BUILTIN_CRAWLER_DESCRIPTORS.len());
         // The real GPTBot UA no longer matches (built-in pattern gone).
         assert!(classify_ua(&merged, "Mozilla/5.0 (compatible; GPTBot/1.0)").is_none());
         // The override pattern matches and reports the custom name.
@@ -985,7 +826,7 @@ mod tests {
     fn disabled_custom_is_ignored() {
         let customs = vec![custom("ExtraBot", r"(?i)\bExtraBot\b", false)];
         let merged = build_merged_registry(&customs);
-        assert_eq!(merged.len(), BUILTIN_DESCRIPTORS.len());
+        assert_eq!(merged.len(), BUILTIN_CRAWLER_DESCRIPTORS.len());
         assert!(classify_ua(&merged, "ExtraBot/1.0").is_none());
     }
 
@@ -1091,7 +932,7 @@ mod tests {
         let customs = vec![custom("ExtraBot", r"(?i)\bExtraBot\b", true)];
         let names = active_crawler_names(&route, &customs);
         // 16 built-ins + 1 enabled custom.
-        assert_eq!(names.len(), BUILTIN_DESCRIPTORS.len() + 1);
+        assert_eq!(names.len(), BUILTIN_CRAWLER_DESCRIPTORS.len() + 1);
         let body = build_robots_preview(&names);
         assert_eq!(body.matches("Disallow: /").count(), names.len());
         assert!(body.contains("User-agent: GPTBot"));
