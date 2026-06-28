@@ -90,6 +90,11 @@ pub struct ProxyInfo {
     pub http_port: u16,
     /// HTTPS proxy listen port.
     pub https_port: u16,
+    /// OS process id of the running proxy. After a hot binary upgrade
+    /// (Story 8.4) the replacement process reports a fresh pid here, so
+    /// an operator can confirm the swap took effect by watching this
+    /// value change.
+    pub pid: u32,
 }
 
 /// Cached `sysinfo::System` instance, kept in `AppState` to avoid the cost of
@@ -205,6 +210,7 @@ pub async fn get_system(
             active_connections,
             http_port: state.http_port,
             https_port: state.https_port,
+            pid: std::process::id(),
         },
     };
 

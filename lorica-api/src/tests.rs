@@ -1726,6 +1726,13 @@ async fn test_system_endpoint() {
     assert!(json["data"]["proxy"]["version"].is_string());
     assert!(json["data"]["proxy"]["uptime_seconds"].as_u64().is_some());
     assert!(json["data"]["process"]["memory_bytes"].as_u64().is_some());
+    // The proxy pid is surfaced so an operator can confirm a hot
+    // binary upgrade took effect (Story 8.4 IV3). In-process tests run
+    // in the same process as the handler, so it equals our own pid.
+    assert_eq!(
+        json["data"]["proxy"]["pid"].as_u64(),
+        Some(u64::from(std::process::id()))
+    );
 }
 
 // ---- Settings Endpoint Tests ----
