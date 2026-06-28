@@ -285,10 +285,21 @@ impl RdnsResolver {
 /// end AND respects DNS label boundaries, so `googlebot.com`
 /// matches `crawl.googlebot.com` but NOT
 /// `fakegooglebot.com`. Case-insensitive.
+///
+/// Suffixes are normalised before comparison: a LEADING dot is
+/// trimmed so the AI-bot Rdns suffixes (`.crawl.commoncrawl.org`,
+/// `.applebot.apple.com`, and custom suffixes which are required
+/// to start with a dot) match real PTRs the same way the
+/// bot-challenge suffixes (no leading dot, e.g. `googlebot.com`)
+/// do. Without the trim the `.{suffix}` target would carry a
+/// double dot and never match.
 pub fn suffix_matches(confirmed_name: &str, suffixes: &[String]) -> bool {
     let host = confirmed_name.trim_end_matches('.').to_ascii_lowercase();
     suffixes.iter().any(|suffix| {
-        let suffix = suffix.trim_end_matches('.').to_ascii_lowercase();
+        let suffix = suffix
+            .trim_end_matches('.')
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
         if host == suffix {
             return true;
         }
@@ -354,6 +365,25 @@ mod tests {
     #[test]
     fn suffix_matches_empty_list_matches_nothing() {
         assert!(!suffix_matches("googlebot.com", &[]));
+    }
+
+    #[test]
+    fn suffix_matches_leading_dot_suffix() {
+        // AI-bot Rdns suffixes carry a LEADING dot (built-ins
+        // `.crawl.commoncrawl.org`, `.applebot.apple.com`, and
+        // custom suffixes required to start with a dot). A real
+        // Common Crawl PTR must match the leading-dot suffix.
+        let suffixes = vec![".crawl.commoncrawl.org".to_string()];
+        assert!(suffix_matches(
+            "18-97-14-84.crawl.commoncrawl.org",
+            &suffixes
+        ));
+        // Sibling-confusion: a host that merely contains the suffix
+        // as a non-terminal label must NOT match.
+        assert!(!suffix_matches(
+            "x.crawl.commoncrawl.org.evil.com",
+            &suffixes
+        ));
     }
 
     #[test]

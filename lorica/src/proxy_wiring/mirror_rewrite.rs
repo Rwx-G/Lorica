@@ -268,6 +268,14 @@ pub(crate) fn build_mirror_forward_headers(
                 // Don't double-set the header we just injected.
                 | "x-lorica-mirror"
                 | "x-request-id"
+                // Never copy a client-forged verified-bot trust value
+                // into a shadow backend. The primary upstream path
+                // strips these unconditionally ; the mirror path must
+                // too, or a client could forge `X-Lorica-Verified-Bot`
+                // straight to a mirror. We do not re-inject the real
+                // verified value into mirrors - just drop the client's.
+                | "x-lorica-verified-bot"
+                | "x-lorica-bot-verification"
         ) {
             continue;
         }

@@ -413,7 +413,16 @@ fn classify_ua<'a>(merged: &'a [MergedEntry], ua: &str) -> Option<&'a MergedEntr
             .build()
         {
             Ok(re) => re.is_match(ua),
-            Err(_) => false,
+            Err(e) => {
+                tracing::warn!(
+                    target: "lorica::ai_bot",
+                    crawler = %m.name,
+                    pattern = %m.pattern,
+                    error = %e,
+                    "custom AI crawler pattern failed to compile in /test classifier ; skipping entry"
+                );
+                false
+            }
         }
     })
 }
@@ -621,9 +630,12 @@ pub struct StatsQuery {
 /// (`metrics::AI_BOT_STATS_BUFFER`) is per-process. In multi-worker
 /// mode `check_ai_bot` runs in the worker processes while this
 /// endpoint runs in the supervisor, so the buffer reflects only
-/// same-process evaluations. The authoritative cross-process source
-/// is the Prometheus `lorica_ai_bot_total` counter via `/metrics`.
-/// The 5-minute buffer is an in-process convenience, not a
+/// same-process evaluations. For the cross-process view, scrape the
+/// Prometheus `lorica_ai_bot_total` counter via `/metrics` : the
+/// AI-bot counters are now shipped from each worker to the
+/// supervisor's registry (see `metrics::PER_WORKER_COUNTERS`), so
+/// `/metrics` is a true cross-process aggregate. The 5-minute buffer
+/// here is only an in-process convenience for the top-5 list, not a
 /// cross-process aggregate.
 pub async fn ai_crawler_stats(
     Query(q): Query<StatsQuery>,
@@ -650,9 +662,48 @@ fn validate_request(body: &CustomCrawlerRequest) -> Result<(), ApiError> {
     if body.name.len() > 64 {
         return Err(ApiError::BadRequest("name must be <= 64 characters".into()));
     }
+    // The name is written verbatim into the auto-served /robots.txt as
+    // `User-agent: {name}`. A control character (notably a newline)
+    // would let an admin inject arbitrary robots.txt directives.
+    if body.name.chars().any(|c| c.is_control()) {
+        return Err(ApiError::BadRequest(
+            "name must not contain control characters".into(),
+        ));
+    }
+    reject_builtin_verification_downgrade(&body.name, &body.verification)?;
     let compiled = compile_pattern(&body.user_agent_pattern)?;
     check_baseline_uas(&compiled)?;
     validate_verification(&body.verification)?;
+    Ok(())
+}
+
+/// Reject a custom row that would DOWNGRADE a built-in's verification
+/// strength. AC #6 lets a custom row override a built-in by name (to
+/// refresh a stale vendor IP list), but a custom `UaOnly` verification
+/// replacing a built-in verified by `rdns` or `ip_ranges` turns a
+/// strong, hard-to-spoof vendor identity into a forgeable UA-only
+/// match. Same-or-stronger overrides (e.g. an `ip_ranges` refresh)
+/// stay allowed. Name match is case-insensitive to mirror the
+/// merge's name-collision semantics.
+fn reject_builtin_verification_downgrade(
+    name: &str,
+    verification: &CustomVerification,
+) -> Result<(), ApiError> {
+    if !matches!(verification, CustomVerification::UaOnly) {
+        return Ok(());
+    }
+    if let Some(descriptor) = BUILTIN_DESCRIPTORS
+        .iter()
+        .find(|d| d.name.eq_ignore_ascii_case(name))
+    {
+        if matches!(descriptor.verification_kind, "rdns" | "ip_ranges") {
+            return Err(ApiError::BadRequest(format!(
+                "custom crawler '{name}' overrides a built-in verified by {}; \
+                 downgrading to ua_only is not allowed - keep rdns/ip_ranges or rename",
+                descriptor.verification_kind
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -806,6 +857,62 @@ mod tests {
     #[test]
     fn ua_only_no_payload_required() {
         assert!(validate_verification(&CustomVerification::UaOnly).is_ok());
+    }
+
+    fn request(name: &str, pattern: &str, verification: CustomVerification) -> CustomCrawlerRequest {
+        CustomCrawlerRequest {
+            name: name.to_string(),
+            user_agent_pattern: pattern.to_string(),
+            verification,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn name_with_control_char_rejected() {
+        // A newline in the name would inject robots.txt directives.
+        let body = request(
+            "Bad\nName",
+            r"(?i)\bSomeBot\b",
+            CustomVerification::UaOnly,
+        );
+        let err = validate_request(&body).unwrap_err();
+        match err {
+            ApiError::BadRequest(msg) => assert!(msg.contains("control characters")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_verification_downgrade_to_ua_only_rejected() {
+        // GPTBot is a built-in verified by ip_ranges. A custom row of
+        // the same name with ua_only verification must be rejected.
+        let body = request("GPTBot", r"(?i)\bMyGptbotClone\b", CustomVerification::UaOnly);
+        let err = validate_request(&body).unwrap_err();
+        match err {
+            ApiError::BadRequest(msg) => {
+                assert!(msg.contains("downgrading to ua_only is not allowed"), "{msg}");
+                assert!(msg.contains("ip_ranges"), "{msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        // Case-insensitive name collision is caught too.
+        let body_ci = request("ccbot", r"(?i)\bMyCcbotClone\b", CustomVerification::UaOnly);
+        assert!(validate_request(&body_ci).is_err());
+    }
+
+    #[test]
+    fn builtin_ip_ranges_refresh_allowed() {
+        // The legitimate stale-IP-list refresh: same name, same-or-
+        // stronger kind (ip_ranges), must pass.
+        let body = request(
+            "GPTBot",
+            r"(?i)\bGPTBotRefresh\b",
+            CustomVerification::IpRanges {
+                cidrs: vec!["203.0.113.0/24".into()],
+            },
+        );
+        assert!(validate_request(&body).is_ok());
     }
 
     fn custom(name: &str, pattern: &str, enabled: bool) -> CustomCrawler {

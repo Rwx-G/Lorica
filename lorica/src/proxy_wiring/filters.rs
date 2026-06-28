@@ -227,13 +227,25 @@ impl LoricaProxy {
     }
 }
 
+/// `Retry-After` advised on an AI-bot 403 (both the verified-Deny
+/// and the spoofed-Deny arms). 24 h - an AI training crawler has no
+/// business retrying the same denied route faster than once a day.
+const AI_BOT_DENY_RETRY_AFTER_SECS: u64 = 86_400;
+
 /// Verdict produced by `check_ai_bot`'s per-Verification dispatch
 /// step, then mapped to a terminal response (or a fall-through)
 /// based on the per-route policy and the spoofed-fallback chain.
 enum AiBotVerdict {
-    /// Verification confirmed (or not applicable for `UaOnly`) -
-    /// apply the per-route `ai_bot_policy`.
-    ApplyPolicy,
+    /// Apply the per-route `ai_bot_policy`. `verified` distinguishes
+    /// a POSITIVELY verified identity (rDNS cache-hit + suffix match,
+    /// or peer IP inside the vendor CIDR list) from a fail-open
+    /// pass (rDNS cache-miss, resolver absent, no peer IP) or a
+    /// `UaOnly` crawler. Only `verified == true` (non-`UaOnly`) is
+    /// allowed to launder the `X-Lorica-Verified-Bot` trust header
+    /// upstream ; the fail-open paths must stage nothing, otherwise
+    /// an attacker spoofing a verified crawler UA from a rotating IP
+    /// would forge that header (Story 8.2 audit fix).
+    ApplyPolicy { verified: bool },
     /// Verification failed (rDNS suffix mismatch / IP outside the
     /// vendor CIDR list) - apply the spoofed-fallback.
     Spoofed,
@@ -241,29 +253,50 @@ enum AiBotVerdict {
 
 /// Stage `X-Lorica-Verified-Bot` + `X-Lorica-Bot-Verification`
 /// headers for the upstream-injection loop (Story 8.2 AC #11).
-/// Gated by the global `ai_bot_inject_headers` setting. The UaOnly
-/// path stages only the kind header (no `X-Lorica-Verified-Bot`)
-/// so backends can distinguish trust levels.
+/// Gated by the global `ai_bot_inject_headers` setting.
+///
+/// Header staging is gated on ACTUAL verification (Story 8.2 audit
+/// fix), not merely on reaching this stage:
+/// - `UaOnly` crawler: stage ONLY the kind header
+///   (`X-Lorica-Bot-Verification: ua_only`). No verified-bot header
+///   because UA-only identity is forgeable by definition.
+/// - non-`UaOnly`, `verified == true` (rDNS suffix-confirmed or peer
+///   IP inside the vendor CIDR list): stage both the
+///   `X-Lorica-Verified-Bot` name header and the kind header.
+/// - non-`UaOnly`, `verified == false` (rDNS fail-open: cache-miss,
+///   resolver absent, or no peer IP): stage NOTHING. Verification
+///   did not actually happen, so laundering the trust header here
+///   would let an attacker spoofing a verified crawler UA from a
+///   rotating IP forge `X-Lorica-Verified-Bot` upstream.
 fn stage_verified_bot_headers(
     ctx: &mut RequestCtx,
     crawler: &MergedCrawler,
     config: &ProxyConfig,
+    verified: bool,
 ) {
     if !config.ai_bot_inject_headers {
         return;
     }
+    ctx.ai_bot_inject
+        .extend(verified_bot_headers(crawler, verified));
+}
+
+/// Pure header-staging decision for [`stage_verified_bot_headers`],
+/// split out so the verification gate is unit-testable without
+/// constructing a full `RequestCtx` / `ProxyConfig`. See
+/// [`stage_verified_bot_headers`] for the per-arm rationale.
+fn verified_bot_headers(crawler: &MergedCrawler, verified: bool) -> Vec<(String, String)> {
     let kind = crawler.verification.kind_str();
     match crawler.verification {
         MergedVerification::UaOnly => {
-            ctx.ai_bot_inject
-                .push(("X-Lorica-Bot-Verification".to_string(), kind.to_string()));
+            vec![("X-Lorica-Bot-Verification".to_string(), kind.to_string())]
         }
-        _ => {
-            ctx.ai_bot_inject
-                .push(("X-Lorica-Verified-Bot".to_string(), crawler.name.clone()));
-            ctx.ai_bot_inject
-                .push(("X-Lorica-Bot-Verification".to_string(), kind.to_string()));
-        }
+        _ if verified => vec![
+            ("X-Lorica-Verified-Bot".to_string(), crawler.name.clone()),
+            ("X-Lorica-Bot-Verification".to_string(), kind.to_string()),
+        ],
+        // Fail-open, unverified non-UaOnly: stage nothing.
+        _ => Vec::new(),
     }
 }
 
@@ -1234,7 +1267,12 @@ impl LoricaProxy {
         let body: String = if policy == AiBotPolicy::Off {
             build_robots_txt_from_names(&[])
         } else {
-            let registry = ai_bot_merged::handle().load();
+            // `load_full` (a single atomic Arc bump), not `load`, so
+            // no non-`Send` arc-swap guard is alive across the
+            // `.await` response writes below - same pattern, and same
+            // reason, as `check_ai_bot`. The body is fully built here
+            // and the snapshot dropped before the writes.
+            let registry = ai_bot_merged::handle().load_full();
             let names: Vec<&str> = registry.iter().map(|c| c.name.as_str()).collect();
             build_robots_txt_from_names(&names)
         };
@@ -1357,13 +1395,14 @@ impl LoricaProxy {
         let verdict = match &crawler.verification {
             MergedVerification::UaOnly => {
                 lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "ua_only_match");
-                AiBotVerdict::ApplyPolicy
+                // UaOnly is never positively verified.
+                AiBotVerdict::ApplyPolicy { verified: false }
             }
             MergedVerification::IpRanges(ranges) => {
                 let parsed_ip = check_ip.and_then(|s| s.parse::<std::net::IpAddr>().ok());
                 match parsed_ip {
                     Some(ip) if ranges.iter().any(|net| net.contains(&ip)) => {
-                        AiBotVerdict::ApplyPolicy
+                        AiBotVerdict::ApplyPolicy { verified: true }
                     }
                     _ => AiBotVerdict::Spoofed,
                 }
@@ -1372,7 +1411,7 @@ impl LoricaProxy {
         };
 
         match verdict {
-            AiBotVerdict::ApplyPolicy => match policy {
+            AiBotVerdict::ApplyPolicy { verified } => match policy {
                 AiBotPolicy::Off => Ok(None),
                 AiBotPolicy::Deny => {
                     lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "deny");
@@ -1383,14 +1422,14 @@ impl LoricaProxy {
                         &ctx.request_id,
                         entry.route.error_page_html.as_deref(),
                         "AI crawler denied",
-                        &[("Retry-After", "86400".to_string())],
+                        &[("Retry-After", AI_BOT_DENY_RETRY_AFTER_SECS.to_string())],
                     )
                     .await
                     .map(Some)
                 }
                 AiBotPolicy::Log => {
                     lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "log");
-                    stage_verified_bot_headers(ctx, crawler, config);
+                    stage_verified_bot_headers(ctx, crawler, config, verified);
                     Ok(None)
                 }
             },
@@ -1409,7 +1448,7 @@ impl LoricaProxy {
                             &ctx.request_id,
                             entry.route.error_page_html.as_deref(),
                             "AI crawler denied",
-                            &[("Retry-After", "86400".to_string())],
+                            &[("Retry-After", AI_BOT_DENY_RETRY_AFTER_SECS.to_string())],
                         )
                         .await
                         .map(Some)
@@ -1418,7 +1457,13 @@ impl LoricaProxy {
                         lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "spoofed");
                         Ok(None)
                     }
-                    SpoofedFallback::Allow => Ok(None),
+                    SpoofedFallback::Allow => {
+                        // Fail-open Allow still records the spoofed
+                        // signal so operators see spoofed volume in
+                        // /metrics, not just the deny/log arms.
+                        lorica_api::metrics::record_ai_bot(&crawler.name, route_id, "spoofed");
+                        Ok(None)
+                    }
                 }
             }
         }
@@ -1433,14 +1478,15 @@ impl LoricaProxy {
         let parsed_ip = match check_ip.and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
             Some(ip) => ip,
             // Without a peer IP we cannot verify; fail-open (same
-            // semantic as a cache miss).
-            None => return AiBotVerdict::ApplyPolicy,
+            // semantic as a cache miss) but NOT verified - the trust
+            // header must not be staged on this path.
+            None => return AiBotVerdict::ApplyPolicy { verified: false },
         };
         let resolver = match crate::bot_rdns::handle() {
             Some(r) => r,
             None => {
                 lorica_api::metrics::record_ai_bot_rdns_unavailable();
-                return AiBotVerdict::ApplyPolicy;
+                return AiBotVerdict::ApplyPolicy { verified: false };
             }
         };
         let now = SystemTime::now()
@@ -1450,15 +1496,18 @@ impl LoricaProxy {
         match resolver.cache_check(parsed_ip, now) {
             Some(Some(name)) => {
                 if crate::bot_rdns::suffix_matches(&name, suffixes) {
-                    AiBotVerdict::ApplyPolicy
+                    // Cache hit + suffix match = positively verified.
+                    AiBotVerdict::ApplyPolicy { verified: true }
                 } else {
                     AiBotVerdict::Spoofed
                 }
             }
             Some(None) => AiBotVerdict::Spoofed,
             None => {
+                // Cache miss: fire-and-forget resolve, fail-open but
+                // unverified (no trust header this request).
                 resolver.try_spawn_resolve(parsed_ip);
-                AiBotVerdict::ApplyPolicy
+                AiBotVerdict::ApplyPolicy { verified: false }
             }
         }
     }
@@ -2213,5 +2262,80 @@ impl LoricaProxy {
             }
             lorica_waf::WafVerdict::Pass => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipnet::IpNet;
+    use regex::Regex;
+
+    fn crawler(name: &str, verification: MergedVerification) -> MergedCrawler {
+        MergedCrawler {
+            name: name.to_string(),
+            pattern: Regex::new(r"(?i)\btestbot\b").expect("test regex compiles"),
+            verification,
+        }
+    }
+
+    #[test]
+    fn ip_ranges_verified_stages_both_headers() {
+        let net: IpNet = "203.0.113.0/24".parse().unwrap();
+        let c = crawler("GPTBot", MergedVerification::IpRanges(vec![net]));
+        let headers = verified_bot_headers(&c, true);
+        assert_eq!(
+            headers,
+            vec![
+                ("X-Lorica-Verified-Bot".to_string(), "GPTBot".to_string()),
+                ("X-Lorica-Bot-Verification".to_string(), "ip_ranges".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rdns_confirmed_stages_both_headers() {
+        let c = crawler(
+            "CCBot",
+            MergedVerification::Rdns(vec![".crawl.commoncrawl.org".to_string()]),
+        );
+        let headers = verified_bot_headers(&c, true);
+        assert_eq!(
+            headers,
+            vec![
+                ("X-Lorica-Verified-Bot".to_string(), "CCBot".to_string()),
+                ("X-Lorica-Bot-Verification".to_string(), "rdns".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rdns_fail_open_stages_nothing() {
+        // Cache-miss / resolver-absent / no-peer-IP all surface here
+        // as verified=false on a non-UaOnly crawler. The trust header
+        // must NOT be laundered upstream (the security fix).
+        let c = crawler(
+            "CCBot",
+            MergedVerification::Rdns(vec![".crawl.commoncrawl.org".to_string()]),
+        );
+        let headers = verified_bot_headers(&c, false);
+        assert!(headers.is_empty(), "fail-open must stage no headers");
+    }
+
+    #[test]
+    fn ua_only_stages_only_kind_header() {
+        let c = crawler("Bytespider", MergedVerification::UaOnly);
+        // verified flag is irrelevant for UaOnly.
+        let headers = verified_bot_headers(&c, false);
+        assert_eq!(
+            headers,
+            vec![("X-Lorica-Bot-Verification".to_string(), "ua_only".to_string())]
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name == "X-Lorica-Verified-Bot"),
+            "UaOnly must never stage the verified-bot name header"
+        );
     }
 }
