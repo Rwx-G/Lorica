@@ -5,6 +5,7 @@ When bumping the version, update ALL of these files:
 ## Product crate versions (package version)
 - [ ] `lorica/Cargo.toml` - `version`
 - [ ] `lorica-api/Cargo.toml` - `version`
+- [ ] `lorica-metrics/Cargo.toml` - `version` (follows product since v1.6.0)
 - [ ] `lorica-config/Cargo.toml` - `version`
 - [ ] `lorica-dashboard/Cargo.toml` - `version`
 - [ ] `lorica-bench/Cargo.toml` - `version`

@@ -20,6 +20,7 @@ members = [
     "tinyufo",
     "lorica-config",
     "lorica-api",
+    "lorica-metrics",
     "lorica-dashboard",
     "lorica-worker",
     "lorica-command",

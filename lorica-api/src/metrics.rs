@@ -20,16 +20,14 @@
 use axum::extract::Extension;
 use axum::http::header;
 use axum::response::IntoResponse;
+use lorica_metrics::REGISTRY;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
     TextEncoder,
 };
 
 use crate::server::AppState;
-
-/// Global metrics registry.
-static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
 /// HTTP request counter. Labels: route_id, status_code.
 static HTTP_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -664,268 +662,102 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     "lorica_ai_bot_rdns_unavailable_total",
 ];
 
-/// One generic counter entry at the lorica-api boundary.
-/// `(metric_name, label_NAME_value_pairs, value)`. The lorica
+/// Re-export of the worker -> supervisor wire tuple. The lorica
 /// binary translates between this tuple and the
-/// `lorica_command::GenericCounterEntry` wire type — this crate
-/// stays free of the lorica-command dep.
-///
-/// Labels are name=value pairs (not positional values) because
-/// `prometheus::Metric::get_label()` returns them in ALPHABETICAL
-/// order, not registration order. At apply time the supervisor
-/// looks up each metric's registered label-name list and builds
-/// the positional `with_label_values` slice from there.
-pub type GenericCounterTuple = (String, Vec<(String, String)>, u64);
+/// `lorica_command::GenericCounterEntry` wire type, keeping this
+/// crate free of the lorica-command dep. The definition and the
+/// alphabetical-label-order rationale live in `lorica-metrics`.
+pub use lorica_metrics::GenericCounterTuple;
 
-/// Snapshot every per-worker counter. Called on every
-/// metrics-report tick by the worker. Returns an empty vec when no
-/// counter has ever incremented on this worker (all vecs are lazy
-/// — they only allocate label sets on first `inc`).
+/// Resolve a per-worker counter name to its registered label order
+/// and the live supervisor-side counter handle. MUST stay in sync
+/// with the `&[...]` label slice passed to each counter's
+/// `IntCounterVec::new` constructor above and with
+/// [`PER_WORKER_COUNTERS`]. `lorica-metrics` owns the snapshot/apply
+/// mechanics; this crate owns the data-plane counter bindings.
+fn resolve_per_worker_counter(
+    metric: &str,
+) -> Option<(&'static [&'static str], lorica_metrics::CounterTarget)> {
+    use lorica_metrics::CounterTarget;
+    match metric {
+        "lorica_cache_predictor_bypass_total" => Some((
+            &["route_id"],
+            CounterTarget::Vec(&CACHE_PREDICTOR_BYPASS_TOTAL),
+        )),
+        "lorica_header_rule_match_total" => Some((
+            &["route_id", "rule_index"],
+            CounterTarget::Vec(&HEADER_RULE_MATCH_TOTAL),
+        )),
+        "lorica_canary_split_selected_total" => Some((
+            &["route_id", "split_name"],
+            CounterTarget::Vec(&CANARY_SPLIT_SELECTED_TOTAL),
+        )),
+        "lorica_mirror_outcome_total" => Some((
+            &["route_id", "outcome"],
+            CounterTarget::Vec(&MIRROR_OUTCOME_TOTAL),
+        )),
+        "lorica_forward_auth_cache_total" => Some((
+            &["route_id", "outcome"],
+            CounterTarget::Vec(&FORWARD_AUTH_CACHE_TOTAL),
+        )),
+        "lorica_geoip_block_total" => Some((
+            &["route_id", "country", "mode"],
+            CounterTarget::Vec(&GEOIP_BLOCK_TOTAL),
+        )),
+        "lorica_bot_challenge_total" => Some((
+            &["route_id", "mode", "outcome"],
+            CounterTarget::Vec(&BOT_CHALLENGE_TOTAL),
+        )),
+        "lorica_ai_bot_total" => Some((
+            &["crawler", "route_id", "action"],
+            CounterTarget::Vec(&AI_BOT_TOTAL),
+        )),
+        "lorica_ai_bot_skipped_custom_total" => Some((
+            &["reason"],
+            CounterTarget::Vec(&AI_BOT_SKIPPED_CUSTOM_TOTAL),
+        )),
+        // Label-less scalar : empty registered-order list.
+        "lorica_ai_bot_rdns_unavailable_total" => {
+            Some((&[], CounterTarget::Scalar(&AI_BOT_RDNS_UNAVAILABLE_TOTAL)))
+        }
+        _ => None,
+    }
+}
+
+/// Snapshot every per-worker counter into the wire form. Called on
+/// every metrics-report tick by the worker. Returns an empty vec when
+/// no counter has ever incremented on this worker. Delegates to
+/// [`lorica_metrics::snapshot_per_worker_counters`] with this crate's
+/// [`PER_WORKER_COUNTERS`] name list.
 pub fn snapshot_per_worker_counters() -> Vec<GenericCounterTuple> {
-    use prometheus::core::Collector;
-
-    let vecs: [(&str, &IntCounterVec); 9] = [
-        (
-            "lorica_cache_predictor_bypass_total",
-            &CACHE_PREDICTOR_BYPASS_TOTAL,
-        ),
-        ("lorica_header_rule_match_total", &HEADER_RULE_MATCH_TOTAL),
-        (
-            "lorica_canary_split_selected_total",
-            &CANARY_SPLIT_SELECTED_TOTAL,
-        ),
-        ("lorica_mirror_outcome_total", &MIRROR_OUTCOME_TOTAL),
-        ("lorica_forward_auth_cache_total", &FORWARD_AUTH_CACHE_TOTAL),
-        ("lorica_geoip_block_total", &GEOIP_BLOCK_TOTAL),
-        ("lorica_bot_challenge_total", &BOT_CHALLENGE_TOTAL),
-        ("lorica_ai_bot_total", &AI_BOT_TOTAL),
-        (
-            "lorica_ai_bot_skipped_custom_total",
-            &AI_BOT_SKIPPED_CUSTOM_TOTAL,
-        ),
-    ];
-
-    let mut out = Vec::new();
-    for (name, vec) in vecs {
-        // `Collector::collect()` returns an owned one-element
-        // `Vec<MetricFamily>` by API contract (prometheus 0.14
-        // `vec![self.v.collect()]`); the vec internals are
-        // pub(crate), so there is no buffer-reuse readback path.
-        // The small Vec allocations per tick live inside the
-        // prometheus crate and cannot be hoisted out (backlog #41g).
-        let families = vec.collect();
-        for mf in families {
-            for m in mf.get_metric() {
-                // Carry label name=value pairs on the wire so the
-                // supervisor can rebuild positional ordering using
-                // the target vec's registered label names.
-                // `get_label` returns pairs in alphabetical order,
-                // which is NOT the registration order.
-                let labels: Vec<(String, String)> = m
-                    .get_label()
-                    .iter()
-                    .map(|l| (l.name().to_string(), l.value().to_string()))
-                    .collect();
-                let value = m.get_counter().value() as u64;
-                if value > 0 {
-                    out.push((name.to_string(), labels, value));
-                }
-            }
-        }
-    }
-
-    // The rDNS-unavailable counter is a label-less `IntCounter`, not
-    // an `IntCounterVec`, so it cannot live in the `vecs` array. Snap
-    // it on its own with an empty label set ; the supervisor apply
-    // path resolves it to a scalar target.
-    let rdns_unavailable = AI_BOT_RDNS_UNAVAILABLE_TOTAL.get();
-    if rdns_unavailable > 0 {
-        out.push((
-            "lorica_ai_bot_rdns_unavailable_total".to_string(),
-            Vec::new(),
-            rdns_unavailable,
-        ));
-    }
-    out
+    lorica_metrics::snapshot_per_worker_counters(PER_WORKER_COUNTERS)
 }
 
-/// Supervisor-side snapshot: worker_id -> metric_name ->
-/// label_key -> last-known-value. Stored alongside the typed
-/// per-worker fields in `AggregatedMetrics`.
-type PerWorkerCounterSnapshot =
-    std::collections::HashMap<String, std::collections::HashMap<String, u64>>;
-
-static SUPERVISOR_GENERIC_SNAPSHOT: Lazy<
-    parking_lot::RwLock<std::collections::HashMap<u32, PerWorkerCounterSnapshot>>,
-> = Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-
-/// Apply a worker's generic-counter snapshot to the supervisor's
-/// own metrics registry. Called from the supervisor's
-/// `MetricsReport` ingress. The supervisor's vec (same
-/// `IntCounterVec` statics declared above — the `lorica-api`
-/// crate is linked into both worker and supervisor binaries)
-/// receives a POSITIVE delta only: a dropped worker's state stays
-/// in the last scrape until another `MetricsReport` arrives or a
-/// `forget_worker` call removes it.
+/// Apply a worker's generic-counter snapshot to the supervisor's own
+/// metrics registry. Called from the supervisor's `MetricsReport`
+/// ingress. Delegates delta tracking and label reordering to
+/// [`lorica_metrics::apply_worker_generic_counters`], supplying
+/// [`resolve_per_worker_counter`] so the generic machinery can reach
+/// this crate's counter statics. Counters receive a POSITIVE delta
+/// only: a dropped worker's state stays at the last scrape until
+/// another report arrives or a `forget` call removes it.
 pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTuple]) {
-    // Registered label order for each per-worker counter vec.
-    // MUST match the `&[...]` passed to `IntCounterVec::new` at
-    // the corresponding `Lazy::new` above. The apply path walks
-    // this list to reorder name=value pairs from the wire into
-    // positional arguments for `with_label_values`.
-    fn label_names(metric: &str) -> Option<&'static [&'static str]> {
-        match metric {
-            "lorica_cache_predictor_bypass_total" => Some(&["route_id"]),
-            "lorica_header_rule_match_total" => Some(&["route_id", "rule_index"]),
-            "lorica_canary_split_selected_total" => Some(&["route_id", "split_name"]),
-            "lorica_mirror_outcome_total" => Some(&["route_id", "outcome"]),
-            "lorica_forward_auth_cache_total" => Some(&["route_id", "outcome"]),
-            "lorica_geoip_block_total" => Some(&["route_id", "country", "mode"]),
-            "lorica_bot_challenge_total" => Some(&["route_id", "mode", "outcome"]),
-            "lorica_ai_bot_total" => Some(&["crawler", "route_id", "action"]),
-            "lorica_ai_bot_skipped_custom_total" => Some(&["reason"]),
-            // Label-less scalar : empty registered-order list.
-            "lorica_ai_bot_rdns_unavailable_total" => Some(&[]),
-            _ => None,
-        }
-    }
-
-    fn key_from_positional(values: &[String]) -> String {
-        values.join("\0")
-    }
-
-    /// Where a resolved wire entry applies on the supervisor side:
-    /// a labelled `IntCounterVec` or a label-less scalar `IntCounter`
-    /// (the rDNS-unavailable counter). References are `Copy`.
-    #[derive(Clone, Copy)]
-    enum CounterTarget {
-        Vec(&'static IntCounterVec),
-        Scalar(&'static IntCounter),
-    }
-
-    /// One wire entry fully resolved before the snapshot lock is
-    /// taken: owned key strings plus the target supervisor-side
-    /// counter.
-    struct PreparedEntry {
-        metric_name: String,
-        label_key: String,
-        positional: Vec<String>,
-        value: u64,
-        target: CounterTarget,
-    }
-
-    // Phase 1 - no lock held. Resolve the label order, build the
-    // positional values and the snapshot key, and bind the target
-    // vec for every wire entry. All string allocation happens here
-    // so the write lock below covers hashmap delta math only,
-    // instead of the whole apply loop. Holding the global lock
-    // across the full loop serialized every apply, and /metrics
-    // scrapes funnel through apply via the pull-on-scrape
-    // refresher, so they stalled behind it too (backlog #41g).
-    let mut prepared: Vec<PreparedEntry> = Vec::with_capacity(entries.len());
-    for (name, label_pairs, value) in entries {
-        let Some(order) = label_names(name) else {
-            continue;
-        };
-        let target: CounterTarget = match name.as_str() {
-            "lorica_cache_predictor_bypass_total" => {
-                CounterTarget::Vec(&CACHE_PREDICTOR_BYPASS_TOTAL)
-            }
-            "lorica_header_rule_match_total" => CounterTarget::Vec(&HEADER_RULE_MATCH_TOTAL),
-            "lorica_canary_split_selected_total" => {
-                CounterTarget::Vec(&CANARY_SPLIT_SELECTED_TOTAL)
-            }
-            "lorica_mirror_outcome_total" => CounterTarget::Vec(&MIRROR_OUTCOME_TOTAL),
-            "lorica_forward_auth_cache_total" => CounterTarget::Vec(&FORWARD_AUTH_CACHE_TOTAL),
-            "lorica_geoip_block_total" => CounterTarget::Vec(&GEOIP_BLOCK_TOTAL),
-            "lorica_bot_challenge_total" => CounterTarget::Vec(&BOT_CHALLENGE_TOTAL),
-            "lorica_ai_bot_total" => CounterTarget::Vec(&AI_BOT_TOTAL),
-            "lorica_ai_bot_skipped_custom_total" => {
-                CounterTarget::Vec(&AI_BOT_SKIPPED_CUSTOM_TOTAL)
-            }
-            "lorica_ai_bot_rdns_unavailable_total" => {
-                CounterTarget::Scalar(&AI_BOT_RDNS_UNAVAILABLE_TOTAL)
-            }
-            _ => continue,
-        };
-        // Reorder name=value pairs into positional values matching
-        // the registered order. Missing names get an empty string
-        // (the registered vec never accepts empty labels, so this
-        // will fail the `get_metric_with_label_values` check in
-        // phase 3 and be skipped - safe default).
-        let mut positional: Vec<String> = Vec::with_capacity(order.len());
-        for expected in order {
-            let v = label_pairs
-                .iter()
-                .find(|(n, _)| n.as_str() == *expected)
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default();
-            positional.push(v);
-        }
-        let label_key = key_from_positional(&positional);
-        prepared.push(PreparedEntry {
-            metric_name: name.clone(),
-            label_key,
-            positional,
-            value: *value,
-            target,
-        });
-    }
-
-    // Phase 2 - tight critical section. Compute per-label deltas
-    // against the worker's last-known snapshot and record the new
-    // values: HashMap moves and u64 math only, no string building
-    // and no prometheus calls under the lock. Note this MERGES
-    // into the existing worker state rather than swapping it out
-    // wholesale - a label combo absent from this report keeps its
-    // previous value, otherwise the next report carrying it again
-    // would re-apply the full count as a fresh delta.
-    let mut to_apply: Vec<(CounterTarget, Vec<String>, u64)> = Vec::with_capacity(prepared.len());
-    {
-        let mut map = SUPERVISOR_GENERIC_SNAPSHOT.write();
-        let worker_state = map.entry(worker_id).or_default();
-        for entry in prepared {
-            let metric_state = worker_state.entry(entry.metric_name).or_default();
-            let prev = metric_state.get(&entry.label_key).copied().unwrap_or(0);
-            if entry.value <= prev {
-                continue;
-            }
-            let delta = entry.value - prev;
-            metric_state.insert(entry.label_key, entry.value);
-            to_apply.push((entry.target, entry.positional, delta));
-        }
-    }
-
-    // Phase 3 - no lock held. Counter increments are atomic and the
-    // deltas were computed atomically in phase 2, so interleaving
-    // with a concurrent apply still converges to the same sums.
-    for (target, positional, delta) in to_apply {
-        match target {
-            CounterTarget::Vec(vec) => {
-                let label_refs: Vec<&str> = positional.iter().map(|s| s.as_str()).collect();
-                if vec.get_metric_with_label_values(&label_refs).is_ok() {
-                    vec.with_label_values(&label_refs).inc_by(delta);
-                }
-            }
-            // Label-less scalar : no label-arity guard needed.
-            CounterTarget::Scalar(counter) => counter.inc_by(delta),
-        }
-    }
+    lorica_metrics::apply_worker_generic_counters(worker_id, entries, resolve_per_worker_counter);
 }
 
-/// Drop a worker's snapshot on the supervisor side. Called when
-/// the supervisor detects a dead worker (RPC channel gone, crash
-/// signalled). Without this, the supervisor would keep the last-
-/// known counter values forever, skewing the aggregate.
+/// Drop a worker's snapshot on the supervisor side. Called when the
+/// supervisor detects a dead worker (RPC channel gone, crash
+/// signalled). Without this, the supervisor would keep the last-known
+/// counter values forever, skewing the aggregate.
 pub fn forget_worker_generic_counters(worker_id: u32) {
-    SUPERVISOR_GENERIC_SNAPSHOT.write().remove(&worker_id);
+    lorica_metrics::forget_worker_generic_counters(worker_id);
 }
 
 /// Test-only helper that wipes the supervisor's generic-counter
 /// snapshot so a fresh test starts from zero.
 #[cfg(test)]
 pub fn reset_generic_counter_snapshot_for_test() {
-    SUPERVISOR_GENERIC_SNAPSHOT.write().clear();
+    lorica_metrics::reset_generic_counter_snapshot_for_test();
 }
 
 /// Counter: notification events dropped by the bounded broadcast

@@ -2970,6 +2970,7 @@ dependencies = [
  "lorica-cache",
  "lorica-config",
  "lorica-dashboard",
+ "lorica-metrics",
  "lorica-notify",
  "lorica-tls",
  "lorica-waf",
@@ -3007,6 +3008,7 @@ version = "1.5.13"
 dependencies = [
  "chrono",
  "lorica-config",
+ "lorica-metrics",
  "lorica-notify",
  "reqwest",
  "serde",
@@ -3287,11 +3289,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lorica-metrics"
+version = "1.5.13"
+dependencies = [
+ "once_cell",
+ "parking_lot",
+ "prometheus",
+]
+
+[[package]]
 name = "lorica-notify"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "lettre",
+ "lorica-metrics",
  "parking_lot",
  "reqwest",
  "serde",

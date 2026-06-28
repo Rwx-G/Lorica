@@ -9,6 +9,7 @@ description = "SLA monitoring and load testing for Lorica reverse proxy"
 
 [dependencies]
 lorica-config = { version = "1.5.13", path = "../lorica-config" }
+lorica-metrics = { version = "1.5.13", path = "../lorica-metrics" }
 lorica-notify = { version = "0.1.0", path = "../lorica-notify" }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -41,6 +41,7 @@ COPY lorica-lb/ lorica-lb/
 COPY lorica-limits/ lorica-limits/
 COPY lorica-lru/ lorica-lru/
 COPY lorica-memory-cache/ lorica-memory-cache/
+COPY lorica-metrics/ lorica-metrics/
 COPY lorica-pool/ lorica-pool/
 COPY lorica-proxy/ lorica-proxy/
 COPY lorica-runtime/ lorica-runtime/
