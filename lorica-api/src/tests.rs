@@ -1997,6 +1997,50 @@ async fn test_update_settings_cert_export_roundtrip() {
 }
 
 #[tokio::test]
+async fn test_update_settings_upgrade_signing_pubkey_path_roundtrip() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({
+        "upgrade_signing_pubkey_path": "/etc/lorica/upgrade-signing.pub",
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings")
+        .header("Content-Type", "application/json")
+        .header("Cookie", &cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&payload).expect("test setup");
+    // The PUT response echoes the full GlobalSettings doc; assert the
+    // signing-key path round-tripped through the store.
+    assert_eq!(
+        json["data"]["upgrade_signing_pubkey_path"].as_str(),
+        Some("/etc/lorica/upgrade-signing.pub")
+    );
+
+    // Confirm it is actually persisted (not just reflected back).
+    let stored = {
+        let s = state.store.lock().await;
+        s.get_global_settings().expect("test setup")
+    };
+    assert_eq!(
+        stored.upgrade_signing_pubkey_path.as_deref(),
+        Some("/etc/lorica/upgrade-signing.pub")
+    );
+}
+
+#[tokio::test]
 async fn test_update_settings_cert_export_rejects_relative_dir() {
     let (state, session_store, rate_limiter) = test_state().await;
     let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;

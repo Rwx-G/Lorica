@@ -122,6 +122,12 @@ pub struct UpdateSettingsRequest {
     /// `X-Lorica-Bot-Verification` headers upstream on
     /// verification-confirmed AI-bot requests.
     pub ai_bot_inject_headers: Option<bool>,
+    /// Story 8.4. Absolute path to the Ed25519 public key the
+    /// hot-upgrade endpoint verifies uploaded binaries against. An
+    /// empty (after trim) value clears it, disabling hot binary
+    /// upgrade. Without this write path the operator could never
+    /// configure a signing key and every upload returned 400.
+    pub upgrade_signing_pubkey_path: Option<String>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -294,6 +300,13 @@ pub async fn update_settings(
             &mut settings.ai_bot_treat_spoofed_as,
         );
         apply_plain(body.ai_bot_inject_headers, &mut settings.ai_bot_inject_headers);
+        // Story 8.4. Mirrors `geoip_db_path` plumbing: absolute-path
+        // validation, empty string clears to None.
+        apply_optional_abs_path(
+            body.upgrade_signing_pubkey_path,
+            &mut settings.upgrade_signing_pubkey_path,
+            "upgrade_signing_pubkey_path",
+        )?;
 
         store.update_global_settings(&settings)?;
         Ok::<_, ApiError>(settings)
