@@ -308,6 +308,18 @@ pub struct GlobalSettings {
     /// response cache). Story 8.2 AC #11.
     #[serde(default = "default_ai_bot_inject_headers")]
     pub ai_bot_inject_headers: bool,
+
+    /// Filesystem path to the Ed25519 public key that
+    /// `POST /api/v1/system/upgrade` verifies uploaded binaries
+    /// against (Story 8.4). The file holds the 32-byte verifying key
+    /// hex-encoded as a single 64-character line (trailing whitespace
+    /// tolerated). `None` = hot binary upgrade disabled: the endpoint
+    /// rejects every upload with 400 rather than trusting an
+    /// unsigned binary. No key is compiled into the binary on purpose
+    /// so a dev key can never be trusted in production; the operator
+    /// manages this key file out of band.
+    #[serde(default)]
+    pub upgrade_signing_pubkey_path: Option<String>,
 }
 
 fn default_waf_ban_threshold() -> i32 {
@@ -430,6 +442,7 @@ impl Default for GlobalSettings {
             cert_export_dir_mode: default_cert_export_dir_mode(),
             ai_bot_treat_spoofed_as: SpoofedFallback::default(),
             ai_bot_inject_headers: default_ai_bot_inject_headers(),
+            upgrade_signing_pubkey_path: None,
         }
     }
 }

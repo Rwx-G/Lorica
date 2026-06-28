@@ -53,6 +53,14 @@ pub const BODY_CAP_REAPPLY: usize = 4 * 1024;
 /// Body cap for the TOML config import endpoint.
 pub const BODY_CAP_CONFIG_IMPORT: usize = 2 * 1024 * 1024;
 
+/// Body cap for the hot binary-upgrade endpoint (Story 8.4). The
+/// multipart body carries a full `lorica` executable plus a detached
+/// signature, so the limit is generous (128 MiB) relative to every
+/// other endpoint. The Ed25519 verification gate downstream rejects
+/// any payload that is not a correctly-signed binary, so the large cap
+/// is not a free write primitive.
+pub const BODY_CAP_UPGRADE: usize = 128 * 1024 * 1024;
+
 /// Body cap for ACME provisioning (carries domains + DNS provider
 /// id, modest JSON).
 pub const BODY_CAP_ACME: usize = 16 * 1024;
@@ -485,6 +493,17 @@ pub fn build_router(
         .route("/api/v1/logs/export", get(crate::logs::export_logs))
         .route("/api/v1/logs/ws", get(crate::logs::logs_ws))
         .route("/api/v1/system", get(crate::system::get_system))
+        // Story 8.4 hot binary upgrade: upload + Ed25519-verify + stage
+        // a new `lorica` executable. Generous body cap (carries a full
+        // binary) and the `destructive_cud` bucket since a successful
+        // call stages a replacement executable. Story 8.3 RBAC will
+        // retag this SuperAdmin-only.
+        .route(
+            "/api/v1/system/upgrade",
+            post(crate::upgrade::upgrade_binary)
+                .layer(bl(BODY_CAP_UPGRADE))
+                .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
+        )
         .route("/api/v1/workers", get(crate::workers::get_workers))
         .route("/api/v1/config/export", post(crate::config::export_config))
         .route(

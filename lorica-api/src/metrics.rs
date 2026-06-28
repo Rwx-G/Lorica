@@ -1099,6 +1099,35 @@ pub fn inc_config_reload_split_fleet() {
     CONFIG_RELOAD_SPLIT_FLEET_TOTAL.inc();
 }
 
+/// Counter: hot binary-upgrade outcomes (Story 8.4 AC #5). Label
+/// `outcome` is one of a small fixed set:
+/// - `"ok"`: a signed binary verified and was staged for handoff.
+/// - `"signature_failed"`: the uploaded binary failed Ed25519
+///   verification and was rejected before staging.
+/// - `"exec_failed"`: the chunk-2 execve handoff failed (emitted by
+///   the next chunk).
+/// - `"drain_timeout"`: the chunk-2 connection drain exceeded its
+///   deadline (emitted by the next chunk).
+///
+/// Bounded cardinality: four operator-controlled outcome strings, no
+/// user-derived label. This chunk increments only `ok` and
+/// `signature_failed`; `exec_failed` / `drain_timeout` land with the
+/// handoff implementation.
+static HOT_UPGRADE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    lorica_metrics::register_int_counter_vec(
+        "hot_upgrade_total",
+        "Hot binary-upgrade outcomes (outcome=ok|signature_failed|exec_failed|drain_timeout)",
+        &["outcome"],
+    )
+});
+
+/// Record one hot binary-upgrade outcome. `outcome` MUST be one of
+/// `ok | signature_failed | exec_failed | drain_timeout`; the counter
+/// API does not constrain it, so the call site enforces.
+pub fn record_hot_upgrade(outcome: &str) {
+    HOT_UPGRADE_TOTAL.with_label_values(&[outcome]).inc();
+}
+
 /// GET /metrics - Prometheus scrape endpoint.
 ///
 /// Refreshes dynamic gauges (active connections, backend health, cert expiry,

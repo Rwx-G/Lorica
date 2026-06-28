@@ -35,6 +35,13 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 argon2 = "0.5"
+# Native Ed25519 verification for the Story 8.4 hot binary-upgrade
+# endpoint (`POST /api/v1/system/upgrade`). Default features only:
+# the `verify_strict` path needs no RNG, and tests build a
+# `SigningKey` from fixed bytes (`SigningKey::from_bytes`) rather than
+# `generate`, so the optional `rand_core` feature stays off and no
+# extra RNG dep is pulled.
+ed25519-dalek = "2"
 rand = "0.9"
 rand_chacha = "0.9"
 rcgen = "0.13"

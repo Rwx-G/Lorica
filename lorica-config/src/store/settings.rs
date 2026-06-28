@@ -202,6 +202,10 @@ impl ConfigStore {
                 "ai_bot_inject_headers" => {
                     settings.ai_bot_inject_headers = value == "true" || value == "1";
                 }
+                "upgrade_signing_pubkey_path" => {
+                    settings.upgrade_signing_pubkey_path =
+                        if value.is_empty() { None } else { Some(value) };
+                }
                 _ => {}
             }
         }
@@ -402,6 +406,13 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('ai_bot_inject_headers', ?1)",
             params![settings.ai_bot_inject_headers.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('upgrade_signing_pubkey_path', ?1)",
+            params![settings
+                .upgrade_signing_pubkey_path
+                .as_deref()
+                .unwrap_or("")],
         )?;
         Ok(())
     }

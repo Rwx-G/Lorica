@@ -4723,3 +4723,199 @@ async fn list_bans_includes_reason() {
     assert_eq!(body["data"]["bans"][0]["ip"], "10.0.0.7");
     assert_eq!(body["data"]["bans"][0]["reason"], "waf_flood");
 }
+
+// ---- Hot binary upgrade (Story 8.4) ----
+
+/// Read the live value of `lorica_hot_upgrade_total{outcome=...}` from
+/// the process-global registry so a test can assert the AC #5 counter
+/// ticked. Returns 0 when the label combination has not been touched.
+fn hot_upgrade_counter(outcome: &str) -> u64 {
+    for mf in lorica_metrics::gather() {
+        if mf.name() != "lorica_hot_upgrade_total" {
+            continue;
+        }
+        for m in mf.get_metric() {
+            let hit = m
+                .get_label()
+                .iter()
+                .any(|l| l.name() == "outcome" && l.value() == outcome);
+            if hit {
+                return m.get_counter().value() as u64;
+            }
+        }
+    }
+    0
+}
+
+/// Build a `multipart/form-data` body with a `binary` part (raw bytes)
+/// and a `signature` part (hex). Returns `(content_type, body)`.
+fn build_upgrade_multipart(binary: &[u8], signature_hex: &str) -> (String, Vec<u8>) {
+    let boundary = "lorica84boundary";
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"binary\"; filename=\"lorica\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(binary);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"signature\"\r\n\r\n{signature_hex}\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+#[tokio::test]
+async fn upgrade_endpoint_valid_signature_stages_and_200s() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let signing = SigningKey::from_bytes(&[42u8; 32]);
+    let key_path = data_dir.path().join("upgrade-signing.pub");
+    std::fs::write(&key_path, hex_encode(signing.verifying_key().as_bytes()))
+        .expect("write key file");
+
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    state.data_dir = data_dir.path().to_path_buf();
+    {
+        let store = state.store.lock().await;
+        let mut s = store.get_global_settings().expect("get settings");
+        s.upgrade_signing_pubkey_path = Some(key_path.to_string_lossy().into_owned());
+        store.update_global_settings(&s).expect("set pubkey path");
+    }
+
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let binary = b"fake new lorica binary v9.9.9";
+    let signature_hex = hex_encode(&signing.sign(binary).to_bytes());
+    let (content_type, body) = build_upgrade_multipart(binary, &signature_hex);
+
+    let before = hot_upgrade_counter("ok");
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/system/upgrade")
+        .header("Content-Type", content_type)
+        .header(http::header::COOKIE, &cookie)
+        .body(Body::from(body))
+        .expect("build request");
+    let response = router.oneshot(req).await.expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("json");
+    assert_eq!(json["data"]["size"], binary.len() as u64);
+    assert!(json["data"]["sha256"].as_str().expect("sha256").len() == 64);
+
+    let staged = data_dir.path().join("upgrade").join("lorica.new");
+    assert!(staged.exists(), "verified binary must be staged");
+    assert_eq!(std::fs::read(&staged).expect("read staged"), binary);
+
+    assert!(
+        hot_upgrade_counter("ok") >= before + 1,
+        "the ok outcome counter must increment on a successful stage"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_endpoint_bad_signature_400s_and_increments_counter() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let signing = SigningKey::from_bytes(&[7u8; 32]);
+    let key_path = data_dir.path().join("upgrade-signing.pub");
+    std::fs::write(&key_path, hex_encode(signing.verifying_key().as_bytes()))
+        .expect("write key file");
+
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    state.data_dir = data_dir.path().to_path_buf();
+    {
+        let store = state.store.lock().await;
+        let mut s = store.get_global_settings().expect("get settings");
+        s.upgrade_signing_pubkey_path = Some(key_path.to_string_lossy().into_owned());
+        store.update_global_settings(&s).expect("set pubkey path");
+    }
+
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let binary = b"fake new lorica binary";
+    // Sign different bytes so the signature does not match `binary`.
+    let mut signature = signing.sign(b"a different payload").to_bytes();
+    signature[0] ^= 0xff;
+    let signature_hex = hex_encode(&signature);
+    let (content_type, body) = build_upgrade_multipart(binary, &signature_hex);
+
+    let before = hot_upgrade_counter("signature_failed");
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/system/upgrade")
+        .header("Content-Type", content_type)
+        .header(http::header::COOKIE, &cookie)
+        .body(Body::from(body))
+        .expect("build request");
+    let response = router.oneshot(req).await.expect("request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    assert!(
+        hot_upgrade_counter("signature_failed") >= before + 1,
+        "the signature_failed outcome counter must increment on a bad signature"
+    );
+
+    // Nothing must be staged on a rejected upload.
+    assert!(!data_dir.path().join("upgrade").join("lorica.new").exists());
+}
+
+#[tokio::test]
+async fn upgrade_endpoint_missing_signing_key_400s() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let data_dir = tempfile::tempdir().expect("test tempdir");
+    let (mut state, session_store, rate_limiter) = test_state().await;
+    state.data_dir = data_dir.path().to_path_buf();
+    // Deliberately leave `upgrade_signing_pubkey_path` unset (None).
+
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let signing = SigningKey::from_bytes(&[3u8; 32]);
+    let binary = b"some binary";
+    let signature_hex = hex_encode(&signing.sign(binary).to_bytes());
+    let (content_type, body) = build_upgrade_multipart(binary, &signature_hex);
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/system/upgrade")
+        .header("Content-Type", content_type)
+        .header(http::header::COOKIE, &cookie)
+        .body(Body::from(body))
+        .expect("build request");
+    let response = router.oneshot(req).await.expect("request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let resp_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&resp_body).expect("json");
+    assert_eq!(
+        json["error"]["message"], "bad request: no upgrade signing key configured",
+        "an unconfigured signing key must produce the documented 400 message"
+    );
+}
