@@ -1534,11 +1534,11 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // Hot upgrade (Story 8.4), NEW supervisor side: now that workers
         // are forked from the inherited sockets and the API task is
         // running on the inherited management socket, tell the outgoing
-        // supervisor (and systemd) we are up. The shared listening
+        // supervisor we are up so it can drain. The shared listening
         // sockets mean the old process is still accepting until it
         // drains, so an early "ready" here is safe.
+        let self_pid: i32 = std::process::id() as i32;
         if hu_hot_upgrade {
-            let self_pid: i32 = std::process::id() as i32;
             match hot_upgrade::signal_ready_to_old(&data_dir_path) {
                 Ok(()) => info!("hot upgrade: signalled readiness to outgoing supervisor"),
                 Err(e) => warn!(
@@ -1546,11 +1546,17 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     "hot upgrade: readiness signal failed; outgoing supervisor will fall back to liveness check"
                 ),
             }
-            match hot_upgrade::sd_notify_ready(self_pid) {
-                Ok(true) => info!(pid = self_pid, "hot upgrade: sent sd_notify READY + MAINPID"),
-                Ok(false) => info!("hot upgrade: NOTIFY_SOCKET unset, skipping sd_notify"),
-                Err(e) => warn!(error = %e, "hot upgrade: sd_notify failed"),
-            }
+        }
+        // Tell systemd we are accepting. REQUIRED for `Type=notify` on
+        // EVERY start (cold boot AND post-upgrade) or systemd times the
+        // unit out and marks the start failed. `MAINPID=self` is a no-op
+        // on a cold start (self is already the tracked main PID) and the
+        // real handover value on the post-upgrade path. No-op when
+        // `$NOTIFY_SOCKET` is unset (Docker, manual run).
+        match hot_upgrade::sd_notify_ready(self_pid) {
+            Ok(true) => info!(pid = self_pid, "sent sd_notify READY + MAINPID"),
+            Ok(false) => info!("NOTIFY_SOCKET unset, skipping sd_notify"),
+            Err(e) => warn!(error = %e, "sd_notify failed"),
         }
 
         // Main control loop: serve until either a shutdown signal or a

@@ -5,12 +5,42 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Hot binary upgrade (Story 8.4) requires Type=notify so systemd tracks
+# the MainPID handover. On a hot upgrade the OLD supervisor fork+execv's
+# the new one; the NEW process sends `sd_notify READY=1\nMAINPID=<newpid>`
+# once it is accepting, and systemd reassigns the unit's main PID to it
+# while the old process drains and exits 0. See docs/hot-upgrade.md.
+#
+# REQUIREMENT: Type=notify makes systemd wait for READY=1 at EVERY start,
+# not only after an upgrade. The normal (non-upgrade) startup path MUST
+# therefore also emit `sd_notify READY=1` once the API + listeners are up,
+# in BOTH supervisor and single-process mode, or systemd will time the
+# unit out and mark the start failed. The post-upgrade READY alone is not
+# sufficient for a cold boot.
+Type=notify
+# The post-upgrade READY=1 + MAINPID datagram is sent by the NEW process,
+# which is not the original MainPID, so NotifyAccess=main would drop it.
+# `all` lets any process in the unit's cgroup notify, which is what makes
+# the MainPID handover land.
+NotifyAccess=all
 User=lorica
 Group=lorica
 ExecStart=/usr/bin/lorica --data-dir /var/lib/lorica
+# A clean hot-upgrade exit is code 0: the new process has already taken
+# over the MainPID, so with Restart=on-failure systemd must NOT treat that
+# exit as a restart trigger (the service is already running under the new
+# PID). A
+# real crash exits non-zero and still restarts.
 Restart=on-failure
 RestartSec=5
+# SIGTERM goes to the main process so the supervisor can orchestrate the
+# worker drain itself; remaining processes are SIGKILLed only after the
+# stop timeout. Required for both ordinary shutdown and the hot-upgrade
+# drain.
+KillMode=mixed
+# Must exceed the worker drain window (worker_drain_timeout_s, default 30s)
+# with headroom so a legitimate drain is never cut short by systemd.
+TimeoutStopSec=90
 LimitNOFILE=65536
 
 # Logging
@@ -28,6 +58,10 @@ ProtectHome=yes
 # ReadWritePaths below. If the operator points
 # `cert_export_dir` at a different path, add it here too or the
 # exporter will fail with EACCES under `ProtectSystem=strict`.
+# The hot-upgrade staging zone `/var/lib/lorica/upgrade` (Story 8.4)
+# is created 0700 at runtime by the upgrade endpoint and lives under
+# the data dir, so it is already covered by this single entry - no
+# extra ReadWritePaths line is needed.
 ReadWritePaths=/var/lib/lorica
 # CAP_NET_BIND_SERVICE lets the proxy bind privileged ports (80,
 # 443) without running as root. CAP_CHOWN is optional and only

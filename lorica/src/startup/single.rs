@@ -518,6 +518,18 @@ pub(crate) fn run_single_process(cli: Cli) {
             server.run_forever();
         });
 
+        // Tell systemd we are accepting. REQUIRED for `Type=notify` or
+        // systemd times the unit out and marks the start failed. No-op
+        // when `$NOTIFY_SOCKET` is unset (Docker, manual run). MAINPID is
+        // self here (single-process has no handover), a no-op for a cold
+        // start. Mirrors the supervisor cold path.
+        let self_pid = std::process::id() as i32;
+        match crate::startup::hot_upgrade::sd_notify_ready(self_pid) {
+            Ok(true) => info!(pid = self_pid, "sent sd_notify READY + MAINPID"),
+            Ok(false) => info!("NOTIFY_SOCKET unset, skipping sd_notify"),
+            Err(e) => warn!(error = %e, "sd_notify failed"),
+        }
+
         // Wait for shutdown signal
         shutdown_signal().await;
 
