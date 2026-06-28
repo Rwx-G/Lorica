@@ -38,6 +38,28 @@ use crate::startup::{
 /// `(counter_name, [(label_key, label_value), ...], value)`.
 type GenericCounterRow = (String, Vec<(String, String)>, u64);
 
+/// Decode a worker's [`lorica_command::BanReportEntry`] wire row into the
+/// supervisor-side ban tuple
+/// `(ip, remaining_seconds, ban_duration_seconds, reason)`.
+///
+/// `reason` is an i32 on the wire; an unrecognized value (a legacy `0`,
+/// or a future reason emitted by a newer worker) falls back to
+/// [`lorica_api::ban::BanReason::WafCriticalRule`] rather than dropping
+/// the row or mislabeling it, matching the worker-side decode in
+/// `startup::worker`. Single source of truth for the three metrics-report
+/// ingestion sites that previously inlined this map closure verbatim.
+fn decode_ban_report_entry(
+    b: &lorica_command::BanReportEntry,
+) -> (String, u64, u64, lorica_api::ban::BanReason) {
+    (
+        b.ip.clone(),
+        b.remaining_seconds,
+        b.ban_duration_seconds,
+        lorica_api::ban::BanReason::from_i32(b.reason)
+            .unwrap_or(lorica_api::ban::BanReason::WafCriticalRule),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Supervisor mode (Unix only): forks workers, runs API server, monitors workers
 // ---------------------------------------------------------------------------
@@ -693,7 +715,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                                         let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
                                             .ban_entries
                                             .iter()
-                                            .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds, lorica_api::ban::BanReason::from_i32(b.reason).unwrap_or(lorica_api::ban::BanReason::WafCriticalRule)))
+                                            .map(decode_ban_report_entry)
                                             .collect();
                                         let backend_conns: std::collections::HashMap<String, u64> = report
                                             .backend_conn_entries
@@ -1350,7 +1372,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                                                                     .collect();
                                                                 let bans: Vec<(String, u64, u64, lorica_api::ban::BanReason)> = report
                                                                     .ban_entries.iter()
-                                                                    .map(|b| (b.ip.clone(), b.remaining_seconds, b.ban_duration_seconds, lorica_api::ban::BanReason::from_i32(b.reason).unwrap_or(lorica_api::ban::BanReason::WafCriticalRule)))
+                                                                    .map(decode_ban_report_entry)
                                                                     .collect();
                                                                 let backend_conns: std::collections::HashMap<String, u64> = report
                                                                     .backend_conn_entries.iter()
@@ -2378,6 +2400,46 @@ async fn pull_all_metrics_via_rpc(
 #[cfg(test)]
 mod supervisor_tests {
     use super::*;
+
+    #[test]
+    fn decode_ban_report_entry_round_trips_reason_and_falls_back() {
+        use lorica_api::ban::BanReason;
+        use lorica_command::BanReportEntry;
+
+        // Every known wire reason decodes back to its variant, with the
+        // ip / remaining / duration fields carried through verbatim.
+        for reason in [
+            BanReason::RateLimit,
+            BanReason::WafFlood,
+            BanReason::WafCriticalRule,
+            BanReason::Manual,
+        ] {
+            let entry = BanReportEntry {
+                ip: "192.0.2.7".to_string(),
+                remaining_seconds: 12,
+                ban_duration_seconds: 60,
+                reason: reason.as_i32(),
+            };
+            let (ip, remaining, duration, decoded) = decode_ban_report_entry(&entry);
+            assert_eq!(ip, "192.0.2.7");
+            assert_eq!(remaining, 12);
+            assert_eq!(duration, 60);
+            assert_eq!(decoded, reason);
+        }
+
+        // An unknown wire value (legacy 0 or a future reason) falls back
+        // to WafCriticalRule rather than dropping the row.
+        for unknown in [0, 99] {
+            let entry = BanReportEntry {
+                ip: "192.0.2.8".to_string(),
+                remaining_seconds: 1,
+                ban_duration_seconds: 2,
+                reason: unknown,
+            };
+            let (_, _, _, decoded) = decode_ban_report_entry(&entry);
+            assert_eq!(decoded, BanReason::WafCriticalRule);
+        }
+    }
 
     #[test]
     fn verdict_cache_lookup_miss_on_empty() {

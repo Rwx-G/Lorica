@@ -1,18 +1,36 @@
 //! Ban reason classification carried on every IP ban.
 //!
-//! A ban entry in the data-plane ban map is `(banned_at, duration_s,
-//! BanReason)`. The reason is surfaced in `GET /api/v1/bans` and
-//! propagated over the supervisor -> worker `BanIp` RPC as an i32
-//! ([`BanReason::as_i32`] / [`BanReason::from_i32`]).
+//! A ban entry in the data-plane ban map is a [`BanRecord`]. The reason
+//! is surfaced in `GET /api/v1/bans` and propagated over the
+//! supervisor -> worker `BanIp` RPC as an i32 ([`BanReason::as_i32`] /
+//! [`BanReason::from_i32`]).
 
 use std::time::Instant;
 
 use dashmap::DashMap;
 
+/// One ban entry in the data-plane ban map.
+///
+/// Replaces the former bare `(Instant, u64, BanReason)` tuple. The two
+/// adjacent `u64`-shaped quantities (`duration_s` here plus the
+/// `remaining_seconds` carried by neighbouring report code) made the
+/// positional form a transposition magnet; named fields make every
+/// read and write site self-documenting. The per-request expiry check
+/// gates on `banned_at` + `duration_s`; `reason` is cosmetic (surfaced
+/// in the API response and logs).
+#[derive(Debug, Clone)]
+pub struct BanRecord {
+    /// When the ban was issued (monotonic clock).
+    pub banned_at: Instant,
+    /// Ban duration in seconds.
+    pub duration_s: u64,
+    /// Why the IP was banned.
+    pub reason: BanReason,
+}
+
 /// Data-plane ban map shared between the proxy hot path and the
-/// management API: client IP -> (ban timestamp, ban duration in
-/// seconds, reason).
-pub type BanMap = DashMap<String, (Instant, u64, BanReason)>;
+/// management API: client IP -> [`BanRecord`].
+pub type BanMap = DashMap<String, BanRecord>;
 
 /// Why an IP was added to the ban list.
 ///
@@ -103,5 +121,26 @@ mod tests {
     fn unknown_i32_is_none() {
         assert_eq!(BanReason::from_i32(0), None);
         assert_eq!(BanReason::from_i32(99), None);
+    }
+
+    #[test]
+    fn unknown_i32_falls_back_to_waf_critical_rule() {
+        // Documents the wire-decode contract the supervisor/worker
+        // ban-report decoders rely on: an unrecognized i32 (legacy `0`
+        // or a future reason from a newer peer) decodes via
+        // `from_i32(..).unwrap_or(WafCriticalRule)` to WafCriticalRule
+        // rather than dropping the row or mislabeling it. Pairs with
+        // `decode_ban_report_entry` in the lorica supervisor module.
+        for unknown in [0, 99] {
+            assert_eq!(
+                BanReason::from_i32(unknown).unwrap_or(BanReason::WafCriticalRule),
+                BanReason::WafCriticalRule,
+            );
+        }
+        // A known value still round-trips, never hitting the fallback.
+        assert_eq!(
+            BanReason::from_i32(BanReason::Manual.as_i32()).unwrap_or(BanReason::WafCriticalRule),
+            BanReason::Manual,
+        );
     }
 }

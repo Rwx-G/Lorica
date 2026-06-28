@@ -381,17 +381,16 @@ pub(crate) fn run_worker(
                         let ban_entries: Vec<BanReportEntry> = cmd_ban_list
                             .iter()
                             .filter_map(|entry| {
-                                let (ip, (banned_at, duration_s, reason)) =
-                                    (entry.key(), entry.value());
-                                let elapsed = banned_at.elapsed().as_secs();
-                                if elapsed >= *duration_s {
+                                let (ip, rec) = (entry.key(), entry.value());
+                                let elapsed = rec.banned_at.elapsed().as_secs();
+                                if elapsed >= rec.duration_s {
                                     return None; // expired
                                 }
                                 Some(BanReportEntry {
                                     ip: ip.clone(),
-                                    remaining_seconds: duration_s - elapsed,
-                                    ban_duration_seconds: *duration_s,
-                                    reason: reason.as_i32(),
+                                    remaining_seconds: rec.duration_s - elapsed,
+                                    ban_duration_seconds: rec.duration_s,
+                                    reason: rec.reason.as_i32(),
                                 })
                             })
                             .collect();
@@ -466,7 +465,14 @@ pub(crate) fn run_worker(
                         let reason = lorica_api::ban::BanReason::from_i32(cmd.ban_reason)
                             .unwrap_or(lorica_api::ban::BanReason::WafCriticalRule);
                         if !ip.is_empty() {
-                            cmd_ban_list.insert(ip.clone(), (Instant::now(), duration_s, reason));
+                            cmd_ban_list.insert(
+                                ip.clone(),
+                                lorica_api::ban::BanRecord {
+                                    banned_at: Instant::now(),
+                                    duration_s,
+                                    reason,
+                                },
+                            );
                             info!(
                                 worker_id = id,
                                 ip = %ip,

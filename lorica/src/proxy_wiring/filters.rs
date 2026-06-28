@@ -494,8 +494,8 @@ impl LoricaProxy {
         ip: &str,
     ) -> Result<Option<bool>> {
         let banned = if let Some(entry) = self.ban_list.get(ip) {
-            let (banned_at, duration_s, _reason) = entry.value();
-            if banned_at.elapsed() >= Duration::from_secs(*duration_s) {
+            let rec = entry.value();
+            if rec.banned_at.elapsed() >= Duration::from_secs(rec.duration_s) {
                 drop(entry);
                 // Ban expired - lazy cleanup
                 self.ban_list.remove(ip);
@@ -2041,11 +2041,11 @@ impl LoricaProxy {
                                 let ban_duration = entry.route.auto_ban_duration_s;
                                 self.ban_list.insert(
                                     ip.to_string(),
-                                    (
-                                        Instant::now(),
-                                        ban_duration as u64,
-                                        lorica_api::ban::BanReason::RateLimit,
-                                    ),
+                                    lorica_api::ban::BanRecord {
+                                        banned_at: Instant::now(),
+                                        duration_s: ban_duration as u64,
+                                        reason: lorica_api::ban::BanReason::RateLimit,
+                                    },
                                 );
                                 warn!(
                                     ip = %ip,
@@ -2216,11 +2216,11 @@ impl LoricaProxy {
                                 let ban_duration = config.waf_ban_duration_s;
                                 self.ban_list.insert(
                                     ip.to_string(),
-                                    (
-                                        Instant::now(),
-                                        ban_duration as u64,
-                                        lorica_api::ban::BanReason::WafCriticalRule,
-                                    ),
+                                    lorica_api::ban::BanRecord {
+                                        banned_at: Instant::now(),
+                                        duration_s: ban_duration as u64,
+                                        reason: lorica_api::ban::BanReason::WafCriticalRule,
+                                    },
                                 );
                                 self.waf_violations.remove(ip);
                                 warn!(

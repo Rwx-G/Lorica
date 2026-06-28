@@ -4707,11 +4707,11 @@ async fn list_bans_includes_reason() {
     let bans = Arc::new(dashmap::DashMap::new());
     bans.insert(
         "10.0.0.7".to_string(),
-        (
-            Instant::now(),
-            600u64,
-            crate::ban::BanReason::WafFlood,
-        ),
+        crate::ban::BanRecord {
+            banned_at: Instant::now(),
+            duration_s: 600,
+            reason: crate::ban::BanReason::WafFlood,
+        },
     );
     state.ban_list = Some(bans);
 

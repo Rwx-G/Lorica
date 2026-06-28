@@ -168,16 +168,16 @@ async fn handle_metrics_request(
         .ban_list
         .iter()
         .filter_map(|entry| {
-            let (ip, (banned_at, duration_s, reason)) = (entry.key(), entry.value());
-            let elapsed = banned_at.elapsed().as_secs();
-            if elapsed >= *duration_s {
+            let (ip, rec) = (entry.key(), entry.value());
+            let elapsed = rec.banned_at.elapsed().as_secs();
+            if elapsed >= rec.duration_s {
                 return None;
             }
             Some(BanReportEntry {
                 ip: ip.clone(),
-                remaining_seconds: duration_s - elapsed,
-                ban_duration_seconds: *duration_s,
-                reason: reason.as_i32(),
+                remaining_seconds: rec.duration_s - elapsed,
+                ban_duration_seconds: rec.duration_s,
+                reason: rec.reason.as_i32(),
             })
         })
         .collect();

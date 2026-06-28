@@ -88,14 +88,14 @@ pub async fn list_bans(
         // Single-process: read directly from shared DashMap
         bl.iter()
             .filter_map(|entry| {
-                let (banned_at, duration_s, reason) = entry.value();
-                let elapsed = banned_at.elapsed().as_secs();
-                if elapsed < *duration_s {
+                let rec = entry.value();
+                let elapsed = rec.banned_at.elapsed().as_secs();
+                if elapsed < rec.duration_s {
                     Some(serde_json::json!({
                         "ip": entry.key(),
                         "banned_seconds_ago": elapsed,
-                        "remaining_seconds": duration_s - elapsed,
-                        "reason": reason.as_str(),
+                        "remaining_seconds": rec.duration_s - elapsed,
+                        "reason": rec.reason.as_str(),
                     }))
                 } else {
                     None
