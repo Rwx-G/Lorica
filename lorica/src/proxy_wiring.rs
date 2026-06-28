@@ -297,6 +297,8 @@ pub use lb::{BackendConnections, CircuitBreaker, EwmaTracker};
 pub mod context;
 pub use context::RequestCtx;
 
+pub mod ai_bot_merged;
+
 pub mod filters;
 pub use filters::ip_to_shmem_key;
 #[cfg(test)]
@@ -2515,3 +2517,6 @@ mod tests;
 
 #[cfg(test)]
 mod cert_reload_commit_tests;
+
+#[cfg(test)]
+mod ai_bot_reload_tests;

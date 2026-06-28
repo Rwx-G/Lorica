@@ -121,7 +121,23 @@ pub async fn reload_proxy_config_with_mtls(
     apply_geoip_settings_from_store(store).await;
     apply_asn_settings_from_store(store).await;
     apply_bot_secret_from_store(store).await;
+    rebuild_merged_crawlers(store).await;
     Ok(())
+}
+
+/// Rebuild the process-wide merged AI-crawler registry (built-in +
+/// enabled custom rows) from the current store and atomically swap it
+/// in (Story 8.2 AC #8). Called from every config-application path -
+/// worker / single-process startup and every reload commit - so a
+/// dashboard Custom Crawler edit takes effect on the next request
+/// without a process restart. Lenient by construction : a single
+/// unreadable or malformed custom row is dropped (logged + counted)
+/// while the rest of the registry stays live. Placed next to the
+/// per-process resolver hooks so the call site reads uniformly with
+/// the GeoIP / ASN / OTel / bot-secret re-application.
+pub async fn rebuild_merged_crawlers(store: &Arc<Mutex<ConfigStore>>) {
+    let guard = store.lock().await;
+    crate::proxy_wiring::ai_bot_merged::rebuild_from_store(&guard);
 }
 
 /// Re-apply the four per-process resolver hooks (OTel exporter,

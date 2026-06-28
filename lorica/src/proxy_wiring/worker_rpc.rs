@@ -453,6 +453,11 @@ pub(crate) async fn handle_config_reload_commit(
             crate::reload::apply_geoip_settings_from_store(store).await;
             crate::reload::apply_asn_settings_from_store(store).await;
             crate::reload::apply_bot_secret_from_store(store).await;
+            // Rebuild the merged AI-crawler registry so a dashboard
+            // Custom Crawler CRUD edit becomes visible on this worker
+            // after the two-phase commit (Story 8.2 AC #8), the same
+            // way the resolver hooks above propagate GeoIP / ASN state.
+            crate::reload::rebuild_merged_crawlers(store).await;
             // Reply BEFORE the cert resolver reload. The supervisor
             // coordinator's `CONFIG_RELOAD_COMMIT_TIMEOUT` is 500 ms,
             // and `reload_cert_resolver` does OCSP fetches with a
