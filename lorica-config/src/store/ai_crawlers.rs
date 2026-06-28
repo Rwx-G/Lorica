@@ -87,6 +87,55 @@ impl ConfigStore {
         Ok(out)
     }
 
+    /// List every custom crawler row tolerantly (Story 8.2 AC #8).
+    ///
+    /// Unlike [`list_custom_crawlers`], a single malformed row (a
+    /// `verification_data` blob that fails to parse, an unknown
+    /// `verification_kind`, an invalid stored timestamp) does NOT
+    /// abort the whole load : the bad row is dropped and recorded in
+    /// the returned skip list while every well-formed row is still
+    /// returned. The merged-registry rebuild uses this loader so a
+    /// single corrupt row can never blank the live AI-crawler
+    /// registry on hot-reload.
+    ///
+    /// Returns `(good_rows, skipped)` where `skipped` is a list of
+    /// `(row_id, reason)` ; `row_id` is `-1` when the failure is at
+    /// the statement / column-read level and no id could be read.
+    pub fn list_custom_crawlers_lenient(&self) -> (Vec<CustomCrawler>, Vec<(i64, String)>) {
+        let mut good: Vec<CustomCrawler> = Vec::new();
+        let mut skipped: Vec<(i64, String)> = Vec::new();
+        let mut stmt = match self.conn.prepare(
+            "SELECT id, name, user_agent_pattern, verification_kind, verification_data,
+             enabled, created_at, updated_at
+             FROM ai_crawlers_custom ORDER BY name",
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                skipped.push((-1, format!("prepare failed: {e}")));
+                return (good, skipped);
+            }
+        };
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            Ok((id, row_to_custom_crawler(row)?))
+        });
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(e) => {
+                skipped.push((-1, format!("query failed: {e}")));
+                return (good, skipped);
+            }
+        };
+        for row in rows {
+            match row {
+                Ok((_, Ok(crawler))) => good.push(crawler),
+                Ok((id, Err(e))) => skipped.push((id, e.to_string())),
+                Err(e) => skipped.push((-1, format!("row read failed: {e}"))),
+            }
+        }
+        (good, skipped)
+    }
+
     /// Update a custom crawler row. Returns `NotFound` if the id
     /// does not exist.
     pub fn update_custom_crawler(&self, crawler: &CustomCrawler) -> Result<()> {
