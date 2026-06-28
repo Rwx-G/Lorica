@@ -633,12 +633,30 @@ export interface ProxyInfo {
   active_connections: number;
   http_port: number;
   https_port: number;
+  /// OS process id of the running proxy. Changes after a hot binary
+  /// upgrade (Story 8.4), letting an operator confirm the swap landed.
+  pid: number;
 }
 
 export interface SystemResponse {
   host: HostMetrics;
   process: ProcessMetrics;
   proxy: ProxyInfo;
+}
+
+/// Successful result of `POST /api/v1/system/upgrade` (Story 8.4):
+/// the verified binary has been staged and the handoff signalled.
+export interface UpgradeStageResult {
+  staged_path: string;
+  size: number;
+  sha256: string;
+}
+
+/// A detached Ed25519 signature is the 64-byte sig hex-encoded, i.e.
+/// exactly 128 lower/upper-case hex characters. Validate client-side so
+/// the operator gets immediate feedback before the multipart upload.
+export function isValidUpgradeSignatureHex(sig: string): boolean {
+  return /^[0-9a-fA-F]{128}$/.test(sig.trim());
 }
 
 export interface SecurityHeaderPreset {
@@ -1058,6 +1076,60 @@ export const api = {
 
   getSystem: () =>
     request<SystemResponse>('GET', '/system'),
+
+  /**
+   * Upload + verify + stage a new `lorica` binary (Story 8.4).
+   *
+   * Posts a `multipart/form-data` body with two parts the backend
+   * expects by name: `binary` (the raw executable) and `signature`
+   * (the detached Ed25519 signature as 128 hex chars, supplied either
+   * as a `.sig` File or a pasted hex string). The shared `request<T>`
+   * wrapper forces a JSON body, so this writes its own credentialed
+   * fetch and mirrors the same error-envelope handling: a 4xx
+   * `{error:{code,message}}` surfaces verbatim so the panel can show
+   * "no upgrade signing key configured" or a signature-mismatch
+   * message inline.
+   */
+  uploadUpgradeBinary: async (
+    binary: File,
+    signature: File | string,
+  ): Promise<ApiResponse<UpgradeStageResult>> => {
+    const form = new FormData();
+    form.append('binary', binary);
+    form.append('signature', signature);
+
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}/system/upgrade`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        body: form,
+      });
+    } catch {
+      return { error: { code: 'network_error', message: 'Unable to reach the server. Is Lorica running?' } };
+    }
+
+    if (res.status === 401) {
+      const { auth } = await import('./auth');
+      auth.set({ status: 'unauthenticated' });
+      return { error: { code: 'unauthorized', message: 'Session expired. Please log in again.' } };
+    }
+
+    let json: Record<string, unknown>;
+    try {
+      json = await res.json();
+    } catch {
+      return { error: { code: 'parse_error', message: `Server returned invalid response (${res.status})` } };
+    }
+
+    if (!res.ok) {
+      const err = json.error && typeof json.error === 'object' && 'code' in json.error
+        ? (json.error as ApiError)
+        : { code: 'unknown', message: res.statusText };
+      return { error: err };
+    }
+    return { data: json.data as UpgradeStageResult };
+  },
 
   // Settings
   getSettings: () =>

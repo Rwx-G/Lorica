@@ -22,6 +22,7 @@
   import PreferencesTab from '../components/settings-tabs/PreferencesTab.svelte';
   import ExportImportTab from '../components/settings-tabs/ExportImportTab.svelte';
   import CertExportTab from '../components/settings-tabs/CertExportTab.svelte';
+  import BinaryUpgradeTab from '../components/settings-tabs/BinaryUpgradeTab.svelte';
   import { parseOctalMode } from '../lib/validators';
 
   // Global settings
@@ -109,6 +110,7 @@
     ban_rules: true,
     ai_crawlers: true,
     cert_export: true,
+    binary_upgrade: true,
   };
   let expandedSections = $state<Record<string, boolean>>((() => {
     try {
@@ -420,6 +422,11 @@
       expanded={expandedSections.export}
       toggleSection={() => toggleSection('export')}
       onReload={loadAll}
+    />
+
+    <BinaryUpgradeTab
+      expanded={expandedSections.binary_upgrade}
+      toggleSection={() => toggleSection('binary_upgrade')}
     />
   {/if}
 </div>

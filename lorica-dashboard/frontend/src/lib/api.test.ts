@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { api, sanitizeFilenameFromHeader } from './api';
+import { api, sanitizeFilenameFromHeader, isValidUpgradeSignatureHex } from './api';
 
 const mockRoute = {
   id: '123',
@@ -266,6 +266,54 @@ describe('api.getSystem', () => {
     expect(res.data?.proxy.version).toBe('0.3.0');
     expect(res.data?.process.memory_bytes).toBe(50000000);
     expect(fetch).toHaveBeenCalledWith('/api/v1/system', expect.objectContaining({ method: 'GET' }));
+  });
+});
+
+// ---- Binary Upgrade API Tests (Story 8.4) ----
+
+describe('isValidUpgradeSignatureHex', () => {
+  it('accepts exactly 128 hex characters', () => {
+    expect(isValidUpgradeSignatureHex('a'.repeat(128))).toBe(true);
+    expect(isValidUpgradeSignatureHex('0123456789abcdefABCDEF'.padEnd(128, '0'))).toBe(true);
+  });
+
+  it('tolerates surrounding whitespace', () => {
+    expect(isValidUpgradeSignatureHex(`  ${'f'.repeat(128)}\n`)).toBe(true);
+  });
+
+  it('rejects wrong length', () => {
+    expect(isValidUpgradeSignatureHex('a'.repeat(127))).toBe(false);
+    expect(isValidUpgradeSignatureHex('a'.repeat(129))).toBe(false);
+    expect(isValidUpgradeSignatureHex('')).toBe(false);
+  });
+
+  it('rejects non-hex characters', () => {
+    expect(isValidUpgradeSignatureHex('z'.repeat(128))).toBe(false);
+    expect(isValidUpgradeSignatureHex(`${'a'.repeat(127)}g`)).toBe(false);
+  });
+});
+
+describe('api.uploadUpgradeBinary', () => {
+  it('POSTs multipart binary + signature and returns the staged result', async () => {
+    mockFetch({ staged_path: '/var/lib/lorica/upgrade/lorica.new', size: 1024, sha256: 'abc123' });
+    const binary = new File([new Uint8Array([1, 2, 3])], 'lorica');
+    const res = await api.uploadUpgradeBinary(binary, 'f'.repeat(128));
+    expect(res.data?.staged_path).toBe('/var/lib/lorica/upgrade/lorica.new');
+    expect(res.data?.sha256).toBe('abc123');
+    const [url, opts] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/v1/system/upgrade');
+    expect(opts.method).toBe('POST');
+    expect(opts.body).toBeInstanceOf(FormData);
+    const form = opts.body as FormData;
+    expect(form.get('signature')).toBe('f'.repeat(128));
+    expect(form.get('binary')).toBeInstanceOf(File);
+  });
+
+  it('surfaces the backend error message on a 400 (no signing key)', async () => {
+    mockFetch({ code: 'bad_request', message: 'no upgrade signing key configured' }, false, 400);
+    const binary = new File([new Uint8Array([1])], 'lorica');
+    const res = await api.uploadUpgradeBinary(binary, 'f'.repeat(128));
+    expect(res.error?.message).toBe('no upgrade signing key configured');
   });
 });
 
