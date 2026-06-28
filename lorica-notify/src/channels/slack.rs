@@ -69,13 +69,23 @@ pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), Noti
         request = request.header("Authorization", auth);
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| NotifyError::Webhook(format!("Slack webhook failed: {e}")))?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            crate::metrics::record_notification_dispatch(
+                "slack",
+                crate::metrics::classify_reqwest_error(&e),
+            );
+            return Err(NotifyError::Webhook(format!("Slack webhook failed: {e}")));
+        }
+    };
 
     let status = response.status();
     if !status.is_success() {
+        crate::metrics::record_notification_dispatch(
+            "slack",
+            crate::metrics::classify_response_status(status),
+        );
         let body = response
             .text()
             .await
@@ -85,6 +95,7 @@ pub async fn send(config: &WebhookConfig, event: &AlertEvent) -> Result<(), Noti
         )));
     }
 
+    crate::metrics::record_notification_dispatch("slack", "ok");
     Ok(())
 }
 
