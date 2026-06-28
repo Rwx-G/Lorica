@@ -1947,13 +1947,17 @@ impl ProxyHttp for LoricaProxy {
             let _ = upstream_request.insert_header(name.clone(), value);
         }
 
-        // Story 8.2 AC #11. Drain the AI-bot verified header buffer.
-        // MUST use insert_header (overwrite), NOT append_header: a
-        // switch to append would let a client pre-supply
-        // `X-Lorica-Verified-Bot: GPTBot` and have it forwarded
-        // verbatim alongside our own value (header trust-laundering).
-        // For non-bot requests `ctx.ai_bot_inject` is empty and the
-        // loop is zero-cost.
+        // Story 8.2 AC #11 trust-laundering defense. Strip any
+        // client-supplied values for the Lorica-namespaced verified-bot
+        // headers BEFORE injecting our own, on EVERY upstream request.
+        // A non-bot request stages nothing in `ctx.ai_bot_inject`, so
+        // without this unconditional removal a client could forge
+        // `X-Lorica-Verified-Bot: GPTBot` and have it forwarded to the
+        // backend (which trusts the header). The subsequent inject uses
+        // insert_header (overwrite), NOT append_header, so a verified
+        // bot's value also replaces rather than augments any client value.
+        upstream_request.remove_header("X-Lorica-Verified-Bot");
+        upstream_request.remove_header("X-Lorica-Bot-Verification");
         for (name, value) in &ctx.ai_bot_inject {
             let _ = upstream_request.insert_header(name.clone(), value);
         }
