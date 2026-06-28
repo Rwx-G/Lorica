@@ -321,6 +321,42 @@ mod tests {
     }
 
     #[test]
+    fn test_route_ai_bot_fields_round_trip_through_get_route() {
+        // Story 8.2 audit fix: the `get_route` single-row SELECT must
+        // carry ai_bot_policy / ai_bot_spoofed_fallback /
+        // serve_robots_txt, not just `list_routes`. A dashboard edit
+        // loaded via get_route previously dropped these to defaults
+        // and persisted them back on save, silently disabling the
+        // operator's AI-bot policy.
+        let store = ConfigStore::open_in_memory().expect("test setup");
+        let mut route = make_route();
+        route.id = "ai-bot-route".into();
+        route.ai_bot_policy = Some(AiBotPolicy::Deny);
+        route.ai_bot_spoofed_fallback = Some(SpoofedFallback::Log);
+        route.serve_robots_txt = true;
+        store.create_route(&route).expect("test setup");
+
+        let got = store
+            .get_route("ai-bot-route")
+            .expect("test setup")
+            .expect("route present");
+        assert_eq!(got.ai_bot_policy, Some(AiBotPolicy::Deny));
+        assert_eq!(got.ai_bot_spoofed_fallback, Some(SpoofedFallback::Log));
+        assert!(got.serve_robots_txt);
+
+        // list_routes must agree with get_route.
+        let listed = store
+            .list_routes()
+            .expect("test setup")
+            .into_iter()
+            .find(|r| r.id == "ai-bot-route")
+            .expect("route present in list");
+        assert_eq!(listed.ai_bot_policy, got.ai_bot_policy);
+        assert_eq!(listed.ai_bot_spoofed_fallback, got.ai_bot_spoofed_fallback);
+        assert_eq!(listed.serve_robots_txt, got.serve_robots_txt);
+    }
+
+    #[test]
     fn test_route_not_found() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
         let mut route = make_route();

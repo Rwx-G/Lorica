@@ -255,7 +255,8 @@ impl ConfigStore {
                  rate_limit,
                  geoip,
                  bot_protection,
-                 group_name
+                 group_name,
+                 ai_bot_policy, ai_bot_spoofed_fallback, serve_robots_txt
                  FROM routes WHERE id = ?1",
                 params![id],
                 |row| Ok(row_to_route(row)),
