@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Run the Lorica E2E test suite with Docker Compose.
-# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export]
+# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot]
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
 #   --skip-cert-export  Skip the v1.4.1 cert-export profile (faster)
+#   --skip-ai-bot       Skip the v1.6.0 Story 8.2 AI-bot profile (faster)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -13,6 +14,7 @@ BUILD_FLAG=""
 KEEP=false
 SKIP_WORKERS=false
 SKIP_CERT_EXPORT=false
+SKIP_AI_BOT=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -20,6 +22,7 @@ for arg in "$@"; do
         --keep)              KEEP=true ;;
         --skip-workers)      SKIP_WORKERS=true ;;
         --skip-cert-export)  SKIP_CERT_EXPORT=true ;;
+        --skip-ai-bot)       SKIP_AI_BOT=true ;;
     esac
 done
 
@@ -36,7 +39,7 @@ fi
 # `down -v` skips their containers and named volumes; the next run then
 # boots against stale data (e.g. the cert-export smoke rotates the
 # admin password, and a stale volume 401s the next run's login).
-ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns"
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers"
 
 # ---- Phase 1: Single-process tests ----
 echo "=== Lorica E2E Tests (single-process) ==="
@@ -111,6 +114,58 @@ if [ "$SKIP_CERT_EXPORT" = false ] && [ "$EXIT_CODE" = "0" ]; then
     done
 
     docker compose --profile cert-export run --rm cert-export-smoke || EXIT_CODE=$?
+fi
+
+# ---- Phase 4: AI-bot deny-list profile (single-process + workers) ----
+# Story 8.2 (v1.6.0) IV4. Opt-out via --skip-ai-bot (default ON). Both
+# the single-process and workers variants run so the custom-crawler
+# hot-reload propagates across the supervisor -> worker RPC path too.
+if [ "$SKIP_AI_BOT" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (AI-bot deny-list profile) ==="
+    echo ""
+
+    docker compose --profile ai-bot up $BUILD_FLAG -d lorica-ai-bot
+
+    echo "Waiting for Lorica (ai-bot) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica-ai-bot curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (ai-bot) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (ai-bot) did not start within 120s"
+            docker compose logs lorica-ai-bot | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    docker compose --profile ai-bot run --rm ai-bot-smoke || EXIT_CODE=$?
+
+    if [ "$SKIP_WORKERS" = false ] && [ "$EXIT_CODE" = "0" ]; then
+        echo ""
+        echo "=== Lorica E2E Tests (AI-bot deny-list, worker mode) ==="
+        echo ""
+
+        docker compose --profile ai-bot-workers up $BUILD_FLAG -d lorica-ai-bot-workers
+
+        echo "Waiting for Lorica (ai-bot workers) to initialize..."
+        for i in $(seq 1 60); do
+            if docker compose exec -T lorica-ai-bot-workers curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+                echo "Lorica (ai-bot workers) is ready."
+                break
+            fi
+            if [ "$i" = "60" ]; then
+                echo "ERROR: Lorica (ai-bot workers) did not start within 120s"
+                docker compose logs lorica-ai-bot-workers | tail -20
+                break
+            fi
+            sleep 2
+        done
+
+        docker compose --profile ai-bot-workers run --rm ai-bot-smoke-workers || EXIT_CODE=$?
+    fi
 fi
 
 # Cleanup unless --keep

@@ -516,6 +516,89 @@ services:
     networks:
       - e2e
 
+  # ---- AI / LLM crawler deny-list E2E (v1.6.0 Story 8.2, IV4) --------
+  # Runs the default Lorica image; the `ai-bot-smoke` runner drives
+  # everything over the management API (global AI-bot settings, route
+  # ai_bot_policy / ai_bot_spoofed_fallback / serve_robots_txt, and
+  # custom-crawler CRUD). No GeoIP fixture needed: the matrix keys on
+  # User-Agent classification + the runner's own e2e IP for the custom
+  # ip_ranges verified path. A built-in GPTBot (IpRanges) from the
+  # runner is always out-of-vendor-range, so it deterministically
+  # exercises the spoofed-fallback chain.
+  #
+  # Run with:
+  #   docker compose --profile ai-bot up --build
+  #   docker compose --profile ai-bot run --rm ai-bot-smoke
+  lorica-ai-bot:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["ai-bot"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-ai-bot-data:/var/lib/lorica
+      - shared-ai-bot:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  ai-bot-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["ai-bot"]
+    entrypoint: ["bash", "run-ai-bot-smoke.sh"]
+    depends_on:
+      - lorica-ai-bot
+    volumes:
+      - shared-ai-bot:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-ai-bot:9443
+      - LORICA_PROXY=http://lorica-ai-bot:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
+  # AI-bot E2E in WORKER MODE. Same smoke, but Lorica runs with
+  # `--workers 2` so the custom-crawler hot-reload (AC #8) is exercised
+  # across the supervisor -> worker RPC propagation path and the
+  # check_ai_bot filter runs in the worker processes. Prometheus +
+  # in-process stats are supervisor-scoped, so the runner sets
+  # AI_BOT_SMOKE_SKIP_METRICS=1; all data-plane assertions still run.
+  lorica-ai-bot-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-workers.sh"]
+    profiles: ["ai-bot-workers"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-ai-bot-workers-data:/var/lib/lorica
+      - shared-ai-bot-workers:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  ai-bot-smoke-workers:
+    build:
+      context: ./test-runner
+    profiles: ["ai-bot-workers"]
+    entrypoint: ["bash", "run-ai-bot-smoke.sh"]
+    depends_on:
+      - lorica-ai-bot-workers
+    volumes:
+      - shared-ai-bot-workers:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-ai-bot-workers:9443
+      - LORICA_PROXY=http://lorica-ai-bot-workers:8080
+      - BACKEND1_ADDR=backend1:80
+      - AI_BOT_SMOKE_SKIP_METRICS=1
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
@@ -526,6 +609,8 @@ volumes:
   lorica-bot-workers-data:
   lorica-rdns-data:
   lorica-cert-export-data:
+  lorica-ai-bot-data:
+  lorica-ai-bot-workers-data:
   shared:
   shared-workers:
   shared-bot-workers:
@@ -535,6 +620,8 @@ volumes:
   shared-bot:
   shared-rdns:
   shared-cert-export:
+  shared-ai-bot:
+  shared-ai-bot-workers:
 
 networks:
   e2e:
