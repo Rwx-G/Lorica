@@ -134,6 +134,8 @@ impl ProbeScheduler {
 
                 let result = execute_probe(&client, &probe, timeout, &store).await;
 
+                crate::metrics::record_probe_outcome(&probe.id, probe_outcome(&result));
+
                 debug!(
                     probe_id = %probe.id,
                     route_id = %probe.route_id,
@@ -254,6 +256,30 @@ async fn resolve_backend_address(
             .find(|b| &b.id == id)
             .map(|b| b.address.clone())
     })
+}
+
+/// Map a [`ProbeResult`] to its `lorica_active_probe_outcome_total`
+/// outcome label.
+///
+/// `success == true` -> `ok`. Otherwise the failure is classified from
+/// `ProbeResult::error`: [`execute_probe`] stores the transport error's
+/// `to_string()` there, and reqwest renders an elapsed request timeout
+/// as "operation timed out", so a case-insensitive `timed out` / `timeout`
+/// match buckets the failure as `timeout`. Every other failure
+/// (unexpected status, connection refused, DNS, no backend) -> `fail`.
+fn probe_outcome(result: &ProbeResult) -> &'static str {
+    if result.success {
+        return "ok";
+    }
+    let is_timeout = result.error.as_deref().is_some_and(|err| {
+        let err = err.to_ascii_lowercase();
+        err.contains("timed out") || err.contains("timeout")
+    });
+    if is_timeout {
+        "timeout"
+    } else {
+        "fail"
+    }
 }
 
 /// Execute a single probe against a backend of the route.
@@ -620,5 +646,35 @@ mod tests {
             .error
             .expect("test setup: error field is Some for failure result")
             .contains("503"));
+    }
+
+    #[test]
+    fn test_probe_outcome_mapping() {
+        let ok = ProbeResult {
+            route_id: "r1".to_string(),
+            status_code: 200,
+            latency_ms: 12,
+            success: true,
+            error: None,
+        };
+        assert_eq!(probe_outcome(&ok), "ok");
+
+        let timed_out = ProbeResult {
+            route_id: "r1".to_string(),
+            status_code: 0,
+            latency_ms: 10_000,
+            success: false,
+            error: Some("error sending request: operation timed out".to_string()),
+        };
+        assert_eq!(probe_outcome(&timed_out), "timeout");
+
+        let failed = ProbeResult {
+            route_id: "r1".to_string(),
+            status_code: 503,
+            latency_ms: 100,
+            success: false,
+            error: Some("expected status 200, got 503".to_string()),
+        };
+        assert_eq!(probe_outcome(&failed), "fail");
     }
 }

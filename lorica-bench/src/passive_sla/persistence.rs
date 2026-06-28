@@ -160,7 +160,14 @@ pub(super) fn check_thresholds(collector: &SlaCollector, store: &ConfigStore) ->
         let is_breached = !summary.meets_target;
 
         if is_breached && !was_breached {
-            // Transition OK -> breached
+            // Transition OK -> breached. Count the breach once per
+            // transition (not per sample). The passive-SLA check reduces
+            // to the single composite `meets_target` decision, so the
+            // only threshold kind exposed here is the SLA target pct.
+            crate::metrics::record_sla_breach(
+                &config.route_id,
+                crate::metrics::SLA_THRESHOLD_TARGET_PCT,
+            );
             let event = AlertEvent::new(
                 AlertType::SlaBreached,
                 format!(
