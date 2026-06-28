@@ -139,7 +139,23 @@ fn merged_from_builtin(verification: &Verification) -> MergedVerification {
             MergedVerification::Rdns(suffixes.iter().map(|s| s.to_string()).collect())
         }
         Verification::IpRanges(key) => {
-            MergedVerification::IpRanges(VENDOR_IP_RANGES.get(*key).cloned().unwrap_or_default())
+            let ranges = match VENDOR_IP_RANGES.get(*key) {
+                Some(ranges) => ranges.clone(),
+                None => {
+                    // A missing key yields an empty range set, which
+                    // makes every request for this crawler Spoofed
+                    // with no other signal. Surface it loudly at
+                    // startup, mirroring the regex-compile-failure
+                    // branch, so a bad built-in vendor key is caught.
+                    tracing::error!(
+                        target: "lorica::ai_bot",
+                        vendor_key = *key,
+                        "built-in AI crawler references an unknown VENDOR_IP_RANGES key ; degrading to empty range set"
+                    );
+                    Vec::new()
+                }
+            };
+            MergedVerification::IpRanges(ranges)
         }
         Verification::UaOnly => MergedVerification::UaOnly,
     }
@@ -158,7 +174,11 @@ fn merged_from_custom(row_id: i64, verification: &CustomVerification) -> Option<
                 match IpNet::from_str(cidr) {
                     Ok(net) => nets.push(net),
                     Err(e) => {
-                        lorica_api::metrics::record_ai_bot_skipped_custom("json_parse");
+                        // The JSON parsed fine ; it is the CIDR string
+                        // that is malformed. Bucket it as `cidr_parse`
+                        // (not `json_parse`) so the AC #8 metric is
+                        // diagnostic.
+                        lorica_api::metrics::record_ai_bot_skipped_custom("cidr_parse");
                         tracing::warn!(
                             target: "lorica::ai_bot",
                             row_id,
@@ -250,7 +270,13 @@ pub fn build_merged(custom: &[CustomCrawler]) -> Vec<MergedCrawler> {
 pub fn rebuild_from_store(store: &lorica_config::ConfigStore) {
     let (good, skipped) = store.list_custom_crawlers_lenient();
     for (row_id, reason) in &skipped {
-        lorica_api::metrics::record_ai_bot_skipped_custom("json_parse");
+        // The lenient loader skips a row for any of: a DB/column
+        // decode error, an unknown verification_kind, or a datetime
+        // parse failure - all store-side row decode problems, none of
+        // which is a JSON parse. Bucket them as `row_decode` so the
+        // AC #8 metric distinguishes store-load skips from the
+        // build-side `regex_compile` / `cidr_parse` skips.
+        lorica_api::metrics::record_ai_bot_skipped_custom("row_decode");
         tracing::warn!(
             target: "lorica::ai_bot",
             row_id = *row_id,

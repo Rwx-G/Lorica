@@ -328,19 +328,20 @@ pub(crate) fn run_worker(
                                     &cmd_cert_resolver,
                                 )
                                 .await;
-                                // Re-apply the per-process resolver
-                                // hooks (OTel exporter, GeoIP / ASN
+                                // Re-apply the full per-process reload
+                                // state (OTel exporter, GeoIP / ASN
                                 // updater task lifecycle, bot HMAC
-                                // secret) so the legacy fallback path
-                                // converges with the two-phase RPC
-                                // commit handler. Audit M-18 closure :
-                                // before this, falling back to the
-                                // legacy ConfigReload (e.g. when
-                                // two-phase Prepare timed out) left
-                                // GeoIP / OTel / ASN / bot-secret
-                                // state frozen even though the proxy
-                                // config swap completed.
-                                lorica::reload::apply_per_process_resolver_hooks(
+                                // secret, AND the merged AI-crawler
+                                // registry rebuild) so the legacy
+                                // fallback path converges with the
+                                // two-phase RPC commit handler. Audit
+                                // M-18 closure : before this, falling
+                                // back to the legacy ConfigReload (e.g.
+                                // when two-phase Prepare timed out) left
+                                // GeoIP / OTel / ASN / bot-secret AND
+                                // the AI-crawler registry frozen even
+                                // though the proxy config swap completed.
+                                lorica::reload::apply_per_process_reload_state(
                                     &cmd_store,
                                 )
                                 .await;

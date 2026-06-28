@@ -117,11 +117,7 @@ pub async fn reload_proxy_config_with_mtls(
     let prepared =
         build_proxy_config_inner(store, proxy_config, installed_mtls_fingerprint).await?;
     commit_prepared_reload(proxy_config, connection_filter, prepared);
-    apply_otel_settings_from_store(store).await;
-    apply_geoip_settings_from_store(store).await;
-    apply_asn_settings_from_store(store).await;
-    apply_bot_secret_from_store(store).await;
-    rebuild_merged_crawlers(store).await;
+    apply_per_process_reload_state(store).await;
     Ok(())
 }
 
@@ -140,34 +136,42 @@ pub async fn rebuild_merged_crawlers(store: &Arc<Mutex<ConfigStore>>) {
     crate::proxy_wiring::ai_bot_merged::rebuild_from_store(&guard);
 }
 
-/// Re-apply the four per-process resolver hooks (OTel exporter,
-/// GeoIP / ASN updater task lifecycle, bot HMAC secret) from the
-/// current store state. Idempotent ; each `apply_*` helper dedups
-/// internally so calling this on every reload is cheap when the
-/// settings haven't changed.
+/// Re-apply the full per-process reload state from the current store:
+/// the four resolver hooks (OTel exporter, GeoIP / ASN updater task
+/// lifecycle, bot HMAC secret) AND the merged AI-crawler registry
+/// rebuild. Idempotent ; each step dedups internally so calling this
+/// on every reload is cheap when nothing changed.
+///
+/// This is THE single bundle every reload path must invoke. The
+/// AI-crawler registry rebuild used to be wired separately from the
+/// resolver hooks, so any reload path that called only the hooks
+/// (notably the legacy `CommandType::ConfigReload` worker fallback)
+/// refreshed resolvers but silently skipped the registry - the exact
+/// missed-rebuild asymmetry Story 8.1 killed for resolver spawns.
+/// Folding the rebuild in here makes that class of bug unrepresentable.
 ///
 /// Used by both the supervisor's `config_reload_tx` listener (the
 /// supervisor never calls `reload_proxy_config` itself - only workers
 /// do, via the two-phase RPC coordinator) AND by every worker reload
 /// path. The two-phase RPC `ConfigReloadCommit` handler at
-/// `proxy_wiring.rs::handle_config_reload_commit` calls it ; the
-/// legacy `CommandType::ConfigReload` worker handler at `main.rs`
-/// calls it too (audit M-18 - was previously skipping this sequence,
-/// so a fallback-from-two-phase reload left GeoIP / OTel / ASN /
-/// bot-secret state frozen even though the proxy config swap
-/// completed).
-pub async fn apply_per_process_resolver_hooks(store: &Arc<Mutex<ConfigStore>>) {
+/// `proxy_wiring/worker_rpc.rs::handle_config_reload_commit` calls it ;
+/// the legacy `CommandType::ConfigReload` worker handler calls it too
+/// (audit M-18 - was previously skipping this sequence, so a
+/// fallback-from-two-phase reload left GeoIP / OTel / ASN / bot-secret
+/// state frozen even though the proxy config swap completed).
+pub async fn apply_per_process_reload_state(store: &Arc<Mutex<ConfigStore>>) {
     apply_otel_settings_from_store(store).await;
     apply_geoip_settings_from_store(store).await;
     apply_asn_settings_from_store(store).await;
     apply_bot_secret_from_store(store).await;
+    rebuild_merged_crawlers(store).await;
 }
 
-/// Supervisor-only alias for [`apply_per_process_resolver_hooks`].
-/// Kept as the public symbol used by `main.rs` boot + reload listener
-/// for backwards naming clarity ; the body delegates.
+/// Supervisor-only alias for [`apply_per_process_reload_state`].
+/// Kept as the public symbol used by the supervisor boot + reload
+/// listener for backwards naming clarity ; the body delegates.
 pub async fn apply_supervisor_settings_from_store(store: &Arc<Mutex<ConfigStore>>) {
-    apply_per_process_resolver_hooks(store).await;
+    apply_per_process_reload_state(store).await;
 }
 
 /// Supervisor-side reload trigger registered at boot. The

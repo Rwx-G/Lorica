@@ -157,10 +157,14 @@ static AI_BOT_RDNS_UNAVAILABLE_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
 });
 
 /// Counter for custom crawlers skipped on reload (Story 8.2 AC #8
-/// tampered-row defense). Labels: reason ("regex_compile" |
-/// "json_parse"). Surfaces operator visibility for the
-/// skip-with-warn path so a corrupt SQLite row never silently
-/// disappears from the merged registry.
+/// tampered-row defense). Labels: reason, one of a small fixed set
+/// of buckets: `"regex_compile"` (UA pattern failed to compile),
+/// `"cidr_parse"` (a CIDR string in an ip_ranges row was malformed),
+/// `"row_decode"` (the lenient store loader could not decode the
+/// row: DB/column error, unknown verification_kind, or datetime
+/// parse). Surfaces operator visibility for the skip-with-warn path
+/// so a corrupt SQLite row never silently disappears from the merged
+/// registry.
 static AI_BOT_SKIPPED_CUSTOM_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let counter = IntCounterVec::new(
         prometheus::opts!(
@@ -220,9 +224,12 @@ struct AiBotStatEvent {
 /// evaluations (e.g. requests the supervisor itself handled, which
 /// in a pure worker deployment is none). The authoritative
 /// cross-process source is the Prometheus `lorica_ai_bot_total`
-/// counter exposed via `/metrics`. Cross-process aggregation is
-/// deliberately NOT solved here ; the 5-minute buffer is an
-/// in-process convenience per Story 8.2 AC #7.
+/// counter exposed via `/metrics` : the AI-bot counters are shipped
+/// from each worker to the supervisor's registry via
+/// [`snapshot_per_worker_counters`] / [`apply_worker_generic_counters`]
+/// (they are listed in [`PER_WORKER_COUNTERS`]), so `/metrics` is a
+/// true cross-process aggregate. The 5-minute buffer here is only an
+/// in-process convenience for the top-5 endpoint per Story 8.2 AC #7.
 static AI_BOT_STATS_BUFFER: Lazy<
     parking_lot::Mutex<std::collections::HashMap<String, std::collections::VecDeque<AiBotStatEvent>>>,
 > = Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -640,6 +647,13 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     "lorica_forward_auth_cache_total",
     "lorica_geoip_block_total",
     "lorica_bot_challenge_total",
+    // AI-bot counters (Story 8.2). In worker mode check_ai_bot /
+    // rebuild run in the workers, so without shipping these the
+    // supervisor's /metrics never sees worker-side AI-bot activity -
+    // which the stats doc claims is the cross-process source of truth.
+    "lorica_ai_bot_total",
+    "lorica_ai_bot_skipped_custom_total",
+    "lorica_ai_bot_rdns_unavailable_total",
 ];
 
 /// One generic counter entry at the lorica-api boundary.
@@ -662,7 +676,7 @@ pub type GenericCounterTuple = (String, Vec<(String, String)>, u64);
 pub fn snapshot_per_worker_counters() -> Vec<GenericCounterTuple> {
     use prometheus::core::Collector;
 
-    let vecs: [(&str, &IntCounterVec); 7] = [
+    let vecs: [(&str, &IntCounterVec); 9] = [
         (
             "lorica_cache_predictor_bypass_total",
             &CACHE_PREDICTOR_BYPASS_TOTAL,
@@ -676,6 +690,11 @@ pub fn snapshot_per_worker_counters() -> Vec<GenericCounterTuple> {
         ("lorica_forward_auth_cache_total", &FORWARD_AUTH_CACHE_TOTAL),
         ("lorica_geoip_block_total", &GEOIP_BLOCK_TOTAL),
         ("lorica_bot_challenge_total", &BOT_CHALLENGE_TOTAL),
+        ("lorica_ai_bot_total", &AI_BOT_TOTAL),
+        (
+            "lorica_ai_bot_skipped_custom_total",
+            &AI_BOT_SKIPPED_CUSTOM_TOTAL,
+        ),
     ];
 
     let mut out = Vec::new();
@@ -684,7 +703,7 @@ pub fn snapshot_per_worker_counters() -> Vec<GenericCounterTuple> {
         // `Vec<MetricFamily>` by API contract (prometheus 0.14
         // `vec![self.v.collect()]`); the vec internals are
         // pub(crate), so there is no buffer-reuse readback path.
-        // The 7 small Vec allocations per tick live inside the
+        // The small Vec allocations per tick live inside the
         // prometheus crate and cannot be hoisted out (backlog #41g).
         let families = vec.collect();
         for mf in families {
@@ -705,6 +724,19 @@ pub fn snapshot_per_worker_counters() -> Vec<GenericCounterTuple> {
                 }
             }
         }
+    }
+
+    // The rDNS-unavailable counter is a label-less `IntCounter`, not
+    // an `IntCounterVec`, so it cannot live in the `vecs` array. Snap
+    // it on its own with an empty label set ; the supervisor apply
+    // path resolves it to a scalar target.
+    let rdns_unavailable = AI_BOT_RDNS_UNAVAILABLE_TOTAL.get();
+    if rdns_unavailable > 0 {
+        out.push((
+            "lorica_ai_bot_rdns_unavailable_total".to_string(),
+            Vec::new(),
+            rdns_unavailable,
+        ));
     }
     out
 }
@@ -742,6 +774,10 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
             "lorica_forward_auth_cache_total" => Some(&["route_id", "outcome"]),
             "lorica_geoip_block_total" => Some(&["route_id", "country", "mode"]),
             "lorica_bot_challenge_total" => Some(&["route_id", "mode", "outcome"]),
+            "lorica_ai_bot_total" => Some(&["crawler", "route_id", "action"]),
+            "lorica_ai_bot_skipped_custom_total" => Some(&["reason"]),
+            // Label-less scalar : empty registered-order list.
+            "lorica_ai_bot_rdns_unavailable_total" => Some(&[]),
             _ => None,
         }
     }
@@ -750,14 +786,24 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
         values.join("\0")
     }
 
+    /// Where a resolved wire entry applies on the supervisor side:
+    /// a labelled `IntCounterVec` or a label-less scalar `IntCounter`
+    /// (the rDNS-unavailable counter). References are `Copy`.
+    #[derive(Clone, Copy)]
+    enum CounterTarget {
+        Vec(&'static IntCounterVec),
+        Scalar(&'static IntCounter),
+    }
+
     /// One wire entry fully resolved before the snapshot lock is
-    /// taken: owned key strings plus the target supervisor-side vec.
+    /// taken: owned key strings plus the target supervisor-side
+    /// counter.
     struct PreparedEntry {
         metric_name: String,
         label_key: String,
         positional: Vec<String>,
         value: u64,
-        vec: &'static IntCounterVec,
+        target: CounterTarget,
     }
 
     // Phase 1 - no lock held. Resolve the label order, build the
@@ -773,14 +819,25 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
         let Some(order) = label_names(name) else {
             continue;
         };
-        let vec: &'static IntCounterVec = match name.as_str() {
-            "lorica_cache_predictor_bypass_total" => &CACHE_PREDICTOR_BYPASS_TOTAL,
-            "lorica_header_rule_match_total" => &HEADER_RULE_MATCH_TOTAL,
-            "lorica_canary_split_selected_total" => &CANARY_SPLIT_SELECTED_TOTAL,
-            "lorica_mirror_outcome_total" => &MIRROR_OUTCOME_TOTAL,
-            "lorica_forward_auth_cache_total" => &FORWARD_AUTH_CACHE_TOTAL,
-            "lorica_geoip_block_total" => &GEOIP_BLOCK_TOTAL,
-            "lorica_bot_challenge_total" => &BOT_CHALLENGE_TOTAL,
+        let target: CounterTarget = match name.as_str() {
+            "lorica_cache_predictor_bypass_total" => {
+                CounterTarget::Vec(&CACHE_PREDICTOR_BYPASS_TOTAL)
+            }
+            "lorica_header_rule_match_total" => CounterTarget::Vec(&HEADER_RULE_MATCH_TOTAL),
+            "lorica_canary_split_selected_total" => {
+                CounterTarget::Vec(&CANARY_SPLIT_SELECTED_TOTAL)
+            }
+            "lorica_mirror_outcome_total" => CounterTarget::Vec(&MIRROR_OUTCOME_TOTAL),
+            "lorica_forward_auth_cache_total" => CounterTarget::Vec(&FORWARD_AUTH_CACHE_TOTAL),
+            "lorica_geoip_block_total" => CounterTarget::Vec(&GEOIP_BLOCK_TOTAL),
+            "lorica_bot_challenge_total" => CounterTarget::Vec(&BOT_CHALLENGE_TOTAL),
+            "lorica_ai_bot_total" => CounterTarget::Vec(&AI_BOT_TOTAL),
+            "lorica_ai_bot_skipped_custom_total" => {
+                CounterTarget::Vec(&AI_BOT_SKIPPED_CUSTOM_TOTAL)
+            }
+            "lorica_ai_bot_rdns_unavailable_total" => {
+                CounterTarget::Scalar(&AI_BOT_RDNS_UNAVAILABLE_TOTAL)
+            }
             _ => continue,
         };
         // Reorder name=value pairs into positional values matching
@@ -803,7 +860,7 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
             label_key,
             positional,
             value: *value,
-            vec,
+            target,
         });
     }
 
@@ -815,8 +872,7 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
     // wholesale - a label combo absent from this report keeps its
     // previous value, otherwise the next report carrying it again
     // would re-apply the full count as a fresh delta.
-    let mut to_apply: Vec<(&'static IntCounterVec, Vec<String>, u64)> =
-        Vec::with_capacity(prepared.len());
+    let mut to_apply: Vec<(CounterTarget, Vec<String>, u64)> = Vec::with_capacity(prepared.len());
     {
         let mut map = SUPERVISOR_GENERIC_SNAPSHOT.write();
         let worker_state = map.entry(worker_id).or_default();
@@ -828,17 +884,23 @@ pub fn apply_worker_generic_counters(worker_id: u32, entries: &[GenericCounterTu
             }
             let delta = entry.value - prev;
             metric_state.insert(entry.label_key, entry.value);
-            to_apply.push((entry.vec, entry.positional, delta));
+            to_apply.push((entry.target, entry.positional, delta));
         }
     }
 
     // Phase 3 - no lock held. Counter increments are atomic and the
     // deltas were computed atomically in phase 2, so interleaving
     // with a concurrent apply still converges to the same sums.
-    for (vec, positional, delta) in to_apply {
-        let label_refs: Vec<&str> = positional.iter().map(|s| s.as_str()).collect();
-        if vec.get_metric_with_label_values(&label_refs).is_ok() {
-            vec.with_label_values(&label_refs).inc_by(delta);
+    for (target, positional, delta) in to_apply {
+        match target {
+            CounterTarget::Vec(vec) => {
+                let label_refs: Vec<&str> = positional.iter().map(|s| s.as_str()).collect();
+                if vec.get_metric_with_label_values(&label_refs).is_ok() {
+                    vec.with_label_values(&label_refs).inc_by(delta);
+                }
+            }
+            // Label-less scalar : no label-arity guard needed.
+            CounterTarget::Scalar(counter) => counter.inc_by(delta),
         }
     }
 }
@@ -1549,6 +1611,60 @@ mod tests {
         // delta). This is the correct semantics — a crashed
         // worker's counts are NOT lost at the supervisor.
         assert_eq!(v, 16);
+    }
+
+    #[test]
+    fn test_ai_bot_counters_aggregate_across_workers() {
+        // Story 8.2 audit fix: the AI-bot counters must reach the
+        // supervisor's registry in worker mode. Exercises both a
+        // 3-label IntCounterVec (ai_bot_total) and the label-less
+        // IntCounter scalar (ai_bot_rdns_unavailable_total).
+        reset_generic_counter_snapshot_for_test();
+
+        // ai_bot_total{crawler,route_id,action} from two workers.
+        for (wid, val) in [(11u32, 2u64), (12u32, 3u64)] {
+            apply_worker_generic_counters(
+                wid,
+                &[(
+                    "lorica_ai_bot_total".to_string(),
+                    vec![
+                        ("crawler".to_string(), "CCBot".to_string()),
+                        ("route_id".to_string(), "ai-agg-rt".to_string()),
+                        ("action".to_string(), "deny".to_string()),
+                    ],
+                    val,
+                )],
+            );
+        }
+        let v = AI_BOT_TOTAL
+            .with_label_values(&["CCBot", "ai-agg-rt", "deny"])
+            .get();
+        assert_eq!(v, 5, "ai_bot_total must aggregate across workers");
+
+        // Label-less scalar: ai_bot_rdns_unavailable_total. Wire form
+        // carries an empty label set.
+        let before = AI_BOT_RDNS_UNAVAILABLE_TOTAL.get();
+        apply_worker_generic_counters(
+            11,
+            &[(
+                "lorica_ai_bot_rdns_unavailable_total".to_string(),
+                Vec::new(),
+                4,
+            )],
+        );
+        apply_worker_generic_counters(
+            12,
+            &[(
+                "lorica_ai_bot_rdns_unavailable_total".to_string(),
+                Vec::new(),
+                6,
+            )],
+        );
+        assert_eq!(
+            AI_BOT_RDNS_UNAVAILABLE_TOTAL.get(),
+            before + 10,
+            "label-less rdns-unavailable scalar must aggregate across workers"
+        );
     }
 
     #[test]
