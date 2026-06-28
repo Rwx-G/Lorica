@@ -208,12 +208,24 @@ export interface RouteResponse {
   rate_limit?: RateLimitConfig | null;
   geoip?: GeoIpConfig | null;
   bot_protection?: BotProtectionConfig | null;
+  /// AI crawler policy (Story 8.2). `null` / absent = off.
+  ai_bot_policy?: AiBotPolicy | null;
+  /// Action for a spoofed AI bot (UA matches but verification fails).
+  /// `null` = inherit the global default.
+  ai_bot_spoofed_fallback?: AiBotSpoofedFallback | null;
+  /// When true, Lorica auto-serves a registry-driven `/robots.txt` for
+  /// this route instead of passing the path through to the backend.
+  serve_robots_txt?: boolean;
   /// Free-form classification label (prod / staging / homelab / ...).
   /// Empty string = ungrouped. Mirrors `Backend.group_name`.
   group_name?: string;
   created_at: string;
   updated_at: string;
 }
+
+export type AiBotPolicy = 'off' | 'deny' | 'log';
+
+export type AiBotSpoofedFallback = 'deny' | 'log' | 'allow';
 
 export type RateLimitScope = 'per_ip' | 'per_route';
 
@@ -407,6 +419,9 @@ export interface CreateRouteRequest {
   rate_limit?: RateLimitConfig;
   geoip?: GeoIpConfig;
   bot_protection?: BotProtectionConfig;
+  ai_bot_policy?: AiBotPolicy;
+  ai_bot_spoofed_fallback?: AiBotSpoofedFallback | null;
+  serve_robots_txt?: boolean;
   group_name?: string;
 }
 
@@ -480,6 +495,9 @@ export interface UpdateRouteRequest {
   /// `bot_protection` leaves the stored value alone - the
   /// "missing = no-op" contract preserved for every other field.
   bot_protection_disable?: boolean;
+  ai_bot_policy?: AiBotPolicy;
+  ai_bot_spoofed_fallback?: AiBotSpoofedFallback | null;
+  serve_robots_txt?: boolean;
   /// Free-form operator classification (prod / staging / homelab / ...).
   /// Empty string clears the grouping. `undefined` leaves the field
   /// unchanged (follows the same missing-= no-op rule as every other
@@ -826,6 +844,84 @@ export interface ImportDiffResponse {
   user_preferences: EntityDiff;
   admin_users: EntityDiff;
   global_settings: { changes: SettingChange[] };
+}
+
+// --- AI crawler management (Story 8.2) ---
+
+/// Verification strategy attached to a crawler entry. A discriminated
+/// union on `kind`: `rdns` carries DNS suffixes, `ip_ranges` carries
+/// CIDRs, `ua_only` matches on the User-Agent pattern alone.
+export type AiCrawlerVerification =
+  | { kind: 'rdns'; suffixes: string[] }
+  | { kind: 'ip_ranges'; cidrs: string[] }
+  | { kind: 'ua_only' };
+
+export type AiCrawlerVerificationKind = AiCrawlerVerification['kind'];
+
+export interface CustomCrawler {
+  id: number;
+  name: string;
+  user_agent_pattern: string;
+  verification: AiCrawlerVerification;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CustomCrawlerBody {
+  name: string;
+  user_agent_pattern: string;
+  verification: AiCrawlerVerification;
+  enabled: boolean;
+}
+
+export interface AiCrawlersCustomResponse {
+  entries: CustomCrawler[];
+  built_in_count: number;
+  max_count: number;
+}
+
+export interface BuiltinCrawler {
+  name: string;
+  user_agent_pattern: string;
+  verification_kind: AiCrawlerVerificationKind;
+  source: string;
+}
+
+export interface AiCrawlersBuiltinResponse {
+  entries: BuiltinCrawler[];
+}
+
+export interface AiCrawlerTestResponse {
+  matched_crawler: string | null;
+  verification_kind: AiCrawlerVerificationKind | null;
+  would_apply_policy: AiBotPolicy;
+  note: string;
+}
+
+export interface AiCrawlerRobotsPreviewResponse {
+  body: string;
+  route_id: string;
+  generated_at: string;
+}
+
+export interface AiCrawlerStatActionBreakdown {
+  deny: number;
+  log: number;
+  spoofed: number;
+  ua_only_match: number;
+}
+
+export interface AiCrawlerStatEntry {
+  crawler: string;
+  count: number;
+  action_breakdown: AiCrawlerStatActionBreakdown;
+}
+
+export interface AiCrawlerStatsResponse {
+  window: '5m';
+  route_id: string;
+  top_5: AiCrawlerStatEntry[];
 }
 
 export const api = {
@@ -1235,6 +1331,38 @@ export const api = {
 
   deleteBan: (ip: string) =>
     request<{ unbanned: boolean; ip: string }>('DELETE', `/bans/${encodeURIComponent(ip)}`),
+
+  // AI crawler management (Story 8.2)
+  getAiCrawlersCustom: () =>
+    request<AiCrawlersCustomResponse>('GET', '/ai-crawlers/custom'),
+
+  createAiCrawlerCustom: (body: CustomCrawlerBody) =>
+    request<CustomCrawler>('POST', '/ai-crawlers/custom', body),
+
+  updateAiCrawlerCustom: (id: number, body: CustomCrawlerBody) =>
+    request<CustomCrawler>('PUT', `/ai-crawlers/custom/${id}`, body),
+
+  deleteAiCrawlerCustom: (id: number) =>
+    request<{ deleted: number }>('DELETE', `/ai-crawlers/custom/${id}`),
+
+  getAiCrawlersBuiltin: () =>
+    request<AiCrawlersBuiltinResponse>('GET', '/ai-crawlers/builtin'),
+
+  testAiCrawler: (ua: string, routeId?: string | null) => {
+    const qs = new URLSearchParams({ ua });
+    if (routeId) qs.set('route_id', routeId);
+    return request<AiCrawlerTestResponse>('GET', `/ai-crawlers/test?${qs.toString()}`);
+  },
+
+  getAiCrawlerRobotsPreview: (routeId: string) => {
+    const qs = new URLSearchParams({ route_id: routeId });
+    return request<AiCrawlerRobotsPreviewResponse>('GET', `/ai-crawlers/robots-preview?${qs.toString()}`);
+  },
+
+  getAiCrawlerStats: (routeId: string) => {
+    const qs = new URLSearchParams({ route_id: routeId, window: '5m' });
+    return request<AiCrawlerStatsResponse>('GET', `/ai-crawlers/stats?${qs.toString()}`);
+  },
 };
 
 export interface WafEvent {

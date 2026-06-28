@@ -17,6 +17,7 @@
   import ObservabilityTab from '../components/settings-tabs/ObservabilityTab.svelte';
   import SecurityPresetsTab from '../components/settings-tabs/SecurityPresetsTab.svelte';
   import BanRulesTab from '../components/settings-tabs/BanRulesTab.svelte';
+  import AiCrawlersTab from '../components/settings-tabs/AiCrawlersTab.svelte';
   import NotificationHistoryTab from '../components/settings-tabs/NotificationHistoryTab.svelte';
   import PreferencesTab from '../components/settings-tabs/PreferencesTab.svelte';
   import ExportImportTab from '../components/settings-tabs/ExportImportTab.svelte';
@@ -106,6 +107,7 @@
     preferences: true,
     export: true,
     ban_rules: true,
+    ai_crawlers: true,
     cert_export: true,
   };
   let expandedSections = $state<Record<string, boolean>>((() => {
@@ -390,6 +392,11 @@
     <BanRulesTab
       expanded={expandedSections.ban_rules}
       toggleSection={() => toggleSection('ban_rules')}
+    />
+
+    <AiCrawlersTab
+      expanded={expandedSections.ai_crawlers}
+      toggleSection={() => toggleSection('ai_crawlers')}
     />
 
     <SettingsDnsProviders bind:dnsProviders {expandedSections} {toggleSection} onReload={loadAll} />

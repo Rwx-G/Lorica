@@ -1,4 +1,4 @@
-import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest, MirrorConfigRequest, ResponseRewriteConfigRequest, MtlsConfigRequest } from './api';
+import type { RouteResponse, CreateRouteRequest, UpdateRouteRequest, PathRuleRequest, HeaderRuleRequest, TrafficSplitRequest, ForwardAuthConfigRequest, MirrorConfigRequest, ResponseRewriteConfigRequest, MtlsConfigRequest, AiBotPolicy, AiBotSpoofedFallback } from './api';
 import {
   validateUrl,
   validateRegex,
@@ -153,6 +153,15 @@ export interface RouteFormState {
   bot_bypass_user_agents: string;
   bot_bypass_rdns: string;
   bot_only_country: string;
+  // AI crawler policy (v1.6.0 Story 8.2). `ai_bot_policy` off = the
+  // feature is off for this route. `ai_bot_spoofed_fallback` empty
+  // string = inherit the global default (null on the wire); the
+  // other values pin a per-route fallback for a spoofed AI bot.
+  // `serve_robots_txt` off (default) = pass /robots.txt through to
+  // the backend.
+  ai_bot_policy: AiBotPolicy;
+  ai_bot_spoofed_fallback: '' | AiBotSpoofedFallback;
+  serve_robots_txt: boolean;
 }
 
 export const ROUTE_DEFAULTS: RouteFormState = {
@@ -242,6 +251,9 @@ export const ROUTE_DEFAULTS: RouteFormState = {
   bot_bypass_user_agents: '',
   bot_bypass_rdns: '',
   bot_only_country: '',
+  ai_bot_policy: 'off',
+  ai_bot_spoofed_fallback: '',
+  serve_robots_txt: false,
 };
 
 // Tab field mappings for dot indicators
@@ -315,6 +327,8 @@ export const TAB_FIELDS: Record<string, (keyof RouteFormState)[]> = {
     'bot_captcha_alphabet',
     'bot_bypass_ip_cidrs', 'bot_bypass_asns', 'bot_bypass_countries',
     'bot_bypass_user_agents', 'bot_bypass_rdns', 'bot_only_country',
+    // AI crawler policy (Story 8.2)
+    'ai_bot_policy', 'ai_bot_spoofed_fallback', 'serve_robots_txt',
   ],
   // path_rules, header_rules, traffic_splits, mirror all absorbed into routing.
   // headers, cors, response_rewrite all absorbed into transform.
@@ -540,6 +554,9 @@ export function routeToFormState(route: RouteResponse): RouteFormState {
     bot_bypass_user_agents: (route.bot_protection?.bypass?.user_agents ?? []).join('\n'),
     bot_bypass_rdns: (route.bot_protection?.bypass?.rdns ?? []).join('\n'),
     bot_only_country: (route.bot_protection?.only_country ?? []).join(', '),
+    ai_bot_policy: route.ai_bot_policy ?? 'off',
+    ai_bot_spoofed_fallback: route.ai_bot_spoofed_fallback ?? '',
+    serve_robots_txt: route.serve_robots_txt ?? false,
   };
 }
 
@@ -756,6 +773,14 @@ function buildAdvancedFields(form: RouteFormState, isUpdate = false) {
     // route with bot_enabled=false simply omits the
     // bot_protection field (undefined above).
     bot_protection_disable: isUpdate && !form.bot_enabled ? true : undefined,
+    // AI crawler policy (Story 8.2). Policy always rides (off / deny /
+    // log). The spoofed-bot fallback uses null to mean "inherit the
+    // global default"; the empty-string sentinel in the form maps to
+    // null on the wire.
+    ai_bot_policy: form.ai_bot_policy,
+    ai_bot_spoofed_fallback:
+      form.ai_bot_spoofed_fallback === '' ? null : form.ai_bot_spoofed_fallback,
+    serve_robots_txt: form.serve_robots_txt,
   };
 }
 

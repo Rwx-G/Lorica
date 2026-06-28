@@ -421,7 +421,7 @@
         {:else if activeTab === 'security'}
           <SecurityTab bind:form={form} {importedFields} {customPresets} {backends} initialMtlsCaCertPem={editing?.mtls?.ca_cert_pem ?? ''} />
         {:else if activeTab === 'protection'}
-          <ProtectionTab bind:form={form} {importedFields} />
+          <ProtectionTab bind:form={form} {importedFields} routeId={editing?.id ?? null} />
         {:else if activeTab === 'upstream'}
           <UpstreamTab bind:form={form} {importedFields} />
         {/if}
