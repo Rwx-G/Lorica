@@ -51,6 +51,12 @@ The provided `dist/lorica.service` includes:
 - `RestrictNamespaces=yes` - no namespace creation
 - `UMask=0077` - restrictive file permissions
 
+The unit also carries `Type=notify` + `NotifyAccess=all` + `KillMode=mixed`
++ `TimeoutStopSec=90` for the zero-downtime hot binary upgrade. Upgrade
+uploads are gated on an operator-managed Ed25519 signature; see
+[hot-upgrade.md](hot-upgrade.md) and
+[installation.md](installation.md#hot-binary-upgrade).
+
 ### Network
 - Management API binds to **localhost only** (127.0.0.1)
 - Use socat or SSH tunnel for remote administration

@@ -21,6 +21,11 @@ mkdir -p "$PKG_DIR/usr/bin"
 mkdir -p "$PKG_DIR/lib/systemd/system"
 mkdir -p "$PKG_DIR/usr/share/doc/lorica"
 mkdir -p "$PKG_DIR/var/lib/lorica"
+# The hot-upgrade staging zone /var/lib/lorica/upgrade (Story 8.4) is
+# created 0700 at runtime by the upgrade endpoint - do NOT pre-create it
+# here. No signing key is bundled either: the Ed25519 public key is
+# operator-managed (the operator sets `upgrade_signing_pubkey_path`, e.g.
+# to /etc/lorica/upgrade-signing.pub). See docs/hot-upgrade.md.
 
 # Copy binary
 cp "$BINARY" "$PKG_DIR/usr/bin/lorica"

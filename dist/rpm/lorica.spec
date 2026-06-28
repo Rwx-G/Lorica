@@ -20,6 +20,11 @@ mkdir -p %{buildroot}/usr/share/doc/lorica
 mkdir -p %{buildroot}/usr/share/licenses/lorica
 mkdir -p %{buildroot}/var/lib/lorica
 mkdir -p %{buildroot}/var/lib/lorica/exported-certs
+# The hot-upgrade staging zone /var/lib/lorica/upgrade (Story 8.4) is
+# created 0700 at runtime by the upgrade endpoint - not pre-created here.
+# No signing key is bundled: the Ed25519 public key is operator-managed
+# (`upgrade_signing_pubkey_path`, e.g. /etc/lorica/upgrade-signing.pub).
+# See docs/hot-upgrade.md.
 
 install -m 755 %{_sourcedir}/lorica %{buildroot}/usr/bin/lorica
 install -m 644 %{_sourcedir}/dist/lorica.service %{buildroot}/usr/lib/systemd/system/lorica.service
