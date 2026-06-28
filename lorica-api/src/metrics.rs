@@ -185,6 +185,104 @@ pub fn record_ai_bot(crawler: &str, route_id: &str, action: &str) {
     AI_BOT_TOTAL
         .with_label_values(&[crawler, route_id, action])
         .inc();
+    push_ai_bot_stat(route_id, crawler, action);
+}
+
+/// Sliding-window length for the in-process AI-bot stats ring
+/// buffer backing `GET /api/v1/ai-crawlers/stats?window=5m`.
+const AI_BOT_STATS_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Per-route hard cap on retained ring-buffer events. Oldest
+/// entries are dropped first when a single route exceeds this
+/// under a sustained AI-crawler burst, bounding memory regardless
+/// of traffic.
+const AI_BOT_STATS_MAX_PER_ROUTE: usize = 4096;
+
+/// One AI-bot evaluation recorded in the in-process ring buffer.
+struct AiBotStatEvent {
+    /// Monotonic insertion instant ; used for 5-minute pruning.
+    at: std::time::Instant,
+    /// Matched crawler name (built-in or custom).
+    crawler: String,
+    /// Decision action: `deny | log | spoofed | ua_only_match`.
+    action: String,
+}
+
+/// In-process 5-minute sliding ring buffer of AI-bot evaluations,
+/// keyed by `route_id`. Populated from [`record_ai_bot`] (the same
+/// call site the proxy's `check_ai_bot` filter already drives), read
+/// by the `/api/v1/ai-crawlers/stats` endpoint.
+///
+/// WORKERS-MODE LIMITATION : this buffer is per-process. In
+/// multi-worker mode `check_ai_bot` runs inside the worker
+/// processes while the stats endpoint is served by the supervisor,
+/// so the supervisor's buffer reflects ONLY same-process
+/// evaluations (e.g. requests the supervisor itself handled, which
+/// in a pure worker deployment is none). The authoritative
+/// cross-process source is the Prometheus `lorica_ai_bot_total`
+/// counter exposed via `/metrics`. Cross-process aggregation is
+/// deliberately NOT solved here ; the 5-minute buffer is an
+/// in-process convenience per Story 8.2 AC #7.
+static AI_BOT_STATS_BUFFER: Lazy<
+    parking_lot::Mutex<std::collections::HashMap<String, std::collections::VecDeque<AiBotStatEvent>>>,
+> = Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// Push one AI-bot evaluation into the ring buffer and prune the
+/// route's queue (drop entries older than the window, then enforce
+/// the per-route cap).
+fn push_ai_bot_stat(route_id: &str, crawler: &str, action: &str) {
+    let now = std::time::Instant::now();
+    let mut map = AI_BOT_STATS_BUFFER.lock();
+    let buf = map.entry(route_id.to_string()).or_default();
+    buf.push_back(AiBotStatEvent {
+        at: now,
+        crawler: crawler.to_string(),
+        action: action.to_string(),
+    });
+    prune_ai_bot_buffer(buf, now);
+    while buf.len() > AI_BOT_STATS_MAX_PER_ROUTE {
+        buf.pop_front();
+    }
+}
+
+/// Drop ring-buffer entries older than [`AI_BOT_STATS_WINDOW`].
+/// Entries are appended in time order so a front-to-back scan stops
+/// at the first in-window entry.
+fn prune_ai_bot_buffer(
+    buf: &mut std::collections::VecDeque<AiBotStatEvent>,
+    now: std::time::Instant,
+) {
+    while let Some(front) = buf.front() {
+        if now.duration_since(front.at) > AI_BOT_STATS_WINDOW {
+            buf.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Return the `(crawler, action)` pairs recorded for `route_id`
+/// within the last 5 minutes, pruning expired entries on the way.
+/// Returns an empty vec when the route has no in-window events
+/// (including the workers-mode case described on
+/// [`AI_BOT_STATS_BUFFER`]).
+pub fn ai_bot_window_events(route_id: &str) -> Vec<(String, String)> {
+    let now = std::time::Instant::now();
+    let mut map = AI_BOT_STATS_BUFFER.lock();
+    let Some(buf) = map.get_mut(route_id) else {
+        return Vec::new();
+    };
+    prune_ai_bot_buffer(buf, now);
+    buf.iter()
+        .map(|e| (e.crawler.clone(), e.action.clone()))
+        .collect()
+}
+
+/// Test-only helper that clears the AI-bot stats ring buffer so a
+/// fresh test starts from an empty window.
+#[cfg(test)]
+pub fn reset_ai_bot_stats_for_test() {
+    AI_BOT_STATS_BUFFER.lock().clear();
 }
 
 /// Increment the `lorica_ai_bot_rdns_unavailable_total` counter.

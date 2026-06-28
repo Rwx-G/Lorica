@@ -517,6 +517,22 @@ pub fn build_router(
             delete(crate::ai_crawlers::delete_custom_crawler)
                 .layer(rl("destructive_cud", RL_DESTRUCTIVE_CUD, RL_WINDOW_S)),
         )
+        .route(
+            "/api/v1/ai-crawlers/builtin",
+            get(crate::ai_crawlers::list_builtin_crawlers),
+        )
+        .route(
+            "/api/v1/ai-crawlers/test",
+            get(crate::ai_crawlers::test_crawler),
+        )
+        .route(
+            "/api/v1/ai-crawlers/robots-preview",
+            get(crate::ai_crawlers::robots_preview),
+        )
+        .route(
+            "/api/v1/ai-crawlers/stats",
+            get(crate::ai_crawlers::ai_crawler_stats),
+        )
         .route("/api/v1/settings", get(crate::settings::get_settings))
         .route(
             "/api/v1/settings",
