@@ -14,7 +14,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
