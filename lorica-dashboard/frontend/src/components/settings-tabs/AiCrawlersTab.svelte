@@ -336,6 +336,9 @@
             <span class="settings-hint test-result">
               Matched: {testResult.matched_crawler} ; Verification: {testResult.verification_kind ? verificationKindLabel(testResult.verification_kind) : 'none'}
             </span>
+            <span class="settings-hint test-result-note">
+              Policy depends on the route; test from a route's Protection tab to see the applied policy.
+            </span>
           {:else}
             <span class="settings-hint test-result">No AI bot match{testResult.note ? ` - ${testResult.note}` : ''}</span>
           {/if}
@@ -415,6 +418,7 @@
   .test-row { display: flex; gap: 0.5rem; }
   .test-row input { flex: 1; }
   .test-result { margin-top: 0.375rem; color: var(--color-text); }
+  .test-result-note { margin-top: 0.25rem; color: var(--color-text-muted); font-size: var(--text-xs); }
 
   .field-error { display: block; color: var(--color-red); font-size: var(--text-xs); margin-top: 0.25rem; }
 </style>
