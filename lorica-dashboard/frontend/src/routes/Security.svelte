@@ -114,6 +114,15 @@
     unbanningIp = null;
   }
 
+  function banReasonLabel(reason: BanEntry['reason']): string {
+    switch (reason) {
+      case 'rate_limit': return 'Rate Limit';
+      case 'waf_flood': return 'WAF Flood';
+      case 'waf_critical_rule': return 'WAF Critical Rule';
+      case 'manual': return 'Manual';
+    }
+  }
+
   function formatDuration(seconds: number): string {
     if (seconds < 60) return `${seconds}s`;
     const m = Math.floor(seconds / 60);
@@ -563,6 +572,7 @@
             <thead>
               <tr>
                 <th>IP Address</th>
+                <th>Reason</th>
                 <th>Banned</th>
                 <th>Expires In</th>
                 <th></th>
@@ -572,6 +582,15 @@
               {#each bans as ban (ban.ip)}
                 <tr>
                   <td class="mono">{ban.ip}</td>
+                  <td>
+                    <span
+                      class="ban-reason-badge"
+                      class:ban-reason-rate-limit={ban.reason === 'rate_limit'}
+                      class:ban-reason-waf-flood={ban.reason === 'waf_flood'}
+                      class:ban-reason-waf-critical={ban.reason === 'waf_critical_rule'}
+                      class:ban-reason-manual={ban.reason === 'manual'}
+                    >{banReasonLabel(ban.reason)}</span>
+                  </td>
                   <td>{formatDuration(ban.banned_seconds_ago)} ago</td>
                   <td>{formatDuration(ban.remaining_seconds)}</td>
                   <td>
@@ -729,6 +748,19 @@
   }
   .action-blocked { background: var(--color-red-subtle); color: var(--color-red); }
   .action-detected { background: var(--color-orange-subtle); color: var(--color-orange); }
+
+  .ban-reason-badge {
+    display: inline-block;
+    padding: 0.125rem 0.5rem;
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .ban-reason-rate-limit { background: var(--color-orange-subtle); color: var(--color-orange); }
+  .ban-reason-waf-flood { background: var(--color-red-subtle); color: var(--color-red); }
+  .ban-reason-waf-critical { background: rgba(127, 29, 29, 0.18); color: #7f1d1d; }
+  .ban-reason-manual { background: var(--color-bg-muted, rgba(148, 163, 184, 0.18)); color: var(--color-text-muted); }
 
   .severity-critical {
     color: var(--color-red);

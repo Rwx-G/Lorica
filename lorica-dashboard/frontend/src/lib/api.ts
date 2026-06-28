@@ -1720,10 +1720,13 @@ export interface CacheStatsResponse {
   hit_rate: number;
 }
 
+export type BanReason = 'rate_limit' | 'waf_flood' | 'waf_critical_rule' | 'manual';
+
 export interface BanEntry {
   ip: string;
   banned_seconds_ago: number;
   remaining_seconds: number;
+  reason: BanReason;
 }
 
 export interface BanListResponse {
