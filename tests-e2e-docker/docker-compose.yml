@@ -599,9 +599,66 @@ services:
     networks:
       - e2e
 
+  # ---- Hot binary-upgrade E2E (v1.6.0 Story 8.4, IV1/IV3) ------------
+  # Boots Lorica in supervisor/workers mode (the zero-downtime handoff
+  # only exists in supervisor mode) and drives a live binary swap over
+  # the management API while sustained traffic flows through the proxy.
+  # The `shared-hot-upgrade` volume is mounted READ-WRITE in both the
+  # lorica service and the smoke runner: the entrypoint publishes the
+  # running binary at /shared/lorica-bin (so the runner can sign + re-
+  # upload the exact same executable) and the runner writes the test
+  # Ed25519 public key at /shared/upgrade-pubkey.hex (the path the smoke
+  # configures via `upgrade_signing_pubkey_path`). The keypair is
+  # generated fresh at test time, so no key material is committed.
+  #
+  # Run with:
+  #   docker compose --profile hot-upgrade up --build
+  #   docker compose --profile hot-upgrade run --rm hot-upgrade-smoke
+  lorica-hot-upgrade:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-hot-upgrade.sh"]
+    profiles: ["hot-upgrade"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-hot-upgrade-data:/var/lib/lorica
+      - shared-hot-upgrade:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  hot-upgrade-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["hot-upgrade"]
+    entrypoint: ["bash", "run-hot-upgrade-smoke.sh"]
+    # Run as root so the runner can WRITE the test public key into the
+    # `/shared` volume (owned by the unprivileged lorica user in the
+    # lorica container) and READ the published binary the entrypoint
+    # copied there. Same rationale as cert-export-smoke.
+    user: "0:0"
+    depends_on:
+      - lorica-hot-upgrade
+    volumes:
+      # Read-write: the runner writes the test public key into the same
+      # volume the lorica container reads it from, and reads the
+      # published binary the entrypoint copied in.
+      - shared-hot-upgrade:/shared
+    environment:
+      - LORICA_API=http://lorica-hot-upgrade:9443
+      - LORICA_PROXY=http://lorica-hot-upgrade:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
 volumes:
   lorica-data:
   lorica-workers-data:
+  lorica-hot-upgrade-data:
+  shared-hot-upgrade:
   lorica-otel-data:
   lorica-otel-workers-data:
   lorica-geoip-data:

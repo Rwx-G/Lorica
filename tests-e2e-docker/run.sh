@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Run the Lorica E2E test suite with Docker Compose.
-# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot]
+# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-hot-upgrade]
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
 #   --skip-cert-export  Skip the v1.4.1 cert-export profile (faster)
 #   --skip-ai-bot       Skip the v1.6.0 Story 8.2 AI-bot profile (faster)
+#   --skip-hot-upgrade  Skip the v1.6.0 Story 8.4 hot binary-upgrade profile (faster)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -15,6 +16,7 @@ KEEP=false
 SKIP_WORKERS=false
 SKIP_CERT_EXPORT=false
 SKIP_AI_BOT=false
+SKIP_HOT_UPGRADE=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -23,6 +25,7 @@ for arg in "$@"; do
         --skip-workers)      SKIP_WORKERS=true ;;
         --skip-cert-export)  SKIP_CERT_EXPORT=true ;;
         --skip-ai-bot)       SKIP_AI_BOT=true ;;
+        --skip-hot-upgrade)  SKIP_HOT_UPGRADE=true ;;
     esac
 done
 
@@ -39,7 +42,7 @@ fi
 # `down -v` skips their containers and named volumes; the next run then
 # boots against stale data (e.g. the cert-export smoke rotates the
 # admin password, and a stale volume 401s the next run's login).
-ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers"
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile hot-upgrade"
 
 # ---- Phase 1: Single-process tests ----
 echo "=== Lorica E2E Tests (single-process) ==="
@@ -166,6 +169,34 @@ if [ "$SKIP_AI_BOT" = false ] && [ "$EXIT_CODE" = "0" ]; then
 
         docker compose --profile ai-bot-workers run --rm ai-bot-smoke-workers || EXIT_CODE=$?
     fi
+fi
+
+# ---- Phase 5: Hot binary-upgrade profile (Story 8.4, IV1/IV3) -------
+# Boots Lorica in supervisor/workers mode and drives a live zero-downtime
+# binary swap while sustained traffic flows through the proxy. Opt-out
+# via --skip-hot-upgrade (default ON).
+if [ "$SKIP_HOT_UPGRADE" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (hot binary-upgrade profile) ==="
+    echo ""
+
+    docker compose --profile hot-upgrade up $BUILD_FLAG -d lorica-hot-upgrade
+
+    echo "Waiting for Lorica (hot-upgrade) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica-hot-upgrade curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (hot-upgrade) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (hot-upgrade) did not start within 120s"
+            docker compose logs lorica-hot-upgrade | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    docker compose --profile hot-upgrade run --rm hot-upgrade-smoke || EXIT_CODE=$?
 fi
 
 # Cleanup unless --keep
