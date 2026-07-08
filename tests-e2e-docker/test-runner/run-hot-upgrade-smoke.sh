@@ -256,6 +256,31 @@ esac
 log "=== hot-upgrade smoke: IV1/IV3 live swap under traffic ==="
 OK_BEFORE=$(hu_counter ok)
 
+# sd_notify emit coverage (Story 8.4 audit): bind a datagram listener on
+# the same $NOTIFY_SOCKET the lorica container points at, so we can prove
+# the NEW supervisor emits `READY=1` + `MAINPID=<newpid>` after the ack.
+# The socket lives on the shared volume; chmod 0777 lets the unprivileged
+# lorica user (different uid than this root runner) sendto it. Bound BEFORE
+# the swap so the post-handoff datagram lands.
+NOTIFY_SOCK=/shared/notify.sock
+NOTIFY_LOG=/shared/notify.log
+rm -f "$NOTIFY_SOCK" "$NOTIFY_LOG"
+python3 - "$NOTIFY_SOCK" "$NOTIFY_LOG" <<'PY' &
+import socket, sys, os
+sock_path, out_path = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(sock_path)
+os.chmod(sock_path, 0o777)
+with open(out_path, "a") as f:
+    while True:
+        data, _ = s.recvfrom(4096)
+        f.write(data.decode("utf-8", "replace") + "\n---\n")
+        f.flush()
+PY
+NOTIFY_BG=$!
+# Let the listener bind + chmod before any notify can be sent.
+sleep 1
+
 # Sustained sequential traffic in the background. Every reply code is
 # appended to a file; a refused/timed-out connection records 000.
 TRAFFIC_LOG=/tmp/hu_traffic.log
@@ -320,6 +345,22 @@ done
 [ "$CONSEC" -ge "$NEED_CONSEC" ] \
     && ok "replacement supervisor pid converged stable ($NEED_CONSEC consecutive reads = $NEW_PID)" \
     || fail "proxy.pid did not converge to a stable replacement value (last=$NEW_PID, consec=$CONSEC)"
+
+# sd_notify emit coverage: the NEW supervisor must have sent a
+# `READY=1\nMAINPID=<newpid>` datagram to $NOTIFY_SOCKET after the ack.
+# Give the datagram a moment to be captured, then stop the listener.
+sleep 2
+kill "$NOTIFY_BG" 2>/dev/null || true
+if grep -q "READY=1" "$NOTIFY_LOG" 2>/dev/null; then
+    ok "sd_notify READY=1 datagram captured on \$NOTIFY_SOCKET"
+else
+    fail "no sd_notify READY=1 datagram captured (emit path not exercised); log: $(tr '\n' ' ' < "$NOTIFY_LOG" 2>/dev/null)"
+fi
+if [ -n "$NEW_PID" ] && grep -q "MAINPID=$NEW_PID" "$NOTIFY_LOG" 2>/dev/null; then
+    ok "sd_notify MAINPID matches the replacement supervisor pid ($NEW_PID)"
+else
+    fail "sd_notify MAINPID did not match new pid $NEW_PID; log: $(tr '\n' ' ' < "$NOTIFY_LOG" 2>/dev/null)"
+fi
 
 # Stop traffic and tally. Traffic ran across the whole overlap + drain.
 rm -f "$RUN_FLAG"

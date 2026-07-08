@@ -622,6 +622,16 @@ services:
     profiles: ["hot-upgrade"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    environment:
+      # Story 8.4 audit: point sd_notify at a datagram socket on the
+      # shared volume so the smoke runner can capture the READY=1 +
+      # MAINPID=<newpid> the NEW supervisor emits after the swap. Docker
+      # has no real systemd, so this exercises Lorica's emit side (payload,
+      # PID, post-handoff timing) - systemd's own MainPID reassignment is
+      # out of scope. At cold boot the socket is not yet bound, so that
+      # send fails harmlessly; the post-swap send lands on the runner's
+      # listener.
+      - NOTIFY_SOCKET=/shared/notify.sock
     volumes:
       - lorica-hot-upgrade-data:/var/lib/lorica
       - shared-hot-upgrade:/shared
