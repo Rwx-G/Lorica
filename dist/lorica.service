@@ -25,7 +25,14 @@ Type=notify
 NotifyAccess=all
 User=lorica
 Group=lorica
-ExecStart=/usr/bin/lorica --data-dir /var/lib/lorica
+# `--workers auto` runs one worker process per CPU core (multi-process
+# supervisor mode). This is REQUIRED for the hot binary upgrade to be a
+# real handoff: the supervisor hands its listening sockets to a freshly
+# exec'd new supervisor, which only exists in multi-process mode. Without
+# it (single-process `--workers 0`) an upgrade would only stage the binary
+# and take effect on the next restart. Override with `--workers N` via a
+# drop-in if you need a fixed count.
+ExecStart=/usr/bin/lorica --data-dir /var/lib/lorica --workers auto
 # A clean hot-upgrade exit is code 0: the new process has already taken
 # over the MainPID, so with Restart=on-failure systemd must NOT treat that
 # exit as a restart trigger (the service is already running under the new
