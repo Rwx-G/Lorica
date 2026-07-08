@@ -26,11 +26,12 @@
 //! - [`kill_and_reap`] terminates a failed-to-start child and reaps it so
 //!   it never lingers as a zombie.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
+use std::os::raw::c_char;
 
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{execv, fork, ForkResult, Pid};
+use nix::unistd::{fork, ForkResult, Pid};
 
 use crate::WorkerError;
 
@@ -38,13 +39,16 @@ use crate::WorkerError;
 /// child, returning the child's [`Pid`] in the parent.
 ///
 /// `args` is the full argv vector INCLUDING `args[0]` (the program name
-/// the child sees). All `CString` conversions happen BEFORE `fork` so the
-/// child path performs no heap allocation: between `fork` and `execv` it
-/// only touches already-built buffers, keeping it async-signal-safe in a
-/// multi-threaded (tokio) parent. On `execv` failure the child calls
-/// `_exit(127)` (the shell convention for "command not executable")
-/// rather than unwinding, which would run `atexit` handlers inherited
-/// from the parent.
+/// the child sees). Both the `CString` conversions AND the
+/// null-terminated `argv` pointer array are built BEFORE `fork`, then the
+/// child calls `libc::execv` directly. This matters: `nix::unistd::execv`
+/// allocates a fresh pointer array internally (`to_exec_array`), which
+/// would run in the child AFTER `fork` and is not async-signal-safe in a
+/// multi-threaded (tokio) parent. Calling the raw `libc::execv` on a
+/// pre-built array keeps the post-fork path allocation-free and
+/// signal-safe. On `execv` failure the child calls `_exit(127)` (the
+/// shell convention for "command not executable") rather than unwinding,
+/// which would run `atexit` handlers inherited from the parent.
 ///
 /// This is the engine of the hot-upgrade handoff: the old supervisor
 /// forks the verified, staged binary so both processes briefly coexist
@@ -55,17 +59,25 @@ pub fn fork_exec(exe_path: &str, args: &[String]) -> Result<Pid, WorkerError> {
         .iter()
         .map(|s| CString::new(s.as_str()).map_err(|_| WorkerError::InvalidExecArg))
         .collect::<Result<Vec<CString>, WorkerError>>()?;
-    let c_arg_refs: Vec<&CStr> = c_args.iter().map(AsRef::as_ref).collect();
+    // Null-terminated argv pointer array, built here (pre-fork) so the
+    // child does no allocation. Each pointer borrows a `c_args` CString;
+    // both `c_args` and `argv` outlive the call in the parent, and in the
+    // child `execv` replaces the image before either could drop.
+    let mut argv: Vec<*const c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
+    argv.push(std::ptr::null());
 
     // SAFETY: `fork` in a multi-threaded process leaves only the calling
     // thread running in the child. The child below performs no allocation,
-    // no lock acquisition, and no async work: it calls `execv` (which
-    // replaces the image) and, only if that fails, the async-signal-safe
-    // `_exit`. All argv buffers were built before the fork.
+    // no lock acquisition, and no async work: it calls `libc::execv` on the
+    // pre-built `exe_cstr` / `argv` buffers (which replaces the image) and,
+    // only if that fails, the async-signal-safe `libc::_exit`.
     match unsafe { fork() }.map_err(WorkerError::Fork)? {
         ForkResult::Parent { child } => Ok(child),
         ForkResult::Child => {
-            let _ = execv(&exe_cstr, &c_arg_refs);
+            // SAFETY: `exe_cstr` is NUL-terminated and `argv` is a
+            // NUL-terminated array of pointers into live `c_args` CStrings;
+            // both were fully built before the fork.
+            unsafe { nix::libc::execv(exe_cstr.as_ptr(), argv.as_ptr()) };
             // SAFETY: `_exit` is async-signal-safe and the correct exit
             // path in a forked child whose `execv` failed; it skips the
             // `atexit`/`TLS` teardown that `std::process::exit` would run.
