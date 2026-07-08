@@ -1100,30 +1100,41 @@ pub fn inc_config_reload_split_fleet() {
 }
 
 /// Counter: hot binary-upgrade outcomes (Story 8.4 AC #5). Label
-/// `outcome` is one of a small fixed set:
-/// - `"ok"`: a signed binary verified and was staged for handoff.
+/// `outcome` is one of a small fixed set, split into a STAGE outcome
+/// (recorded by the API on the upload path) and terminal HANDOFF
+/// outcomes (recorded by the supervisor), so a rollback no longer looks
+/// like a success (audit M3/M4):
+/// - `"ok"`: a signed binary verified and was STAGED. This is a
+///   stage-level outcome; it does not mean the handoff succeeded.
 /// - `"signature_failed"`: the uploaded binary failed Ed25519
 ///   verification and was rejected before staging.
-/// - `"exec_failed"`: the chunk-2 execve handoff failed (emitted by
-///   the next chunk).
-/// - `"drain_timeout"`: the chunk-2 connection drain exceeded its
-///   deadline (emitted by the next chunk).
+/// - `"completed"`: the handoff finished - the NEW supervisor took over
+///   (recorded in the new process's registry, the survivor, so it stays
+///   observable after the old exits). This is the success signal to
+///   alert on, NOT `ok`.
+/// - `"exec_failed"`: the new supervisor never came up (fork/exec failed,
+///   staged-binary re-verify failed, or it never signalled readiness);
+///   the old rolled back and kept serving.
+/// - `"drain_timeout"`: the old supervisor's post-handoff connection
+///   drain exceeded its window and stragglers were force-killed. This is
+///   informational, not an error, and CAN co-occur with a `completed`
+///   upgrade: pingora keeps idle upstream-keepalive connections that do
+///   not self-exit, so the drain routinely reaches the window even on a
+///   zero-drop swap. Do not alert on it alone.
 ///
-/// Bounded cardinality: four operator-controlled outcome strings, no
-/// user-derived label. This chunk increments only `ok` and
-/// `signature_failed`; `exec_failed` / `drain_timeout` land with the
-/// handoff implementation.
+/// Bounded cardinality: five operator-controlled outcome strings, no
+/// user-derived label.
 static HOT_UPGRADE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     lorica_metrics::register_int_counter_vec(
         "hot_upgrade_total",
-        "Hot binary-upgrade outcomes (outcome=ok|signature_failed|exec_failed|drain_timeout)",
+        "Hot binary-upgrade outcomes (outcome=ok|signature_failed|completed|exec_failed|drain_timeout)",
         &["outcome"],
     )
 });
 
 /// Record one hot binary-upgrade outcome. `outcome` MUST be one of
-/// `ok | signature_failed | exec_failed | drain_timeout`; the counter
-/// API does not constrain it, so the call site enforces.
+/// `ok | signature_failed | completed | exec_failed | drain_timeout`;
+/// the counter API does not constrain it, so the call site enforces.
 pub fn record_hot_upgrade(outcome: &str) {
     HOT_UPGRADE_TOTAL.with_label_values(&[outcome]).inc();
 }

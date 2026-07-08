@@ -35,15 +35,22 @@
 //! 2. Old: bind a Unix datagram readiness socket `ready.sock`, then
 //!    `fork`+`execv` the staged `lorica.new` with `--hot-upgrade`.
 //! 3. New: pull the FDs from `transfer.sock`, build its workers from
-//!    them, start accepting + the management API, then (a) send a "ready"
-//!    datagram to `ready.sock` and (b) `sd_notify` `READY=1` +
-//!    `MAINPID=<newpid>` so systemd reassigns the unit's main PID.
+//!    them, start accepting + the management API, then run the readiness
+//!    handshake: bind `ack.sock`, and repeatedly send a "ready" datagram
+//!    to `ready.sock` until it receives an "ack" back (or its deadline
+//!    elapses, in which case it exits so the old rolls back cleanly).
 //! 4. Old: wait up to 10 s for the readiness datagram while watching the
-//!    child for an early exit. On ready -> drain workers, record the
-//!    drain histogram, exit(0). On early exit / timeout -> roll back
-//!    (kill the child, quarantine the staged binary, resume serving).
+//!    child for an early exit. On ready -> ack the new side, drain
+//!    workers, record the metrics, exit(0). On early exit / timeout ->
+//!    roll back (kill the child, quarantine the staged binary, resume).
+//! 5. New: only AFTER the ack does it `sd_notify` `READY=1` +
+//!    `MAINPID=<newpid>` (systemd main-PID handover) and record the
+//!    terminal `completed` outcome. Deferring the MAINPID reassignment
+//!    until the old has committed to draining is what prevents a lost
+//!    readiness datagram from stranding systemd on a killed PID (H3).
 
 use std::os::fd::RawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -53,8 +60,33 @@ use lorica_core::server::Fds;
 /// the old side rolls back (Story 8.4 AC #6).
 pub const READY_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Deadline for the NEW supervisor to get an ack back from the old before
+/// it gives up and exits so the old rolls back. Set slightly above
+/// [`READY_DEADLINE`]: if the old is going to ack at all it does so within
+/// its own readiness window, and the new must not give up first (audit H3).
+pub const READY_ACK_DEADLINE: Duration = Duration::from_secs(12);
+
 /// Datagram an up new supervisor sends to the old over `ready.sock`.
 const READY_TOKEN: &[u8] = b"ready";
+
+/// Datagram the old supervisor sends back over `ack.sock` to confirm it
+/// received the readiness signal and has committed to draining. The new
+/// side waits for this before reassigning the systemd MAINPID, so a lost
+/// readiness datagram can never leave the old rolling back (SIGKILLing the
+/// new) after the new already claimed MAINPID (audit H3 split-brain).
+const ACK_TOKEN: &[u8] = b"ack";
+
+/// Restrict a just-bound Unix socket to owner-only (0600). Defence in
+/// depth on top of the 0700 `upgrade/` directory: the handoff sockets
+/// carry live listening-socket FDs and the MAINPID handshake, so no other
+/// local user should be able to reach them even if the directory mode
+/// were ever relaxed (audit L1/L2). Best-effort: a chmod failure is logged
+/// and the directory mode remains the primary control.
+fn restrict_socket_perms(path: &Path) {
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(path = %path.display(), error = %e, "hot upgrade: could not tighten socket perms to 0600");
+    }
+}
 
 /// `Fds` table key prefix marking the management-API listener, so the
 /// new supervisor can tell it apart from the proxy (HTTP/HTTPS) listeners
@@ -78,6 +110,12 @@ pub fn transfer_sock_path(data_dir: &Path) -> PathBuf {
 /// the new supervisor's readiness signal.
 pub fn ready_sock_path(data_dir: &Path) -> PathBuf {
     upgrade_dir(data_dir).join("ready.sock")
+}
+
+/// Path of the Unix datagram socket the NEW supervisor binds to receive
+/// the old supervisor's ack of its readiness signal (audit H3).
+pub fn ack_sock_path(data_dir: &Path) -> PathBuf {
+    upgrade_dir(data_dir).join("ack.sock")
 }
 
 /// Quarantine name for a staged binary whose handoff failed:
@@ -227,14 +265,62 @@ pub fn pull_inherited_listeners(
     Ok(InheritedListeners { proxy, management })
 }
 
-/// Send the readiness datagram to the old supervisor's `ready.sock`
-/// (NEW side). Best-effort: the old side also watches the child PID, so a
-/// failure here just falls back to the liveness-based readiness path.
-pub fn signal_ready_to_old(data_dir: &Path) -> std::io::Result<()> {
-    let sock = ready_sock_path(data_dir);
-    let dgram = std::os::unix::net::UnixDatagram::unbound()?;
-    dgram.send_to(READY_TOKEN, &sock)?;
-    Ok(())
+/// NEW-side readiness handshake: repeatedly announce readiness to the old
+/// supervisor on `ready.sock` and wait for its ack on `ack.sock`, up to
+/// `deadline`. Returns `Ok(true)` once acked, `Ok(false)` if the deadline
+/// elapses with no ack.
+///
+/// This is the robust half of audit H3: the caller (new supervisor) must
+/// NOT reassign the systemd MAINPID until this returns `true`. A single
+/// dropped readiness datagram no longer strands the handoff - the new side
+/// keeps resending until the old acks (or gives up and exits so the old
+/// rolls back cleanly, having never lost MAINPID).
+pub async fn handshake_ready_with_old(
+    data_dir: &Path,
+    deadline: Duration,
+) -> std::io::Result<bool> {
+    let ack_path = ack_sock_path(data_dir);
+    let _ = std::fs::remove_file(&ack_path);
+    let sock = tokio::net::UnixDatagram::bind(&ack_path)?;
+    restrict_socket_perms(&ack_path);
+
+    let ready_path = ready_sock_path(data_dir);
+    let start = Instant::now();
+    let mut buf = [0u8; 64];
+    while start.elapsed() < deadline {
+        // (Re)announce readiness; ignore transient send errors (the old
+        // may not have bound ready.sock in the same instant).
+        let _ = sock.send_to(READY_TOKEN, &ready_path).await;
+        match tokio::time::timeout(Duration::from_millis(200), sock.recv(&mut buf)).await {
+            Ok(Ok(n)) if buf.get(..n) == Some(ACK_TOKEN) => {
+                let _ = std::fs::remove_file(&ack_path);
+                return Ok(true);
+            }
+            // Timeout tick or a spurious datagram: resend and keep waiting.
+            _ => {}
+        }
+    }
+    let _ = std::fs::remove_file(&ack_path);
+    Ok(false)
+}
+
+/// OLD-side ack burst: fire several `ACK_TOKEN` datagrams at the new
+/// supervisor's `ack.sock`. Called the instant a readiness datagram
+/// arrives, before the old commits to draining. The new side stops
+/// resending on the first ack it receives, so a short burst on loopback
+/// (where a bound, actively-receiving peer effectively never drops)
+/// reliably delivers at least one even if an individual datagram is lost
+/// (audit H3).
+async fn send_ack_burst(ack_target: &Path) {
+    let Ok(sock) = tokio::net::UnixDatagram::unbound() else {
+        return;
+    };
+    for _ in 0..10 {
+        if sock.send_to(ACK_TOKEN, ack_target).await.is_err() {
+            // ack.sock not bound yet or gone; a later tick may still land.
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Send the `sd_notify` `READY=1` + `MAINPID` datagram to `$NOTIFY_SOCKET`
@@ -277,8 +363,13 @@ pub fn quarantine_failed_binary(
 ///
 /// Polls in short ticks so child-liveness is re-checked even while no
 /// datagram arrives. The terminal verdict comes from [`decide_readiness`].
+/// On the first readiness datagram it fires an ack burst at `ack_target`
+/// (the new side's `ack.sock`) so the new supervisor can safely reassign
+/// the systemd MAINPID; only THEN does this return [`HandoffDecision::Drain`]
+/// (audit H3). No ack is sent on the rollback paths.
 pub async fn wait_for_new_ready(
     ready_listener: &tokio::net::UnixDatagram,
+    ack_target: &Path,
     child: lorica_worker::Pid,
     deadline: Duration,
 ) -> HandoffDecision {
@@ -292,12 +383,17 @@ pub async fn wait_for_new_ready(
         )
         .await
         {
-            Ok(Ok(_)) => new_ready = true,
-            // recv error (rare for a bound datagram socket): fall through
-            // and let the liveness/timeout checks drive the verdict.
-            Ok(Err(_)) => {}
-            // Tick elapsed with no datagram: re-check child + deadline.
-            Err(_) => {}
+            Ok(Ok(n)) if buf.get(..n) == Some(READY_TOKEN) => {
+                if !new_ready {
+                    // First readiness signal: ack it so the new side can
+                    // take over MAINPID before we drain and exit.
+                    send_ack_burst(ack_target).await;
+                }
+                new_ready = true;
+            }
+            // Other datagram, recv error, or tick timeout: re-check the
+            // child + deadline and keep waiting.
+            _ => {}
         }
         let child_alive = !lorica_worker::hot_upgrade::child_exited(child);
         if let Some(decision) =
@@ -350,7 +446,10 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
     let ready_path = ready_sock_path(&args.data_dir);
     let _ = std::fs::remove_file(&ready_path);
     let ready_listener = match tokio::net::UnixDatagram::bind(&ready_path) {
-        Ok(l) => l,
+        Ok(l) => {
+            restrict_socket_perms(&ready_path);
+            l
+        }
         Err(e) => {
             // Cannot observe readiness: spawn a no-op completed serve task
             // so the return type holds, and roll back.
@@ -390,8 +489,10 @@ pub async fn run_old_side_handoff(args: HandoffArgs) -> HandoffRun {
     };
     tracing::info!(child_pid = child.as_raw(), "hot upgrade: forked new supervisor, awaiting readiness");
 
-    let decision = wait_for_new_ready(&ready_listener, child, READY_DEADLINE).await;
-    // Clean up the readiness socket regardless of outcome.
+    let ack_target = ack_sock_path(&args.data_dir);
+    let decision = wait_for_new_ready(&ready_listener, &ack_target, child, READY_DEADLINE).await;
+    // Clean up the readiness socket regardless of outcome (the new side
+    // owns and removes ack.sock).
     let _ = std::fs::remove_file(&ready_path);
 
     HandoffRun {

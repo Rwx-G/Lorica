@@ -68,12 +68,12 @@ fn main() {
             init_logging(&cli.log_level, &cli.log_format, cli.log_file.as_deref());
             startup_banner(&cli);
 
-            if cli.workers > 0 {
+            if cli.workers.is_multi_process() {
                 startup::supervisor::run_supervisor(cli);
                 return;
             }
 
-            // Single-process mode (workers=0 or non-Unix)
+            // Single-process mode (--workers 0)
             startup::single::run_single_process(cli);
         }
     }

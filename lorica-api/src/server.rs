@@ -112,13 +112,15 @@ pub type MetricsRefresher =
 /// Channel the `POST /api/v1/system/upgrade` handler uses to signal the
 /// supervisor that a verified binary has been staged and the
 /// zero-downtime handoff (Story 8.4) should begin. The payload is the
-/// staged binary path (`<data_dir>/upgrade/lorica.new`).
+/// staged binary plus the SHA-256 verified at stage time
+/// ([`crate::upgrade::StagedBinary`]), so the supervisor can re-hash the
+/// on-disk binary just before exec (audit M7).
 ///
 /// `None` in single-process mode and tests, where there is no supervisor
 /// to fork a replacement; the upload then stages only. Bounded capacity
 /// (1): a concurrent second upgrade attempt while a handoff is in flight
 /// is shed rather than queued.
-pub type UpgradeTrigger = tokio::sync::mpsc::Sender<std::path::PathBuf>;
+pub type UpgradeTrigger = tokio::sync::mpsc::Sender<crate::upgrade::StagedBinary>;
 
 /// Shared application state holding the config store, log buffer, and start time.
 #[derive(Clone)]

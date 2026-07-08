@@ -77,6 +77,53 @@ pub enum UpgradeError {
     /// boundary.
     #[error("upgrade I/O error: {0}")]
     Io(String),
+
+    /// The staged binary on disk no longer matches the SHA-256 computed
+    /// at verify+stage time. Raised by the supervisor's re-check just
+    /// before `fork`/`exec` so a binary swapped in the staging directory
+    /// between staging and exec is never run (TOCTOU defence-in-depth).
+    #[error("staged binary digest does not match the verified upload")]
+    StagedDigestMismatch,
+}
+
+/// A verified, staged binary handed to the supervisor for the handoff.
+///
+/// Carries the SHA-256 computed at verify+stage time alongside the path
+/// so the supervisor can re-hash the file on disk immediately before
+/// `fork`/`exec` and refuse to run a binary that was swapped in the
+/// staging directory after staging (audit M7 TOCTOU defence-in-depth).
+#[derive(Debug, Clone)]
+pub struct StagedBinary {
+    /// Absolute path of the staged binary (`<data_dir>/upgrade/lorica.new`).
+    pub path: PathBuf,
+    /// Lower-case hex SHA-256 of the verified bytes at stage time.
+    pub sha256: String,
+}
+
+/// Whether the successful verify+stage actually kicked off a live
+/// zero-downtime handoff, so the CLI / dashboard can report honestly
+/// instead of always claiming a swap happened (audit H1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffSignal {
+    /// A supervisor received the handoff signal; the live swap is running.
+    Triggered,
+    /// Single-process mode: no supervisor to fork a replacement, so the
+    /// binary is staged only and takes effect on the next restart.
+    StagedOnly,
+    /// Supervisor mode but the signal could not be delivered (a handoff is
+    /// already in flight or the supervisor is gone); binary left staged.
+    Unavailable,
+}
+
+impl HandoffSignal {
+    /// Stable machine-readable token surfaced in the API JSON response.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HandoffSignal::Triggered => "triggered",
+            HandoffSignal::StagedOnly => "staged_only",
+            HandoffSignal::Unavailable => "trigger_unavailable",
+        }
+    }
 }
 
 /// Verify a detached Ed25519 `signature` over `binary` against
@@ -149,10 +196,16 @@ fn decode_public_key_hex(s: &str) -> Result<Vec<u8>, UpgradeError> {
         .ok_or(UpgradeError::BadPublicKey)
 }
 
-/// Decode an even-length hex string into bytes. Returns `None` on an
-/// odd length or any non-hex character.
+/// Decode an even-length hex string into bytes. Returns `None` on a
+/// non-ASCII input, an odd length, or any non-hex character.
+///
+/// The ASCII guard is load-bearing: the operator-supplied `signature`
+/// field reaches here unvalidated, and a multibyte UTF-8 character would
+/// make the `&s[i..i + 2]` slice fall on a non-char boundary and panic.
+/// A hex string is ASCII by definition, so a non-ASCII input is rejected
+/// up front, after which every byte index is a valid char boundary.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if !s.is_ascii() || !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -171,6 +224,26 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// SHA-256 the file at `path` and confirm it still matches
+/// `expected_sha256_hex` (the digest computed at verify+stage time).
+///
+/// Called by the supervisor immediately before `fork`/`exec` of the
+/// staged binary. The staging directory is 0700 and owned by the service
+/// user, so a swap requires an already-compromised service account or
+/// root; re-hashing closes that residual TOCTOU window rather than
+/// trusting the path blindly (audit M7). The comparison is byte-exact on
+/// the 64-char lower-case hex form.
+pub fn verify_staged_digest(path: &Path, expected_sha256_hex: &str) -> Result<(), UpgradeError> {
+    let bytes: Vec<u8> = std::fs::read(path).map_err(|e| UpgradeError::Io(e.to_string()))?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    let actual: String = encode_hex(digest.as_ref());
+    if actual == expected_sha256_hex {
+        Ok(())
+    } else {
+        Err(UpgradeError::StagedDigestMismatch)
+    }
+}
+
 /// Hand the staged binary off to the supervisor's zero-downtime restart
 /// (Story 8.4 chunk 2): execve of the new binary, listening-socket FD
 /// passing, connection drain.
@@ -187,15 +260,18 @@ fn encode_hex(bytes: &[u8]) -> String {
 /// and a warning is logged. The HTTP response is unchanged either way -
 /// staging succeeded - so the operator always learns the binary is in
 /// place; only the live swap is conditional on running under a
-/// supervisor.
-pub async fn trigger_handoff(state: &AppState, staged_path: &Path) {
+/// supervisor. The returned [`HandoffSignal`] tells the caller which of
+/// the three happened so the API response (and thus the CLI / dashboard)
+/// reports honestly instead of always claiming a swap (audit H1).
+pub async fn trigger_handoff(state: &AppState, staged: &StagedBinary) -> HandoffSignal {
     match &state.upgrade_trigger {
-        Some(trigger) => match trigger.try_send(staged_path.to_path_buf()) {
+        Some(trigger) => match trigger.try_send(staged.clone()) {
             Ok(()) => {
                 tracing::info!(
-                    staged_path = %staged_path.display(),
+                    staged_path = %staged.path.display(),
                     "hot upgrade staged; signalled supervisor to begin handoff"
                 );
+                HandoffSignal::Triggered
             }
             Err(e) => {
                 // A full/closed channel means a handoff is already in
@@ -203,18 +279,20 @@ pub async fn trigger_handoff(state: &AppState, staged_path: &Path) {
                 // binary is staged and the operator can retry.
                 tracing::error!(
                     error = %e,
-                    staged_path = %staged_path.display(),
+                    staged_path = %staged.path.display(),
                     "hot upgrade staged but the handoff signal could not be delivered \
                      (a handoff may already be in progress); binary left staged"
                 );
+                HandoffSignal::Unavailable
             }
         },
         None => {
             tracing::warn!(
-                staged_path = %staged_path.display(),
+                staged_path = %staged.path.display(),
                 "hot upgrade staged but no handoff trigger is wired (single-process mode); \
                  the binary is staged only and will take effect on the next restart"
             );
+            HandoffSignal::StagedOnly
         }
     }
 }
@@ -288,13 +366,17 @@ pub async fn upgrade_binary(
             ));
         }
         Err(e) => {
-            return Err(ApiError::Internal(format!(
-                "upgrade signing key load failed: {e}"
-            )));
+            // Log the detail (which may include the configured key path)
+            // server-side only; the operator-facing error stays generic
+            // so a failed load never leaks the filesystem layout (audit L3).
+            tracing::error!(error = %e, "hot upgrade: failed to load the signing public key");
+            return Err(ApiError::Internal(
+                "upgrade signing key could not be loaded".to_string(),
+            ));
         }
     };
 
-    let mut binary: Option<Vec<u8>> = None;
+    let mut binary: Option<axum::body::Bytes> = None;
     let mut signature_hex: Option<String> = None;
     while let Some(field) = multipart
         .next_field()
@@ -304,11 +386,15 @@ pub async fn upgrade_binary(
         let name: Option<String> = field.name().map(str::to_string);
         match name.as_deref() {
             Some("binary") => {
+                // Keep the multipart `Bytes` as-is: it is already a single
+                // contiguous owned buffer, so a `.to_vec()` here would
+                // duplicate the whole (up to 128 MiB) upload for no reason
+                // (audit M5). `Bytes` derefs to `&[u8]` for every consumer.
                 let bytes = field
                     .bytes()
                     .await
                     .map_err(|e| ApiError::BadRequest(format!("failed to read binary part: {e}")))?;
-                binary = Some(bytes.to_vec());
+                binary = Some(bytes);
             }
             Some("signature") => {
                 let text = field.text().await.map_err(|e| {
@@ -320,7 +406,7 @@ pub async fn upgrade_binary(
         }
     }
 
-    let binary: Vec<u8> =
+    let binary: axum::body::Bytes =
         binary.ok_or_else(|| ApiError::BadRequest("missing `binary` upload part".to_string()))?;
     let signature_hex: String = signature_hex
         .ok_or_else(|| ApiError::BadRequest("missing `signature` upload part".to_string()))?;
@@ -332,18 +418,18 @@ pub async fn upgrade_binary(
             )
         })?;
 
-    if let Err(e) = verify_binary_signature(&binary, &signature, &public_key) {
+    if let Err(e) = verify_binary_signature(binary.as_ref(), &signature, &public_key) {
         record_hot_upgrade("signature_failed");
         return Err(ApiError::BadRequest(format!(
             "binary signature verification failed: {e}"
         )));
     }
 
-    let digest = ring::digest::digest(&ring::digest::SHA256, &binary);
+    let digest = ring::digest::digest(&ring::digest::SHA256, binary.as_ref());
     let sha256: String = encode_hex(digest.as_ref());
     let size: u64 = binary.len() as u64;
 
-    let staged_path: PathBuf = stage_binary(&state.data_dir, &binary)
+    let staged_path: PathBuf = stage_binary(&state.data_dir, binary.as_ref())
         .map_err(|e| ApiError::Internal(format!("failed to stage uploaded binary: {e}")))?;
 
     record_hot_upgrade("ok");
@@ -351,16 +437,24 @@ pub async fn upgrade_binary(
     // Stage succeeded: signal the supervisor to begin the zero-downtime
     // handoff (fork the staged binary, pass listening sockets, drain).
     // The "ok" outcome above records a successful verify+stage; the
-    // handoff's own terminal outcome ("exec_failed" / "drain_timeout" on
-    // rollback) is recorded by the supervisor. Signalling AFTER building
-    // the success response below would race the supervisor's drain
-    // against this task being torn down, so we signal here and return.
-    trigger_handoff(&state, &staged_path).await;
+    // handoff's own terminal outcome ("completed" on success, or
+    // "exec_failed" / "drain_timeout" on rollback) is recorded by the
+    // supervisor. Signalling AFTER building the success response below
+    // would race the supervisor's drain against this task being torn
+    // down, so we signal here and return. The staged SHA-256 travels with
+    // the signal so the supervisor can re-verify the on-disk binary just
+    // before exec (audit M7).
+    let staged = StagedBinary {
+        path: staged_path.clone(),
+        sha256: sha256.clone(),
+    };
+    let handoff: HandoffSignal = trigger_handoff(&state, &staged).await;
 
     Ok(json_data(serde_json::json!({
         "staged_path": staged_path.display().to_string(),
         "size": size,
         "sha256": sha256,
+        "handoff": handoff.as_str(),
     })))
 }
 
@@ -439,6 +533,39 @@ mod tests {
     fn decode_hex_rejects_odd_length_and_non_hex() {
         assert_eq!(decode_hex("abc"), None);
         assert_eq!(decode_hex("zz"), None);
+    }
+
+    #[test]
+    fn decode_hex_rejects_multibyte_without_panicking() {
+        // A multibyte UTF-8 char (2 bytes) would make a naive
+        // `&s[i..i + 2]` slice land off a char boundary and panic; the
+        // ASCII guard must reject it as `None` instead (audit M1). Prefix
+        // with an ASCII byte so the string is even-length in bytes.
+        assert_eq!(decode_hex("a\u{00e9}"), None);
+        assert_eq!(decode_hex("\u{1f600}"), None);
+    }
+
+    #[test]
+    fn verify_staged_digest_matches_and_detects_tampering() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let payload = b"a staged lorica binary";
+        let staged = stage_binary(dir.path(), payload).expect("staging must succeed");
+        let digest = ring::digest::digest(&ring::digest::SHA256, payload);
+        let good = encode_hex(digest.as_ref());
+        assert!(verify_staged_digest(&staged, &good).is_ok());
+        // A different expected digest (as if the file was swapped) fails.
+        let bad = encode_hex(&[0u8; 32]);
+        assert!(matches!(
+            verify_staged_digest(&staged, &bad),
+            Err(UpgradeError::StagedDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn handoff_signal_tokens_are_stable() {
+        assert_eq!(HandoffSignal::Triggered.as_str(), "triggered");
+        assert_eq!(HandoffSignal::StagedOnly.as_str(), "staged_only");
+        assert_eq!(HandoffSignal::Unavailable.as_str(), "trigger_unavailable");
     }
 
     #[test]

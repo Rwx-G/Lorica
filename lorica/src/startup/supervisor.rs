@@ -101,11 +101,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
         None
     };
 
-    let worker_count = if cli.workers == 0 {
-        WorkerConfig::default_worker_count()
-    } else {
-        cli.workers
-    };
+    let worker_count = cli.workers.resolved();
 
     let config = WorkerConfig {
         worker_count,
@@ -1158,27 +1154,19 @@ pub(crate) fn run_supervisor(cli: Cli) {
         // for AppState without ever starting the scheduler, so
         // cron-scheduled load tests silently never ran in worker mode.
         let load_test_engine = startup::start_load_test_engine(&store);
-        // Snapshot the CLI fields the hot-upgrade control loop needs, as
-        // the API task's `async move` below moves `cli` into itself.
-        // `management_port`, `worker_count`, and `data_dir_path` are
-        // already independent locals; these are the remaining non-Copy
-        // fields the handoff's `child_argv` (and the new-side ready
-        // signal) reference.
-        let hu_hot_upgrade: bool = cli.hot_upgrade;
-        let hu_data_dir: String = cli.data_dir.clone();
-        let hu_http_port: u16 = cli.http_port;
-        let hu_https_port: u16 = cli.https_port;
-        let hu_log_level: String = cli.log_level.clone();
-        let hu_log_format: String = cli.log_format.clone();
-        let hu_log_file: Option<String> = cli.log_file.clone();
-        let hu_crl: Option<String> = cli.upstream_crl_file.clone();
+        // Snapshot the whole CLI for the hot-upgrade control loop, as the
+        // API task's `async move` below moves `cli` into itself. Cloning
+        // the live `Cli` (rather than a hand-picked subset of scalars) is
+        // what lets the handoff derive the child argv from it without the
+        // two drifting apart (audit M2).
+        let hu_cli = cli.clone();
         // Hot-upgrade trigger channel (Story 8.4). The API's
         // `POST /api/v1/system/upgrade` handler sends the staged binary
         // path here after a successful verify+stage; the supervisor's
         // control loop (below) receives it and drives the handoff.
         // Capacity 1: a second upgrade while one is in flight is shed.
         let (upgrade_tx, mut upgrade_rx) =
-            tokio::sync::mpsc::channel::<PathBuf>(1);
+            tokio::sync::mpsc::channel::<lorica_api::upgrade::StagedBinary>(1);
         let api_handle = tokio::spawn(async move {
             let state = AppState {
                 store: api_store,
@@ -1533,30 +1521,61 @@ pub(crate) fn run_supervisor(cli: Cli) {
 
         // Hot upgrade (Story 8.4), NEW supervisor side: now that workers
         // are forked from the inherited sockets and the API task is
-        // running on the inherited management socket, tell the outgoing
-        // supervisor we are up so it can drain. The shared listening
-        // sockets mean the old process is still accepting until it
-        // drains, so an early "ready" here is safe.
+        // running on the inherited management socket, confirm we are up to
+        // the outgoing supervisor so it can drain. The shared listening
+        // sockets mean the old process is still accepting until it drains,
+        // so an early "ready" here is safe.
         let self_pid: i32 = std::process::id() as i32;
-        if hu_hot_upgrade {
-            match hot_upgrade::signal_ready_to_old(&data_dir_path) {
-                Ok(()) => info!("hot upgrade: signalled readiness to outgoing supervisor"),
-                Err(e) => warn!(
-                    error = %e,
-                    "hot upgrade: readiness signal failed; outgoing supervisor will fall back to liveness check"
-                ),
+        if hu_cli.hot_upgrade {
+            // Robust readiness handshake (audit H3): resend "ready" until
+            // the old acks, and ONLY THEN reassign the systemd MAINPID. A
+            // dropped datagram must never leave the old rolling back (and
+            // SIGKILLing us) after we have claimed MAINPID (split-brain).
+            match hot_upgrade::handshake_ready_with_old(
+                &data_dir_path,
+                hot_upgrade::READY_ACK_DEADLINE,
+            )
+            .await
+            {
+                Ok(true) => {
+                    info!("hot upgrade: outgoing supervisor acked readiness");
+                    match hot_upgrade::sd_notify_ready(self_pid) {
+                        Ok(true) => info!(pid = self_pid, "sent sd_notify READY + MAINPID"),
+                        Ok(false) => info!("NOTIFY_SOCKET unset, skipping sd_notify"),
+                        Err(e) => warn!(error = %e, "sd_notify failed"),
+                    }
+                    // Terminal success recorded HERE, in the surviving new
+                    // process's registry (the old's dies on exit), so an
+                    // operator can see the completed upgrade on /metrics
+                    // (audit M4).
+                    lorica_api::metrics::record_hot_upgrade("completed");
+                }
+                Ok(false) => {
+                    // No ack within the deadline: the old never saw us (or
+                    // the ack path is broken). Exit so it rolls back
+                    // cleanly; we never claimed MAINPID, so systemd still
+                    // tracks the (live) old supervisor.
+                    error!(
+                        "hot upgrade: no ack from outgoing supervisor within the deadline; \
+                         exiting so it resumes serving"
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    error!(error = %e, "hot upgrade: readiness handshake failed; exiting so the outgoing supervisor resumes");
+                    std::process::exit(1);
+                }
             }
-        }
-        // Tell systemd we are accepting. REQUIRED for `Type=notify` on
-        // EVERY start (cold boot AND post-upgrade) or systemd times the
-        // unit out and marks the start failed. `MAINPID=self` is a no-op
-        // on a cold start (self is already the tracked main PID) and the
-        // real handover value on the post-upgrade path. No-op when
-        // `$NOTIFY_SOCKET` is unset (Docker, manual run).
-        match hot_upgrade::sd_notify_ready(self_pid) {
-            Ok(true) => info!(pid = self_pid, "sent sd_notify READY + MAINPID"),
-            Ok(false) => info!("NOTIFY_SOCKET unset, skipping sd_notify"),
-            Err(e) => warn!(error = %e, "sd_notify failed"),
+        } else {
+            // Cold boot: tell systemd we are accepting. REQUIRED for
+            // `Type=notify` on every start or systemd times the unit out.
+            // `MAINPID=self` is a no-op (self is already the tracked main
+            // PID). No-op when `$NOTIFY_SOCKET` is unset (Docker, manual run).
+            match hot_upgrade::sd_notify_ready(self_pid) {
+                Ok(true) => info!(pid = self_pid, "sent sd_notify READY + MAINPID"),
+                Ok(false) => info!("NOTIFY_SOCKET unset, skipping sd_notify"),
+                Err(e) => warn!(error = %e, "sd_notify failed"),
+            }
         }
 
         // Main control loop: serve until either a shutdown signal or a
@@ -1597,45 +1616,50 @@ pub(crate) fn run_supervisor(cli: Cli) {
                     break;
                 }
                 staged = upgrade_rx.recv() => {
-                    let Some(staged_path) = staged else {
+                    let Some(staged) = staged else {
                         // All senders dropped (API task gone): nothing
                         // more can trigger an upgrade. Keep serving until
                         // a shutdown signal arrives.
                         continue;
                     };
+                    let staged_path = staged.path.clone();
                     info!(
                         staged = %staged_path.display(),
                         "hot upgrade triggered; beginning handoff to new supervisor"
                     );
 
-                    // Build the new binary's argv from this process's CLI.
-                    let staged_str: String = staged_path.to_string_lossy().into_owned();
-                    let mut child_argv: Vec<String> = vec![
-                        staged_str,
-                        "--hot-upgrade".to_string(),
-                        "--data-dir".to_string(),
-                        hu_data_dir.clone(),
-                        "--management-port".to_string(),
-                        management_port.to_string(),
-                        "--http-port".to_string(),
-                        hu_http_port.to_string(),
-                        "--https-port".to_string(),
-                        hu_https_port.to_string(),
-                        "--workers".to_string(),
-                        worker_count.to_string(),
-                        "--log-level".to_string(),
-                        hu_log_level.clone(),
-                        "--log-format".to_string(),
-                        hu_log_format.clone(),
-                    ];
-                    if let Some(ref lf) = hu_log_file {
-                        child_argv.push("--log-file".to_string());
-                        child_argv.push(lf.clone());
+                    // Re-verify the staged binary against the SHA-256
+                    // computed at verify+stage time, immediately before we
+                    // fork/exec it. Closes the TOCTOU where the on-disk
+                    // binary is swapped between staging and exec (audit M7).
+                    if let Err(e) =
+                        lorica_api::upgrade::verify_staged_digest(&staged_path, &staged.sha256)
+                    {
+                        error!(
+                            error = %e,
+                            staged = %staged_path.display(),
+                            "hot upgrade: staged binary failed re-verification; refusing to exec it"
+                        );
+                        lorica_api::metrics::record_hot_upgrade(
+                            hot_upgrade::RollbackReason::ExecFailed.metric_outcome(),
+                        );
+                        let unix_ts: u64 = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if let Ok(dest) =
+                            hot_upgrade::quarantine_failed_binary(&data_dir_path, &staged_path, unix_ts)
+                        {
+                            info!(quarantined = %dest.display(), "hot upgrade: quarantined the mismatched staged binary");
+                        }
+                        continue;
                     }
-                    if let Some(ref crl) = hu_crl {
-                        child_argv.push("--upstream-crl-file".to_string());
-                        child_argv.push(crl.clone());
-                    }
+
+                    // Build the new binary's argv from this process's live
+                    // CLI (audit M2), resolving the concrete worker count so
+                    // the child does not re-resolve `auto`.
+                    let child_argv: Vec<String> =
+                        hu_cli.hot_upgrade_argv(&staged_path.to_string_lossy(), worker_count);
 
                     let run = hot_upgrade::run_old_side_handoff(hot_upgrade::HandoffArgs {
                         data_dir: data_dir_path.clone(),
@@ -1700,7 +1724,24 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             if let Some(child) = run.child {
                                 lorica_worker::hot_upgrade::kill_and_reap(child);
                             }
+                            // Abort the FD-transfer task and surface its
+                            // outcome rather than silently dropping it: an
+                            // error here (e.g. the socket serve failed)
+                            // explains WHY the new side never connected
+                            // (audit L6).
                             run.serve_task.abort();
+                            match run.serve_task.await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => warn!(
+                                    error = %e,
+                                    "hot upgrade: FD-transfer task errored during rollback"
+                                ),
+                                Err(join_err) if join_err.is_cancelled() => {}
+                                Err(join_err) => warn!(
+                                    error = %join_err,
+                                    "hot upgrade: FD-transfer task panicked during rollback"
+                                ),
+                            }
                             let unix_ts: u64 = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs())
@@ -1721,6 +1762,7 @@ pub(crate) fn run_supervisor(cli: Cli) {
                             }
                             let _ = std::fs::remove_file(hot_upgrade::transfer_sock_path(&data_dir_path));
                             let _ = std::fs::remove_file(hot_upgrade::ready_sock_path(&data_dir_path));
+                            let _ = std::fs::remove_file(hot_upgrade::ack_sock_path(&data_dir_path));
                             lorica_api::metrics::record_hot_upgrade(reason.metric_outcome());
                             error!(
                                 reason = reason.metric_outcome(),
