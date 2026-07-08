@@ -127,6 +127,34 @@ jobs:
         with:
           node-version: 22
 
+      - name: Regression - cert-export chown must fail soft, not SIGSYS
+        run: |
+          # PR-time guard for the v1.5.13 crash: the source unit's
+          # SystemCallFilter must let chown fail soft (EPERM) instead of
+          # killing the process with SIGSYS. Lives here because
+          # build-and-package / test-deb-install are gated to main + tags
+          # and skip on pull requests, so the installed-unit probe never
+          # runs on a PR. Reads the directives straight from the repo unit.
+          grep -q '^SystemCallFilter=~@chown:EPERM' dist/lorica.service \
+            || { echo "FAIL: ~@chown:EPERM softening missing from dist/lorica.service"; exit 1; }
+          touch /tmp/seccomp-probe
+          args=()
+          while IFS= read -r line; do
+            args+=(-p "$line")
+          done < <(grep -E '^SystemCallFilter=' dist/lorica.service)
+          echo "Applying ${#args[@]} filter directives from dist/lorica.service"
+          set +e
+          sudo systemd-run --quiet --pipe --wait --collect "${args[@]}" \
+            /bin/chown 1000:1000 /tmp/seccomp-probe
+          rc=$?
+          set -e
+          echo "chown-under-shipped-seccomp exit code: $rc"
+          if [ "$rc" -ge 128 ]; then
+            echo "FAIL: chown killed by a signal under the shipped filter (SIGSYS regression)"
+            exit 1
+          fi
+          echo "OK: chown fails soft under the shipped filter (no SIGSYS)"
+
       - name: Build frontend
         run: |
           cd lorica-dashboard/frontend
@@ -270,6 +298,42 @@ jobs:
           test -f /lib/systemd/system/lorica.service
           lorica --version
           echo ".deb installation verified OK"
+      - name: systemd unit - hardening lint
+        run: |
+          # The ~@chown:EPERM softening (v1.5.13) must stay in the shipped
+          # unit: without it, a cert-export configured with an owner
+          # UID/GID sends chown -> SECCOMP_RET_KILL and the proxy dies with
+          # SIGSYS. Deterministic gate so an accidental removal fails CI.
+          grep -q '^SystemCallFilter=~@chown:EPERM' /lib/systemd/system/lorica.service \
+            || { echo "FAIL: ~@chown:EPERM softening missing from the shipped unit"; exit 1; }
+          # Informational: unit load check + exposure score (see lorica-systemd.md).
+          sudo systemd-analyze verify /lib/systemd/system/lorica.service || true
+          sudo systemd-analyze security lorica.service --no-pager || true
+      - name: Regression - cert-export chown must fail soft, not SIGSYS
+        run: |
+          # Reproduce the v1.5.13 incident at the syscall level. Run chown
+          # under the EXACT SystemCallFilter directives shipped in the unit
+          # and assert the process is not killed by a signal. Before the
+          # fix, chown hit SECCOMP_RET_KILL and the probe would exit
+          # 128+31=159 (SIGSYS); with the fix chown returns EPERM and
+          # /bin/chown exits 1.
+          touch /tmp/seccomp-probe
+          args=()
+          while IFS= read -r line; do
+            args+=(-p "$line")
+          done < <(grep -E '^SystemCallFilter=' /lib/systemd/system/lorica.service)
+          echo "Applying ${#args[@]} filter directives from the shipped unit"
+          set +e
+          sudo systemd-run --quiet --pipe --wait --collect "${args[@]}" \
+            /bin/chown 1000:1000 /tmp/seccomp-probe
+          rc=$?
+          set -e
+          echo "chown-under-shipped-seccomp exit code: $rc"
+          if [ "$rc" -ge 128 ]; then
+            echo "FAIL: chown was killed by a signal under the shipped filter (SIGSYS regression)"
+            exit 1
+          fi
+          echo "OK: chown fails soft under the shipped filter (no SIGSYS)"
 
   test-rpm-install:
     name: Test .rpm install
