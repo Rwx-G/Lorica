@@ -103,6 +103,21 @@ KeyringMode=private
 #                 LimitNOFILE via prlimit BEFORE exec, the
 #                 service itself never needs to call it.
 SystemCallFilter=~@privileged @resources
+# The `chown` family (chown/fchown/lchown/fchownat) is part of
+# @privileged and is therefore killed by the deny list above. The
+# v1.4.1 cert-export feature calls `chown` when an owner UID/GID is
+# configured (settings `cert_export_owner_uid` / `cert_export_group_gid`),
+# so a matching export would send SECCOMP_RET_KILL and take the whole
+# proxy down with SIGSYS - a hard crash for an optional feature. This
+# trailing rule overrides ONLY the chown family to fail soft with EPERM;
+# every other @privileged / @resources syscall still hard-kills. On EPERM
+# the exporter falls back to ExportOutcome::PermissionsSkipped
+# (lorica-api/src/cert_export.rs), writing the bundle with the configured
+# file mode (0640) and owner `lorica`, ownership change skipped. Operators
+# who need the `chown` to actually take effect must instead add CAP_CHOWN
+# and re-allow @chown (see CapabilityBoundingSet note above).
+# (v1.5.13 - fixes the mail.* cert-export re-export SIGSYS incident.)
+SystemCallFilter=~@chown:EPERM
 
 [Install]
 WantedBy=multi-user.target

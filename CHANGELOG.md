@@ -9,6 +9,16 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [1.5.13] - 2026-07-08
+
+### Fixed
+
+- Certificate export no longer crashes the entire proxy when an owner UID or group GID is configured. The shipped systemd unit's `SystemCallFilter=~@privileged` deny list includes the `chown` syscall family, so any export that tried to apply ownership (initial issuance, auto-renewal, or the "re-export all" operator action) issued a `chown` that seccomp answered with `SECCOMP_RET_KILL`, taking the supervisor process down with SIGSYS. All workers then lost the command channel and systemd restarted the service. As a result, renewed certificates configured with an export owner were never written to disk. The unit now downgrades only the `chown` family to fail-soft with `EPERM`, so the exporter falls back to `ExportOutcome::PermissionsSkipped` (the bundle is written with the configured file mode and left owned by the `lorica` user) instead of aborting. Renewed and re-exported certificates now land on disk as intended.
+
+### Security
+
+- The seccomp softening is scoped to the `chown` family alone, via a trailing `SystemCallFilter=~@chown:EPERM` that overrides only those syscalls. Every other `@privileged` and `@resources` syscall still hard-kills the process, and no capability (`CAP_CHOWN` included) is granted, so the sandbox exposure is unchanged for all non-`chown` syscalls. Exported private keys keep their `0640` file mode and `0750` directory mode, readable only by the `lorica` user and root.
+
 ## [1.5.12] - 2026-06-16
 
 ### Fixed
