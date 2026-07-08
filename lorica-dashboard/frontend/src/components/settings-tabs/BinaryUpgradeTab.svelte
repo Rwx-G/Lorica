@@ -191,11 +191,26 @@
           <strong>Binary verified and staged.</strong>
           <div><span class="info-label">SHA-256</span><span class="info-value mono">{result.sha256}</span></div>
           <div><span class="info-label">Size</span><span class="info-value">{formatBytes(result.size, { units: 'decimal' })}</span></div>
-          <p class="hint">
-            The supervisor is draining connections and handing off to the new
-            process. Refresh the running version above to confirm the PID
-            changed.
-          </p>
+          {#if result.handoff === 'triggered'}
+            <p class="hint">
+              The supervisor is draining connections and handing off to the new
+              process. Refresh the running version above to confirm the PID
+              changed.
+            </p>
+          {:else if result.handoff === 'staged_only'}
+            <p class="hint">
+              This instance runs in single-process mode, so no live handoff was
+              performed. The binary is staged and takes effect on the next
+              restart. Run Lorica with <code>--workers auto</code> (the packaged
+              systemd unit does) for a true zero-downtime upgrade.
+            </p>
+          {:else}
+            <p class="hint">
+              The binary is staged, but the handoff signal could not be
+              delivered (an upgrade may already be in progress). Retry once it
+              settles; the staged binary is in place.
+            </p>
+          {/if}
         </div>
       {/if}
 

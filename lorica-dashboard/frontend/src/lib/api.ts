@@ -644,12 +644,20 @@ export interface SystemResponse {
   proxy: ProxyInfo;
 }
 
+/// Whether the upload actually started a live handoff or only staged the
+/// binary (audit H1): `triggered` = the supervisor is performing the
+/// zero-downtime swap; `staged_only` = single-process mode, effective on
+/// the next restart; `trigger_unavailable` = staged but the signal could
+/// not be delivered (a handoff may already be running).
+export type UpgradeHandoff = 'triggered' | 'staged_only' | 'trigger_unavailable';
+
 /// Successful result of `POST /api/v1/system/upgrade` (Story 8.4):
 /// the verified binary has been staged and the handoff signalled.
 export interface UpgradeStageResult {
   staged_path: string;
   size: number;
   sha256: string;
+  handoff: UpgradeHandoff;
 }
 
 /// A detached Ed25519 signature is the 64-byte sig hex-encoded, i.e.

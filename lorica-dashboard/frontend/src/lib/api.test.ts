@@ -295,11 +295,12 @@ describe('isValidUpgradeSignatureHex', () => {
 
 describe('api.uploadUpgradeBinary', () => {
   it('POSTs multipart binary + signature and returns the staged result', async () => {
-    mockFetch({ staged_path: '/var/lib/lorica/upgrade/lorica.new', size: 1024, sha256: 'abc123' });
+    mockFetch({ staged_path: '/var/lib/lorica/upgrade/lorica.new', size: 1024, sha256: 'abc123', handoff: 'triggered' });
     const binary = new File([new Uint8Array([1, 2, 3])], 'lorica');
     const res = await api.uploadUpgradeBinary(binary, 'f'.repeat(128));
     expect(res.data?.staged_path).toBe('/var/lib/lorica/upgrade/lorica.new');
     expect(res.data?.sha256).toBe('abc123');
+    expect(res.data?.handoff).toBe('triggered');
     const [url, opts] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     expect(url).toBe('/api/v1/system/upgrade');
     expect(opts.method).toBe('POST');
