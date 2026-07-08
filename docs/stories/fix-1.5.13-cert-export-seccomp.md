@@ -82,11 +82,14 @@ unit.
 
 ## Regression protection
 
-- CI job `test-deb-install` (ubuntu-latest, real systemd) now runs
-  `systemd-analyze verify` on the installed unit and a syscall-level
-  probe: `chown` executed under the unit's exact `SystemCallFilter`
-  directives must fail soft (EPERM, exit < 128), not be killed by a
-  signal. Before the fix this probe returns 159 (128 + SIGSYS).
+- CI job `test` (ubuntu-latest, real systemd, runs on every PR) probes
+  the source unit `dist/lorica.service`: `chown` executed under its exact
+  `SystemCallFilter` directives must fail soft (EPERM, exit < 128), not be
+  killed by a signal. Before the fix this probe returns 159 (128 + SIGSYS).
+  This is the PR-time guard, since packaging jobs are gated to main + tags.
+- CI job `test-deb-install` (main + tags only) repeats the probe against
+  the *installed* unit plus `systemd-analyze verify`, catching any
+  packaging drift between `dist/lorica.service` and the shipped unit.
 - The existing `cert_export.rs` unit tests already exercise the
   `EPERM -> PermissionsSkipped` code contract (the test harness has no
   `CAP_CHOWN`, so `chown` returns `EPERM` naturally). No Rust test can
