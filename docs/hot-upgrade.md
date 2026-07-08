@@ -11,6 +11,14 @@ connections and exits 0.
 This is opt-in: until you configure a signing public key, the upgrade
 endpoint rejects every upload.
 
+**Requires multi-process mode.** The handoff hands listening sockets from
+the old supervisor to a new one, which only exists when Lorica runs with
+worker processes. The packaged systemd unit starts `lorica` with
+`--workers auto` (one worker per CPU core) for exactly this reason. In
+single-process mode (`--workers 0`) an upload is still verified and staged,
+but no live swap happens: the API response's `handoff` field reports
+`staged_only`, and the binary takes effect on the next restart.
+
 ## Workflow
 
 1. **Sign the new binary.** On an offline or CI signing host, produce a
@@ -30,12 +38,20 @@ endpoint rejects every upload.
    small-order edge cases), then atomically stages the binary at
    `<data_dir>/upgrade/lorica.new` (mode 0755, written to a temp file and
    renamed). A bad signature returns `400` and changes nothing.
-4. **Zero-downtime handoff.** The supervisor fork+execv's `lorica.new`
-   with the live arguments plus `--hot-upgrade`. The new supervisor pulls
-   the inherited listeners, spawns its workers, starts the management API,
-   then signals readiness.
-5. **Drain.** Once the new process is up, the old supervisor stops its
-   worker monitor, drains in-flight connections on
+4. **Zero-downtime handoff.** The supervisor re-verifies the staged
+   binary's SHA-256 against the value computed at stage time (so a file
+   swapped in the staging directory between staging and exec is refused),
+   then fork+execv's `lorica.new` with the live arguments (reconstructed
+   from the running process's CLI) plus `--hot-upgrade`. The new
+   supervisor pulls the inherited listeners, spawns its workers, starts
+   the management API, then runs the readiness handshake: it resends a
+   "ready" datagram to the old supervisor until it gets an ack back. Only
+   after the ack does it reassign the systemd MainPID (`sd_notify
+   MAINPID=`) and record `lorica_hot_upgrade_total{outcome="completed"}`.
+   Deferring the MainPID handover until the old has acked is what keeps a
+   lost datagram from stranding systemd on a killed PID.
+5. **Drain.** Once it has acked the new process, the old supervisor stops
+   its worker monitor, drains in-flight connections on
    `worker_drain_timeout_s` (default 30s), records the drain histogram,
    and exits 0. The new process owns the unit from that point.
 
@@ -58,6 +74,15 @@ endpoint rejects every upload.
 If `upgrade_signing_pubkey_path` is unset or blank, the endpoint returns
 `400 "no upgrade signing key configured"` and the running binary is
 untouched.
+
+> **Trust boundary (RBAC, Story 8.3).** The upgrade endpoint and the
+> `upgrade_signing_pubkey_path` setting are ONE trust unit and must be
+> gated to the same role. Whoever can point `upgrade_signing_pubkey_path`
+> at a key they control can then upload a binary signed with the matching
+> private key. When multi-user RBAC lands (Story 8.3), both
+> `POST /api/v1/system/upgrade` and the settings write that changes
+> `upgrade_signing_pubkey_path` must be `SuperAdmin`-only; do not gate one
+> without the other, or the weaker gate becomes the effective one.
 
 ## Rollback
 
@@ -113,15 +138,20 @@ simpler to reason about and keeps the image immutable. For an in-place
 swap without recreating the container:
 
 ```bash
-docker exec lorica upgrade --binary /path/in/container/lorica.new \
+docker exec lorica lorica upgrade --binary /path/in/container/lorica.new \
   --signature /path/in/container/lorica.new.sig
 ```
 
+(The first `lorica` is the container name, the second is the `lorica`
+binary inside it.)
+
 This requires the binary and its signature to be readable inside the
-container (bind-mount or `docker cp` them first) and a configured signing
-key, exactly as on a bare-metal install. Outside systemd there is no
-`$NOTIFY_SOCKET`, so the MainPID notify is skipped and readiness is
-detected by liveness; the zero-downtime drain is unchanged.
+container (bind-mount or `docker cp` them first), a configured signing
+key, and the container running Lorica in multi-process mode
+(`--workers auto`), exactly as on a bare-metal install. Outside systemd
+there is no `$NOTIFY_SOCKET`, so the MainPID notify is skipped, but the
+new-to-old readiness ack handshake still runs (it is independent of
+systemd), and the zero-downtime drain is unchanged.
 
 ## See also
 

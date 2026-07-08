@@ -59,9 +59,15 @@ the operator guide is [docs/hot-upgrade.md](hot-upgrade.md).
 
 ### Unit directives that make it work
 
-- `ExecStart` is **unchanged**. The upgrade does not alter the command
-  line; the old supervisor fork+execv's the staged binary with the same
-  arguments plus an internal `--hot-upgrade` flag.
+- `--workers auto` (packaged default) runs Lorica as a multi-process
+  supervisor, which the handoff **requires**: it hands listening sockets
+  to a new supervisor, and that only exists in multi-process mode. If a
+  drop-in overrides `ExecStart` to `--workers 0`, an upload is verified
+  and staged but no live swap happens (it takes effect on the next
+  restart); the API response's `handoff` field reports `staged_only`.
+- `ExecStart` is otherwise **unchanged** by an upgrade. The upgrade does
+  not alter the command line; the old supervisor fork+execv's the staged
+  binary with the same arguments plus an internal `--hot-upgrade` flag.
 - `Type=notify` lets systemd track the MainPID handover. When the new
   process is accepting it sends `sd_notify READY=1\nMAINPID=<newpid>` and
   systemd reassigns the unit's main PID to it.
