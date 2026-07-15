@@ -148,8 +148,8 @@ Get the first-run admin password (printed to stdout once and persisted to a
 
 ```bash
 docker exec lorica cat /var/lib/lorica/initial-admin-password
-# or, if the container has already rotated logs:
-docker logs lorica 2>&1 | grep 'Initial admin password'
+# Fallback only if the file write failed (password printed to stdout instead):
+docker logs lorica 2>&1 | grep 'Initial admin password:'
 ```
 
 Open `http://127.0.0.1:9443` in your browser and log in with `admin` + the
@@ -161,13 +161,32 @@ password. You will be prompted to change it on first login.
 > is not an option, expose the dashboard via an SSH tunnel or Lorica's own
 > self-proxy — see [docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md).
 
+#### Why the management API is loopback-only
+
+The dashboard and REST API bind to **`127.0.0.1` by design**, not by accident.
+That keeps the management plane off the network so it cannot be exposed to the
+web, even through misconfiguration. Binding to `0.0.0.0` is explicitly out of
+scope — it would weaken this security boundary.
+
+On a production host, reach the dashboard through an **SSH tunnel**:
+
+```bash
+ssh -L 9443:127.0.0.1:9443 user@host
+```
+
+Then open `http://127.0.0.1:9443` locally. For TLS-encrypted remote access via
+the proxy itself (not recommended for production), see
+[docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md).
+
 ### Run directly
 
 ```bash
 lorica --data-dir /var/lib/lorica
 ```
 
-Open `http://127.0.0.1:9443` in your browser. On first run, a random admin password is printed to stdout and persisted to `<data-dir>/initial-admin-password` (mode 0600).
+Open `http://127.0.0.1:9443` in your browser (loopback-only by design — use an
+SSH tunnel on remote hosts; see above). On first run, a random admin password
+is written to `<data-dir>/initial-admin-password` (mode 0600).
 
 ### CLI options
 
@@ -281,7 +300,7 @@ Create a route via the REST API:
 # Authenticate
 TOKEN=$(curl -s http://127.0.0.1:9443/api/v1/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"password":"your-admin-password"}' \
+  -d '{"username":"admin","password":"your-admin-password"}' \
   -c - | grep session | awk '{print $NF}')
 
 # Create a backend

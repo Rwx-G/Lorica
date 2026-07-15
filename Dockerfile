@@ -4,8 +4,8 @@
 # Build:
 #   docker build -t lorica .
 #
-# Run:
-#   docker run -p 8080:8080 -p 8443:8443 -p 9443:9443 \
+# Run (Linux; management API binds 127.0.0.1 — use host networking):
+#   docker run -d --name lorica --network host \
 #     -v lorica-data:/var/lib/lorica lorica
 
 # Stage 1: Build frontend
