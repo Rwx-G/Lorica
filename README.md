@@ -128,11 +128,55 @@ sudo systemctl restart lorica
 
 ### Run with Docker
 
+Lorica is Linux-only, and its management API (dashboard) binds to `127.0.0.1`
+**inside** the container. Publishing the port with `-p 9443:9443` therefore
+does **not** expose the dashboard to the host. The simplest fix on Linux is to
+share the host network with the container:
+
 ```bash
 docker build -t lorica .
-docker run -p 8080:8080 -p 8443:8443 -p 9443:9443 \
+docker run -d --name lorica --network host \
   -v lorica-data:/var/lib/lorica lorica
 ```
+
+With `--network host` the dashboard is reachable at `http://127.0.0.1:9443`
+(HTTP, not HTTPS) and the proxy listeners bind straight onto the host —
+`:8080` (HTTP) and `:8443` (HTTPS) — so no `-p` flags are needed.
+
+Get the first-run admin password (printed to stdout once and persisted to a
+0600 file inside the container):
+
+```bash
+docker exec lorica cat /var/lib/lorica/initial-admin-password
+# Fallback only if the file write failed (password printed to stdout instead):
+docker logs lorica 2>&1 | grep 'Initial admin password:'
+```
+
+Open `http://127.0.0.1:9443` in your browser and log in with `admin` + the
+password. You will be prompted to change it on first login.
+
+> **Why not `-p 9443:9443`?** The management server binds `127.0.0.1` only
+> (see `lorica-api/src/server.rs`), so port publishing cannot reach it. Use
+> `--network host` for local dev. For a remote server where host networking
+> is not an option, expose the dashboard via an SSH tunnel or Lorica's own
+> self-proxy — see [docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md).
+
+#### Why the management API is loopback-only
+
+The dashboard and REST API bind to **`127.0.0.1` by design**, not by accident.
+That keeps the management plane off the network so it cannot be exposed to the
+web, even through misconfiguration. Binding to `0.0.0.0` is explicitly out of
+scope — it would weaken this security boundary.
+
+On a production host, reach the dashboard through an **SSH tunnel**:
+
+```bash
+ssh -L 9443:127.0.0.1:9443 user@host
+```
+
+Then open `http://127.0.0.1:9443` locally. For TLS-encrypted remote access via
+the proxy itself (not recommended for production), see
+[docs/self-proxy-dashboard.md](docs/self-proxy-dashboard.md).
 
 ### Run directly
 
@@ -140,7 +184,9 @@ docker run -p 8080:8080 -p 8443:8443 -p 9443:9443 \
 lorica --data-dir /var/lib/lorica
 ```
 
-Open `https://localhost:9443` in your browser. On first run, a random admin password is printed to stdout.
+Open `http://127.0.0.1:9443` in your browser (loopback-only by design — use an
+SSH tunnel on remote hosts; see above). On first run, a random admin password
+is written to `<data-dir>/initial-admin-password` (mode 0600).
 
 ### CLI options
 
@@ -252,13 +298,13 @@ Create a route via the REST API:
 
 ```bash
 # Authenticate
-TOKEN=$(curl -sk https://localhost:9443/api/v1/auth/login \
+TOKEN=$(curl -s http://127.0.0.1:9443/api/v1/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"password":"your-admin-password"}' \
+  -d '{"username":"admin","password":"your-admin-password"}' \
   -c - | grep session | awk '{print $NF}')
 
 # Create a backend
-curl -sk https://localhost:9443/api/v1/backends \
+curl -s http://127.0.0.1:9443/api/v1/backends \
   -b "session=$TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -269,7 +315,7 @@ curl -sk https://localhost:9443/api/v1/backends \
   }'
 
 # Create a route
-curl -sk https://localhost:9443/api/v1/routes \
+curl -s http://127.0.0.1:9443/api/v1/routes \
   -b "session=$TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
@@ -294,7 +340,7 @@ Or just use the dashboard - it covers all the same operations with zero curl.
 
 ## REST API Reference
 
-All endpoints are served on the management port (default `9443`) over HTTPS. Protected endpoints require a session cookie obtained via `/api/v1/auth/login`.
+All endpoints are served on the management port (default `9443`) over HTTP (loopback only). Protected endpoints require a session cookie obtained via `/api/v1/auth/login`.
 
 ### Public endpoints
 
