@@ -1,7 +1,7 @@
 # Story 8.9: Defense-in-Depth Pass
 
 **Epic:** [Epic 8 - Multi-User RBAC, AI Bot Defense & Zero-Downtime Upgrades (v1.6.0)](../prd/epic-8-v1.6.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:** Story 8.3 (RBAC `Session.username`/`role` as operator identity, shipped on this branch); Story 8.7 bot-stash refactor (shipped v1.5.10); Story 8.11 lorica-metrics (shipped on this branch).
@@ -130,6 +130,7 @@ E2E + docs:
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-08-12 | 1.1 | Epic 8 lance-dev closure: full e2e verified this cycle (audit-smoke 17/17: chain verify, sqlite tamper localisation, per-IP cap, RBAC floors), CI gates green. No Critical/High open. Status -> Done. | Romain G. |
 | 2026-08-11 | 1.0 | Phases 2-5: audit emission on ~45 handlers + `/audit` + `/audit/verify` + api_request span (AC #1 #3 #4); per-source-IP TCP connection cap via a lorica-core RAII accept-permit fork + per-IP DashMap + counter (AC #5); bot-stash refusal caps with `503 Retry-After` + per-prefix index + per-route mirror semaphores (AC #6 #7); dashboard Audit tab + defense-in-depth settings (AC #8); 6 settings keys; audit e2e profile 17/17 (sqlite tamper localisation + RBAC floors, IV1 #4); security.md + CHANGELOG. Deviations recorded in Completion Notes. Status -> Review. Gates: lorica-api 560 + lorica-config 200 + lorica 314 lib tests green, CI clippy clean, cargo audit clean, frontend svelte-check/tsc/lint/vitest 363 green, audit e2e 17/17. | Romain G. |
 | 2026-08-11 | 0.2 | Phase 1 (AC #2 #9 storage): audit.rs chain primitives (GENESIS, hash_payload, ChainInput, compute/recompute) + audit_log/audit_log_meta tables + insert/query/verify/retention in LogStore + audit_log_retention_days setting + hourly retention hook. 11 unit tests (chain round-trip, tamper localisation, middle-row deletion, seal survival incl. empty-table, filter escaping). lorica-api 559 tests green, clippy clean. | Romain G. |
 | 2026-08-11 | 0.1 | Story drafted from Epic 8 PRD + deep code exploration (LogStore retention, 57-handler mutation inventory, missing disconnect hook in forked listener, stash eviction-vs-refusal, mirror semaphore wiring, settings plumbing map). Deviations flagged in Dev Notes: helper fn instead of macro (AC #1), per-worker cap semantics (AC #5), stash refusal replaces eviction (AC #6), minimal API request span added for AC #4. | Romain G. |

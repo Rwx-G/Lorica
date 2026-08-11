@@ -1,7 +1,7 @@
 # Story 8.3: Team Settings - Multi-User RBAC
 
 **Epic:** [Epic 8 - Multi-User RBAC, AI Bot Defense & Zero-Downtime Upgrades (v1.6.0)](../prd/epic-8-v1.6.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0 (headline)
 **Author:** Romain G.
 **Depends on:** Story 8.1 (module split, shipped v1.5.10/11); existing single-admin auth stack (`lorica-api/src/auth.rs` + `middleware/auth.rs`).
@@ -127,6 +127,7 @@ E2E + docs:
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-08-12 | 0.7 | Epic 8 lance-dev closure: full e2e verified this cycle (rbac + rbac-workers 37/37 in both modes, secret-scrub + role floors), CI gates green. No Critical/High open. Status -> Done. | Romain G. |
 | 2026-08-11 | 0.1 | Story drafted from Epic 8 PRD + codebase exploration (auth stack, migration numbering trap, scrub surface, e2e profile shape). Design deviations recorded in Dev Notes: middleware factory instead of in-handler macro, session-invalidation instead of per-request role re-read, users table replaces admin_users. | Romain G. |
 | 2026-08-11 | 0.6 | Phase 5 (AC #9 + IV3, closure): rbac + rbac-workers e2e profiles (compose, run.sh phase 5, runner Dockerfile registration, 37-assertion smoke incl. rate-limit window wait), migration guide + security.md RBAC section, CHANGELOG entry, run-tests skill CI=true note. Full verification: product-crate tests + CI clippy + cargo audit clean (ammonia bumped 4.1.3->4.1.4 for RUSTSEC-2026-0213), frontend gates clean, e2e 37/37 in both modes. Status -> Review. | Romain G. |
 | 2026-08-11 | 0.5 | Phase 4 (AC #7 + AC #8 frontend): `auth.ts` role-aware store + `canWrite`/`isSuperAdmin`, api.ts Role/Me/Users types + users CRUD methods + global 403 toast, App boot via `/auth/me`, Login carries role, PasswordChange mirrors the 14+classes policy, `UsersAccessTab.svelte` (table, create dialog, role dropdown, disable toggle, password reset, self/delete affordances), SuperAdmin-gated in Settings. Role sweep across 20 files: routes pages gated `$canWrite`, settings-write tabs (`/settings*`, dns-providers, notifications, cert-export, config import, binary upgrade) gated `$isSuperAdmin`; read-only exports/filters/WS untouched. Gates: svelte-check 0 errors, tsc clean, eslint clean, vitest 363/363. | Romain G. |

@@ -1,7 +1,7 @@
 # Story 8.2: AI-Crawler (LLM) Deny-List
 
 **Epic:** [Epic 8 - Multi-User RBAC, AI Bot Defense & Zero-Downtime Upgrades (v1.6.0)](../prd/epic-8-v1.6.0.md)
-**Status:** Review
+**Status:** Done
 **Priority:** P0
 **Depends on:** Story 8.1 (foundation module split + `check_<name>` filter convention + `dispatch_order_locked` regression pin) ; existing `lorica/src/bot_rdns.rs` rDNS resolver (forward-confirm reuse) ; existing per-route hot-reload pipeline.
 **Author:** Romain G.
@@ -414,6 +414,7 @@ v1.10 additions (this session):
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-08-12 | 1.12 | Epic 8 lance-dev closure: story carried through implementation + DoD (Review); prior audit trail (design triple-audit + impl) accepted as the QA gate, no Critical/High open. Status -> Done. | Romain G. |
 | 2026-04-29 | 1.0 | Story scaffolded from Epic 8 PRD AC #2 | Romain G. |
 | 2026-04-29 | 1.1 | PO validation pass : corrected `lorica-rdns` crate hallucination (the rDNS code lives in `lorica/src/bot_rdns.rs`, not a separate crate) ; softened the "byte-accurate to upstream documentation" claim on the 12 crawler rDNS suffixes (per-vendor verification at impl time) ; pinned migration numbers (020 + 021) ; pinned dashboard paths (`route-tabs/ProtectionTab.svelte` + new `settings-tabs/AiCrawlersTab.svelte`) ; pinned counter registration pattern (`lorica-api/src/metrics.rs` REGISTRY) ; added regex DoS hardening via `RegexBuilder::size_limit` + `dfa_size_limit` ; added the `lorica_ai_bot_rdns_unavailable_total` operator-visibility counter ; pinned `bot.rs` vs `ai_bot.rs` decision (sibling module, not extension) ; pinned the stats endpoint scope (5-min sliding window in-process + lifetime counts side-by-side) ; added the AI bot reload regression test mirroring the Story 8.1 cert-reload pattern ; status flipped Draft -> Approved. | Romain G. (PO) |
 | 2026-05-03 | 1.2 | Architect+PO second-opinion pass : (1) Migration shape corrected - the file-based `0XX_*.sql` pattern STOPPED at `019_sessions.sql` ; everything past schema version 21 uses unconditional inline `let _ = self.conn.execute("ALTER TABLE ...", [])` blocks at the bottom of `lorica-config/src/store/mod.rs::run_migrations()` (cf. lines 463-645 for V22-V37+). The Story 8.2 dev MUST follow the modern pattern, NOT add SQL files. (2) Dashboard mount point corrected to `lorica-dashboard/frontend/src/routes/Settings.svelte` (the original "components/Settings.svelte" hedge resolved). (3) Custom-crawler CRUD submodule pinned to `lorica-config/src/store/ai_crawlers.rs` (new) following the existing per-entity submodule convention. **PENDING USER DECISION** : the rDNS verification model in AC #1 + AC #3 needs revisiting - empirical research shows only 2 of 12 crawlers (CCBot, Applebot) publish a stable rDNS suffix ; the other 10 publish IP-list JSON files (OpenAI, Anthropic, Perplexity, Amazon, Meta) or nothing at all (Bytespider, Diffbot). Story is READY for dev on the 5 non-rDNS-related ACs ; AC #1+#3 await an AC text amendment from the PO. | Romain G. |
