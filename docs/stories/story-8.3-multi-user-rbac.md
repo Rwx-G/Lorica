@@ -1,7 +1,7 @@
 # Story 8.3: Team Settings - Multi-User RBAC
 
 **Epic:** [Epic 8 - Multi-User RBAC, AI Bot Defense & Zero-Downtime Upgrades (v1.6.0)](../prd/epic-8-v1.6.0.md)
-**Status:** InProgress
+**Status:** Review
 **Priority:** P0 (headline)
 **Author:** Romain G.
 **Depends on:** Story 8.1 (module split, shipped v1.5.10/11); existing single-admin auth stack (`lorica-api/src/auth.rs` + `middleware/auth.rs`).
@@ -39,9 +39,9 @@ As an operator running Lorica on a shared infrastructure team, I want multiple a
 - [x] AC #2 (Viewer scrub): Viewer is blocked (403) from the whole `GET /certificates/:id/download` surface (key/full formats live there) and from `POST /config/export` (Operator floor on non-GET); existing unconditional masking (settings `bot_hmac_secret_hex`, notification `********`, DNS-provider write-only credentials) is the remaining Viewer-visible surface.
 - [x] AC #8: `password_policy.rs` validator (min length 14 default via new `GlobalSettings.password_min_length`, complexity classes via `password_require_complexity`, default true); applied to login-change, users create/update; frontend mirror in `PasswordChange.svelte` + create-user dialog (replaces the drifted 8/12-char checks).
 - [x] AC #7: `UsersAccessTab.svelte` settings section (user table + create dialog + role dropdown + disable toggle + password reset); `auth.ts` store carries `role` (+ `canWrite` / `isSuperAdmin` derived stores); mutating buttons hidden or disabled for Viewer across all pages and settings tabs; global 403 toast handler in `api.ts`; boot probe moved from `/status` to `/auth/me`.
-- [ ] AC #9: `docs/migrations/v1.6.0-rbac.md` + `docs/security.md` RBAC section.
-- [ ] IV3: `rbac` + `rbac-workers` compose profiles, `run-rbac-smoke.sh` (~25 assertions: 3 roles, 403 matrix, secret scrub, last-SuperAdmin guard, back-compat login shim), registered in `run.sh` phases + `ALL_PROFILES`.
-- [ ] Gates: `cargo test --workspace`, `cargo clippy --tests -- -D warnings`, `cargo audit`, `pnpm lint` + `svelte-check` + `tsc` clean.
+- [x] AC #9: `docs/migrations/v1.6.0-rbac.md` + `docs/security.md` RBAC section.
+- [x] IV3: `rbac` + `rbac-workers` compose profiles, `run-rbac-smoke.sh` (37 assertions: 3 roles, 403 matrix, secret scrub, session invalidation, disabled-account handling, last-SuperAdmin + self-delete guards, back-compat login shim), registered in `run.sh` phases + `ALL_PROFILES` + runner Dockerfile. 37/37 green in single-process AND workers mode.
+- [x] Gates: product-crate tests (config 197, api 548, waf, notify 60, bench 66) green; CI clippy set clean; `cargo audit` clean (after ammonia bump, separate commit); `svelte-check` 0 errors + `tsc` + `pnpm lint` + vitest 363 clean.
 
 ## Dev Notes
 
@@ -96,23 +96,39 @@ Sessions, users and role checks are supervisor-only (`middleware/auth.rs:51` doc
 
 ### Completion Notes
 
-(in progress - phase 1 of 5 done)
+All 9 AC + 3 IV covered across 8 commits (story record, 5 feature phases, e2e, docs) plus the RUSTSEC-2026-0213 ammonia bump surfaced by the pre-commit audit. Two disclosed deviations from the PRD letter, both documented in Dev Notes with rationale: (1) authorization is a single fail-closed policy middleware instead of a per-handler `require_role!` macro; (2) the Viewer secret scrub blocks the certificate-download and config-export surfaces instead of per-field response scrubbing (no secret ever reaches a serialized response struct). e2e gotchas encoded in the smoke: the runner image Dockerfile enumerates smoke scripts explicitly (a new profile must touch compose + run.sh + runner Dockerfile), and the login rate limiter (5/60s per IP) requires waiting out the window before late login assertions. Follow-up candidates for QA: metrics-auth interplay lands in Story 8.8; the audit log consuming `Session.username` lands in Story 8.9.
 
 ## File List
 
-- lorica-config/src/models/{enums,preferences,mod}.rs (Role enum; User replaces AdminUser)
-- lorica-config/src/store/{users,row_helpers,sessions,mod}.rs (users CRUD, v22 migration + backfill, sessions role column, clear_all)
+Backend:
+- lorica-config/src/models/{enums,preferences,settings,mod}.rs (Role enum; User replaces AdminUser; password policy settings)
+- lorica-config/src/store/{users,row_helpers,sessions,settings,mod}.rs (users CRUD + count_active_super_admins, v22 migration + backfill, sessions role column, policy keys, clear_all)
 - lorica-config/src/{export,import,diff}.rs (users field, legacy admin_users alias, user_eq incl. role/disabled)
-- lorica-config/src/tests.rs (renames + role/disabled round-trip, count_active_super_admins, v22 backfill, legacy alias import, schema version 22)
-- lorica-api/src/{auth.rs, middleware/auth.rs, tests.rs} (Session.role, create(role), store method renames)
-- lorica-dashboard/frontend/src/{lib/api.ts, lib/api.test.ts, components/settings-tabs/ExportImportTab.svelte} (diff field admin_users -> users)
-- docs/architecture/data-models-and-schema-changes.md (User model section)
+- lorica-config/src/tests.rs (role/disabled round-trip, count_active_super_admins, v22 backfill, legacy alias import, schema version 22)
+- lorica-api/src/auth.rs (login shim, disabled rejection, LoginResponse role, /auth/me, verify_password helper, policy-driven change_password)
+- lorica-api/src/password_policy.rs (new: validator + unit tests)
+- lorica-api/src/middleware/{auth.rs, authorize.rs (new), mod.rs} (Session.role; fail-closed policy middleware)
+- lorica-api/src/users.rs (new: users CRUD handlers + guards)
+- lorica-api/src/{server.rs, lib.rs, tests.rs} (routes + authorize layer + RL_USERS; 10 new integration tests)
+- lorica-api/openapi.yaml (login/me/users paths, Role + User schemas, Forbidden response)
+
+Frontend:
+- lib/{auth.ts, api.ts} (role store + canWrite/isSuperAdmin; Role/Me/Users types + CRUD + 403 toast; diff field rename)
+- App.svelte, routes/{Login,PasswordChange,Settings}.svelte (boot via /auth/me; role propagation; policy mirror; tab registration)
+- components/settings-tabs/UsersAccessTab.svelte (new)
+- Role sweep: routes/{Routes,Backends,Certificates,LoadTest,Logs,Probes,Security,Sla}.svelte, components/certificates/CertificateList.svelte, components/settings-tabs/{AiCrawlersTab,AppearanceTab,BinaryUpgradeTab,CertExportTab,ExportImportTab,GlobalConfigTab,NetworkTab,ObservabilityTab,PreferencesTab,SecurityPresetsTab}.svelte, components/settings/{SettingsDnsProviders,SettingsNotifications}.svelte
+
+E2E + docs:
+- tests-e2e-docker/{docker-compose.yml, run.sh, test-runner/run-rbac-smoke.sh (new)} (rbac + rbac-workers profiles, ~35 assertions)
+- docs/migrations/v1.6.0-rbac.md (new), docs/security.md (RBAC section), docs/architecture/data-models-and-schema-changes.md (User model)
+- CHANGELOG.md ([Unreleased] Added entry)
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-08-11 | 0.1 | Story drafted from Epic 8 PRD + codebase exploration (auth stack, migration numbering trap, scrub surface, e2e profile shape). Design deviations recorded in Dev Notes: middleware factory instead of in-handler macro, session-invalidation instead of per-request role re-read, users table replaces admin_users. | Romain G. |
+| 2026-08-11 | 0.6 | Phase 5 (AC #9 + IV3, closure): rbac + rbac-workers e2e profiles (compose, run.sh phase 5, runner Dockerfile registration, 37-assertion smoke incl. rate-limit window wait), migration guide + security.md RBAC section, CHANGELOG entry, run-tests skill CI=true note. Full verification: product-crate tests + CI clippy + cargo audit clean (ammonia bumped 4.1.3->4.1.4 for RUSTSEC-2026-0213), frontend gates clean, e2e 37/37 in both modes. Status -> Review. | Romain G. |
 | 2026-08-11 | 0.5 | Phase 4 (AC #7 + AC #8 frontend): `auth.ts` role-aware store + `canWrite`/`isSuperAdmin`, api.ts Role/Me/Users types + users CRUD methods + global 403 toast, App boot via `/auth/me`, Login carries role, PasswordChange mirrors the 14+classes policy, `UsersAccessTab.svelte` (table, create dialog, role dropdown, disable toggle, password reset, self/delete affordances), SuperAdmin-gated in Settings. Role sweep across 20 files: routes pages gated `$canWrite`, settings-write tabs (`/settings*`, dns-providers, notifications, cert-export, config import, binary upgrade) gated `$isSuperAdmin`; read-only exports/filters/WS untouched. Gates: svelte-check 0 errors, tsc clean, eslint clean, vitest 363/363. | Romain G. |
 | 2026-08-11 | 0.4 | Phase 3 (AC #5 #6 + Viewer scrub): `middleware/authorize.rs` policy middleware (matrix as pure `required_role(method, path)` fn + 6 unit tests), `users.rs` CRUD (username validation, policy-checked passwords, 409 on duplicate, admin-reset sets must_change_password, session invalidation on role change/disable/password reset, last-SuperAdmin + self-delete guards), `RL_USERS` bucket, OpenAPI (Users paths + User schema + Forbidden response). 5 integration tests incl. demote-invalidates-session and 403-before-lookup on cert download. 548 lorica-api tests green; clippy clean. | Romain G. |
 | 2026-08-11 | 0.3 | Phase 2 (AC #3 #4 + AC #8 server side): legacy `{password}` login shim (username optional -> admin), disabled-account 401 post-verify with generic message (no enumeration, no timing oracle), `LoginResponse` gains username+role, `GET /api/v1/auth/me`, shared `verify_password` helper, `password_policy.rs` validator (min 14 via `password_min_length`, complexity via `password_require_complexity`, 128 cap; char-count not bytes), `change_password` now policy-driven (settings read inside the db_blocking closure, current-password check first so wrong-current = 401 not 400), OpenAPI updated (login/me/Role schema). Tests: 5 new integration tests + 7 policy unit tests; 536 lorica-api + 197 lorica-config green; clippy clean. | Romain G. |
