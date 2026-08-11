@@ -62,6 +62,33 @@ uploads are gated on an operator-managed Ed25519 signature; see
 - Use socat or SSH tunnel for remote administration
 - Proxy ports (80/443) are the only externally exposed services
 
+### Access control (RBAC, v1.6.0)
+
+Multi-user role-based access control on the management API and
+dashboard (Story 8.3):
+
+- Three roles: `super_admin` (everything, including user management,
+  settings writes, config import, and binary upgrades), `operator`
+  (full CRUD on the traffic plane: routes, backends, certificates,
+  WAF, SLA, probes, load tests, cache, bans; read-only settings),
+  `viewer` (read-only; certificate downloads and config export are
+  blocked, and stored secrets are masked in every response).
+- Authorization is a single fail-closed policy middleware
+  (`lorica-api/src/middleware/authorize.rs`): any state-mutating
+  method requires Operator minimum by default, so a future endpoint
+  cannot accidentally ship Viewer-mutable.
+- Sessions carry the role at login; any role change, disable, or
+  admin password reset invalidates every session of the target user
+  immediately (no stale-privilege window).
+- Login rejects disabled accounts with the same generic message and
+  post-verification timing as a wrong password (no account
+  enumeration oracle).
+- Password policy on set/change: minimum 14 characters plus
+  upper/lower/digit/symbol classes (tunable via
+  `password_min_length` / `password_require_complexity`); Argon2id
+  (19 MiB, t=2) for storage.
+- Migration details: [migrations/v1.6.0-rbac.md](migrations/v1.6.0-rbac.md).
+
 ### Database
 - SQLite with WAL mode for crash safety
 - `PRAGMA busy_timeout=5000` for concurrent worker access
