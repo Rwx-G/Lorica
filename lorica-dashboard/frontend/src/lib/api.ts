@@ -639,6 +639,46 @@ export interface LogsQuery {
   after_id?: number;
 }
 
+// --- Audit log (Story 8.9) ---
+
+/// One hash-chained operator-action record. `chain_hash` is the
+/// running chain digest ; `prev_chain_hash` links to the record
+/// before it. Newest first in list responses.
+export interface AuditRecord {
+  id: number;
+  timestamp: string;
+  operator_username: string;
+  operator_role: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  before_payload_hash: string;
+  after_payload_hash: string;
+  ip: string;
+  user_agent: string;
+  prev_chain_hash: string;
+  chain_hash: string;
+}
+
+export interface AuditQuery {
+  operator?: string;
+  action?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+  before_id?: number;
+}
+
+/// Result of the SuperAdmin-only chain integrity check. When
+/// `verified` is false, `first_break_id` / `first_break_reason`
+/// pinpoint the first row whose chain digest does not reconcile.
+export interface AuditVerifyResult {
+  verified: boolean;
+  total_rows: number;
+  first_break_id?: number;
+  first_break_reason?: string;
+}
+
 export interface DiskUsage {
   /// Short role label for the mount: `"root"` or `"data"`. The
   /// absolute path is intentionally not exposed (v1.5.0 hardening).
@@ -748,6 +788,13 @@ export interface GlobalSettingsResponse {
   cert_export_group_gid?: number | null;
   cert_export_file_mode?: number;
   cert_export_dir_mode?: number;
+  // Defense-in-depth data-plane bounds (Story 8.9).
+  audit_log_retention_days: number;
+  connection_limits_per_ip: number | null;
+  bot_stash_max_entries: number;
+  bot_stash_per_prefix_max: number;
+  mirror_max_concurrent_per_route: number;
+  mirror_max_concurrent_global: number;
 }
 
 export interface UpdateSettingsRequest {
@@ -784,6 +831,13 @@ export interface UpdateSettingsRequest {
   cert_export_group_gid?: number | null;
   cert_export_file_mode?: number;
   cert_export_dir_mode?: number;
+  // Defense-in-depth data-plane bounds (Story 8.9).
+  audit_log_retention_days?: number;
+  connection_limits_per_ip?: number | null;
+  bot_stash_max_entries?: number;
+  bot_stash_per_prefix_max?: number;
+  mirror_max_concurrent_per_route?: number;
+  mirror_max_concurrent_global?: number;
 }
 
 export interface CertExportAclResponse {
@@ -1133,6 +1187,22 @@ export const api = {
 
   clearLogs: () =>
     request<{ message: string }>('DELETE', '/logs'),
+
+  // Audit log (Story 8.9)
+  listAudit: (params: AuditQuery) => {
+    const query = new URLSearchParams();
+    if (params.operator) query.set('operator', params.operator);
+    if (params.action) query.set('action', params.action);
+    if (params.from) query.set('from', params.from);
+    if (params.to) query.set('to', params.to);
+    if (params.limit !== undefined) query.set('limit', String(params.limit));
+    if (params.before_id !== undefined) query.set('before_id', String(params.before_id));
+    const qs = query.toString();
+    return request<{ entries: AuditRecord[]; total: number }>('GET', `/audit${qs ? `?${qs}` : ''}`);
+  },
+
+  verifyAudit: () =>
+    request<AuditVerifyResult>('GET', '/audit/verify'),
 
   getSystem: () =>
     request<SystemResponse>('GET', '/system'),

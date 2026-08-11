@@ -21,6 +21,15 @@
     geoip_auto_update_enabled: boolean;
     asn_db_path: string;
     asn_auto_update_enabled: boolean;
+    // Defense-in-depth data-plane bounds (Story 8.9).
+    // connection_limits_per_ip is a free-form text field so an
+    // empty input means "no cap" (mapped to null on save).
+    audit_log_retention_days: number;
+    connection_limits_per_ip: string;
+    bot_stash_max_entries: number;
+    bot_stash_per_prefix_max: number;
+    mirror_max_concurrent_per_route: number;
+    mirror_max_concurrent_global: number;
   }
 
   interface Props {
@@ -49,6 +58,31 @@
   function checkTrustedProxies() { trustedProxiesErr = cidrListErr(settingsForm.trusted_proxies); }
   function checkDenyCidrs() { denyCidrsErr = cidrListErr(settingsForm.connection_deny_cidrs); }
   function checkAllowCidrs() { allowCidrsErr = cidrListErr(settingsForm.connection_allow_cidrs); }
+
+  // Defense-in-depth numeric bounds (Story 8.9). Empty is treated
+  // as "unset"; the connection limit additionally accepts 0 as
+  // "no cap".
+  function numErr(raw: number | string, min: number, max: number): string | null {
+    const str = String(raw).trim();
+    if (str === '') return null;
+    const n = Number(str);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      return `value must be an integer in ${min}..${max}`;
+    }
+    return null;
+  }
+  let auditRetentionErr = $state<string | null>(null);
+  let connLimitErr = $state<string | null>(null);
+  let botStashMaxErr = $state<string | null>(null);
+  let botStashPrefixErr = $state<string | null>(null);
+  let mirrorRouteErr = $state<string | null>(null);
+  let mirrorGlobalErr = $state<string | null>(null);
+  function checkAuditRetention() { auditRetentionErr = numErr(settingsForm.audit_log_retention_days, 1, 3650); }
+  function checkConnLimit() { connLimitErr = numErr(settingsForm.connection_limits_per_ip, 0, 1_000_000); }
+  function checkBotStashMax() { botStashMaxErr = numErr(settingsForm.bot_stash_max_entries, 1, 10_000_000); }
+  function checkBotStashPrefix() { botStashPrefixErr = numErr(settingsForm.bot_stash_per_prefix_max, 1, 1_000_000); }
+  function checkMirrorRoute() { mirrorRouteErr = numErr(settingsForm.mirror_max_concurrent_per_route, 1, 1_000_000); }
+  function checkMirrorGlobal() { mirrorGlobalErr = numErr(settingsForm.mirror_max_concurrent_global, 1, 1_000_000); }
 </script>
 
 <section class="settings-section">
@@ -187,6 +221,101 @@
           Opt in after reading the CC-BY 4.0 attribution note in
           <code>NOTICE</code>.
         </span>
+      </div>
+
+      <h3>Defense in depth</h3>
+      <p class="section-hint">
+        Data-plane hardening bounds. Caps on connection fan-out,
+        bot-challenge memory, request-mirroring concurrency, and
+        audit-log retention. All hot-reload on save.
+      </p>
+
+      <div class="settings-form-row">
+        <label for="audit-retention">Audit log retention (days)</label>
+        <input
+          id="audit-retention"
+          type="number"
+          min="1"
+          max="3650"
+          bind:value={settingsForm.audit_log_retention_days}
+          onblur={checkAuditRetention} oninput={checkAuditRetention}
+        />
+        {#if auditRetentionErr}<span class="field-error" role="alert">{auditRetentionErr}</span>{/if}
+        <span class="hint">Operator audit records older than this are purged. Default 90.</span>
+      </div>
+
+      <div class="settings-form-row">
+        <label for="conn-limit-per-ip">Connection limit per IP</label>
+        <input
+          id="conn-limit-per-ip"
+          type="text"
+          inputmode="numeric"
+          bind:value={settingsForm.connection_limits_per_ip}
+          placeholder="(no cap)"
+          autocomplete="off"
+          onblur={checkConnLimit} oninput={checkConnLimit}
+        />
+        {#if connLimitErr}<span class="field-error" role="alert">{connLimitErr}</span>{/if}
+        <span class="hint">
+          Max simultaneous connections from a single client IP,
+          dropped at accept time above the cap. Empty or 0 = no cap.
+        </span>
+      </div>
+
+      <div class="settings-form-row">
+        <label for="bot-stash-max">Bot challenge stash - max entries</label>
+        <input
+          id="bot-stash-max"
+          type="number"
+          min="1"
+          max="10000000"
+          bind:value={settingsForm.bot_stash_max_entries}
+          onblur={checkBotStashMax} oninput={checkBotStashMax}
+        />
+        {#if botStashMaxErr}<span class="field-error" role="alert">{botStashMaxErr}</span>{/if}
+        <span class="hint">Global cap on stored bot-protection challenge entries. Default 10000.</span>
+      </div>
+
+      <div class="settings-form-row">
+        <label for="bot-stash-prefix">Bot challenge stash - per-prefix max</label>
+        <input
+          id="bot-stash-prefix"
+          type="number"
+          min="1"
+          max="1000000"
+          bind:value={settingsForm.bot_stash_per_prefix_max}
+          onblur={checkBotStashPrefix} oninput={checkBotStashPrefix}
+        />
+        {#if botStashPrefixErr}<span class="field-error" role="alert">{botStashPrefixErr}</span>{/if}
+        <span class="hint">Per source-prefix cap on bot-protection challenge entries. Default 100.</span>
+      </div>
+
+      <div class="settings-form-row">
+        <label for="mirror-per-route">Mirror concurrency - per route</label>
+        <input
+          id="mirror-per-route"
+          type="number"
+          min="1"
+          max="1000000"
+          bind:value={settingsForm.mirror_max_concurrent_per_route}
+          onblur={checkMirrorRoute} oninput={checkMirrorRoute}
+        />
+        {#if mirrorRouteErr}<span class="field-error" role="alert">{mirrorRouteErr}</span>{/if}
+        <span class="hint">Cap on in-flight mirrored requests per route. Default 32.</span>
+      </div>
+
+      <div class="settings-form-row">
+        <label for="mirror-global">Mirror concurrency - global</label>
+        <input
+          id="mirror-global"
+          type="number"
+          min="1"
+          max="1000000"
+          bind:value={settingsForm.mirror_max_concurrent_global}
+          onblur={checkMirrorGlobal} oninput={checkMirrorGlobal}
+        />
+        {#if mirrorGlobalErr}<span class="field-error" role="alert">{mirrorGlobalErr}</span>{/if}
+        <span class="hint">Global cap on in-flight mirrored requests. Default 4096.</span>
       </div>
 
       {#if settingsError}
