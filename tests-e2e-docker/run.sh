@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Run the Lorica E2E test suite with Docker Compose.
-# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-hot-upgrade]
+# Usage: ./run.sh [--build] [--keep] [--skip-workers] [--skip-cert-export] [--skip-ai-bot] [--skip-rbac] [--skip-hot-upgrade]
 #   --build             Force rebuild all images
 #   --keep              Don't tear down containers after tests
 #   --skip-workers      Skip worker isolation tests (faster)
 #   --skip-cert-export  Skip the v1.4.1 cert-export profile (faster)
 #   --skip-ai-bot       Skip the v1.6.0 Story 8.2 AI-bot profile (faster)
+#   --skip-rbac         Skip the v1.6.0 Story 8.3 RBAC profile (faster)
 #   --skip-hot-upgrade  Skip the v1.6.0 Story 8.4 hot binary-upgrade profile (faster)
 
 set -euo pipefail
@@ -16,6 +17,7 @@ KEEP=false
 SKIP_WORKERS=false
 SKIP_CERT_EXPORT=false
 SKIP_AI_BOT=false
+SKIP_RBAC=false
 SKIP_HOT_UPGRADE=false
 
 for arg in "$@"; do
@@ -25,6 +27,7 @@ for arg in "$@"; do
         --skip-workers)      SKIP_WORKERS=true ;;
         --skip-cert-export)  SKIP_CERT_EXPORT=true ;;
         --skip-ai-bot)       SKIP_AI_BOT=true ;;
+        --skip-rbac)         SKIP_RBAC=true ;;
         --skip-hot-upgrade)  SKIP_HOT_UPGRADE=true ;;
     esac
 done
@@ -42,7 +45,7 @@ fi
 # `down -v` skips their containers and named volumes; the next run then
 # boots against stale data (e.g. the cert-export smoke rotates the
 # admin password, and a stale volume 401s the next run's login).
-ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile hot-upgrade"
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile hot-upgrade"
 
 # ---- Phase 1: Single-process tests ----
 echo "=== Lorica E2E Tests (single-process) ==="
@@ -171,7 +174,58 @@ if [ "$SKIP_AI_BOT" = false ] && [ "$EXIT_CODE" = "0" ]; then
     fi
 fi
 
-# ---- Phase 5: Hot binary-upgrade profile (Story 8.4, IV1/IV3) -------
+# ---- Phase 5: RBAC profile (Story 8.3, IV3; single-process + workers) --
+# Users CRUD, per-role 403 matrix, session invalidation, legacy login
+# shim, last-super-admin guards. Opt-out via --skip-rbac (default ON).
+if [ "$SKIP_RBAC" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (RBAC profile) ==="
+    echo ""
+
+    docker compose --profile rbac up $BUILD_FLAG -d lorica-rbac
+
+    echo "Waiting for Lorica (rbac) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica-rbac curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (rbac) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (rbac) did not start within 120s"
+            docker compose logs lorica-rbac | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    docker compose --profile rbac run --rm rbac-smoke || EXIT_CODE=$?
+
+    if [ "$SKIP_WORKERS" = false ] && [ "$EXIT_CODE" = "0" ]; then
+        echo ""
+        echo "=== Lorica E2E Tests (RBAC, worker mode) ==="
+        echo ""
+
+        docker compose --profile rbac-workers up $BUILD_FLAG -d lorica-rbac-workers
+
+        echo "Waiting for Lorica (rbac workers) to initialize..."
+        for i in $(seq 1 60); do
+            if docker compose exec -T lorica-rbac-workers curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+                echo "Lorica (rbac workers) is ready."
+                break
+            fi
+            if [ "$i" = "60" ]; then
+                echo "ERROR: Lorica (rbac workers) did not start within 120s"
+                docker compose logs lorica-rbac-workers | tail -20
+                break
+            fi
+            sleep 2
+        done
+
+        docker compose --profile rbac-workers run --rm rbac-smoke-workers || EXIT_CODE=$?
+    fi
+fi
+
+# ---- Phase 6: Hot binary-upgrade profile (Story 8.4, IV1/IV3) -------
 # Boots Lorica in supervisor/workers mode and drives a live zero-downtime
 # binary swap while sustained traffic flows through the proxy. Opt-out
 # via --skip-hot-upgrade (default ON).

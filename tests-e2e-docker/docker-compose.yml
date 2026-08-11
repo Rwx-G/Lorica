@@ -599,6 +599,78 @@ services:
     networks:
       - e2e
 
+  # ---- RBAC E2E (v1.6.0 Story 8.3, IV3) ------------------------------
+  # Exercises the three roles end-to-end: users CRUD, per-role 403
+  # matrix, session invalidation on role change / disable, the legacy
+  # {password}-only login shim, and the last-super-admin guards.
+  # Dedicated volumes: the smoke creates users and rotates the admin
+  # password, so its state must not leak into other profiles.
+  lorica-rbac:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["rbac"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-rbac-data:/var/lib/lorica
+      - shared-rbac:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  rbac-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["rbac"]
+    entrypoint: ["bash", "run-rbac-smoke.sh"]
+    depends_on:
+      - lorica-rbac
+    volumes:
+      - shared-rbac:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-rbac:9443
+      - LORICA_PROXY=http://lorica-rbac:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
+  # RBAC E2E in WORKER MODE. Sessions, users and role checks are
+  # supervisor-only state; this profile proves the management API
+  # behaves identically when Lorica runs with --workers 2.
+  lorica-rbac-workers:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    entrypoint: ["/entrypoint-workers.sh"]
+    profiles: ["rbac-workers"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-rbac-workers-data:/var/lib/lorica
+      - shared-rbac-workers:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  rbac-smoke-workers:
+    build:
+      context: ./test-runner
+    profiles: ["rbac-workers"]
+    entrypoint: ["bash", "run-rbac-smoke.sh"]
+    depends_on:
+      - lorica-rbac-workers
+    volumes:
+      - shared-rbac-workers:/shared:ro
+    environment:
+      - LORICA_API=http://lorica-rbac-workers:9443
+      - LORICA_PROXY=http://lorica-rbac-workers:8080
+      - BACKEND1_ADDR=backend1:80
+    networks:
+      - e2e
+
   # ---- Hot binary-upgrade E2E (v1.6.0 Story 8.4, IV1/IV3) ------------
   # Boots Lorica in supervisor/workers mode (the zero-downtime handoff
   # only exists in supervisor mode) and drives a live binary swap over
@@ -678,6 +750,8 @@ volumes:
   lorica-cert-export-data:
   lorica-ai-bot-data:
   lorica-ai-bot-workers-data:
+  lorica-rbac-data:
+  lorica-rbac-workers-data:
   shared:
   shared-workers:
   shared-bot-workers:
@@ -689,6 +763,8 @@ volumes:
   shared-cert-export:
   shared-ai-bot:
   shared-ai-bot-workers:
+  shared-rbac:
+  shared-rbac-workers:
 
 networks:
   e2e:
