@@ -460,6 +460,11 @@ pub(crate) fn run_single_process(cli: Cli) {
         // store failed to open.
         startup::spawn_retention_loop(log_store.clone(), Arc::clone(&store));
 
+        // Background OCSP-staple refresh (Story 8.5). Reload swaps cert
+        // bodies with no staple; this loop attaches OCSP responses out
+        // of band, nudged immediately after each reload.
+        startup::spawn_ocsp_refresh_loop(Arc::clone(&cert_resolver), Arc::clone(&store));
+
         // Background task: reload proxy config, cert resolver, and probe scheduler when API signals a change
         let reload_store = Arc::clone(&store);
         let reload_config = Arc::clone(&proxy_config);

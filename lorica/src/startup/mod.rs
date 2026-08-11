@@ -315,6 +315,133 @@ pub(crate) fn spawn_retention_loop(
     });
 }
 
+/// Spawn the background OCSP-staple refresh loop (Story 8.5).
+///
+/// The cert resolver reloads cert bodies only (OCSP fetching was lifted
+/// off the reload critical path, so a slow responder no longer delays a
+/// freshly installed cert from being served). This loop attaches the
+/// staples out-of-band: every 6 hours - or immediately when
+/// [`crate::reload::ocsp_refresh_notify`] fires right after a cert
+/// install / rotation - it re-reads the route-referenced certs from the
+/// store, fetches a fresh staple per cert over the shared
+/// `lorica_tls::ocsp` HTTP client, and arc-swaps them into the resolver
+/// via [`lorica_tls::cert_resolver::CertResolver::refresh_staples`].
+///
+/// The `min(nextUpdate - now, 6h)` cadence from the story AC collapses
+/// to a flat 6 h for every real-world CA (public OCSP `nextUpdate` is
+/// days out, so the `6h` cap always wins); the notify path covers the
+/// "staple a freshly installed cert within seconds" requirement. Must be
+/// called from within a tokio runtime context; the `JoinHandle` is
+/// detached (the loop lives for the whole process, like the resolver).
+pub(crate) fn spawn_ocsp_refresh_loop(
+    cert_resolver: Arc<lorica_tls::cert_resolver::CertResolver>,
+    config_store: Arc<Mutex<ConfigStore>>,
+) {
+    const OCSP_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+    tokio::spawn(async move {
+        // Per-domain instant of the last successful staple, feeding the
+        // `cert_resolver_pending_ocsp_seconds` gauge.
+        let mut last_ok: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        let mut interval = tokio::time::interval(OCSP_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            // First `tick()` fires immediately, so boot certs get stapled
+            // right away; thereafter the timer or a post-reload notify
+            // wakes the loop, whichever comes first.
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = lorica::reload::ocsp_refresh_notify().notified() => {}
+            }
+
+            // Snapshot the route-referenced certs under the store lock,
+            // then drop it before any network I/O.
+            let active_certs = {
+                let s = config_store.lock().await;
+                let certs = match s.list_certificates() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(error = %e, "OCSP refresh: failed to list certificates");
+                        continue;
+                    }
+                };
+                let active_ids: std::collections::HashSet<String> = match s.list_routes() {
+                    Ok(routes) => routes
+                        .iter()
+                        .filter_map(|r| r.certificate_id.clone())
+                        .collect(),
+                    Err(e) => {
+                        warn!(error = %e, "OCSP refresh: failed to list routes");
+                        continue;
+                    }
+                };
+                certs
+                    .into_iter()
+                    .filter(|c| active_ids.contains(&c.id))
+                    .collect::<Vec<_>>()
+            };
+
+            if active_certs.is_empty() {
+                continue;
+            }
+
+            let fetches = active_certs
+                .iter()
+                .map(|c| lorica_tls::ocsp::try_fetch_ocsp(&c.cert_pem));
+            let responses = futures_util::future::join_all(fetches).await;
+
+            let now = std::time::Instant::now();
+            let mut staples: std::collections::HashMap<String, Vec<u8>> =
+                std::collections::HashMap::new();
+            let mut ok: u64 = 0;
+            let mut fail: u64 = 0;
+
+            for (c, resp) in active_certs.iter().zip(responses) {
+                let domains: Vec<String> = std::iter::once(c.domain.to_lowercase())
+                    .chain(c.san_domains.iter().map(|s| s.to_lowercase()))
+                    .collect();
+                match resp {
+                    Some(bytes) => {
+                        ok += 1;
+                        for d in domains {
+                            last_ok.insert(d.clone(), now);
+                            lorica_api::metrics::set_cert_resolver_pending_ocsp_seconds(&d, 0.0);
+                            staples.insert(d, bytes.clone());
+                        }
+                    }
+                    None => {
+                        fail += 1;
+                        for d in &domains {
+                            // Age the gauge only for domains that were
+                            // stapled before; a never-stapled domain is
+                            // "no staple yet", not "aging".
+                            if let Some(t) = last_ok.get(d) {
+                                let age = now.duration_since(*t).as_secs_f64();
+                                lorica_api::metrics::set_cert_resolver_pending_ocsp_seconds(d, age);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !staples.is_empty() {
+                let stats = cert_resolver.refresh_staples(&staples);
+                info!(
+                    refreshed = stats.refreshed,
+                    unchanged = stats.unchanged,
+                    ok,
+                    fail,
+                    "OCSP staples refreshed"
+                );
+            }
+            lorica_api::metrics::inc_ocsp_refresh_by("ok", ok);
+            lorica_api::metrics::inc_ocsp_refresh_by("fail", fail);
+        }
+    });
+}
+
 /// Spawn the backend health-check loop (audit H-9 dedup).
 ///
 /// Reads `default_health_check_interval_s` from `GlobalSettings`

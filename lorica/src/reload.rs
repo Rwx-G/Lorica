@@ -848,6 +848,19 @@ async fn build_proxy_config_inner(
 /// at the per-process level is the simplest correct fix.
 static CERT_RESOLVER_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Process-wide nudge from [`reload_cert_resolver`] to the background
+/// `ocsp_refresh_loop` (Story 8.5). Reload now swaps cert bodies with no
+/// OCSP staple; firing this after the swap lets the loop staple the
+/// fresh certs within a few seconds instead of waiting for its next
+/// periodic tick.
+static OCSP_REFRESH_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Handle to the OCSP-refresh nudge. The background loop awaits
+/// [`tokio::sync::Notify::notified`] on it alongside its periodic timer.
+pub fn ocsp_refresh_notify() -> &'static tokio::sync::Notify {
+    &OCSP_REFRESH_NOTIFY
+}
+
 /// Reload the TLS certificate resolver from the database.
 /// Only loads certificates that are actively referenced by at least one route.
 /// Called alongside `reload_proxy_config` when certificates change.
@@ -867,6 +880,7 @@ pub async fn reload_cert_resolver(
     let db_certs = match s.list_certificates() {
         Ok(c) => c,
         Err(e) => {
+            lorica_api::metrics::inc_cert_resolver_reload("fail");
             warn!(error = %e, "failed to list certificates for resolver reload");
             return;
         }
@@ -879,13 +893,20 @@ pub async fn reload_cert_resolver(
             .filter_map(|r| r.certificate_id.clone())
             .collect(),
         Err(e) => {
+            lorica_api::metrics::inc_cert_resolver_reload("fail");
             warn!(error = %e, "failed to list routes for resolver reload");
             return;
         }
     };
 
-    // Build CertData with OCSP staple responses fetched in parallel.
-    // Drop the store lock before doing network I/O.
+    // Build cert bodies only - no OCSP fetch on the reload critical
+    // path (Story 8.5 AC #3). Stapling used to run a 10 s-per-responder
+    // parallel fetch here, so a slow OCSP responder delayed the TLS
+    // listener from serving a freshly installed cert by up to 10 s. The
+    // staples are now attached by the background `ocsp_refresh_loop`,
+    // nudged via `OCSP_REFRESH_NOTIFY` right after this swap (typically
+    // stapled within a few seconds). Drop the store lock before the
+    // (now purely CPU) key parsing in `reload`.
     let active_certs: Vec<_> = db_certs
         .iter()
         .filter(|c| active_cert_ids.contains(&c.id))
@@ -893,27 +914,21 @@ pub async fn reload_cert_resolver(
         .collect();
     drop(s);
 
-    let ocsp_futures: Vec<_> = active_certs
-        .iter()
-        .map(|c| lorica_tls::ocsp::try_fetch_ocsp(&c.cert_pem))
-        .collect();
-    let ocsp_responses = futures_util::future::join_all(ocsp_futures).await;
-
     let cert_data: Vec<CertData> = active_certs
         .iter()
-        .zip(ocsp_responses)
-        .map(|(c, ocsp)| CertData {
+        .map(|c| CertData {
             domain: c.domain.clone(),
             san_domains: c.san_domains.clone(),
             cert_pem: c.cert_pem.clone(),
             key_pem: c.key_pem.clone(),
             not_after_epoch: c.not_after.timestamp(),
-            ocsp_response: ocsp,
+            ocsp_response: None,
         })
         .collect();
 
     match cert_resolver.reload(cert_data) {
         Ok(stats) => {
+            lorica_api::metrics::inc_cert_resolver_reload("ok");
             if stats.skipped > 0 {
                 lorica_api::metrics::inc_certificates_invalid_bundle_by(
                     "reload",
@@ -924,10 +939,16 @@ pub async fn reload_cert_resolver(
                 domains = cert_resolver.domain_count(),
                 skipped = stats.skipped,
                 total = stats.total,
-                "TLS certificate resolver reloaded"
+                "TLS certificate resolver reloaded (OCSP staples deferred to background refresh)"
             );
+            // Nudge the background OCSP loop so the fresh certs get
+            // stapled promptly instead of at the next periodic tick.
+            OCSP_REFRESH_NOTIFY.notify_one();
         }
-        Err(e) => warn!(error = %e, "failed to reload TLS certificate resolver"),
+        Err(e) => {
+            lorica_api::metrics::inc_cert_resolver_reload("fail");
+            warn!(error = %e, "failed to reload TLS certificate resolver");
+        }
     }
 }
 

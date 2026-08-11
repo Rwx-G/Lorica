@@ -21,6 +21,7 @@ Author: Rwx-G
 
 ### Changed
 
+- Cert-resolver reliability pass (Epic 8 Story 8.5): OCSP staple fetching moved off the certificate-reload critical path into a background refresh loop. A certificate reload now swaps cert bodies only and is observable on the TLS listener in ~200 ms instead of waiting up to 10 s for a slow OCSP responder; the staple is attached out of band within a few seconds (the loop is nudged immediately after each reload and otherwise refreshes every 6 h). Staple hot-swaps and cert-body reloads never block each other on the network, and neither drops in-flight handshakes. The OCSP HTTP client is now a shared connection pool instead of one client per fetch. New metrics: `lorica_cert_resolver_reload_total{result}`, `lorica_ocsp_refresh_total{result}`, `lorica_cert_resolver_active_domains`, `lorica_cert_resolver_pending_ocsp_seconds{domain}`. Certificate reload was already partial-tolerant (a single malformed row is skipped, the rest still publish). See `docs/architecture/cert-resolver.md`.
 - New internal `lorica-metrics` crate (Epic 8 Story 8.11): the shared Prometheus registry, the metric-registration helpers, and the cross-worker counter aggregation were extracted from `lorica-api` into `lorica-metrics`, which re-exports `prometheus`. This breaks the `lorica-api -> lorica-bench / lorica-notify` dependency cycle so those crates can register their own counters. Metric names and `/metrics` output are unchanged.
 
 ## [1.5.13] - 2026-07-08

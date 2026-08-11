@@ -688,6 +688,11 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     // the worker accept loops; without aggregation the supervisor's
     // /metrics would always read 0 in multi-worker mode.
     "lorica_per_ip_connection_refused_total",
+    // Cert-resolver reload + OCSP background-refresh outcomes (Story
+    // 8.5) fire inside the workers (the resolver lives there); without
+    // aggregation the supervisor's /metrics never sees them.
+    "lorica_cert_resolver_reload_total",
+    "lorica_ocsp_refresh_total",
 ];
 
 /// Re-export of the worker -> supervisor wire tuple. The lorica
@@ -750,6 +755,13 @@ fn resolve_per_worker_counter(
         }
         "lorica_per_ip_connection_refused_total" => {
             Some((&[], CounterTarget::Scalar(&PER_IP_CONNECTION_REFUSED_TOTAL)))
+        }
+        "lorica_cert_resolver_reload_total" => Some((
+            &["result"],
+            CounterTarget::Vec(&CERT_RESOLVER_RELOAD_TOTAL),
+        )),
+        "lorica_ocsp_refresh_total" => {
+            Some((&["result"], CounterTarget::Vec(&OCSP_REFRESH_TOTAL)))
         }
         _ => None,
     }
@@ -1106,6 +1118,116 @@ pub fn inc_certificates_invalid_bundle_by(source: &str, count: u64) {
         .inc_by(count);
 }
 
+// --- Story 8.5: cert-resolver reliability -------------------------------
+
+/// Counter: cert-resolver reloads by outcome. `result` is `"ok"` (the
+/// arc-swap published a fresh table) or `"fail"` (a store read failed
+/// and the resolver kept its previous state). The resolver lives in the
+/// workers, so this is per-worker aggregated - see
+/// [`PER_WORKER_COUNTERS`]; the supervisor sums worker deltas rather
+/// than carrying a `worker_id` label (the established Lorica pattern).
+static CERT_RESOLVER_RELOAD_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "cert_resolver_reload_total",
+            "Cert-resolver reloads by outcome (result=ok|fail)"
+        )
+        .namespace("lorica"),
+        &["result"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Bump the cert-resolver reload counter. `result` is `"ok"` | `"fail"`.
+pub fn inc_cert_resolver_reload(result: &str) {
+    CERT_RESOLVER_RELOAD_TOTAL
+        .with_label_values(&[result])
+        .inc();
+}
+
+/// Counter: OCSP staple background-refresh fetches by outcome. `result`
+/// is `"ok"` (staple fetched and swapped in) or `"fail"` (a responder
+/// fetch failed for a still-registered cert). Per-worker aggregated.
+static OCSP_REFRESH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        prometheus::opts!(
+            "ocsp_refresh_total",
+            "OCSP staple background-refresh fetches by outcome (result=ok|fail)"
+        )
+        .namespace("lorica"),
+        &["result"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Bump the OCSP-refresh counter by `count` for `result` (`"ok"`|`"fail"`).
+pub fn inc_ocsp_refresh_by(result: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    OCSP_REFRESH_TOTAL
+        .with_label_values(&[result])
+        .inc_by(count);
+}
+
+/// Gauge: distinct domains the TLS cert resolver actively serves.
+///
+/// Refreshed supervisor-side from the store on every `/metrics` scrape
+/// (the supervisor process has no resolver of its own), so it reflects
+/// the route-referenced cert domain set in single-process AND worker
+/// modes without depending on the counter-only cross-worker machinery.
+static CERT_RESOLVER_ACTIVE_DOMAINS: Lazy<IntGauge> = Lazy::new(|| {
+    let gauge = IntGauge::with_opts(
+        prometheus::opts!(
+            "cert_resolver_active_domains",
+            "Distinct domains currently served by the TLS cert resolver"
+        )
+        .namespace("lorica"),
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(gauge.clone())).ok();
+    gauge
+});
+
+/// Set the active-domains gauge (called from the `/metrics` refresh).
+pub fn set_cert_resolver_active_domains(count: i64) {
+    CERT_RESOLVER_ACTIVE_DOMAINS.set(count);
+}
+
+/// Gauge: seconds since each domain last received a fresh OCSP staple
+/// (`0` right after a successful refresh). Labels: `domain`.
+///
+/// Set in-process by the OCSP refresh loop. In multi-worker mode this
+/// is a per-worker-process gauge and is NOT shipped to the supervisor's
+/// registry (Lorica's cross-worker aggregation covers counters only),
+/// so - like every runtime gauge - it is authoritative in
+/// single-process mode. The cross-worker OCSP signal is
+/// `ocsp_refresh_total`, which does aggregate.
+static CERT_RESOLVER_PENDING_OCSP_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::opts!(
+            "cert_resolver_pending_ocsp_seconds",
+            "Seconds since a domain last received a fresh OCSP staple"
+        )
+        .namespace("lorica"),
+        &["domain"],
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(gauge.clone())).ok();
+    gauge
+});
+
+/// Set the pending-OCSP-seconds gauge for `domain`.
+pub fn set_cert_resolver_pending_ocsp_seconds(domain: &str, seconds: f64) {
+    CERT_RESOLVER_PENDING_OCSP_SECONDS
+        .with_label_values(&[domain])
+        .set(seconds);
+}
+
 /// Counter: two-phase config reload rounds where the Commit phase
 /// partially succeeded - some workers committed, others failed
 /// (timeout / error). The supervisor coordinator falls back to the
@@ -1254,6 +1376,26 @@ pub async fn get_metrics(Extension(state): Extension<AppState>) -> impl IntoResp
             for c in &certs {
                 let days = (c.not_after - chrono::Utc::now()).num_days() as f64;
                 set_cert_expiry_days(&c.domain, days);
+            }
+            // Story 8.5: mirror the resolver's active-domain set from the
+            // store so the gauge is meaningful in worker mode too (the
+            // supervisor has no resolver). Counts distinct primary + SAN
+            // domains across certs referenced by at least one route -
+            // the same active-cert filter `reload_cert_resolver` applies.
+            if let Ok(routes) = store.list_routes() {
+                let active_cert_ids: std::collections::HashSet<String> = routes
+                    .iter()
+                    .filter_map(|r| r.certificate_id.clone())
+                    .collect();
+                let active_domains: std::collections::HashSet<String> = certs
+                    .iter()
+                    .filter(|c| active_cert_ids.contains(&c.id))
+                    .flat_map(|c| {
+                        std::iter::once(c.domain.to_lowercase())
+                            .chain(c.san_domains.iter().map(|s| s.to_lowercase()))
+                    })
+                    .collect();
+                set_cert_resolver_active_domains(active_domains.len() as i64);
             }
         }
     }

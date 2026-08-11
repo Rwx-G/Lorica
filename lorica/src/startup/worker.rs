@@ -732,6 +732,11 @@ pub(crate) fn run_worker(
         Duration::from_secs(5 * 60),
     );
     let _bot_stash_prune = lorica_proxy.spawn_bot_stash_prune(&worker_auth_prune_tracker);
+    // Background OCSP-staple refresh (Story 8.5). Each worker owns its
+    // own resolver, so each runs its own loop; the fetches are
+    // idempotent. Reload swaps cert bodies with no staple; this loop
+    // attaches OCSP responses out of band, nudged after each reload.
+    crate::startup::spawn_ocsp_refresh_loop(Arc::clone(&cert_resolver), Arc::clone(&store));
     // Spawn the cross-worker sync task when the supervisor provided
     // an RPC socketpair (production worker mode). The task drains
     // `LocalBucket::take_delta` every 100 ms, pushes the batch via
