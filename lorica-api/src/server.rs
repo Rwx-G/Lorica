@@ -348,6 +348,7 @@ pub fn build_router(
                 RL_WINDOW_S,
             )),
         )
+        .route("/api/v1/auth/me", get(crate::auth::me))
         .route("/api/v1/routes", get(crate::routes::list_routes))
         .route(
             "/api/v1/routes",

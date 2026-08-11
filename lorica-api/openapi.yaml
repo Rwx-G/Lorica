@@ -65,10 +65,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [username, password]
+              required: [password]
               properties:
                 username:
                   type: string
+                  description: >-
+                    Optional backwards-compat shim (pre-1.6.0 clients
+                    sent `{password}` only); defaults to `admin`.
                 password:
                   type: string
       responses:
@@ -87,6 +90,10 @@ paths:
                   data:
                     type: object
                     properties:
+                      username:
+                        type: string
+                      role:
+                        $ref: "#/components/schemas/Role"
                       must_change_password:
                         type: boolean
                       session_expires_at:
@@ -96,6 +103,31 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/RateLimited"
+
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: Identity and role behind the current session
+      responses:
+        "200":
+          description: Session identity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      username:
+                        type: string
+                      role:
+                        $ref: "#/components/schemas/Role"
+                      session_expires_at:
+                        type: string
+                        format: date-time
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /api/v1/auth/logout:
     post:
@@ -3075,6 +3107,14 @@ components:
         format: uuid
 
   schemas:
+    Role:
+      type: string
+      description: >-
+        RBAC role of a user account (Story 8.3). viewer is read-only
+        with secrets scrubbed; operator has full CRUD except settings
+        writes and user management; super_admin has full access.
+      enum: [super_admin, operator, viewer]
+
     CustomVerification:
       type: object
       description: >

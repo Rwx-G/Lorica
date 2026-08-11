@@ -31,10 +31,14 @@ fn argon2_hasher() -> argon2::Argon2<'static> {
 }
 
 /// JSON body for `POST /api/v1/auth/login`.
+///
+/// `username` is optional as a backwards-compat shim (Story 8.3
+/// AC #3): the pre-RBAC body was `{password}` only, and an omitted
+/// username routes to the migrated `admin` account.
 #[derive(Deserialize)]
 pub struct LoginRequest {
-    /// Username.
-    pub username: String,
+    /// Username; defaults to `"admin"` when omitted (legacy body).
+    pub username: Option<String>,
     /// Plaintext password (hashed Argon2id in the store).
     pub password: String,
 }
@@ -42,10 +46,27 @@ pub struct LoginRequest {
 /// Successful login payload returned in the `data` envelope.
 #[derive(Serialize)]
 pub struct LoginResponse {
+    /// Username of the authenticated account.
+    pub username: String,
+    /// RBAC role of the authenticated account (snake_case).
+    pub role: lorica_config::models::Role,
     /// `true` when the user must rotate their password on next login
     /// (post admin reset).
     pub must_change_password: bool,
     /// RFC 3339 expiry timestamp of the issued session cookie.
+    pub session_expires_at: String,
+}
+
+/// Payload of `GET /api/v1/auth/me`: the identity behind the
+/// current session cookie. The dashboard boot probe uses it to
+/// restore the role after a page refresh.
+#[derive(Serialize)]
+pub struct MeResponse {
+    /// Username of the session owner.
+    pub username: String,
+    /// RBAC role of the session owner (snake_case).
+    pub role: lorica_config::models::Role,
+    /// RFC 3339 expiry timestamp of the current session.
     pub session_expires_at: String,
 }
 
@@ -95,18 +116,22 @@ pub async fn login(
     // the Argon2 verification previously executed under the store
     // guard, so it stays inside the closure.
     let user = db_blocking(&state.store, move |store| {
+        // Legacy `{password}` body shim: route to the migrated
+        // single-admin account (Story 8.3 AC #3).
+        let username = body.username.as_deref().unwrap_or("admin");
         let user = store
-            .get_user_by_username(&body.username)
+            .get_user_by_username(username)
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::Unauthorized("invalid credentials".into()))?;
 
-        let parsed_hash = argon2::PasswordHash::new(&user.password_hash)
-            .map_err(|e| ApiError::Internal(format!("invalid stored password hash: {e}")))?;
+        verify_password(&body.password, &user.password_hash)?;
 
-        use argon2::PasswordVerifier;
-        argon2_hasher()
-            .verify_password(body.password.as_bytes(), &parsed_hash)
-            .map_err(|_| ApiError::Unauthorized("invalid credentials".into()))?;
+        // A disabled account fails AFTER the hash verification with
+        // the same generic message as a wrong password: timing and
+        // wording leak neither "user exists" nor "user disabled".
+        if user.disabled_at.is_some() {
+            return Err(ApiError::Unauthorized("invalid credentials".into()));
+        }
 
         // Update last_login_at
         let mut updated_user = user.clone();
@@ -127,6 +152,8 @@ pub async fn login(
         .unwrap_or_else(Utc::now);
 
     let response = LoginResponse {
+        username: user.username.clone(),
+        role: user.role,
         must_change_password: user.must_change_password,
         session_expires_at: expires_at.to_rfc3339(),
     };
@@ -161,39 +188,46 @@ pub async fn logout(
     )
 }
 
+/// GET /api/v1/auth/me - identity behind the current session.
+///
+/// Protected route: `require_auth` has already validated the cookie
+/// and injected the [`Session`] extension. The dashboard calls this
+/// on boot to restore `{username, role}` after a page refresh
+/// (Story 8.3 AC #4/#7).
+pub async fn me(Extension(session): Extension<Session>) -> impl IntoResponse {
+    json_data(MeResponse {
+        username: session.username.clone(),
+        role: session.role,
+        session_expires_at: session.expires_at.to_rfc3339(),
+    })
+}
+
 /// PUT /api/v1/auth/password - rotate the current user's password.
 ///
-/// Verifies the current password, enforces 8-128 character bounds
-/// on the new one, then invalidates **every** session belonging to
-/// this user (including the currently active one) and mints a
-/// fresh session. The response carries a `Set-Cookie` header with
-/// the new session id so the legitimate user stays logged in while
-/// any attacker holding the previous cookie gets a 401 on the
-/// next call (v1.5.0 audit LOW-13).
+/// Verifies the current password, enforces the configured password
+/// policy (`password_min_length` + `password_require_complexity`,
+/// Story 8.3 AC #8) on the new one, then invalidates **every**
+/// session belonging to this user (including the currently active
+/// one) and mints a fresh session. The response carries a
+/// `Set-Cookie` header with the new session id so the legitimate
+/// user stays logged in while any attacker holding the previous
+/// cookie gets a 401 on the next call (v1.5.0 audit LOW-13).
 pub async fn change_password(
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
     Extension(session): Extension<Session>,
     Json(body): Json<ChangePasswordRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if body.new_password.len() < 8 {
-        return Err(ApiError::BadRequest(
-            "new password must be at least 8 characters".into(),
-        ));
-    }
-    if body.new_password.len() > 128 {
-        return Err(ApiError::BadRequest(
-            "new password must not exceed 128 characters".into(),
-        ));
-    }
-
     // Verify current password + persist new hash. The ConfigStore
     // Mutex guard lives inside `db_blocking` and drops BEFORE calling
     // `session_store.create(...)` below : `SessionStore::create`
     // re-acquires the same `ConfigStore` Mutex to persist the new
     // session row, and holding both would deadlock. The Argon2
     // verify + re-hash previously ran under the guard, so they stay
-    // inside the closure (on the blocking pool).
+    // inside the closure (on the blocking pool). The policy check
+    // needs `GlobalSettings`, so it also runs inside the closure
+    // (single store acquisition, current-password check first so a
+    // wrong current password reads as 401 not 400).
     let user_id = session.user_id.clone();
     db_blocking(&state.store, move |store| {
         let user = store
@@ -201,13 +235,13 @@ pub async fn change_password(
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
 
-        let parsed_hash = argon2::PasswordHash::new(&user.password_hash)
-            .map_err(|e| ApiError::Internal(format!("invalid stored password hash: {e}")))?;
-
-        use argon2::PasswordVerifier;
-        argon2_hasher()
-            .verify_password(body.current_password.as_bytes(), &parsed_hash)
+        verify_password(&body.current_password, &user.password_hash)
             .map_err(|_| ApiError::Unauthorized("current password is incorrect".into()))?;
+
+        let settings = store
+            .get_global_settings()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        crate::password_policy::validate_password(&body.new_password, &settings)?;
 
         let new_hash = hash_password(&body.new_password)?;
         let mut updated_user = user;
@@ -241,6 +275,20 @@ pub async fn change_password(
             message: "Password updated".into(),
         }),
     ))
+}
+
+/// Verify a plaintext password against a stored Argon2id hash.
+///
+/// Returns 401 `invalid credentials` on mismatch; an unparseable
+/// stored hash is a 500 (corrupted row, not a user error). Shared
+/// by login, change-password, and the users CRUD.
+pub fn verify_password(password: &str, stored_hash: &str) -> Result<(), ApiError> {
+    use argon2::PasswordVerifier;
+    let parsed_hash = argon2::PasswordHash::new(stored_hash)
+        .map_err(|e| ApiError::Internal(format!("invalid stored password hash: {e}")))?;
+    argon2_hasher()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .map_err(|_| ApiError::Unauthorized("invalid credentials".into()))
 }
 
 /// Hash a password using argon2.

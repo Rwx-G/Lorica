@@ -31,6 +31,7 @@ pub mod log_writer;
 pub mod logs;
 pub mod metrics;
 pub mod middleware;
+pub mod password_policy;
 pub mod probes;
 pub mod routes;
 /// Axum router + shared `AppState` construction.

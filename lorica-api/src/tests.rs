@@ -257,7 +257,7 @@ async fn test_change_password() {
     let router3 = app(state, session_store, rate_limiter);
     let body = serde_json::json!({
         "current_password": known_password,
-        "new_password": "new_secure_password_456"
+        "new_password": "New_secure_password_456"
     });
 
     let req = Request::builder()
@@ -318,7 +318,7 @@ async fn test_change_password_rotates_session_cookie() {
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
     let body = serde_json::json!({
         "current_password": known_password,
-        "new_password": "new_secure_password_456",
+        "new_password": "New_secure_password_456",
     });
     let req = Request::builder()
         .method("PUT")
@@ -399,6 +399,166 @@ async fn test_rate_limiting() {
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         }
     }
+}
+
+#[tokio::test]
+async fn test_login_legacy_body_without_username_routes_to_admin() {
+    // Pre-RBAC clients send `{password}` only; the shim routes the
+    // login to the migrated `admin` account (Story 8.3 AC #3).
+    let (state, session_store, rate_limiter) = test_state().await;
+    let password = {
+        let store = state.store.lock().await;
+        ensure_admin_user(&store)
+            .expect("test setup")
+            .expect("test setup")
+    };
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "password": password });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["username"], "admin");
+    assert_eq!(json["data"]["role"], "super_admin");
+}
+
+#[tokio::test]
+async fn test_login_disabled_account_returns_401() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let password = {
+        let store = state.store.lock().await;
+        let password = ensure_admin_user(&store)
+            .expect("test setup")
+            .expect("test setup");
+        let mut user = store
+            .get_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup");
+        user.disabled_at = Some(chrono::Utc::now());
+        store.update_user(&user).expect("test setup");
+        password
+    };
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({ "username": "admin", "password": password });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Same generic message as a wrong password: no account-state
+    // enumeration.
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["error"]["message"], "unauthorized: invalid credentials");
+}
+
+#[tokio::test]
+async fn test_auth_me_returns_identity_and_role() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let cookie = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/auth/me")
+        .header("Cookie", &cookie)
+        .body(Body::empty())
+        .expect("test setup");
+
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    assert_eq!(json["data"]["username"], "admin");
+    assert_eq!(json["data"]["role"], "super_admin");
+    assert!(json["data"]["session_expires_at"].is_string());
+}
+
+#[tokio::test]
+async fn test_auth_me_unauthenticated_returns_401() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let router = app(state, session_store, rate_limiter);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/auth/me")
+        .body(Body::empty())
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_change_password_missing_complexity_returns_400() {
+    // Long enough (>= 14) but single character class: rejected by
+    // the complexity rule (Story 8.3 AC #8).
+    let (state, session_store, rate_limiter) = test_state().await;
+    let known_password = "test_password_123";
+    {
+        let store = state.store.lock().await;
+        ensure_admin_user(&store).expect("test setup");
+        let mut user = store
+            .get_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup");
+        user.password_hash = hash_password(known_password).expect("test setup");
+        store.update_user(&user).expect("test setup");
+    }
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let login_body = serde_json::json!({ "username": "admin", "password": known_password });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&login_body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    let cookie = format!(
+        "lorica_session={}",
+        extract_session_cookie(&response).expect("test setup")
+    );
+
+    let router = app(state, session_store, rate_limiter);
+    let body = serde_json::json!({
+        "current_password": known_password,
+        "new_password": "aaaaaaaaaaaaaaaaaa"
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/auth/password")
+        .header("Content-Type", "application/json")
+        .header("Cookie", cookie)
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 // ---- Routes CRUD Tests ----
@@ -3053,7 +3213,7 @@ async fn test_change_password_wrong_current_returns_401() {
     let router = app(state, session_store, rate_limiter);
     let body = serde_json::json!({
         "current_password": "wrong_password",
-        "new_password": "new_secure_password_456"
+        "new_password": "New_secure_password_456"
     });
 
     let req = Request::builder()

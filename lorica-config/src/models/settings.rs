@@ -309,6 +309,18 @@ pub struct GlobalSettings {
     #[serde(default = "default_ai_bot_inject_headers")]
     pub ai_bot_inject_headers: bool,
 
+    /// Minimum length enforced when a user sets or changes a
+    /// password (Story 8.3 AC #8). Applies to the change-password
+    /// flow and user CRUD, never to login verification. The upper
+    /// bound stays a fixed 128 (argon2 DoS guard).
+    #[serde(default = "default_password_min_length")]
+    pub password_min_length: u32,
+
+    /// Require at least one of each [upper, lower, digit, symbol]
+    /// class in new passwords (Story 8.3 AC #8). Default `true`.
+    #[serde(default = "default_password_require_complexity")]
+    pub password_require_complexity: bool,
+
     /// Filesystem path to the Ed25519 public key that
     /// `POST /api/v1/system/upgrade` verifies uploaded binaries
     /// against (Story 8.4). The file holds the 32-byte verifying key
@@ -443,6 +455,16 @@ impl Default for GlobalSettings {
             ai_bot_treat_spoofed_as: SpoofedFallback::default(),
             ai_bot_inject_headers: default_ai_bot_inject_headers(),
             upgrade_signing_pubkey_path: None,
+            password_min_length: default_password_min_length(),
+            password_require_complexity: default_password_require_complexity(),
         }
     }
+}
+
+fn default_password_min_length() -> u32 {
+    14
+}
+
+fn default_password_require_complexity() -> bool {
+    true
 }

@@ -206,6 +206,12 @@ impl ConfigStore {
                     settings.upgrade_signing_pubkey_path =
                         if value.is_empty() { None } else { Some(value) };
                 }
+                "password_min_length" => {
+                    settings.password_min_length = value.parse().unwrap_or(14);
+                }
+                "password_require_complexity" => {
+                    settings.password_require_complexity = value == "true" || value == "1";
+                }
                 _ => {}
             }
         }
@@ -413,6 +419,14 @@ impl ConfigStore {
                 .upgrade_signing_pubkey_path
                 .as_deref()
                 .unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('password_min_length', ?1)",
+            params![settings.password_min_length.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('password_require_complexity', ?1)",
+            params![settings.password_require_complexity.to_string()],
         )?;
         Ok(())
     }
