@@ -9,6 +9,8 @@ Author: Rwx-G
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-12
+
 ### Added
 
 - Defense-in-depth pass (Epic 8 Story 8.9): a tamper-evident admin audit log on every state-mutating management-API endpoint. Each entry records the operator identity (RBAC username + role), action, target, source IP, user-agent, and SHA-256 hashes of the before/after payloads (payloads themselves are never stored), linked in a SHA-256 hash chain. `GET /api/v1/audit` (Operator+) lists entries with operator / action-prefix / date-range filters; `GET /api/v1/audit/verify` (SuperAdmin) walks the chain and localises any tampering to the earliest affected row. Audit events also emit on the `lorica::audit` tracing target inside the request span for OTel correlation. Day-based retention (`audit_log_retention_days`, default 90) is chain-safe via a retention seal. New resource-exhaustion caps, all live-reloadable: a per-source-IP TCP connection cap (`connection_limits_per_ip`, refused at accept before TLS, counter `lorica_per_ip_connection_refused_total`); bot-challenge stash caps (`bot_stash_max_entries` / `bot_stash_per_prefix_max`, over-cap issuance returns `503 Retry-After: 30` instead of evicting legitimate challenges); and per-route mirror concurrency semaphores (`mirror_max_concurrent_per_route` / `mirror_max_concurrent_global`) so one slow shadow target cannot starve other routes. Dashboard Security tab gains an "Audit log" sub-page with filters and a chain-verify button.
