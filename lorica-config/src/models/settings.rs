@@ -316,6 +316,12 @@ pub struct GlobalSettings {
     #[serde(default = "default_password_min_length")]
     pub password_min_length: u32,
 
+    /// Days of admin audit-log history kept before chain-safe
+    /// truncation (Story 8.9 AC #9). `0` disables retention (rows
+    /// kept forever). Default 90.
+    #[serde(default = "default_audit_log_retention_days")]
+    pub audit_log_retention_days: u32,
+
     /// Require at least one of each [upper, lower, digit, symbol]
     /// class in new passwords (Story 8.3 AC #8). Default `true`.
     #[serde(default = "default_password_require_complexity")]
@@ -457,12 +463,17 @@ impl Default for GlobalSettings {
             upgrade_signing_pubkey_path: None,
             password_min_length: default_password_min_length(),
             password_require_complexity: default_password_require_complexity(),
+            audit_log_retention_days: default_audit_log_retention_days(),
         }
     }
 }
 
 fn default_password_min_length() -> u32 {
     14
+}
+
+fn default_audit_log_retention_days() -> u32 {
+    90
 }
 
 fn default_password_require_complexity() -> bool {

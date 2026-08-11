@@ -31,7 +31,7 @@ As a security-conscious operator, I want a structured admin audit log on every s
 
 ## Tasks
 
-- [ ] AC #2/#9 (audit storage): `audit_log` + `audit_log_meta` tables in `LogStore::open`; `insert_audit` computes the chain INSIDE the single `Mutex<Connection>` critical section (read last `chain_hash` + write row atomically, no writer-queue path); `query_audit` (operator / action-prefix / date-range filters + limit); `verify_audit_chain` (genesis or retention-seal start); `enforce_audit_retention_days` (day-based DELETE + seal write); retention hooked into `spawn_retention_loop` with new `audit_log_retention_days` setting (default 90).
+- [x] AC #2/#9 (audit storage): `audit_log` + `audit_log_meta` tables in `LogStore::open`; `insert_audit` computes the chain INSIDE the single `Mutex<Connection>` critical section (read last `chain_hash` + write row atomically, no writer-queue path); `query_audit` (operator / action-prefix / date-range filters + limit + before_id cursor, LIKE wildcards escaped); `verify_audit_chain` (genesis or retention-seal start); `enforce_audit_retention` (cutoff-based DELETE + seal write, empty-table case seals the tail); retention hooked into `spawn_retention_loop` with new `audit_log_retention_days` setting (default 90, 0 = keep forever).
 - [ ] AC #1/#4 (emission): `lorica-api/src/audit.rs` with `AuditEntry` builder + `record_audit(...)` helper (macro-or-fn per Dev Notes) that SHA-256-hashes before/after payloads, inserts via `spawn_blocking` (skip when `log_store` is `None`), and emits `tracing::info!(target: "lorica::audit", ...)`; light `api_request` span middleware so the event lands inside a request span; applied to every state-mutating handler (~45 real sites incl. sla / logs-clear / upgrade / ai-crawlers, see Dev Notes inventory).
 - [ ] AC #3/#8 API: `GET /api/v1/audit` (Operator+, authorize floor via existing GET+users-style carve-out) + `GET /api/v1/audit/verify` (SuperAdmin only); OpenAPI.
 - [ ] AC #5: per-IP connection cap. Fork change in `lorica-core` listeners: `ConnectionFilter` gains an RAII accept-permit so the count decrements on stream drop (see Dev Notes design); `GlobalConnectionFilter` gains `DashMap<IpAddr, AtomicU32>` + `ArcSwapOption<u32>` limit; `connection_limits_per_ip` setting plumbed via `PreparedReload`/`commit_prepared_reload`; `lorica_per_ip_connection_refused_total` counter registered via lorica-metrics + `PER_WORKER_COUNTERS` aggregation (refusals happen in worker processes).
@@ -90,7 +90,8 @@ API-only: `audit_log_retention_days`. Data-plane (need ProxyConfig or filter plu
 
 ### Debug Log
 
-(empty)
+- Phase 1: `ring` (already a lorica-api dep) provides SHA-256; no new dependency. Chain fields are hashed length-prefixed (u64 LE + bytes), not raw-concatenated - boundary-shift collisions (`ab|c` vs `a|bc`) are unit-tested. clippy `too_many_arguments` forced `compute_chain_hash(prev, &ChainInput)` with `From<&NewAuditEntry>` / `From<&AuditRecord>` conversions.
+- Retention seal semantics: seal = the earliest SURVIVING row's `prev_chain_hash`; when truncation empties the table, seal = newest deleted row's `chain_hash` so the NEXT insert still chains (tested). `insert_audit` prefers last-row hash > seal > genesis.
 
 ### Completion Notes
 
@@ -104,4 +105,5 @@ API-only: `audit_log_retention_days`. Data-plane (need ProxyConfig or filter plu
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-08-11 | 0.2 | Phase 1 (AC #2 #9 storage): audit.rs chain primitives (GENESIS, hash_payload, ChainInput, compute/recompute) + audit_log/audit_log_meta tables + insert/query/verify/retention in LogStore + audit_log_retention_days setting + hourly retention hook. 11 unit tests (chain round-trip, tamper localisation, middle-row deletion, seal survival incl. empty-table, filter escaping). lorica-api 559 tests green, clippy clean. | Romain G. |
 | 2026-08-11 | 0.1 | Story drafted from Epic 8 PRD + deep code exploration (LogStore retention, 57-handler mutation inventory, missing disconnect hook in forked listener, stash eviction-vs-refusal, mirror semaphore wiring, settings plumbing map). Deviations flagged in Dev Notes: helper fn instead of macro (AC #1), per-worker cap semantics (AC #5), stash refusal replaces eviction (AC #6), minimal API request span added for AC #4. | Romain G. |

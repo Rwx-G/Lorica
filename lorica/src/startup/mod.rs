@@ -272,15 +272,32 @@ pub(crate) fn spawn_retention_loop(
         let mut last_sla_purge_day: u32 = 0;
         loop {
             interval.tick().await;
-            let retention = {
+            let (retention, audit_retention_days) = {
                 let s = retention_config_store.lock().await;
                 s.get_global_settings()
-                    .map(|gs| gs.access_log_retention)
-                    .unwrap_or(100_000)
+                    .map(|gs| (gs.access_log_retention, gs.audit_log_retention_days))
+                    .unwrap_or((100_000, 90))
             };
             if retention > 0 {
                 if let Err(e) = retention_log_store.enforce_retention(retention as u64) {
                     tracing::warn!(error = %e, "access log retention cleanup failed");
+                }
+            }
+            // Audit-log retention is day-based and chain-safe: the
+            // store writes a retention seal before truncating so
+            // /api/v1/audit/verify keeps passing (Story 8.9 AC #9).
+            if audit_retention_days > 0 {
+                let cutoff = (chrono::Utc::now()
+                    - chrono::Duration::days(i64::from(audit_retention_days)))
+                .to_rfc3339();
+                match retention_log_store.enforce_audit_retention(&cutoff) {
+                    Ok(0) => {}
+                    Ok(deleted) => {
+                        tracing::info!(deleted, "audit log retention: expired rows sealed and removed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "audit log retention cleanup failed");
+                    }
                 }
             }
             {

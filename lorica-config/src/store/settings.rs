@@ -212,6 +212,9 @@ impl ConfigStore {
                 "password_require_complexity" => {
                     settings.password_require_complexity = value == "true" || value == "1";
                 }
+                "audit_log_retention_days" => {
+                    settings.audit_log_retention_days = value.parse().unwrap_or(90);
+                }
                 _ => {}
             }
         }
@@ -427,6 +430,10 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('password_require_complexity', ?1)",
             params![settings.password_require_complexity.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('audit_log_retention_days', ?1)",
+            params![settings.audit_log_retention_days.to_string()],
         )?;
         Ok(())
     }
