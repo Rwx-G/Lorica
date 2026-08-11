@@ -89,6 +89,58 @@ dashboard (Story 8.3):
   (19 MiB, t=2) for storage.
 - Migration details: [migrations/v1.6.0-rbac.md](migrations/v1.6.0-rbac.md).
 
+### Tamper-evident admin audit log (v1.6.0)
+
+Every state-mutating management-API call is recorded in a dedicated
+`audit_log` table (Story 8.9):
+
+- Each row carries `{operator_username, operator_role, action,
+  target_type, target_id, before/after payload SHA-256 hashes, ip,
+  user_agent}` plus a hash chain. The payloads themselves are never
+  stored - only their hashes - so no secret material lands in the
+  audit trail by construction.
+- **Hash chain**: `chain_hash = SHA-256(prev_chain_hash ||
+  length-prefixed row fields)`, genesis row anchors on 32 zero bytes.
+  `GET /api/v1/audit/verify` (SuperAdmin only) walks the chain from
+  genesis and returns the earliest row where recomputation diverges,
+  localising any tampering (a modified field, or a deleted middle row
+  breaking its successor's `prev_chain_hash`).
+- `GET /api/v1/audit` (Operator+) lists entries with operator /
+  action-prefix / date-range filters; the dashboard Security tab
+  renders them with a chain-status column and a verify button.
+- Emission is fail-open: an audit-write failure logs an error but
+  never fails the underlying mutation (availability over
+  auditability; the chain covers integrity, not liveness). Events are
+  also emitted on the `lorica::audit` tracing target and attach to the
+  request span, so OTel users can pivot from a trace to its audit
+  footprint.
+- **Retention** is day-based (`audit_log_retention_days`, default 90;
+  `0` = keep forever) and chain-safe: before truncating, the earliest
+  surviving row's `prev_chain_hash` is stored as a "retention seal" in
+  `audit_log_meta`, which `verify` treats as the new genesis so the
+  surviving suffix still verifies.
+
+### Resource-exhaustion caps (v1.6.0)
+
+Story 8.9 hardening knobs, all live-reloadable via settings:
+
+- **Per-source-IP TCP connection cap** (`connection_limits_per_ip`,
+  default off): connections beyond the cap for one source IP are
+  refused at `accept()`, before the TLS handshake, so a single IP
+  cannot exhaust `max_global_connections`. The cap is enforced per
+  worker process (effective ceiling `value x workers` in multi-worker
+  mode); refusals surface on `lorica_per_ip_connection_refused_total`.
+- **Bot-challenge stash caps** (`bot_stash_max_entries` default 10000,
+  `bot_stash_per_prefix_max` default 100 per /24 IPv4 or /48 IPv6):
+  over-cap challenge issuance is REFUSED with `503 Retry-After: 30`
+  instead of evicting legitimate pending challenges, so captcha
+  flooding cannot OOM the process or displace honest users.
+- **Per-route mirror concurrency** (`mirror_max_concurrent_per_route`
+  default 32, `mirror_max_concurrent_global` default 4096): shadow /
+  mirror sub-requests use a per-route semaphore plus a coarse global
+  net, so one slow shadow target cannot starve every other route's
+  mirrors.
+
 ### Database
 - SQLite with WAL mode for crash safety
 - `PRAGMA busy_timeout=5000` for concurrent worker access

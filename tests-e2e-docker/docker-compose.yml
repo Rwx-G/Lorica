@@ -671,6 +671,43 @@ services:
     networks:
       - e2e
 
+  # ---- Audit-log E2E (v1.6.0 Story 8.9, IV1 + IV4) -------------------
+  # The lorica data volume is shared READ-WRITE with the smoke runner
+  # so the tamper step can mutate access-log.db directly with sqlite3
+  # (reproducing on-disk tampering the hash chain must detect).
+  lorica-audit:
+    build:
+      context: ..
+      dockerfile: tests-e2e-docker/Dockerfile
+    profiles: ["audit"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lorica-audit-data:/var/lib/lorica
+      - shared-audit:/shared
+    depends_on:
+      - backend1
+    networks:
+      - e2e
+
+  audit-smoke:
+    build:
+      context: ./test-runner
+    profiles: ["audit"]
+    entrypoint: ["bash", "run-audit-smoke.sh"]
+    depends_on:
+      - lorica-audit
+    volumes:
+      - shared-audit:/shared:ro
+      - lorica-audit-data:/lorica-data
+    environment:
+      - LORICA_API=http://lorica-audit:9443
+      - LORICA_PROXY=http://lorica-audit:8080
+      - BACKEND1_ADDR=backend1:80
+      - AUDIT_DB_PATH=/lorica-data/access-log.db
+    networks:
+      - e2e
+
   # ---- Hot binary-upgrade E2E (v1.6.0 Story 8.4, IV1/IV3) ------------
   # Boots Lorica in supervisor/workers mode (the zero-downtime handoff
   # only exists in supervisor mode) and drives a live binary swap over
@@ -765,6 +802,8 @@ volumes:
   shared-ai-bot-workers:
   shared-rbac:
   shared-rbac-workers:
+  lorica-audit-data:
+  shared-audit:
 
 networks:
   e2e:

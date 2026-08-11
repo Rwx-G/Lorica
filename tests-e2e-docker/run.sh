@@ -7,6 +7,7 @@
 #   --skip-cert-export  Skip the v1.4.1 cert-export profile (faster)
 #   --skip-ai-bot       Skip the v1.6.0 Story 8.2 AI-bot profile (faster)
 #   --skip-rbac         Skip the v1.6.0 Story 8.3 RBAC profile (faster)
+#   --skip-audit        Skip the v1.6.0 Story 8.9 audit-log profile (faster)
 #   --skip-hot-upgrade  Skip the v1.6.0 Story 8.4 hot binary-upgrade profile (faster)
 
 set -euo pipefail
@@ -18,6 +19,7 @@ SKIP_WORKERS=false
 SKIP_CERT_EXPORT=false
 SKIP_AI_BOT=false
 SKIP_RBAC=false
+SKIP_AUDIT=false
 SKIP_HOT_UPGRADE=false
 
 for arg in "$@"; do
@@ -28,6 +30,7 @@ for arg in "$@"; do
         --skip-cert-export)  SKIP_CERT_EXPORT=true ;;
         --skip-ai-bot)       SKIP_AI_BOT=true ;;
         --skip-rbac)         SKIP_RBAC=true ;;
+        --skip-audit)        SKIP_AUDIT=true ;;
         --skip-hot-upgrade)  SKIP_HOT_UPGRADE=true ;;
     esac
 done
@@ -45,7 +48,7 @@ fi
 # `down -v` skips their containers and named volumes; the next run then
 # boots against stale data (e.g. the cert-export smoke rotates the
 # admin password, and a stale volume 401s the next run's login).
-ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile hot-upgrade"
+ALL_PROFILES="--profile bot --profile bot-workers --profile cert-export --profile geoip --profile otel --profile otel-workers --profile rdns --profile ai-bot --profile ai-bot-workers --profile rbac --profile rbac-workers --profile audit --profile hot-upgrade"
 
 # ---- Phase 1: Single-process tests ----
 echo "=== Lorica E2E Tests (single-process) ==="
@@ -225,7 +228,35 @@ if [ "$SKIP_RBAC" = false ] && [ "$EXIT_CODE" = "0" ]; then
     fi
 fi
 
-# ---- Phase 6: Hot binary-upgrade profile (Story 8.4, IV1/IV3) -------
+# ---- Phase 6: Audit-log profile (Story 8.9, IV1/IV4) ---------------
+# Real mutation -> audit row -> GET /audit; chain verify passes;
+# sqlite tamper of a middle row makes verify localise the break.
+# Opt-out via --skip-audit (default ON).
+if [ "$SKIP_AUDIT" = false ] && [ "$EXIT_CODE" = "0" ]; then
+    echo ""
+    echo "=== Lorica E2E Tests (audit-log profile) ==="
+    echo ""
+
+    docker compose --profile audit up $BUILD_FLAG -d lorica-audit
+
+    echo "Waiting for Lorica (audit) to initialize..."
+    for i in $(seq 1 60); do
+        if docker compose exec -T lorica-audit curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+            echo "Lorica (audit) is ready."
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Lorica (audit) did not start within 120s"
+            docker compose logs lorica-audit | tail -20
+            break
+        fi
+        sleep 2
+    done
+
+    docker compose --profile audit run --rm audit-smoke || EXIT_CODE=$?
+fi
+
+# ---- Phase 7: Hot binary-upgrade profile (Story 8.4, IV1/IV3) -------
 # Boots Lorica in supervisor/workers mode and drives a live zero-downtime
 # binary swap while sustained traffic flows through the proxy. Opt-out
 # via --skip-hot-upgrade (default ON).
