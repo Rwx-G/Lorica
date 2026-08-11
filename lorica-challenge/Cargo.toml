@@ -17,7 +17,8 @@ sha2 = "0.10"
 # `==` on byte slices leaks timing; `ConstantTimeEq::ct_eq`
 # guarantees branch-free equality.
 subtle = "2"
-# Base64url encoding on the cookie wire format. Matches the rest of
+# Base64url encoding on the cookie wire format, and standard-base64
+# decode of the vendored captcha font glyphs. Matches the rest of
 # the workspace on 0.22.
 base64 = "0.22"
 # CSPRNG for the HMAC secret, the PoW challenge nonce, and the
@@ -27,10 +28,22 @@ base64 = "0.22"
 # ecosystem (argon2, rand_chacha) lags behind, so 0.9 is the path
 # of least friction.
 rand = "0.9"
-# PNG generation for the image captcha. The `captcha` crate is pure
-# Rust (no C dep) and ships its own font + mild distortion so we
-# do not need to ship a font file. ~2 KiB per rendered image.
-captcha = "1.0"
+# PNG generation for the image captcha. The rendering engine
+# (font + distortion filters + PNG encode) is vendored in-tree
+# under `src/captcha/vendored/` from the `captcha` crate 1.0.0
+# (MIT, Daniel Etzold) to collapse its supply-chain-takeover
+# surface; see `src/captcha/VENDORING.md`. The three crates below
+# are what the vendored code links against; each version already
+# resolved in `Cargo.lock` transitively via `captcha`, so promoting
+# them to direct deps keeps the lockfile on a single copy.
+#
+# Raster buffer + PNG decode of the embedded font glyphs. `png`
+# feature only (no default codecs) keeps the surface minimal.
+image = { version = "0.24", default-features = false, features = ["png"] }
+# PNG encoder used to serialise the finished captcha image.
+lodepng = "3"
+# Parses the embedded `font_default.json` glyph table.
+serde_json = "1"
 # Timestamp handling for cookie expiry; matches the rest of the
 # workspace on 0.4.
 chrono = { version = "0.4", features = ["serde"] }
