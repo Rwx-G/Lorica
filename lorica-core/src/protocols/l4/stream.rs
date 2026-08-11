@@ -350,9 +350,20 @@ pub struct Stream {
     write_pending_time: AccumulatedDuration,
     /// Last rx timestamp associated with the last recvmsg call.
     pub rx_ts: Option<SystemTime>,
+    /// RAII permit handed out by the connection filter at accept time
+    /// (Story 8.9 per-IP connection cap). Dropped with the stream, so
+    /// counting filters decrement exactly at connection close.
+    #[cfg(feature = "connection_filter")]
+    accept_permit: Option<Box<dyn crate::listeners::AcceptPermit>>,
 }
 
 impl Stream {
+    /// Attach the connection filter's accept permit to this stream.
+    /// Called once by `ListenerEndpoint::accept`.
+    #[cfg(feature = "connection_filter")]
+    pub fn set_accept_permit(&mut self, permit: Box<dyn crate::listeners::AcceptPermit>) {
+        self.accept_permit = Some(permit);
+    }
     fn stream(&self) -> &BufStream<RawStreamWrapper> {
         self.stream.as_ref().expect("stream should always be set")
     }
@@ -451,6 +462,8 @@ impl From<TcpStream> for Stream {
             read_pending_time: AccumulatedDuration::new(),
             write_pending_time: AccumulatedDuration::new(),
             rx_ts: None,
+            #[cfg(feature = "connection_filter")]
+            accept_permit: None,
         }
     }
 }
@@ -472,6 +485,8 @@ impl From<virt::VirtualSocketStream> for Stream {
             read_pending_time: AccumulatedDuration::new(),
             write_pending_time: AccumulatedDuration::new(),
             rx_ts: None,
+            #[cfg(feature = "connection_filter")]
+            accept_permit: None,
         }
     }
 }
@@ -493,6 +508,8 @@ impl From<UnixStream> for Stream {
             read_pending_time: AccumulatedDuration::new(),
             write_pending_time: AccumulatedDuration::new(),
             rx_ts: None,
+            #[cfg(feature = "connection_filter")]
+            accept_permit: None,
         }
     }
 }

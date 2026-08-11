@@ -149,6 +149,30 @@ static AI_BOT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// e.g. missing /etc/resolv.conf), so the rDNS verification flow
 /// degrades to Allow. Hit count tells the operator how many
 /// requests landed on the no-rDNS-substrate path.
+/// TCP connections refused at accept() by the per-source-IP
+/// connection cap (`connection_limits_per_ip`, Story 8.9 AC #5).
+/// Deliberately label-less: the refused IP would be an unbounded
+/// cardinality label.
+static PER_IP_CONNECTION_REFUSED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::with_opts(
+        prometheus::Opts::new(
+            "per_ip_connection_refused_total",
+            "TCP connections refused by the per-source-IP connection cap",
+        )
+        .namespace("lorica"),
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Increment the per-IP connection-cap refusal counter. Called from
+/// the connection filter at accept time (worker processes in
+/// multi-worker mode; aggregated via `PER_WORKER_COUNTERS`).
+pub fn inc_per_ip_connection_refused() {
+    PER_IP_CONNECTION_REFUSED_TOTAL.inc();
+}
+
 static AI_BOT_RDNS_UNAVAILABLE_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     let counter = IntCounter::with_opts(
         prometheus::Opts::new(
@@ -660,6 +684,10 @@ pub const PER_WORKER_COUNTERS: &[&str] = &[
     "lorica_ai_bot_total",
     "lorica_ai_bot_skipped_custom_total",
     "lorica_ai_bot_rdns_unavailable_total",
+    // Per-IP connection-cap refusals (Story 8.9 AC #5) happen inside
+    // the worker accept loops; without aggregation the supervisor's
+    // /metrics would always read 0 in multi-worker mode.
+    "lorica_per_ip_connection_refused_total",
 ];
 
 /// Re-export of the worker -> supervisor wire tuple. The lorica
@@ -719,6 +747,9 @@ fn resolve_per_worker_counter(
         // Label-less scalar : empty registered-order list.
         "lorica_ai_bot_rdns_unavailable_total" => {
             Some((&[], CounterTarget::Scalar(&AI_BOT_RDNS_UNAVAILABLE_TOTAL)))
+        }
+        "lorica_per_ip_connection_refused_total" => {
+            Some((&[], CounterTarget::Scalar(&PER_IP_CONNECTION_REFUSED_TOTAL)))
         }
         _ => None,
     }

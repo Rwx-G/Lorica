@@ -31,6 +31,25 @@ use async_trait::async_trait;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 
+/// RAII token handed out by [`ConnectionFilter::try_accept`] for an
+/// accepted connection. The listener attaches it to the accepted
+/// [`Stream`](crate::protocols::l4::stream::Stream), so it is dropped
+/// exactly when the connection closes - filters that count live
+/// connections decrement in their `Drop` impl.
+///
+/// `Debug` is required so `Stream` can keep deriving `Debug`.
+pub trait AcceptPermit: Debug + Send + Sync {}
+
+/// Outcome of [`ConnectionFilter::try_accept`].
+#[derive(Debug)]
+pub enum AcceptVerdict {
+    /// Accept the connection. The optional permit travels with the
+    /// accepted stream and is dropped when the connection closes.
+    Accept(Option<Box<dyn AcceptPermit>>),
+    /// Drop the connection immediately (no TLS handshake).
+    Reject,
+}
+
 /// A trait for filtering incoming connections at the TCP level.
 ///
 /// Implementations of this trait can inspect the peer address of incoming
@@ -94,6 +113,22 @@ pub trait ConnectionFilter: Debug + Send + Sync {
     ///
     async fn should_accept(&self, _addr: Option<&SocketAddr>) -> bool {
         true
+    }
+
+    /// Decide AND (optionally) reserve in one atomic step.
+    ///
+    /// Filters that enforce live-connection counts must implement this
+    /// instead of [`should_accept`](Self::should_accept): the
+    /// check-and-increment happens atomically here, and the returned
+    /// permit's `Drop` performs the decrement when the connection
+    /// closes. The default delegates to `should_accept` with no
+    /// permit, so existing filters keep working unchanged.
+    async fn try_accept(&self, addr: Option<&SocketAddr>) -> AcceptVerdict {
+        if self.should_accept(addr).await {
+            AcceptVerdict::Accept(None)
+        } else {
+            AcceptVerdict::Reject
+        }
     }
 }
 

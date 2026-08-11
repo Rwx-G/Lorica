@@ -183,6 +183,12 @@ pub struct GlobalSettings {
     /// Examples: `["10.0.0.0/8", "192.168.0.0/16"]`.
     #[serde(default)]
     pub connection_allow_cidrs: Vec<String>,
+    /// Maximum simultaneous TCP connections per source IP, refused at
+    /// accept() before the TLS handshake (Story 8.9 AC #5). `None` =
+    /// no cap. The cap is per worker process: in multi-worker mode
+    /// the effective ceiling is `value x workers`.
+    #[serde(default)]
+    pub connection_limits_per_ip: Option<u32>,
     /// OTLP collector endpoint (e.g. `http://localhost:4317` for gRPC,
     /// `http://localhost:4318` for HTTP). Empty / None = OTel tracing
     /// disabled at runtime, even when the binary was built with
@@ -322,6 +328,28 @@ pub struct GlobalSettings {
     #[serde(default = "default_audit_log_retention_days")]
     pub audit_log_retention_days: u32,
 
+    /// Global cap on pending bot challenges in the stash (Story 8.9
+    /// AC #6). Over-cap issuance answers `503 Retry-After: 30`
+    /// instead of evicting legitimate pending entries. Default 10000.
+    #[serde(default = "default_bot_stash_max_entries")]
+    pub bot_stash_max_entries: u32,
+
+    /// Per-IP-prefix (/24 IPv4, /48 IPv6) cap on pending bot
+    /// challenges (Story 8.9 AC #6). Default 100.
+    #[serde(default = "default_bot_stash_per_prefix_max")]
+    pub bot_stash_per_prefix_max: u32,
+
+    /// Per-route cap on concurrent mirror sub-requests (Story 8.9
+    /// AC #7): one slow shadow target cannot starve other routes'
+    /// mirrors. Default 32.
+    #[serde(default = "default_mirror_max_concurrent_per_route")]
+    pub mirror_max_concurrent_per_route: u32,
+
+    /// Coarse global safety net across all routes' mirror
+    /// sub-requests (Story 8.9 AC #7). Default 4096.
+    #[serde(default = "default_mirror_max_concurrent_global")]
+    pub mirror_max_concurrent_global: u32,
+
     /// Require at least one of each [upper, lower, digit, symbol]
     /// class in new passwords (Story 8.3 AC #8). Default `true`.
     #[serde(default = "default_password_require_complexity")]
@@ -443,6 +471,7 @@ impl Default for GlobalSettings {
             waf_whitelist_ips: Vec::new(),
             connection_deny_cidrs: Vec::new(),
             connection_allow_cidrs: Vec::new(),
+            connection_limits_per_ip: None,
             otlp_endpoint: None,
             otlp_protocol: default_otlp_protocol(),
             otlp_service_name: default_otlp_service_name(),
@@ -464,8 +493,28 @@ impl Default for GlobalSettings {
             password_min_length: default_password_min_length(),
             password_require_complexity: default_password_require_complexity(),
             audit_log_retention_days: default_audit_log_retention_days(),
+            bot_stash_max_entries: default_bot_stash_max_entries(),
+            bot_stash_per_prefix_max: default_bot_stash_per_prefix_max(),
+            mirror_max_concurrent_per_route: default_mirror_max_concurrent_per_route(),
+            mirror_max_concurrent_global: default_mirror_max_concurrent_global(),
         }
     }
+}
+
+fn default_bot_stash_max_entries() -> u32 {
+    10_000
+}
+
+fn default_bot_stash_per_prefix_max() -> u32 {
+    100
+}
+
+fn default_mirror_max_concurrent_per_route() -> u32 {
+    32
+}
+
+fn default_mirror_max_concurrent_global() -> u32 {
+    4096
 }
 
 fn default_password_min_length() -> u32 {

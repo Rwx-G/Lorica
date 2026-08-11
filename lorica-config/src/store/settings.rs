@@ -215,6 +215,25 @@ impl ConfigStore {
                 "audit_log_retention_days" => {
                     settings.audit_log_retention_days = value.parse().unwrap_or(90);
                 }
+                "connection_limits_per_ip" => {
+                    settings.connection_limits_per_ip = if value.is_empty() {
+                        None
+                    } else {
+                        value.parse().ok().filter(|v| *v > 0)
+                    };
+                }
+                "bot_stash_max_entries" => {
+                    settings.bot_stash_max_entries = value.parse().unwrap_or(10_000);
+                }
+                "bot_stash_per_prefix_max" => {
+                    settings.bot_stash_per_prefix_max = value.parse().unwrap_or(100);
+                }
+                "mirror_max_concurrent_per_route" => {
+                    settings.mirror_max_concurrent_per_route = value.parse().unwrap_or(32);
+                }
+                "mirror_max_concurrent_global" => {
+                    settings.mirror_max_concurrent_global = value.parse().unwrap_or(4096);
+                }
                 _ => {}
             }
         }
@@ -434,6 +453,29 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('audit_log_retention_days', ?1)",
             params![settings.audit_log_retention_days.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('connection_limits_per_ip', ?1)",
+            params![settings
+                .connection_limits_per_ip
+                .map(|v| v.to_string())
+                .unwrap_or_default()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('bot_stash_max_entries', ?1)",
+            params![settings.bot_stash_max_entries.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('bot_stash_per_prefix_max', ?1)",
+            params![settings.bot_stash_per_prefix_max.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('mirror_max_concurrent_per_route', ?1)",
+            params![settings.mirror_max_concurrent_per_route.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('mirror_max_concurrent_global', ?1)",
+            params![settings.mirror_max_concurrent_global.to_string()],
         )?;
         Ok(())
     }

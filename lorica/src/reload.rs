@@ -45,6 +45,10 @@ pub struct PreparedReload {
     pub config: ProxyConfig,
     pub connection_allow_cidrs: Vec<String>,
     pub connection_deny_cidrs: Vec<String>,
+    /// Per-source-IP live-connection cap (Story 8.9 AC #5); `None`
+    /// disables it. Applied on the connection filter at commit time,
+    /// beside the CIDR policy.
+    pub connection_limits_per_ip: Option<u32>,
     pub mtls_fingerprint_drift: Option<(Option<String>, Option<String>)>,
 }
 
@@ -95,9 +99,11 @@ pub fn commit_prepared_reload(
         let allow_count = policy.allow.len();
         let deny_count = policy.deny.len();
         filter.reload(policy);
+        filter.set_per_ip_limit(prepared.connection_limits_per_ip);
         info!(
             allow_cidrs = allow_count,
             deny_cidrs = deny_count,
+            per_ip_limit = prepared.connection_limits_per_ip.unwrap_or(0),
             "connection filter reloaded"
         );
     }
@@ -707,6 +713,10 @@ async fn build_proxy_config_inner(
         .as_ref()
         .map(|s| s.connection_deny_cidrs.clone())
         .unwrap_or_default();
+    let connection_limits_per_ip = settings
+        .as_ref()
+        .and_then(|s| s.connection_limits_per_ip)
+        .filter(|v| *v > 0);
     // Story 8.2 AC #3 / #11. Plumbed at config-load time so the
     // filter-chain helpers read a stable snapshot, no SettingsStore
     // lookup on the hot path.
@@ -739,6 +749,22 @@ async fn build_proxy_config_inner(
             waf_whitelist_cidrs: waf_whitelist_ips,
             ai_bot_treat_spoofed_as,
             ai_bot_inject_headers,
+            bot_stash_max_entries: settings
+                .as_ref()
+                .map(|s| s.bot_stash_max_entries)
+                .unwrap_or(10_000),
+            bot_stash_per_prefix_max: settings
+                .as_ref()
+                .map(|s| s.bot_stash_per_prefix_max)
+                .unwrap_or(100),
+            mirror_max_concurrent_per_route: settings
+                .as_ref()
+                .map(|s| s.mirror_max_concurrent_per_route)
+                .unwrap_or(32),
+            mirror_max_concurrent_global: settings
+                .as_ref()
+                .map(|s| s.mirror_max_concurrent_global)
+                .unwrap_or(4096),
         },
     );
 
@@ -805,6 +831,7 @@ async fn build_proxy_config_inner(
         config: new_config,
         connection_allow_cidrs,
         connection_deny_cidrs,
+        connection_limits_per_ip,
         mtls_fingerprint_drift,
     })
 }
