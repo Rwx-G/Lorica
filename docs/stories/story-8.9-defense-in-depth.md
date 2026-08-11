@@ -1,7 +1,7 @@
 # Story 8.9: Defense-in-Depth Pass
 
 **Epic:** [Epic 8 - Multi-User RBAC, AI Bot Defense & Zero-Downtime Upgrades (v1.6.0)](../prd/epic-8-v1.6.0.md)
-**Status:** InProgress
+**Status:** Review
 **Priority:** P1
 **Author:** Romain G.
 **Depends on:** Story 8.3 (RBAC `Session.username`/`role` as operator identity, shipped on this branch); Story 8.7 bot-stash refactor (shipped v1.5.10); Story 8.11 lorica-metrics (shipped on this branch).
@@ -37,10 +37,10 @@ As a security-conscious operator, I want a structured admin audit log on every s
 - [ ] AC #5: per-IP connection cap. Fork change in `lorica-core` listeners: `ConnectionFilter` gains an RAII accept-permit so the count decrements on stream drop (see Dev Notes design); `GlobalConnectionFilter` gains `DashMap<IpAddr, AtomicU32>` + `ArcSwapOption<u32>` limit; `connection_limits_per_ip` setting plumbed via `PreparedReload`/`commit_prepared_reload`; `lorica_per_ip_connection_refused_total` counter registered via lorica-metrics + `PER_WORKER_COUNTERS` aggregation (refusals happen in worker processes).
 - [ ] AC #6: bot-stash caps. `bot_stash_insert` gains refuse-over-cap semantics (global `bot_stash_max_entries`, per-prefix `bot_stash_per_prefix_max` via `COUNT` on `(ip_prefix_disc, ip_prefix_bytes)` + new index); `BotEngine::insert` returns capacity outcome; `serve_challenge` returns `503` + `Retry-After: 30` on refusal (Cookie mode exempt, no stash); settings keys + plumbing.
 - [ ] AC #7: mirror semaphores. `MIRROR_SEMAPHORE` (256 global) replaced by `DashMap<String, Arc<Semaphore>>` per route + global net; sized from `mirror_max_concurrent_per_route` (default 32) / `mirror_max_concurrent_global` (default 4096) passed through `ProxyConfig`; stale-route entries pruned on reload.
-- [ ] AC #8 UI: "Audit" tab in `Security.svelte` (6th in-file tab): filterable paginated table + chain-status column + SuperAdmin-only "Verify chain integrity" button; api.ts types + methods.
-- [ ] Settings surface: `audit_log_retention_days`, `connection_limits_per_ip`, `bot_stash_max_entries`, `bot_stash_per_prefix_max`, `mirror_max_concurrent_per_route`, `mirror_max_concurrent_global` (model + store + UpdateSettingsRequest + frontend types; UI exposure in GlobalConfig/Network tab where fitting).
-- [ ] IV coverage: unit tests (chain compute/verify/tamper/seal, stash caps, username inventory); e2e `audit-smoke` profile (IV1 + IV4 tamper via sqlite3 + retention seal; per-IP cap asserted with parallel connects if practical, else unit/integration-level); IV3 asserted at unit level (two routes, one saturated semaphore, other proceeds).
-- [ ] Gates: product-crate tests, CI clippy set, cargo audit, frontend svelte-check/tsc/lint/vitest, e2e profiles green.
+- [x] AC #8 UI: "Audit" tab in `Security.svelte` (6th in-file tab): filterable paginated table + chain-status column + SuperAdmin-only "Verify chain integrity" button; api.ts types + methods.
+- [x] Settings surface: `audit_log_retention_days`, `connection_limits_per_ip`, `bot_stash_max_entries`, `bot_stash_per_prefix_max`, `mirror_max_concurrent_per_route`, `mirror_max_concurrent_global` (model + store + UpdateSettingsRequest + frontend types; UI exposure in GlobalConfig/Network tab where fitting).
+- [x] IV coverage: unit tests (chain compute/verify/tamper/seal, stash caps, username inventory); e2e `audit-smoke` profile (IV1 + IV4 tamper via sqlite3 + retention seal; per-IP cap asserted with parallel connects if practical, else unit/integration-level); IV3 asserted at unit level (two routes, one saturated semaphore, other proceeds).
+- [x] Gates: product-crate tests, CI clippy set, cargo audit, frontend svelte-check/tsc/lint/vitest, e2e profiles green.
 
 ## Dev Notes
 
@@ -95,15 +95,41 @@ API-only: `audit_log_retention_days`. Data-plane (need ProxyConfig or filter plu
 
 ### Completion Notes
 
-(empty)
+All 9 AC + 4 IV covered across 7 commits (story, storage, emission, per-IP cap, stash+mirror, e2e+docs, e2e-root-fix, ui). Disclosed deviations, all in Dev Notes: (1) `audit::record` helper fn instead of an `audit_log!` macro; (2) the per-IP cap is per-worker-process, so the effective ceiling is `value x workers` (documented in the setting + security.md; a shmem-backed global count is a backlog item); (3) bot-stash flips from eviction to refusal (`503 Retry-After: 30`), a deliberate behaviour change so a flooder cannot displace legitimate pending challenges; (4) a minimal `api_request` span middleware added for AC #4 (lorica-api had no request span). IV1 + IV4 are covered end-to-end by the `audit` e2e profile (17/17, including a real sqlite tamper of row id=3 that verify localises with `chain_hash_mismatch`, plus the Operator/SuperAdmin/Viewer floors on `/audit` and `/audit/verify`); IV3 (mirror isolation) and the retention seal are unit-tested. Fork note: AC #5 required a `lorica-core` listener change - `ConnectionFilter` gained an RAII accept-permit (`AcceptVerdict`/`AcceptPermit`) that `ListenerEndpoint::accept` attaches to the stream, so the per-IP count decrements exactly at connection close; the default trait impl preserves every existing filter. Env note: the SynologyDrive mount silently corrupts `include_bytes!` fixtures (ai_bot vendor_ips) while git reports them clean; restore with `git checkout -- lorica/src/ai_bot/vendor_ips/` before running `cargo test -p lorica --lib` locally.
 
 ## File List
 
-(to fill during implementation)
+Backend (storage + emission):
+- lorica-api/src/audit.rs (new: chain primitives + AuditContext + record + list/verify handlers)
+- lorica-api/src/log_store.rs (audit_log + audit_log_meta tables, insert/query/verify/enforce_audit_retention)
+- lorica-api/src/middleware/{request_span.rs (new), mod.rs, authorize.rs} (api_request span; /audit + /audit/verify role floors)
+- lorica-api/src/{server.rs, lib.rs} (routes + span layer + module)
+- lorica-api/src/{routes/crud.rs, backends.rs, certificates.rs, settings.rs, dns_providers.rs, probes.rs, loadtest.rs, config.rs, auth.rs, routes/cert_export.rs, waf.rs, cache.rs, users.rs, ai_crawlers.rs, sla.rs, logs.rs, upgrade.rs, acme/{http01,dns01,dns01_manual,renewal}.rs} (~45 audit emission sites)
+- lorica/src/startup/mod.rs (audit retention hook in spawn_retention_loop)
+
+Per-IP cap (fork + filter):
+- lorica-core/src/listeners/{connection_filter.rs (AcceptVerdict/AcceptPermit/try_accept), l4.rs (permit ride-along), mod.rs} + protocols/l4/stream.rs (accept_permit field)
+- lorica/src/connection_filter.rs (per-IP DashMap + RAII PerIpPermit), lorica/src/reload.rs (PreparedReload.connection_limits_per_ip), lorica-api/src/metrics.rs (counter + PER_WORKER_COUNTERS)
+
+Stash + mirror:
+- lorica-config/src/store/bot_stash.rs (BotStashInsertOutcome refusal + per-prefix cap), store/mod.rs (V43 prefix index), lib.rs
+- lorica/src/bot.rs (BotEngine::insert caps), proxy_wiring/{bot_handlers.rs (503 Retry-After), filters.rs, config.rs (ProxyConfigGlobals fields), mirror_rewrite.rs (per-route semaphores), proxy_wiring.rs}
+
+Config + settings:
+- lorica-config/src/models/settings.rs, store/settings.rs (6 new keys)
+
+Frontend:
+- lorica-dashboard/frontend/src/lib/api.ts (Audit types + methods, settings fields)
+- lorica-dashboard/frontend/src/routes/Security.svelte (Audit tab), routes/Settings.svelte, components/settings-tabs/NetworkTab.svelte (defense-in-depth settings)
+
+E2E + docs:
+- tests-e2e-docker/{docker-compose.yml, run.sh, test-runner/Dockerfile, test-runner/run-audit-smoke.sh (new)} (audit profile, sqlite tamper)
+- docs/security.md (audit-log + resource-cap sections), CHANGELOG.md
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
+| 2026-08-11 | 1.0 | Phases 2-5: audit emission on ~45 handlers + `/audit` + `/audit/verify` + api_request span (AC #1 #3 #4); per-source-IP TCP connection cap via a lorica-core RAII accept-permit fork + per-IP DashMap + counter (AC #5); bot-stash refusal caps with `503 Retry-After` + per-prefix index + per-route mirror semaphores (AC #6 #7); dashboard Audit tab + defense-in-depth settings (AC #8); 6 settings keys; audit e2e profile 17/17 (sqlite tamper localisation + RBAC floors, IV1 #4); security.md + CHANGELOG. Deviations recorded in Completion Notes. Status -> Review. Gates: lorica-api 560 + lorica-config 200 + lorica 314 lib tests green, CI clippy clean, cargo audit clean, frontend svelte-check/tsc/lint/vitest 363 green, audit e2e 17/17. | Romain G. |
 | 2026-08-11 | 0.2 | Phase 1 (AC #2 #9 storage): audit.rs chain primitives (GENESIS, hash_payload, ChainInput, compute/recompute) + audit_log/audit_log_meta tables + insert/query/verify/retention in LogStore + audit_log_retention_days setting + hourly retention hook. 11 unit tests (chain round-trip, tamper localisation, middle-row deletion, seal survival incl. empty-table, filter escaping). lorica-api 559 tests green, clippy clean. | Romain G. |
 | 2026-08-11 | 0.1 | Story drafted from Epic 8 PRD + deep code exploration (LogStore retention, 57-handler mutation inventory, missing disconnect hook in forked listener, stash eviction-vs-refusal, mirror semaphore wiring, settings plumbing map). Deviations flagged in Dev Notes: helper fn instead of macro (AC #1), per-worker cap semantics (AC #5), stash refusal replaces eviction (AC #6), minimal API request span added for AC #4. | Romain G. |
