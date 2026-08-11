@@ -15,7 +15,15 @@
 //! hashed, never stored: no secret material can land in the audit
 //! table by construction.
 
-use serde::Serialize;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Extension, Query};
+use axum::response::IntoResponse;
+use serde::{Deserialize, Serialize};
+
+use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
+use crate::server::AppState;
 
 /// `prev_chain_hash` of the very first row: 32 zero bytes, hex-encoded.
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -209,6 +217,169 @@ pub fn compute_chain_hash(prev_chain_hash: &str, input: &ChainInput<'_>) -> Stri
 /// Recompute the expected `chain_hash` for a stored row (verify path).
 pub fn recompute_chain_hash(row: &AuditRecord) -> String {
     compute_chain_hash(&row.prev_chain_hash, &ChainInput::from(row))
+}
+
+/// Operator identity + request provenance for one audit emission,
+/// captured once at the top of a handler.
+#[derive(Debug, Clone)]
+pub struct AuditContext {
+    /// Session username (Story 8.3 RBAC identity).
+    pub username: String,
+    /// Session role (snake_case).
+    pub role: String,
+    /// Client IP ("" when unknown).
+    pub ip: String,
+    /// Client User-Agent ("" when absent).
+    pub user_agent: String,
+}
+
+impl AuditContext {
+    /// Build the context from the handler's extractors.
+    pub fn new(
+        session: &Session,
+        connect_info: Option<&ConnectInfo<SocketAddr>>,
+        headers: &http::HeaderMap,
+    ) -> Self {
+        Self {
+            username: session.username.clone(),
+            role: session.role.as_str().to_string(),
+            ip: connect_info
+                .map(|ci| ci.0.ip().to_string())
+                .unwrap_or_default(),
+            user_agent: headers
+                .get(http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+}
+
+/// Record one audit entry for a mutation that SUCCEEDED, and emit the
+/// matching `lorica::audit` tracing event (picked up by stdout/JSON
+/// logging and, when enabled, the OTel bridge - inside the current
+/// `api_request` span).
+///
+/// `target` is `(target_type, target_id)`. `before` / `after` payloads
+/// are SHA-256-hashed; the payloads themselves are never persisted.
+/// Failure policy: an insert failure is logged and swallowed -
+/// availability beats auditability, the chain covers integrity, not
+/// liveness. A `None` log store (worker mode, tests) skips persistence
+/// but still emits the tracing event.
+pub async fn record(
+    state: &AppState,
+    ctx: &AuditContext,
+    action: &str,
+    target: (&str, &str),
+    before: Option<&serde_json::Value>,
+    after: Option<&serde_json::Value>,
+) {
+    let (target_type, target_id) = target;
+
+    tracing::info!(
+        target: "lorica::audit",
+        operator = %ctx.username,
+        role = %ctx.role,
+        action = %action,
+        target_type = %target_type,
+        target_id = %target_id,
+        ip = %ctx.ip,
+        "audit"
+    );
+
+    let Some(log_store) = state.log_store.clone() else {
+        return;
+    };
+
+    let entry = NewAuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        operator_username: ctx.username.clone(),
+        operator_role: ctx.role.clone(),
+        action: action.to_string(),
+        target_type: target_type.to_string(),
+        target_id: target_id.to_string(),
+        before_payload_hash: hash_payload(before),
+        after_payload_hash: hash_payload(after),
+        ip: ctx.ip.clone(),
+        user_agent: ctx.user_agent.clone(),
+    };
+
+    let result = tokio::task::spawn_blocking(move || log_store.insert_audit(&entry)).await;
+    match result {
+        Ok(Ok(_id)) => {}
+        Ok(Err(e)) => tracing::error!(error = %e, "audit log insert failed"),
+        Err(e) => tracing::error!(error = %e, "audit log insert task failed"),
+    }
+}
+
+/// Query-string parameters of `GET /api/v1/audit`.
+#[derive(Debug, Deserialize)]
+pub struct AuditListParams {
+    /// Exact operator-username filter.
+    pub operator: Option<String>,
+    /// Action prefix filter (`route.` matches `route.delete`).
+    pub action: Option<String>,
+    /// Inclusive RFC 3339 lower bound.
+    pub from: Option<String>,
+    /// Inclusive RFC 3339 upper bound.
+    pub to: Option<String>,
+    /// Page size (default 100, capped at 1000).
+    pub limit: Option<usize>,
+    /// Cursor: rows with `id` strictly below this value.
+    pub before_id: Option<i64>,
+}
+
+/// GET /api/v1/audit - list audit entries, newest first (Operator+,
+/// enforced by the authorize middleware). An absent log store (worker
+/// mode, tests) reads as an empty log.
+pub async fn list_audit(
+    Extension(state): Extension<AppState>,
+    Query(params): Query<AuditListParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(log_store) = state.log_store.clone() else {
+        return Ok(json_data(serde_json::json!({ "entries": [], "total": 0 })));
+    };
+
+    let query = AuditQuery {
+        operator: params.operator,
+        action_prefix: params.action,
+        from: params.from,
+        to: params.to,
+        limit: params.limit.unwrap_or(100).min(1000),
+        before_id: params.before_id,
+    };
+
+    let (entries, total) = tokio::task::spawn_blocking(move || log_store.query_audit(&query))
+        .await
+        .map_err(|e| ApiError::Internal(format!("audit query task failed: {e}")))?
+        .map_err(ApiError::Internal)?;
+
+    Ok(json_data(serde_json::json!({
+        "entries": entries,
+        "total": total,
+    })))
+}
+
+/// GET /api/v1/audit/verify - walk the whole chain and recompute every
+/// hash (SuperAdmin only, enforced by the authorize middleware).
+pub async fn verify_audit(
+    Extension(state): Extension<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(log_store) = state.log_store.clone() else {
+        return Ok(json_data(VerifyResult {
+            verified: true,
+            total_rows: 0,
+            first_break_id: None,
+            first_break_reason: None,
+        }));
+    };
+
+    let result = tokio::task::spawn_blocking(move || log_store.verify_audit_chain())
+        .await
+        .map_err(|e| ApiError::Internal(format!("audit verify task failed: {e}")))?
+        .map_err(ApiError::Internal)?;
+
+    Ok(json_data(result))
 }
 
 #[cfg(test)]

@@ -6,13 +6,14 @@
 //! last-super-admin invariant. Any role change, disable, or password
 //! reset invalidates every session of the target user immediately.
 
-use axum::extract::{Extension, Path};
+use axum::extract::{ConnectInfo, Extension, Path};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
 use lorica_config::models::{Role, User};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::auth::hash_password;
 use crate::db::db_blocking;
@@ -132,6 +133,8 @@ pub async fn get_user(
 
 /// POST /api/v1/users - create an account.
 pub async fn create_user(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session): Extension<Session>,
     Json(body): Json<CreateUserRequest>,
@@ -171,16 +174,31 @@ pub async fn create_user(
     })
     .await?;
 
-    Ok(json_data_with_status(
-        StatusCode::CREATED,
-        UserResponse::from(created),
-    ))
+    let response = UserResponse::from(created);
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // `after` uses the hash-free response view, never the stored model
+    // (the model carries `password_hash`).
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "user.create",
+        ("user", &response.id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data_with_status(StatusCode::CREATED, response))
 }
 
 /// PUT /api/v1/users/{id} - update password / role / disabled flag.
 pub async fn update_user(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdateUserRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -188,11 +206,12 @@ pub async fn update_user(
     // (SessionStore re-acquires the ConfigStore mutex; holding both
     // would deadlock - same ordering as change_password).
     let target_id = id.clone();
-    let (updated, sessions_stale) = db_blocking(&state.store, move |store| {
+    let (before_user, updated, sessions_stale) = db_blocking(&state.store, move |store| {
         let mut user = store
             .get_user(&target_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
+        let before_user = user.clone();
 
         let was_active_super_admin = user.role == Role::SuperAdmin && user.disabled_at.is_none();
         let demotes = body.role.is_some_and(|r| r != Role::SuperAdmin);
@@ -240,7 +259,7 @@ pub async fn update_user(
         store
             .update_user(&user)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok::<_, ApiError>((user, sessions_stale))
+        Ok::<_, ApiError>((before_user, user, sessions_stale))
     })
     .await?;
 
@@ -250,11 +269,29 @@ pub async fn update_user(
         session_store.remove_all_for_user(&updated.id).await;
     }
 
-    Ok(json_data(UserResponse::from(updated)))
+    let response = UserResponse::from(updated);
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // Both payloads use the hash-free response view, never the stored
+    // model (the model carries `password_hash`).
+    let before = serde_json::to_value(UserResponse::from(before_user)).ok();
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "user.update",
+        ("user", &response.id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data(response))
 }
 
 /// DELETE /api/v1/users/{id} - delete an account.
 pub async fn delete_user(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
     Extension(session): Extension<Session>,
@@ -267,7 +304,7 @@ pub async fn delete_user(
     }
 
     let target_id = id.clone();
-    db_blocking(&state.store, move |store| {
+    let deleted = db_blocking(&state.store, move |store| {
         let user = store
             .get_user(&target_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
@@ -286,11 +323,26 @@ pub async fn delete_user(
 
         store
             .delete_user(&target_id)
-            .map_err(|e| ApiError::Internal(e.to_string()))
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok::<_, ApiError>(user)
     })
     .await?;
 
     session_store.remove_all_for_user(&id).await;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // `before` uses the hash-free response view, never the stored model
+    // (the model carries `password_hash`).
+    let before = serde_json::to_value(UserResponse::from(deleted)).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "user.delete",
+        ("user", &id),
+        before.as_ref(),
+        None,
+    )
+    .await;
 
     Ok(json_data(serde_json::json!({ "message": "user deleted" })))
 }

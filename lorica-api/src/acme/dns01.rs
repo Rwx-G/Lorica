@@ -14,13 +14,15 @@
 
 //! Automated DNS-01 challenge provisioning: endpoint and internal flow.
 
-use axum::extract::Extension;
+use axum::extract::{ConnectInfo, Extension};
 use axum::Json;
 use serde::Deserialize;
+use std::net::SocketAddr;
 use tracing::{info, warn};
 
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 use super::config::AcmeConfig;
@@ -51,7 +53,10 @@ pub struct AcmeDnsProvisionRequest {
 /// the DNS-01 challenge by creating a TXT record via the configured DNS provider,
 /// and waits for certificate issuance.
 pub async fn provision_certificate_dns(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<AcmeDnsProvisionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Support multi-domain: "example.com, *.example.com" or "a.com,b.com"
@@ -127,7 +132,7 @@ pub async fn provision_certificate_dns(
     match result {
         Ok(cert_id) => {
             info!(domains = ?domains, cert_id = %cert_id, "ACME DNS-01 certificate provisioned");
-            Ok(json_data(AcmeProvisionResponse {
+            let response = AcmeProvisionResponse {
                 status: "provisioned".into(),
                 domain: primary_domain,
                 staging: config.staging,
@@ -135,7 +140,24 @@ pub async fn provision_certificate_dns(
                     "Certificate provisioned via DNS-01 for {} domain(s) (id: {cert_id})",
                     domains.len()
                 ),
-            }))
+            };
+
+            // `after` uses the credential-free response view; the
+            // request body may carry inline DNS credentials.
+            let audit_ctx =
+                crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+            let after = serde_json::to_value(&response).ok();
+            crate::audit::record(
+                &state,
+                &audit_ctx,
+                "acme.provision_dns01",
+                ("certificate", &cert_id),
+                None,
+                after.as_ref(),
+            )
+            .await;
+
+            Ok(json_data(response))
         }
         Err(e) => {
             warn!(domains = ?domains, error = %e, "ACME DNS-01 provisioning failed");

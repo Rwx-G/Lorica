@@ -6,8 +6,9 @@
 //! `forward_auth`, `mirror`, `response_rewrite`, `mtls`, `path_rules`).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
-use axum::extract::{Extension, Path};
+use axum::extract::{ConnectInfo, Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 use super::forward_auth::{build_forward_auth, ForwardAuthConfigRequest};
@@ -3293,7 +3295,10 @@ pub async fn list_routes(
 /// Validates type-shape (enum parsing, regex compilability); business
 /// rules (hostname uniqueness) are enforced by the store layer.
 pub async fn create_route(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     if body.hostname.is_empty() {
@@ -3615,6 +3620,21 @@ pub async fn create_route(
 
     let response = route_to_response(&route, backend_ids);
     state.notify_config_changed();
+
+    // `after` uses the response view (no `basic_auth_password_hash`),
+    // never the stored model.
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "route.create",
+        ("route", &route.id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
     Ok(json_data_with_status(StatusCode::CREATED, response))
 }
 
@@ -3636,14 +3656,18 @@ pub async fn get_route(
 
 /// PUT /api/v1/routes/:id - patch route fields and trigger a proxy reload.
 pub async fn update_route(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdateRouteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (route, backend_ids) = db_blocking(&state.store, move |store| {
+    let (before_route, route, backend_ids) = db_blocking(&state.store, move |store| {
         let mut route = store
             .get_route(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("route {id}")))?;
+        let before_route = route.clone();
 
         validate_route_numeric_bounds(
             body.connect_timeout_s,
@@ -4043,19 +4067,54 @@ pub async fn update_route(
         }
 
         let backend_ids = store.list_backends_for_route(&id)?;
-        Ok::<_, ApiError>((route, backend_ids))
+        Ok::<_, ApiError>((before_route, route, backend_ids))
     })
     .await?;
     state.notify_config_changed();
-    Ok(json_data(route_to_response(&route, backend_ids)))
+
+    let response = route_to_response(&route, backend_ids);
+    // Both payloads use the response view (no
+    // `basic_auth_password_hash`). The `before` snapshot omits backend
+    // links (empty list) - capturing them would need an extra DB read
+    // before the mutation.
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(route_to_response(&before_route, Vec::new())).ok();
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "route.update",
+        ("route", &route.id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data(response))
 }
 
 /// DELETE /api/v1/routes/:id - delete a route and notify the proxy.
 pub async fn delete_route(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let route_id = id.clone();
     db_blocking(&state.store, move |store| store.delete_route(&id)).await?;
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "route.delete",
+        ("route", &route_id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({"message": "route deleted"})))
 }

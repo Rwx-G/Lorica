@@ -1,12 +1,14 @@
 //! Response cache statistics, route purge, and IP ban list management.
 
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
-use axum::extract::Path;
+use axum::extract::{ConnectInfo, Path};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// DELETE /api/v1/cache/routes/:id
@@ -17,11 +19,15 @@ use crate::server::AppState;
 /// clears **all** cached entries as a pragmatic alternative and resets the
 /// hit/miss counters.
 pub async fn purge_route_cache(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let entries_cleared = state
         .cache_backend
+        .as_ref()
         .map(|backend| backend.clear_all())
         .unwrap_or(0);
 
@@ -33,13 +39,23 @@ pub async fn purge_route_cache(
         misses.store(0, Ordering::Relaxed);
     }
 
-    Ok(json_data_with_status(
-        StatusCode::OK,
-        serde_json::json!({
-            "message": format!("cache purged (requested route {id}, all {entries_cleared} entries cleared)"),
-            "entries_cleared": entries_cleared,
-        }),
-    ))
+    let payload = serde_json::json!({
+        "message": format!("cache purged (requested route {id}, all {entries_cleared} entries cleared)"),
+        "entries_cleared": entries_cleared,
+    });
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "cache.purge",
+        ("route", &id),
+        None,
+        Some(&payload),
+    )
+    .await;
+
+    Ok(json_data_with_status(StatusCode::OK, payload))
 }
 
 /// GET /api/v1/cache/stats
@@ -130,12 +146,19 @@ pub async fn list_bans(
 ///
 /// Remove a specific IP from the ban list.
 pub async fn delete_ban(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(ip): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match &state.ban_list {
         Some(bl) => {
             if bl.remove(&ip).is_some() {
+                let audit_ctx =
+                    crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+                crate::audit::record(&state, &audit_ctx, "ban.delete", ("ban", &ip), None, None)
+                    .await;
                 Ok(json_data(serde_json::json!({
                     "unbanned": true,
                     "ip": ip,

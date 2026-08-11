@@ -14,13 +14,15 @@
 
 //! HTTP-01 challenge provisioning: axum endpoints and the internal flow.
 
-use axum::extract::{Extension, Path};
+use axum::extract::{ConnectInfo, Extension, Path};
 use axum::Json;
 use serde::Deserialize;
+use std::net::SocketAddr;
 use tracing::{info, warn};
 
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 use super::config::AcmeConfig;
@@ -45,7 +47,10 @@ pub struct AcmeProvisionRequest {
 ///
 /// **Requires**: port 80 reachable from the Internet for HTTP-01 challenge.
 pub async fn provision_certificate(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<AcmeProvisionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Support multi-domain: "www.rwx-g.fr, rwx-g.fr" or "www.rwx-g.fr,rwx-g.fr"
@@ -77,7 +82,7 @@ pub async fn provision_certificate(
     match result {
         Ok(cert_id) => {
             info!(domains = ?domains, cert_id = %cert_id, "ACME certificate provisioned");
-            Ok(json_data(AcmeProvisionResponse {
+            let response = AcmeProvisionResponse {
                 status: "provisioned".into(),
                 domain: primary_domain,
                 staging: config.staging,
@@ -85,7 +90,22 @@ pub async fn provision_certificate(
                     "Certificate provisioned for {} domain(s) (id: {cert_id})",
                     domains.len()
                 ),
-            }))
+            };
+
+            let audit_ctx =
+                crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+            let after = serde_json::to_value(&response).ok();
+            crate::audit::record(
+                &state,
+                &audit_ctx,
+                "acme.provision_http01",
+                ("certificate", &cert_id),
+                None,
+                after.as_ref(),
+            )
+            .await;
+
+            Ok(json_data(response))
         }
         Err(e) => {
             warn!(domains = ?domains, error = %e, "ACME provisioning failed");

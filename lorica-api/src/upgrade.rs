@@ -24,10 +24,11 @@
 //! [`GlobalSettings::upgrade_signing_pubkey_path`]: lorica_config::models::GlobalSettings::upgrade_signing_pubkey_path
 
 use std::io::Write as _;
+use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use axum::extract::{Extension, Multipart};
+use axum::extract::{ConnectInfo, Extension, Multipart};
 use axum::Json;
 use ed25519_dalek::{Signature, VerifyingKey};
 use thiserror::Error;
@@ -35,6 +36,7 @@ use thiserror::Error;
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
 use crate::metrics::record_hot_upgrade;
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// Length in bytes of an Ed25519 verifying key.
@@ -355,7 +357,10 @@ fn stage_binary(data_dir: &Path, binary: &[u8]) -> Result<PathBuf, UpgradeError>
 /// Authorization: mounted behind `require_auth`. Story 8.3 RBAC will
 /// retag this SuperAdmin-only once role tags land.
 pub async fn upgrade_binary(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let public_key: Vec<u8> = match load_signing_public_key(&state).await {
@@ -450,12 +455,24 @@ pub async fn upgrade_binary(
     };
     let handoff: HandoffSignal = trigger_handoff(&state, &staged).await;
 
-    Ok(json_data(serde_json::json!({
+    let payload = serde_json::json!({
         "staged_path": staged_path.display().to_string(),
         "size": size,
         "sha256": sha256,
         "handoff": handoff.as_str(),
-    })))
+    });
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "system.upgrade",
+        ("system", &sha256),
+        None,
+        Some(&payload),
+    )
+    .await;
+
+    Ok(json_data(payload))
 }
 
 #[cfg(test)]

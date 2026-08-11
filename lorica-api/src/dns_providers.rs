@@ -1,13 +1,15 @@
 //! CRUD endpoints for stored DNS provider credentials used by ACME DNS-01
 //! challenges (Cloudflare, Route53, OVH).
 
-use axum::extract::{Extension, Path};
+use axum::extract::{ConnectInfo, Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// Response for a DNS provider (credentials are never returned).
@@ -146,7 +148,10 @@ impl DnsProviderConfig {
 
 /// POST /api/v1/dns-providers - register a new DNS provider with provider-specific credentials.
 pub async fn create_dns_provider(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateDnsProviderRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let name = body.name.trim().to_string();
@@ -169,6 +174,19 @@ pub async fn create_dns_provider(
         Ok::<_, lorica_config::ConfigError>(provider)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // body carries credentials: not even a hash
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "dns_provider.create",
+        ("dns_provider", &provider.id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data_with_status(
         StatusCode::CREATED,
         provider_to_response(&provider),
@@ -177,7 +195,10 @@ pub async fn create_dns_provider(
 
 /// PUT /api/v1/dns-providers/:id - replace the credentials and metadata of an existing DNS provider.
 pub async fn update_dns_provider(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<CreateDnsProviderRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -206,14 +227,31 @@ pub async fn update_dns_provider(
         Ok::<_, ApiError>(provider)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // body carries credentials: not even a hash
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "dns_provider.update",
+        ("dns_provider", &provider.id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(provider_to_response(&provider)))
 }
 
 /// DELETE /api/v1/dns-providers/:id - delete the provider, refusing if any certificate references it.
 pub async fn delete_dns_provider(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let provider_id = id.clone();
     db_blocking(&state.store, move |store| {
         // Check if any certificates reference this provider
         if store.dns_provider_in_use(&id)? {
@@ -226,6 +264,18 @@ pub async fn delete_dns_provider(
         Ok(())
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "dns_provider.delete",
+        ("dns_provider", &provider_id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({
         "message": "DNS provider deleted"
     })))
@@ -233,9 +283,13 @@ pub async fn delete_dns_provider(
 
 /// POST /api/v1/dns-providers/:id/test - test DNS provider connectivity
 pub async fn test_dns_provider(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let provider_id = id.clone();
     // Fetch the provider on the blocking pool, then run the async
     // challenger test with the store lock released.
     let provider = db_blocking(&state.store, move |store| {
@@ -256,6 +310,17 @@ pub async fn test_dns_provider(
     let _challenger = crate::acme::build_dns_challenger(&dns_config)
         .await
         .map_err(|e| ApiError::Internal(format!("DNS provider test failed: {e}")))?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "dns_provider.test",
+        ("dns_provider", &provider_id),
+        None,
+        None,
+    )
+    .await;
 
     Ok(json_data(serde_json::json!({
         "message": "DNS provider configuration is valid",

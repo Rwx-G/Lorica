@@ -290,7 +290,10 @@ pub async fn list_certificates(
 
 /// POST /api/v1/certificates - upload a PEM cert + key. Metadata is parsed from the cert.
 pub async fn create_certificate(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateCertificateRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     if body.domain.is_empty() {
@@ -338,10 +341,22 @@ pub async fn create_certificate(
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
-    Ok(json_data_with_status(
-        StatusCode::CREATED,
-        cert_to_response(&cert),
-    ))
+    let response = cert_to_response(&cert);
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // `after` uses the PEM-free response view, never the stored model
+    // (the model carries `key_pem`).
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "certificate.create",
+        ("certificate", &cert.id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data_with_status(StatusCode::CREATED, response))
 }
 
 /// GET /api/v1/certificates/:id - return cert details, PEM body, and associated routes.
@@ -386,14 +401,18 @@ pub async fn get_certificate(
 
 /// PUT /api/v1/certificates/:id - replace the PEM body, domain, or ACME settings.
 pub async fn update_certificate(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdateCertificateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let cert = db_blocking(&state.store, move |store| {
+    let (before_cert, cert) = db_blocking(&state.store, move |store| {
         let mut cert = store
             .get_certificate(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("certificate {id}")))?;
+        let before_cert = cert.clone();
 
         if let Some(domain) = body.domain {
             cert.domain = domain;
@@ -438,19 +457,40 @@ pub async fn update_certificate(
         }
 
         store.update_certificate(&cert)?;
-        Ok::<_, ApiError>(cert)
+        Ok::<_, ApiError>((before_cert, cert))
     })
     .await?;
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
-    Ok(json_data(cert_to_response(&cert)))
+
+    let response = cert_to_response(&cert);
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // Both payloads use the PEM-free response view, never the stored
+    // model (the model carries `key_pem`).
+    let before = serde_json::to_value(cert_to_response(&before_cert)).ok();
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "certificate.update",
+        ("certificate", &cert.id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data(response))
 }
 
 /// DELETE /api/v1/certificates/:id - delete a certificate, refusing if any route still references it.
 pub async fn delete_certificate(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let cert_id = id.clone();
     db_blocking(&state.store, move |store| {
         // Check if any routes reference this certificate
         let routes = store.list_routes()?;
@@ -472,6 +512,18 @@ pub async fn delete_certificate(
     })
     .await?;
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "certificate.delete",
+        ("certificate", &cert_id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(
         serde_json::json!({"message": "certificate deleted"}),
     ))
@@ -479,7 +531,10 @@ pub async fn delete_certificate(
 
 /// POST /api/v1/certificates/self-signed - generate and store a self-signed cert for the given domain.
 pub async fn generate_self_signed(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<GenerateSelfSignedRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     if body.domain.is_empty() {
@@ -535,10 +590,22 @@ pub async fn generate_self_signed(
     state.rotate_bot_hmac_on_cert_event().await;
     state.notify_config_changed();
 
-    Ok(json_data_with_status(
-        StatusCode::CREATED,
-        cert_to_response(&certificate),
-    ))
+    let response = cert_to_response(&certificate);
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // `after` uses the PEM-free response view, never the stored model
+    // (the model carries `key_pem`).
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "certificate.self_signed",
+        ("certificate", &certificate.id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data_with_status(StatusCode::CREATED, response))
 }
 
 /// Query string for `GET /api/v1/certificates/:id/download`.

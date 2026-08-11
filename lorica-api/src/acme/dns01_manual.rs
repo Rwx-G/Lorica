@@ -14,15 +14,17 @@
 
 //! Two-step manual DNS-01 challenge flow (init, check, confirm).
 
+use std::net::SocketAddr;
 use std::time::Instant;
 
-use axum::extract::Extension;
+use axum::extract::{ConnectInfo, Extension};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 use super::config::AcmeConfig;
@@ -85,7 +87,10 @@ pub struct AcmeDnsManualConfirmRequest {
 /// the TXT record. Instead it returns the record name and value so the user can
 /// create it manually. The pending challenge is stored in memory.
 pub async fn provision_dns_manual(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<AcmeDnsManualRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use instant_acme::{
@@ -229,6 +234,20 @@ pub async fn provision_dns_manual(
         "manual DNS-01 challenge created, waiting for user to set TXT record(s)"
     );
 
+    // The pending challenge (order + account credentials) is state
+    // this handler just created; the audit payload stays None so the
+    // key authorization values never reach the audit hash input.
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "acme.provision_dns01_manual",
+        ("certificate", &primary_domain),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(AcmeDnsManualResponse {
         status: "pending_dns".into(),
         domain: primary_domain,
@@ -337,7 +356,10 @@ async fn check_txt_record(
 /// to verify the challenge, waits for validation, downloads the certificate, and
 /// stores it in the database.
 pub async fn provision_dns_manual_confirm(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<AcmeDnsManualConfirmRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use instant_acme::{
@@ -544,7 +566,7 @@ pub async fn provision_dns_manual_confirm(
         "manual DNS-01 certificate provisioned"
     );
 
-    Ok(json_data(AcmeProvisionResponse {
+    let response = AcmeProvisionResponse {
         status: "provisioned".into(),
         domain: primary_domain,
         staging: pending.staging,
@@ -552,5 +574,19 @@ pub async fn provision_dns_manual_confirm(
             "Certificate provisioned via manual DNS-01 for {} domain(s) (id: {cert_id})",
             domains.len()
         ),
-    }))
+    };
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "acme.dns01_manual_confirm",
+        ("certificate", &cert_id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data(response))
 }

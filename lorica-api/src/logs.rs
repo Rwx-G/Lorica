@@ -4,16 +4,18 @@
 //! present and falls back to the in-process [`LogBuffer`] otherwise.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, Query};
+use axum::extract::{ConnectInfo, Extension, Query};
 use axum::response::IntoResponse;
 use axum::Json;
 use futures_util::{SinkExt, StreamExt};
 use http::header;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use tokio::sync::broadcast;
 
 use crate::db::log_db_blocking;
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// A single access log entry.
@@ -488,7 +490,10 @@ pub async fn export_logs(
 
 /// DELETE /api/v1/logs - empty both the in-memory ring buffer and the persistent store.
 pub async fn clear_logs(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.log_buffer.clear();
     if let Some(ref store) = state.log_store {
@@ -503,6 +508,10 @@ pub async fn clear_logs(
         // few seconds on a busy DB - off the tokio worker.
         log_db_blocking(store, |s| s.clear()).await?;
     }
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(&state, &audit_ctx, "logs.clear", ("logs", ""), None, None).await;
+
     Ok(json_data(serde_json::json!({ "message": "logs cleared" })))
 }
 

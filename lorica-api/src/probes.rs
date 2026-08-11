@@ -14,16 +14,18 @@
 
 //! Active SLA probe configuration endpoints (CRUD plus per-probe history).
 
-use axum::extract::{Path, Query};
+use axum::extract::{ConnectInfo, Path, Query};
 use axum::Extension;
 use axum::Json;
 use chrono::Utc;
 use lorica_config::models::ProbeConfig;
 use lorica_config::store::new_id;
 use serde::Deserialize;
+use std::net::SocketAddr;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// GET /api/v1/probes
@@ -77,7 +79,10 @@ pub struct CreateProbe {
 
 /// POST /api/v1/probes - create a new active probe attached to a route.
 pub async fn create_probe(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateProbe>,
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
     let probe = db_blocking(&state.store, move |store| {
@@ -115,6 +120,19 @@ pub async fn create_probe(
     .await?;
 
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let after = serde_json::to_value(&probe).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "probe.create",
+        ("probe", &probe.id),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
     Ok(json_data_with_status(
         axum::http::StatusCode::CREATED,
         probe,
@@ -140,15 +158,19 @@ pub struct UpdateProbe {
 
 /// PUT /api/v1/probes/:id - patch fields on an existing probe configuration.
 pub async fn update_probe(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdateProbe>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let probe = db_blocking(&state.store, move |store| {
+    let (before_probe, probe) = db_blocking(&state.store, move |store| {
         let mut probe = store
             .get_probe_config(&id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::NotFound(format!("probe {id}")))?;
+        let before_probe = probe.clone();
 
         if let Some(method) = body.method {
             probe.method = method;
@@ -179,18 +201,35 @@ pub async fn update_probe(
             .update_probe_config(&probe)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-        Ok(probe)
+        Ok((before_probe, probe))
     })
     .await?;
 
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(&before_probe).ok();
+    let after = serde_json::to_value(&probe).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "probe.update",
+        ("probe", &probe.id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
+
     Ok(json_data(probe))
 }
 
 /// DELETE /api/v1/probes/:id
 /// Delete a probe configuration.
 pub async fn delete_probe(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let db_id = id.clone();
@@ -201,6 +240,10 @@ pub async fn delete_probe(
     })
     .await?;
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(&state, &audit_ctx, "probe.delete", ("probe", &id), None, None).await;
+
     Ok(json_data(serde_json::json!({"deleted": id})))
 }
 

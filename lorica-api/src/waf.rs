@@ -14,12 +14,14 @@
 
 //! WAF security events API for the management dashboard.
 
-use axum::extract::{Extension, Query};
+use axum::extract::{ConnectInfo, Extension, Query};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::db::{db_blocking, log_db_blocking};
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 use lorica_waf::WafEvent;
 
@@ -180,7 +182,10 @@ pub struct RuleToggleRequest {
 
 /// PUT /api/v1/waf/rules/:id - enable or disable a specific rule
 pub async fn toggle_waf_rule(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     axum::extract::Path(rule_id): axum::extract::Path<u32>,
     Json(body): Json<RuleToggleRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -210,15 +215,31 @@ pub async fn toggle_waf_rule(
     }
 
     state.notify_config_changed();
-    Ok(json_data(serde_json::json!({
+
+    let payload = serde_json::json!({
         "rule_id": rule_id,
         "enabled": body.enabled,
-    })))
+    });
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "waf.rule_toggle",
+        ("waf_rule", &rule_id.to_string()),
+        None,
+        Some(&payload),
+    )
+    .await;
+
+    Ok(json_data(payload))
 }
 
 /// DELETE /api/v1/waf/events - clear WAF event buffer
 pub async fn clear_waf_events(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if let Some(ref waf_buffer) = state.waf_event_buffer {
         let mut buf = waf_buffer.lock();
@@ -236,6 +257,18 @@ pub async fn clear_waf_events(
         })
         .await?;
     }
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "waf.events_clear",
+        ("waf_events", ""),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({"cleared": true})))
 }
 
@@ -258,7 +291,10 @@ pub struct CreateCustomRuleRequest {
 
 /// POST /api/v1/waf/rules/custom - create a user-defined WAF rule
 pub async fn create_custom_rule(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateCustomRuleRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let engine = state
@@ -270,6 +306,15 @@ pub async fn create_custom_rule(
         .category
         .parse::<lorica_waf::RuleCategory>()
         .map_err(|e| ApiError::BadRequest(format!("invalid category: {e}")))?;
+
+    // Captured before `body` moves into the persistence closure.
+    let audit_after = serde_json::json!({
+        "id": body.id,
+        "description": body.description.clone(),
+        "category": body.category.clone(),
+        "pattern": body.pattern.clone(),
+        "severity": body.severity.unwrap_or(3),
+    });
 
     engine
         .add_custom_rule(
@@ -298,6 +343,18 @@ pub async fn create_custom_rule(
     .await;
 
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "waf.custom_rule_create",
+        ("waf_rule", &rule_id.to_string()),
+        None,
+        Some(&audit_after),
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({
         "id": rule_id,
         "description": description,
@@ -323,7 +380,10 @@ pub async fn list_custom_rules(
 
 /// DELETE /api/v1/waf/rules/custom/:id - delete a user-defined WAF rule
 pub async fn delete_custom_rule(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     axum::extract::Path(rule_id): axum::extract::Path<u32>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let engine = state
@@ -338,6 +398,18 @@ pub async fn delete_custom_rule(
         })
         .await;
         state.notify_config_changed();
+
+        let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            "waf.custom_rule_delete",
+            ("waf_rule", &rule_id.to_string()),
+            None,
+            None,
+        )
+        .await;
+
         Ok(json_data(
             serde_json::json!({"deleted": true, "id": rule_id}),
         ))
@@ -374,7 +446,10 @@ pub struct BlocklistToggleRequest {
 
 /// PUT /api/v1/waf/blocklist - enable or disable the IP blocklist
 pub async fn toggle_blocklist(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<BlocklistToggleRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let engine = state
@@ -400,10 +475,22 @@ pub async fn toggle_blocklist(
     // Notify workers so they apply the new blocklist state
     state.notify_config_changed();
 
-    Ok(json_data(serde_json::json!({
+    let payload = serde_json::json!({
         "enabled": body.enabled,
         "ip_count": count,
-    })))
+    });
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "waf.blocklist_toggle",
+        ("waf_blocklist", ""),
+        None,
+        Some(&payload),
+    )
+    .await;
+
+    Ok(json_data(payload))
 }
 
 /// Fetch and load the blocklist from the remote URL.
@@ -444,7 +531,10 @@ pub async fn fetch_and_load_blocklist(
 
 /// POST /api/v1/waf/blocklist/reload - reload the IP blocklist from the remote URL
 pub async fn reload_blocklist(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let engine = state
         .waf_engine
@@ -454,6 +544,17 @@ pub async fn reload_blocklist(
     let count = fetch_and_load_blocklist(engine.ip_blocklist())
         .await
         .map_err(ApiError::Internal)?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "waf.blocklist_reload",
+        ("waf_blocklist", ""),
+        None,
+        None,
+    )
+    .await;
 
     Ok(json_data(serde_json::json!({
         "reloaded": true,

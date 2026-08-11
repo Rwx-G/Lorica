@@ -352,6 +352,11 @@ pub fn build_router(
             )),
         )
         .route("/api/v1/auth/me", get(crate::auth::me))
+        // Admin audit log (Story 8.9). Role floors live in the
+        // authorize middleware: /audit is Operator+, /audit/verify
+        // is SuperAdmin-only.
+        .route("/api/v1/audit", get(crate::audit::list_audit))
+        .route("/api/v1/audit/verify", get(crate::audit::verify_audit))
         // Users CRUD (Story 8.3 AC #5). SuperAdmin-only for every
         // method, enforced by the authorize middleware.
         .route(
@@ -946,6 +951,12 @@ pub fn build_router(
         .layer(axum::Extension(state))
         .layer(axum::Extension(session_store))
         .layer(axum::Extension(rate_limiter))
+        // Outermost: every API request runs inside an `api_request`
+        // tracing span so `lorica::audit` events correlate with the
+        // request in OTel (Story 8.9 AC #4).
+        .layer(middleware::from_fn(
+            crate::middleware::request_span::api_request_span,
+        ))
 }
 
 /// Start the API server on localhost only.

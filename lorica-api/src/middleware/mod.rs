@@ -4,3 +4,4 @@
 pub mod auth;
 pub mod authorize;
 pub mod rate_limit;
+pub mod request_span;

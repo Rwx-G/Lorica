@@ -1,12 +1,14 @@
 //! Global settings, notification channels, and per-user UI preferences endpoints.
 
-use axum::extract::{Extension, Path};
+use axum::extract::{ConnectInfo, Extension, Path};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::db::{db_blocking, log_db_blocking};
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 // ---- Global Settings ----
@@ -46,7 +48,11 @@ pub async fn get_settings(
 /// JSON body for `PUT /api/v1/settings`. Only the supplied fields are
 /// mutated ; each field mirrors the matching
 /// [`lorica_config::models::GlobalSettings`] key.
-#[derive(Deserialize)]
+///
+/// `Serialize` exists solely for the audit-log payload hash (Story
+/// 8.9): the request body carries no secret (there is no write path
+/// for `bot_hmac_secret_hex`), unlike the full `GlobalSettings` row.
+#[derive(Deserialize, Serialize)]
 pub struct UpdateSettingsRequest {
     /// Management API TCP port.
     pub management_port: Option<u16>,
@@ -138,9 +144,17 @@ pub struct UpdateSettingsRequest {
 /// are kept on purpose (normalising them is a behaviour change) and
 /// flagged with `// NOTE: bound drift` comments for the next audit.
 pub async fn update_settings(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<UpdateSettingsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Audit payload = the PATCH body (secret-free by construction),
+    // never the resulting GlobalSettings row (carries
+    // `bot_hmac_secret_hex`). Serialized before the closure consumes
+    // the body; recorded only after the mutation succeeds.
+    let audit_after = serde_json::to_value(&body).ok();
     // The whole get -> validate/assign -> update sequence is sync and
     // runs in one closure on the blocking pool; the store mutex hold
     // window is unchanged.
@@ -313,6 +327,18 @@ pub async fn update_settings(
     })
     .await?;
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "settings.update",
+        ("settings", ""),
+        None,
+        audit_after.as_ref(),
+    )
+    .await;
+
     Ok(json_data(settings))
 }
 
@@ -732,7 +758,10 @@ pub struct CreateNotificationRequest {
 
 /// POST /api/v1/notifications - register a new notification channel.
 pub async fn create_notification(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CreateNotificationRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let channel: lorica_config::models::NotificationChannel = body
@@ -757,14 +786,31 @@ pub async fn create_notification(
         Ok::<_, ApiError>(masked)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // body carries credentials: not even a hash
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "notification.create",
+        ("notification", &masked.id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data_with_status(StatusCode::CREATED, masked))
 }
 
 /// POST /api/v1/notifications/:id/test - send a real test alert through the configured channel.
 pub async fn test_notification(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let notification_id = id.clone();
     let nc = db_blocking(&state.store, move |store| {
         store
             .get_notification_config(&id)?
@@ -817,6 +863,17 @@ pub async fn test_notification(
                 .map_err(|e| ApiError::Internal(format!("slack send failed: {e}")))?;
         }
     }
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "notification.test",
+        ("notification", &notification_id),
+        None,
+        None,
+    )
+    .await;
 
     Ok(json_data(serde_json::json!({
         "message": "test notification sent successfully",
@@ -907,7 +964,10 @@ fn validate_notification_config(config: &str) -> Result<(), ApiError> {
 
 /// PUT /api/v1/notifications/:id - update channel config; `********` placeholders preserve stored secrets.
 pub async fn update_notification(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<CreateNotificationRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -993,18 +1053,47 @@ pub async fn update_notification(
         Ok::<_, ApiError>(masked)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // body carries credentials: not even a hash
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "notification.update",
+        ("notification", &masked.id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(masked))
 }
 
 /// DELETE /api/v1/notifications/:id - remove a notification channel.
 pub async fn delete_notification(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let notification_id = id.clone();
     db_blocking(&state.store, move |store| {
         store.delete_notification_config(&id)
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "notification.delete",
+        ("notification", &notification_id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(
         serde_json::json!({"message": "notification config deleted"}),
     ))
@@ -1030,7 +1119,10 @@ pub struct UpdatePreferenceRequest {
 
 /// PUT /api/v1/preferences/:id - update one user preference value.
 pub async fn update_preference(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
     Json(body): Json<UpdatePreferenceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1039,10 +1131,12 @@ pub async fn update_preference(
         .parse()
         .map_err(|e: strum::ParseError| ApiError::BadRequest(e.to_string()))?;
 
-    let updated = db_blocking(&state.store, move |store| {
+    let preference_id = id.clone();
+    let (before_pref, updated) = db_blocking(&state.store, move |store| {
         let existing = store
             .get_user_preference(&id)?
             .ok_or_else(|| ApiError::NotFound(format!("preference {id}")))?;
+        let before_pref = existing.clone();
 
         let updated = lorica_config::models::UserPreference {
             value,
@@ -1051,18 +1145,48 @@ pub async fn update_preference(
         };
 
         store.update_user_preference(&updated)?;
-        Ok::<_, ApiError>(updated)
+        Ok::<_, ApiError>((before_pref, updated))
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(&before_pref).ok();
+    let after = serde_json::to_value(&updated).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "preference.update",
+        ("preference", &preference_id),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
+
     Ok(json_data(updated))
 }
 
 /// DELETE /api/v1/preferences/:id - remove a user preference.
 pub async fn delete_preference(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let preference_id = id.clone();
     db_blocking(&state.store, move |store| store.delete_user_preference(&id)).await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "preference.delete",
+        ("preference", &preference_id),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(
         serde_json::json!({"message": "preference deleted"}),
     ))

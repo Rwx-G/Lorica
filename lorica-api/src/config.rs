@@ -1,13 +1,15 @@
 //! Endpoints to export the running configuration as TOML and import a new
 //! one (with optional dry-run diff preview).
 
-use axum::extract::Extension;
+use axum::extract::{ConnectInfo, Extension};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
+use std::net::SocketAddr;
 
 use crate::db::db_blocking;
 use crate::error::{json_data, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// JSON body wrapping a TOML configuration document.
@@ -19,7 +21,10 @@ pub struct ImportRequest {
 
 /// POST /api/v1/config/export - serialize the current configuration as a TOML download.
 pub async fn export_config(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
 ) -> Result<
     (
         StatusCode,
@@ -33,6 +38,19 @@ pub async fn export_config(
             .map_err(|e| ApiError::Internal(e.to_string()))
     })
     .await?;
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // The export body carries private keys and credentials: not even a
+    // hash lands in the audit row.
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "config.export",
+        ("config", ""),
+        None,
+        None,
+    )
+    .await;
 
     Ok((
         StatusCode::OK,
@@ -52,7 +70,10 @@ const MAX_IMPORT_SIZE: usize = 1_048_576;
 
 /// POST /api/v1/config/import - replace the entire configuration from a TOML payload (max 1 MB).
 pub async fn import_config(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<ImportRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if body.toml_content.len() > MAX_IMPORT_SIZE {
@@ -91,6 +112,19 @@ pub async fn import_config(
     })
     .await?;
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    // The import body carries private keys and credentials: not even a
+    // hash lands in the audit row.
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "config.import",
+        ("config", ""),
+        None,
+        None,
+    )
+    .await;
 
     Ok(json_data(
         serde_json::json!({"message": "configuration imported successfully"}),

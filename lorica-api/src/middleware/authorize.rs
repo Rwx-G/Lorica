@@ -41,6 +41,16 @@ pub fn required_role(method: &http::Method, path: &str) -> Role {
         return Role::SuperAdmin;
     }
 
+    // Audit log (Story 8.9 AC #3/#8): reads are Operator+, the chain
+    // verification is SuperAdmin-only. Both are carved out of the
+    // Viewer-open GET default below.
+    if path == "/api/v1/audit/verify" {
+        return Role::SuperAdmin;
+    }
+    if path == "/api/v1/audit" {
+        return Role::Operator;
+    }
+
     if method == http::Method::GET || method == http::Method::HEAD {
         // `format=key` / `format=full` return the private key; the
         // whole download endpoint is treated as secret material
@@ -174,6 +184,15 @@ mod tests {
         );
         assert_eq!(
             required_role(&Method::POST, "/api/v1/system/upgrade"),
+            Role::SuperAdmin
+        );
+    }
+
+    #[test]
+    fn audit_endpoints_are_carved_out_of_viewer_reads() {
+        assert_eq!(required_role(&Method::GET, "/api/v1/audit"), Role::Operator);
+        assert_eq!(
+            required_role(&Method::GET, "/api/v1/audit/verify"),
             Role::SuperAdmin
         );
     }

@@ -95,6 +95,7 @@ pub async fn login(
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
     Extension(rate_limiter): Extension<RateLimiter>,
+    headers: http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let client_ip = connect_info
@@ -158,6 +159,30 @@ pub async fn login(
         session_expires_at: expires_at.to_rfc3339(),
     };
 
+    // Pre-session context: the Session extension does not exist yet,
+    // so the audit context is built from the verified user directly.
+    // Failed logins are deliberately NOT audited (rate-limiter
+    // territory; auditing them would let an attacker grow the chain).
+    let audit_ctx = crate::audit::AuditContext {
+        username: user.username.clone(),
+        role: user.role.as_str().to_string(),
+        ip: client_ip.clone(),
+        user_agent: headers
+            .get(http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+    };
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "auth.login",
+        ("user", &user.id),
+        None,
+        None,
+    )
+    .await;
+
     Ok((
         StatusCode::OK,
         [(http::header::SET_COOKIE, session_cookie(&session_id))],
@@ -167,18 +192,46 @@ pub async fn login(
 
 /// POST /api/v1/auth/logout - invalidate the current session and clear the cookie.
 pub async fn logout(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
     headers: http::HeaderMap,
 ) -> impl IntoResponse {
+    // Public route: no Session extension. The audit identity comes
+    // from the session row looked up via the cookie BEFORE removal;
+    // no valid session means nothing to audit.
+    let mut audit_identity: Option<(crate::audit::AuditContext, String)> = None;
     if let Some(cookie_header) = headers.get(http::header::COOKIE) {
         if let Ok(cookies) = cookie_header.to_str() {
             for cookie in cookies.split(';') {
                 let cookie = cookie.trim();
                 if let Some(session_id) = cookie.strip_prefix("lorica_session=") {
+                    if let Some(session) = session_store.get(session_id).await {
+                        audit_identity = Some((
+                            crate::audit::AuditContext::new(
+                                &session,
+                                connect_info.as_ref(),
+                                &headers,
+                            ),
+                            session.user_id.clone(),
+                        ));
+                    }
                     session_store.remove(session_id).await;
                 }
             }
         }
+    }
+
+    if let Some((audit_ctx, user_id)) = audit_identity {
+        crate::audit::record(
+            &state,
+            &audit_ctx,
+            "auth.logout",
+            ("user", &user_id),
+            None,
+            None,
+        )
+        .await;
     }
 
     (
@@ -213,6 +266,8 @@ pub async fn me(Extension(session): Extension<Session>) -> impl IntoResponse {
 /// user stays logged in while any attacker holding the previous
 /// cookie gets a 401 on the next call (v1.5.0 audit LOW-13).
 pub async fn change_password(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
     Extension(session_store): Extension<SessionStore>,
     Extension(session): Extension<Session>,
@@ -268,6 +323,19 @@ pub async fn change_password(
             session.role,
         )
         .await;
+
+    // Passwords never reach the audit payloads, not even as a hash:
+    // before/after stay explicitly None.
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "auth.password_change",
+        ("user", &session.user_id),
+        None,
+        None,
+    )
+    .await;
 
     Ok((
         [(http::header::SET_COOKIE, session_cookie(&new_session_id))],

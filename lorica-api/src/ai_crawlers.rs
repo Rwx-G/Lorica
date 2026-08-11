@@ -34,11 +34,12 @@
 //! - The total custom-crawler row count MUST stay below
 //!   `CUSTOM_CRAWLER_MAX_COUNT` on insert.
 
-use axum::extract::{Extension, Path, Query};
+use axum::extract::{ConnectInfo, Extension, Path, Query};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use ipnet::IpNet;
+use std::net::SocketAddr;
 use lorica_config::ai_crawler_registry::{
     build_robots_txt_from_names, BASELINE_UAS, BUILTIN_CRAWLER_DESCRIPTORS,
 };
@@ -50,6 +51,7 @@ use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{json_data, json_data_with_status, ApiError};
+use crate::middleware::auth::Session;
 use crate::server::AppState;
 
 /// Body shape for POST / PUT.
@@ -122,7 +124,10 @@ pub async fn list_custom_crawlers(
 /// Pipeline-validates the regex (compile + baseline-UA smoke), the
 /// verification kind payload, and the count cap.
 pub async fn create_custom_crawler(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Json(body): Json<CustomCrawlerRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     validate_request(&body)?;
@@ -143,15 +148,29 @@ pub async fn create_custom_crawler(
         .ok_or_else(|| ApiError::Internal("post-insert read failed".into()))?;
     drop(store);
     state.notify_config_changed();
-    Ok(json_data_with_status(
-        StatusCode::CREATED,
-        CustomCrawlerResponse::from(saved),
-    ))
+
+    let response = CustomCrawlerResponse::from(saved);
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "ai_crawler.create",
+        ("ai_crawler", &id.to_string()),
+        None,
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data_with_status(StatusCode::CREATED, response))
 }
 
 /// `PUT /api/v1/ai-crawlers/custom/:id` - update an existing row.
 pub async fn update_custom_crawler(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<i64>,
     Json(body): Json<CustomCrawlerRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -160,6 +179,7 @@ pub async fn update_custom_crawler(
     let mut existing = store
         .get_custom_crawler(id)?
         .ok_or_else(|| ApiError::NotFound(format!("ai_crawler_custom {id}")))?;
+    let before_row = existing.clone();
     existing.name = body.name;
     existing.user_agent_pattern = body.user_agent_pattern;
     existing.verification = body.verification;
@@ -171,18 +191,48 @@ pub async fn update_custom_crawler(
         .ok_or_else(|| ApiError::Internal("post-update read failed".into()))?;
     drop(store);
     state.notify_config_changed();
-    Ok(json_data(CustomCrawlerResponse::from(saved)))
+
+    let response = CustomCrawlerResponse::from(saved);
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    let before = serde_json::to_value(CustomCrawlerResponse::from(before_row)).ok();
+    let after = serde_json::to_value(&response).ok();
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "ai_crawler.update",
+        ("ai_crawler", &id.to_string()),
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await;
+
+    Ok(json_data(response))
 }
 
 /// `DELETE /api/v1/ai-crawlers/custom/:id` - remove a row.
 pub async fn delete_custom_crawler(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: http::HeaderMap,
     Extension(state): Extension<AppState>,
+    Extension(session): Extension<Session>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.lock().await;
     store.delete_custom_crawler(id)?;
     drop(store);
     state.notify_config_changed();
+
+    let audit_ctx = crate::audit::AuditContext::new(&session, connect_info.as_ref(), &headers);
+    crate::audit::record(
+        &state,
+        &audit_ctx,
+        "ai_crawler.delete",
+        ("ai_crawler", &id.to_string()),
+        None,
+        None,
+    )
+    .await;
+
     Ok(json_data(serde_json::json!({ "deleted": id })))
 }
 
