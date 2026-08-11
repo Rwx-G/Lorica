@@ -200,6 +200,13 @@ assert_status PUT "$API/api/v1/users/$VIEW_ID" 200 "admin disables view1" \
 SESSION="$VIEW_SESSION"
 assert_status GET "$API/api/v1/routes" 401 "disabled viewer session is invalidated"
 
+# The login rate limiter allows 5 attempts / 60 s per source IP and
+# the smoke has already spent them (admin x2-3, op1, view1). Wait out
+# the fixed window so the next two login checks measure auth
+# behavior, not the limiter.
+log "waiting 61s for the login rate-limit window to reset"
+sleep 61
+
 DISABLED_HTTP=$(curl -s -o /dev/null -w '%{http_code}' \
     "$API/api/v1/auth/login" -X POST -H "Content-Type: application/json" \
     -d "{\"username\":\"view1\",\"password\":\"$VIEW_PW\"}")
