@@ -229,6 +229,16 @@ fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> Setting
             new_value: incoming.log_level.clone(),
         });
     }
+    // Story 8.8 AC #4. The bool toggle is safe to surface in the reload
+    // diff; the paired `prometheus_scrape_token` is a secret and is
+    // deliberately never diffed (same policy as `bot_hmac_secret_hex`).
+    if current.metrics_require_auth != incoming.metrics_require_auth {
+        changes.push(SettingChange {
+            key: "metrics_require_auth".to_string(),
+            old_value: current.metrics_require_auth.to_string(),
+            new_value: incoming.metrics_require_auth.to_string(),
+        });
+    }
     if current.default_health_check_interval_s != incoming.default_health_check_interval_s {
         changes.push(SettingChange {
             key: "default_health_check_interval_s".to_string(),

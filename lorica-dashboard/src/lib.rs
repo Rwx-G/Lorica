@@ -1,10 +1,14 @@
 #![deny(clippy::all)]
 
+use std::sync::LazyLock;
+
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use rust_embed::Embed;
+
+pub mod csp;
 
 #[derive(Embed)]
 #[folder = "frontend/dist"]
@@ -12,29 +16,14 @@ struct DashboardAssets;
 
 /// Content-Security-Policy emitted on every dashboard asset.
 ///
-/// `connect-src` is restricted to the same-origin HTTP(S) document
-/// (via `'self'`) plus same-host WebSocket schemes scoped to the
-/// loopback addresses Lorica binds the management API to. The
-/// management port can be reconfigured via `management_port`, so a
-/// `:*` port wildcard keeps the policy honest across operator
-/// deployments without admitting arbitrary remote `ws://attacker.example`
-/// connections (v1.5.1 audit L-2 - the previous bare `ws:` token
-/// allowed any host).
-///
-/// `style-src 'unsafe-inline'` is still needed for Svelte's runtime-
-/// injected scoped styles (audit L-1 - a CSP3 nonce migration is
-/// tracked in `docs/backlog.md` as a v2.0 candidate).
-const CSP_HEADER: &str = "default-src 'self'; \
-script-src 'self'; \
-style-src 'self' 'unsafe-inline'; \
-img-src 'self' data:; \
-connect-src 'self' \
-ws://localhost:* ws://127.0.0.1:* ws://[::1]:* \
-wss://localhost:* wss://127.0.0.1:* wss://[::1]:*; \
-frame-ancestors 'none'; \
-form-action 'self'; \
-base-uri 'none'; \
-object-src 'none'";
+/// The directive set lives in [`csp::build_csp`] (Story 8.8 AC #7).
+/// The served value uses the `None` (pre-CSP3) variant: `style-src`
+/// keeps `'unsafe-inline'` because the production Vite build extracts
+/// component CSS to linked stylesheets while Svelte still emits inline
+/// `style=` attributes at runtime, which a `style-src` nonce would not
+/// authorize. The nonce-capable variant is wired and unit-tested in
+/// `csp.rs` for the follow-up that patches the runtime style emitter.
+static CSP_HEADER: LazyLock<String> = LazyLock::new(|| csp::build_csp(None));
 
 /// Build the dashboard router for serving embedded frontend assets.
 ///

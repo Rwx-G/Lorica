@@ -449,7 +449,10 @@ pub(crate) fn run_unban(port: u16, ip: String, user: String, password: String) {
                 std::process::exit(1);
             }
             Err(e) => {
-                eprintln!("Cannot connect to management API on port {port}: {e}");
+                eprintln!(
+                    "Cannot connect to management API on port {port}: {e}. \
+                     Hint: is lorica running and is --management-port correct?"
+                );
                 std::process::exit(1);
             }
         }

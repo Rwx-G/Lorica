@@ -148,9 +148,48 @@ Story 8.9 hardening knobs, all live-reloadable via settings:
 - Database file permissions: 0600 (owner read/write only)
 
 ### Monitoring
-- `/metrics` endpoint available for Prometheus (no auth, localhost only)
+- `/metrics` endpoint available for Prometheus (localhost only; optional auth, see "Management plane authentication")
 - Structured JSON logging via tracing for SIEM integration
 - WAF events logged with alert_type and matched rule details
+
+### Management plane authentication (v1.6.0)
+
+The management API (default port 9443) binds to loopback only. Two
+controls harden it further.
+
+**`/metrics` authentication (opt-in).** By default `/metrics` is
+served without authentication so existing Prometheus scrapes keep
+working. On a shared / multi-tenant host any local user can otherwise
+read the full backend topology and certificate inventory from the
+endpoint. Set the global setting `metrics_require_auth = true` to
+require, on every scrape, ONE of:
+
+- a valid dashboard session cookie (an operator viewing `/metrics` in
+  the browser), or
+- a static bearer token supplied as `Authorization: Bearer <token>`.
+
+The token is configured via the `prometheus_scrape_token` setting or,
+preferably, injected out of band through the environment variable
+`LORICA_PROMETHEUS_SCRAPE_TOKEN` (the env value overrides the stored
+one). The token is compared in constant time so a failed attempt does
+not leak how many leading bytes matched. A rejected scrape returns
+`401` with `WWW-Authenticate: Bearer realm="lorica-metrics"`. The
+token is masked (`**REDACTED**`) in `GET /api/v1/settings` responses
+and is never written to the reload diff.
+
+> Migration note: `metrics_require_auth` defaults to `false` in v1.6.0
+> for back-compat and is planned to default to `true` in v1.7.0.
+> Configure `prometheus_scrape_token` and update your scraper's
+> `Authorization` header before upgrading to v1.7.0.
+
+**Dashboard CSP.** The dashboard assets carry a strict CSP3 policy
+(built in `lorica-dashboard/src/csp.rs`): `default-src 'self'`,
+`script-src 'self'`, `frame-ancestors 'none'`, `form-action 'self'`,
+`base-uri 'none'`, `object-src 'none'`, and a `connect-src` scoped to
+the loopback WebSocket origins. The `style-src` directive retains
+`'unsafe-inline'` for Svelte's runtime-emitted styles; the CSP builder
+already supports a per-request `'nonce-...'` variant for the follow-up
+that patches the runtime style emitter.
 
 ## Fuzz Testing
 

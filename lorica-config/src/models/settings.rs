@@ -384,6 +384,42 @@ pub struct GlobalSettings {
     /// manages this key file out of band.
     #[serde(default)]
     pub upgrade_signing_pubkey_path: Option<String>,
+
+    /// Require authentication on the `/metrics` endpoint (Story 8.8
+    /// AC #4). Default `false` in v1.6.0 for back-compat: existing
+    /// Prometheus scrapers keep working unauthenticated. When `true`,
+    /// `/metrics` demands either a valid dashboard session cookie OR
+    /// the static bearer token in `prometheus_scrape_token`. Flips to
+    /// `true` in v1.7.0 with a release-note migration paragraph.
+    #[serde(default)]
+    pub metrics_require_auth: bool,
+
+    /// Static bearer token accepted on `/metrics` when
+    /// `metrics_require_auth` is `true` (Story 8.8 AC #4). `None` =
+    /// no token configured (only a session cookie authenticates). The
+    /// environment variable `LORICA_PROMETHEUS_SCRAPE_TOKEN` overrides
+    /// this value at request time so operators can inject the token
+    /// out of band without persisting it in the database. Compared in
+    /// constant time (AC #5). Never serialised back over the API: the
+    /// `GET /api/v1/settings` handler masks it like the bot HMAC
+    /// secret.
+    #[serde(default)]
+    pub prometheus_scrape_token: Option<String>,
+
+    /// Operator-supplied PEM certificate chain for the management-API
+    /// TLS listener (Story 8.8 AC #2). When both this and
+    /// `management_key_pem_path` are set, Lorica serves the management
+    /// port with the operator certificate and ignores the
+    /// auto-generated self-signed cert. `None` = use the self-signed
+    /// cert persisted under `<data_dir>/management/`.
+    #[serde(default)]
+    pub management_cert_pem_path: Option<String>,
+
+    /// Operator-supplied PEM private key paired with
+    /// `management_cert_pem_path` (Story 8.8 AC #2). Both must be set
+    /// for the operator override to take effect.
+    #[serde(default)]
+    pub management_key_pem_path: Option<String>,
 }
 
 fn default_header_timeout_s() -> u32 {
@@ -514,6 +550,10 @@ impl Default for GlobalSettings {
             ai_bot_treat_spoofed_as: SpoofedFallback::default(),
             ai_bot_inject_headers: default_ai_bot_inject_headers(),
             upgrade_signing_pubkey_path: None,
+            metrics_require_auth: false,
+            prometheus_scrape_token: None,
+            management_cert_pem_path: None,
+            management_key_pem_path: None,
             password_min_length: default_password_min_length(),
             password_require_complexity: default_password_require_complexity(),
             audit_log_retention_days: default_audit_log_retention_days(),

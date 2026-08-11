@@ -42,6 +42,16 @@ pub async fn get_settings(
     } else {
         "**REDACTED**".to_string()
     };
+    // Story 8.8 AC #4: the Prometheus scrape token is a secret (a leaked
+    // value grants unauthenticated `/metrics` access when
+    // `metrics_require_auth` is on). Mask it exactly like the bot HMAC
+    // secret: `None` stays `None`, a configured value becomes the
+    // sentinel. The `PUT` write path treats the sentinel as "leave
+    // unchanged" so the dashboard round-trip never clobbers the token.
+    settings.prometheus_scrape_token = settings
+        .prometheus_scrape_token
+        .as_ref()
+        .map(|_| "**REDACTED**".to_string());
     Ok(json_data(settings))
 }
 
@@ -139,6 +149,20 @@ pub struct UpdateSettingsRequest {
     /// upgrade. Without this write path the operator could never
     /// configure a signing key and every upload returned 400.
     pub upgrade_signing_pubkey_path: Option<String>,
+    /// Story 8.8 AC #4. Require auth on `/metrics`.
+    pub metrics_require_auth: Option<bool>,
+    /// Story 8.8 AC #4. Static bearer token accepted on `/metrics`.
+    /// An empty (after trim) value clears the token. The masking
+    /// sentinel `**REDACTED**` returned by `GET /settings` is treated
+    /// as "leave unchanged" so a dashboard round-trip never clobbers
+    /// the stored token.
+    pub prometheus_scrape_token: Option<String>,
+    /// Story 8.8 AC #2. Absolute path to the operator management-TLS
+    /// certificate chain (PEM). Empty clears it.
+    pub management_cert_pem_path: Option<String>,
+    /// Story 8.8 AC #2. Absolute path to the operator management-TLS
+    /// private key (PEM). Empty clears it.
+    pub management_key_pem_path: Option<String>,
 }
 
 /// PUT /api/v1/settings - patch the global settings document and trigger a proxy reload.
@@ -341,6 +365,22 @@ pub async fn update_settings(
             &mut settings.upgrade_signing_pubkey_path,
             "upgrade_signing_pubkey_path",
         )?;
+        // Story 8.8 AC #4 + AC #2.
+        apply_plain(body.metrics_require_auth, &mut settings.metrics_require_auth);
+        apply_secret_token(
+            body.prometheus_scrape_token,
+            &mut settings.prometheus_scrape_token,
+        );
+        apply_optional_abs_path(
+            body.management_cert_pem_path,
+            &mut settings.management_cert_pem_path,
+            "management_cert_pem_path",
+        )?;
+        apply_optional_abs_path(
+            body.management_key_pem_path,
+            &mut settings.management_key_pem_path,
+            "management_key_pem_path",
+        )?;
 
         store.update_global_settings(&settings)?;
         Ok::<_, ApiError>(settings)
@@ -482,6 +522,27 @@ fn apply_cidr_list(
         *target = cidrs;
     }
     Ok(())
+}
+
+/// Assign an optional secret string field (Story 8.8 AC #4 scrape
+/// token). `None` leaves the stored value untouched. An empty (after
+/// trim) value clears the secret to `None`. The masking sentinel the
+/// `GET /settings` handler returns (`**REDACTED**`) is treated as
+/// "leave unchanged" so a dashboard PUT that echoes the masked value
+/// never overwrites the real token. Any other value is stored verbatim.
+fn apply_secret_token(value: Option<String>, target: &mut Option<String>) {
+    let Some(v) = value else {
+        return;
+    };
+    let trimmed = v.trim();
+    if trimmed == "**REDACTED**" {
+        return;
+    }
+    *target = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
 }
 
 /// Assign a Unix permission mode field when present, rejecting values

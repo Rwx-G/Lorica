@@ -333,13 +333,21 @@ pub fn build_router(
         .route("/api/v1/auth/login", post(crate::auth::login))
         .route("/api/v1/auth/logout", post(crate::auth::logout));
 
-    // Metrics and ACME challenge endpoints (no auth)
+    // `/metrics` carries an opt-in auth gate (Story 8.8 AC #4/#5):
+    // pass-through when `metrics_require_auth` is off (the default),
+    // else a session cookie OR the bearer scrape token is required. The
+    // ACME challenge stays fully public (the CA reaches it un
+    // authenticated), so the two endpoints are split into separate
+    // sub-routers and only `/metrics` gets the layer.
     let metrics_routes = Router::new()
         .route("/metrics", get(crate::metrics::get_metrics))
-        .route(
-            "/.well-known/acme-challenge/:token",
-            get(crate::acme::serve_challenge),
-        );
+        .layer(middleware::from_fn(
+            crate::middleware::metrics_auth::metrics_auth,
+        ));
+    let acme_challenge_routes = Router::new().route(
+        "/.well-known/acme-challenge/:token",
+        get(crate::acme::serve_challenge),
+    );
 
     // Protected routes (auth required)
     let protected_routes = Router::new()
@@ -930,6 +938,7 @@ pub fn build_router(
     Router::new()
         .merge(auth_routes)
         .merge(metrics_routes)
+        .merge(acme_challenge_routes)
         .merge(protected_routes)
         .merge(dashboard_routes)
         // No CORS layer by design. The dashboard SPA is served from the

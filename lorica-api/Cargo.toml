@@ -94,6 +94,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 parking_lot = "0.12"
 ipnet = "2"
 strum = "0.26"
+# Constant-time byte comparison for the `/metrics` bearer-token check
+# (Story 8.8 AC #5) so token verification does not leak how many
+# leading bytes matched. Already in the workspace lockfile via the
+# rustls / dalek stack; promoted to a direct dep here.
+subtle = "2"
 tokio-util = { version = "0.7", features = ["rt"] }
 # Allocation-free integer formatter used on per-request hot paths
 # (e.g. `metrics::record_request` for the `status_code` Prometheus

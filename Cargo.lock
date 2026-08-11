@@ -3037,6 +3037,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
+ "subtle",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",

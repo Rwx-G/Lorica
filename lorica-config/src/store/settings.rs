@@ -240,6 +240,21 @@ impl ConfigStore {
                 "mirror_max_concurrent_global" => {
                     settings.mirror_max_concurrent_global = value.parse().unwrap_or(4096);
                 }
+                "metrics_require_auth" => {
+                    settings.metrics_require_auth = value == "true" || value == "1";
+                }
+                "prometheus_scrape_token" => {
+                    settings.prometheus_scrape_token =
+                        if value.is_empty() { None } else { Some(value) };
+                }
+                "management_cert_pem_path" => {
+                    settings.management_cert_pem_path =
+                        if value.is_empty() { None } else { Some(value) };
+                }
+                "management_key_pem_path" => {
+                    settings.management_key_pem_path =
+                        if value.is_empty() { None } else { Some(value) };
+                }
                 _ => {}
             }
         }
@@ -490,6 +505,22 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('mirror_max_concurrent_global', ?1)",
             params![settings.mirror_max_concurrent_global.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('metrics_require_auth', ?1)",
+            params![settings.metrics_require_auth.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('prometheus_scrape_token', ?1)",
+            params![settings.prometheus_scrape_token.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('management_cert_pem_path', ?1)",
+            params![settings.management_cert_pem_path.as_deref().unwrap_or("")],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('management_key_pem_path', ?1)",
+            params![settings.management_key_pem_path.as_deref().unwrap_or("")],
         )?;
         Ok(())
     }
