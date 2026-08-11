@@ -30,8 +30,8 @@ As an operator running Lorica on a shared infrastructure team, I want multiple a
 
 ## Tasks
 
-- [ ] AC #1: `users` table migration (real version gate 22 in `store/mod.rs`, restores the counter), backfill `INSERT ... SELECT` from `admin_users`, drop `admin_users`; `User` model replaces `AdminUser` (adds `role`, `disabled_at`, `created_by`); store CRUD rewritten in `store/users.rs`; `export.rs` scrub follows the rename.
-- [ ] AC #2: `Role` enum (`SuperAdmin` / `Operator` / `Viewer`) in lorica-config models, TEXT-encoded (`super_admin` / `operator` / `viewer`), decode-tolerant (unknown -> error, not panic).
+- [x] AC #1: `users` table migration (real version gate 22 in `store/mod.rs`, restores the counter), backfill `INSERT ... SELECT` from `admin_users`, drop `admin_users`; `User` model replaces `AdminUser` (adds `role`, `disabled_at`, `created_by`); store CRUD rewritten in `store/users.rs`; `export.rs` scrub follows the rename.
+- [x] AC #2: `Role` enum (`SuperAdmin` / `Operator` / `Viewer`) in lorica-config models, TEXT-encoded (`super_admin` / `operator` / `viewer`), decode-tolerant (unknown -> error, not panic).
 - [ ] AC #3: login accepts `{username, password}` with `username` optional defaulting to `"admin"` (back-compat shim); rejects disabled users; stamps `last_login_at`.
 - [ ] AC #4: `Session` struct + `sessions` table gain `role`; sessions of a user are invalidated on role change / disable / password reset (immediate effect, mirrors `change_password`); `GET /api/v1/auth/me` returns `{username, role}` and `LoginResponse` gains `role` (frontend boot probe needs it).
 - [ ] AC #5: `lorica-api/src/users.rs` CRUD handlers (SuperAdmin only): list/create/get/update/delete + last-SuperAdmin and self-delete guards; rate-limited; OpenAPI updated.
@@ -88,18 +88,29 @@ Sessions, users and role checks are supervisor-only (`middleware/auth.rs:51` doc
 
 ### Debug Log
 
-(empty)
+- Phase 1 (config layer): the `V22-V41` comment labels in `store/mod.rs` are ungated ALTERs never recorded in `schema_migrations`; the real recorded version 22 is the users-table gate added at the END of `run_migrations` (after the ungated blocks). Do not renumber the old comments.
+- `sessions.role` ships as an ungated idempotent ALTER (default `'super_admin'`, safe: pre-RBAC sessions all belong to the single admin, 30-min TTL).
+- Session role staleness is prevented by session invalidation on role change/disable (phase 3 wires the CRUD side); `load_all_sessions` skips rows with unparseable roles instead of failing rehydration.
+- Docker gate runs need `MSYS_NO_PATHCONV=1` + Node 22 in the rust container (lorica-dashboard build.rs shells `npm run build`); named volumes `lorica-target-cache` + `lorica-cargo-registry` cache the target dir across runs.
+- Full workspace clippy on rust:1-bookworm (clippy 1.95) fails on pre-existing `lorica-proxy` `collapsible_match` - out of CI scope (CI clippy = 5 product crates only).
 
 ### Completion Notes
 
-(empty)
+(in progress - phase 1 of 5 done)
 
 ## File List
 
-(to fill during implementation)
+- lorica-config/src/models/{enums,preferences,mod}.rs (Role enum; User replaces AdminUser)
+- lorica-config/src/store/{users,row_helpers,sessions,mod}.rs (users CRUD, v22 migration + backfill, sessions role column, clear_all)
+- lorica-config/src/{export,import,diff}.rs (users field, legacy admin_users alias, user_eq incl. role/disabled)
+- lorica-config/src/tests.rs (renames + role/disabled round-trip, count_active_super_admins, v22 backfill, legacy alias import, schema version 22)
+- lorica-api/src/{auth.rs, middleware/auth.rs, tests.rs} (Session.role, create(role), store method renames)
+- lorica-dashboard/frontend/src/{lib/api.ts, lib/api.test.ts, components/settings-tabs/ExportImportTab.svelte} (diff field admin_users -> users)
+- docs/architecture/data-models-and-schema-changes.md (User model section)
 
 ## Change Log
 
 | Date | Version | Description | Author |
 |------|---------|-------------|--------|
 | 2026-08-11 | 0.1 | Story drafted from Epic 8 PRD + codebase exploration (auth stack, migration numbering trap, scrub surface, e2e profile shape). Design deviations recorded in Dev Notes: middleware factory instead of in-handler macro, session-invalidation instead of per-request role re-read, users table replaces admin_users. | Romain G. |
+| 2026-08-11 | 0.2 | Phase 1 (AC #1 #2 data layer): users table migration v22 with backfill + drop of admin_users, Role enum (PartialOrd floor semantics), User model, store CRUD + count_active_super_admins, sessions role column, Session.role plumbed through SessionStore/login/change_password, export [[users]] + import legacy [[admin_users]] alias, diff rename. Gates: cargo test config+api (197+ tests) green, clippy config+api clean, lorica binary compiles, frontend svelte-check/tsc/lint/vitest (363) green. | Romain G. |

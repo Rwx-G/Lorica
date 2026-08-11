@@ -96,7 +96,7 @@ pub async fn login(
     // guard, so it stays inside the closure.
     let user = db_blocking(&state.store, move |store| {
         let user = store
-            .get_admin_user_by_username(&body.username)
+            .get_user_by_username(&body.username)
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::Unauthorized("invalid credentials".into()))?;
 
@@ -108,18 +108,18 @@ pub async fn login(
             .verify_password(body.password.as_bytes(), &parsed_hash)
             .map_err(|_| ApiError::Unauthorized("invalid credentials".into()))?;
 
-        // Update last_login
+        // Update last_login_at
         let mut updated_user = user.clone();
-        updated_user.last_login = Some(Utc::now());
+        updated_user.last_login_at = Some(Utc::now());
         store
-            .update_admin_user(&updated_user)
+            .update_user(&updated_user)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         Ok::<_, ApiError>(user)
     })
     .await?;
 
     let session_id = session_store
-        .create(user.id.clone(), user.username.clone())
+        .create(user.id.clone(), user.username.clone(), user.role)
         .await;
     let expires_at = session_store
         .expires_at(&session_id)
@@ -197,7 +197,7 @@ pub async fn change_password(
     let user_id = session.user_id.clone();
     db_blocking(&state.store, move |store| {
         let user = store
-            .get_admin_user(&user_id)
+            .get_user(&user_id)
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
 
@@ -214,7 +214,7 @@ pub async fn change_password(
         updated_user.password_hash = new_hash;
         updated_user.must_change_password = false;
         store
-            .update_admin_user(&updated_user)
+            .update_user(&updated_user)
             .map_err(|e| ApiError::Internal(e.to_string()))
     })
     .await?;
@@ -228,7 +228,11 @@ pub async fn change_password(
     // classic lock-ordering deadlock.
     session_store.remove_all_for_user(&session.user_id).await;
     let new_session_id = session_store
-        .create(session.user_id.clone(), session.username.clone())
+        .create(
+            session.user_id.clone(),
+            session.username.clone(),
+            session.role,
+        )
         .await;
 
     Ok((
@@ -285,7 +289,7 @@ pub fn generate_random_password() -> String {
 /// Returns the generated password if a new user was created.
 pub fn ensure_admin_user(store: &lorica_config::ConfigStore) -> Result<Option<String>, ApiError> {
     let users = store
-        .list_admin_users()
+        .list_users()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     if !users.is_empty() {
@@ -295,17 +299,20 @@ pub fn ensure_admin_user(store: &lorica_config::ConfigStore) -> Result<Option<St
     let password = generate_random_password();
     let password_hash = hash_password(&password)?;
 
-    let admin = lorica_config::models::AdminUser {
+    let admin = lorica_config::models::User {
         id: uuid::Uuid::new_v4().to_string(),
         username: "admin".to_string(),
         password_hash,
+        role: lorica_config::models::Role::SuperAdmin,
         must_change_password: true,
         created_at: Utc::now(),
-        last_login: None,
+        last_login_at: None,
+        disabled_at: None,
+        created_by: None,
     };
 
     store
-        .create_admin_user(&admin)
+        .create_user(&admin)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Some(password))

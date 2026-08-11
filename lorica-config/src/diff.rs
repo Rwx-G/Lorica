@@ -22,8 +22,8 @@ pub struct ConfigDiff {
     pub notification_configs: EntityDiff,
     /// Per-entity diff for `user_preferences`.
     pub user_preferences: EntityDiff,
-    /// Per-entity diff for `admin_users`.
-    pub admin_users: EntityDiff,
+    /// Per-entity diff for `users`.
+    pub users: EntityDiff,
     /// Key-level diff for `global_settings`.
     pub global_settings: SettingsDiff,
 }
@@ -67,7 +67,7 @@ impl ConfigDiff {
             && self.route_backends.is_empty()
             && self.notification_configs.is_empty()
             && self.user_preferences.is_empty()
-            && self.admin_users.is_empty()
+            && self.users.is_empty()
             && self.global_settings.changes.is_empty()
     }
 }
@@ -123,11 +123,11 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         |p| format!("{} ({})", p.preference_key, p.id),
     );
 
-    let admin_users = diff_by_id(
-        &store.list_admin_users()?,
-        &incoming.admin_users,
+    let users = diff_by_id(
+        &store.list_users()?,
+        &incoming.users,
         |u| u.id.clone(),
-        admin_eq,
+        user_eq,
         |u| format!("{} ({})", u.username, u.id),
     );
 
@@ -140,7 +140,7 @@ pub fn compute_diff(store: &ConfigStore, incoming: &ImportData) -> Result<Config
         route_backends,
         notification_configs,
         user_preferences,
-        admin_users,
+        users,
         global_settings,
     })
 }
@@ -319,6 +319,9 @@ fn pref_eq(a: &UserPreference, b: &UserPreference) -> bool {
     a.preference_key == b.preference_key && a.value == b.value
 }
 
-fn admin_eq(a: &AdminUser, b: &AdminUser) -> bool {
-    a.username == b.username && a.password_hash == b.password_hash
+fn user_eq(a: &User, b: &User) -> bool {
+    a.username == b.username
+        && a.password_hash == b.password_hash
+        && a.role == b.role
+        && a.disabled_at.is_some() == b.disabled_at.is_some()
 }

@@ -480,7 +480,7 @@ describe('api.importPreview', () => {
       route_backends: { added: [], modified: [], removed: [] },
       notification_configs: { added: [], modified: [], removed: [] },
       user_preferences: { added: [], modified: [], removed: [] },
-      admin_users: { added: [], modified: [], removed: [] },
+      users: { added: [], modified: [], removed: [] },
       global_settings: { changes: [] },
     };
     mockFetch(diff);

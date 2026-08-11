@@ -226,11 +226,11 @@ async fn test_change_password() {
     {
         let store = state.store.lock().await;
         let mut user = store
-            .get_admin_user_by_username("admin")
+            .get_user_by_username("admin")
             .expect("test setup")
             .expect("test setup");
         user.password_hash = hash_password(known_password).expect("test setup");
-        store.update_admin_user(&user).expect("test setup");
+        store.update_user(&user).expect("test setup");
     }
 
     // Login again with known password
@@ -288,11 +288,11 @@ async fn test_change_password_rotates_session_cookie() {
     {
         let store = state.store.lock().await;
         let mut user = store
-            .get_admin_user_by_username("admin")
+            .get_user_by_username("admin")
             .expect("test setup")
             .expect("test setup");
         user.password_hash = hash_password(known_password).expect("test setup");
-        store.update_admin_user(&user).expect("test setup");
+        store.update_user(&user).expect("test setup");
     }
 
     // Login, capture cookie_A.
@@ -825,10 +825,10 @@ async fn test_config_export_import() {
     .expect("test setup");
     assert!(toml_content.contains("version = 1"));
 
-    // Strip admin_users section (contains redacted password hash from export)
+    // Strip users section (contains redacted password hash from export)
     let toml_content: String = toml_content
         .lines()
-        .take_while(|line| !line.starts_with("[[admin_users]]"))
+        .take_while(|line| !line.starts_with("[[users]]"))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -2557,10 +2557,10 @@ async fn test_import_preview_empty_diff() {
     )
     .expect("test setup");
 
-    // Strip admin_users section (contains redacted password hash from export)
+    // Strip users section (contains redacted password hash from export)
     let toml_content: String = toml_content
         .lines()
-        .take_while(|line| !line.starts_with("[[admin_users]]"))
+        .take_while(|line| !line.starts_with("[[users]]"))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -2656,7 +2656,7 @@ async fn test_session_purge_expired() {
     let store = SessionStore::new(Arc::new(Mutex::new(db))).await;
 
     // Create a session
-    let sid = store.create("user1".into(), "admin".into()).await;
+    let sid = store.create("user1".into(), "admin".into(), lorica_config::models::Role::SuperAdmin).await;
 
     // Nothing expired yet
     assert_eq!(store.purge_expired().await, 0);
@@ -2670,6 +2670,7 @@ async fn test_session_purge_expired() {
             Session {
                 user_id: "user2".into(),
                 username: "old".into(),
+                role: lorica_config::models::Role::SuperAdmin,
                 created_at: chrono::Utc::now() - chrono::Duration::hours(2),
                 expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
             },
@@ -2966,11 +2967,11 @@ async fn test_change_password_too_short_returns_400() {
         let store = state.store.lock().await;
         ensure_admin_user(&store).expect("test setup");
         let mut user = store
-            .get_admin_user_by_username("admin")
+            .get_user_by_username("admin")
             .expect("test setup")
             .expect("test setup");
         user.password_hash = hash_password(known_password).expect("test setup");
-        store.update_admin_user(&user).expect("test setup");
+        store.update_user(&user).expect("test setup");
     }
 
     // Login
@@ -3023,11 +3024,11 @@ async fn test_change_password_wrong_current_returns_401() {
         let store = state.store.lock().await;
         ensure_admin_user(&store).expect("test setup");
         let mut user = store
-            .get_admin_user_by_username("admin")
+            .get_user_by_username("admin")
             .expect("test setup")
             .expect("test setup");
         user.password_hash = hash_password(known_password).expect("test setup");
-        store.update_admin_user(&user).expect("test setup");
+        store.update_user(&user).expect("test setup");
     }
 
     let router = app(state.clone(), session_store.clone(), rate_limiter.clone());

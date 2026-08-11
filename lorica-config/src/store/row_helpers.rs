@@ -336,14 +336,22 @@ pub(super) fn row_to_user_preference(row: &rusqlite::Row<'_>) -> Result<UserPref
     })
 }
 
-pub(super) fn row_to_admin_user(row: &rusqlite::Row<'_>) -> Result<AdminUser> {
-    Ok(AdminUser {
+/// Column order matches `USER_COLUMNS` in `store/users.rs`:
+/// id, username, password_hash, role, must_change_password,
+/// created_at, last_login_at, disabled_at, created_by.
+pub(super) fn row_to_user(row: &rusqlite::Row<'_>) -> Result<User> {
+    use std::str::FromStr;
+    Ok(User {
         id: row.get(0)?,
         username: row.get(1)?,
         password_hash: row.get(2)?,
-        must_change_password: row.get(3)?,
-        created_at: parse_datetime(&row.get::<_, String>(4)?)?,
-        last_login: parse_optional_datetime(row.get(5)?)?,
+        role: Role::from_str(&row.get::<_, String>(3)?)
+            .map_err(|e| ConfigError::Validation(format!("invalid user role: {e}")))?,
+        must_change_password: row.get(4)?,
+        created_at: parse_datetime(&row.get::<_, String>(5)?)?,
+        last_login_at: parse_optional_datetime(row.get(6)?)?,
+        disabled_at: parse_optional_datetime(row.get(7)?)?,
+        created_by: row.get(8)?,
     })
 }
 

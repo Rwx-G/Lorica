@@ -128,23 +128,26 @@
 - `created_at`: TIMESTAMP
 - `updated_at`: TIMESTAMP
 
-### AdminUser
+### User
 
-**Purpose:** Dashboard admin account.
-**Integration:** Used by API authentication middleware.
+**Purpose:** Dashboard / API user account with RBAC role (Story 8.3, v1.6.0; replaced the single-admin `AdminUser` / `admin_users` table via schema migration 22).
+**Integration:** Used by API authentication middleware and per-route authorization; the session carries the role.
 
 **Key Attributes:**
 - `id`: TEXT (UUID) - Primary key
-- `username`: TEXT - Admin username (default: `admin`)
-- `password_hash`: TEXT - Argon2 hash
-- `must_change_password`: BOOLEAN - True on first run
+- `username`: TEXT - Unique username (bootstrap account: `admin`)
+- `password_hash`: TEXT - Argon2id hash
+- `role`: TEXT - `super_admin`, `operator`, or `viewer`
+- `must_change_password`: BOOLEAN - True on first run / after admin reset
 - `created_at`: TIMESTAMP
-- `last_login`: TIMESTAMP
+- `last_login_at`: TIMESTAMP (nullable)
+- `disabled_at`: TIMESTAMP (nullable) - Set when the account is disabled; login rejected
+- `created_by`: TEXT (nullable) - `users.id` of the creating account
 
 ## Schema Integration Strategy
 
 **Database Changes Required:**
-- **New Tables:** `routes`, `backends`, `route_backends` (join), `certificates`, `notification_configs`, `user_preferences`, `admin_users`, `schema_migrations`
+- **New Tables:** `routes`, `backends`, `route_backends` (join), `certificates`, `notification_configs`, `user_preferences`, `users`, `schema_migrations`
 - **Modified Tables:** None (new database)
 - **New Indexes:** `idx_routes_hostname`, `idx_backends_health_status`, `idx_certificates_domain`, `idx_certificates_not_after`
 - **Migration Strategy:** Embedded migrations using a simple version table (`schema_migrations`). Migrations run automatically on startup. Each migration is a SQL file compiled into the binary.

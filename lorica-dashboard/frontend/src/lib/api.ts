@@ -868,7 +868,7 @@ export interface ImportDiffResponse {
   route_backends: EntityDiff;
   notification_configs: EntityDiff;
   user_preferences: EntityDiff;
-  admin_users: EntityDiff;
+  users: EntityDiff;
   global_settings: { changes: SettingChange[] };
 }
 

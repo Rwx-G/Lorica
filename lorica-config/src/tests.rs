@@ -164,14 +164,17 @@ mod tests {
         }
     }
 
-    fn make_admin_user() -> AdminUser {
-        AdminUser {
+    fn make_user() -> User {
+        User {
             id: new_id(),
             username: "admin".into(),
             password_hash: "$argon2id$v=19$m=65536,t=3,p=4$fakehash".into(),
+            role: Role::SuperAdmin,
             must_change_password: true,
             created_at: Utc::now(),
-            last_login: None,
+            last_login_at: None,
+            disabled_at: None,
+            created_by: None,
         }
     }
 
@@ -737,54 +740,198 @@ mod tests {
             .is_none());
     }
 
-    // ---- AdminUser CRUD ----
+    // ---- User CRUD ----
 
     #[test]
-    fn test_admin_user_crud() {
+    fn test_user_crud() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        let mut user = make_admin_user();
+        let mut user = make_user();
 
         store
-            .create_admin_user(&user)
+            .create_user(&user)
             .expect("test setup: admin user inserts");
 
         let fetched = store
-            .get_admin_user(&user.id)
+            .get_user(&user.id)
             .expect("test setup: admin user fetch")
             .expect("test setup: value present");
         assert_eq!(fetched.username, "admin");
         assert!(fetched.must_change_password);
 
         let by_name = store
-            .get_admin_user_by_username("admin")
+            .get_user_by_username("admin")
             .expect("test setup: admin user by username")
             .expect("test setup: value present");
         assert_eq!(by_name.id, user.id);
 
         let users = store
-            .list_admin_users()
+            .list_users()
             .expect("test setup: admin users listed");
         assert_eq!(users.len(), 1);
 
         user.must_change_password = false;
-        user.last_login = Some(Utc::now());
+        user.last_login_at = Some(Utc::now());
         store
-            .update_admin_user(&user)
+            .update_user(&user)
             .expect("test setup: admin user updates");
         let fetched = store
-            .get_admin_user(&user.id)
+            .get_user(&user.id)
             .expect("test setup: admin user fetch")
             .expect("test setup: value present");
         assert!(!fetched.must_change_password);
-        assert!(fetched.last_login.is_some());
+        assert!(fetched.last_login_at.is_some());
 
         store
-            .delete_admin_user(&user.id)
+            .delete_user(&user.id)
             .expect("test setup: admin user deletes");
         assert!(store
-            .get_admin_user(&user.id)
+            .get_user(&user.id)
             .expect("test setup: admin user fetch")
             .is_none());
+    }
+
+    #[test]
+    fn test_user_role_and_disabled_round_trip() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let mut user = make_user();
+        user.username = "viewer1".into();
+        user.role = Role::Viewer;
+        user.created_by = Some("creator-id".into());
+        store.create_user(&user).expect("test setup: user inserts");
+
+        let fetched = store
+            .get_user(&user.id)
+            .expect("test setup: user fetch")
+            .expect("test setup: value present");
+        assert_eq!(fetched.role, Role::Viewer);
+        assert_eq!(fetched.created_by.as_deref(), Some("creator-id"));
+        assert!(fetched.disabled_at.is_none());
+
+        user.role = Role::Operator;
+        user.disabled_at = Some(Utc::now());
+        store.update_user(&user).expect("test setup: user updates");
+        let fetched = store
+            .get_user(&user.id)
+            .expect("test setup: user fetch")
+            .expect("test setup: value present");
+        assert_eq!(fetched.role, Role::Operator);
+        assert!(fetched.disabled_at.is_some());
+    }
+
+    #[test]
+    fn test_count_active_super_admins() {
+        let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
+        let admin = make_user();
+        store.create_user(&admin).expect("test setup: user inserts");
+
+        let mut operator = make_user();
+        operator.id = new_id();
+        operator.username = "op1".into();
+        operator.role = Role::Operator;
+        store
+            .create_user(&operator)
+            .expect("test setup: user inserts");
+
+        let mut disabled_admin = make_user();
+        disabled_admin.id = new_id();
+        disabled_admin.username = "admin2".into();
+        disabled_admin.disabled_at = Some(Utc::now());
+        store
+            .create_user(&disabled_admin)
+            .expect("test setup: user inserts");
+
+        // Only the enabled SuperAdmin counts: the Operator has the
+        // wrong role, admin2 is disabled.
+        assert_eq!(
+            store
+                .count_active_super_admins()
+                .expect("test setup: count reads"),
+            1
+        );
+    }
+
+    #[test]
+    fn test_migration_v22_backfills_admin_users() {
+        // Build a pre-v22 database by hand: schema_migrations pinned
+        // at 21 with a populated admin_users table, then reopen via
+        // ConfigStore::open so run_migrations executes the V22
+        // backfill against realistic on-disk state.
+        let dir = tempfile::tempdir().expect("test setup: tempdir");
+        let db_path = dir.path().join("legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("test setup: raw open");
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                 INSERT INTO schema_migrations (version) VALUES (21);
+                 CREATE TABLE admin_users (
+                    id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    must_change_password INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_login TEXT
+                 );
+                 INSERT INTO admin_users VALUES
+                    ('legacy-id', 'admin', 'hash', 1, '2026-01-01T00:00:00Z', NULL);",
+            )
+            .expect("test setup: legacy schema");
+        }
+
+        let store = ConfigStore::open(&db_path, None).expect("test setup: migrated open");
+        // Migration gates below 21 re-ran against this synthetic DB
+        // (missing tables get created); what matters here is the V22
+        // outcome: the admin row landed in `users` as super_admin and
+        // admin_users is gone.
+        let migrated = store
+            .get_user("legacy-id")
+            .expect("test setup: user fetch")
+            .expect("backfilled row present");
+        assert_eq!(migrated.username, "admin");
+        assert_eq!(migrated.role, Role::SuperAdmin);
+        assert!(migrated.must_change_password);
+        assert!(migrated.disabled_at.is_none());
+
+        let table_gone: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='admin_users'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("test setup: sqlite_master read");
+        assert_eq!(table_gone, 0, "admin_users must be dropped");
+        assert!(store.schema_version().expect("test setup: version") >= 22);
+    }
+
+    #[test]
+    fn test_import_accepts_legacy_admin_users_alias() {
+        // Pre-1.6.0 TOML exports carry [[admin_users]] rows with a
+        // `last_login` key and no role; they must import as
+        // super_admin `users` rows.
+        let toml_str = r#"
+version = 1
+
+[global_settings]
+management_port = 9443
+log_level = "info"
+default_health_check_interval_s = 30
+cert_warning_days = 30
+cert_critical_days = 7
+
+[[admin_users]]
+id = "legacy-import-id"
+username = "admin"
+password_hash = "$argon2id$v=19$m=65536,t=3,p=4$realhash"
+must_change_password = false
+created_at = "2026-01-01T00:00:00Z"
+"#;
+        let data = crate::import::parse_toml(toml_str).expect("legacy TOML parses");
+        assert_eq!(data.users.len(), 1);
+        assert_eq!(data.users[0].role, Role::SuperAdmin);
+        assert_eq!(data.users[0].id, "legacy-import-id");
     }
 
     // ---- GlobalSettings ----
@@ -939,7 +1086,7 @@ mod tests {
             store
                 .schema_version()
                 .expect("test setup: schema version reads"),
-            21
+            22
         );
     }
 
@@ -957,7 +1104,7 @@ mod tests {
                 store
                     .schema_version()
                     .expect("test setup: schema version reads"),
-                21
+                22
             );
         }
     }
@@ -998,9 +1145,9 @@ mod tests {
             .create_user_preference(&pref)
             .expect("test setup: user preference inserts");
 
-        let user = make_admin_user();
+        let user = make_user();
         store1
-            .create_admin_user(&user)
+            .create_user(&user)
             .expect("test setup: admin user inserts");
 
         let settings = GlobalSettings {
@@ -1062,7 +1209,7 @@ mod tests {
         assert_eq!(prefs2[0].preference_key, pref.preference_key);
 
         let users2 = store2
-            .list_admin_users()
+            .list_users()
             .expect("test setup: admin users listed");
         assert_eq!(users2.len(), 1);
         assert_eq!(users2[0].username, user.username);
@@ -1625,18 +1772,18 @@ default_health_check_interval_s = 10
     }
 
     #[test]
-    fn test_diff_admin_user_changes() {
+    fn test_diff_user_changes() {
         let store = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        let user = make_admin_user();
+        let user = make_user();
         store
-            .create_admin_user(&user)
+            .create_user(&user)
             .expect("test setup: admin user inserts");
 
         // Import with modified username
         let mut modified = user.clone();
         modified.username = "superadmin".into();
         let temp = ConfigStore::open_in_memory().expect("test setup: in-memory store opens");
-        temp.create_admin_user(&modified)
+        temp.create_user(&modified)
             .expect("test setup: admin user inserts");
         let toml_str = export_to_toml(&temp).expect("test setup: toml export succeeds");
 
@@ -1646,7 +1793,7 @@ default_health_check_interval_s = 10
         let diff =
             crate::diff::compute_diff(&store, &import_data).expect("test setup: diff computes");
 
-        assert_eq!(diff.admin_users.modified.len(), 1);
+        assert_eq!(diff.users.modified.len(), 1);
     }
 
     #[test]
@@ -1810,14 +1957,14 @@ cert_critical_days = 3
 
         let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
         // The webhook entry must NOT contribute a REDACTED token
-        // (admin_user password_hash will, so we cannot grep the
+        // (user password_hash will, so we cannot grep the
         // whole document - check the notification block only).
         let nc_block = toml_str
             .split("[[notification_configs]]")
             .nth(1)
             .expect("notification block present");
         // Stop at the next top-level section so we don't read into
-        // admin_users / certificates / ...
+        // users / certificates / ...
         let nc_block = nc_block.split("\n[[").next().unwrap_or(nc_block);
         assert!(
             !nc_block.contains("**REDACTED**"),
@@ -1971,9 +2118,9 @@ cert_critical_days = 3
             .create_user_preference(&pref)
             .expect("test setup: user preference inserts");
 
-        let user = make_admin_user();
+        let user = make_user();
         store
-            .create_admin_user(&user)
+            .create_user(&user)
             .expect("test setup: admin user inserts");
 
         let toml_str = export_to_toml(&store).expect("test setup: toml export succeeds");
@@ -1985,7 +2132,7 @@ cert_critical_days = 3
         assert!(toml_str.contains("[[route_backends]]"));
         assert!(toml_str.contains("[[notification_configs]]"));
         assert!(toml_str.contains("[[user_preferences]]"));
-        assert!(toml_str.contains("[[admin_users]]"));
+        assert!(toml_str.contains("[[users]]"));
     }
 
     // ---- Error type tests ----

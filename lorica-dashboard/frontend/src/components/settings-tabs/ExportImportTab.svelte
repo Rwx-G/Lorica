@@ -95,7 +95,7 @@
     return (
       e(diff.routes) || e(diff.backends) || e(diff.certificates) ||
       e(diff.route_backends) || e(diff.notification_configs) ||
-      e(diff.user_preferences) || e(diff.admin_users) ||
+      e(diff.user_preferences) || e(diff.users) ||
       diff.global_settings.changes.length > 0
     );
   }
@@ -166,7 +166,7 @@
               { label: 'Route-Backend Links', diff: importDiff.route_backends },
               { label: 'Notification Configs', diff: importDiff.notification_configs },
               { label: 'User Preferences', diff: importDiff.user_preferences },
-              { label: 'Admin Users', diff: importDiff.admin_users },
+              { label: 'Users', diff: importDiff.users },
             ]}
             {#each sections as sec (sec.label)}
               {#if sec.diff.added.length > 0 || sec.diff.modified.length > 0 || sec.diff.removed.length > 0}

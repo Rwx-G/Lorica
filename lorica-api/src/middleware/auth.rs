@@ -8,6 +8,7 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use chrono::{DateTime, Duration, Utc};
+use lorica_config::models::Role;
 use lorica_config::ConfigStore;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -20,10 +21,14 @@ const SESSION_TIMEOUT_MINUTES: i64 = 30;
 /// Authenticated session injected into request extensions by [`require_auth`].
 #[derive(Debug, Clone)]
 pub struct Session {
-    /// AdminUser id that owns the session.
+    /// `users.id` of the account that owns the session.
     pub user_id: String,
     /// Username (denormalised for audit-logging convenience).
     pub username: String,
+    /// RBAC role at login time. Denormalised: a role change or
+    /// account disable invalidates every session of the user
+    /// (Story 8.3), so this can never be stale beyond that window.
+    pub role: Role,
     /// Creation timestamp (first login).
     pub created_at: DateTime<Utc>,
     /// Expiry timestamp ; requests past this point are rejected 401.
@@ -75,12 +80,13 @@ impl SessionStore {
             let store = db.lock().await;
             match store.load_all_sessions() {
                 Ok(rows) => {
-                    for (id, user_id, username, created_at, expires_at) in rows {
+                    for (id, user_id, username, role, created_at, expires_at) in rows {
                         cache.insert(
                             id,
                             Session {
                                 user_id,
                                 username,
+                                role,
                                 created_at,
                                 expires_at,
                             },
@@ -112,12 +118,13 @@ impl SessionStore {
     }
 
     /// Create a new session and return the session ID.
-    pub async fn create(&self, user_id: String, username: String) -> String {
+    pub async fn create(&self, user_id: String, username: String, role: Role) -> String {
         let session_id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let session = Session {
             user_id: user_id.clone(),
             username: username.clone(),
+            role,
             created_at: now,
             expires_at: now + Duration::minutes(SESSION_TIMEOUT_MINUTES),
         };
@@ -131,7 +138,7 @@ impl SessionStore {
             let created_at = session.created_at;
             let expires_at = session.expires_at;
             let persisted = crate::db::db_blocking(&self.db, move |store| {
-                store.save_session(&sid, &uid, &uname, &created_at, &expires_at)
+                store.save_session(&sid, &uid, &uname, role, &created_at, &expires_at)
             })
             .await;
             if let Err(e) = persisted {
@@ -173,11 +180,12 @@ impl SessionStore {
         let sid = session_id.to_string();
         let session = crate::db::db_blocking(&self.db, move |store| {
             Ok::<_, ApiError>(match store.get_session(&sid) {
-                Ok(Some((user_id, username, created_at, expires_at))) => {
+                Ok(Some((user_id, username, role, created_at, expires_at))) => {
                     if expires_at > Utc::now() {
                         Some(Session {
                             user_id,
                             username,
+                            role,
                             created_at,
                             expires_at,
                         })
@@ -370,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_store_create_and_get() {
         let store = test_store().await;
-        let sid = store.create("user-1".into(), "admin".into()).await;
+        let sid = store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
         let session = store.get(&sid).await.expect("test setup");
         assert_eq!(session.user_id, "user-1");
         assert_eq!(session.username, "admin");
@@ -385,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_store_remove() {
         let store = test_store().await;
-        let sid = store.create("user-1".into(), "admin".into()).await;
+        let sid = store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
         store.remove(&sid).await;
         // Allow spawned DB task to complete
         tokio::task::yield_now().await;
@@ -395,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_store_expires_at() {
         let store = test_store().await;
-        let sid = store.create("user-1".into(), "admin".into()).await;
+        let sid = store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
         let expires = store.expires_at(&sid).await;
         assert!(expires.is_some());
         assert!(expires.expect("test setup") > Utc::now());
@@ -414,6 +422,7 @@ mod tests {
         let expired = Session {
             user_id: "user-1".into(),
             username: "admin".into(),
+            role: Role::SuperAdmin,
             created_at: Utc::now() - Duration::minutes(60),
             expires_at: Utc::now() - Duration::minutes(1),
         };
@@ -428,13 +437,14 @@ mod tests {
         let store = test_store().await;
 
         // Insert a valid session
-        let valid_sid = store.create("user-1".into(), "admin".into()).await;
+        let valid_sid = store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
 
         // Insert an expired session
         let expired_sid = Uuid::new_v4().to_string();
         let expired = Session {
             user_id: "user-2".into(),
             username: "old".into(),
+            role: Role::SuperAdmin,
             created_at: Utc::now() - Duration::minutes(60),
             expires_at: Utc::now() - Duration::minutes(1),
         };
@@ -456,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn test_purge_expired_returns_zero_when_none_expired() {
         let store = test_store().await;
-        store.create("user-1".into(), "admin".into()).await;
+        store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
         assert_eq!(store.purge_expired().await, 0);
     }
 
@@ -466,13 +476,13 @@ mod tests {
             ConfigStore::open_in_memory().expect("test setup"),
         ));
         let store = SessionStore::new(db.clone()).await;
-        let sid = store.create("user-1".into(), "admin".into()).await;
+        let sid = store.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
 
         // Verify session exists in database
         let db_lock = db.lock().await;
         let row = db_lock.get_session(&sid).expect("test setup");
         assert!(row.is_some());
-        let (user_id, _username, _created, _expires) = row.expect("test setup");
+        let (user_id, _username, _role, _created, _expires) = row.expect("test setup");
         assert_eq!(user_id, "user-1");
     }
 
@@ -484,7 +494,7 @@ mod tests {
 
         // Create a session with the first store instance
         let store1 = SessionStore::new(db.clone()).await;
-        let sid = store1.create("user-1".into(), "admin".into()).await;
+        let sid = store1.create("user-1".into(), "admin".into(), Role::SuperAdmin).await;
         drop(store1);
 
         // Create a new store instance (simulates restart)
@@ -568,6 +578,7 @@ mod tests {
                 Session {
                     user_id: "u1".into(),
                     username: "u1".into(),
+                    role: Role::SuperAdmin,
                     created_at: Utc::now() - Duration::hours(2),
                     expires_at: Utc::now() - Duration::hours(1),
                 },

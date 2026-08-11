@@ -28,14 +28,14 @@ pub use cert_export_acl::{
 pub use certificate::{Certificate, DnsProvider};
 pub use enums::{
     HeaderMatchType, HealthStatus, LifecycleState, LoadBalancing, NotificationChannel,
-    PathMatchType, PreferenceValue, WafMode,
+    PathMatchType, PreferenceValue, Role, WafMode,
 };
 pub use loadtest::{
     LoadTestComparison, LoadTestConfig, LoadTestResult, SAFE_LIMIT_CONCURRENCY,
     SAFE_LIMIT_DURATION_S, SAFE_LIMIT_RPS,
 };
 pub use notification::NotificationConfig;
-pub use preferences::{AdminUser, UserPreference};
+pub use preferences::{User, UserPreference};
 pub use probes::{ProbeConfig, ProbeResultRow};
 pub use route::{
     AiBotPolicy, BotBypassRules, BotProtectionConfig, BotProtectionMode, ForwardAuthConfig,

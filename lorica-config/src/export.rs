@@ -38,15 +38,17 @@ pub struct ExportData {
     pub notification_configs: Vec<NotificationConfig>,
     /// All rows of `user_preferences`.
     pub user_preferences: Vec<UserPreference>,
-    /// All rows of `admin_users` (password hashes redacted).
-    pub admin_users: Vec<AdminUser>,
+    /// All rows of `users` (password hashes redacted). Named
+    /// `[[users]]` in the TOML since v1.6.0; pre-RBAC exports used
+    /// `[[admin_users]]`, which import still accepts via alias.
+    pub users: Vec<User>,
 }
 
 /// Export the full database state to a TOML string.
 /// Password hashes are redacted from the export for security.
 pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
-    let admin_users: Vec<AdminUser> = store
-        .list_admin_users()?
+    let users: Vec<User> = store
+        .list_users()?
         .into_iter()
         .map(|mut u| {
             u.password_hash = REDACTED.into();
@@ -122,7 +124,7 @@ pub fn export_to_toml(store: &ConfigStore) -> Result<String> {
         certificates,
         notification_configs,
         user_preferences: store.list_user_preferences()?,
-        admin_users,
+        users,
     };
 
     toml::to_string_pretty(&data)

@@ -716,6 +716,66 @@ impl ConfigStore {
             [],
         );
 
+        // V22 (real version gate - first since 21): `users` table
+        // replaces `admin_users` (Story 8.3 RBAC). This one carries a
+        // data backfill (the single pre-RBAC admin row migrates as
+        // role = 'super_admin') so it CANNOT be an ungated idempotent
+        // ALTER like the V22-V41 blocks above: the backfill must run
+        // exactly once. Concurrent-open safety (supervisor + workers
+        // race the migration at boot): the backfill + drop only run
+        // while `admin_users` still exists, so the losing process
+        // skips them cleanly.
+        if current_version < 22 {
+            tracing::info!("applying migration 022_users_rbac");
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'super_admin',
+                    must_change_password INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_login_at TEXT,
+                    disabled_at TEXT,
+                    created_by TEXT
+                );",
+            )?;
+            let has_admin_users: bool = self
+                .conn
+                .prepare(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='admin_users'",
+                )?
+                .query_row([], |row| row.get::<_, i64>(0))
+                .map(|c| c > 0)?;
+            if has_admin_users {
+                self.conn.execute_batch(
+                    "INSERT OR IGNORE INTO users
+                        (id, username, password_hash, role, must_change_password,
+                         created_at, last_login_at)
+                     SELECT id, username, password_hash, 'super_admin',
+                            must_change_password, created_at, last_login
+                     FROM admin_users;
+                     DROP TABLE admin_users;",
+                )?;
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                params![22],
+            )?;
+        }
+
+        // V42: sessions carry the owning user's role so `require_auth`
+        // can authorise without a per-request users read. Default
+        // 'super_admin' covers pre-RBAC rows: every session minted
+        // before this migration belongs to the single admin account,
+        // and sessions are 30-minute ephemeral anyway. Role changes
+        // invalidate the user's sessions (Story 8.3), so a stale
+        // denormalised role cannot outlive a demotion.
+        let _ = self.conn.execute(
+            "ALTER TABLE sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'super_admin'",
+            [],
+        );
+
         Ok(())
     }
 
@@ -830,7 +890,7 @@ impl ConfigStore {
              DELETE FROM notification_configs;
              DELETE FROM dns_providers;
              DELETE FROM user_preferences;
-             DELETE FROM admin_users;
+             DELETE FROM users;
              DELETE FROM global_settings;",
         )?;
         Ok(())
