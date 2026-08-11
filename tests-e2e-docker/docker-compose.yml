@@ -695,6 +695,9 @@ services:
       context: ./test-runner
     profiles: ["audit"]
     entrypoint: ["bash", "run-audit-smoke.sh"]
+    # Runs as root so the IV4 tamper step can write access-log.db,
+    # which the lorica container owns as its unprivileged runtime uid.
+    user: "0:0"
     depends_on:
       - lorica-audit
     volumes:
