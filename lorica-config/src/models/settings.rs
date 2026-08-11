@@ -128,9 +128,27 @@ pub struct GlobalSettings {
     pub ip_blocklist_enabled: bool,
     /// Global flood detection threshold (requests per second).
     /// When the proxy-wide RPS exceeds this value, per-IP rate limits are
-    /// halved to provide stricter protection. 0 = disabled (default).
+    /// tightened to provide stricter protection. 0 = disabled (default).
     #[serde(default)]
     pub flood_threshold_rps: i32,
+    /// Per-IP admission rate (requests per second) enforced while the
+    /// proxy is in flood mode (proxy-wide RPS above `flood_threshold_rps`).
+    /// It is the tunable form of the historical hard-coded "halve the
+    /// limit" factor: the effective per-IP token cost is scaled by
+    /// `flood_threshold_rps / flood_strict_rps`, so the default of
+    /// `flood_threshold_rps / 2` reproduces the original 0.5x behaviour.
+    /// `0` means "auto" and resolves to `flood_threshold_rps / 2` at
+    /// enforcement time. Only consulted when `flood_threshold_rps > 0`.
+    #[serde(default)]
+    pub flood_strict_rps: u32,
+    /// Maximum time (seconds) the proxy waits for a client to finish
+    /// sending its request headers before the header phase is treated as
+    /// a slowloris attempt and the request is answered with 408. Applies
+    /// globally across every route as a floor on top of the per-route
+    /// `slowloris_threshold_ms`. Default 10. `0` disables the global
+    /// floor (per-route thresholds still apply).
+    #[serde(default = "default_header_timeout_s")]
+    pub header_timeout_s: u32,
     /// Number of WAF blocks before an IP is auto-banned. 0 = disabled (default 5).
     #[serde(default = "default_waf_ban_threshold")]
     pub waf_ban_threshold: i32,
@@ -368,6 +386,10 @@ pub struct GlobalSettings {
     pub upgrade_signing_pubkey_path: Option<String>,
 }
 
+fn default_header_timeout_s() -> u32 {
+    10
+}
+
 fn default_waf_ban_threshold() -> i32 {
     3
 }
@@ -460,6 +482,8 @@ impl Default for GlobalSettings {
             ip_blocklist_enabled: false,
             max_global_connections: 0,
             flood_threshold_rps: 0,
+            flood_strict_rps: 0,
+            header_timeout_s: default_header_timeout_s(),
             waf_ban_threshold: default_waf_ban_threshold(),
             waf_ban_duration_s: default_waf_ban_duration_s(),
             custom_security_presets: Vec::new(),

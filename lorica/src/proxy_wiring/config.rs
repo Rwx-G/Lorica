@@ -196,8 +196,15 @@ pub struct ProxyConfig {
     /// Max total proxy connections. 503 when exceeded. 0 = unlimited.
     pub max_global_connections: u32,
     /// Global flood detection threshold (RPS). When exceeded, per-IP rate
-    /// limits are halved. 0 = disabled.
+    /// limits are tightened. 0 = disabled.
     pub flood_threshold_rps: u32,
+    /// Story 8.10 AC #2. Per-IP admission rate enforced during flood mode.
+    /// `0` = auto (resolves to `flood_threshold_rps / 2`, the historical
+    /// 0.5x factor). Only consulted when `flood_threshold_rps > 0`.
+    pub flood_strict_rps: u32,
+    /// Story 8.10 AC #1. Global header-phase read timeout (seconds) used
+    /// as a slowloris floor across every route. `0` = disabled.
+    pub header_timeout_s: u32,
     /// WAF auto-ban: ban IP after this many WAF blocks. 0 = disabled.
     pub waf_ban_threshold: u32,
     /// Duration of WAF-triggered bans in seconds.
@@ -237,6 +244,8 @@ pub struct ProxyConfigGlobals {
     pub custom_security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
     pub max_global_connections: u32,
     pub flood_threshold_rps: u32,
+    pub flood_strict_rps: u32,
+    pub header_timeout_s: u32,
     pub waf_ban_threshold: u32,
     pub waf_ban_duration_s: u32,
     pub trusted_proxy_cidrs: Vec<String>,
@@ -270,6 +279,8 @@ impl ProxyConfig {
             custom_security_presets,
             max_global_connections,
             flood_threshold_rps,
+            flood_strict_rps,
+            header_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs,
@@ -601,6 +612,8 @@ impl ProxyConfig {
             security_presets: presets,
             max_global_connections,
             flood_threshold_rps,
+            flood_strict_rps,
+            header_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxies,

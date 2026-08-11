@@ -271,6 +271,20 @@ fn diff_settings(current: &GlobalSettings, incoming: &GlobalSettings) -> Setting
             new_value: incoming.flood_threshold_rps.to_string(),
         });
     }
+    if current.flood_strict_rps != incoming.flood_strict_rps {
+        changes.push(SettingChange {
+            key: "flood_strict_rps".to_string(),
+            old_value: current.flood_strict_rps.to_string(),
+            new_value: incoming.flood_strict_rps.to_string(),
+        });
+    }
+    if current.header_timeout_s != incoming.header_timeout_s {
+        changes.push(SettingChange {
+            key: "header_timeout_s".to_string(),
+            old_value: current.header_timeout_s.to_string(),
+            new_value: incoming.header_timeout_s.to_string(),
+        });
+    }
     SettingsDiff { changes }
 }
 

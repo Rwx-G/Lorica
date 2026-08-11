@@ -494,6 +494,114 @@ fn test_route_with_path_rule_overrides_applies_some_fields() {
     assert!(!overridden.force_https);
 }
 
+// ---- Story 8.10: legacy -> unified rate-limit shim ----
+
+#[test]
+fn from_legacy_follows_ac_capacity_formula() {
+    use crate::models::{RateLimit, RateLimitScope};
+    // AC #3 formula: capacity = burst.unwrap_or(rps), refill = rps, PerIp.
+    let with_burst: RateLimit = RateLimit::from_legacy(10, Some(25));
+    assert_eq!(with_burst.capacity, 25);
+    assert_eq!(with_burst.refill_per_sec, 10);
+    assert_eq!(with_burst.scope, RateLimitScope::PerIp);
+
+    let no_burst: RateLimit = RateLimit::from_legacy(10, None);
+    assert_eq!(no_burst.capacity, 10);
+    assert_eq!(no_burst.refill_per_sec, 10);
+}
+
+#[test]
+fn from_legacy_guards_degenerate_zero_burst() {
+    use crate::models::RateLimit;
+    // A `Some(0)` burst must not collapse the bucket to zero tokens
+    // (which would reject every request); it falls back to `rps`.
+    let rl: RateLimit = RateLimit::from_legacy(7, Some(0));
+    assert_eq!(rl.capacity, 7);
+    assert_eq!(rl.refill_per_sec, 7);
+}
+
+#[test]
+fn effective_rate_limit_synthesises_from_legacy_rps() {
+    use crate::models::RateLimitScope;
+    // IV1 setup: a route with only `rate_limit_rps=10` enforces the same
+    // 10 rps cap through the unified path.
+    let mut route = example_route_for_serde();
+    route.rate_limit_rps = Some(10);
+    route.rate_limit_burst = None;
+    let effective = route.effective_rate_limit().expect("legacy rps synthesises");
+    assert_eq!(effective.capacity, 10);
+    assert_eq!(effective.refill_per_sec, 10);
+    assert_eq!(effective.scope, RateLimitScope::PerIp);
+}
+
+#[test]
+fn effective_rate_limit_prefers_structured_over_legacy() {
+    use crate::models::{RateLimit, RateLimitScope};
+    let mut route = example_route_for_serde();
+    route.rate_limit_rps = Some(999);
+    route.rate_limit = Some(RateLimit {
+        capacity: 5,
+        refill_per_sec: 5,
+        scope: RateLimitScope::PerRoute,
+    });
+    let effective = route.effective_rate_limit().expect("structured limit present");
+    assert_eq!(effective.capacity, 5);
+    assert_eq!(effective.refill_per_sec, 5);
+    assert_eq!(effective.scope, RateLimitScope::PerRoute);
+}
+
+#[test]
+fn effective_rate_limit_none_when_disabled() {
+    let mut route = example_route_for_serde();
+    route.rate_limit_rps = None;
+    route.rate_limit = None;
+    assert!(route.effective_rate_limit().is_none());
+    // `rate_limit_rps = 0` means "no limit", not "reject everything".
+    route.rate_limit_rps = Some(0);
+    assert!(route.effective_rate_limit().is_none());
+}
+
+#[test]
+fn path_rule_override_reaches_unified_path() {
+    use crate::models::{PathMatchType, PathRule, RateLimit, RateLimitScope};
+    // IV2: a route carrying a `rate_limit` struct plus a path rule that
+    // overrides `rate_limit_rps=100` must apply the 100 rps cap on the
+    // matched path (previously the struct silently won).
+    let mut route = example_route_for_serde();
+    route.rate_limit = Some(RateLimit {
+        capacity: 10,
+        refill_per_sec: 10,
+        scope: RateLimitScope::PerIp,
+    });
+    let rule = PathRule {
+        path: "/api/".to_string(),
+        match_type: PathMatchType::Prefix,
+        rate_limit_rps: Some(100),
+        ..Default::default()
+    };
+    let overridden = route.with_path_rule_overrides(&rule);
+    let effective = overridden
+        .effective_rate_limit()
+        .expect("override synthesises a limit");
+    assert_eq!(effective.refill_per_sec, 100);
+    assert_eq!(effective.capacity, 100);
+}
+
+#[test]
+fn legacy_route_keeps_auto_ban_config_for_unified_path() {
+    // AC #4: auto-ban escalation reads the route-level
+    // `auto_ban_threshold` / `auto_ban_duration_s` directly, so a legacy
+    // route routed through the shim keeps those settings and still
+    // escalates repeat offenders on the unified path.
+    let mut route = example_route_for_serde();
+    route.rate_limit_rps = Some(1);
+    route.auto_ban_threshold = Some(3);
+    route.auto_ban_duration_s = 120;
+    assert!(route.effective_rate_limit().is_some());
+    assert_eq!(route.auto_ban_threshold, Some(3));
+    assert_eq!(route.auto_ban_duration_s, 120);
+}
+
 // ---------------------------------------------------------------------------
 // RateLimit (WPAR-1 Phase 3) serde + default coverage.
 // ---------------------------------------------------------------------------

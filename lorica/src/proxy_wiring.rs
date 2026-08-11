@@ -143,8 +143,6 @@ pub struct LoricaProxy {
     pub waf_engine: Arc<WafEngine>,
     /// Passive SLA metrics collector.
     pub sla_collector: Arc<SlaCollector>,
-    /// Per-route rate limiter (keyed by "route_id:client_ip").
-    pub rate_limiter: Arc<lorica_limits::rate::Rate>,
     /// Ban list: maps banned IP addresses to (ban timestamp, ban
     /// duration in seconds, ban reason). Bans expire after the
     /// route-specific `auto_ban_duration_s`.
@@ -325,7 +323,6 @@ impl LoricaProxy {
             ewma_tracker: Arc::new(EwmaTracker::new()),
             waf_engine: Arc::new(WafEngine::new()),
             sla_collector,
-            rate_limiter: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(1))),
             ban_list: Arc::new(DashMap::new()),
             rate_violations: Arc::new(lorica_limits::rate::Rate::new(Duration::from_secs(60))),
             waf_violations: Arc::new(DashMap::new()),
@@ -837,9 +834,11 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(handled);
             }
 
-            // Per-route token-bucket rate limit (structured config)
+            // Unified per-route rate limit (structured `rate_limit` struct
+            // or a legacy `rate_limit_rps` route synthesised through the
+            // compatibility shim). Story 8.10 AC #3/#4/#5.
             if let Some(handled) = self
-                .check_structured_rate_limit(session, ctx, entry, is_whitelisted)
+                .check_structured_rate_limit(session, ctx, entry, is_whitelisted, &config)
                 .await?
             {
                 return Ok(handled);
@@ -921,9 +920,17 @@ impl ProxyHttp for LoricaProxy {
                 return Ok(handled);
             }
 
-            // Slowloris detection (headers took too long to arrive)
+            // Slowloris detection (headers took too long to arrive). The
+            // global `header_timeout_s` (Story 8.10 AC #1) applies as a
+            // floor across every route on top of `slowloris_threshold_ms`.
             if let Some(handled) = self
-                .check_slowloris(session, ctx, entry, check_ip.as_deref())
+                .check_slowloris(
+                    session,
+                    ctx,
+                    entry,
+                    check_ip.as_deref(),
+                    config.header_timeout_s,
+                )
                 .await?
             {
                 return Ok(handled);
@@ -939,21 +946,6 @@ impl ProxyHttp for LoricaProxy {
 
             // Request body size limit + WAF body-scan cap (advertised CL)
             if let Some(handled) = self.check_body_limits(session, ctx, entry).await? {
-                return Ok(handled);
-            }
-
-            // Per-route legacy rate limiting (skipped for whitelisted IPs)
-            if let Some(handled) = self
-                .check_legacy_rate_limit(
-                    session,
-                    ctx,
-                    entry,
-                    check_ip.as_deref(),
-                    is_whitelisted,
-                    &config,
-                )
-                .await?
-            {
                 return Ok(handled);
             }
 

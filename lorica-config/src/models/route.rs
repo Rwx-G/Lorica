@@ -403,6 +403,36 @@ pub struct RateLimit {
     pub scope: RateLimitScope,
 }
 
+impl RateLimit {
+    /// Synthesise a [`RateLimit`] from the legacy `rate_limit_rps` +
+    /// optional `rate_limit_burst` fields (Story 8.10 AC #3). This is the
+    /// single compatibility shim that lets the legacy per-route knobs run
+    /// through the unified token-bucket path instead of the old sliding-
+    /// window limiter.
+    ///
+    /// `capacity` follows the AC formula `burst.unwrap_or(rps)`, with one
+    /// degenerate-input guard: a `Some(0)` burst is treated like an unset
+    /// burst (so it never collapses the bucket to zero tokens, which would
+    /// reject every request). `refill_per_sec` is the steady admission
+    /// rate `rps`, and the scope is always `PerIp` to match the legacy
+    /// per-`(route, ip)` keying.
+    ///
+    /// ```
+    /// use lorica_config::models::{RateLimit, RateLimitScope};
+    /// let rl = RateLimit::from_legacy(10, Some(25));
+    /// assert_eq!(rl.capacity, 25);
+    /// assert_eq!(rl.refill_per_sec, 10);
+    /// assert_eq!(rl.scope, RateLimitScope::PerIp);
+    /// ```
+    pub fn from_legacy(rps: u32, burst: Option<u32>) -> RateLimit {
+        RateLimit {
+            capacity: burst.filter(|&b| b > 0).unwrap_or(rps).max(1),
+            refill_per_sec: rps,
+            scope: RateLimitScope::PerIp,
+        }
+    }
+}
+
 /// How a `RateLimit` partitions traffic across clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1033,6 +1063,17 @@ impl Route {
         if let Some(v) = rule.rate_limit_burst {
             r.rate_limit_burst = Some(v);
         }
+        // Story 8.10 AC #5. The unified limiter reads `rate_limit`, so a
+        // path rule that overrides the legacy `rate_limit_rps` must also
+        // re-synthesise the structured limit; otherwise a route carrying a
+        // `rate_limit` struct would keep enforcing the route-level bucket
+        // and silently ignore the per-path override.
+        if rule.rate_limit_rps.is_some() {
+            r.rate_limit = r
+                .rate_limit_rps
+                .filter(|&rps| rps > 0)
+                .map(|rps| RateLimit::from_legacy(rps, r.rate_limit_burst));
+        }
         if rule.redirect_to.is_some() {
             r.redirect_to = rule.redirect_to.clone();
         }
@@ -1040,6 +1081,20 @@ impl Route {
             r.return_status = rule.return_status;
         }
         r
+    }
+
+    /// Resolve the effective token-bucket rate limit for this route
+    /// (Story 8.10 AC #3). The structured `rate_limit` struct wins when
+    /// present; otherwise the legacy `rate_limit_rps` / `rate_limit_burst`
+    /// pair is synthesised through [`RateLimit::from_legacy`]. A legacy
+    /// `rate_limit_rps` of `0` (or absent) means "no limit" and yields
+    /// `None`, so both engines now share a single admission path.
+    pub fn effective_rate_limit(&self) -> Option<RateLimit> {
+        self.rate_limit.clone().or_else(|| {
+            self.rate_limit_rps
+                .filter(|&rps| rps > 0)
+                .map(|rps| RateLimit::from_legacy(rps, self.rate_limit_burst))
+        })
     }
 }
 

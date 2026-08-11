@@ -65,6 +65,12 @@ impl ConfigStore {
                         ))
                     })?;
                 }
+                "flood_strict_rps" => {
+                    settings.flood_strict_rps = value.parse().unwrap_or(0);
+                }
+                "header_timeout_s" => {
+                    settings.header_timeout_s = value.parse().unwrap_or(10);
+                }
                 "waf_ban_threshold" => {
                     settings.waf_ban_threshold = value.parse().map_err(|e| {
                         ConfigError::Validation(format!("invalid waf_ban_threshold {value:?}: {e}"))
@@ -277,6 +283,14 @@ impl ConfigStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('flood_threshold_rps', ?1)",
             params![settings.flood_threshold_rps.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('flood_strict_rps', ?1)",
+            params![settings.flood_strict_rps.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('header_timeout_s', ?1)",
+            params![settings.header_timeout_s.to_string()],
         )?;
         self.conn.execute(
             "INSERT OR REPLACE INTO global_settings (key, value) VALUES ('waf_ban_threshold', ?1)",

@@ -665,6 +665,34 @@ struct OtelSnapshot {
     sampling_ratio: f64,
 }
 
+/// Story 8.10 AC #8. Emit a single operator-facing notice, once per
+/// process, listing routes that still carry the legacy `rate_limit_rps`
+/// fields without a structured `rate_limit` block. The unified limiter
+/// keeps enforcing these via a compatibility shim, so this is advisory
+/// only: no database row is written and operators are encouraged (not
+/// forced) to migrate to the richer `rate_limit` struct. The
+/// `std::sync::Once` guard keeps it to the first config build of the
+/// process (`build_proxy_config_inner` also runs on every hot reload).
+fn log_legacy_rate_limit_migration_notice(routes: &[lorica_config::models::Route]) {
+    static NOTICE: std::sync::Once = std::sync::Once::new();
+    NOTICE.call_once(|| {
+        let legacy: Vec<&str> = routes
+            .iter()
+            .filter(|r| r.rate_limit_rps.is_some() && r.rate_limit.is_none())
+            .map(|r| r.hostname.as_str())
+            .collect();
+        if !legacy.is_empty() {
+            tracing::warn!(
+                count = legacy.len(),
+                routes = %legacy.join(", "),
+                "routes still use the legacy rate_limit_rps field; they keep working via the \
+                 compatibility shim, but migrating them to the structured rate_limit block is \
+                 recommended (Story 8.10)"
+            );
+        }
+    });
+}
+
 async fn build_proxy_config_inner(
     store: &Arc<Mutex<ConfigStore>>,
     proxy_config: &Arc<ArcSwap<ProxyConfig>>,
@@ -673,6 +701,7 @@ async fn build_proxy_config_inner(
     let store = store.lock().await;
 
     let routes = store.list_routes()?;
+    log_legacy_rate_limit_migration_notice(&routes);
     let backends = store.list_backends()?;
     let certificates = store.list_certificates()?;
     let route_backends = store.list_route_backends()?;
@@ -689,6 +718,8 @@ async fn build_proxy_config_inner(
         .as_ref()
         .map(|s| s.flood_threshold_rps.max(0) as u32)
         .unwrap_or(0);
+    let flood_strict_rps = settings.as_ref().map(|s| s.flood_strict_rps).unwrap_or(0);
+    let header_timeout_s = settings.as_ref().map(|s| s.header_timeout_s).unwrap_or(10);
     let waf_ban_threshold = settings
         .as_ref()
         .map(|s| s.waf_ban_threshold.max(0) as u32)
@@ -743,6 +774,8 @@ async fn build_proxy_config_inner(
             custom_security_presets: custom_presets,
             max_global_connections,
             flood_threshold_rps,
+            flood_strict_rps,
+            header_timeout_s,
             waf_ban_threshold,
             waf_ban_duration_s,
             trusted_proxy_cidrs: trusted_proxies,

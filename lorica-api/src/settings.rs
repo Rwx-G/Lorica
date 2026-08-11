@@ -70,6 +70,11 @@ pub struct UpdateSettingsRequest {
     pub max_global_connections: Option<i32>,
     /// Proxy-wide flood threshold (RPS).
     pub flood_threshold_rps: Option<i32>,
+    /// Per-IP admission rate enforced during flood mode (Story 8.10
+    /// AC #2). `0` = auto (`flood_threshold_rps / 2`).
+    pub flood_strict_rps: Option<u32>,
+    /// Global header-phase read timeout in seconds (Story 8.10 AC #1).
+    pub header_timeout_s: Option<u32>,
     /// Number of WAF blocks before auto-ban.
     pub waf_ban_threshold: Option<i32>,
     /// WAF auto-ban duration (s).
@@ -208,6 +213,21 @@ pub async fn update_settings(
             &mut settings.flood_threshold_rps,
             0,
             "flood_threshold_rps",
+        )?;
+        // Story 8.10 AC #2. `0` is accepted and means "auto"
+        // (`flood_threshold_rps / 2`), resolved at enforcement time.
+        apply_ranged_u32(
+            body.flood_strict_rps,
+            &mut settings.flood_strict_rps,
+            0..=10_000_000,
+            "flood_strict_rps must be in 0..=10000000",
+        )?;
+        // Story 8.10 AC #1. `0` disables the global header-phase floor.
+        apply_ranged_u32(
+            body.header_timeout_s,
+            &mut settings.header_timeout_s,
+            0..=3600,
+            "header_timeout_s must be in 0..=3600",
         )?;
         apply_min_i32(
             body.waf_ban_threshold,
@@ -400,6 +420,24 @@ fn apply_ranged_i32(
     value: Option<i32>,
     target: &mut i32,
     range: std::ops::RangeInclusive<i32>,
+    error_msg: &str,
+) -> Result<(), ApiError> {
+    if let Some(v) = value {
+        if !range.contains(&v) {
+            return Err(ApiError::BadRequest(error_msg.to_string()));
+        }
+        *target = v;
+    }
+    Ok(())
+}
+
+/// `u32` variant of [`apply_ranged_i32`]. Used by the Story 8.10
+/// settings (`flood_strict_rps`, `header_timeout_s`) which are `u32`
+/// on `GlobalSettings`.
+fn apply_ranged_u32(
+    value: Option<u32>,
+    target: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
     error_msg: &str,
 ) -> Result<(), ApiError> {
     if let Some(v) = value {
