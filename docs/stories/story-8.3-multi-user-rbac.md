@@ -1,0 +1,105 @@
+# Story 8.3: Team Settings - Multi-User RBAC
+
+**Epic:** [Epic 8 - Multi-User RBAC, AI Bot Defense & Zero-Downtime Upgrades (v1.6.0)](../prd/epic-8-v1.6.0.md)
+**Status:** InProgress
+**Priority:** P0 (headline)
+**Author:** Romain G.
+**Depends on:** Story 8.1 (module split, shipped v1.5.10/11); existing single-admin auth stack (`lorica-api/src/auth.rs` + `middleware/auth.rs`).
+
+---
+
+As an operator running Lorica on a shared infrastructure team, I want multiple admin / operator / viewer accounts with role-based access control, so that I can grant junior engineers read-only access without sharing the single admin password and so that audit logs (Story 8.9) carry meaningful operator identity.
+
+## Acceptance Criteria (from the Epic 8 PRD)
+
+1. New `users` table (`id`, `username`, `password_hash` argon2id, `role` enum, `created_at`, `last_login_at`, `disabled_at`, `created_by`); the existing single-admin row is migrated as `username = "admin", role = SuperAdmin` (one-shot DB migration, idempotent).
+2. Three built-in roles: `SuperAdmin` (full access + user management + license / settings / encryption-key rotation), `Operator` (full CRUD on routes / backends / certs / WAF / SLA / load-tests / probes / cache / bans, read on settings, NO user management, NO encryption-key rotation), `Viewer` (read-only on everything except secrets - cert private keys, SMTP password, webhook URLs, DNS provider tokens are scrubbed in JSON responses).
+3. Login flow: username + password (`POST /api/v1/auth/login` body changes from `{password}` to `{username, password}`; backwards-compat shim accepts the old shape and routes to `username = "admin"`).
+4. Session cookie carries the user_id; `Session` extension carries `username + role` so handlers can authorise.
+5. New CRUD endpoints under `/api/v1/users` (SuperAdmin only): `GET /users`, `POST /users`, `GET /users/:id`, `PUT /users/:id` (password / role / disabled flag), `DELETE /users/:id` (cannot delete the last SuperAdmin; cannot delete self).
+6. Per-handler authorisation: a `require_role!(Operator)` macro on every mutating endpoint; `require_role!(SuperAdmin)` on settings / DNS providers / notification configs / cert-export ACL editing / user CRUD.
+7. Dashboard Settings gains a "Users & access" tab: user table (username / role / last login / status / actions) + create-user dialog + change-password dialog + role-change dropdown + disable toggle. Viewer accounts see the dashboard with mutating buttons hidden.
+8. Password policy: minimum 14 chars + at least one of each [upper, lower, digit, symbol] (configurable via settings); same hash + verification stack as the existing single-admin (argon2id).
+9. Migration path documented in `docs/migrations/v1.6.0-rbac.md` with a one-paragraph operator note explaining the auto-migration of the existing admin password.
+
+## Integration Verification
+
+- IV1: A Viewer-role session calling `POST /api/v1/routes` receives 403; calling `GET /api/v1/routes` succeeds and the JSON has secrets scrubbed.
+- IV2: An Operator-role session can create a route but `PUT /api/v1/settings` returns 403.
+- IV3: New `tests-e2e-docker/` profile `rbac-smoke` exercises the 3 roles end-to-end (~25 assertions) including the secret-scrub verification; runs in both single-process and workers mode.
+
+## Tasks
+
+- [ ] AC #1: `users` table migration (real version gate 22 in `store/mod.rs`, restores the counter), backfill `INSERT ... SELECT` from `admin_users`, drop `admin_users`; `User` model replaces `AdminUser` (adds `role`, `disabled_at`, `created_by`); store CRUD rewritten in `store/users.rs`; `export.rs` scrub follows the rename.
+- [ ] AC #2: `Role` enum (`SuperAdmin` / `Operator` / `Viewer`) in lorica-config models, TEXT-encoded (`super_admin` / `operator` / `viewer`), decode-tolerant (unknown -> error, not panic).
+- [ ] AC #3: login accepts `{username, password}` with `username` optional defaulting to `"admin"` (back-compat shim); rejects disabled users; stamps `last_login_at`.
+- [ ] AC #4: `Session` struct + `sessions` table gain `role`; sessions of a user are invalidated on role change / disable / password reset (immediate effect, mirrors `change_password`); `GET /api/v1/auth/me` returns `{username, role}` and `LoginResponse` gains `role` (frontend boot probe needs it).
+- [ ] AC #5: `lorica-api/src/users.rs` CRUD handlers (SuperAdmin only): list/create/get/update/delete + last-SuperAdmin and self-delete guards; rate-limited; OpenAPI updated.
+- [ ] AC #6: `require_role(Role)` axum middleware factory applied per-route in `server.rs` (see Dev Notes deviation); Operator floor on every mutating endpoint; SuperAdmin floor on settings PUT, DNS providers, notification configs, cert-export ACLs, config import, users CRUD, `POST /system/upgrade` (clears the Story 8.3 TODO at `server.rs:519`).
+- [ ] AC #2 (Viewer scrub): Viewer is blocked (403) from `GET /certificates/:id/download` with `format=key|full` and from `POST /config/export`; existing unconditional masking (settings `bot_hmac_secret_hex`, notification `********`, DNS-provider write-only credentials) verified by tests as the Viewer-visible surface.
+- [ ] AC #8: `password_policy.rs` validator (min length 14 default via new `GlobalSettings.password_min_length`, complexity classes via `password_require_complexity`, default true); applied to login-change, users create/update; frontend mirror in `PasswordChange.svelte` + create-user dialog (replaces the drifted 8/12-char checks).
+- [ ] AC #7: `UsersAccessTab.svelte` settings section (user table + create dialog + role dropdown + disable toggle + password reset); `auth.ts` store carries `role`; mutating buttons hidden for Viewer across pages; global 403 toast handler in `api.ts`.
+- [ ] AC #9: `docs/migrations/v1.6.0-rbac.md` + `docs/security.md` RBAC section.
+- [ ] IV3: `rbac` + `rbac-workers` compose profiles, `run-rbac-smoke.sh` (~25 assertions: 3 roles, 403 matrix, secret scrub, last-SuperAdmin guard, back-compat login shim), registered in `run.sh` phases + `ALL_PROFILES`.
+- [ ] Gates: `cargo test --workspace`, `cargo clippy --tests -- -D warnings`, `cargo audit`, `pnpm lint` + `svelte-check` + `tsc` clean.
+
+## Dev Notes
+
+### Current auth stack (verified 2026-08-11)
+
+- Login handler `lorica-api/src/auth.rs:72` already takes `{username, password}` (AC #3 is half-done; only the shim, disabled check and role wiring are missing). Argon2id params 19456/2/1 at `auth.rs:25`; `hash_password` at `auth.rs:243`; verify is inlined in `db_blocking` closures (`auth.rs:106`, `auth.rs:207`) - extract a shared `verify_password` helper for reuse by users CRUD.
+- `Session` struct at `middleware/auth.rs:21` (`user_id`, `username`, `created_at`, `expires_at`); inserted into request extensions by `require_auth` (`middleware/auth.rs:338`). `SessionStore` is a hybrid in-memory map + SQLite `sessions` table (`019_sessions.sql`), sliding 30-min expiry.
+- Bootstrap: `ensure_admin_user` (`auth.rs:286`) creates `admin` with a random 24-char password on first boot, called from `startup/single.rs:74` AND `startup/supervisor.rs:283` (duplicated blocks); plaintext persisted once to `<data_dir>/initial-admin-password` mode 0600.
+- Auth is router-wide authentication only: one `require_auth` layer at `server.rs:897`; there is NO authorization anywhere. Public routes: login, logout, `/metrics`, ACME challenge, dashboard assets.
+
+### Migration numbering trap
+
+`schema_migrations` tops out at version 21 but `.sql` files stop at `019_sessions.sql` (file 017 = version 19, inline 018 = version 20, file 019 = version 21); V22-V41 are ungated idempotent `ALTER TABLE` blocks. The `users` table needs a data backfill so it CANNOT be an ungated ALTER: use a real `if current_version < 22` gate + `INSERT INTO schema_migrations VALUES (22)`. Workers open the same DB at boot, so the migration must stay safe under concurrent open (transaction + busy_timeout precedent).
+
+### Design decisions (deviations from PRD letter, not spirit)
+
+- **`require_role!` macro -> `require_role(Role)` middleware factory.** The PRD asks for a macro inside every handler; handlers do not currently receive `Session` (only `change_password` does). A per-route `.layer(role_min(Role::Operator))` in `server.rs` sits beside the existing `rl()` / `bl()` decorators, keeps the whole authorization matrix reviewable in one file, needs no change to ~50 handler signatures, and covers WebSocket upgrades at upgrade time. Handlers that need the identity (users CRUD self-delete guard, Story 8.9 audit log) still read `Extension<Session>`.
+- **Role change / disable takes effect immediately** by deleting all sessions of the target user (pattern already used by `change_password`), not by re-reading the user row per request. A demoted or disabled account is logged out instantly; the session cache stays single-read.
+- **`users` table replaces `admin_users`** (backfill + `DROP TABLE`), per AC #1 wording "new users table". The `AdminUser` model and store methods are renamed rather than duplicated; `export.rs` scrub and TOML export follow. Config export archives from pre-1.6.0 remain importable (import maps `admin_users` -> `users` if present).
+- **POST-but-not-CRUD endpoints**: `POST /validate/*`, `POST /*/test`, `POST /waf/blocklist/reload`, `POST /loadtest/start*` get Operator floor (they trigger outbound traffic or state reload); `POST /config/export` gets Operator floor (full config disclosure, scrubbed or not, is not Viewer material).
+- **Sessions table gains a `role` column** (denormalised like `username`) via ungated idempotent ALTER (V42 style) - no backfill needed, sessions are ephemeral.
+
+### Secret-scrub reality (Viewer surface)
+
+Cert private keys never appear in JSON structs; the leak path is `GET /certificates/:id/download?format=key|full` (`certificates.rs:570-612`) - block for Viewer. SMTP password / webhook url+auth_header are already masked `"********"` for every role (`settings.rs:868`); DNS provider credentials are write-only (`DnsProviderResponse` carries no secret); `bot_hmac_secret_hex` already redacted in `get_settings` (`settings.rs:34`). So the Viewer scrub is: download restriction + config-export restriction + tests pinning the existing masking.
+
+### Password policy
+
+Server-side authoritative validator in `lorica-api/src/password_policy.rs`; the three existing drifted checks (server `>=8` at `auth.rs:179`, frontend `>=12` in `PasswordChange.svelte`) converge on it. New `GlobalSettings` keys `password_min_length` (default 14) and `password_require_complexity` (default true). Length cap stays 128 (argon2 DoS guard).
+
+### Frontend
+
+`auth.ts` is 8 lines (`AuthState` writable, no role) - add `role` to the authenticated state, sourced from `LoginResponse` or `GET /auth/me` on the F5 boot probe (`App.svelte` currently probes `getStatus()` which carries no identity). Settings "tabs" are stacked collapsible Cards in `src/components/settings-tabs/`; `BinaryUpgradeTab` is the cleanest template. Global 401 handler exists at `api.ts:75`; add a 403 handler (toast, no logout). Viewer button-hiding: derive a `canWrite` / `isSuperAdmin` store from `auth` and gate mutating controls.
+
+### e2e
+
+Profile = compose profile + dedicated volumes pair + smoke script (cert-export is the reference shape; ai-bot is the reference for the single+workers dual run). `helpers.sh login()` hardcodes `"username":"admin"` - add a `login_as(user, pass)` variant. Register `rbac` + `rbac-workers` in `run.sh` `ALL_PROFILES` AND the phase list (missing teardown entries leak volumes - Story 8.1 IV2 lesson).
+
+### Worker-mode
+
+Sessions, users and role checks are supervisor-only (`middleware/auth.rs:51` doc); workers never see auth state and `lorica-command` needs no change. The only cross-process concern is the concurrent-migration safety above. The `rbac-workers` e2e profile exists to prove exactly that (management API in supervisor + workers serving traffic).
+
+## Dev Agent Record
+
+### Debug Log
+
+(empty)
+
+### Completion Notes
+
+(empty)
+
+## File List
+
+(to fill during implementation)
+
+## Change Log
+
+| Date | Version | Description | Author |
+|------|---------|-------------|--------|
+| 2026-08-11 | 0.1 | Story drafted from Epic 8 PRD + codebase exploration (auth stack, migration numbering trap, scrub surface, e2e profile shape). Design deviations recorded in Dev Notes: middleware factory instead of in-handler macro, session-invalidation instead of per-request role re-read, users table replaces admin_users. | Romain G. |
