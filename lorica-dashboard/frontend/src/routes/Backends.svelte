@@ -9,6 +9,7 @@
   import StatusBadge from '../components/StatusBadge.svelte';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { showToast } from '../lib/toast';
+  import { canWrite } from '../lib/auth';
 
   let backends: BackendResponse[] = $state([]);
   let error = $state('');
@@ -261,7 +262,9 @@
 <div class="backends-page">
   <div class="page-header">
     <h1>Backends</h1>
-    <button class="btn btn-primary" onclick={openCreateForm}>Add Backend</button>
+    {#if $canWrite}
+      <button class="btn btn-primary" onclick={openCreateForm}>Add Backend</button>
+    {/if}
   </div>
 
   {#if error}
@@ -273,7 +276,9 @@
   {:else if backends.length === 0}
     <div class="empty-state">
       <p>No backends configured yet.</p>
-      <button class="btn btn-primary" onclick={openCreateForm}>Add your first backend</button>
+      {#if $canWrite}
+        <button class="btn btn-primary" onclick={openCreateForm}>Add your first backend</button>
+      {/if}
     </div>
   {:else}
     <div class="filter-bar">
@@ -332,14 +337,16 @@
               <td class="mono">{b.active_connections}</td>
               <td class="mono">{b.ewma_score_us > 0 ? `${(b.ewma_score_us / 1000).toFixed(1)}ms` : '-'}</td>
               <td class="actions">
-                <button class="btn-icon" onclick={() => openEditForm(b)} title="Edit" aria-label="Edit">
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                  {@html editIcon}
-                </button>
-                <button class="btn-icon btn-icon-danger" onclick={() => (deletingBackend = b)} title="Delete" aria-label="Delete">
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                  {@html trashIcon}
-                </button>
+                {#if $canWrite}
+                  <button class="btn-icon" onclick={() => openEditForm(b)} title="Edit" aria-label="Edit">
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                    {@html editIcon}
+                  </button>
+                  <button class="btn-icon btn-icon-danger" onclick={() => (deletingBackend = b)} title="Delete" aria-label="Delete">
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                    {@html trashIcon}
+                  </button>
+                {/if}
               </td>
             </tr>
           {/each}

@@ -3,6 +3,7 @@
   import { api, type WafEvent, type WafCategoryCount, type WafRuleSummary, type BlocklistStatus, type CustomWafRule, type BanEntry } from '../lib/api';
   import ConfirmDialog from '../components/ConfirmDialog.svelte';
   import { showToast } from '../lib/toast';
+  import { canWrite } from '../lib/auth';
 
   let events: WafEvent[] = $state([]);
   let stats: { total_events: number; rule_count: number; by_category: WafCategoryCount[] } = $state({
@@ -256,7 +257,7 @@
     <h1>Security</h1>
     <div class="header-actions">
       <button class="btn btn-secondary" onclick={loadData}>Refresh</button>
-      {#if activeTab === 'events' && events.length > 0}
+      {#if $canWrite && activeTab === 'events' && events.length > 0}
         <button class="btn btn-secondary" style="color: var(--color-red)" onclick={() => (showClearConfirm = true)}>Clear Events</button>
       {/if}
     </div>
@@ -399,7 +400,7 @@
                 <td>{rule.description}</td>
                 <td>
                   <label class="toggle">
-                    <input type="checkbox" checked={rule.enabled} onchange={() => toggleRule(rule.id, !rule.enabled)} />
+                    <input type="checkbox" checked={rule.enabled} disabled={!$canWrite} onchange={() => toggleRule(rule.id, !rule.enabled)} />
                     <span class="toggle-slider"></span>
                   </label>
                 </td>
@@ -412,13 +413,17 @@
   {:else if activeTab === 'custom'}
     <div class="custom-header">
       <p class="text-muted">User-defined WAF rules with custom regex patterns.</p>
-      <button class="btn btn-primary" onclick={openCustomForm}>+ Add Rule</button>
+      {#if $canWrite}
+        <button class="btn btn-primary" onclick={openCustomForm}>+ Add Rule</button>
+      {/if}
     </div>
 
     {#if customRules.length === 0}
       <div class="empty-state">
         <p>No custom WAF rules defined.</p>
-        <button class="btn btn-primary" onclick={openCustomForm}>Create your first rule</button>
+        {#if $canWrite}
+          <button class="btn btn-primary" onclick={openCustomForm}>Create your first rule</button>
+        {/if}
       </div>
     {:else}
       <div class="table-wrapper">
@@ -442,10 +447,12 @@
                 <td>{rule.description}</td>
                 <td class="mono matched-value" title={rule.pattern}>{rule.pattern}</td>
                 <td>
-                  <button class="btn-icon btn-icon-danger" onclick={() => (deletingCustomRule = rule)} title="Delete" aria-label="Delete">
-                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                    {@html trashIcon}
-                  </button>
+                  {#if $canWrite}
+                    <button class="btn-icon btn-icon-danger" onclick={() => (deletingCustomRule = rule)} title="Delete" aria-label="Delete">
+                      <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                      {@html trashIcon}
+                    </button>
+                  {/if}
                 </td>
               </tr>
             {/each}
@@ -524,7 +531,7 @@
             <p class="text-muted">Blocks known malicious IP addresses from accessing the proxy. Sourced from Data-Shield and refreshed every 6 hours.</p>
           </div>
           <label class="toggle">
-            <input type="checkbox" checked={blocklist.enabled} onchange={toggleBlocklist} />
+            <input type="checkbox" checked={blocklist.enabled} disabled={!$canWrite} onchange={toggleBlocklist} />
             <span class="toggle-slider"></span>
           </label>
         </div>
@@ -545,11 +552,13 @@
           <a href={blocklist.source} target="_blank" rel="noopener noreferrer" class="mono">{blocklist.source}</a>
         </div>
 
-        <div class="blocklist-actions">
-          <button class="btn btn-secondary" onclick={reloadBlocklist} disabled={blocklistLoading || !blocklist.enabled}>
-            {blocklistLoading ? 'Reloading...' : 'Reload Now'}
-          </button>
-        </div>
+        {#if $canWrite}
+          <div class="blocklist-actions">
+            <button class="btn btn-secondary" onclick={reloadBlocklist} disabled={blocklistLoading || !blocklist.enabled}>
+              {blocklistLoading ? 'Reloading...' : 'Reload Now'}
+            </button>
+          </div>
+        {/if}
       </div>
     </div>
   {:else if activeTab === 'bans'}
@@ -594,10 +603,12 @@
                   <td>{formatDuration(ban.banned_seconds_ago)} ago</td>
                   <td>{formatDuration(ban.remaining_seconds)}</td>
                   <td>
-                    <button
-                      class="btn btn-danger btn-sm"
-                      onclick={() => (unbanningIp = ban.ip)}
-                    >Unban</button>
+                    {#if $canWrite}
+                      <button
+                        class="btn btn-danger btn-sm"
+                        onclick={() => (unbanningIp = ban.ip)}
+                      >Unban</button>
+                    {/if}
                   </td>
                 </tr>
               {/each}

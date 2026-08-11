@@ -6,6 +6,7 @@
   import ConfirmDialog from '../ConfirmDialog.svelte';
   import { showToast } from '../../lib/toast';
   import { validateUrl } from '../../lib/validators';
+  import { isSuperAdmin } from '../../lib/auth';
 
   let {
     notifications = $bindable([]),
@@ -253,9 +254,11 @@
                     {nc.enabled ? 'Yes' : 'No'}
                   </td>
                   <td class="settings-actions-cell">
-                    <button class="settings-btn-action settings-btn-test" onclick={() => handleTestNotif(nc.id)} disabled={testingNotif === nc.id}>Test</button>
-                    <button class="settings-btn-action settings-btn-edit" onclick={() => openNotifEdit(nc)}>Edit</button>
-                    <button class="settings-btn-action settings-btn-delete" onclick={() => deletingNotif = nc}>Delete</button>
+                    {#if $isSuperAdmin}
+                      <button class="settings-btn-action settings-btn-test" onclick={() => handleTestNotif(nc.id)} disabled={testingNotif === nc.id}>Test</button>
+                      <button class="settings-btn-action settings-btn-edit" onclick={() => openNotifEdit(nc)}>Edit</button>
+                      <button class="settings-btn-action settings-btn-delete" onclick={() => deletingNotif = nc}>Delete</button>
+                    {/if}
                   </td>
                 </tr>
               {/each}
@@ -263,9 +266,11 @@
           </table>
         </div>
       {/if}
-      <div class="settings-dialog-actions">
-        <button class="btn btn-primary" onclick={openNotifCreate}>Add Channel</button>
-      </div>
+      {#if $isSuperAdmin}
+        <div class="settings-dialog-actions">
+          <button class="btn btn-primary" onclick={openNotifCreate}>Add Channel</button>
+        </div>
+      {/if}
     </div>
   {/if}
 </section>

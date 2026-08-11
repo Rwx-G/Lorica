@@ -1,5 +1,6 @@
 <script lang="ts">
   import { validateCidr } from '../../lib/validators';
+  import { isSuperAdmin } from '../../lib/auth';
 
   function cidrListErr(text: string): string | null {
     const raw = text.trim();
@@ -191,11 +192,13 @@
       {#if settingsError}
         <div class="settings-form-error">{settingsError}</div>
       {/if}
-      <div class="settings-dialog-actions">
-        <button class="btn btn-primary" onclick={onSave} disabled={settingsSaving}>
-          {settingsSaving ? 'Saving...' : 'Save Network Settings'}
-        </button>
-      </div>
+      {#if $isSuperAdmin}
+        <div class="settings-dialog-actions">
+          <button class="btn btn-primary" onclick={onSave} disabled={settingsSaving}>
+            {settingsSaving ? 'Saving...' : 'Save Network Settings'}
+          </button>
+        </div>
+      {/if}
     </div>
   {/if}
 </section>

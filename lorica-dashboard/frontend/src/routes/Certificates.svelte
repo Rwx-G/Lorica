@@ -17,6 +17,7 @@
   import CertificateSelfSignedPrefPrompt from '../components/certificates/CertificateSelfSignedPrefPrompt.svelte';
   import CertificateThresholdsForm from '../components/certificates/CertificateThresholdsForm.svelte';
   import { showToast } from '../lib/toast';
+  import { canWrite, isSuperAdmin } from '../lib/auth';
 
   let certificates: CertificateResponse[] = $state([]);
   let routes: RouteResponse[] = $state([]);
@@ -235,13 +236,17 @@
   <div class="page-header">
     <h1>Certificates</h1>
     <div class="header-actions">
-      <button class="btn btn-secondary" onclick={() => showThresholdConfig = true} title="Configure expiration thresholds">
-        <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-        {@html gearIcon}
-      </button>
-      <button class="btn btn-secondary" onclick={openSelfSigned}>Self-signed</button>
-      <button class="btn btn-acme" onclick={openAcmeForm}>Let's Encrypt</button>
-      <button class="btn btn-primary" onclick={() => showUploadForm = true}>+ Upload Certificate</button>
+      {#if $isSuperAdmin}
+        <button class="btn btn-secondary" onclick={() => showThresholdConfig = true} title="Configure expiration thresholds">
+          <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+          {@html gearIcon}
+        </button>
+      {/if}
+      {#if $canWrite}
+        <button class="btn btn-secondary" onclick={openSelfSigned}>Self-signed</button>
+        <button class="btn btn-acme" onclick={openAcmeForm}>Let's Encrypt</button>
+        <button class="btn btn-primary" onclick={() => showUploadForm = true}>+ Upload Certificate</button>
+      {/if}
     </div>
   </div>
 
@@ -255,7 +260,9 @@
     <div class="empty-state">
       <p>No certificates configured yet.</p>
       <p class="text-muted">You can upload a PEM certificate, generate a self-signed certificate for testing, or provision a free Let's Encrypt certificate.</p>
-      <button class="btn btn-primary" onclick={() => showUploadForm = true}>Upload your first certificate</button>
+      {#if $canWrite}
+        <button class="btn btn-primary" onclick={() => showUploadForm = true}>Upload your first certificate</button>
+      {/if}
     </div>
   {:else}
     <CertificateList

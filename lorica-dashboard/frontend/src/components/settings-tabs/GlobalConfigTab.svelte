@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { isSuperAdmin } from '../../lib/auth';
+
   interface SettingsFormShape {
     management_port: number;
     log_level: string;
@@ -178,11 +180,13 @@
       {#if settingsError}
         <div class="settings-form-error">{settingsError}</div>
       {/if}
-      <div class="settings-dialog-actions">
-        <button class="btn btn-primary" onclick={onSave} disabled={settingsSaving}>
-          {settingsSaving ? 'Saving...' : 'Save Settings'}
-        </button>
-      </div>
+      {#if $isSuperAdmin}
+        <div class="settings-dialog-actions">
+          <button class="btn btn-primary" onclick={onSave} disabled={settingsSaving}>
+            {settingsSaving ? 'Saving...' : 'Save Settings'}
+          </button>
+        </div>
+      {/if}
     </div>
   {/if}
 </section>

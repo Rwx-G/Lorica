@@ -11,6 +11,7 @@
   import { showToast } from '../../lib/toast';
   import { formatBytes } from '../../lib/format';
   import ConfirmDialog from '../ConfirmDialog.svelte';
+  import { isSuperAdmin } from '../../lib/auth';
 
   /**
    * Form shape for the cert-export section. The fields on the
@@ -362,15 +363,17 @@
       {#if settingsError}
         <div class="settings-form-error">{settingsError}</div>
       {/if}
-      <div class="settings-dialog-actions">
-        <button
-          class="btn btn-primary"
-          onclick={onSave}
-          disabled={settingsSaving || hasAnyFieldErr}
-        >
-          {settingsSaving ? 'Saving...' : 'Save Export Settings'}
-        </button>
-      </div>
+      {#if $isSuperAdmin}
+        <div class="settings-dialog-actions">
+          <button
+            class="btn btn-primary"
+            onclick={onSave}
+            disabled={settingsSaving || hasAnyFieldErr}
+          >
+            {settingsSaving ? 'Saving...' : 'Save Export Settings'}
+          </button>
+        </div>
+      {/if}
 
       <hr class="section-separator" />
 
@@ -385,6 +388,7 @@
         (wildcard suffix), or an exact hostname.
       </p>
 
+      {#if $isSuperAdmin}
       <form class="acl-add-form" onsubmit={addAcl}>
         <div class="acl-add-grid">
           <div class="settings-form-row">
@@ -436,6 +440,7 @@
           </button>
         </div>
       </form>
+      {/if}
 
       {#if aclsError}
         <div class="settings-form-error">{aclsError}</div>
@@ -467,13 +472,15 @@
                 <td>{acl.allowed_gid ?? '—'}</td>
                 <td><time datetime={acl.created_at}>{new Date(acl.created_at).toLocaleString()}</time></td>
                 <td class="acl-row-actions">
-                  <button
-                    type="button"
-                    class="btn btn-danger-subtle"
-                    onclick={() => (deletingAcl = acl)}
-                  >
-                    Delete
-                  </button>
+                  {#if $isSuperAdmin}
+                    <button
+                      type="button"
+                      class="btn btn-danger-subtle"
+                      onclick={() => (deletingAcl = acl)}
+                    >
+                      Delete
+                    </button>
+                  {/if}
                 </td>
               </tr>
             {/each}
@@ -483,32 +490,34 @@
 
       <hr class="section-separator" />
 
-      <h3>Operator actions</h3>
-      <div class="settings-form-row reapply-row">
-        <div class="reapply-inner">
-          {#if reapplyMsg}
-            <span class="test-msg {reapplyOk ? 'test-ok' : 'test-err'}" role="status">
-              {reapplyMsg}
-            </span>
-          {/if}
-          <button
-            type="button"
-            class="btn btn-secondary"
-            onclick={reapply}
-            disabled={reapplying}
-          >
-            {reapplying ? 'Re-exporting...' : 'Re-export matching certificates now'}
-          </button>
+      {#if $isSuperAdmin}
+        <h3>Operator actions</h3>
+        <div class="settings-form-row reapply-row">
+          <div class="reapply-inner">
+            {#if reapplyMsg}
+              <span class="test-msg {reapplyOk ? 'test-ok' : 'test-err'}" role="status">
+                {reapplyMsg}
+              </span>
+            {/if}
+            <button
+              type="button"
+              class="btn btn-secondary"
+              onclick={reapply}
+              disabled={reapplying}
+            >
+              {reapplying ? 'Re-exporting...' : 'Re-export matching certificates now'}
+            </button>
+          </div>
+          <span class="hint">
+            Forces a re-export of every certificate whose hostname
+            matches a configured ACL pattern. Useful after changing
+            ACLs or default file modes, when you do not want to wait
+            for the next ACME renewal to realign on-disk files.
+            Honours the currently-persisted settings - save first if
+            you just changed them.
+          </span>
         </div>
-        <span class="hint">
-          Forces a re-export of every certificate whose hostname
-          matches a configured ACL pattern. Useful after changing
-          ACLs or default file modes, when you do not want to wait
-          for the next ACME renewal to realign on-disk files.
-          Honours the currently-persisted settings - save first if
-          you just changed them.
-        </span>
-      </div>
+      {/if}
 
       <h3>Orphan directories</h3>
       <p class="section-hint">
@@ -545,13 +554,15 @@
                 <td>{formatBytes(o.size_bytes)}</td>
                 <td>{formatTimestamp(o.modified_at)}</td>
                 <td class="acl-row-actions">
-                  <button
-                    type="button"
-                    class="btn btn-secondary btn-small"
-                    onclick={() => (deletingOrphan = o)}
-                  >
-                    Delete
-                  </button>
+                  {#if $isSuperAdmin}
+                    <button
+                      type="button"
+                      class="btn btn-secondary btn-small"
+                      onclick={() => (deletingOrphan = o)}
+                    >
+                      Delete
+                    </button>
+                  {/if}
                 </td>
               </tr>
             {/each}

@@ -79,6 +79,12 @@ async function request<T>(
     return { error: { code: 'unauthorized', message: 'Session expired. Please log in again.' } };
   }
 
+  // Insufficient role (Story 8.3): surface a toast, keep the session.
+  if (res.status === 403) {
+    const { showToast } = await import('./toast');
+    showToast('Your role does not allow this action.', 'error');
+  }
+
   let json: Record<string, unknown>;
   try {
     json = await res.json();
@@ -101,9 +107,42 @@ export interface LoginRequest {
   password: string;
 }
 
+export type Role = 'super_admin' | 'operator' | 'viewer';
+
 export interface LoginResponse {
+  username: string;
+  role: Role;
   must_change_password: boolean;
   session_expires_at: string;
+}
+
+export interface MeResponse {
+  username: string;
+  role: Role;
+  session_expires_at: string;
+}
+
+export interface UserResponse {
+  id: string;
+  username: string;
+  role: Role;
+  must_change_password: boolean;
+  created_at: string;
+  last_login_at: string | null;
+  disabled: boolean;
+  created_by: string | null;
+}
+
+export interface CreateUserRequest {
+  username: string;
+  password: string;
+  role: Role;
+}
+
+export interface UpdateUserRequest {
+  password?: string;
+  role?: Role;
+  disabled?: boolean;
 }
 
 export interface StatusResponse {
@@ -961,6 +1000,19 @@ export const api = {
       current_password,
       new_password,
     }),
+
+  getMe: () => request<MeResponse>('GET', '/auth/me'),
+
+  listUsers: () => request<UserResponse[]>('GET', '/users'),
+
+  createUser: (body: CreateUserRequest) =>
+    request<UserResponse>('POST', '/users', body),
+
+  updateUser: (id: string, body: UpdateUserRequest) =>
+    request<UserResponse>('PUT', `/users/${id}`, body),
+
+  deleteUser: (id: string) =>
+    request<{ message: string }>('DELETE', `/users/${id}`),
 
   getStatus: () => request<StatusResponse>('GET', '/status'),
 

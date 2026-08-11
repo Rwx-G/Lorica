@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { CertificateResponse, RouteResponse } from '../../lib/api';
   import CertExpiryBadge from '../CertExpiryBadge.svelte';
+  import { canWrite } from '../../lib/auth';
 
   interface Props {
     certificates: CertificateResponse[];
@@ -105,41 +106,43 @@
               <!-- eslint-disable-next-line svelte/no-at-html-tags -->
               {@html eyeIcon}
             </button>
-            <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => onEdit(cert)}>
-              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-              {@html editIcon}
-            </button>
-            {#if cert.is_acme}
-              <button class="btn-icon" title="Renew" aria-label="Renew certificate" onclick={() => onRenew(cert)} disabled={renewingId === cert.id}>
+            {#if $canWrite}
+              <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => onEdit(cert)}>
                 <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                {@html renewIcon}
+                {@html editIcon}
+              </button>
+              {#if cert.is_acme}
+                <button class="btn-icon" title="Renew" aria-label="Renew certificate" onclick={() => onRenew(cert)} disabled={renewingId === cert.id}>
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                  {@html renewIcon}
+                </button>
+              {/if}
+              <div class="download-menu-wrap">
+                <button
+                  class="btn-icon"
+                  title="Download PEM"
+                  aria-label="Download certificate"
+                  aria-haspopup="menu"
+                  aria-expanded={openMenuId === cert.id}
+                  onclick={() => toggleMenu(cert.id)}
+                >
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                  {@html downloadIcon}
+                </button>
+                {#if openMenuId === cert.id}
+                  <div class="download-menu" role="menu">
+                    <button role="menuitem" onclick={() => { onDownload(cert, 'bundle'); openMenuId = null; }}>Bundle (cert + key)</button>
+                    <button role="menuitem" onclick={() => { onDownload(cert, 'cert'); openMenuId = null; }}>Certificate only</button>
+                    <button role="menuitem" onclick={() => { onDownload(cert, 'chain'); openMenuId = null; }}>Certificate + chain</button>
+                    <button role="menuitem" class="danger" onclick={() => { onDownload(cert, 'key'); openMenuId = null; }}>Private key (sensitive)</button>
+                  </div>
+                {/if}
+              </div>
+              <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => onDelete(cert)}>
+                <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                {@html trashIcon}
               </button>
             {/if}
-            <div class="download-menu-wrap">
-              <button
-                class="btn-icon"
-                title="Download PEM"
-                aria-label="Download certificate"
-                aria-haspopup="menu"
-                aria-expanded={openMenuId === cert.id}
-                onclick={() => toggleMenu(cert.id)}
-              >
-                <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                {@html downloadIcon}
-              </button>
-              {#if openMenuId === cert.id}
-                <div class="download-menu" role="menu">
-                  <button role="menuitem" onclick={() => { onDownload(cert, 'bundle'); openMenuId = null; }}>Bundle (cert + key)</button>
-                  <button role="menuitem" onclick={() => { onDownload(cert, 'cert'); openMenuId = null; }}>Certificate only</button>
-                  <button role="menuitem" onclick={() => { onDownload(cert, 'chain'); openMenuId = null; }}>Certificate + chain</button>
-                  <button role="menuitem" class="danger" onclick={() => { onDownload(cert, 'key'); openMenuId = null; }}>Private key (sensitive)</button>
-                </div>
-              {/if}
-            </div>
-            <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => onDelete(cert)}>
-              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-              {@html trashIcon}
-            </button>
           </td>
         </tr>
       {/each}

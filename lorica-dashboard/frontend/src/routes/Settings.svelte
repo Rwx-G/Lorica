@@ -23,6 +23,8 @@
   import ExportImportTab from '../components/settings-tabs/ExportImportTab.svelte';
   import CertExportTab from '../components/settings-tabs/CertExportTab.svelte';
   import BinaryUpgradeTab from '../components/settings-tabs/BinaryUpgradeTab.svelte';
+  import UsersAccessTab from '../components/settings-tabs/UsersAccessTab.svelte';
+  import { isSuperAdmin } from '../lib/auth';
   import { parseOctalMode } from '../lib/validators';
 
   // Global settings
@@ -111,6 +113,7 @@
     ai_crawlers: true,
     cert_export: true,
     binary_upgrade: true,
+    users_access: true,
   };
   let expandedSections = $state<Record<string, boolean>>((() => {
     try {
@@ -428,6 +431,13 @@
       expanded={expandedSections.binary_upgrade}
       toggleSection={() => toggleSection('binary_upgrade')}
     />
+
+    {#if $isSuperAdmin}
+      <UsersAccessTab
+        expanded={expandedSections.users_access}
+        toggleSection={() => toggleSection('users_access')}
+      />
+    {/if}
   {/if}
 </div>
 

@@ -17,6 +17,7 @@
   } from '../../lib/ai-crawlers';
   import ConfirmDialog from '../ConfirmDialog.svelte';
   import { showToast } from '../../lib/toast';
+  import { canWrite } from '../../lib/auth';
 
   interface Props {
     expanded: boolean;
@@ -244,13 +245,15 @@
                 </td>
                 <td>
                   <label class="toggle-cell">
-                    <input type="checkbox" checked={c.enabled} onchange={() => toggleEnabled(c)} />
+                    <input type="checkbox" checked={c.enabled} disabled={!$canWrite} onchange={() => toggleEnabled(c)} />
                     <span>{c.enabled ? 'On' : 'Off'}</span>
                   </label>
                 </td>
                 <td class="settings-actions-cell">
-                  <button class="settings-btn-action settings-btn-edit" onclick={() => openEdit(c)}>Edit</button>
-                  <button class="settings-btn-action settings-btn-delete" onclick={() => (deletingId = c.id)}>Delete</button>
+                  {#if $canWrite}
+                    <button class="settings-btn-action settings-btn-edit" onclick={() => openEdit(c)}>Edit</button>
+                    <button class="settings-btn-action settings-btn-delete" onclick={() => (deletingId = c.id)}>Delete</button>
+                  {/if}
                 </td>
               </tr>
             {/each}
@@ -266,7 +269,9 @@
           {customs.length} custom{maxCount > 0 ? ` / ${maxCount} max` : ''}
           {builtInCount > 0 ? ` (+${builtInCount} built-in)` : ''}
         </span>
-        <button class="btn btn-primary" onclick={openCreate} disabled={capReached}>Add Crawler</button>
+        {#if $canWrite}
+          <button class="btn btn-primary" onclick={openCreate} disabled={capReached}>Add Crawler</button>
+        {/if}
       </div>
       {#if capReached}
         <span class="field-error" role="alert">Custom crawler cap reached. Delete one before adding another.</span>

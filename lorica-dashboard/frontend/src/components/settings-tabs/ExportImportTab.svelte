@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api, type ImportDiffResponse } from '../../lib/api';
+  import { canWrite, isSuperAdmin } from '../../lib/auth';
 
   interface Props {
     expanded: boolean;
@@ -116,18 +117,20 @@
           {#if exportError}
             <div class="settings-form-error">{exportError}</div>
           {/if}
-          <div class="actions-center">
-            <button class="btn btn-primary" onclick={handleExport} disabled={exporting}>
-              {exporting ? 'Exporting...' : 'Download TOML'}
-            </button>
-          </div>
+          {#if $canWrite}
+            <div class="actions-center">
+              <button class="btn btn-primary" onclick={handleExport} disabled={exporting}>
+                {exporting ? 'Exporting...' : 'Download TOML'}
+              </button>
+            </div>
+          {/if}
         </div>
 
         <!-- Import -->
         <div class="settings-form-card">
           <h3>Import</h3>
           <p class="settings-hint">Upload a TOML file to preview and apply changes.</p>
-          {#if !importDiff}
+          {#if $isSuperAdmin && !importDiff}
             <div class="actions-center">
               <label class="file-input-label">
                 <input type="file" accept=".toml,text/plain" onchange={handleFileSelect} style="display:none" />

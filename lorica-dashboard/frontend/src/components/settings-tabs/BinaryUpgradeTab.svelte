@@ -1,7 +1,6 @@
 <script lang="ts">
-  // SuperAdmin-only once Story 8.3 RBAC lands; today it is gated by
-  // the single-admin session like every other settings panel.
   import { onMount } from 'svelte';
+  import { isSuperAdmin } from '../../lib/auth';
   import {
     api,
     isValidUpgradeSignatureHex,
@@ -127,6 +126,7 @@
         <p class="hint">Loading...</p>
       {/if}
 
+      {#if $isSuperAdmin}
       <h3>New binary</h3>
       <div class="settings-form-row">
         <label for="upgrade-binary">Binary file</label>
@@ -219,6 +219,7 @@
           {uploading ? 'Uploading...' : 'Verify & stage upgrade'}
         </button>
       </div>
+      {/if}
     </div>
   {/if}
 </section>

@@ -11,6 +11,7 @@
   import RouteDrawer from '../components/RouteDrawer.svelte';
   import NginxImportWizard from '../components/NginxImportWizard.svelte';
   import { showToast } from '../lib/toast';
+  import { canWrite } from '../lib/auth';
 
   let routes: RouteResponse[] = $state([]);
   let backends: BackendResponse[] = $state([]);
@@ -218,10 +219,12 @@
 <div class="routes-page">
   <div class="page-header">
     <h1>Routes</h1>
-    <div class="header-actions">
-      <button class="btn btn-secondary" onclick={() => { showImportWizard = true; }}>Import from Nginx</button>
-      <button class="btn btn-primary" onclick={openCreateForm}>+ New Route</button>
-    </div>
+    {#if $canWrite}
+      <div class="header-actions">
+        <button class="btn btn-secondary" onclick={() => { showImportWizard = true; }}>Import from Nginx</button>
+        <button class="btn btn-primary" onclick={openCreateForm}>+ New Route</button>
+      </div>
+    {/if}
   </div>
 
   {#if error}
@@ -233,7 +236,9 @@
   {:else if routes.length === 0}
     <div class="empty-state">
       <p>No routes configured yet.</p>
-      <button class="btn btn-primary" onclick={openCreateForm}>Create your first route</button>
+      {#if $canWrite}
+        <button class="btn btn-primary" onclick={openCreateForm}>Create your first route</button>
+      {/if}
     </div>
   {:else}
     <div class="filter-bar">
@@ -316,26 +321,28 @@
                 </span>
               </td>
               <td class="actions">
-                <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => openEditForm(route)}>
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                  {@html editIcon}
-                </button>
-                <button
-                  class="btn-icon btn-icon-maintenance"
-                  class:active={route.maintenance_mode}
-                  title={route.maintenance_mode ? 'Disable maintenance mode' : 'Enable maintenance mode (returns 503 to all requests)'}
-                  aria-label={route.maintenance_mode ? 'Disable maintenance' : 'Enable maintenance'}
-                  aria-pressed={route.maintenance_mode}
-                  disabled={togglingRouteId === route.id}
-                  onclick={() => requestMaintenanceToggle(route)}
-                >
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                  {@html wrenchIcon}
-                </button>
-                <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => { deletingRoute = route; }}>
-                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                  {@html trashIcon}
-                </button>
+                {#if $canWrite}
+                  <button class="btn-icon" title="Edit" aria-label="Edit" onclick={() => openEditForm(route)}>
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                    {@html editIcon}
+                  </button>
+                  <button
+                    class="btn-icon btn-icon-maintenance"
+                    class:active={route.maintenance_mode}
+                    title={route.maintenance_mode ? 'Disable maintenance mode' : 'Enable maintenance mode (returns 503 to all requests)'}
+                    aria-label={route.maintenance_mode ? 'Disable maintenance' : 'Enable maintenance'}
+                    aria-pressed={route.maintenance_mode}
+                    disabled={togglingRouteId === route.id}
+                    onclick={() => requestMaintenanceToggle(route)}
+                  >
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                    {@html wrenchIcon}
+                  </button>
+                  <button class="btn-icon btn-icon-danger" title="Delete" aria-label="Delete" onclick={() => { deletingRoute = route; }}>
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                    {@html trashIcon}
+                  </button>
+                {/if}
               </td>
             </tr>
           {/each}

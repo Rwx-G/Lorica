@@ -24,8 +24,12 @@
 
     if (res.data?.must_change_password) {
       auth.set({ status: 'must_change_password' });
-    } else {
-      auth.set({ status: 'authenticated' });
+    } else if (res.data) {
+      auth.set({
+        status: 'authenticated',
+        username: res.data.username,
+        role: res.data.role,
+      });
     }
 
     loading = false;
