@@ -214,25 +214,61 @@ impl BotEngine {
         (raw, hex)
     }
 
-    /// Stash a pending challenge. Overwrites any prior entry with
-    /// the same nonce (128-bit random, collisions unobservable in
-    /// practice). Async because the SQLite backend needs an
-    /// `.await` on the shared store mutex; the in-memory backend
-    /// completes synchronously (no real await) so the async
-    /// overhead is a single vtable dispatch on the future.
-    pub async fn insert(&self, nonce: String, entry: PendingEntry) {
+    /// Stash a pending challenge, enforcing the global and
+    /// per-IP-prefix capacity caps (Story 8.9 AC #6, `0` disables a
+    /// cap). Over-cap inserts are REFUSED so a flooder cannot evict
+    /// legitimate pending challenges; the caller answers
+    /// `503 Retry-After`. Overwrites any prior entry with the same
+    /// nonce (128-bit random, collisions unobservable in practice).
+    /// Async because the SQLite backend needs an `.await` on the
+    /// shared store mutex; the in-memory backend completes
+    /// synchronously.
+    ///
+    /// A failed SQLite insert reads as `GlobalCapExceeded`: the
+    /// challenge was not stored, so handing the client an
+    /// unverifiable challenge would be worse than a retryable 503.
+    pub async fn insert(
+        &self,
+        nonce: String,
+        entry: PendingEntry,
+        max_entries: u32,
+        per_prefix_max: u32,
+    ) -> lorica_config::BotStashInsertOutcome {
+        use lorica_config::BotStashInsertOutcome;
         match &self.backend {
             StashBackend::InMemory(mx) => {
-                mx.lock().insert(nonce, entry);
+                let mut map = mx.lock();
+                if max_entries > 0
+                    && map.len() >= max_entries as usize
+                    && !map.contains_key(&nonce)
+                {
+                    return BotStashInsertOutcome::GlobalCapExceeded;
+                }
+                if per_prefix_max > 0 {
+                    let prefix_count = map
+                        .values()
+                        .filter(|e| e.ip_prefix == entry.ip_prefix)
+                        .count();
+                    if prefix_count >= per_prefix_max as usize {
+                        return BotStashInsertOutcome::PrefixCapExceeded;
+                    }
+                }
+                map.insert(nonce, entry);
+                BotStashInsertOutcome::Inserted
             }
             StashBackend::Sqlite(store) => {
                 let stash = to_stash(&nonce, &entry);
                 stash_blocking(store, move |g| {
-                    if let Err(e) = g.bot_stash_insert(&stash) {
-                        tracing::warn!(error = %e, nonce = %nonce, "bot_stash_insert failed");
+                    match g.bot_stash_insert(&stash, max_entries, per_prefix_max) {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            tracing::warn!(error = %e, nonce = %nonce, "bot_stash_insert failed");
+                            BotStashInsertOutcome::GlobalCapExceeded
+                        }
                     }
                 })
-                .await;
+                .await
+                .unwrap_or(BotStashInsertOutcome::GlobalCapExceeded)
             }
         }
     }
@@ -1282,6 +1318,8 @@ mod tests {
                 cookie_ttl_s: 86_400,
                 expires_at: 4_000_000_000,
             },
+            0,
+            0,
         )
         .await;
         assert_eq!(e.len().await, 1);
@@ -1312,6 +1350,8 @@ mod tests {
                 cookie_ttl_s: 86_400,
                 expires_at: 4_000_000_000,
             },
+            0,
+            0,
         )
         .await;
         assert_eq!(e.captcha_image("abc").await, Some(vec![1, 2, 3]));
@@ -1337,6 +1377,8 @@ mod tests {
                 cookie_ttl_s: 86_400,
                 expires_at: 2_000_000_000,
             },
+            0,
+            0,
         )
         .await;
         e.insert(
@@ -1353,6 +1395,8 @@ mod tests {
                 cookie_ttl_s: 86_400,
                 expires_at: 1_000_000_000,
             },
+            0,
+            0,
         )
         .await;
         e.prune_expired(1_500_000_000).await;
@@ -1388,6 +1432,8 @@ mod tests {
                 cookie_ttl_s: 86_400,
                 expires_at: 2_000_000_000,
             },
+            0,
+            0,
         )
         .await;
         assert_eq!(e.len().await, 1);
@@ -1429,6 +1475,8 @@ mod tests {
                 cookie_ttl_s: 3600,
                 expires_at: 2_000_000_000,
             },
+            0,
+            0,
         )
         .await;
         // Image lookup returns the PNG bytes without consuming.

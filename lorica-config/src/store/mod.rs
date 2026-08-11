@@ -764,6 +764,16 @@ impl ConfigStore {
             )?;
         }
 
+        // V43: per-prefix index for the bot-stash per-IP-prefix cap
+        // (Story 8.9 AC #6). The COUNT on (disc, bytes) runs on every
+        // challenge issuance; without the index it is a full-table
+        // scan of up to bot_stash_max_entries rows.
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bot_pending_prefix
+             ON bot_pending_challenges(ip_prefix_disc, ip_prefix_bytes)",
+            [],
+        );
+
         // V42: sessions carry the owning user's role so `require_auth`
         // can authorise without a per-request users read. Default
         // 'super_admin' covers pre-RBAC rows: every session minted

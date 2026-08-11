@@ -1129,6 +1129,13 @@ impl ProxyHttp for LoricaProxy {
             {
                 match body_state {
                     MirrorBodyState::Active(buf) => {
+                        let mirror_caps = {
+                            let cfg = self.config.load();
+                            (
+                                cfg.mirror_max_concurrent_per_route,
+                                cfg.mirror_max_concurrent_global,
+                            )
+                        };
                         spawn_mirrors(
                             &pending.cfg,
                             &pending.backends,
@@ -1138,6 +1145,7 @@ impl ProxyHttp for LoricaProxy {
                             Some(buf),
                             pending.request_id,
                             pending.route_id,
+                            mirror_caps,
                         );
                     }
                     MirrorBodyState::Overflowed => {

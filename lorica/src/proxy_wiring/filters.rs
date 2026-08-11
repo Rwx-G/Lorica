@@ -1006,6 +1006,13 @@ impl LoricaProxy {
                 } else {
                     // No body to buffer (or operator opted into
                     // headers-only via max_body_bytes = 0): fire now.
+                    let mirror_caps = {
+                        let cfg = self.config.load();
+                        (
+                            cfg.mirror_max_concurrent_per_route,
+                            cfg.mirror_max_concurrent_global,
+                        )
+                    };
                     spawn_mirrors(
                         mirror_cfg,
                         &entry.mirror_backends,
@@ -1015,6 +1022,7 @@ impl LoricaProxy {
                         None,
                         ctx.request_id.clone(),
                         entry.route.id.clone(),
+                        mirror_caps,
                     );
                 }
             }
@@ -1806,6 +1814,10 @@ impl LoricaProxy {
                                 .get(http::header::ACCEPT)
                                 .and_then(|v| v.to_str().ok()),
                         );
+                        let stash_caps = {
+                            let cfg = self.config.load();
+                            (cfg.bot_stash_max_entries, cfg.bot_stash_per_prefix_max)
+                        };
                         return bot_handlers::serve_challenge(
                             session,
                             &self.bot_engine,
@@ -1815,6 +1827,7 @@ impl LoricaProxy {
                             &path_and_q,
                             accept_html,
                             now_secs,
+                            stash_caps,
                         )
                         .await
                         .map(Some);

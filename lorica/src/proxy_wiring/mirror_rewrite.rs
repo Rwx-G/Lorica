@@ -43,15 +43,37 @@ static MIRROR_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("build mirror reqwest client")
 });
 
-/// Global cap on in-flight mirror sub-requests. Prevents a misconfigured
-/// shadow backend (slow or dead) from leaking unbounded tokio tasks and
-/// file descriptors. When the permit can't be acquired immediately, the
-/// mirror is dropped - shadow testing is best-effort by design.
-///
-/// 256 is generous for a single-node deployment and still bounded
-/// enough that a hung shadow can't take the process down.
-static MIRROR_SEMAPHORE: Lazy<Arc<tokio::sync::Semaphore>> =
-    Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(256)));
+/// Coarse global safety net on in-flight mirror sub-requests across
+/// ALL routes (Story 8.9 AC #7, `mirror_max_concurrent_global`,
+/// default 4096). Prevents total tokio-task / FD exhaustion even if
+/// many routes each mirror heavily. Sized once at first use; a
+/// running process keeps its net size (a net, not a tuning knob).
+static MIRROR_GLOBAL_SEMAPHORE: Lazy<Arc<tokio::sync::Semaphore>> =
+    Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(4096)));
+
+/// Per-route mirror concurrency semaphores (Story 8.9 AC #7). A slow
+/// or hung shadow target on route A saturates only route A's
+/// semaphore; route B's mirrors keep flowing. The stored `size`
+/// tracks the value the semaphore was built with so a settings
+/// change (`mirror_max_concurrent_per_route`) rebuilds it on the
+/// next issuance instead of requiring a restart.
+static MIRROR_ROUTE_SEMAPHORES: Lazy<dashmap::DashMap<String, (u32, Arc<tokio::sync::Semaphore>)>> =
+    Lazy::new(dashmap::DashMap::new);
+
+/// Fetch (or lazily build / resize) the per-route mirror semaphore.
+fn route_mirror_semaphore(route_id: &str, size: u32) -> Arc<tokio::sync::Semaphore> {
+    let size = size.max(1);
+    if let Some(entry) = MIRROR_ROUTE_SEMAPHORES.get(route_id) {
+        if entry.0 == size {
+            return Arc::clone(&entry.1);
+        }
+    }
+    // Missing or resized: rebuild. A concurrent rebuild racing here is
+    // harmless - the last writer wins and both hand out valid permits.
+    let sem = Arc::new(tokio::sync::Semaphore::new(size as usize));
+    MIRROR_ROUTE_SEMAPHORES.insert(route_id.to_string(), (size, Arc::clone(&sem)));
+    sem
+}
 
 pub(crate) fn mirror_sample_hit(request_id: &str, sample_percent: u8) -> bool {
     let pct = sample_percent.min(100);
@@ -362,6 +384,7 @@ pub(crate) fn spawn_mirrors(
     body: Option<Vec<u8>>,
     request_id: String,
     route_id: String,
+    concurrency_caps: (u32, u32),
 ) {
     if !mirror_sample_hit(&request_id, cfg.sample_percent) {
         return;
@@ -370,8 +393,13 @@ pub(crate) fn spawn_mirrors(
         return;
     }
 
+    let (per_route_max, global_max) = concurrency_caps;
     let timeout = Duration::from_millis(cfg.timeout_ms as u64);
-    let sem = Arc::clone(&MIRROR_SEMAPHORE);
+    // Per-route semaphore isolates a slow shadow to its own route;
+    // the global net caps total in-flight sub-requests across routes.
+    let route_sem = route_mirror_semaphore(&route_id, per_route_max);
+    let global_sem = Arc::clone(&MIRROR_GLOBAL_SEMAPHORE);
+    let _ = global_max; // net is sized once at static init (see doc).
 
     for backend in resolved_backends {
         let url = match build_mirror_url(&backend.address, &path_and_query) {
@@ -384,17 +412,27 @@ pub(crate) fn spawn_mirrors(
         let method_c = method.clone();
         let headers_c = forward_headers.clone();
         let body_c = body.clone();
-        let sem_c = Arc::clone(&sem);
+        let route_sem_c = Arc::clone(&route_sem);
+        let global_sem_c = Arc::clone(&global_sem);
         let route_id_c = route_id.clone();
         tokio::spawn(async move {
-            // try_acquire_owned is the right primitive here: if all 256
-            // slots are in-flight, drop the mirror silently instead of
-            // queuing (queuing would build a backlog behind a slow
-            // shadow that never drains).
-            let _permit = match sem_c.try_acquire_owned() {
+            // try_acquire_owned on BOTH: if either the per-route or the
+            // global net is saturated, drop the mirror silently instead
+            // of queuing (queuing builds a backlog behind a slow shadow
+            // that never drains). The route permit is acquired first so
+            // a saturated route does not consume global slots.
+            let _route_permit = match route_sem_c.try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    tracing::debug!(url = %url, "mirror: semaphore saturated, dropping");
+                    tracing::debug!(url = %url, "mirror: per-route semaphore saturated, dropping");
+                    lorica_api::metrics::inc_mirror_outcome(&route_id_c, "dropped_saturated");
+                    return;
+                }
+            };
+            let _global_permit = match global_sem_c.try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::debug!(url = %url, "mirror: global semaphore saturated, dropping");
                     lorica_api::metrics::inc_mirror_outcome(&route_id_c, "dropped_saturated");
                     return;
                 }

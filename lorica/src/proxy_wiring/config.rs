@@ -216,6 +216,19 @@ pub struct ProxyConfig {
     /// `X-Lorica-Bot-Verification` headers upstream when verification
     /// confirms.
     pub ai_bot_inject_headers: bool,
+    /// Story 8.9 AC #6 - global cap on pending bot challenges;
+    /// over-cap issuance answers 503 Retry-After instead of evicting
+    /// legitimate pending entries.
+    pub bot_stash_max_entries: u32,
+    /// Story 8.9 AC #6 - per-IP-prefix (/24 v4, /48 v6) cap on
+    /// pending bot challenges.
+    pub bot_stash_per_prefix_max: u32,
+    /// Story 8.9 AC #7 - per-route cap on concurrent mirror
+    /// sub-requests.
+    pub mirror_max_concurrent_per_route: u32,
+    /// Story 8.9 AC #7 - coarse global safety net across all routes'
+    /// mirror sub-requests.
+    pub mirror_max_concurrent_global: u32,
 }
 
 /// Global settings extracted from the config store for ProxyConfig construction.
@@ -233,6 +246,11 @@ pub struct ProxyConfigGlobals {
     /// consumption (no hot-path settings lookup).
     pub ai_bot_treat_spoofed_as: lorica_config::models::SpoofedFallback,
     pub ai_bot_inject_headers: bool,
+    /// Story 8.9 AC #6 / #7 caps, same plumbing rationale.
+    pub bot_stash_max_entries: u32,
+    pub bot_stash_per_prefix_max: u32,
+    pub mirror_max_concurrent_per_route: u32,
+    pub mirror_max_concurrent_global: u32,
 }
 
 impl ProxyConfig {
@@ -258,6 +276,10 @@ impl ProxyConfig {
             waf_whitelist_cidrs,
             ai_bot_treat_spoofed_as,
             ai_bot_inject_headers,
+            bot_stash_max_entries,
+            bot_stash_per_prefix_max,
+            mirror_max_concurrent_per_route,
+            mirror_max_concurrent_global,
         } = globals;
         let backend_map: HashMap<String, Backend> = backends
             .into_iter()
@@ -585,6 +607,10 @@ impl ProxyConfig {
             waf_whitelist,
             ai_bot_treat_spoofed_as,
             ai_bot_inject_headers,
+            bot_stash_max_entries,
+            bot_stash_per_prefix_max,
+            mirror_max_concurrent_per_route,
+            mirror_max_concurrent_global,
         }
     }
 
