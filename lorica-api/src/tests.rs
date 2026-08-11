@@ -561,6 +561,376 @@ async fn test_change_password_missing_complexity_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+// ---- RBAC authorization tests (Story 8.3) ----
+
+/// Create a user with the given role directly in the store, then
+/// log in through the endpoint and return the session cookie.
+async fn create_user_and_login(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    username: &str,
+    role: lorica_config::models::Role,
+) -> String {
+    let password = "Rbac-test-pass-42!";
+    {
+        let store = state.store.lock().await;
+        let user = lorica_config::models::User {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: username.to_string(),
+            password_hash: hash_password(password).expect("test setup"),
+            role,
+            must_change_password: false,
+            created_at: chrono::Utc::now(),
+            last_login_at: None,
+            disabled_at: None,
+            created_by: None,
+        };
+        store.create_user(&user).expect("test setup");
+    }
+
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let body = serde_json::json!({ "username": username, "password": password });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/login")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_string(&body).expect("test setup"),
+        ))
+        .expect("test setup");
+    let response = router.oneshot(req).await.expect("test setup");
+    assert_eq!(response.status(), StatusCode::OK);
+    format!(
+        "lorica_session={}",
+        extract_session_cookie(&response).expect("test setup")
+    )
+}
+
+async fn send(
+    state: &AppState,
+    session_store: &SessionStore,
+    rate_limiter: &RateLimiter,
+    method: &str,
+    uri: &str,
+    cookie: &str,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
+    let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Cookie", cookie);
+    let body = match body {
+        Some(json) => {
+            builder = builder.header("Content-Type", "application/json");
+            Body::from(serde_json::to_string(&json).expect("test setup"))
+        }
+        None => Body::empty(),
+    };
+    router
+        .oneshot(builder.body(body).expect("test setup"))
+        .await
+        .expect("test setup")
+}
+
+#[tokio::test]
+async fn test_viewer_can_read_but_not_mutate() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "viewer1",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/routes",
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &viewer,
+        Some(serde_json::json!({
+            "hostname": "viewer-denied.example.com",
+            "path_prefix": "/",
+            "load_balancing": "round_robin"
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_operator_can_mutate_but_not_touch_settings_or_users() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let operator = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "operator1",
+        lorica_config::models::Role::Operator,
+    )
+    .await;
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/routes",
+        &operator,
+        Some(serde_json::json!({
+            "hostname": "operator-ok.example.com",
+            "path_prefix": "/",
+            "load_balancing": "round_robin"
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        "/api/v1/settings",
+        &operator,
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Even LISTING users is user management (AC #5).
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/users",
+        &operator,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_users_crud_super_admin_flow() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    // Create an operator through the endpoint.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/users",
+        &admin,
+        Some(serde_json::json!({
+            "username": "ops1",
+            "password": "Ops1-initial-pass!",
+            "role": "operator"
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("test setup");
+    let created: serde_json::Value = serde_json::from_slice(&body).expect("test setup");
+    let ops_id = created["data"]["id"].as_str().expect("test setup").to_string();
+    assert_eq!(created["data"]["role"], "operator");
+    assert!(created["data"].get("password_hash").is_none());
+
+    // Duplicate username -> 409.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "POST",
+        "/api/v1/users",
+        &admin,
+        Some(serde_json::json!({
+            "username": "ops1",
+            "password": "Ops1-initial-pass!",
+            "role": "viewer"
+        })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // The new operator logs in, then gets demoted: their session
+    // must die immediately.
+    let ops_cookie = {
+        let router = app(state.clone(), session_store.clone(), rate_limiter.clone());
+        let body = serde_json::json!({ "username": "ops1", "password": "Ops1-initial-pass!" });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&body).expect("test setup"),
+            ))
+            .expect("test setup");
+        let response = router.oneshot(req).await.expect("test setup");
+        assert_eq!(response.status(), StatusCode::OK);
+        format!(
+            "lorica_session={}",
+            extract_session_cookie(&response).expect("test setup")
+        )
+    };
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/users/{ops_id}"),
+        &admin,
+        Some(serde_json::json!({ "role": "viewer" })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/routes",
+        &ops_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "role change must invalidate the target's sessions"
+    );
+
+    // Delete works; the row is gone.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/users/{ops_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        &format!("/api/v1/users/{ops_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_users_guards_last_super_admin_and_self_delete() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+
+    let admin_id = {
+        let store = state.store.lock().await;
+        store
+            .get_user_by_username("admin")
+            .expect("test setup")
+            .expect("test setup")
+            .id
+    };
+
+    // Demoting the only enabled super admin -> 400.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/users/{admin_id}"),
+        &admin,
+        Some(serde_json::json!({ "role": "operator" })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Disabling them -> 400.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "PUT",
+        &format!("/api/v1/users/{admin_id}"),
+        &admin,
+        Some(serde_json::json!({ "disabled": true })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Deleting yourself -> 400 (also the last-super-admin case).
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "DELETE",
+        &format!("/api/v1/users/{admin_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_viewer_blocked_from_certificate_download() {
+    let (state, session_store, rate_limiter) = test_state().await;
+    let _admin = setup_admin_and_login(&state, &session_store, &rate_limiter).await;
+    let viewer = create_user_and_login(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "viewer2",
+        lorica_config::models::Role::Viewer,
+    )
+    .await;
+
+    // The id does not need to exist: the 403 must fire before any
+    // lookup, proving the policy gates the whole download surface.
+    let resp = send(
+        &state,
+        &session_store,
+        &rate_limiter,
+        "GET",
+        "/api/v1/certificates/some-id/download?format=key",
+        &viewer,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
 // ---- Routes CRUD Tests ----
 
 #[tokio::test]

@@ -97,6 +97,9 @@ pub const RL_DESTRUCTIVE_CUD: u32 = 60;
 /// Forensics-trail wipe (logs clear, WAF events clear). Tight cap
 /// so a stolen session cookie cannot flush the trail in one call.
 pub const RL_LOGS_CLEAR: u32 = 1;
+/// Users CRUD (Story 8.3). Moderate cap : account management is
+/// low-frequency, and create/update run an argon2 hash per call.
+pub const RL_USERS: u32 = 20;
 
 /// Type-erased metrics refresher closure (WPAR-7 pull-on-scrape).
 ///
@@ -349,6 +352,21 @@ pub fn build_router(
             )),
         )
         .route("/api/v1/auth/me", get(crate::auth::me))
+        // Users CRUD (Story 8.3 AC #5). SuperAdmin-only for every
+        // method, enforced by the authorize middleware.
+        .route(
+            "/api/v1/users",
+            get(crate::users::list_users)
+                .post(crate::users::create_user)
+                .layer(rl("users", RL_USERS, RL_WINDOW_S)),
+        )
+        .route(
+            "/api/v1/users/:id",
+            get(crate::users::get_user)
+                .put(crate::users::update_user)
+                .delete(crate::users::delete_user)
+                .layer(rl("users", RL_USERS, RL_WINDOW_S)),
+        )
         .route("/api/v1/routes", get(crate::routes::list_routes))
         .route(
             "/api/v1/routes",
@@ -895,6 +913,10 @@ pub fn build_router(
             "/api/v1/loadtest/results/:config_id/compare",
             get(crate::loadtest::compare_results),
         )
+        // Layer order (outermost runs first): require_auth
+        // authenticates and injects the Session extension, then
+        // authorize enforces the role floor (Story 8.3 AC #6).
+        .layer(middleware::from_fn(crate::middleware::authorize::authorize))
         .layer(middleware::from_fn(require_auth));
 
     // Dashboard routes serve embedded frontend assets (SPA with fallback)

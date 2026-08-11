@@ -200,7 +200,10 @@ paths:
                   type: string
                 new_password:
                   type: string
-                  minLength: 8
+                  description: >-
+                    Validated against the configured policy
+                    (password_min_length, default 14, plus character
+                    classes when password_require_complexity is on).
       responses:
         "200":
           description: Password updated
@@ -212,6 +215,170 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # Users (SuperAdmin only, Story 8.3)
+  # ---------------------------------------------------------------------------
+  /api/v1/users:
+    get:
+      tags: [Users]
+      summary: List user accounts (SuperAdmin)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: All accounts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Users]
+      summary: Create a user account (SuperAdmin)
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, role]
+              properties:
+                username:
+                  type: string
+                  description: 3-32 chars, lowercase alphanumeric plus '._-', starting alphanumeric.
+                password:
+                  type: string
+                  description: Validated against the password policy.
+                role:
+                  $ref: "#/components/schemas/Role"
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Username already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Users]
+      summary: Fetch one user account (SuperAdmin)
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The account
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Users]
+      summary: Update password / role / disabled flag (SuperAdmin)
+      description: >-
+        Any role change, disable, or password reset invalidates every
+        session of the target user immediately. Demoting or disabling
+        the last enabled super admin is rejected.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password:
+                  type: string
+                  description: >-
+                    New password (policy-validated); sets
+                    must_change_password on the target.
+                role:
+                  $ref: "#/components/schemas/Role"
+                disabled:
+                  type: boolean
+      responses:
+        "200":
+          description: Updated account
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Users]
+      summary: Delete a user account (SuperAdmin)
+      description: >-
+        Deleting your own account or the last enabled super admin is
+        rejected.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Account deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   # ---------------------------------------------------------------------------
   # Settings
@@ -3107,6 +3274,31 @@ components:
         format: uuid
 
   schemas:
+    User:
+      type: object
+      description: A dashboard / API user account (password hash never serialized).
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        role:
+          $ref: "#/components/schemas/Role"
+        must_change_password:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        last_login_at:
+          type: string
+          format: date-time
+          nullable: true
+        disabled:
+          type: boolean
+        created_by:
+          type: string
+          nullable: true
+
     Role:
       type: string
       description: >-
@@ -3608,6 +3800,12 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     Unauthorized:
       description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Forbidden:
+      description: Authenticated but the session role is insufficient
       content:
         application/json:
           schema:

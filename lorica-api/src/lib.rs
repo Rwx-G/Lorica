@@ -42,6 +42,7 @@ pub mod status;
 pub mod system;
 /// Hot binary-upgrade verification + staging (Story 8.4).
 pub mod upgrade;
+pub mod users;
 pub mod waf;
 pub mod workers;
 
