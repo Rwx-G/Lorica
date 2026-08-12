@@ -136,6 +136,23 @@ pub(crate) fn run_worker(
             error!(error = %e, "worker failed to load proxy configuration");
             std::process::exit(1);
         }
+        // Story 8.2 AC #8 / Epic-8.1 mode parity. A freshly forked,
+        // respawned, or hot-upgraded worker lazy-inits the process-wide
+        // merged AI-crawler registry with the BUILT-INS ONLY, and
+        // `reload_proxy_config` above does not touch that registry. Without
+        // this rebuild, operator-defined custom AI-crawler deny rows are
+        // silently unenforced on this worker until the next config
+        // mutation reaches it. Rebuild once here from the store so the
+        // worker enforces existing custom rows from its first request -
+        // single-process boot already gets the same rebuild via
+        // `apply_supervisor_settings_from_store`. Idempotent and lenient:
+        // a malformed custom row is dropped, logged, and counted, never
+        // blanking the live registry. Scoped to the registry (rather than
+        // the full `apply_per_process_reload_state` bundle) because worker
+        // boot already applies OTel above and GeoIP/ASN below through
+        // mode-specific code; routing the whole bundle here would re-init
+        // OTel and race the not-yet-registered resolver handles.
+        lorica::reload::rebuild_merged_crawlers(&store).await;
     });
 
     // Initialise the OTel exporter in this worker's runtime. Must run
@@ -375,77 +392,29 @@ pub(crate) fn run_worker(
                         std::process::exit(0);
                     }
                     CommandType::MetricsRequest => {
-                        use lorica_command::{BanReportEntry, EwmaReportEntry, MetricsReport};
-
-                        // Collect ban list entries (skip expired)
-                        let ban_entries: Vec<BanReportEntry> = cmd_ban_list
-                            .iter()
-                            .filter_map(|entry| {
-                                let (ip, rec) = (entry.key(), entry.value());
-                                let elapsed = rec.banned_at.elapsed().as_secs();
-                                if elapsed >= rec.duration_s {
-                                    return None; // expired
-                                }
-                                Some(BanReportEntry {
-                                    ip: ip.clone(),
-                                    remaining_seconds: rec.duration_s - elapsed,
-                                    ban_duration_seconds: rec.duration_s,
-                                    reason: rec.reason.as_i32(),
-                                })
-                            })
-                            .collect();
-
-                        // Collect EWMA scores
-                        let ewma_entries: Vec<EwmaReportEntry> = cmd_ewma
-                            .iter()
-                            .map(|entry| EwmaReportEntry {
-                                backend_address: entry.key().clone(),
-                                score_us: *entry.value(),
-                            })
-                            .collect();
-
-                        let mut report = MetricsReport::new(
-                            id,
-                            0, // total_requests not tracked yet
-                            cmd_active_conns.load(std::sync::atomic::Ordering::Relaxed),
-                        );
-                        report.cache_hits =
-                            cmd_cache_hits.load(std::sync::atomic::Ordering::Relaxed);
-                        report.cache_misses =
-                            cmd_cache_misses.load(std::sync::atomic::Ordering::Relaxed);
-                        report.ban_entries = ban_entries;
-                        report.ewma_entries = ewma_entries;
-                        report.backend_conn_entries = cmd_backend_conns
-                            .snapshot()
-                            .into_iter()
-                            .map(|(addr, conns)| lorica_command::BackendConnEntry {
-                                backend_address: addr,
-                                connections: conns,
-                            })
-                            .collect();
-                        report.request_entries = cmd_request_counts
-                            .iter()
-                            .map(|entry| {
-                                let ((route_id, status_code), counter) =
-                                    (entry.key(), entry.value());
-                                lorica_command::RequestCountEntry {
-                                    route_id: route_id.clone(),
-                                    status_code: *status_code as u32,
-                                    count: counter.load(std::sync::atomic::Ordering::Relaxed),
-                                }
-                            })
-                            .collect();
-                        report.waf_entries = cmd_waf_counts
-                            .iter()
-                            .map(|entry| {
-                                let ((category, action), counter) = (entry.key(), entry.value());
-                                lorica_command::WafCountEntry {
-                                    category: category.clone(),
-                                    action: action.clone(),
-                                    count: counter.load(std::sync::atomic::Ordering::Relaxed),
-                                }
-                            })
-                            .collect();
+                        // Build the snapshot through the SAME shared builder
+                        // the pipelined-RPC handler uses, so this legacy
+                        // channel report also carries `generic_counters`
+                        // (bot_challenge, geoip_block, ai_bot,
+                        // cert_resolver_reload, ocsp_refresh, ...). This arm
+                        // used to build its own report and omit them, which
+                        // silently zeroed every per-worker generic counter
+                        // whenever the supervisor pulled metrics over the
+                        // legacy channel (which it still does, as the
+                        // periodic-pull populator behind the RPC pull-on-
+                        // scrape path).
+                        let metrics_ctx =
+                            lorica::proxy_wiring::worker_rpc::WorkerMetricsCtx::new(
+                                Arc::clone(&cmd_ban_list),
+                                Arc::clone(&cmd_ewma),
+                                Arc::clone(&cmd_backend_conns),
+                                Arc::clone(&cmd_request_counts),
+                                Arc::clone(&cmd_waf_counts),
+                                Arc::clone(&cmd_cache_hits),
+                                Arc::clone(&cmd_cache_misses),
+                                Arc::clone(&cmd_active_conns),
+                            );
+                        let report = metrics_ctx.build_report(id);
 
                         if let Err(e) = channel.send(&report).await {
                             warn!(error = %e, "failed to send metrics report");

@@ -130,12 +130,21 @@ impl LoricaProxy {
     }
 }
 
-/// Handles needed for the worker-side `MetricsRequest` RPC. Mirrors
-/// the fields the legacy command-channel handler reads to build a
-/// `MetricsReport`, clonable via `Arc` so the listener task can own
-/// its own handle without holding the whole `LoricaProxy`.
+/// Handles needed to build a worker-side `MetricsReport` snapshot.
+/// Mirrors the per-worker counter Arcs the proxy hot path writes to,
+/// clonable via `Arc` so the pipelined-RPC listener task can own its
+/// own handle without holding the whole `LoricaProxy`.
+///
+/// The single [`build_report`](Self::build_report) builder is shared
+/// by BOTH `MetricsRequest` responders - the pipelined-RPC handler
+/// here and the legacy `CommandChannel` handler in
+/// `startup::worker` - so the two snapshots can never diverge. The
+/// legacy path previously built its own report and silently omitted
+/// `generic_counters`, dropping every per-worker generic counter
+/// (bot_challenge, geoip_block, ai_bot, cert_resolver_reload, ...)
+/// whenever metrics were pulled over the legacy channel.
 #[derive(Clone)]
-struct WorkerMetricsCtx {
+pub struct WorkerMetricsCtx {
     ban_list: Arc<lorica_api::ban::BanMap>,
     ewma_scores: Arc<dashmap::DashMap<String, f64>>,
     backend_connections: Arc<BackendConnections>,
@@ -146,11 +155,159 @@ struct WorkerMetricsCtx {
     active_connections: Arc<AtomicU64>,
 }
 
+impl WorkerMetricsCtx {
+    /// Assemble the context from the proxy's per-worker counter Arcs.
+    /// Every argument is an `Arc` clone of a slot the proxy hot path
+    /// writes to, so [`build_report`](Self::build_report) reads an
+    /// instant snapshot.
+    // Eight per-worker counter Arcs; grouping them into a sub-struct
+    // would only move the same argument list one level down.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ban_list: Arc<lorica_api::ban::BanMap>,
+        ewma_scores: Arc<dashmap::DashMap<String, f64>>,
+        backend_connections: Arc<BackendConnections>,
+        request_counts: Arc<DashMap<(String, u16), AtomicU64>>,
+        waf_counts: Arc<DashMap<(String, String), AtomicU64>>,
+        cache_hits: Arc<AtomicU64>,
+        cache_misses: Arc<AtomicU64>,
+        active_connections: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            ban_list,
+            ewma_scores,
+            backend_connections,
+            request_counts,
+            waf_counts,
+            cache_hits,
+            cache_misses,
+            active_connections,
+        }
+    }
+
+    /// Build an instant `MetricsReport` snapshot for `worker_id`:
+    /// cache hits/misses, active connections, bans, EWMA scores,
+    /// backend connections, request counts, WAF counts, AND the
+    /// per-worker `generic_counters` (bot_challenge, geoip_block,
+    /// ai_bot, cert_resolver_reload, ocsp_refresh, ...). Shared by
+    /// both `MetricsRequest` responders so neither can drop a field.
+    pub fn build_report(&self, worker_id: u32) -> lorica_command::MetricsReport {
+        use lorica_command::{
+            BackendConnEntry, BanReportEntry, EwmaReportEntry, MetricsReport, RequestCountEntry,
+            WafCountEntry,
+        };
+
+        let ban_entries: Vec<BanReportEntry> = self
+            .ban_list
+            .iter()
+            .filter_map(|entry| {
+                let (ip, rec) = (entry.key(), entry.value());
+                let elapsed = rec.banned_at.elapsed().as_secs();
+                if elapsed >= rec.duration_s {
+                    return None;
+                }
+                Some(BanReportEntry {
+                    ip: ip.clone(),
+                    remaining_seconds: rec.duration_s - elapsed,
+                    ban_duration_seconds: rec.duration_s,
+                    reason: rec.reason.as_i32(),
+                })
+            })
+            .collect();
+
+        let ewma_entries: Vec<EwmaReportEntry> = self
+            .ewma_scores
+            .iter()
+            .map(|entry| EwmaReportEntry {
+                backend_address: entry.key().clone(),
+                score_us: *entry.value(),
+            })
+            .collect();
+
+        let backend_conn_entries: Vec<BackendConnEntry> = self
+            .backend_connections
+            .snapshot()
+            .into_iter()
+            .map(|(addr, conns)| BackendConnEntry {
+                backend_address: addr,
+                connections: conns,
+            })
+            .collect();
+
+        let request_entries: Vec<RequestCountEntry> = self
+            .request_counts
+            .iter()
+            .map(|entry| {
+                let ((route_id, status_code), counter) = (entry.key(), entry.value());
+                RequestCountEntry {
+                    route_id: route_id.clone(),
+                    status_code: *status_code as u32,
+                    count: counter.load(Ordering::Relaxed),
+                }
+            })
+            .collect();
+
+        let waf_entries: Vec<WafCountEntry> = self
+            .waf_counts
+            .iter()
+            .map(|entry| {
+                let ((category, action), counter) = (entry.key(), entry.value());
+                WafCountEntry {
+                    category: category.clone(),
+                    action: action.clone(),
+                    count: counter.load(Ordering::Relaxed),
+                }
+            })
+            .collect();
+
+        let mut report = MetricsReport::new(
+            worker_id,
+            0, // total_requests not tracked yet
+            self.active_connections.load(Ordering::Relaxed),
+        );
+        report.cache_hits = self.cache_hits.load(Ordering::Relaxed);
+        report.cache_misses = self.cache_misses.load(Ordering::Relaxed);
+        report.ban_entries = ban_entries;
+        report.ewma_entries = ewma_entries;
+        report.backend_conn_entries = backend_conn_entries;
+        report.request_entries = request_entries;
+        report.waf_entries = waf_entries;
+        // Cross-worker counter aggregation (v1.4.0 follow-up). Ships
+        // every non-typed per-worker counter (bot_challenge,
+        // geoip_block, forward_auth_cache, ...) to the supervisor so
+        // `/metrics` at the supervisor sees the union across workers.
+        // lorica-api exposes the snapshot as `(name, labels, value)`
+        // tuples; translate into the lorica-command wire shape here -
+        // keeps lorica-api free of the lorica-command dep.
+        report.generic_counters = lorica_api::metrics::snapshot_per_worker_counters()
+            .into_iter()
+            .map(|(name, label_pairs, value)| {
+                // Flatten name=value pairs into alternating strings on
+                // the wire (`["route_id", "uuid", "mode", "cookie", ...]`).
+                // The supervisor re-pairs them at apply time. This keeps
+                // the wire format flat while preserving the label-name
+                // metadata needed for positional reorder.
+                let mut labels: Vec<String> = Vec::with_capacity(label_pairs.len() * 2);
+                for (k, v) in label_pairs {
+                    labels.push(k);
+                    labels.push(v);
+                }
+                lorica_command::GenericCounterEntry {
+                    name,
+                    labels,
+                    value,
+                }
+            })
+            .collect();
+
+        report
+    }
+}
+
 /// Worker-side handler for `CommandType::MetricsRequest` on the
-/// pipelined RPC channel (WPAR-7). Builds an instant snapshot of
-/// per-request counters (cache, bans, EWMA, backend conns, request
-/// counts, WAF counts) into a `MetricsReport` and replies with it as
-/// a `Response::MetricsReport` payload so the supervisor's pull-on-
+/// pipelined RPC channel (WPAR-7). Builds an instant snapshot via the
+/// shared [`WorkerMetricsCtx::build_report`] and replies with it as a
+/// `Response::MetricsReport` payload so the supervisor's pull-on-
 /// scrape coordinator can aggregate across workers within a single
 /// 500 ms budget.
 async fn handle_metrics_request(
@@ -158,114 +315,7 @@ async fn handle_metrics_request(
     ctx: &WorkerMetricsCtx,
     worker_id: u32,
 ) {
-    use lorica_command::{
-        BackendConnEntry, BanReportEntry, EwmaReportEntry, MetricsReport, RequestCountEntry,
-        WafCountEntry,
-    };
-
-    let ban_entries: Vec<BanReportEntry> = ctx
-        .ban_list
-        .iter()
-        .filter_map(|entry| {
-            let (ip, rec) = (entry.key(), entry.value());
-            let elapsed = rec.banned_at.elapsed().as_secs();
-            if elapsed >= rec.duration_s {
-                return None;
-            }
-            Some(BanReportEntry {
-                ip: ip.clone(),
-                remaining_seconds: rec.duration_s - elapsed,
-                ban_duration_seconds: rec.duration_s,
-                reason: rec.reason.as_i32(),
-            })
-        })
-        .collect();
-
-    let ewma_entries: Vec<EwmaReportEntry> = ctx
-        .ewma_scores
-        .iter()
-        .map(|entry| EwmaReportEntry {
-            backend_address: entry.key().clone(),
-            score_us: *entry.value(),
-        })
-        .collect();
-
-    let backend_conn_entries: Vec<BackendConnEntry> = ctx
-        .backend_connections
-        .snapshot()
-        .into_iter()
-        .map(|(addr, conns)| BackendConnEntry {
-            backend_address: addr,
-            connections: conns,
-        })
-        .collect();
-
-    let request_entries: Vec<RequestCountEntry> = ctx
-        .request_counts
-        .iter()
-        .map(|entry| {
-            let ((route_id, status_code), counter) = (entry.key(), entry.value());
-            RequestCountEntry {
-                route_id: route_id.clone(),
-                status_code: *status_code as u32,
-                count: counter.load(Ordering::Relaxed),
-            }
-        })
-        .collect();
-
-    let waf_entries: Vec<WafCountEntry> = ctx
-        .waf_counts
-        .iter()
-        .map(|entry| {
-            let ((category, action), counter) = (entry.key(), entry.value());
-            WafCountEntry {
-                category: category.clone(),
-                action: action.clone(),
-                count: counter.load(Ordering::Relaxed),
-            }
-        })
-        .collect();
-
-    let mut report = MetricsReport::new(
-        worker_id,
-        0, // total_requests not tracked yet (matches legacy)
-        ctx.active_connections.load(Ordering::Relaxed),
-    );
-    report.cache_hits = ctx.cache_hits.load(Ordering::Relaxed);
-    report.cache_misses = ctx.cache_misses.load(Ordering::Relaxed);
-    report.ban_entries = ban_entries;
-    report.ewma_entries = ewma_entries;
-    report.backend_conn_entries = backend_conn_entries;
-    report.request_entries = request_entries;
-    report.waf_entries = waf_entries;
-    // Cross-worker counter aggregation (v1.4.0 follow-up). Ships
-    // every non-typed per-worker counter (bot_challenge,
-    // geoip_block, forward_auth_cache, ...) to the supervisor so
-    // `/metrics` at the supervisor sees the union across workers.
-    // lorica-api exposes the snapshot as `(name, labels, value)`
-    // tuples; translate into the lorica-command wire shape here —
-    // keeps lorica-api free of the lorica-command dep.
-    report.generic_counters = lorica_api::metrics::snapshot_per_worker_counters()
-        .into_iter()
-        .map(|(name, label_pairs, value)| {
-            // Flatten name=value pairs into alternating strings on
-            // the wire (`["route_id", "uuid", "mode", "cookie", ...]`).
-            // The supervisor re-pairs them at apply time. This keeps
-            // the wire format flat while preserving the label-name
-            // metadata needed for positional reorder.
-            let mut labels: Vec<String> = Vec::with_capacity(label_pairs.len() * 2);
-            for (k, v) in label_pairs {
-                labels.push(k);
-                labels.push(v);
-            }
-            lorica_command::GenericCounterEntry {
-                name,
-                labels,
-                value,
-            }
-        })
-        .collect();
-
+    let report = ctx.build_report(worker_id);
     let _ = inc
         .reply(lorica_command::Response::ok_with(
             0,

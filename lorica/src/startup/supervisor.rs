@@ -1308,6 +1308,19 @@ pub(crate) fn run_supervisor(cli: Cli) {
                         info!(worker_id = id, "aborted stale worker task");
                     }
 
+                    // Drop the dead worker's generic-counter baseline before
+                    // it respawns with the SAME worker_id. The aggregator
+                    // keeps a per-worker last-value baseline and applies
+                    // positive deltas only; a respawned worker restarts its
+                    // counters at 0, so without this forget the supervisor
+                    // would hold the pre-crash high-water mark and freeze the
+                    // worker's contribution until it climbed back over it.
+                    // Typed metrics (cache/bans/EWMA/...) self-heal because
+                    // `AggregatedMetrics::update_worker` stores absolute
+                    // values keyed by worker_id; only the delta-based generic
+                    // counters need this reset.
+                    lorica_api::metrics::forget_worker_generic_counters(id);
+
                     // Re-check shutdown flag before respawning - a
                     // crash detected just before SIGTERM should not
                     // trigger a respawn that races shutdown.
