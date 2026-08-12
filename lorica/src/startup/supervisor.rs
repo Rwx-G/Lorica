@@ -1033,35 +1033,8 @@ pub(crate) fn run_supervisor(cli: Cli) {
             }
         });
 
-        // Restore WAF state from persisted settings
-        {
-            let s = store.lock().await;
-            if let Ok(settings) = s.get_global_settings() {
-                if settings.ip_blocklist_enabled {
-                    waf_engine.ip_blocklist().set_enabled(true);
-                    // Fetch blocklist immediately at startup
-                    match lorica_api::waf::fetch_and_load_blocklist(waf_engine.ip_blocklist()).await {
-                        Ok(count) => info!(count, "supervisor: IP blocklist loaded at startup"),
-                        Err(e) => warn!(error = %e, "supervisor: IP blocklist initial load failed"),
-                    }
-                }
-            }
-            if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
-                if !disabled_ids.is_empty() {
-                    waf_engine.set_disabled_rules(&disabled_ids);
-                    info!(count = disabled_ids.len(), "supervisor: WAF disabled rules restored");
-                }
-            }
-            if let Ok(custom_rules) = s.load_waf_custom_rules() {
-                for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
-                    let category = cat.parse().unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
-                    let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
-                }
-                if !custom_rules.is_empty() {
-                    info!(count = custom_rules.len(), "supervisor: WAF custom rules restored");
-                }
-            }
-        }
+        // Restore WAF state (IP blocklist + initial fetch, disabled + custom rules)
+        supervisor_restore_waf_state(&store, &waf_engine).await;
 
         // Tracker shared by every background task that must drain on
         // shutdown (blocklist refresh, ACME polling, session GC,
@@ -1794,6 +1767,43 @@ pub(crate) fn run_supervisor(cli: Cli) {
             }
         }
     });
+}
+
+/// Restore WAF runtime state for the supervisor from persisted settings:
+/// the IP blocklist (enable flag plus an initial Data-Shield fetch when
+/// on), the disabled-rule set, and custom rules. The supervisor owns the
+/// blocklist fetch; workers inherit the enable flag only.
+async fn supervisor_restore_waf_state(
+    store: &Arc<Mutex<ConfigStore>>,
+    waf_engine: &Arc<lorica_waf::WafEngine>,
+) {
+    let s = store.lock().await;
+    if let Ok(settings) = s.get_global_settings() {
+        if settings.ip_blocklist_enabled {
+            waf_engine.ip_blocklist().set_enabled(true);
+            match lorica_api::waf::fetch_and_load_blocklist(waf_engine.ip_blocklist()).await {
+                Ok(count) => info!(count, "supervisor: IP blocklist loaded at startup"),
+                Err(e) => warn!(error = %e, "supervisor: IP blocklist initial load failed"),
+            }
+        }
+    }
+    if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
+        if !disabled_ids.is_empty() {
+            waf_engine.set_disabled_rules(&disabled_ids);
+            info!(count = disabled_ids.len(), "supervisor: WAF disabled rules restored");
+        }
+    }
+    if let Ok(custom_rules) = s.load_waf_custom_rules() {
+        for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
+            let category = cat
+                .parse()
+                .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
+            let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
+        }
+        if !custom_rules.is_empty() {
+            info!(count = custom_rules.len(), "supervisor: WAF custom rules restored");
+        }
+    }
 }
 
 /// Supervisor-side handler for `CommandType::RateLimitDelta`. Walks the

@@ -165,41 +165,7 @@ pub(crate) fn run_worker(
 
     // Build CertResolver for TLS termination in worker
     let cert_resolver = Arc::new(lorica_tls::cert_resolver::CertResolver::new());
-    rt.block_on(async {
-        let db_certs = store.lock().await;
-        let certs = db_certs.list_certificates().unwrap_or_default();
-        if !certs.is_empty() {
-            let cert_data: Vec<lorica_tls::cert_resolver::CertData> = certs
-                .iter()
-                .map(|c| lorica_tls::cert_resolver::CertData {
-                    domain: c.domain.clone(),
-                    san_domains: c.san_domains.clone(),
-                    cert_pem: c.cert_pem.clone(),
-                    key_pem: c.key_pem.clone(),
-                    not_after_epoch: c.not_after.timestamp(),
-                    ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
-                })
-                .collect();
-            match cert_resolver.reload(cert_data) {
-                Ok(stats) => {
-                    if stats.skipped > 0 {
-                        lorica_api::metrics::inc_certificates_invalid_bundle_by(
-                            "reload",
-                            stats.skipped as u64,
-                        );
-                    }
-                    info!(
-                        worker_id = id,
-                        domains = cert_resolver.domain_count(),
-                        skipped = stats.skipped,
-                        total = stats.total,
-                        "worker loaded TLS certificates"
-                    );
-                }
-                Err(e) => warn!(error = %e, "worker failed to load certificates into resolver"),
-            }
-        }
-    });
+    rt.block_on(worker_load_certs_into_resolver(&store, &cert_resolver, id));
 
     // Pre-create metric Arcs so the command thread can read them
     let worker_cache_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -214,38 +180,7 @@ pub(crate) fn run_worker(
 
     // Create shared WAF engine for worker (must be before command channel setup)
     let waf_engine = Arc::new(lorica_waf::WafEngine::new());
-    {
-        let s = store.blocking_lock();
-        if let Ok(settings) = s.get_global_settings() {
-            if settings.ip_blocklist_enabled {
-                waf_engine.ip_blocklist().set_enabled(true);
-                info!("worker: IP blocklist restored as enabled");
-            }
-        }
-        if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
-            if !disabled_ids.is_empty() {
-                waf_engine.set_disabled_rules(&disabled_ids);
-                info!(
-                    count = disabled_ids.len(),
-                    "worker: WAF disabled rules restored"
-                );
-            }
-        }
-        if let Ok(custom_rules) = s.load_waf_custom_rules() {
-            for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
-                let category = cat
-                    .parse()
-                    .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
-                let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
-            }
-            if !custom_rules.is_empty() {
-                info!(
-                    count = custom_rules.len(),
-                    "worker: WAF custom rules restored"
-                );
-            }
-        }
-    }
+    worker_restore_waf_state(&store, &waf_engine);
 
     // Start the command channel listener in a background thread
     // (the proxy server's run_forever blocks the main thread)
@@ -870,4 +805,86 @@ pub(crate) fn run_worker(
     info!(worker_id = id, "proxy engine drained; flushing OTel spans");
     lorica::otel::shutdown();
     std::process::exit(0);
+}
+
+/// Load persisted certificates into the worker's SNI resolver at boot.
+/// Mirrors single-process cert loading; OCSP staples are attached later
+/// by the reload path, so each `CertData` starts with `ocsp_response: None`.
+async fn worker_load_certs_into_resolver(
+    store: &Arc<Mutex<ConfigStore>>,
+    cert_resolver: &Arc<lorica_tls::cert_resolver::CertResolver>,
+    id: u32,
+) {
+    let db_certs = store.lock().await;
+    let certs = db_certs.list_certificates().unwrap_or_default();
+    if certs.is_empty() {
+        return;
+    }
+    let cert_data: Vec<lorica_tls::cert_resolver::CertData> = certs
+        .iter()
+        .map(|c| lorica_tls::cert_resolver::CertData {
+            domain: c.domain.clone(),
+            san_domains: c.san_domains.clone(),
+            cert_pem: c.cert_pem.clone(),
+            key_pem: c.key_pem.clone(),
+            not_after_epoch: c.not_after.timestamp(),
+            ocsp_response: None, // OCSP fetched asynchronously on reload_cert_resolver
+        })
+        .collect();
+    match cert_resolver.reload(cert_data) {
+        Ok(stats) => {
+            if stats.skipped > 0 {
+                lorica_api::metrics::inc_certificates_invalid_bundle_by(
+                    "reload",
+                    stats.skipped as u64,
+                );
+            }
+            info!(
+                worker_id = id,
+                domains = cert_resolver.domain_count(),
+                skipped = stats.skipped,
+                total = stats.total,
+                "worker loaded TLS certificates"
+            );
+        }
+        Err(e) => warn!(error = %e, "worker failed to load certificates into resolver"),
+    }
+}
+
+/// Restore WAF runtime state for a worker from persisted settings: the IP
+/// blocklist enable flag (workers inherit the flag only; single-process /
+/// supervisor owns the Data-Shield fetch), the disabled-rule set, and any
+/// custom rules. Synchronous - called outside a runtime, so it takes the
+/// store's blocking lock.
+fn worker_restore_waf_state(store: &Arc<Mutex<ConfigStore>>, waf_engine: &Arc<lorica_waf::WafEngine>) {
+    let s = store.blocking_lock();
+    if let Ok(settings) = s.get_global_settings() {
+        if settings.ip_blocklist_enabled {
+            waf_engine.ip_blocklist().set_enabled(true);
+            info!("worker: IP blocklist restored as enabled");
+        }
+    }
+    if let Ok(disabled_ids) = s.load_waf_disabled_rules() {
+        if !disabled_ids.is_empty() {
+            waf_engine.set_disabled_rules(&disabled_ids);
+            info!(
+                count = disabled_ids.len(),
+                "worker: WAF disabled rules restored"
+            );
+        }
+    }
+    if let Ok(custom_rules) = s.load_waf_custom_rules() {
+        for (id, desc, cat, pattern, severity, _enabled) in &custom_rules {
+            let category = cat
+                .parse()
+                .unwrap_or(lorica_waf::RuleCategory::ProtocolViolation);
+            let _ = waf_engine.add_custom_rule(*id, desc.clone(), category, pattern, *severity);
+        }
+        if !custom_rules.is_empty() {
+            info!(
+                count = custom_rules.len(),
+                "worker: WAF custom rules restored"
+            );
+        }
+    }
 }
