@@ -246,7 +246,7 @@ pub struct ProxyConfig {
 }
 
 /// Global settings extracted from the config store for ProxyConfig construction.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ProxyConfigGlobals {
     pub custom_security_presets: Vec<lorica_config::models::SecurityHeaderPreset>,
     pub max_global_connections: u32,
@@ -267,6 +267,38 @@ pub struct ProxyConfigGlobals {
     pub bot_stash_per_prefix_max: u32,
     pub mirror_max_concurrent_per_route: u32,
     pub mirror_max_concurrent_global: u32,
+}
+
+impl Default for ProxyConfigGlobals {
+    /// Hand-written so the two mirror concurrency caps seed to the same
+    /// values the production settings layer uses (`lorica-config`'s
+    /// `default_mirror_max_concurrent_per_route`/`_global`, currently
+    /// 32 / 4096) instead of `0`. A `0` cap is never produced in
+    /// production (the store parses these with `unwrap_or(32/4096)`),
+    /// and it would clamp the per-route mirror semaphore to a single
+    /// permit via `route_mirror_semaphore`'s `.max(1)`, starving every
+    /// shadow backend after the first. Keeping `default()` production-
+    /// faithful stops that footgun from biting config built in tests
+    /// and fallbacks. Every other field keeps its zero/empty default.
+    fn default() -> Self {
+        Self {
+            custom_security_presets: Vec::new(),
+            max_global_connections: 0,
+            flood_threshold_rps: 0,
+            flood_strict_rps: 0,
+            header_timeout_s: 0,
+            waf_ban_threshold: 0,
+            waf_ban_duration_s: 0,
+            trusted_proxy_cidrs: Vec::new(),
+            waf_whitelist_cidrs: Vec::new(),
+            ai_bot_treat_spoofed_as: lorica_config::models::SpoofedFallback::default(),
+            ai_bot_inject_headers: false,
+            bot_stash_max_entries: 0,
+            bot_stash_per_prefix_max: 0,
+            mirror_max_concurrent_per_route: 32,
+            mirror_max_concurrent_global: 4096,
+        }
+    }
 }
 
 impl ProxyConfig {
