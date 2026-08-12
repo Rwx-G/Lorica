@@ -148,6 +148,55 @@ async fn test_csp_header_present_on_spa_fallback() {
 }
 
 #[tokio::test]
+async fn test_csp_style_src_nonce_hardening_and_per_request() {
+    // Story 8.8 AC #6: the served document drops 'unsafe-inline' from
+    // style-src in favour of a per-request nonce, keeping inline style=
+    // attributes working via style-src-attr, and the nonce is fresh on
+    // every request.
+    async fn csp_of(uri: &str) -> String {
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        res.headers()
+            .get("content-security-policy")
+            .expect("CSP header must be set")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    let csp1 = csp_of("/").await;
+    let csp2 = csp_of("/").await;
+
+    assert!(
+        csp1.contains("style-src 'self' 'nonce-"),
+        "style-src must be nonce-based, got: {csp1}"
+    );
+    assert!(
+        !csp1.contains("style-src 'self' 'unsafe-inline'"),
+        "style-src must not keep 'unsafe-inline', got: {csp1}"
+    );
+    assert!(
+        csp1.contains("style-src-attr 'unsafe-inline'"),
+        "style-src-attr must keep inline style= attributes working, got: {csp1}"
+    );
+
+    let extract_nonce = |csp: &str| -> String {
+        let start = csp.find("'nonce-").expect("nonce present") + "'nonce-".len();
+        let rest = &csp[start..];
+        let end = rest.find('\'').expect("nonce terminator");
+        rest[..end].to_string()
+    };
+    assert_ne!(
+        extract_nonce(&csp1),
+        extract_nonce(&csp2),
+        "each request must get a fresh nonce"
+    );
+}
+
+#[tokio::test]
 async fn test_asset_cache_headers() {
     let app = app();
 

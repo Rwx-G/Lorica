@@ -14,16 +14,17 @@ pub mod csp;
 #[folder = "frontend/dist"]
 struct DashboardAssets;
 
-/// Content-Security-Policy emitted on every dashboard asset.
-///
-/// The directive set lives in [`csp::build_csp`] (Story 8.8 AC #7).
-/// The served value uses the `None` (pre-CSP3) variant: `style-src`
-/// keeps `'unsafe-inline'` because the production Vite build extracts
-/// component CSS to linked stylesheets while Svelte still emits inline
-/// `style=` attributes at runtime, which a `style-src` nonce would not
-/// authorize. The nonce-capable variant is wired and unit-tested in
-/// `csp.rs` for the follow-up that patches the runtime style emitter.
+/// Content-Security-Policy emitted on non-document dashboard assets
+/// (JS/CSS/images). CSP is only enforced against documents, so the
+/// static nonce-less variant is fine here; the served `index.html`
+/// document gets the hardened per-request nonce variant in
+/// [`serve_html_with_nonce`]. Directive set lives in [`csp::build_csp`].
 static CSP_HEADER: LazyLock<String> = LazyLock::new(|| csp::build_csp(None));
+
+/// Placeholder the frontend build stamps into the `csp-nonce` meta (and,
+/// via Vite, onto the tags it emits). Replaced per request with a fresh
+/// random nonce in [`serve_html_with_nonce`] (Story 8.8 AC #6).
+const NONCE_PLACEHOLDER: &str = "__LORICA_CSP_NONCE__";
 
 /// Build the dashboard router for serving embedded frontend assets.
 ///
@@ -53,7 +54,7 @@ pub fn router() -> Router {
 }
 
 async fn index_handler() -> impl IntoResponse {
-    serve_embedded_file("index.html")
+    serve_html_with_nonce()
 }
 
 async fn static_handler(uri: Uri) -> impl IntoResponse {
@@ -67,7 +68,49 @@ async fn spa_fallback(uri: Uri) -> impl IntoResponse {
     if path.starts_with("/api/") {
         return StatusCode::NOT_FOUND.into_response();
     }
-    serve_embedded_file("index.html")
+    serve_html_with_nonce()
+}
+
+/// Generate a 128-bit CSP nonce, hex-encoded (Story 8.8 AC #6). The OS
+/// CSPRNG is a platform guarantee on the Linux runtime; a failure here is
+/// an unrecoverable fault, so the request panics into a 500 rather than
+/// serving the dashboard without a valid nonce.
+fn generate_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable for the CSP nonce");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Serve the `index.html` document with a fresh per-request CSP nonce.
+///
+/// The `__LORICA_CSP_NONCE__` placeholder (in the `csp-nonce` meta and on
+/// every tag Vite stamped from it) is replaced with the fresh nonce, and
+/// the `Content-Security-Policy` header carries the matching
+/// `style-src 'self' 'nonce-<nonce>'` directive (no `'unsafe-inline'`,
+/// plus `style-src-attr 'unsafe-inline'` for Svelte's runtime `style=`
+/// attributes). The document is never cached so each load gets its own
+/// nonce.
+fn serve_html_with_nonce() -> Response {
+    let Some(content) = DashboardAssets::get("index.html") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let nonce = generate_nonce();
+    let html = String::from_utf8_lossy(&content.data).replace(NONCE_PLACEHOLDER, &nonce);
+    let mut response = (StatusCode::OK, html).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "text/html; charset=utf-8".parse().unwrap(),
+    );
+    headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        csp::build_csp(Some(&nonce)).parse().unwrap(),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+    response
 }
 
 fn serve_embedded_file(path: &str) -> Response {

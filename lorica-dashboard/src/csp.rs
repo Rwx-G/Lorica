@@ -25,27 +25,42 @@ wss://localhost:* wss://127.0.0.1:* wss://[::1]:*";
 
 /// Build the `Content-Security-Policy` header value.
 ///
-/// When `style_nonce` is `Some`, the `style-src` directive is
-/// `'self' 'nonce-<nonce>'` (no `'unsafe-inline'`); when `None` it is
-/// `'self' 'unsafe-inline'` (the pre-CSP3 fallback).
+/// When `style_nonce` is `Some`, `style-src` is `'self' 'nonce-<nonce>'`
+/// (no `'unsafe-inline'`, so an injected `<style>` block is blocked) and a
+/// companion `style-src-attr 'unsafe-inline'` is emitted so Svelte 5's
+/// runtime inline `style=` attributes keep working - a `style-src` nonce
+/// authorizes `<style>` elements, not `style=` attributes (Story 8.8
+/// AC #6). When `None`, `style-src` keeps the pre-CSP3 `'unsafe-inline'`
+/// fallback and no `style-src-attr` is set.
 ///
 /// ```
 /// let with_nonce = lorica_dashboard::csp::build_csp(Some("abc123"));
-/// assert!(with_nonce.contains("style-src 'self' 'nonce-abc123'"));
-/// assert!(!with_nonce.contains("'unsafe-inline'"));
+/// // style-src carries the nonce and NOT 'unsafe-inline'.
+/// assert!(with_nonce.contains("style-src 'self' 'nonce-abc123';"));
+/// assert!(!with_nonce.contains("style-src 'self' 'unsafe-inline'"));
+/// // Inline style= attributes stay allowed via style-src-attr.
+/// assert!(with_nonce.contains("style-src-attr 'unsafe-inline'"));
 ///
 /// let fallback = lorica_dashboard::csp::build_csp(None);
 /// assert!(fallback.contains("style-src 'self' 'unsafe-inline'"));
+/// assert!(!fallback.contains("style-src-attr"));
 /// ```
 pub fn build_csp(style_nonce: Option<&str>) -> String {
-    let style_src = match style_nonce {
-        Some(nonce) => format!("style-src 'self' 'nonce-{nonce}'"),
+    // `style-src` governs `<style>` elements and `<link rel=stylesheet>`;
+    // `style-src-attr` governs inline `style=` attributes. A nonce cannot
+    // cover attributes, so the CSP3 posture drops `'unsafe-inline'` from
+    // `style-src` (blocking injected stylesheets) while keeping it on
+    // `style-src-attr` (Svelte emits `style=` at runtime).
+    let style_directives = match style_nonce {
+        Some(nonce) => {
+            format!("style-src 'self' 'nonce-{nonce}'; style-src-attr 'unsafe-inline'")
+        }
         None => "style-src 'self' 'unsafe-inline'".to_string(),
     };
     format!(
         "default-src 'self'; \
 script-src 'self'; \
-{style_src}; \
+{style_directives}; \
 img-src 'self' data:; \
 {CONNECT_SRC}; \
 frame-ancestors 'none'; \
@@ -60,10 +75,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nonce_variant_drops_unsafe_inline() {
+    fn nonce_variant_drops_unsafe_inline_from_style_src() {
         let csp = build_csp(Some("R4nd0mNonce"));
-        assert!(csp.contains("style-src 'self' 'nonce-R4nd0mNonce'"));
-        assert!(!csp.contains("'unsafe-inline'"));
+        // style-src carries the nonce and drops 'unsafe-inline' (an
+        // injected <style> block is blocked).
+        assert!(csp.contains("style-src 'self' 'nonce-R4nd0mNonce';"));
+        assert!(
+            !csp.contains("style-src 'self' 'unsafe-inline'"),
+            "style-src must not keep 'unsafe-inline' in the nonce variant"
+        );
+        // Inline style= attributes (Svelte runtime) stay allowed via
+        // the companion style-src-attr directive.
+        assert!(csp.contains("style-src-attr 'unsafe-inline'"));
         // The other directives are unchanged.
         assert!(csp.contains("default-src 'self'"));
         assert!(csp.contains("script-src 'self'"));
@@ -76,8 +99,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_variant_keeps_unsafe_inline() {
+    fn fallback_variant_keeps_unsafe_inline_and_no_attr_directive() {
         let csp = build_csp(None);
         assert!(csp.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(!csp.contains("style-src-attr"));
     }
 }

@@ -12,6 +12,9 @@ axum = "0.7"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 mime_guess = "2"
 tracing = "0.1"
+# OS CSPRNG for the per-request CSP3 style-src nonce (Story 8.8 AC #6).
+# Already resolved in the workspace lockfile; promoted to a direct dep.
+getrandom = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

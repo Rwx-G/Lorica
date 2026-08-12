@@ -2,6 +2,12 @@
 <html lang="en" data-theme="light">
   <head>
     <meta charset="UTF-8" />
+    <!-- CSP3 per-request nonce (Story 8.8 AC #6). The dashboard backend
+         swaps the placeholder in the nonce attribute below for a fresh
+         random value on every request and sets the matching style-src
+         directive; Vite's runtime reads this meta to nonce any element it
+         injects at runtime. -->
+    <meta property="csp-nonce" nonce="__LORICA_CSP_NONCE__" />
     <meta name="color-scheme" content="light dark" />
     <link rel="icon" type="image/png" href="/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />

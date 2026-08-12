@@ -3218,6 +3218,7 @@ name = "lorica-dashboard"
 version = "1.6.0"
 dependencies = [
  "axum",
+ "getrandom 0.2.17",
  "hyper 1.10.1",
  "mime_guess",
  "rust-embed",
