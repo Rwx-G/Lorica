@@ -28,6 +28,7 @@ pub mod dns_providers;
 pub mod error;
 pub mod loadtest;
 pub mod log_store;
+pub mod management_tls;
 pub mod log_writer;
 pub mod logs;
 pub mod metrics;

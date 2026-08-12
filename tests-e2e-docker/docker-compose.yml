@@ -97,7 +97,7 @@ services:
     volumes:
       - shared:/shared:ro
     environment:
-      - LORICA_API=http://lorica:9443
+      - LORICA_API=https://lorica:9443
       - LORICA_PROXY=http://lorica:8080
       - LORICA_PROXY_HTTPS=https://lorica:8443
       - BACKEND1_ADDR=backend1:80
@@ -126,7 +126,7 @@ services:
     volumes:
       - shared-workers:/shared:ro
     environment:
-      - LORICA_API=http://lorica-workers:9443
+      - LORICA_API=https://lorica-workers:9443
       - LORICA_PROXY=http://lorica-workers:8080
       - BACKEND1_ADDR=backend1:80
       - BACKEND2_ADDR=backend2:80
@@ -187,7 +187,7 @@ services:
     volumes:
       - shared-otel:/shared:ro
     environment:
-      - LORICA_API=http://lorica-otel:9443
+      - LORICA_API=https://lorica-otel:9443
       - LORICA_PROXY=http://lorica-otel:8080
       - JAEGER_QUERY=http://jaeger:16686
       - BACKEND1_ADDR=backend1:80
@@ -248,7 +248,7 @@ services:
     volumes:
       - shared-otel-workers:/shared:ro
     environment:
-      - LORICA_API=http://lorica-otel-workers:9443
+      - LORICA_API=https://lorica-otel-workers:9443
       - LORICA_PROXY=http://lorica-otel-workers:8080
       - JAEGER_QUERY=http://jaeger-workers:16686
       - OTLP_ENDPOINT=http://jaeger-workers:4318
@@ -295,7 +295,7 @@ services:
     volumes:
       - shared-geoip:/shared:ro
     environment:
-      - LORICA_API=http://lorica-geoip:9443
+      - LORICA_API=https://lorica-geoip:9443
       - LORICA_PROXY=http://lorica-geoip:8080
       - BACKEND1_ADDR=backend1:80
     networks:
@@ -334,7 +334,7 @@ services:
     volumes:
       - shared-bot:/shared:ro
     environment:
-      - LORICA_API=http://lorica-bot:9443
+      - LORICA_API=https://lorica-bot:9443
       - LORICA_PROXY=http://lorica-bot:8080
       - BACKEND1_ADDR=backend1:80
     networks:
@@ -375,7 +375,7 @@ services:
     volumes:
       - shared-bot-workers:/shared:ro
     environment:
-      - LORICA_API=http://lorica-bot-workers:9443
+      - LORICA_API=https://lorica-bot-workers:9443
       - LORICA_PROXY=http://lorica-bot-workers:8080
       - BACKEND1_ADDR=backend1:80
       # Counter aggregation now lands (v1.4.0 follow-up):
@@ -447,7 +447,7 @@ services:
     volumes:
       - shared-rdns:/shared:ro
     environment:
-      - LORICA_API=http://lorica-rdns:9443
+      - LORICA_API=https://lorica-rdns:9443
       - LORICA_PROXY=http://lorica-rdns:8080
       - BACKEND1_ADDR=backend1:80
       - DNSMASQ_ADDR=dnsmasq:53
@@ -509,7 +509,7 @@ services:
       # without a docker exec hop.
       - lorica-cert-export-data:/lorica-data:ro
     environment:
-      - LORICA_API=http://lorica-cert-export:9443
+      - LORICA_API=https://lorica-cert-export:9443
       - LORICA_PROXY=http://lorica-cert-export:8080
       - BACKEND1_ADDR=backend1:80
       - EXPORT_ROOT=/lorica-data/exported-certs
@@ -554,7 +554,7 @@ services:
     volumes:
       - shared-ai-bot:/shared:ro
     environment:
-      - LORICA_API=http://lorica-ai-bot:9443
+      - LORICA_API=https://lorica-ai-bot:9443
       - LORICA_PROXY=http://lorica-ai-bot:8080
       - BACKEND1_ADDR=backend1:80
     networks:
@@ -592,7 +592,7 @@ services:
     volumes:
       - shared-ai-bot-workers:/shared:ro
     environment:
-      - LORICA_API=http://lorica-ai-bot-workers:9443
+      - LORICA_API=https://lorica-ai-bot-workers:9443
       - LORICA_PROXY=http://lorica-ai-bot-workers:8080
       - BACKEND1_ADDR=backend1:80
       - AI_BOT_SMOKE_SKIP_METRICS=1
@@ -630,7 +630,7 @@ services:
     volumes:
       - shared-rbac:/shared:ro
     environment:
-      - LORICA_API=http://lorica-rbac:9443
+      - LORICA_API=https://lorica-rbac:9443
       - LORICA_PROXY=http://lorica-rbac:8080
       - BACKEND1_ADDR=backend1:80
     networks:
@@ -665,7 +665,7 @@ services:
     volumes:
       - shared-rbac-workers:/shared:ro
     environment:
-      - LORICA_API=http://lorica-rbac-workers:9443
+      - LORICA_API=https://lorica-rbac-workers:9443
       - LORICA_PROXY=http://lorica-rbac-workers:8080
       - BACKEND1_ADDR=backend1:80
     networks:
@@ -704,7 +704,7 @@ services:
       - shared-audit:/shared:ro
       - lorica-audit-data:/lorica-data
     environment:
-      - LORICA_API=http://lorica-audit:9443
+      - LORICA_API=https://lorica-audit:9443
       - LORICA_PROXY=http://lorica-audit:8080
       - BACKEND1_ADDR=backend1:80
       - AUDIT_DB_PATH=/lorica-data/access-log.db
@@ -770,7 +770,7 @@ services:
       # published binary the entrypoint copied in.
       - shared-hot-upgrade:/shared
     environment:
-      - LORICA_API=http://lorica-hot-upgrade:9443
+      - LORICA_API=https://lorica-hot-upgrade:9443
       - LORICA_PROXY=http://lorica-hot-upgrade:8080
       - BACKEND1_ADDR=backend1:80
     networks:

@@ -424,19 +424,19 @@ pub(crate) fn run_rotate_key(data_dir: &str, new_key_file: &str) {
 pub(crate) fn run_unban(port: u16, ip: String, user: String, password: String) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        // The management API is served over plaintext HTTP (see
-        // lorica-api `server.rs`: `axum::serve` over a plain
-        // `TcpListener`). When TLS on the management port lands
-        // (backlog #20), switch the scheme below back to https and
-        // restore `danger_accept_invalid_certs(true)` for the
-        // self-signed startup cert.
+        // The management API is served over TLS on localhost (Story 8.8
+        // AC #1), by default with an auto-generated self-signed cert.
+        // `danger_accept_invalid_certs(true)` is intentional: the target
+        // is always `127.0.0.1`, so there is no MITM surface to defend
+        // against, and the self-signed leaf has no chain to validate.
         let client = reqwest::Client::builder()
             .cookie_store(true)
+            .danger_accept_invalid_certs(true)
             .build()
             .expect("HTTP client");
 
         // Login
-        let login_url = format!("http://127.0.0.1:{port}/api/v1/auth/login");
+        let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
         let login_res = client
             .post(&login_url)
             .json(&serde_json::json!({ "username": user, "password": password }))
@@ -458,7 +458,7 @@ pub(crate) fn run_unban(port: u16, ip: String, user: String, password: String) {
         }
 
         // Unban
-        let unban_url = format!("http://127.0.0.1:{port}/api/v1/bans/{ip}");
+        let unban_url = format!("https://127.0.0.1:{port}/api/v1/bans/{ip}");
         match client.delete(&unban_url).send().await {
             Ok(r) if r.status().is_success() => {
                 println!("IP {ip} unbanned successfully.");
@@ -511,13 +511,17 @@ pub(crate) fn run_upgrade(
             }
         };
 
+        // Same localhost-only TLS management API as `run_unban` (Story
+        // 8.8 AC #1): accept the self-signed cert since the target is
+        // always `127.0.0.1`.
         let client = reqwest::Client::builder()
             .cookie_store(true)
+            .danger_accept_invalid_certs(true)
             .build()
             .expect("HTTP client");
 
         // Login (the upgrade endpoint is behind require_auth).
-        let login_url = format!("http://127.0.0.1:{port}/api/v1/auth/login");
+        let login_url = format!("https://127.0.0.1:{port}/api/v1/auth/login");
         match client
             .post(&login_url)
             .json(&serde_json::json!({ "username": user, "password": password }))
@@ -558,7 +562,7 @@ pub(crate) fn run_upgrade(
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
         println!("Uploading {} ({} bytes) for hot upgrade...", binary, binary_bytes.len());
-        let upgrade_url = format!("http://127.0.0.1:{port}/api/v1/system/upgrade");
+        let upgrade_url = format!("https://127.0.0.1:{port}/api/v1/system/upgrade");
         match client
             .post(&upgrade_url)
             .header(

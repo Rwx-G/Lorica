@@ -58,7 +58,7 @@ docker compose up $BUILD_FLAG -d backend1 backend2 lorica
 
 echo "Waiting for Lorica to initialize..."
 for i in $(seq 1 60); do
-    if docker compose exec -T lorica curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+    if docker compose exec -T lorica curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
         echo "Lorica is ready."
         break
     fi
@@ -83,7 +83,7 @@ if [ "$SKIP_WORKERS" = false ] && [ "$EXIT_CODE" = "0" ]; then
 
     echo "Waiting for Lorica workers to initialize..."
     for i in $(seq 1 60); do
-        if docker compose exec -T lorica-workers curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+        if docker compose exec -T lorica-workers curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
             echo "Lorica workers instance is ready."
             break
         fi
@@ -110,7 +110,7 @@ if [ "$SKIP_CERT_EXPORT" = false ] && [ "$EXIT_CODE" = "0" ]; then
 
     echo "Waiting for Lorica (cert-export) to initialize..."
     for i in $(seq 1 60); do
-        if docker compose exec -T lorica-cert-export curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+        if docker compose exec -T lorica-cert-export curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
             echo "Lorica (cert-export) is ready."
             break
         fi
@@ -138,7 +138,7 @@ if [ "$SKIP_AI_BOT" = false ] && [ "$EXIT_CODE" = "0" ]; then
 
     echo "Waiting for Lorica (ai-bot) to initialize..."
     for i in $(seq 1 60); do
-        if docker compose exec -T lorica-ai-bot curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+        if docker compose exec -T lorica-ai-bot curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
             echo "Lorica (ai-bot) is ready."
             break
         fi
@@ -161,7 +161,7 @@ if [ "$SKIP_AI_BOT" = false ] && [ "$EXIT_CODE" = "0" ]; then
 
         echo "Waiting for Lorica (ai-bot workers) to initialize..."
         for i in $(seq 1 60); do
-            if docker compose exec -T lorica-ai-bot-workers curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+            if docker compose exec -T lorica-ai-bot-workers curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
                 echo "Lorica (ai-bot workers) is ready."
                 break
             fi
@@ -189,7 +189,7 @@ if [ "$SKIP_RBAC" = false ] && [ "$EXIT_CODE" = "0" ]; then
 
     echo "Waiting for Lorica (rbac) to initialize..."
     for i in $(seq 1 60); do
-        if docker compose exec -T lorica-rbac curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+        if docker compose exec -T lorica-rbac curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
             echo "Lorica (rbac) is ready."
             break
         fi
@@ -212,7 +212,7 @@ if [ "$SKIP_RBAC" = false ] && [ "$EXIT_CODE" = "0" ]; then
 
         echo "Waiting for Lorica (rbac workers) to initialize..."
         for i in $(seq 1 60); do
-            if docker compose exec -T lorica-rbac-workers curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+            if docker compose exec -T lorica-rbac-workers curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
                 echo "Lorica (rbac workers) is ready."
                 break
             fi
@@ -241,7 +241,7 @@ if [ "$SKIP_AUDIT" = false ] && [ "$EXIT_CODE" = "0" ]; then
 
     echo "Waiting for Lorica (audit) to initialize..."
     for i in $(seq 1 60); do
-        if docker compose exec -T lorica-audit curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+        if docker compose exec -T lorica-audit curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
             echo "Lorica (audit) is ready."
             break
         fi
@@ -269,7 +269,7 @@ if [ "$SKIP_HOT_UPGRADE" = false ] && [ "$EXIT_CODE" = "0" ]; then
 
     echo "Waiting for Lorica (hot-upgrade) to initialize..."
     for i in $(seq 1 60); do
-        if docker compose exec -T lorica-hot-upgrade curl -sf http://127.0.0.1:19443/ >/dev/null 2>&1; then
+        if docker compose exec -T lorica-hot-upgrade curl -skf https://127.0.0.1:19443/ >/dev/null 2>&1; then
             echo "Lorica (hot-upgrade) is ready."
             break
         fi

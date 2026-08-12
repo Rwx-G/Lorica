@@ -30,6 +30,18 @@ futures-util = "0.3"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "sync", "time"] }
+# Management-plane TLS (Story 8.8 AC #1/#2). The management API moved
+# off plaintext `axum::serve` onto a manual rustls accept loop: axum 0.7
+# `Router` -> `hyper-util` auto (h1/h2) connection server over a
+# `tokio-rustls` acceptor. Both crates are already in the workspace
+# lockfile (transitive via the rustls / hyper stack); promoted to direct
+# deps here. `tokio-rustls` pins the `ring` provider (no aws-lc-rs) to
+# match the rest of the workspace, which installs the ring default
+# provider at process start. `hyper-util` needs `server-auto` (protocol
+# auto-detect), `service` (`TowerToHyperService` bridge), and `tokio`
+# (the `TokioIo` / `TokioExecutor` adapters).
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }

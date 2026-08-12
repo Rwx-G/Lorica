@@ -968,7 +968,15 @@ pub fn build_router(
         ))
 }
 
-/// Start the API server on localhost only.
+/// Start the API server on localhost only, over TLS (Story 8.8 AC #1).
+///
+/// The management listener terminates TLS with either the operator's
+/// certificate (`management_cert_pem_path` + `management_key_pem_path`,
+/// AC #2) or the auto-generated self-signed leaf under
+/// `<data_dir>/management/`. Serving is a manual accept loop: axum 0.7
+/// `Router` -> `hyper-util` auto (h1/h2, with upgrades for the dashboard
+/// websockets) over a `tokio-rustls` acceptor, replacing the previous
+/// plaintext `axum::serve`.
 ///
 /// When `inherited_listener` is `Some`, the server serves on that
 /// pre-bound socket instead of binding a fresh one. The hot-upgrade
@@ -984,8 +992,42 @@ pub async fn start_server(
     rate_limiter: RateLimiter,
     inherited_listener: Option<std::net::TcpListener>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = build_router(state, session_store, rate_limiter)
-        .into_make_service_with_connect_info::<SocketAddr>();
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as HyperAutoBuilder;
+    use hyper_util::service::TowerToHyperService;
+    use tokio_rustls::TlsAcceptor;
+    use tower::Service;
+
+    // Read the operator TLS override paths and the data dir before the
+    // state is consumed into the router below.
+    let data_dir: PathBuf = state.data_dir.clone();
+    let (cert_override, key_override): (Option<String>, Option<String>) = {
+        let store = state.store.lock().await;
+        match store.get_global_settings() {
+            Ok(gs) => (gs.management_cert_pem_path, gs.management_key_pem_path),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to read global settings for management TLS; using self-signed certificate"
+                );
+                (None, None)
+            }
+        }
+    };
+
+    let server_config = crate::management_tls::build_management_server_config(
+        &data_dir,
+        cert_override.as_deref(),
+        key_override.as_deref(),
+    )?;
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+    // `into_make_service_with_connect_info` yields a maker whose per-call
+    // output is the router with a `ConnectInfo<SocketAddr>` extension
+    // injected; the manual loop calls it once per accepted connection so
+    // handlers keep seeing the peer address (audit logging, rate limits).
+    let mut make_service =
+        build_router(state, session_store, rate_limiter).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener: tokio::net::TcpListener = match inherited_listener {
         Some(std_listener) => {
@@ -997,11 +1039,45 @@ pub async fn start_server(
         }
         None => {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            info!(port = port, "API server listening on localhost only");
+            info!(port = port, "API server listening on localhost only (TLS)");
             tokio::net::TcpListener::bind(addr).await?
         }
     };
-    axum::serve(listener, app).await?;
 
-    Ok(())
+    loop {
+        let (tcp, remote_addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "management listener accept failed");
+                continue;
+            }
+        };
+
+        // Build the per-connection service. `make_service` is always
+        // ready and its error type is `Infallible`, so the `Err` arm is
+        // an empty match on an uninhabited type.
+        let tower_service = match make_service.call(remote_addr).await {
+            Ok(svc) => svc,
+            Err(err) => match err {},
+        };
+        let acceptor = acceptor.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(peer = %remote_addr, error = %e, "management TLS handshake failed");
+                    return;
+                }
+            };
+            let io = TokioIo::new(tls_stream);
+            let hyper_service = TowerToHyperService::new(tower_service);
+            if let Err(e) = HyperAutoBuilder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(io, hyper_service)
+                .await
+            {
+                tracing::debug!(peer = %remote_addr, error = %e, "management connection ended with error");
+            }
+        });
+    }
 }
