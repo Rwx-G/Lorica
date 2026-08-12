@@ -825,7 +825,7 @@ impl LogStore {
     /// computed HERE, inside the connection lock: two concurrent
     /// mutations cannot fork the chain. The previous hash comes from
     /// the newest stored row, else the retention seal, else genesis.
-    pub fn insert_audit(&self, entry: &crate::audit::NewAuditEntry) -> Result<i64, String> {
+    pub fn insert_audit(&self, entry: &crate::audit::NewAuditEntry) -> Result<(i64, String), String> {
         use rusqlite::OptionalExtension;
         let conn = self.conn.lock();
 
@@ -871,7 +871,7 @@ impl LogStore {
         )
         .map_err(|e| format!("failed to insert audit row: {e}"))?;
 
-        Ok(conn.last_insert_rowid())
+        Ok((conn.last_insert_rowid(), chain_hash))
     }
 
     fn row_to_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::audit::AuditRecord> {

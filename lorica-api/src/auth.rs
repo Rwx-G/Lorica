@@ -120,10 +120,20 @@ pub async fn login(
         // Legacy `{password}` body shim: route to the migrated
         // single-admin account (Story 8.3 AC #3).
         let username = body.username.as_deref().unwrap_or("admin");
-        let user = store
+        let user = match store
             .get_user_by_username(username)
             .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or_else(|| ApiError::Unauthorized("invalid credentials".into()))?;
+        {
+            Some(u) => u,
+            None => {
+                // Equalize cost with the valid-user path so response
+                // latency does not reveal whether the username exists
+                // (username enumeration timing oracle). The dummy verify
+                // runs the same Argon2id work and always fails.
+                let _ = verify_password(&body.password, DUMMY_PASSWORD_HASH.as_str());
+                return Err(ApiError::Unauthorized("invalid credentials".into()));
+            }
+        };
 
         verify_password(&body.password, &user.password_hash)?;
 
@@ -376,6 +386,16 @@ pub fn hash_password(password: &str) -> Result<String, ApiError> {
         .map_err(|e| ApiError::Internal(format!("password hashing failed: {e}")))?;
     Ok(hash.to_string())
 }
+
+/// Fixed Argon2id hash used only to equalize the cost of a
+/// user-not-found login with the real verify path, closing the username
+/// enumeration timing oracle. A dummy verify against this hash always
+/// fails but performs the same Argon2id work as a real verify. Computed
+/// once with the production hashing parameters.
+static DUMMY_PASSWORD_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    hash_password("timing-oracle-equalizer")
+        .expect("hashing a fixed constant password is infallible")
+});
 
 /// Generate a random password for first-run admin setup.
 ///

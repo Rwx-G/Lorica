@@ -2,12 +2,29 @@
 //!
 //! Every state-mutating management-API handler records an audit entry.
 //! Rows form a linear SHA-256 hash chain: each row stores the previous
-//! row's `chain_hash` and its own `chain_hash` computed over the
-//! row's identifying fields. Tampering with any stored field (or
-//! deleting a middle row) breaks recomputation at the earliest
-//! affected row, which `verify` localises. Retention truncation is
-//! chain-safe via a "retention seal" (the earliest surviving row's
-//! `prev_chain_hash`) stored in `audit_log_meta`.
+//! row's `chain_hash` and its own `chain_hash` computed over ALL of the
+//! row's content fields (timestamp, operator username + role, action,
+//! target type + id, before/after payload hashes, ip, user_agent).
+//! Editing any of those fields, or deleting a middle row, breaks
+//! recomputation at the earliest affected row, which `verify` localises.
+//! Retention truncation is chain-safe via a "retention seal" (the
+//! earliest surviving row's `prev_chain_hash`) stored in
+//! `audit_log_meta`.
+//!
+//! Threat model (honest scope): the chain is tamper-EVIDENT, not
+//! tamper-PROOF. The hash is unkeyed and the seal is stored in-band, so
+//! a principal with write access to `access-log.db` who recomputes every
+//! `chain_hash` forward (the algorithm is public) can produce a
+//! self-consistent forged history that `verify` accepts. `verify` proves
+//! INTERNAL consistency, not authenticity against an external anchor. For
+//! out-of-band detection, each successful `record` emits the row's
+//! `chain_hash` on the `lorica::audit` tracing target (see [`record`]);
+//! shipping that stream to a WORM / append-only sink lets an operator
+//! catch a wholesale rewrite by comparing the persisted head against the
+//! externally-captured one. An HMAC key was considered and rejected: on a
+//! single-host deployment the key would live under the same owner as the
+//! DB, so it stops no realistic on-host attacker while adding key
+//! lifecycle complexity - the external anchor is the effective control.
 //!
 //! Storage lives in [`crate::log_store::LogStore`] (`access-log.db`),
 //! which only exists in the process that serves the management API
@@ -149,6 +166,8 @@ pub struct ChainInput<'a> {
     pub timestamp: &'a str,
     /// Operator username.
     pub operator_username: &'a str,
+    /// Operator role at mutation time (snake_case).
+    pub operator_role: &'a str,
     /// Dotted action verb.
     pub action: &'a str,
     /// Entity kind.
@@ -159,6 +178,10 @@ pub struct ChainInput<'a> {
     pub before_payload_hash: &'a str,
     /// SHA-256 hex of the post-mutation payload ("" = absent).
     pub after_payload_hash: &'a str,
+    /// Source IP ("" when unknown).
+    pub ip: &'a str,
+    /// Client User-Agent ("" when absent).
+    pub user_agent: &'a str,
 }
 
 impl<'a> From<&'a NewAuditEntry> for ChainInput<'a> {
@@ -166,11 +189,14 @@ impl<'a> From<&'a NewAuditEntry> for ChainInput<'a> {
         Self {
             timestamp: &entry.timestamp,
             operator_username: &entry.operator_username,
+            operator_role: &entry.operator_role,
             action: &entry.action,
             target_type: &entry.target_type,
             target_id: &entry.target_id,
             before_payload_hash: &entry.before_payload_hash,
             after_payload_hash: &entry.after_payload_hash,
+            ip: &entry.ip,
+            user_agent: &entry.user_agent,
         }
     }
 }
@@ -180,11 +206,14 @@ impl<'a> From<&'a AuditRecord> for ChainInput<'a> {
         Self {
             timestamp: &row.timestamp,
             operator_username: &row.operator_username,
+            operator_role: &row.operator_role,
             action: &row.action,
             target_type: &row.target_type,
             target_id: &row.target_id,
             before_payload_hash: &row.before_payload_hash,
             after_payload_hash: &row.after_payload_hash,
+            ip: &row.ip,
+            user_agent: &row.user_agent,
         }
     }
 }
@@ -202,11 +231,14 @@ pub fn compute_chain_hash(prev_chain_hash: &str, input: &ChainInput<'_>) -> Stri
         prev_chain_hash,
         input.timestamp,
         input.operator_username,
+        input.operator_role,
         input.action,
         input.target_type,
         input.target_id,
         input.before_payload_hash,
         input.after_payload_hash,
+        input.ip,
+        input.user_agent,
     ] {
         ctx.update(&(field.len() as u64).to_le_bytes());
         ctx.update(field.as_bytes());
@@ -261,11 +293,14 @@ impl AuditContext {
 /// `api_request` span).
 ///
 /// `target` is `(target_type, target_id)`. `before` / `after` payloads
-/// are SHA-256-hashed; the payloads themselves are never persisted.
-/// Failure policy: an insert failure is logged and swallowed -
+/// are SHA-256-hashed; the payloads themselves are never persisted. The
+/// tracing event is emitted AFTER persistence so it carries the committed
+/// `chain_hash` (the external-anchor control in the module threat model);
+/// on the no-store / failure paths it is still emitted, with an empty
+/// `chain_hash`. Failure policy: an insert failure is counted
+/// (`lorica_audit_insert_failed_total`), logged, and swallowed -
 /// availability beats auditability, the chain covers integrity, not
-/// liveness. A `None` log store (worker mode, tests) skips persistence
-/// but still emits the tracing event.
+/// liveness. A `None` log store (worker mode, tests) skips persistence.
 pub async fn record(
     state: &AppState,
     ctx: &AuditContext,
@@ -276,18 +311,8 @@ pub async fn record(
 ) {
     let (target_type, target_id) = target;
 
-    tracing::info!(
-        target: "lorica::audit",
-        operator = %ctx.username,
-        role = %ctx.role,
-        action = %action,
-        target_type = %target_type,
-        target_id = %target_id,
-        ip = %ctx.ip,
-        "audit"
-    );
-
     let Some(log_store) = state.log_store.clone() else {
+        emit_audit_event(ctx, action, target_type, target_id, "");
         return;
     };
 
@@ -306,10 +331,43 @@ pub async fn record(
 
     let result = tokio::task::spawn_blocking(move || log_store.insert_audit(&entry)).await;
     match result {
-        Ok(Ok(_id)) => {}
-        Ok(Err(e)) => tracing::error!(error = %e, "audit log insert failed"),
-        Err(e) => tracing::error!(error = %e, "audit log insert task failed"),
+        Ok(Ok((_id, chain_hash))) => {
+            emit_audit_event(ctx, action, target_type, target_id, &chain_hash);
+        }
+        Ok(Err(e)) => {
+            crate::metrics::inc_audit_insert_failed();
+            tracing::error!(error = %e, "audit log insert failed");
+            emit_audit_event(ctx, action, target_type, target_id, "");
+        }
+        Err(e) => {
+            crate::metrics::inc_audit_insert_failed();
+            tracing::error!(error = %e, "audit log insert task failed");
+            emit_audit_event(ctx, action, target_type, target_id, "");
+        }
     }
+}
+
+/// Emit the `lorica::audit` tracing event for one mutation. `chain_hash`
+/// is the committed chain head (the out-of-band anchor), or `""` when
+/// nothing was persisted (worker mode or an insert failure).
+fn emit_audit_event(
+    ctx: &AuditContext,
+    action: &str,
+    target_type: &str,
+    target_id: &str,
+    chain_hash: &str,
+) {
+    tracing::info!(
+        target: "lorica::audit",
+        operator = %ctx.username,
+        role = %ctx.role,
+        action = %action,
+        target_type = %target_type,
+        target_id = %target_id,
+        ip = %ctx.ip,
+        chain_hash = %chain_hash,
+        "audit"
+    );
 }
 
 /// Query-string parameters of `GET /api/v1/audit`.
@@ -411,11 +469,14 @@ mod tests {
         ChainInput {
             timestamp: "t",
             operator_username: username,
+            operator_role: "super_admin",
             action,
             target_type: "route",
             target_id,
             before_payload_hash: "",
             after_payload_hash: "",
+            ip: "",
+            user_agent: "",
         }
     }
 

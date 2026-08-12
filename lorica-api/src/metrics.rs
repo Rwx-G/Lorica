@@ -1118,6 +1118,28 @@ pub fn inc_certificates_invalid_bundle_by(source: &str, count: u64) {
         .inc_by(count);
 }
 
+/// Counter: audit-log row inserts that failed (DB error or task panic).
+/// The mutation itself still succeeded - availability beats auditability
+/// (Story 8.9) - so this counter surfaces the resulting audit gap for
+/// alerting, since a swallowed insert leaves no chain break to detect.
+static AUDIT_INSERT_FAILED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let counter = IntCounter::with_opts(
+        prometheus::opts!(
+            "audit_insert_failed_total",
+            "Audit-log row inserts that failed (the mutation still succeeded)"
+        )
+        .namespace("lorica"),
+    )
+    .expect("prometheus metric creation");
+    REGISTRY.register(Box::new(counter.clone())).ok();
+    counter
+});
+
+/// Bump the audit-insert-failure counter (Story 8.9).
+pub fn inc_audit_insert_failed() {
+    AUDIT_INSERT_FAILED_TOTAL.inc();
+}
+
 // --- Story 8.5: cert-resolver reliability -------------------------------
 
 /// Counter: cert-resolver reloads by outcome. `result` is `"ok"` (the
